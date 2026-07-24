@@ -123,11 +123,11 @@ impl MicroExecutor {
             let frame = *continuation.arena.current()?;
             let program = self
                 .programs
-                .get(&frame.program_id)
-                .ok_or(MicroError::MissingProgram(frame.program_id))?;
+                .get(&frame.function)
+                .ok_or(MicroError::MissingProgram(frame.function))?;
             let op = *program
                 .ops
-                .get(frame.pc)
+                .get(frame.pc as usize)
                 .ok_or(MicroError::FellOffProgram)?;
             match op {
                 MicroOp::Compute(cost) => {
@@ -212,7 +212,7 @@ impl MicroExecutor {
                     DeferAction::SetFlag(id) => {
                         self.flags.insert(id, true);
                     }
-                    DeferAction::Trap => {
+                    DeferAction::Trap | DeferAction::Call { .. } => {
                         runtime.trap_task(continuation.task)?;
                         return Err(MicroError::Trapped);
                     }

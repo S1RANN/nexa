@@ -1,6 +1,6 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use nexa_core::RawHandle;
 
@@ -115,7 +115,7 @@ impl ReleaseQueue {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostRequestHandle(RawHandle);
 
 impl HostRequestHandle {
@@ -135,16 +135,118 @@ pub enum HostRequestState {
 
 #[derive(Debug)]
 struct HostRequest {
+    module_id: u32,
     epoch: u64,
     state: HostRequestState,
     release: Option<ReleaseReservation>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostPayload {
+    I32(i32),
+    Unit,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HostValue {
+    I32(i32),
+    F32(f32),
+    Bool(bool),
+    String(String),
+    Request(HostRequestHandle),
+    Token(ResourceTokenHandle),
+    Snapshot(SnapshotHandle),
+    Unit,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HostArgs<'a> {
+    values: &'a [HostValue],
+}
+
+impl<'a> HostArgs<'a> {
+    #[must_use]
+    pub const fn new(values: &'a [HostValue]) -> Self {
+        Self { values }
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.values.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn get(self, index: usize) -> Result<&'a HostValue, HostTrap> {
+        self.values.get(index).ok_or(HostTrap::Arity)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HostCallOutcome {
+    Immediate(HostValue),
+    Pending(HostRequestHandle),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HostTrap {
+    UnknownFunction(u32),
+    Arity,
+    Type,
+    Panicked,
+    Host(String),
+}
+
+pub trait HostRegistry {
+    fn call(
+        &mut self,
+        id: u32,
+        context: &mut ResourceContext<'_>,
+        args: HostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap>;
+}
+
+pub trait ScriptFunction {
+    type Args;
+    type Output;
+    const FUNCTION_ID: u32;
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCompletion {
+    pub realm_id: u32,
+    pub module_id: u32,
+    pub epoch: u64,
+    pub request: HostRequestHandle,
+    pub payload: HostPayload,
+}
+
+#[derive(Debug)]
+struct CompletionQueue {
+    items: VecDeque<HostCompletion>,
+    capacity: usize,
+    reserved: usize,
+    closed: bool,
+}
+
 #[derive(Clone, Debug)]
-struct Completion {
-    request: HostRequestHandle,
-    epoch: u64,
-    value: i32,
+pub struct HostCompletionSender {
+    queue: Arc<Mutex<CompletionQueue>>,
+}
+
+impl HostCompletionSender {
+    pub fn complete(&self, completion: HostCompletion) -> Result<(), HostRequestError> {
+        let mut queue = self.queue.lock().expect("completion queue mutex poisoned");
+        if queue.closed || queue.reserved == 0 || queue.items.len() >= queue.capacity {
+            return Err(HostRequestError::CompletionQueueFull);
+        }
+        queue.reserved -= 1;
+        queue.items.push_back(completion);
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -186,9 +288,16 @@ impl From<ReleaseQueueError> for HostRequestError {
 pub struct HostRequestManager {
     realm_id: u32,
     requests: SlotPool<HostRequest>,
-    completions: VecDeque<Completion>,
-    completion_capacity: usize,
+    completions: Arc<Mutex<CompletionQueue>>,
     discarded_late_results: u64,
+    terminal_records: VecDeque<RequestTerminalRecord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestTerminalRecord {
+    pub request: HostRequestHandle,
+    pub state: HostRequestState,
+    pub epoch: u64,
 }
 
 impl HostRequestManager {
@@ -197,9 +306,21 @@ impl HostRequestManager {
         Self {
             realm_id,
             requests: SlotPool::with_capacity_limit(realm_id, capacity),
-            completions: VecDeque::with_capacity(capacity as usize),
-            completion_capacity: capacity as usize,
+            completions: Arc::new(Mutex::new(CompletionQueue {
+                items: VecDeque::with_capacity(capacity as usize),
+                capacity: capacity as usize,
+                reserved: 0,
+                closed: false,
+            })),
             discarded_late_results: 0,
+            terminal_records: VecDeque::with_capacity(capacity as usize),
+        }
+    }
+
+    #[must_use]
+    pub fn completion_sender(&self) -> HostCompletionSender {
+        HostCompletionSender {
+            queue: Arc::clone(&self.completions),
         }
     }
 
@@ -208,14 +329,36 @@ impl HostRequestManager {
         epoch: u64,
         releases: &mut ReleaseQueue,
     ) -> Result<HostRequestHandle, HostRequestError> {
+        self.create_for_module(0, epoch, releases)
+    }
+
+    pub fn create_for_module(
+        &mut self,
+        module_id: u32,
+        epoch: u64,
+        releases: &mut ReleaseQueue,
+    ) -> Result<HostRequestHandle, HostRequestError> {
         let release = releases.reserve()?;
+        {
+            let mut queue = self
+                .completions
+                .lock()
+                .expect("completion queue mutex poisoned");
+            if queue.items.len() + queue.reserved >= queue.capacity {
+                releases.cancel_reservation(release);
+                return Err(HostRequestError::CompletionQueueFull);
+            }
+            queue.reserved += 1;
+        }
         match self.requests.try_allocate(HostRequest {
+            module_id,
             epoch,
             state: HostRequestState::Pending,
             release: Some(release),
         }) {
             Ok(handle) => Ok(HostRequestHandle(handle)),
             Err(error) => {
+                self.cancel_completion_reservation();
                 releases.cancel_reservation(release);
                 Err(error.into())
             }
@@ -228,15 +371,13 @@ impl HostRequestManager {
         epoch: u64,
         value: i32,
     ) -> Result<(), HostRequestError> {
-        if self.completions.len() >= self.completion_capacity {
-            return Err(HostRequestError::CompletionQueueFull);
-        }
-        self.completions.push_back(Completion {
+        self.completion_sender().complete(HostCompletion {
+            realm_id: self.realm_id,
+            module_id: 0,
             request,
             epoch,
-            value,
-        });
-        Ok(())
+            payload: HostPayload::I32(value),
+        })
     }
 
     pub fn drain_completions(
@@ -245,21 +386,44 @@ impl HostRequestManager {
         releases: &mut ReleaseQueue,
     ) -> Vec<(HostRequestHandle, i32)> {
         let mut accepted = Vec::new();
-        while let Some(completion) = self.completions.pop_front() {
+        let completions = {
+            let mut queue = self
+                .completions
+                .lock()
+                .expect("completion queue mutex poisoned");
+            queue.items.drain(..).collect::<Vec<_>>()
+        };
+        for completion in completions {
             let Ok(request) = self.requests.resolve_mut(completion.request.raw()) else {
                 self.discarded_late_results += 1;
                 continue;
             };
-            if request.epoch != current_epoch
+            if completion.realm_id != self.realm_id
+                || request.epoch != current_epoch
                 || completion.epoch != current_epoch
+                || completion.module_id != request.module_id
                 || request.state != HostRequestState::Pending
             {
                 self.discarded_late_results += 1;
                 continue;
             }
             request.state = HostRequestState::Completed;
-            accepted.push((completion.request, completion.value));
+            let HostPayload::I32(value) = completion.payload else {
+                self.discarded_late_results += 1;
+                continue;
+            };
+            accepted.push((completion.request, value));
             enqueue_request_release(self.realm_id, completion.request, request, releases);
+            let terminal = RequestTerminalRecord {
+                request: completion.request,
+                state: HostRequestState::Completed,
+                epoch: request.epoch,
+            };
+            let _ = request;
+            self.requests
+                .release(completion.request.raw())
+                .expect("resolved request remains live");
+            self.push_terminal(terminal);
         }
         accepted
     }
@@ -270,22 +434,55 @@ impl HostRequestManager {
         detach: bool,
         releases: &mut ReleaseQueue,
     ) -> Result<(), HostRequestError> {
-        let request_state = self.requests.resolve_mut(request.raw())?;
-        if request_state.state != HostRequestState::Pending {
+        if self.requests.resolve(request.raw())?.state != HostRequestState::Pending {
             return Err(HostRequestError::InvalidState);
         }
+        self.cancel_completion_reservation();
+        let request_state = self.requests.resolve_mut(request.raw())?;
         request_state.state = if detach {
             HostRequestState::Detached
         } else {
             HostRequestState::Cancelled
         };
         enqueue_request_release(self.realm_id, request, request_state, releases);
+        let terminal = RequestTerminalRecord {
+            request,
+            state: request_state.state,
+            epoch: request_state.epoch,
+        };
+        let _ = request_state;
+        self.requests.release(request.raw())?;
+        self.push_terminal(terminal);
         Ok(())
     }
 
     #[must_use]
     pub const fn discarded_late_results(&self) -> u64 {
         self.discarded_late_results
+    }
+
+    fn cancel_completion_reservation(&self) {
+        let mut queue = self
+            .completions
+            .lock()
+            .expect("completion queue mutex poisoned");
+        queue.reserved = queue.reserved.saturating_sub(1);
+    }
+
+    fn push_terminal(&mut self, record: RequestTerminalRecord) {
+        if self.terminal_records.len() == self.terminal_records.capacity() {
+            self.terminal_records.pop_front();
+        }
+        self.terminal_records.push_back(record);
+    }
+}
+
+impl Drop for HostRequestManager {
+    fn drop(&mut self) {
+        self.completions
+            .lock()
+            .expect("completion queue mutex poisoned")
+            .closed = true;
     }
 }
 
@@ -311,7 +508,7 @@ fn enqueue_request_release(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceTokenHandle(RawHandle);
 
 #[derive(Debug)]
@@ -326,6 +523,8 @@ struct ResourceToken {
 pub struct ResourceTokenManager {
     realm_id: u32,
     tokens: SlotPool<ResourceToken>,
+    terminal: BTreeSet<RawHandle>,
+    terminal_capacity: usize,
 }
 
 impl ResourceTokenManager {
@@ -334,6 +533,8 @@ impl ResourceTokenManager {
         Self {
             realm_id,
             tokens: SlotPool::with_capacity_limit(realm_id, capacity),
+            terminal: BTreeSet::new(),
+            terminal_capacity: capacity as usize,
         }
     }
 
@@ -363,24 +564,34 @@ impl ResourceTokenManager {
         handle: ResourceTokenHandle,
         releases: &mut ReleaseQueue,
     ) -> Result<bool, HostRequestError> {
-        let token = self.tokens.resolve_mut(handle.0)?;
-        if token.released {
+        if self.terminal.contains(&handle.0) {
             return Ok(false);
         }
+        let token = self.tokens.resolve_mut(handle.0)?;
         token.released = true;
         let reservation = token
             .release
             .take()
             .expect("unreleased token owns reservation");
+        let domain = token.domain;
         releases.enqueue_reserved(
             reservation,
             ReleaseRecord {
                 realm_id: self.realm_id,
                 kind: ReleaseKind::ResourceToken,
                 object_id: u64::from(handle.0.generation) << 32 | u64::from(handle.0.index),
-                domain: token.domain,
+                domain,
             },
         )?;
+        let _ = token;
+        self.tokens.release(handle.0)?;
+        if self.terminal.len() == self.terminal_capacity {
+            let oldest = self.terminal.iter().next().copied();
+            if let Some(oldest) = oldest {
+                self.terminal.remove(&oldest);
+            }
+        }
+        self.terminal.insert(handle.0);
         Ok(true)
     }
 
@@ -396,7 +607,7 @@ impl ResourceTokenManager {
             .filter(|handle| {
                 self.tokens
                     .resolve(*handle)
-                    .is_ok_and(|token| token.owner == owner && !token.released)
+                    .is_ok_and(|token| token.owner == owner)
             })
             .map(ResourceTokenHandle)
             .collect::<Vec<_>>();
@@ -404,6 +615,244 @@ impl ResourceTokenManager {
             self.release(*handle, releases)?;
         }
         Ok(handles.len())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SnapshotHandle(RawHandle);
+
+impl SnapshotHandle {
+    #[must_use]
+    pub const fn raw(self) -> RawHandle {
+        self.0
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotEntry {
+    data: Arc<[i32]>,
+    external_bytes: usize,
+    release: ReleaseReservation,
+}
+
+#[derive(Debug)]
+pub struct SnapshotManager {
+    realm_id: u32,
+    snapshots: SlotPool<SnapshotEntry>,
+}
+
+impl SnapshotManager {
+    #[must_use]
+    pub fn new(realm_id: u32, capacity: u32) -> Self {
+        Self {
+            realm_id,
+            snapshots: SlotPool::with_capacity_limit(realm_id, capacity),
+        }
+    }
+
+    fn create(
+        &mut self,
+        _owner: TaskHandle,
+        data: Arc<[i32]>,
+        releases: &mut ReleaseQueue,
+    ) -> Result<SnapshotHandle, HostRequestError> {
+        let release = releases.reserve()?;
+        let external_bytes = data.len().saturating_mul(std::mem::size_of::<i32>());
+        match self.snapshots.try_allocate(SnapshotEntry {
+            data,
+            external_bytes,
+            release,
+        }) {
+            Ok(raw) => Ok(SnapshotHandle(raw)),
+            Err(error) => {
+                releases.cancel_reservation(release);
+                Err(error.into())
+            }
+        }
+    }
+
+    pub fn data(&self, handle: SnapshotHandle) -> Result<&[i32], HostRequestError> {
+        Ok(&self.snapshots.resolve(handle.raw())?.data)
+    }
+
+    pub fn external_bytes(&self, handle: SnapshotHandle) -> Result<usize, HostRequestError> {
+        Ok(self.snapshots.resolve(handle.raw())?.external_bytes)
+    }
+
+    fn release(
+        &mut self,
+        handle: SnapshotHandle,
+        releases: &mut ReleaseQueue,
+    ) -> Result<(), HostRequestError> {
+        let snapshot = self.snapshots.release(handle.raw())?;
+        releases.enqueue_reserved(
+            snapshot.release,
+            ReleaseRecord {
+                realm_id: self.realm_id,
+                kind: ReleaseKind::Snapshot,
+                object_id: u64::from(handle.raw().generation) << 32 | u64::from(handle.raw().index),
+                domain: RuntimeHostDomain::VmThread,
+            },
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TaskResourceSet {
+    pub requests: BTreeSet<HostRequestHandle>,
+    pub tokens: BTreeSet<ResourceTokenHandle>,
+    pub snapshots: BTreeSet<SnapshotHandle>,
+}
+
+#[derive(Debug)]
+pub struct RuntimeResources {
+    requests: HostRequestManager,
+    tokens: ResourceTokenManager,
+    snapshots: SnapshotManager,
+    releases: ReleaseQueue,
+    ownership: BTreeMap<TaskHandle, TaskResourceSet>,
+}
+
+impl RuntimeResources {
+    #[must_use]
+    pub fn new(realm_id: u32, capacity: u32, release_capacity: usize) -> Self {
+        Self {
+            requests: HostRequestManager::new(realm_id, capacity),
+            tokens: ResourceTokenManager::new(realm_id, capacity),
+            snapshots: SnapshotManager::new(realm_id, capacity),
+            releases: ReleaseQueue::new(release_capacity),
+            ownership: BTreeMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn completion_sender(&self) -> HostCompletionSender {
+        self.requests.completion_sender()
+    }
+
+    pub fn context(&mut self, task: TaskHandle, module_id: u32, epoch: u64) -> ResourceContext<'_> {
+        ResourceContext {
+            task,
+            module_id,
+            epoch,
+            resources: self,
+        }
+    }
+
+    pub fn drain_completions(&mut self, epoch: u64) -> Vec<(HostRequestHandle, HostPayload)> {
+        self.requests
+            .drain_completions(epoch, &mut self.releases)
+            .into_iter()
+            .map(|(request, value)| {
+                for resources in self.ownership.values_mut() {
+                    resources.requests.remove(&request);
+                }
+                (request, HostPayload::I32(value))
+            })
+            .collect()
+    }
+
+    pub fn cleanup_task(
+        &mut self,
+        task: TaskHandle,
+        detach_requests: bool,
+    ) -> Result<(), HostRequestError> {
+        let Some(owned) = self.ownership.remove(&task) else {
+            return Ok(());
+        };
+        for request in owned.requests {
+            match self
+                .requests
+                .cancel(request, detach_requests, &mut self.releases)
+            {
+                Ok(()) | Err(HostRequestError::Handle(_)) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        for token in owned.tokens {
+            self.tokens.release(token, &mut self.releases)?;
+        }
+        for snapshot in owned.snapshots {
+            self.snapshots.release(snapshot, &mut self.releases)?;
+        }
+        Ok(())
+    }
+
+    pub fn drain_releases(&mut self) -> Vec<ReleaseRecord> {
+        self.releases.drain().collect()
+    }
+
+    pub fn snapshot_data(&self, snapshot: SnapshotHandle) -> Result<&[i32], HostRequestError> {
+        self.snapshots.data(snapshot)
+    }
+
+    #[must_use]
+    pub fn ownership(&self, task: TaskHandle) -> Option<&TaskResourceSet> {
+        self.ownership.get(&task)
+    }
+
+    #[must_use]
+    pub const fn discarded_late_results(&self) -> u64 {
+        self.requests.discarded_late_results()
+    }
+}
+
+pub struct ResourceContext<'a> {
+    task: TaskHandle,
+    module_id: u32,
+    epoch: u64,
+    resources: &'a mut RuntimeResources,
+}
+
+impl ResourceContext<'_> {
+    pub fn create_request(&mut self) -> Result<HostRequestHandle, HostRequestError> {
+        let request = self.resources.requests.create_for_module(
+            self.module_id,
+            self.epoch,
+            &mut self.resources.releases,
+        )?;
+        self.resources
+            .ownership
+            .entry(self.task)
+            .or_default()
+            .requests
+            .insert(request);
+        Ok(request)
+    }
+
+    pub fn create_token(
+        &mut self,
+        domain: RuntimeHostDomain,
+    ) -> Result<ResourceTokenHandle, HostRequestError> {
+        let token =
+            self.resources
+                .tokens
+                .create(self.task, domain, &mut self.resources.releases)?;
+        self.resources
+            .ownership
+            .entry(self.task)
+            .or_default()
+            .tokens
+            .insert(token);
+        Ok(token)
+    }
+
+    pub fn create_snapshot(
+        &mut self,
+        data: Arc<[i32]>,
+    ) -> Result<SnapshotHandle, HostRequestError> {
+        let snapshot =
+            self.resources
+                .snapshots
+                .create(self.task, data, &mut self.resources.releases)?;
+        self.resources
+            .ownership
+            .entry(self.task)
+            .or_default()
+            .snapshots
+            .insert(snapshot);
+        Ok(snapshot)
     }
 }
 

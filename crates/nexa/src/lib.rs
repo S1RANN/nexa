@@ -11,7 +11,7 @@ pub mod prelude {
         CheckedInterpreter, FrameArena, FrameLimits, GcRef, Heap, HostRequestManager,
         ModuleEpochRoot, ReloadManager, RuntimeError, RuntimeLimits, RuntimeTrace, ScopeHandle,
         ScopeSnapshot, StateHandle, StatefulRegistry, StepConfig, StepResult, TaskError,
-        TaskHandle, TaskLimits, TaskRuntime, TaskSnapshot, TaskState, VerifiedTaskContinuation,
+        TaskHandle, TaskLimits, TaskRuntime, TaskSnapshot, TaskState,
     };
     pub use nexa_verifier::{VerifierLimits, verify};
 }

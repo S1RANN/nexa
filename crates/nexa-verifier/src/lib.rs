@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::fmt;
 
-use nexa_bytecode::{Function, Instruction, Module, ValueType};
+use nexa_bytecode::{Function, FunctionEffect, Instruction, Module, ValueType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifierLimits {
@@ -41,6 +41,10 @@ pub enum VerifyErrorKind {
     ForgedRoot(u16),
     MissingRoot(u16),
     ImmediateCostLimit,
+    MissingSafepoint(u32),
+    InvalidRootMap(u32),
+    InvalidEffect,
+    ImmediateRecursion,
 }
 
 impl fmt::Display for VerifyError {
@@ -65,9 +69,22 @@ impl VerifiedModule {
     }
 }
 
-pub fn verify(module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
+pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
+    let depths = static_call_depths(&module)?;
+    for (function, depth) in module.functions.iter_mut().zip(depths) {
+        function.max_static_call_depth = depth;
+    }
     for (index, function) in module.functions.iter().enumerate() {
         verify_function(&module, index, function, limits)?;
+        if function.effect == FunctionEffect::Immediate
+            && immediate_wcet(&module, index, &mut Vec::new())? > limits.max_immediate_cost
+        {
+            return Err(VerifyError {
+                function: index,
+                instruction: None,
+                kind: VerifyErrorKind::ImmediateCostLimit,
+            });
+        }
     }
     Ok(VerifiedModule(module))
 }
@@ -160,18 +177,24 @@ fn verify_function(
             }
             Instruction::Call {
                 function: callee,
-                args,
+                args_base,
+                args_count,
                 dst,
             } => {
                 let callee = module
                     .functions
                     .get(callee as usize)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(callee)))?;
-                if usize::from(args) != callee.signature.parameters.len() {
+                if usize::from(args_count) != callee.signature.parameters.len() {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
                 for (argument, ty) in callee.signature.parameters.iter().copied().enumerate() {
-                    require(&state, u16::try_from(argument).unwrap(), ty)?;
+                    let argument = args_base
+                        .checked_add(u16::try_from(argument).unwrap())
+                        .ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?;
+                    require(&state, argument, ty)?;
                 }
                 if let Some(result) = callee.signature.result {
                     state[register(dst)?] = Some(result);
@@ -189,21 +212,55 @@ fn verify_function(
                     return Err(error(Some(pc), VerifyErrorKind::InvalidReturn));
                 }
             }
-            Instruction::Safepoint | Instruction::Yield | Instruction::Trap => {}
+            Instruction::DeferPush {
+                function: cleanup,
+                args_base,
+                args_count,
+            } => {
+                let cleanup = module
+                    .functions
+                    .get(cleanup as usize)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(cleanup)))?;
+                if !matches!(
+                    cleanup.effect,
+                    FunctionEffect::Ordinary | FunctionEffect::Cleanup
+                ) || cleanup.signature.result.is_some()
+                    || cleanup.signature.parameters.len() != usize::from(args_count)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                for (argument, ty) in cleanup.signature.parameters.iter().copied().enumerate() {
+                    let argument = args_base
+                        .checked_add(u16::try_from(argument).unwrap())
+                        .ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?;
+                    require(&state, argument, ty)?;
+                }
+            }
+            Instruction::Yield if !matches!(function.effect, FunctionEffect::Task) => {
+                return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+            }
+            Instruction::CleanupReturn if function.effect != FunctionEffect::Cleanup => {
+                return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+            }
+            Instruction::Safepoint
+            | Instruction::Yield
+            | Instruction::Trap
+            | Instruction::DeferPop
+            | Instruction::CleanupReturn => {}
         }
         if !matches!(
             instruction,
             Instruction::Jump { .. }
                 | Instruction::Return { .. }
                 | Instruction::ReturnVoid
+                | Instruction::CleanupReturn
                 | Instruction::Trap
         ) && successors.is_empty()
             && pc + 1 < function.code.len()
         {
             successors.push(pc + 1);
-        }
-        if immediate_cost(function, pc) > limits.max_immediate_cost {
-            return Err(error(Some(pc), VerifyErrorKind::ImmediateCostLimit));
         }
         for successor in successors {
             match &mut states[successor] {
@@ -221,6 +278,7 @@ fn verify_function(
             }
         }
     }
+    verify_safepoints(function_index, function)?;
     for register in 0..register_count {
         let can_hold_ref = states
             .iter()
@@ -245,6 +303,48 @@ fn verify_function(
     Ok(())
 }
 
+fn verify_safepoints(function_index: usize, function: &Function) -> Result<(), VerifyError> {
+    for (pc, instruction) in function.code.iter().copied().enumerate() {
+        let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
+        let required = pc == 0
+            || matches!(
+                instruction,
+                Instruction::Safepoint
+                    | Instruction::Yield
+                    | Instruction::Call { .. }
+                    | Instruction::Return { .. }
+                    | Instruction::ReturnVoid
+                    | Instruction::Trap
+                    | Instruction::CleanupReturn
+            )
+            || matches!(instruction, Instruction::Jump { target } if target <= pc_u32)
+            || matches!(
+                instruction,
+                Instruction::JumpIfFalse { target, .. } if target <= pc_u32
+            );
+        if required && !function.safepoints.contains(&pc_u32) {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::MissingSafepoint(pc_u32),
+            });
+        }
+        if required
+            && !function
+                .root_maps
+                .iter()
+                .any(|map| map.pc == pc_u32 && map.bitmap.len() == usize::from(function.registers))
+        {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::InvalidRootMap(pc_u32),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn target_index(
     function: &Function,
     function_index: usize,
@@ -263,22 +363,133 @@ fn target_index(
     }
 }
 
-fn immediate_cost(function: &Function, start: usize) -> u32 {
-    let mut cost = 0_u32;
-    for instruction in &function.code[start..] {
-        if matches!(
-            instruction,
-            Instruction::Safepoint
-                | Instruction::Yield
-                | Instruction::Return { .. }
-                | Instruction::ReturnVoid
-                | Instruction::Trap
-        ) {
-            break;
+fn static_call_depths(module: &Module) -> Result<Vec<u16>, VerifyError> {
+    (0..module.functions.len())
+        .map(|function| call_depth(module, function, &mut Vec::new()))
+        .collect()
+}
+
+fn call_depth(
+    module: &Module,
+    function: usize,
+    visiting: &mut Vec<usize>,
+) -> Result<u16, VerifyError> {
+    if visiting.contains(&function) {
+        if visiting
+            .iter()
+            .any(|index| module.functions[*index].effect == FunctionEffect::Immediate)
+        {
+            return Err(VerifyError {
+                function,
+                instruction: None,
+                kind: VerifyErrorKind::ImmediateRecursion,
+            });
         }
-        cost = cost.saturating_add(1);
+        return Ok(u16::MAX);
     }
-    cost
+    visiting.push(function);
+    let mut depth = 1_u16;
+    for instruction in &module.functions[function].code {
+        if let Instruction::Call {
+            function: callee, ..
+        } = instruction
+        {
+            let callee_depth = call_depth(module, *callee as usize, visiting)?;
+            depth = depth.max(callee_depth.saturating_add(1));
+        }
+    }
+    visiting.pop();
+    Ok(depth)
+}
+
+fn immediate_wcet(
+    module: &Module,
+    function: usize,
+    visiting: &mut Vec<usize>,
+) -> Result<u32, VerifyError> {
+    if visiting.contains(&function) {
+        return Err(VerifyError {
+            function,
+            instruction: None,
+            kind: VerifyErrorKind::ImmediateRecursion,
+        });
+    }
+    visiting.push(function);
+    let code = &module.functions[function].code;
+    let mut memo = vec![None; code.len()];
+    let cost = longest_path(module, function, 0, visiting, &mut memo)?;
+    visiting.pop();
+    Ok(cost)
+}
+
+fn longest_path(
+    module: &Module,
+    function: usize,
+    pc: usize,
+    visiting: &mut Vec<usize>,
+    memo: &mut [Option<u32>],
+) -> Result<u32, VerifyError> {
+    if let Some(cost) = memo[pc] {
+        return Ok(cost);
+    }
+    let instruction = module.functions[function].code[pc];
+    let callee_cost = if let Instruction::Call {
+        function: callee, ..
+    } = instruction
+    {
+        immediate_wcet(module, callee as usize, visiting)?
+    } else {
+        0
+    };
+    let successors = match instruction {
+        Instruction::Jump { target } => {
+            if target as usize <= pc {
+                return Err(VerifyError {
+                    function,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::ImmediateCostLimit,
+                });
+            }
+            vec![target as usize]
+        }
+        Instruction::JumpIfFalse { target, .. } => {
+            if target as usize <= pc {
+                return Err(VerifyError {
+                    function,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::ImmediateCostLimit,
+                });
+            }
+            let mut successors = vec![target as usize];
+            if pc + 1 < module.functions[function].code.len() {
+                successors.push(pc + 1);
+            }
+            successors
+        }
+        Instruction::Return { .. }
+        | Instruction::ReturnVoid
+        | Instruction::CleanupReturn
+        | Instruction::Trap => Vec::new(),
+        _ if pc + 1 < module.functions[function].code.len() => vec![pc + 1],
+        _ => Vec::new(),
+    };
+    let suffix = successors
+        .into_iter()
+        .map(|successor| longest_path(module, function, successor, visiting, memo))
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .max()
+        .unwrap_or(0);
+    let cost = 1_u32
+        .checked_add(callee_cost)
+        .and_then(|value| value.checked_add(suffix))
+        .ok_or(VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })?;
+    memo[pc] = Some(cost);
+    Ok(cost)
 }
 
 #[cfg(test)]

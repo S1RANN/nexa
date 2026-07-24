@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use nexa_core::StableId;
 
-use crate::{GcRef, TaskHandle};
+use crate::{GcRef, HostCompletion, ModuleHandle, TaskHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StateHandle {
@@ -166,6 +166,48 @@ pub enum ReloadError {
     GraphCheck,
     QuiesceTimeout,
     Activation(String),
+}
+
+#[derive(Debug)]
+pub struct ReloadTransaction {
+    pub old_module: ModuleHandle,
+    pub candidate: ModuleHandle,
+    pub old_epoch: u64,
+    pub paused_tasks: Vec<TaskHandle>,
+    pub deferred_completions: Vec<HostCompletion>,
+    pub staging_roots: Vec<GcRef>,
+}
+
+#[derive(Debug, Default)]
+pub struct ReloadCoordinator {
+    transaction: Option<ReloadTransaction>,
+}
+
+impl ReloadCoordinator {
+    pub(crate) fn begin(&mut self, transaction: ReloadTransaction) -> Result<(), ReloadError> {
+        if self.transaction.is_some() {
+            return Err(ReloadError::InvalidState);
+        }
+        self.transaction = Some(transaction);
+        Ok(())
+    }
+
+    pub(crate) fn transaction(&self) -> Result<&ReloadTransaction, ReloadError> {
+        self.transaction.as_ref().ok_or(ReloadError::InvalidState)
+    }
+
+    pub(crate) fn transaction_mut(&mut self) -> Result<&mut ReloadTransaction, ReloadError> {
+        self.transaction.as_mut().ok_or(ReloadError::InvalidState)
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<ReloadTransaction, ReloadError> {
+        self.transaction.take().ok_or(ReloadError::InvalidState)
+    }
+
+    #[must_use]
+    pub fn active(&self) -> bool {
+        self.transaction.is_some()
+    }
 }
 
 impl fmt::Display for ReloadError {

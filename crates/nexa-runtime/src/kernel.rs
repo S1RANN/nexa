@@ -1,7 +1,9 @@
 use crate::FrameLimits;
 use crate::RuntimeTrace;
 use crate::scope::{ScopeError, ScopeHandle, ScopeManager, ScopeSnapshot};
+use crate::task::TaskExecution;
 use crate::task::{TaskError, TaskEvent, TaskHandle, TaskManager, TaskSnapshot};
+use crate::{FuelState, InterpreterContinuation};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19,6 +21,7 @@ pub struct RuntimeLimits {
 pub struct TaskLimits {
     pub frames: FrameLimits,
     pub max_cleanup_ops: u32,
+    pub max_cleanup_fuel: u64,
 }
 
 impl Default for TaskLimits {
@@ -26,6 +29,7 @@ impl Default for TaskLimits {
         Self {
             frames: FrameLimits::default(),
             max_cleanup_ops: 256,
+            max_cleanup_fuel: 4_096,
         }
     }
 }
@@ -246,8 +250,15 @@ impl TaskRuntime {
     }
 
     pub fn commit_reload_cancel(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
-        self.apply_task(task, TaskEvent::CommitReload)?;
+        self.begin_reload_commit_cancel(task)?;
         self.clean_task(task)
+    }
+
+    pub(crate) fn begin_reload_commit_cancel(
+        &mut self,
+        task: TaskHandle,
+    ) -> Result<(), RuntimeError> {
+        self.apply_task(task, TaskEvent::CommitReload)
     }
 
     pub fn trap_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
@@ -289,6 +300,49 @@ impl TaskRuntime {
 
     pub fn inject_failure_once(&mut self, point: FailurePoint) {
         self.injected_failure = Some(point);
+    }
+
+    pub(crate) fn attach_continuation(
+        &mut self,
+        task: TaskHandle,
+        priority: u32,
+        fuel: FuelState,
+        continuation: InterpreterContinuation,
+        module_id: u32,
+        limits: TaskLimits,
+    ) -> Result<(), RuntimeError> {
+        Ok(self.tasks.attach_execution(
+            task,
+            priority,
+            fuel,
+            TaskExecution::Ready(continuation),
+            module_id,
+            limits,
+        )?)
+    }
+
+    pub(crate) fn take_execution(
+        &mut self,
+        task: TaskHandle,
+    ) -> Result<TaskExecution, RuntimeError> {
+        Ok(self.tasks.take_execution(task)?)
+    }
+
+    pub(crate) fn put_execution(
+        &mut self,
+        task: TaskHandle,
+        execution: TaskExecution,
+        fuel: FuelState,
+    ) -> Result<(), RuntimeError> {
+        Ok(self.tasks.put_execution(task, execution, fuel)?)
+    }
+
+    pub(crate) fn execution(&self, task: TaskHandle) -> Result<&TaskExecution, RuntimeError> {
+        Ok(self.tasks.execution(task)?)
+    }
+
+    pub(crate) fn task_handles(&self) -> Vec<TaskHandle> {
+        self.tasks.handles()
     }
 
     fn apply_task(&mut self, task: TaskHandle, event: TaskEvent) -> Result<(), RuntimeError> {

@@ -11,12 +11,21 @@ pub use crate::machines::task::{
     TransitionError as TaskTransitionError,
 };
 use crate::scope::ScopeManager;
-use crate::{HandleError, RuntimeTrace, ScopeError, ScopeHandle, SlotAllocError, SlotPool};
+use crate::{
+    FuelState, HandleError, HostRequestHandle, InterpreterContinuation, RuntimeTrace, ScopeError,
+    ScopeHandle, SlotAllocError, SlotPool,
+};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TaskHandle(RawHandle);
 
 impl TaskHandle {
+    #[must_use]
+    #[cfg(test)]
+    pub(crate) const fn from_raw(raw: RawHandle) -> Self {
+        Self(raw)
+    }
+
     #[must_use]
     pub const fn raw(self) -> RawHandle {
         self.0
@@ -34,8 +43,40 @@ struct Task {
     state: TaskState,
     owner: ScopeHandle,
     module_epoch: u64,
+    module_id: u32,
     child_kind: ChildKind,
     reserved_slots: i64,
+    priority: u32,
+    fuel: FuelState,
+    execution: Option<TaskExecution>,
+    limits: crate::TaskLimits,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug)]
+pub(crate) enum TaskExecution {
+    Ready(InterpreterContinuation),
+    Running(InterpreterContinuation),
+    FuelYielded(InterpreterContinuation),
+    Waiting {
+        continuation: InterpreterContinuation,
+        request: HostRequestHandle,
+    },
+    ReloadPaused(InterpreterContinuation),
+    Cancelling(InterpreterContinuation),
+}
+
+impl TaskExecution {
+    pub(crate) const fn continuation(&self) -> &InterpreterContinuation {
+        match self {
+            Self::Ready(continuation)
+            | Self::Running(continuation)
+            | Self::FuelYielded(continuation)
+            | Self::Waiting { continuation, .. }
+            | Self::ReloadPaused(continuation)
+            | Self::Cancelling(continuation) => continuation,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,8 +84,12 @@ pub struct TaskSnapshot {
     pub state: TaskState,
     pub owner: ScopeHandle,
     pub module_epoch: u64,
+    pub module_id: u32,
     pub persistent: bool,
     pub task_slots: i64,
+    pub priority: u32,
+    pub fuel: FuelState,
+    pub limits: crate::TaskLimits,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -127,8 +172,13 @@ impl TaskManager {
             state: TaskState::Created,
             owner,
             module_epoch,
+            module_id: 0,
             child_kind: ChildKind::Transient,
             reserved_slots: 0,
+            priority: 0,
+            fuel: FuelState::new(0, 0, u64::MAX),
+            execution: None,
+            limits: crate::TaskLimits::default(),
         })?;
         let handle = TaskHandle(raw);
         if let Err(error) = scopes.add_transient_child(trace, owner) {
@@ -295,9 +345,75 @@ impl TaskManager {
             state: task.state,
             owner: task.owner,
             module_epoch: task.module_epoch,
+            module_id: task.module_id,
             persistent: task.child_kind == ChildKind::Persistent,
             task_slots: task.reserved_slots,
+            priority: task.priority,
+            fuel: task.fuel,
+            limits: task.limits,
         })
+    }
+
+    pub(crate) fn attach_execution(
+        &mut self,
+        handle: TaskHandle,
+        priority: u32,
+        fuel: FuelState,
+        execution: TaskExecution,
+        module_id: u32,
+        limits: crate::TaskLimits,
+    ) -> Result<(), TaskError> {
+        let task = self.tasks.resolve_mut(handle.raw())?;
+        if task.execution.is_some() {
+            return Err(TaskError::Invariant("task already owns a continuation"));
+        }
+        task.priority = priority;
+        task.module_id = module_id;
+        task.fuel = fuel;
+        task.execution = Some(execution);
+        task.limits = limits;
+        Ok(())
+    }
+
+    pub(crate) fn take_execution(
+        &mut self,
+        handle: TaskHandle,
+    ) -> Result<TaskExecution, TaskError> {
+        self.tasks
+            .resolve_mut(handle.raw())?
+            .execution
+            .take()
+            .ok_or(TaskError::Invariant("task has no continuation"))
+    }
+
+    pub(crate) fn put_execution(
+        &mut self,
+        handle: TaskHandle,
+        execution: TaskExecution,
+        fuel: FuelState,
+    ) -> Result<(), TaskError> {
+        let task = self.tasks.resolve_mut(handle.raw())?;
+        if task.execution.replace(execution).is_some() {
+            return Err(TaskError::Invariant("task already owns a continuation"));
+        }
+        task.fuel = fuel;
+        Ok(())
+    }
+
+    pub(crate) fn execution(&self, handle: TaskHandle) -> Result<&TaskExecution, TaskError> {
+        self.tasks
+            .resolve(handle.raw())?
+            .execution
+            .as_ref()
+            .ok_or(TaskError::Invariant("task has no continuation"))
+    }
+
+    pub(crate) fn handles(&self) -> Vec<TaskHandle> {
+        self.tasks
+            .occupied_handles()
+            .into_iter()
+            .map(TaskHandle)
+            .collect()
     }
 }
 

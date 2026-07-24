@@ -3,7 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use nexa_bytecode::{Function, Instruction, Module, ModuleBuilder, Signature, ValueType};
+use nexa_bytecode::{
+    Function, FunctionEffect, Instruction, Module, ModuleBuilder, RootMap, Signature, ValueType,
+};
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +67,7 @@ pub enum CompileError {
     TypeMismatch,
     MissingReturn,
     SuspendingDefer,
+    InvalidEffect,
     TooManyRegisters,
     Verify(String),
 }
@@ -167,6 +170,7 @@ pub struct HirModule {
 #[derive(Clone, Debug)]
 struct HirFunction {
     name: String,
+    effect: FunctionEffect,
     signature: Signature,
     body: Vec<AstStatement>,
     locals: BTreeMap<String, (u16, ValueType)>,
@@ -565,17 +569,25 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
                 return Err(CompileError::DuplicateName(name.clone()));
             }
         }
-        let has_return = check_statements(
+        if !function.is_task && statements_contain_await(&function.body) {
+            return Err(CompileError::InvalidEffect);
+        }
+        let flow = check_statements(
             &function.body,
             &mut locals,
             &signatures,
             signature.result.expect("result is required"),
         )?;
-        if !has_return {
+        if flow == Flow::FallsThrough {
             return Err(CompileError::MissingReturn);
         }
         functions.push(HirFunction {
             name: function.name,
+            effect: if function.is_task {
+                FunctionEffect::Task
+            } else {
+                FunctionEffect::Ordinary
+            },
             signature,
             body: function.body,
             locals,
@@ -593,14 +605,24 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Flow {
+    FallsThrough,
+    Returns,
+    Diverges,
+}
+
 fn check_statements(
     statements: &[AstStatement],
     locals: &mut BTreeMap<String, (u16, ValueType)>,
     signatures: &BTreeMap<String, Signature>,
     result: ValueType,
-) -> Result<bool, CompileError> {
-    let mut has_return = false;
+) -> Result<Flow, CompileError> {
+    let mut flow = Flow::FallsThrough;
     for statement in statements {
+        if flow != Flow::FallsThrough {
+            break;
+        }
         match statement {
             AstStatement::Bind { name, value } => {
                 let ty = expression_type(value, locals, signatures)?;
@@ -614,7 +636,7 @@ fn check_statements(
                 if expression_type(expression, locals, signatures)? != result {
                     return Err(CompileError::TypeMismatch);
                 }
-                has_return = true;
+                flow = Flow::Returns;
             }
             AstStatement::Expression(expression) => {
                 expression_type(expression, locals, signatures)?;
@@ -627,14 +649,26 @@ fn check_statements(
                 if expression_type(condition, locals, signatures)? != ValueType::Bool {
                     return Err(CompileError::TypeMismatch);
                 }
-                has_return |= check_statements(then_body, locals, signatures, result)?;
-                has_return |= check_statements(else_body, locals, signatures, result)?;
+                let mut then_locals = locals.clone();
+                let mut else_locals = locals.clone();
+                let then_flow = check_statements(then_body, &mut then_locals, signatures, result)?;
+                let else_flow = check_statements(else_body, &mut else_locals, signatures, result)?;
+                if then_flow == Flow::Returns && else_flow == Flow::Returns {
+                    flow = Flow::Returns;
+                } else if then_flow != Flow::FallsThrough && else_flow != Flow::FallsThrough {
+                    flow = Flow::Diverges;
+                }
             }
             AstStatement::While { condition, body } => {
                 if expression_type(condition, locals, signatures)? != ValueType::Bool {
                     return Err(CompileError::TypeMismatch);
                 }
-                has_return |= check_statements(body, locals, signatures, result)?;
+                let mut loop_locals = locals.clone();
+                let body_flow = check_statements(body, &mut loop_locals, signatures, result)?;
+                if matches!(condition, AstExpression::Bool(true)) && body_flow != Flow::FallsThrough
+                {
+                    flow = body_flow;
+                }
             }
             AstStatement::Defer(expression) => {
                 if contains_await(expression) {
@@ -644,7 +678,28 @@ fn check_statements(
             }
         }
     }
-    Ok(has_return)
+    Ok(flow)
+}
+
+fn statements_contain_await(statements: &[AstStatement]) -> bool {
+    statements.iter().any(|statement| match statement {
+        AstStatement::Bind { value, .. }
+        | AstStatement::Return(value)
+        | AstStatement::Expression(value)
+        | AstStatement::Defer(value) => contains_await(value),
+        AstStatement::If {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            contains_await(condition)
+                || statements_contain_await(then_body)
+                || statements_contain_await(else_body)
+        }
+        AstStatement::While { condition, body } => {
+            contains_await(condition) || statements_contain_await(body)
+        }
+    })
 }
 
 fn contains_await(expression: &AstExpression) -> bool {
@@ -761,11 +816,23 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
                 }
             }
         }
+        let safepoints = collect_safepoints(&code);
+        let root_maps = safepoints
+            .iter()
+            .map(|pc| RootMap {
+                pc: *pc,
+                bitmap: root_bitmap.clone(),
+            })
+            .collect();
         module.function(Function {
             signature: function.signature.clone(),
             registers,
             frame_bytes: u32::from(registers) * 8,
             root_bitmap,
+            root_maps,
+            safepoints,
+            effect: function.effect,
+            max_static_call_depth: 1,
             code,
         });
     }
@@ -788,12 +855,39 @@ fn emit_statements(
                 emit_expression(value, temporary, locals, functions, code)?;
                 code.push(Instruction::Return { source: temporary });
             }
-            AstStatement::Expression(expression) | AstStatement::Defer(expression) => {
+            AstStatement::Expression(expression) => {
                 emit_expression(expression, temporary, locals, functions, code)?;
-                if matches!(statement, AstStatement::Defer(_)) {
-                    code.push(Instruction::Safepoint);
-                }
             }
+            AstStatement::Defer(AstExpression::Call {
+                function,
+                arguments,
+            }) => {
+                let args_base = temporary
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                for (index, argument) in arguments.iter().enumerate() {
+                    emit_expression(
+                        argument,
+                        args_base
+                            .checked_add(
+                                u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                            )
+                            .ok_or(CompileError::TooManyRegisters)?,
+                        locals,
+                        functions,
+                        code,
+                    )?;
+                }
+                code.push(Instruction::DeferPush {
+                    function: *functions
+                        .get(function)
+                        .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
+                    args_base,
+                    args_count: u16::try_from(arguments.len())
+                        .map_err(|_| CompileError::TooManyRegisters)?,
+                });
+            }
+            AstStatement::Defer(_) => return Err(CompileError::SuspendingDefer),
             AstStatement::If {
                 condition,
                 then_body,
@@ -898,10 +992,17 @@ fn emit_expression(
             function,
             arguments,
         } => {
+            let args_base = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
             for (index, argument) in arguments.iter().enumerate() {
                 emit_expression(
                     argument,
-                    u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                    args_base
+                        .checked_add(
+                            u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                        )
+                        .ok_or(CompileError::TooManyRegisters)?,
                     locals,
                     functions,
                     code,
@@ -911,7 +1012,9 @@ fn emit_expression(
                 function: *functions
                     .get(function)
                     .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
-                args: u16::try_from(arguments.len()).map_err(|_| CompileError::TooManyRegisters)?,
+                args_base,
+                args_count: u16::try_from(arguments.len())
+                    .map_err(|_| CompileError::TooManyRegisters)?,
                 dst: destination,
             });
         }
@@ -921,6 +1024,31 @@ fn emit_expression(
         }
     }
     Ok(())
+}
+
+fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
+    code.iter()
+        .enumerate()
+        .filter_map(|(pc, instruction)| {
+            let pc = u32::try_from(pc).ok()?;
+            let explicit = matches!(
+                instruction,
+                Instruction::Safepoint
+                    | Instruction::Yield
+                    | Instruction::Call { .. }
+                    | Instruction::Return { .. }
+                    | Instruction::ReturnVoid
+                    | Instruction::Trap
+                    | Instruction::CleanupReturn
+            );
+            let back_edge = matches!(instruction, Instruction::Jump { target } if *target <= pc)
+                || matches!(
+                    instruction,
+                    Instruction::JumpIfFalse { target, .. } if *target <= pc
+                );
+            (pc == 0 || explicit || back_edge).then_some(pc)
+        })
+        .collect()
 }
 
 pub fn compile(source: &str) -> Result<VerifiedModule, CompileError> {
@@ -955,7 +1083,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             outcome,
-            InterpreterOutcome::Returned(Some(RuntimeValue::I32(42)))
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(42)),
+                ..
+            }
         ));
     }
 
@@ -980,7 +1111,10 @@ mod tests {
         .unwrap();
         assert!(matches!(
             outcome,
-            InterpreterOutcome::Returned(Some(RuntimeValue::I32(2)))
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(2)),
+                ..
+            }
         ));
 
         let reference = compile(
@@ -998,7 +1132,10 @@ mod tests {
         });
         assert!(matches!(
             CheckedInterpreter::run(&reference, 0, &[value], 100).unwrap(),
-            InterpreterOutcome::Returned(Some(result)) if result == value
+            InterpreterOutcome::Returned {
+                value: Some(result),
+                ..
+            } if result == value
         ));
 
         let task = compile(
@@ -1007,12 +1144,15 @@ mod tests {
         )
         .unwrap();
         let outcome = CheckedInterpreter::run(&task, 1, &[RuntimeValue::I32(8)], 100).unwrap();
-        let InterpreterOutcome::Yielded(continuation) = outcome else {
+        let InterpreterOutcome::Suspended { continuation, .. } = outcome else {
             panic!("await must suspend");
         };
         assert!(matches!(
             CheckedInterpreter::resume(&task, continuation, 100).unwrap(),
-            InterpreterOutcome::Returned(Some(RuntimeValue::I32(8)))
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(8)),
+                ..
+            }
         ));
     }
 }

@@ -2,8 +2,10 @@
 
 use std::fmt;
 
+use nexa_core::StableId;
+
 pub const MAGIC: [u8; 4] = *b"NXBC";
-pub const BYTECODE_VERSION: u16 = 1;
+pub const BYTECODE_VERSION: u16 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueType {
@@ -18,19 +20,79 @@ pub struct Signature {
     pub result: Option<ValueType>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FunctionEffect {
+    #[default]
+    Ordinary,
+    Task,
+    Immediate,
+    Migration,
+    Cleanup,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RootMap {
+    pub pc: u32,
+    pub bitmap: Vec<bool>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Instruction {
-    LoadI32 { dst: u16, value: i32 },
-    LoadBool { dst: u16, value: bool },
-    Move { dst: u16, source: u16 },
-    Add { dst: u16, lhs: u16, rhs: u16 },
-    Sub { dst: u16, lhs: u16, rhs: u16 },
-    Mul { dst: u16, lhs: u16, rhs: u16 },
-    CompareEq { dst: u16, lhs: u16, rhs: u16 },
-    Jump { target: u32 },
-    JumpIfFalse { condition: u16, target: u32 },
-    Call { function: u32, args: u16, dst: u16 },
-    Return { source: u16 },
+    LoadI32 {
+        dst: u16,
+        value: i32,
+    },
+    LoadBool {
+        dst: u16,
+        value: bool,
+    },
+    Move {
+        dst: u16,
+        source: u16,
+    },
+    Add {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Sub {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Mul {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    CompareEq {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Jump {
+        target: u32,
+    },
+    JumpIfFalse {
+        condition: u16,
+        target: u32,
+    },
+    Call {
+        function: u32,
+        args_base: u16,
+        args_count: u16,
+        dst: u16,
+    },
+    DeferPush {
+        function: u32,
+        args_base: u16,
+        args_count: u16,
+    },
+    DeferPop,
+    CleanupReturn,
+    Return {
+        source: u16,
+    },
     ReturnVoid,
     Safepoint,
     Yield,
@@ -43,12 +105,18 @@ pub struct Function {
     pub registers: u16,
     pub frame_bytes: u32,
     pub root_bitmap: Vec<bool>,
+    pub root_maps: Vec<RootMap>,
+    pub safepoints: Vec<u32>,
+    pub effect: FunctionEffect,
+    pub max_static_call_depth: u16,
     pub code: Vec<Instruction>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
     pub functions: Vec<Function>,
+    pub host_interface_hash: Option<StableId>,
+    pub schema_hash: Option<StableId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +145,8 @@ impl Module {
         let mut output = Vec::new();
         output.extend_from_slice(&MAGIC);
         put_u16(&mut output, BYTECODE_VERSION);
+        put_optional_id(&mut output, self.host_interface_hash);
+        put_optional_id(&mut output, self.schema_hash);
         put_u32(
             &mut output,
             u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
@@ -98,11 +168,34 @@ impl Module {
             );
             put_u16(&mut output, function.registers);
             put_u32(&mut output, function.frame_bytes);
+            output.push(encode_effect(function.effect));
+            put_u16(&mut output, function.max_static_call_depth);
             put_u16(
                 &mut output,
                 u16::try_from(function.root_bitmap.len()).expect("root bitmap exceeds wire format"),
             );
             output.extend(function.root_bitmap.iter().map(|root| u8::from(*root)));
+            put_u32(
+                &mut output,
+                u32::try_from(function.root_maps.len())
+                    .expect("root map count exceeds wire format"),
+            );
+            for root_map in &function.root_maps {
+                put_u32(&mut output, root_map.pc);
+                put_u16(
+                    &mut output,
+                    u16::try_from(root_map.bitmap.len()).expect("root bitmap exceeds wire format"),
+                );
+                output.extend(root_map.bitmap.iter().map(|root| u8::from(*root)));
+            }
+            put_u32(
+                &mut output,
+                u32::try_from(function.safepoints.len())
+                    .expect("safepoint count exceeds wire format"),
+            );
+            for safepoint in &function.safepoints {
+                put_u32(&mut output, *safepoint);
+            }
             put_u32(
                 &mut output,
                 u32::try_from(function.code.len()).expect("instruction count exceeds wire format"),
@@ -123,6 +216,8 @@ impl Module {
         if version != BYTECODE_VERSION {
             return Err(DecodeError::UnsupportedVersion(version));
         }
+        let host_interface_hash = read_optional_id(&mut reader)?;
+        let schema_hash = read_optional_id(&mut reader)?;
         let function_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
         if function_count > reader.remaining() {
@@ -144,6 +239,8 @@ impl Module {
             };
             let registers = reader.u16()?;
             let frame_bytes = reader.u32()?;
+            let effect = decode_effect(reader.u8()?)?;
+            let max_static_call_depth = reader.u16()?;
             let root_count = usize::from(reader.u16()?);
             if root_count > reader.remaining() {
                 return Err(DecodeError::Truncated);
@@ -155,6 +252,28 @@ impl Module {
                     1 => true,
                     value => return Err(DecodeError::InvalidBoolean(value)),
                 });
+            }
+            let root_map_count =
+                usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            let mut root_maps = Vec::with_capacity(root_map_count);
+            for _ in 0..root_map_count {
+                let pc = reader.u32()?;
+                let bitmap_len = usize::from(reader.u16()?);
+                let mut bitmap = Vec::with_capacity(bitmap_len);
+                for _ in 0..bitmap_len {
+                    bitmap.push(match reader.u8()? {
+                        0 => false,
+                        1 => true,
+                        value => return Err(DecodeError::InvalidBoolean(value)),
+                    });
+                }
+                root_maps.push(RootMap { pc, bitmap });
+            }
+            let safepoint_count =
+                usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            let mut safepoints = Vec::with_capacity(safepoint_count);
+            for _ in 0..safepoint_count {
+                safepoints.push(reader.u32()?);
             }
             let instruction_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
@@ -170,13 +289,42 @@ impl Module {
                 registers,
                 frame_bytes,
                 root_bitmap,
+                root_maps,
+                safepoints,
+                effect,
+                max_static_call_depth,
                 code,
             });
         }
         if reader.cursor != bytes.len() {
             return Err(DecodeError::TrailingBytes);
         }
-        Ok(Self { functions })
+        Ok(Self {
+            functions,
+            host_interface_hash,
+            schema_hash,
+        })
+    }
+}
+
+fn encode_effect(effect: FunctionEffect) -> u8 {
+    match effect {
+        FunctionEffect::Ordinary => 0,
+        FunctionEffect::Task => 1,
+        FunctionEffect::Immediate => 2,
+        FunctionEffect::Migration => 3,
+        FunctionEffect::Cleanup => 4,
+    }
+}
+
+fn decode_effect(value: u8) -> Result<FunctionEffect, DecodeError> {
+    match value {
+        0 => Ok(FunctionEffect::Ordinary),
+        1 => Ok(FunctionEffect::Task),
+        2 => Ok(FunctionEffect::Immediate),
+        3 => Ok(FunctionEffect::Migration),
+        4 => Ok(FunctionEffect::Cleanup),
+        value => Err(DecodeError::InvalidType(value)),
     }
 }
 
@@ -241,12 +389,14 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
         }
         Instruction::Call {
             function,
-            args,
+            args_base,
+            args_count,
             dst,
         } => {
             output.push(9);
             put_u32(output, function);
-            put_u16(output, args);
+            put_u16(output, args_base);
+            put_u16(output, args_count);
             put_u16(output, dst);
         }
         Instruction::Return { source } => {
@@ -257,6 +407,18 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
         Instruction::Safepoint => output.push(12),
         Instruction::Yield => output.push(13),
         Instruction::Trap => output.push(14),
+        Instruction::DeferPush {
+            function,
+            args_base,
+            args_count,
+        } => {
+            output.push(15);
+            put_u32(output, function);
+            put_u16(output, args_base);
+            put_u16(output, args_count);
+        }
+        Instruction::DeferPop => output.push(16),
+        Instruction::CleanupReturn => output.push(17),
     }
 }
 
@@ -299,7 +461,8 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         },
         9 => Instruction::Call {
             function: reader.u32()?,
-            args: reader.u16()?,
+            args_base: reader.u16()?,
+            args_count: reader.u16()?,
             dst: reader.u16()?,
         },
         10 => Instruction::Return {
@@ -309,6 +472,13 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         12 => Instruction::Safepoint,
         13 => Instruction::Yield,
         14 => Instruction::Trap,
+        15 => Instruction::DeferPush {
+            function: reader.u32()?,
+            args_base: reader.u16()?,
+            args_count: reader.u16()?,
+        },
+        16 => Instruction::DeferPop,
+        17 => Instruction::CleanupReturn,
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -319,6 +489,25 @@ fn put_u16(output: &mut Vec<u8>, value: u16) {
 
 fn put_u32(output: &mut Vec<u8>, value: u32) {
     output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_optional_id(output: &mut Vec<u8>, value: Option<StableId>) {
+    output.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        put_u64(output, value.0);
+    }
+}
+
+fn read_optional_id(reader: &mut Reader<'_>) -> Result<Option<StableId>, DecodeError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(StableId(reader.u64()?))),
+        value => Err(DecodeError::InvalidBoolean(value)),
+    }
 }
 
 struct Reader<'a> {
@@ -359,6 +548,10 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.array()?))
     }
+
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_le_bytes(self.array()?))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -378,6 +571,8 @@ impl std::error::Error for BuildError {}
 #[derive(Default)]
 pub struct ModuleBuilder {
     functions: Vec<Function>,
+    host_interface_hash: Option<StableId>,
+    schema_hash: Option<StableId>,
 }
 
 impl ModuleBuilder {
@@ -385,7 +580,15 @@ impl ModuleBuilder {
     pub const fn new() -> Self {
         Self {
             functions: Vec::new(),
+            host_interface_hash: None,
+            schema_hash: None,
         }
+    }
+
+    pub fn metadata(&mut self, host_interface_hash: StableId, schema_hash: StableId) -> &mut Self {
+        self.host_interface_hash = Some(host_interface_hash);
+        self.schema_hash = Some(schema_hash);
+        self
     }
 
     pub fn function(&mut self, function: Function) -> u32 {
@@ -398,6 +601,8 @@ impl ModuleBuilder {
     pub fn finish(self) -> Module {
         Module {
             functions: self.functions,
+            host_interface_hash: self.host_interface_hash,
+            schema_hash: self.schema_hash,
         }
     }
 }
@@ -407,6 +612,7 @@ pub struct FunctionBuilder {
     registers: u16,
     frame_bytes: u32,
     root_bitmap: Vec<bool>,
+    effect: FunctionEffect,
     code: Vec<Instruction>,
 }
 
@@ -418,8 +624,14 @@ impl FunctionBuilder {
             registers,
             frame_bytes: u32::from(registers) * 8,
             root_bitmap: vec![false; usize::from(registers)],
+            effect: FunctionEffect::Ordinary,
             code: Vec::new(),
         }
+    }
+
+    pub fn effect(&mut self, effect: FunctionEffect) -> &mut Self {
+        self.effect = effect;
+        self
     }
 
     #[must_use]
@@ -445,11 +657,48 @@ impl FunctionBuilder {
         if self.code.is_empty() {
             return Err(BuildError::EmptyFunction);
         }
+        let safepoints = self
+            .code
+            .iter()
+            .enumerate()
+            .filter_map(|(pc, instruction)| {
+                let pc = u32::try_from(pc).ok()?;
+                let explicit = matches!(
+                    instruction,
+                    Instruction::Safepoint
+                        | Instruction::Yield
+                        | Instruction::Call { .. }
+                        | Instruction::Return { .. }
+                        | Instruction::ReturnVoid
+                        | Instruction::Trap
+                        | Instruction::CleanupReturn
+                );
+                let back_edge = matches!(
+                    instruction,
+                    Instruction::Jump { target } if *target <= pc
+                ) || matches!(
+                    instruction,
+                    Instruction::JumpIfFalse { target, .. } if *target <= pc
+                );
+                (pc == 0 || explicit || back_edge).then_some(pc)
+            })
+            .collect::<Vec<_>>();
+        let root_maps = safepoints
+            .iter()
+            .map(|pc| RootMap {
+                pc: *pc,
+                bitmap: self.root_bitmap.clone(),
+            })
+            .collect();
         Ok(Function {
             signature: self.signature,
             registers: self.registers,
             frame_bytes: self.frame_bytes,
             root_bitmap: self.root_bitmap,
+            root_maps,
+            safepoints,
+            effect: self.effect,
+            max_static_call_depth: 1,
             code: self.code,
         })
     }
