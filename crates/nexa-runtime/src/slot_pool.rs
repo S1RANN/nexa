@@ -100,7 +100,9 @@ impl<T> SlotPool<T> {
 
     #[must_use]
     pub fn with_capacity_limit(realm_id: u32, max_capacity: u32) -> Self {
-        let capacity = usize::try_from(max_capacity).unwrap_or(usize::MAX);
+        // Pre-reserve ordinary runtime limits without turning an intentionally broad logical
+        // limit (for example u32::MAX in handle tests) into a process-sized allocation.
+        let capacity = usize::try_from(max_capacity.min(4_096)).unwrap_or(4_096);
         Self {
             realm_id,
             max_capacity,
