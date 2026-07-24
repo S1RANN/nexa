@@ -1,6 +1,6 @@
 //! Structural, type and continuation verification for Nexa bytecode.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 
 use nexa_bytecode::{Function, FunctionEffect, Instruction, Module, ValueType};
@@ -43,6 +43,7 @@ pub enum VerifyErrorKind {
     ImmediateCostLimit,
     MissingSafepoint(u32),
     InvalidRootMap(u32),
+    InvalidLoopBound(u32),
     InvalidEffect,
     ImmediateRecursion,
 }
@@ -110,6 +111,7 @@ fn verify_function(
     if function.root_bitmap.len() != usize::from(function.registers) {
         return Err(error(None, VerifyErrorKind::RootBitmapLength));
     }
+    verify_loop_bounds(function_index, function, limits)?;
     let register_count = usize::from(function.registers);
     let parameter_count = function.signature.parameters.len();
     if parameter_count > register_count {
@@ -185,6 +187,13 @@ fn verify_function(
                     .functions
                     .get(callee as usize)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(callee)))?;
+                if (function.effect == FunctionEffect::Immediate
+                    && callee.effect != FunctionEffect::Immediate)
+                    || (callee.effect == FunctionEffect::Task
+                        && function.effect != FunctionEffect::Task)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
                 if usize::from(args_count) != callee.signature.parameters.len() {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
@@ -224,8 +233,7 @@ fn verify_function(
                 if !matches!(
                     cleanup.effect,
                     FunctionEffect::Ordinary | FunctionEffect::Cleanup
-                ) || cleanup.signature.result.is_some()
-                    || cleanup.signature.parameters.len() != usize::from(args_count)
+                ) || cleanup.signature.parameters.len() != usize::from(args_count)
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
@@ -269,11 +277,24 @@ fn verify_function(
                     queue.push_back(successor);
                 }
                 Some(existing) if *existing == state => {}
-                Some(_) => {
-                    return Err(error(
-                        Some(successor),
-                        VerifyErrorKind::ConflictingControlFlowTypes,
-                    ));
+                Some(existing) => {
+                    let mut changed = false;
+                    for (current, incoming) in existing.iter_mut().zip(&state) {
+                        match (*current, *incoming) {
+                            (Some(lhs), Some(rhs)) if lhs != rhs => {
+                                *current = None;
+                                changed = true;
+                            }
+                            (Some(_), None) => {
+                                *current = None;
+                                changed = true;
+                            }
+                            (None, _) | (Some(_), Some(_)) => {}
+                        }
+                    }
+                    if changed {
+                        queue.push_back(successor);
+                    }
                 }
             }
         }
@@ -283,7 +304,7 @@ fn verify_function(
         let can_hold_ref = states
             .iter()
             .flatten()
-            .any(|state| state[register] == Some(ValueType::Ref));
+            .any(|state| state[register].is_some_and(ValueType::is_reference));
         match (function.root_bitmap[register], can_hold_ref) {
             (true, false) => {
                 return Err(error(
@@ -298,6 +319,37 @@ fn verify_function(
                 ));
             }
             _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn verify_loop_bounds(
+    function_index: usize,
+    function: &Function,
+    limits: VerifierLimits,
+) -> Result<(), VerifyError> {
+    let mut seen = BTreeSet::new();
+    for loop_bound in &function.loop_bounds {
+        let pc = usize::try_from(loop_bound.back_edge).unwrap_or(usize::MAX);
+        let valid_edge = function.code.get(pc).is_some_and(|instruction| {
+            matches!(instruction, Instruction::Jump { target } if *target <= loop_bound.back_edge)
+                || matches!(
+                    instruction,
+                    Instruction::JumpIfFalse { target, .. } if *target <= loop_bound.back_edge
+                )
+        });
+        if !valid_edge
+            || loop_bound.max_iterations == 0
+            || !seen.insert(loop_bound.back_edge)
+            || (function.effect == FunctionEffect::Immediate
+                && loop_bound.max_iterations > limits.max_immediate_cost)
+        {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: (pc < function.code.len()).then_some(pc),
+                kind: VerifyErrorKind::InvalidLoopBound(loop_bound.back_edge),
+            });
         }
     }
     Ok(())
@@ -415,9 +467,12 @@ fn immediate_wcet(
         });
     }
     visiting.push(function);
-    let code = &module.functions[function].code;
-    let mut memo = vec![None; code.len()];
-    let cost = longest_path(module, function, 0, visiting, &mut memo)?;
+    let mut remaining = module.functions[function]
+        .loop_bounds
+        .iter()
+        .map(|loop_bound| (loop_bound.back_edge, loop_bound.max_iterations))
+        .collect::<Vec<_>>();
+    let cost = longest_path(module, function, 0, visiting, &mut remaining)?;
     visiting.pop();
     Ok(cost)
 }
@@ -427,11 +482,8 @@ fn longest_path(
     function: usize,
     pc: usize,
     visiting: &mut Vec<usize>,
-    memo: &mut [Option<u32>],
+    remaining: &mut [(u32, u32)],
 ) -> Result<u32, VerifyError> {
-    if let Some(cost) = memo[pc] {
-        return Ok(cost);
-    }
     let instruction = module.functions[function].code[pc];
     let callee_cost = if let Instruction::Call {
         function: callee, ..
@@ -443,23 +495,9 @@ fn longest_path(
     };
     let successors = match instruction {
         Instruction::Jump { target } => {
-            if target as usize <= pc {
-                return Err(VerifyError {
-                    function,
-                    instruction: Some(pc),
-                    kind: VerifyErrorKind::ImmediateCostLimit,
-                });
-            }
             vec![target as usize]
         }
         Instruction::JumpIfFalse { target, .. } => {
-            if target as usize <= pc {
-                return Err(VerifyError {
-                    function,
-                    instruction: Some(pc),
-                    kind: VerifyErrorKind::ImmediateCostLimit,
-                });
-            }
             let mut successors = vec![target as usize];
             if pc + 1 < module.functions[function].code.len() {
                 successors.push(pc + 1);
@@ -473,13 +511,34 @@ fn longest_path(
         _ if pc + 1 < module.functions[function].code.len() => vec![pc + 1],
         _ => Vec::new(),
     };
-    let suffix = successors
-        .into_iter()
-        .map(|successor| longest_path(module, function, successor, visiting, memo))
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .max()
-        .unwrap_or(0);
+    let mut suffix = 0;
+    for successor in successors {
+        let mut branch_remaining = remaining.to_vec();
+        if successor <= pc {
+            let back_edge = u32::try_from(pc).expect("bytecode position fits u32");
+            let Some((_, budget)) = branch_remaining
+                .iter_mut()
+                .find(|(edge, _)| *edge == back_edge)
+            else {
+                return Err(VerifyError {
+                    function,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::ImmediateCostLimit,
+                });
+            };
+            if *budget == 0 {
+                continue;
+            }
+            *budget -= 1;
+        }
+        suffix = suffix.max(longest_path(
+            module,
+            function,
+            successor,
+            visiting,
+            &mut branch_remaining,
+        )?);
+    }
     let cost = 1_u32
         .checked_add(callee_cost)
         .and_then(|value| value.checked_add(suffix))
@@ -488,13 +547,14 @@ fn longest_path(
             instruction: Some(pc),
             kind: VerifyErrorKind::ImmediateCostLimit,
         })?;
-    memo[pc] = Some(cost);
     Ok(cost)
 }
 
 #[cfg(test)]
 mod tests {
-    use nexa_bytecode::{FunctionBuilder, Instruction, ModuleBuilder, Signature, ValueType};
+    use nexa_bytecode::{
+        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
+    };
 
     use super::{VerifierLimits, VerifyErrorKind, verify};
 
@@ -548,5 +608,46 @@ mod tests {
                 .kind,
             VerifyErrorKind::MissingRoot(0)
         ));
+    }
+
+    #[test]
+    fn immediate_wcet_requires_and_consumes_static_loop_bounds() {
+        fn immediate_loop(bound: Option<u32>) -> nexa_bytecode::Module {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: Some(ValueType::I32),
+                },
+                2,
+            );
+            function
+                .effect(FunctionEffect::Immediate)
+                .emit(Instruction::LoadI32 { dst: 0, value: 1 })
+                .emit(Instruction::LoadBool {
+                    dst: 1,
+                    value: false,
+                })
+                .emit(Instruction::JumpIfFalse {
+                    condition: 1,
+                    target: 5,
+                })
+                .emit(Instruction::Safepoint)
+                .emit(Instruction::Jump { target: 2 })
+                .emit(Instruction::Return { source: 0 });
+            if let Some(bound) = bound {
+                function.loop_bound(4, bound);
+            }
+            let mut module = ModuleBuilder::new();
+            module.function(function.finish().unwrap());
+            module.finish()
+        }
+
+        assert!(matches!(
+            verify(immediate_loop(None), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        ));
+        assert!(verify(immediate_loop(Some(3)), VerifierLimits::default()).is_ok());
     }
 }

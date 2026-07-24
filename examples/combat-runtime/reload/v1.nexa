@@ -1,0 +1,3 @@
+task fn update(value: i32) -> i32 {
+    return await value;
+}

@@ -50,6 +50,7 @@ struct Task {
     fuel: FuelState,
     execution: Option<TaskExecution>,
     limits: crate::TaskLimits,
+    charge: crate::ExecutionCharge,
 }
 
 #[allow(dead_code)]
@@ -90,6 +91,7 @@ pub struct TaskSnapshot {
     pub priority: u32,
     pub fuel: FuelState,
     pub limits: crate::TaskLimits,
+    pub charge: crate::ExecutionCharge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -136,7 +138,7 @@ impl From<ScopeError> for TaskError {
 
 /// Owns first-milestone tasks and applies only generated state-machine transitions.
 #[derive(Debug)]
-pub struct TaskManager {
+pub(crate) struct TaskManager {
     realm_id: u32,
     tasks: SlotPool<Task>,
 }
@@ -179,6 +181,7 @@ impl TaskManager {
             fuel: FuelState::new(0, 0, u64::MAX),
             execution: None,
             limits: crate::TaskLimits::default(),
+            charge: crate::ExecutionCharge::default(),
         })?;
         let handle = TaskHandle(raw);
         if let Err(error) = scopes.add_transient_child(trace, owner) {
@@ -351,6 +354,7 @@ impl TaskManager {
             priority: task.priority,
             fuel: task.fuel,
             limits: task.limits,
+            charge: task.charge,
         })
     }
 
@@ -414,6 +418,17 @@ impl TaskManager {
             .into_iter()
             .map(TaskHandle)
             .collect()
+    }
+
+    pub(crate) fn record_charge(
+        &mut self,
+        handle: TaskHandle,
+        charge: crate::ExecutionCharge,
+    ) -> Result<crate::ExecutionCharge, TaskError> {
+        let task = self.tasks.resolve_mut(handle.raw())?;
+        task.charge.instructions = task.charge.instructions.saturating_add(charge.instructions);
+        task.charge.fuel_used = task.charge.fuel_used.saturating_add(charge.fuel_used);
+        Ok(task.charge)
     }
 }
 

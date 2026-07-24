@@ -189,18 +189,26 @@ pub fn generate_rust(idl: &Idl) -> String {
          match id {\n",
     );
     for (index, function) in idl.functions.iter().enumerate() {
-        writeln!(
-            output,
-            "{index} => {{ if args.len() != {} {{ return Err(nexa_runtime::HostTrap::Arity); }}",
-            function.parameters.len()
-        )
-        .expect("String writes do not fail");
+        if function.parameters.is_empty() {
+            writeln!(
+                output,
+                "{index} => {{ if !args.is_empty() {{ return Err(nexa_runtime::HostTrap::Arity); }}"
+            )
+            .expect("String writes do not fail");
+        } else {
+            writeln!(
+                output,
+                "{index} => {{ if args.len() != {} {{ return Err(nexa_runtime::HostTrap::Arity); }}",
+                function.parameters.len()
+            )
+            .expect("String writes do not fail");
+        }
         for (argument, parameter) in function.parameters.iter().enumerate() {
             writeln!(
                 output,
                 "let {} = {};",
                 parameter.name,
-                decode_host_value(&parameter.ty, argument)
+                decode_host_value(idl, &parameter.ty, argument)
             )
             .expect("String writes do not fail");
         }
@@ -217,8 +225,12 @@ pub fn generate_rust(idl: &Idl) -> String {
             "))).map_err(|_| nexa_runtime::HostTrap::Panicked)?\
              .map_err(|error| nexa_runtime::HostTrap::Host(error.0))?;\n",
         );
-        writeln!(output, "Ok({}) }}", encode_host_result(&function.result))
-            .expect("String writes do not fail");
+        writeln!(
+            output,
+            "Ok({}) }}",
+            encode_host_result(idl, &function.result)
+        )
+        .expect("String writes do not fail");
     }
     output.push_str(
         "_ => Err(nexa_runtime::HostTrap::UnknownFunction(id)),\n\
@@ -238,51 +250,95 @@ pub fn generate_rust(idl: &Idl) -> String {
     output
 }
 
-fn decode_host_value(ty: &TypeRef, index: usize) -> String {
-    let pattern = match ty {
-        TypeRef::I32 => "nexa_runtime::HostValue::I32(value) => *value",
-        TypeRef::F32 => "nexa_runtime::HostValue::F32(value) => *value",
-        TypeRef::Bool => "nexa_runtime::HostValue::Bool(value) => *value",
-        TypeRef::String => "nexa_runtime::HostValue::String(value) => value.clone()",
-        TypeRef::HostRequest => "nexa_runtime::HostValue::Request(value) => *value",
-        TypeRef::ResourceToken => "nexa_runtime::HostValue::Token(value) => *value",
-        TypeRef::Snapshot => "nexa_runtime::HostValue::Snapshot(value) => *value",
-        TypeRef::Named(_) => "_ => return Err(nexa_runtime::HostTrap::Type)",
-    };
-    if matches!(ty, TypeRef::Named(_)) {
-        format!("match args.get({index})? {{ {pattern} }}")
+fn decode_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> String {
+    decode_value(idl, ty, &format!("args.get({index})?"))
+}
+
+fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+    match ty {
+        TypeRef::I32 => decode_match(source, "I32", "*value"),
+        TypeRef::F32 => decode_match(source, "F32", "*value"),
+        TypeRef::Bool => decode_match(source, "Bool", "*value"),
+        TypeRef::String => decode_match(source, "String", "value.clone()"),
+        TypeRef::HostRequest => decode_match(source, "Request", "*value"),
+        TypeRef::ResourceToken => decode_match(source, "Token", "*value"),
+        TypeRef::Snapshot => decode_match(source, "Snapshot", "*value"),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
+            "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}"
+        ),
+        TypeRef::Named(name) => {
+            let structure = idl
+                .structs
+                .iter()
+                .find(|structure| structure.name == *name)
+                .expect("validated named type exists");
+            let fields = structure
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    format!(
+                        "{}: {}",
+                        field.name,
+                        decode_value(idl, &field.ty, &format!("&values[{index}]"))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == {} \
+                 => {name} {{ {fields} }}, _ => return Err(nexa_runtime::HostTrap::Type) }}",
+                structure.fields.len()
+            )
+        }
+    }
+}
+
+fn decode_match(source: &str, variant: &str, value: &str) -> String {
+    format!(
+        "match {source} {{ nexa_runtime::HostValue::{variant}(value) => {value}, \
+         _ => return Err(nexa_runtime::HostTrap::Type) }}"
+    )
+}
+
+fn encode_host_result(idl: &Idl, ty: &TypeRef) -> String {
+    if *ty == TypeRef::HostRequest {
+        "nexa_runtime::HostCallOutcome::Pending(result)".into()
     } else {
         format!(
-            "match args.get({index})? {{ {pattern}, _ => return Err(nexa_runtime::HostTrap::Type) }}"
+            "nexa_runtime::HostCallOutcome::Immediate({})",
+            encode_value(idl, ty, "result")
         )
     }
 }
 
-fn encode_host_result(ty: &TypeRef) -> String {
+fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
-        TypeRef::I32 => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::I32(result))".into()
+        TypeRef::I32 => format!("nexa_runtime::HostValue::I32({source})"),
+        TypeRef::F32 => format!("nexa_runtime::HostValue::F32({source})"),
+        TypeRef::Bool => format!("nexa_runtime::HostValue::Bool({source})"),
+        TypeRef::String => format!("nexa_runtime::HostValue::String({source})"),
+        TypeRef::HostRequest => format!("nexa_runtime::HostValue::Request({source})"),
+        TypeRef::ResourceToken => format!("nexa_runtime::HostValue::Token({source})"),
+        TypeRef::Snapshot => format!("nexa_runtime::HostValue::Snapshot({source})"),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
+            format!("nexa_runtime::HostValue::Opaque({source}.0)")
         }
-        TypeRef::F32 => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::F32(result))".into()
+        TypeRef::Named(name) => {
+            let structure = idl
+                .structs
+                .iter()
+                .find(|structure| structure.name == *name)
+                .expect("validated named type exists");
+            let fields = structure
+                .fields
+                .iter()
+                .map(|field| encode_value(idl, &field.ty, &format!("{source}.{}", field.name)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("nexa_runtime::HostValue::Struct(vec![{fields}])")
         }
-        TypeRef::Bool => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::Bool(result))".into()
-        }
-        TypeRef::String => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::String(result))"
-                .into()
-        }
-        TypeRef::HostRequest => "nexa_runtime::HostCallOutcome::Pending(result)".into(),
-        TypeRef::ResourceToken => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::Token(result))"
-                .into()
-        }
-        TypeRef::Snapshot => {
-            "nexa_runtime::HostCallOutcome::Immediate(nexa_runtime::HostValue::Snapshot(result))"
-                .into()
-        }
-        TypeRef::Named(_) => "return Err(nexa_runtime::HostTrap::Type)".into(),
     }
 }
 
@@ -506,6 +562,10 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{exact_hash, generate_rust, parse};
 
     const IDL: &str = "
@@ -533,5 +593,126 @@ mod tests {
         assert!(generated.contains("entity_position"));
         assert!(generated.contains("THUNK_ENTITY_POSITION"));
         assert!(generated.contains("pub enum Update"));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn generated_registry_compiles_and_executes_a_mock_host() {
+        let idl = parse(
+            "interface GameHost {
+                opaque Entity;
+                struct Vec3 { x: f32; y: f32; z: f32; }
+                sync fn add(lhs: i32, rhs: i32) -> i32;
+                sync fn position(entity: Entity, value: Vec3) -> Vec3;
+                sync fn explode() -> i32;
+                export Update;
+            }",
+        )
+        .unwrap();
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("nexa-idl-generated-{}-{nonce}", std::process::id()));
+        fs::create_dir_all(directory.join("src")).unwrap();
+        let runtime = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../nexa-runtime")
+            .canonicalize()
+            .unwrap();
+        fs::write(
+            directory.join("Cargo.toml"),
+            format!(
+                "[package]\nname=\"generated-check\"\nversion=\"0.0.0\"\nedition=\"2024\"\n\
+                 [dependencies]\nnexa-runtime={{path={runtime:?}}}\n"
+            ),
+        )
+        .unwrap();
+        fs::write(directory.join("src/bindings.rs"), generate_rust(&idl)).unwrap();
+        fs::write(
+            directory.join("src/main.rs"),
+            r#"mod bindings;
+use bindings::{Entity, GameHost, GeneratedHostRegistry, HostError, Vec3};
+use nexa_runtime::{HostArgs, HostCallOutcome, HostRegistry, HostValue, RuntimeLimits, RuntimeResources, TaskRuntime};
+
+struct Mock;
+impl GameHost for Mock {
+    fn add(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        lhs: i32,
+        rhs: i32,
+    ) -> Result<i32, HostError> {
+        Ok(lhs + rhs)
+    }
+
+    fn position(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        entity: Entity,
+        mut value: Vec3,
+    ) -> Result<Vec3, HostError> {
+        value.x += entity.0 as f32;
+        Ok(value)
+    }
+
+    fn explode(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+    ) -> Result<i32, HostError> {
+        panic!("host panic")
+    }
+}
+
+fn main() {
+    let mut tasks = TaskRuntime::new(1, RuntimeLimits::default());
+    let scope = tasks.create_scope(None).unwrap();
+    let task = tasks.admit_task(scope, 1, true).unwrap();
+    let mut resources = RuntimeResources::new(1, 4, 8);
+    let mut context = resources.context(task, 0, 1);
+    let values = [HostValue::I32(20), HostValue::I32(22)];
+    let mut registry = GeneratedHostRegistry::new(Mock);
+    let outcome = registry
+        .call(0, &mut context, HostArgs::new(&values))
+        .unwrap();
+    assert_eq!(outcome, HostCallOutcome::Immediate(HostValue::I32(42)));
+    let composite = [
+        HostValue::Opaque(2),
+        HostValue::Struct(vec![
+            HostValue::F32(1.0),
+            HostValue::F32(2.0),
+            HostValue::F32(3.0),
+        ]),
+    ];
+    assert_eq!(
+        registry
+            .call(1, &mut context, HostArgs::new(&composite))
+            .unwrap(),
+        HostCallOutcome::Immediate(HostValue::Struct(vec![
+            HostValue::F32(3.0),
+            HostValue::F32(2.0),
+            HostValue::F32(3.0),
+        ]))
+    );
+    assert_eq!(
+        registry.call(2, &mut context, HostArgs::new(&[])),
+        Err(nexa_runtime::HostTrap::Panicked)
+    );
+}
+"#,
+        )
+        .unwrap();
+        let output = Command::new("cargo")
+            .args(["+1.97.0", "run", "--quiet"])
+            .current_dir(&directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "generated crate failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 }

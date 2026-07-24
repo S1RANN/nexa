@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
+use crate::kernel::StepResult;
 use crate::{
-    DeferAction, FrameArena, FrameError, RuntimeError, RuntimeValue, StepConfig, StepResult,
-    TaskHandle, TaskRuntime,
+    DeferAction, FrameArena, FrameError, RuntimeError, RuntimeValue, StepConfig, TaskHandle,
+    TaskRuntime,
 };
 
 type ProgramId = u32;

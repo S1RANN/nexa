@@ -1,0 +1,9 @@
+result=Completed(Some(I32(7)))
+scope_state=Active
+terminal_state=Some(Completed)
+terminal_reason=Some(Completed(Some(I32(7))))
+epoch=Some(1)
+charge=Some(ExecutionCharge { instructions: 1, fuel_used: 1 })
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 8679550066159350682), (5, 7484891473089443046)]
+token=ResourceTokenHandle(RawHandle { realm_id: 1, index: 0, generation: 0 })
+tick=TickReport { polled: 0, completed: 0, cancelled: 0, trapped: 0, releases: 1, collection: None }

@@ -19,27 +19,24 @@ The current minimum supported Rust toolchain is **1.97.1**.
 
 ## Current milestone
 
-The repository now closes the planned model-checked vertical slice:
+The repository implements **Milestone 2B — Unified Executable Runtime**:
 
 ```text
-machine.spec
-→ validated machine model
-→ generated Rust transition code
-→ versioned trace records
-→ bounded Task/Scope exploration and exhaustive runtime differential replay
-→ pre-reserved Fast Task + safe FrameArena
-→ verified register bytecode + checked interpreter
-→ safe-Rust mark/sweep heap
-→ Lexer / Parser / type check / HIR / bytecode
-→ exact-hash IDL + typed Rust binding
-→ HostRequest / ResourceToken / Snapshot
-→ single-module Stateful pause / stage / commit reload
+Nexa source
+→ compiler and verifier
+→ RealmRuntime
+→ Task-owned InterpreterContinuation
+→ FrameArena and automatic GC roots
+→ scheduler, Host resources and bounded completion delivery
+→ single-module pause / migrate / commit reload
+→ explicit Completed / Cancelled / Trapped terminal records
 ```
 
-`MicroProgram` remains test-only. Public execution uses verified bytecode. The compiler accepts
-typed functions and `task fn`, bindings, arithmetic, calls, `if`, bounded `while`/`for` lowering,
-`await`, non-suspending `defer` validation, and nominal struct/enum/class/stateful-class
-declarations.
+`MicroProgram` remains test-only. Normal callers retain `TaskHandle`, never a continuation, and
+drive execution through `RealmRuntime::poll_task` or `RealmRuntime::tick`. The compiler preserves
+function effects, performs return-flow and lexical-scope checks, lowers non-suspending `defer`,
+and keeps nominal reference types distinct. Bytecode carries effect, frame, root-map, safepoint,
+call-depth, call-range and static loop-bound metadata.
 
 Try the end-to-end and IDL entry points:
 
@@ -47,11 +44,12 @@ Try the end-to-end and IDL entry points:
 cargo run -p nexa-cli -- compile examples/add.nexa
 cargo run -p nexa-cli -- idl check examples/game.idl
 cargo run -p nexa-cli -- idl generate examples/game.idl
-cargo run --release -p nexa-runtime --example fast_task_bench
+cargo run -p combat-runtime
+cargo run --release -p nexa-runtime --example fast_task_bench --features allocation-counting
 ```
 
-The reproducible Task-runtime-only benchmark result is recorded in
-[`reports/fast_task_benchmark_v0.md`](reports/fast_task_benchmark_v0.md).
+The reproducible real-path benchmark result is recorded in
+[`reports/fast_task_benchmark_v1.md`](reports/fast_task_benchmark_v1.md).
 
 Run the workspace checks:
 

@@ -1,0 +1,9 @@
+result=Completed(Some(I32(7)))
+scope_state=Active
+terminal_state=Some(Completed)
+terminal_reason=Some(Completed(Some(I32(7))))
+epoch=Some(1)
+charge=Some(ExecutionCharge { instructions: 1, fuel_used: 1 })
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 7404412225518122269), (5, 16817433213416414995), (6, 2724122448698142936), (7, 7854662167629336809), (8, 7484891473089443046)]
+tick=TickReport { polled: 1, completed: 1, cancelled: 0, trapped: 0, releases: 1, collection: None }
+discarded=0

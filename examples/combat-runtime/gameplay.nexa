@@ -1,0 +1,11 @@
+@stateful class EnemyBrain {
+    phase: i32;
+}
+
+fn identity(value: i32) -> i32 {
+    return value;
+}
+
+task fn update(value: i32) -> i32 {
+    return await identity(value);
+}

@@ -1,19 +1,20 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
 use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
+use crate::reload::{ReloadCoordinator, ReloadTransaction, StatefulRegistry};
 use crate::scheduler::Scheduler;
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, ExecutionCharge, FuelState,
     GcRef, GcRoots, Heap, HeapError, HostCompletionSender, HostRequestError, HostRequestHandle,
-    InterpreterError, InterpreterOutcome, Object, OpcodeCostTable, ReloadCoordinator, ReloadError,
-    ReloadTransaction, ResourceTokenHandle, RuntimeError, RuntimeHostDomain, RuntimeLimits,
-    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
-    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
+    InterpreterError, InterpreterOutcome, Object, OpcodeCostTable, ReloadError,
+    ResourceTokenHandle, RuntimeError, RuntimeHostDomain, RuntimeLimits, RuntimeResources,
+    RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig,
+    SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -32,7 +33,7 @@ struct LoadedModule {
     epoch: u64,
     verified: VerifiedModule,
     globals: Vec<GcRef>,
-    stateful_roots: Vec<GcRef>,
+    state: StatefulRegistry,
     staging_roots: Vec<GcRef>,
     accepts_calls: bool,
 }
@@ -148,6 +149,7 @@ pub enum RealmError {
     TerminalTask,
     TaskWaiting,
     Reload(ReloadError),
+    State(crate::StatefulError),
 }
 
 impl fmt::Display for RealmError {
@@ -188,6 +190,12 @@ impl From<ReloadError> for RealmError {
     }
 }
 
+impl From<crate::StatefulError> for RealmError {
+    fn from(error: crate::StatefulError) -> Self {
+        Self::State(error)
+    }
+}
+
 pub struct RealmRuntime {
     realm_id: u32,
     modules: SlotPool<LoadedModule>,
@@ -196,8 +204,7 @@ pub struct RealmRuntime {
     heap: Heap,
     scheduler: Scheduler,
     cost_table: OpcodeCostTable,
-    tombstones: BTreeMap<TaskHandle, TaskTerminalRecord>,
-    tombstone_order: VecDeque<TaskHandle>,
+    tombstones: VecDeque<(TaskHandle, TaskTerminalRecord)>,
     tombstone_capacity: usize,
     next_epoch: u64,
     reload: ReloadCoordinator,
@@ -216,10 +223,11 @@ impl RealmRuntime {
                 config.release_capacity,
             ),
             heap: Heap::new(config.max_heap_objects),
-            scheduler: Scheduler::default(),
+            scheduler: Scheduler::with_capacity(
+                config.runtime_limits.max_scheduler_tokens as usize,
+            ),
             cost_table: config.cost_table,
-            tombstones: BTreeMap::new(),
-            tombstone_order: VecDeque::with_capacity(config.tombstone_capacity),
+            tombstones: VecDeque::with_capacity(config.tombstone_capacity),
             tombstone_capacity: config.tombstone_capacity,
             next_epoch: 1,
             reload: ReloadCoordinator::default(),
@@ -230,9 +238,60 @@ impl RealmRuntime {
         Ok(self.tasks.create_scope(parent)?)
     }
 
+    pub fn scope_snapshot(&self, scope: ScopeHandle) -> Result<crate::ScopeSnapshot, RealmError> {
+        Ok(self.tasks.scope_snapshot(scope)?)
+    }
+
     #[must_use]
     pub const fn realm_id(&self) -> u32 {
         self.realm_id
+    }
+
+    pub fn module_epoch(&self, module: ModuleHandle) -> Result<u64, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .epoch)
+    }
+
+    pub fn insert_state(
+        &mut self,
+        module: ModuleHandle,
+        stable_id: StableId,
+        value: crate::StateValue,
+    ) -> Result<crate::StateHandle, RealmError> {
+        Ok(self
+            .modules
+            .resolve_mut(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state
+            .insert(stable_id, value)?)
+    }
+
+    pub fn state_handles(
+        &self,
+        module: ModuleHandle,
+    ) -> Result<Vec<crate::StateHandle>, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state
+            .handles())
+    }
+
+    pub fn resolve_state(
+        &self,
+        module: ModuleHandle,
+        handle: crate::StateHandle,
+    ) -> Result<&crate::StateValue, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state
+            .resolve(handle)?)
     }
 
     pub fn load_module(
@@ -256,15 +315,17 @@ impl RealmRuntime {
                 epoch,
                 verified,
                 globals: Vec::new(),
-                stateful_roots: Vec::new(),
+                state: StatefulRegistry::new(0),
                 staging_roots: Vec::new(),
                 accepts_calls: true,
             })
             .map_err(RealmError::ModuleAllocation)?;
-        self.modules
+        let loaded = self
+            .modules
             .resolve_mut(raw)
-            .expect("new module handle resolves")
-            .module_id = raw.index;
+            .expect("new module handle resolves");
+        loaded.module_id = raw.index;
+        loaded.state = StatefulRegistry::new(raw.index);
         Ok(ModuleHandle(raw))
     }
 
@@ -275,11 +336,19 @@ impl RealmRuntime {
         host_hash: StableId,
         schema_hash: StableId,
     ) -> Result<ModuleHandle, RealmError> {
-        let old_epoch = self
+        if self.reload.active() {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let old = self
             .modules
             .resolve(old_module.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .epoch;
+            .map_err(RealmError::ModuleHandle)?;
+        if old.verified.module().host_interface_hash != Some(host_hash) {
+            return Err(RealmError::HostHashMismatch);
+        }
+        if old.verified.module().schema_hash != Some(schema_hash) {
+            return Err(RealmError::SchemaHashMismatch);
+        }
         let candidate = self.load_module(candidate, host_hash, schema_hash)?;
         self.modules
             .resolve_mut(candidate.raw())
@@ -288,10 +357,7 @@ impl RealmRuntime {
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
-            old_epoch,
             paused_tasks: Vec::new(),
-            deferred_completions: Vec::new(),
-            staging_roots: Vec::new(),
         })?;
         Ok(candidate)
     }
@@ -342,18 +408,49 @@ impl RealmRuntime {
 
     pub fn stage_reload(
         &mut self,
-        migrate: impl FnOnce(&mut Vec<GcRef>) -> Result<(), String>,
-    ) -> Result<(), RealmError> {
-        let transaction = self.reload.transaction_mut()?;
-        migrate(&mut transaction.staging_roots).map_err(ReloadError::Migration)?;
+        migration_function: u32,
+        arguments: &[RuntimeValue],
+    ) -> Result<Option<RuntimeValue>, RealmError> {
+        let candidate_handle = self.reload.transaction()?.candidate;
         let candidate = self
             .modules
-            .resolve_mut(transaction.candidate.raw())
+            .resolve(candidate_handle.raw())
             .map_err(RealmError::ModuleHandle)?;
-        candidate
-            .staging_roots
-            .clone_from(&transaction.staging_roots);
-        Ok(())
+        let function = candidate
+            .verified
+            .module()
+            .functions
+            .get(migration_function as usize)
+            .ok_or(RealmError::MissingModule(migration_function))?;
+        if function.effect != nexa_bytecode::FunctionEffect::Migration {
+            return Err(ReloadError::Migration(
+                "migration entry does not have Migration effect".into(),
+            )
+            .into());
+        }
+        let candidate_module_id = candidate.module_id;
+        match CheckedInterpreter::run(&candidate.verified, migration_function, arguments, 4_096)? {
+            InterpreterOutcome::Returned { value, .. } => {
+                let old_module = self.reload.transaction()?.old_module;
+                let migrated = self
+                    .modules
+                    .resolve(old_module.raw())
+                    .map_err(RealmError::ModuleHandle)?
+                    .state
+                    .clone_for_module(candidate_module_id);
+                self.modules
+                    .resolve_mut(candidate_handle.raw())
+                    .map_err(RealmError::ModuleHandle)?
+                    .state = migrated;
+                Ok(value)
+            }
+            InterpreterOutcome::Suspended { .. } => {
+                Err(ReloadError::Migration("migration attempted to suspend".into()).into())
+            }
+            InterpreterOutcome::Trapped { trap, .. } => {
+                Err(ReloadError::Migration(trap.message).into())
+            }
+        }
     }
 
     pub fn commit_reload(
@@ -450,18 +547,33 @@ impl RealmRuntime {
         self.call(module, function, arguments, config)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn poll_task(
         &mut self,
         task: TaskHandle,
         fuel_slice: u64,
     ) -> Result<PollResult<Option<RuntimeValue>>, RealmError> {
-        if self.tombstones.contains_key(&task) {
+        if self
+            .tombstones
+            .iter()
+            .any(|(terminal_task, _)| *terminal_task == task)
+        {
             return Err(RealmError::TerminalTask);
         }
+        self.scheduler.deschedule(task);
         let snapshot = self.tasks.task_snapshot(task)?;
+        crate::allocation::record(
+            if snapshot.fuel.cumulative_used == 0 {
+                crate::allocation::AllocationPhase::FirstSlice
+            } else {
+                crate::allocation::AllocationPhase::Resume
+            },
+            0,
+        );
         match snapshot.state {
             TaskState::Ready => self.tasks.poll_task(task)?,
-            TaskState::FuelYielded | TaskState::Waiting => self.tasks.resume_task(task)?,
+            TaskState::FuelYielded => self.tasks.resume_task(task)?,
+            TaskState::Waiting => return Ok(PollResult::Pending(PendingReason::HostRequest)),
             TaskState::ReloadPaused => return Ok(PollResult::Pending(PendingReason::ReloadPause)),
             TaskState::Running => {}
             _ => return Err(RealmError::TerminalTask),
@@ -501,14 +613,21 @@ impl RealmRuntime {
             snapshot.fuel.cumulative_used,
             snapshot.fuel.cumulative_limit,
         );
-        let trace_start = self.tasks.trace().records().len();
+        let trace_start = self.trace_cursor();
         match CheckedInterpreter::poll(&module.verified, continuation, fuel, &self.cost_table)? {
             InterpreterOutcome::Returned {
                 value,
                 charge,
                 fuel,
             } => {
-                self.finish_task(task, snapshot.module_epoch, trace_start, charge, value)?;
+                let final_charge = self.tasks.record_charge(task, charge)?;
+                self.finish_task(
+                    task,
+                    snapshot.module_epoch,
+                    trace_start,
+                    final_charge,
+                    value,
+                )?;
                 let _ = fuel;
                 Ok(PollResult::Completed(value))
             }
@@ -518,13 +637,15 @@ impl RealmRuntime {
                 charge,
                 fuel,
             } => {
+                let final_charge = self.tasks.record_charge(task, charge)?;
+                crate::allocation::record(crate::allocation::AllocationPhase::Promotion, 0);
                 if continuation.cumulative_exhausted() {
                     if let Some(trap) = self.cancel_task_internal(
                         task,
                         CancelReason::BudgetExceeded,
                         snapshot.module_epoch,
                         trace_start,
-                        charge,
+                        final_charge,
                     )? {
                         return Ok(PollResult::Trapped(trap));
                     }
@@ -543,11 +664,12 @@ impl RealmRuntime {
                 Ok(PollResult::Pending(pending))
             }
             InterpreterOutcome::Trapped { trap, charge, .. } => {
+                let final_charge = self.tasks.record_charge(task, charge)?;
                 self.trap_task(
                     task,
                     snapshot.module_epoch,
                     trace_start,
-                    charge,
+                    final_charge,
                     trap.clone(),
                 )?;
                 Ok(PollResult::Trapped(trap))
@@ -557,6 +679,7 @@ impl RealmRuntime {
 
     pub fn cancel_scope(&mut self, scope: ScopeHandle) -> Result<usize, RealmError> {
         self.tasks.cancel_scope(scope)?;
+        self.tasks.begin_scope_cancellation(scope)?;
         let tasks = self
             .tasks
             .task_handles()
@@ -570,6 +693,7 @@ impl RealmRuntime {
         for task in &tasks {
             self.cancel_task(*task, CancelReason::ScopeCancelled)?;
         }
+        self.tasks.finish_scope_cancellation(scope)?;
         Ok(tasks.len())
     }
 
@@ -582,13 +706,13 @@ impl RealmRuntime {
         if snapshot.state == TaskState::Ready {
             self.tasks.poll_task(task)?;
         }
-        let trace_start = self.tasks.trace().records().len();
+        let trace_start = self.trace_cursor();
         let _ = self.cancel_task_internal(
             task,
             reason,
             snapshot.module_epoch,
             trace_start,
-            ExecutionCharge::default(),
+            snapshot.charge,
         )?;
         Ok(())
     }
@@ -634,9 +758,7 @@ impl RealmRuntime {
                 .resolve(raw)
                 .expect("occupied module handle resolves");
             roots.module_globals.extend_from_slice(&module.globals);
-            roots
-                .stateful_registry
-                .extend_from_slice(&module.stateful_roots);
+            roots.stateful_registry.extend(module.state.gc_roots());
             roots.staging_heap.extend_from_slice(&module.staging_roots);
         }
         Ok(self.heap.collect(&roots)?)
@@ -655,6 +777,57 @@ impl RealmRuntime {
             .resources
             .context(task, snapshot.module_id, snapshot.module_epoch)
             .create_request()?)
+    }
+
+    pub fn wait_for_request(
+        &mut self,
+        task: TaskHandle,
+        request: HostRequestHandle,
+    ) -> Result<(), RealmError> {
+        if !self.resources.owns_request(task, request) {
+            return Err(RealmError::Host(HostRequestError::InvalidState));
+        }
+        let snapshot = self.tasks.task_snapshot(task)?;
+        match snapshot.state {
+            TaskState::Ready => self.tasks.poll_task(task)?,
+            TaskState::FuelYielded => self.tasks.resume_task(task)?,
+            TaskState::Running => {}
+            _ => return Err(RealmError::TaskWaiting),
+        }
+        let execution = self.tasks.take_execution(task)?;
+        let continuation = match execution {
+            TaskExecution::Ready(continuation)
+            | TaskExecution::Running(continuation)
+            | TaskExecution::FuelYielded(continuation) => continuation,
+            other => {
+                self.tasks.put_execution(task, other, snapshot.fuel)?;
+                return Err(RealmError::TaskWaiting);
+            }
+        };
+        self.tasks.await_task(task)?;
+        self.tasks.put_execution(
+            task,
+            TaskExecution::Waiting {
+                continuation,
+                request,
+            },
+            snapshot.fuel,
+        )?;
+        self.scheduler.deschedule(task);
+        self.scheduler.wait_for(request, task);
+        Ok(())
+    }
+
+    pub fn with_resource_context<T>(
+        &mut self,
+        task: TaskHandle,
+        operation: impl FnOnce(&mut crate::ResourceContext<'_>) -> T,
+    ) -> Result<T, RealmError> {
+        let snapshot = self.tasks.task_snapshot(task)?;
+        let mut context = self
+            .resources
+            .context(task, snapshot.module_id, snapshot.module_epoch);
+        Ok(operation(&mut context))
     }
 
     pub fn create_resource_token(
@@ -685,6 +858,15 @@ impl RealmRuntime {
         Ok(self.resources.snapshot_data(snapshot)?)
     }
 
+    pub fn snapshot_external_bytes(&self, snapshot: SnapshotHandle) -> Result<usize, RealmError> {
+        Ok(self.resources.snapshot_external_bytes(snapshot)?)
+    }
+
+    #[must_use]
+    pub const fn discarded_late_host_results(&self) -> u64 {
+        self.resources.discarded_late_results()
+    }
+
     #[must_use]
     pub fn completion_sender(&self) -> HostCompletionSender {
         self.resources.completion_sender()
@@ -692,7 +874,9 @@ impl RealmRuntime {
 
     #[must_use]
     pub fn terminal_record(&self, task: TaskHandle) -> Option<&TaskTerminalRecord> {
-        self.tombstones.get(&task)
+        self.tombstones
+            .iter()
+            .find_map(|(terminal_task, record)| (*terminal_task == task).then_some(record))
     }
 
     #[must_use]
@@ -700,7 +884,14 @@ impl RealmRuntime {
         self.tasks.trace()
     }
 
+    pub fn set_trace_enabled(&mut self, enabled: bool) {
+        self.tasks.set_trace_enabled(enabled);
+    }
+
     fn drain_host_completions(&mut self) -> Result<usize, RealmError> {
+        if self.reload.active() {
+            return Ok(0);
+        }
         let epochs = self
             .modules
             .occupied_handles()
@@ -711,11 +902,30 @@ impl RealmRuntime {
         for epoch in epochs {
             for (request, payload) in self.resources.drain_completions(epoch) {
                 let _ = payload;
-                if let Some(task) = self.scheduler.wake_request(request, 0) {
+                if let Some(task) = self.scheduler.wake_request(request) {
                     let snapshot = self.tasks.task_snapshot(task)?;
-                    if snapshot.module_epoch == epoch {
-                        count += 1;
+                    if snapshot.module_epoch != epoch || snapshot.state != TaskState::Waiting {
+                        continue;
                     }
+                    let execution = self.tasks.take_execution(task)?;
+                    let TaskExecution::Waiting {
+                        continuation,
+                        request: waiting_request,
+                    } = execution
+                    else {
+                        return Err(RealmError::TaskWaiting);
+                    };
+                    if waiting_request != request {
+                        return Err(RealmError::TaskWaiting);
+                    }
+                    self.tasks.resume_task(task)?;
+                    self.tasks.put_execution(
+                        task,
+                        TaskExecution::Running(continuation),
+                        snapshot.fuel,
+                    )?;
+                    self.scheduler.schedule(task, snapshot.priority);
+                    count += 1;
                 }
             }
         }
@@ -731,6 +941,12 @@ impl RealmRuntime {
             .ok_or(RealmError::MissingModule(module_id))
     }
 
+    fn trace_cursor(&self) -> usize {
+        self.tasks.trace().records().last().map_or(0, |record| {
+            usize::try_from(record.sequence.saturating_add(1)).unwrap_or(usize::MAX)
+        })
+    }
+
     fn finish_task(
         &mut self,
         task: TaskHandle,
@@ -739,6 +955,8 @@ impl RealmRuntime {
         charge: ExecutionCharge,
         value: Option<RuntimeValue>,
     ) -> Result<(), RealmError> {
+        crate::allocation::record(crate::allocation::AllocationPhase::TerminalCleanup, 0);
+        self.scheduler.cancel_task(task);
         self.resources.cleanup_task(task, false)?;
         self.tasks.finish_task(task)?;
         self.record_terminal(
@@ -748,7 +966,7 @@ impl RealmRuntime {
                 reason: TaskTerminalReason::Completed(value),
                 module_epoch: epoch,
                 final_charge: charge,
-                trace_range: trace_start..self.tasks.trace().records().len(),
+                trace_range: trace_start..self.trace_cursor(),
             },
         );
         Ok(())
@@ -762,6 +980,7 @@ impl RealmRuntime {
         charge: ExecutionCharge,
         trap: Trap,
     ) -> Result<(), RealmError> {
+        self.scheduler.cancel_task(task);
         self.resources.cleanup_task(task, false)?;
         self.tasks.trap_task(task)?;
         self.record_terminal(
@@ -771,7 +990,7 @@ impl RealmRuntime {
                 reason: TaskTerminalReason::Trapped(trap),
                 module_epoch: epoch,
                 final_charge: charge,
-                trace_range: trace_start..self.tasks.trace().records().len(),
+                trace_range: trace_start..self.trace_cursor(),
             },
         );
         Ok(())
@@ -783,8 +1002,9 @@ impl RealmRuntime {
         reason: CancelReason,
         epoch: u64,
         trace_start: usize,
-        charge: ExecutionCharge,
+        mut charge: ExecutionCharge,
     ) -> Result<Option<Trap>, RealmError> {
+        self.scheduler.cancel_task(task);
         if reason == CancelReason::ReloadCommit {
             self.tasks.begin_reload_commit_cancel(task)?;
         } else {
@@ -808,20 +1028,27 @@ impl RealmRuntime {
         };
         self.resources
             .cleanup_task(task, reason == CancelReason::ReloadCommit)?;
-        if let Err(trap) = cleanup {
-            self.tasks.trap_task(task)?;
-            self.record_terminal(
-                task,
-                TaskTerminalRecord {
-                    state: TaskState::Trapped,
-                    reason: TaskTerminalReason::Trapped(trap.clone()),
-                    module_epoch: epoch,
-                    final_charge: charge,
-                    trace_range: trace_start..self.tasks.trace().records().len(),
-                },
-            );
-            return Ok(Some(trap));
-        }
+        let cleanup_charge = match cleanup {
+            Ok(cleanup_charge) => cleanup_charge,
+            Err(trap) => {
+                self.tasks.trap_task(task)?;
+                self.record_terminal(
+                    task,
+                    TaskTerminalRecord {
+                        state: TaskState::Trapped,
+                        reason: TaskTerminalReason::Trapped(trap.clone()),
+                        module_epoch: epoch,
+                        final_charge: charge,
+                        trace_range: trace_start..self.trace_cursor(),
+                    },
+                );
+                return Ok(Some(trap));
+            }
+        };
+        charge.instructions = charge
+            .instructions
+            .saturating_add(cleanup_charge.instructions);
+        charge.fuel_used = charge.fuel_used.saturating_add(cleanup_charge.fuel_used);
         self.tasks.clean_task(task)?;
         self.record_terminal(
             task,
@@ -830,7 +1057,7 @@ impl RealmRuntime {
                 reason: TaskTerminalReason::Cancelled(reason),
                 module_epoch: epoch,
                 final_charge: charge,
-                trace_range: trace_start..self.tasks.trace().records().len(),
+                trace_range: trace_start..self.trace_cursor(),
             },
         );
         Ok(None)
@@ -840,13 +1067,10 @@ impl RealmRuntime {
         if self.tombstone_capacity == 0 {
             return;
         }
-        if self.tombstone_order.len() == self.tombstone_capacity
-            && let Some(expired) = self.tombstone_order.pop_front()
-        {
-            self.tombstones.remove(&expired);
+        if self.tombstones.len() == self.tombstone_capacity {
+            self.tombstones.pop_front();
         }
-        self.tombstone_order.push_back(task);
-        self.tombstones.insert(task, record);
+        self.tombstones.push_back((task, record));
     }
 }
 

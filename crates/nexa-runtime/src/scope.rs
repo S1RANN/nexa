@@ -83,7 +83,7 @@ impl From<SlotAllocError> for ScopeError {
 
 /// Owns scopes for one realm and emits every transition through the shared trace format.
 #[derive(Debug)]
-pub struct ScopeManager {
+pub(crate) struct ScopeManager {
     realm_id: u32,
     scopes: SlotPool<Scope>,
 }
@@ -383,8 +383,9 @@ mod tests {
         assert_eq!(trace.count_for(MachineKind::Scope), 8);
         assert!(
             records
-                .windows(2)
-                .all(|window| window[0].sequence + 1 == window[1].sequence)
+                .iter()
+                .zip(records.iter().skip(1))
+                .all(|(previous, current)| previous.sequence + 1 == current.sequence)
         );
     }
 

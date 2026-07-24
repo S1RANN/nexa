@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::BinaryHeap;
 
 use crate::{HostRequestHandle, TaskHandle};
 
@@ -27,11 +27,20 @@ impl PartialOrd for ScheduledTask {
 #[derive(Debug, Default)]
 pub struct Scheduler {
     ready: BinaryHeap<ScheduledTask>,
-    waiting: BTreeMap<HostRequestHandle, TaskHandle>,
+    waiting: Vec<(HostRequestHandle, TaskHandle)>,
     sequence: u64,
 }
 
 impl Scheduler {
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            ready: BinaryHeap::with_capacity(capacity),
+            waiting: Vec::with_capacity(capacity),
+            sequence: 0,
+        }
+    }
+
     pub fn schedule(&mut self, task: TaskHandle, priority: u32) {
         let sequence = self.sequence;
         self.sequence = self.sequence.saturating_add(1);
@@ -42,32 +51,38 @@ impl Scheduler {
         });
     }
 
-    pub fn wait_for(&mut self, request: HostRequestHandle, task: TaskHandle) {
-        self.waiting.insert(request, task);
+    pub fn deschedule(&mut self, task: TaskHandle) {
+        self.ready.retain(|scheduled| scheduled.task != task);
     }
 
-    pub fn wake_request(
-        &mut self,
-        request: HostRequestHandle,
-        priority: u32,
-    ) -> Option<TaskHandle> {
-        let task = self.waiting.remove(&request)?;
-        self.schedule(task, priority);
-        Some(task)
+    pub fn wait_for(&mut self, request: HostRequestHandle, task: TaskHandle) {
+        if let Some((_, waiting_task)) = self
+            .waiting
+            .iter_mut()
+            .find(|(waiting_request, _)| *waiting_request == request)
+        {
+            *waiting_task = task;
+        } else {
+            self.waiting.push((request, task));
+        }
+    }
+
+    pub fn wake_request(&mut self, request: HostRequestHandle) -> Option<TaskHandle> {
+        let position = self
+            .waiting
+            .iter()
+            .position(|(waiting_request, _)| *waiting_request == request)?;
+        Some(self.waiting.swap_remove(position).1)
+    }
+
+    pub fn cancel_task(&mut self, task: TaskHandle) {
+        self.deschedule(task);
+        self.waiting
+            .retain(|(_, waiting_task)| *waiting_task != task);
     }
 
     pub fn pop_ready(&mut self) -> Option<TaskHandle> {
         self.ready.pop().map(|scheduled| scheduled.task)
-    }
-
-    #[must_use]
-    pub fn ready_len(&self) -> usize {
-        self.ready.len()
-    }
-
-    #[must_use]
-    pub fn waiting_len(&self) -> usize {
-        self.waiting.len()
     }
 }
 

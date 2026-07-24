@@ -1,0 +1,36 @@
+{
+  "toolchain": "rustc-1.97.0",
+  "os": "macos",
+  "arch": "aarch64",
+  "samples": 1000,
+  "allocation_events": {
+    "admission": 21003,
+    "first_slice": 0,
+    "promotion": 0,
+    "resume": 0,
+    "terminal_cleanup": 0
+  },
+  "fuel_costs": {
+    "fast_complete": 1,
+    "yield_resume": 1,
+    "nested_call": 3
+  },
+  "promotion_rate": 1.0,
+  "gc_measured_separately": true,
+  "trace_comparison": true,
+  "results": [
+    {"case":"rust_direct","mean_ns":22,"p50_ns":41,"p95_ns":42,"p99_ns":42},
+    {"case":"verified_immediate","mean_ns":601,"p50_ns":542,"p95_ns":542,"p99_ns":625},
+    {"case":"nexa_fast_complete","mean_ns":4397,"p50_ns":4333,"p95_ns":5917,"p99_ns":11625},
+    {"case":"nexa_fast_complete_trace_off","mean_ns":3489,"p50_ns":3208,"p95_ns":4959,"p99_ns":5541},
+    {"case":"nexa_fuel_promotion_resume","mean_ns":5742,"p50_ns":5750,"p95_ns":6750,"p99_ns":9708},
+    {"case":"nexa_nested_calls","mean_ns":3606,"p50_ns":3583,"p95_ns":3917,"p99_ns":4625},
+    {"case":"nexa_sync_host_call","mean_ns":33,"p50_ns":42,"p95_ns":42,"p99_ns":42},
+    {"case":"nexa_async_host_call","mean_ns":9039,"p50_ns":8625,"p95_ns":9666,"p99_ns":11833},
+    {"case":"nexa_resource_token","mean_ns":6053,"p50_ns":5958,"p95_ns":7167,"p99_ns":7458},
+    {"case":"nexa_snapshot_read","mean_ns":4384,"p50_ns":4375,"p95_ns":4541,"p99_ns":5458},
+    {"case":"nexa_state_handle","mean_ns":27,"p50_ns":41,"p95_ns":42,"p99_ns":42},
+    {"case":"nexa_reload","mean_ns":8226,"p50_ns":8292,"p95_ns":8584,"p99_ns":9208},
+    {"case":"nexa_gc_collect","mean_ns":2387,"p50_ns":2375,"p95_ns":2459,"p99_ns":2500}
+  ]
+}

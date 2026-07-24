@@ -153,6 +153,8 @@ pub enum HostValue {
     F32(f32),
     Bool(bool),
     String(String),
+    Opaque(u64),
+    Struct(Vec<HostValue>),
     Request(HostRequestHandle),
     Token(ResourceTokenHandle),
     Snapshot(SnapshotHandle),
@@ -285,7 +287,7 @@ impl From<ReleaseQueueError> for HostRequestError {
 }
 
 #[derive(Debug)]
-pub struct HostRequestManager {
+pub(crate) struct HostRequestManager {
     realm_id: u32,
     requests: SlotPool<HostRequest>,
     completions: Arc<Mutex<CompletionQueue>>,
@@ -324,6 +326,7 @@ impl HostRequestManager {
         }
     }
 
+    #[cfg(test)]
     pub fn create(
         &mut self,
         epoch: u64,
@@ -365,6 +368,7 @@ impl HostRequestManager {
         }
     }
 
+    #[cfg(test)]
     pub fn complete_from_host(
         &mut self,
         request: HostRequestHandle,
@@ -437,7 +441,9 @@ impl HostRequestManager {
         if self.requests.resolve(request.raw())?.state != HostRequestState::Pending {
             return Err(HostRequestError::InvalidState);
         }
-        self.cancel_completion_reservation();
+        if !detach {
+            self.cancel_completion_reservation();
+        }
         let request_state = self.requests.resolve_mut(request.raw())?;
         request_state.state = if detach {
             HostRequestState::Detached
@@ -513,14 +519,13 @@ pub struct ResourceTokenHandle(RawHandle);
 
 #[derive(Debug)]
 struct ResourceToken {
-    owner: TaskHandle,
     domain: RuntimeHostDomain,
     released: bool,
     release: Option<ReleaseReservation>,
 }
 
 #[derive(Debug)]
-pub struct ResourceTokenManager {
+pub(crate) struct ResourceTokenManager {
     realm_id: u32,
     tokens: SlotPool<ResourceToken>,
     terminal: BTreeSet<RawHandle>,
@@ -540,13 +545,12 @@ impl ResourceTokenManager {
 
     pub fn create(
         &mut self,
-        owner: TaskHandle,
+        _owner: TaskHandle,
         domain: RuntimeHostDomain,
         releases: &mut ReleaseQueue,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
         let release = releases.reserve()?;
         match self.tokens.try_allocate(ResourceToken {
-            owner,
             domain,
             released: false,
             release: Some(release),
@@ -594,28 +598,6 @@ impl ResourceTokenManager {
         self.terminal.insert(handle.0);
         Ok(true)
     }
-
-    pub fn release_owned_by(
-        &mut self,
-        owner: TaskHandle,
-        releases: &mut ReleaseQueue,
-    ) -> Result<usize, HostRequestError> {
-        let handles = self
-            .tokens
-            .occupied_handles()
-            .into_iter()
-            .filter(|handle| {
-                self.tokens
-                    .resolve(*handle)
-                    .is_ok_and(|token| token.owner == owner)
-            })
-            .map(ResourceTokenHandle)
-            .collect::<Vec<_>>();
-        for handle in &handles {
-            self.release(*handle, releases)?;
-        }
-        Ok(handles.len())
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -636,7 +618,7 @@ struct SnapshotEntry {
 }
 
 #[derive(Debug)]
-pub struct SnapshotManager {
+pub(crate) struct SnapshotManager {
     realm_id: u32,
     snapshots: SlotPool<SnapshotEntry>,
 }
@@ -787,9 +769,23 @@ impl RuntimeResources {
         self.snapshots.data(snapshot)
     }
 
+    pub fn snapshot_external_bytes(
+        &self,
+        snapshot: SnapshotHandle,
+    ) -> Result<usize, HostRequestError> {
+        self.snapshots.external_bytes(snapshot)
+    }
+
     #[must_use]
     pub fn ownership(&self, task: TaskHandle) -> Option<&TaskResourceSet> {
         self.ownership.get(&task)
+    }
+
+    #[must_use]
+    pub fn owns_request(&self, task: TaskHandle, request: HostRequestHandle) -> bool {
+        self.ownership
+            .get(&task)
+            .is_some_and(|resources| resources.requests.contains(&request))
     }
 
     #[must_use]
@@ -878,72 +874,14 @@ impl<T> CopyBuffer<T> {
     }
 }
 
-#[derive(Debug)]
-pub struct ImmutableSnapshot<T> {
-    data: Arc<[T]>,
-    external_bytes: usize,
-    release: ReleaseReservation,
-    realm_id: u32,
-    id: u64,
-}
-
-impl<T> ImmutableSnapshot<T> {
-    pub fn new(
-        realm_id: u32,
-        id: u64,
-        data: Arc<[T]>,
-        external_bytes: usize,
-        releases: &mut ReleaseQueue,
-    ) -> Result<Self, ReleaseQueueError> {
-        Ok(Self {
-            data,
-            external_bytes,
-            release: releases.reserve()?,
-            realm_id,
-            id,
-        })
-    }
-
-    #[must_use]
-    pub fn data(&self) -> &[T] {
-        &self.data
-    }
-
-    #[must_use]
-    pub const fn external_bytes(&self) -> usize {
-        self.external_bytes
-    }
-
-    pub fn share(&self, releases: &mut ReleaseQueue) -> Result<Self, ReleaseQueueError> {
-        Ok(Self {
-            data: Arc::clone(&self.data),
-            external_bytes: self.external_bytes,
-            release: releases.reserve()?,
-            realm_id: self.realm_id,
-            id: self.id,
-        })
-    }
-
-    pub fn release(self, releases: &mut ReleaseQueue) -> Result<(), ReleaseQueueError> {
-        releases.enqueue_reserved(
-            self.release,
-            ReleaseRecord {
-                realm_id: self.realm_id,
-                kind: ReleaseKind::Snapshot,
-                object_id: self.id,
-                domain: RuntimeHostDomain::VmThread,
-            },
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
 
     use super::{
-        HostRequestManager, ImmutableSnapshot, ReleaseKind, ReleaseQueue, ReleaseQueueState,
-        ResourceTokenManager, RuntimeHostDomain,
+        HostCompletion, HostPayload, HostRequestError, HostRequestManager, ReleaseKind,
+        ReleaseQueue, ReleaseQueueState, ResourceTokenManager, RuntimeHostDomain, SnapshotManager,
     };
     use crate::{RuntimeLimits, TaskRuntime};
 
@@ -962,13 +900,19 @@ mod tests {
 
     #[test]
     fn snapshot_shares_read_only_data_and_queue_recovers_after_drain() {
+        let mut runtime = TaskRuntime::new(1, RuntimeLimits::default());
+        let scope = runtime.create_scope(None).unwrap();
+        let task = runtime.admit_task(scope, 1, true).unwrap();
         let mut releases = ReleaseQueue::new(1);
-        let snapshot =
-            ImmutableSnapshot::new(1, 2, Arc::<[i32]>::from([1, 2, 3]), 12, &mut releases).unwrap();
-        assert_eq!(snapshot.data(), &[1, 2, 3]);
+        let mut snapshots = SnapshotManager::new(1, 1);
+        let snapshot = snapshots
+            .create(task, Arc::<[i32]>::from([1, 2, 3]), &mut releases)
+            .unwrap();
+        assert_eq!(snapshots.data(snapshot).unwrap(), &[1, 2, 3]);
+        assert_eq!(snapshots.external_bytes(snapshot).unwrap(), 12);
         assert!(releases.reserve().is_err());
         assert_eq!(releases.state(), ReleaseQueueState::Stalled);
-        snapshot.release(&mut releases).unwrap();
+        snapshots.release(snapshot, &mut releases).unwrap();
         assert_eq!(releases.drain().count(), 1);
         assert_eq!(releases.state(), ReleaseQueueState::Healthy);
     }
@@ -989,5 +933,60 @@ mod tests {
         let record = releases.drain().next().unwrap();
         assert_eq!(record.realm_id, 99);
         assert_eq!(record.kind, ReleaseKind::ResourceToken);
+    }
+
+    #[test]
+    fn completion_sender_is_send_sync_and_request_slots_recycle_under_threads() {
+        const COUNT: u32 = 32;
+
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<super::HostCompletionSender>();
+
+        let mut releases = ReleaseQueue::new(COUNT as usize);
+        let mut requests = HostRequestManager::new(7, COUNT);
+        let handles = (0..COUNT)
+            .map(|_| requests.create_for_module(3, 9, &mut releases).unwrap())
+            .collect::<Vec<_>>();
+        let sender = requests.completion_sender();
+        let workers = handles
+            .iter()
+            .copied()
+            .map(|request| {
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    sender
+                        .complete(HostCompletion {
+                            realm_id: 7,
+                            module_id: 3,
+                            epoch: 9,
+                            request,
+                            payload: HostPayload::I32(1),
+                        })
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert_eq!(
+            requests.drain_completions(9, &mut releases).len(),
+            COUNT as usize
+        );
+        assert_eq!(releases.drain().count(), COUNT as usize);
+        for _ in 0..COUNT {
+            requests.create_for_module(3, 9, &mut releases).unwrap();
+        }
+        drop(requests);
+        assert_eq!(
+            sender.complete(HostCompletion {
+                realm_id: 7,
+                module_id: 3,
+                epoch: 9,
+                request: handles[0],
+                payload: HostPayload::Unit,
+            }),
+            Err(HostRequestError::CompletionQueueFull)
+        );
     }
 }

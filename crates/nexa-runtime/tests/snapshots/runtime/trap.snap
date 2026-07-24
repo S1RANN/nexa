@@ -1,0 +1,7 @@
+result=Trapped(Trap { kind: BytecodeTrap, message: "bytecode trap" })
+scope_state=Active
+terminal_state=Some(Trapped)
+terminal_reason=Some(Trapped(Trap { kind: BytecodeTrap, message: "bytecode trap" }))
+epoch=Some(1)
+charge=Some(ExecutionCharge { instructions: 1, fuel_used: 1 })
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 8679550066159350682), (5, 9398053301032184371)]

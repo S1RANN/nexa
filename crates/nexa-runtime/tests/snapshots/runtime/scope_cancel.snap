@@ -1,0 +1,8 @@
+result=Cancelled(ScopeCancelled)
+scope_state=Cancelled
+terminal_state=Some(Cancelled)
+terminal_reason=Some(Cancelled(ScopeCancelled))
+epoch=Some(1)
+charge=Some(ExecutionCharge { instructions: 1, fuel_used: 1 })
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 7404412225518122269), (5, 6238175855663382976), (6, 18434048166309628517), (7, 9601239894403426750), (8, 12719434323314520416), (9, 1336367623293680442), (10, 10543894887166838981), (11, 6135067495149402947), (12, 16542323711707806902)]
+first=Pending(ExplicitYield)

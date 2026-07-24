@@ -124,8 +124,8 @@ impl InterpreterContinuation {
         module: &VerifiedModule,
     ) -> Result<Vec<GcRef>, InterpreterError> {
         let metadata = self.gc_roots(module)?;
-        let dynamic = self.arena.gc_roots();
-        if metadata != dynamic {
+        let observed = self.arena.gc_roots();
+        if metadata != observed {
             return Err(InterpreterError::RootMapMismatch);
         }
         Ok(metadata)
@@ -690,6 +690,7 @@ const fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::I32(_) => Some(ValueType::I32),
         RuntimeValue::Bool(_) => Some(ValueType::Bool),
         RuntimeValue::Ref(_) => Some(ValueType::Ref),
+        RuntimeValue::NamedRef { type_id, .. } => Some(ValueType::Named(type_id)),
         RuntimeValue::Unit => None,
     }
 }

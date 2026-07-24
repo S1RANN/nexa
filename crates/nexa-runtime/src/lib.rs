@@ -1,5 +1,6 @@
 //! Model-driven Nexa runtime primitives.
 
+mod allocation;
 mod frame;
 mod heap;
 mod host;
@@ -18,9 +19,8 @@ mod trace;
 #[path = "generated/machines.rs"]
 mod machines;
 
-pub use kernel::{
-    FailurePoint, RuntimeError, RuntimeLimits, StepConfig, StepResult, TaskLimits, TaskRuntime,
-};
+pub use allocation::{AllocationSnapshot, allocation_snapshot};
+pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 
 #[cfg(test)]
 mod micro;
@@ -30,10 +30,9 @@ pub use frame::{
 pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, Object};
 pub use host::{
     CopyBuffer, HostArgs, HostCallOutcome, HostCompletion, HostCompletionSender, HostPayload,
-    HostRegistry, HostRequestError, HostRequestHandle, HostRequestManager, HostRequestState,
-    HostTrap, HostValue, ImmutableSnapshot, ReleaseKind, ReleaseQueue, ReleaseQueueError,
-    ReleaseQueueState, ResourceContext, ResourceTokenHandle, ResourceTokenManager,
-    RuntimeHostDomain, RuntimeResources, ScriptFunction, SnapshotHandle, SnapshotManager,
+    HostRegistry, HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue,
+    ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceContext,
+    ResourceTokenHandle, RuntimeHostDomain, RuntimeResources, ScriptFunction, SnapshotHandle,
     TaskResourceSet,
 };
 pub use interpreter::{
@@ -45,12 +44,8 @@ pub use realm::{
     CancelReason, ModuleHandle, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
     TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
-pub use reload::{
-    ModuleEpochRoot, ReloadCoordinator, ReloadError, ReloadManager, ReloadState, ReloadTransaction,
-    StateHandle, StateValue, StatefulError, StatefulRegistry,
-};
-pub use scheduler::Scheduler;
+pub use reload::{ReloadError, StateHandle, StateValue, StatefulError};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
-pub use trace::RuntimeTrace;
+pub use trace::{RuntimeTrace, TraceRecords};

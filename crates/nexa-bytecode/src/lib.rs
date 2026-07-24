@@ -12,6 +12,14 @@ pub enum ValueType {
     I32,
     Bool,
     Ref,
+    Named(StableId),
+}
+
+impl ValueType {
+    #[must_use]
+    pub const fn is_reference(self) -> bool {
+        matches!(self, Self::Ref | Self::Named(_))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +42,12 @@ pub enum FunctionEffect {
 pub struct RootMap {
     pub pc: u32,
     pub bitmap: Vec<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoopBound {
+    pub back_edge: u32,
+    pub max_iterations: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +121,7 @@ pub struct Function {
     pub root_bitmap: Vec<bool>,
     pub root_maps: Vec<RootMap>,
     pub safepoints: Vec<u32>,
+    pub loop_bounds: Vec<LoopBound>,
     pub effect: FunctionEffect,
     pub max_static_call_depth: u16,
     pub code: Vec<Instruction>,
@@ -158,14 +173,12 @@ impl Module {
                     .expect("parameter count exceeds wire format"),
             );
             for ty in &function.signature.parameters {
-                output.push(encode_type(*ty));
+                encode_type(&mut output, *ty);
             }
-            output.push(
-                function
-                    .signature
-                    .result
-                    .map_or(0, |ty| encode_type(ty) + 1),
-            );
+            output.push(u8::from(function.signature.result.is_some()));
+            if let Some(result) = function.signature.result {
+                encode_type(&mut output, result);
+            }
             put_u16(&mut output, function.registers);
             put_u32(&mut output, function.frame_bytes);
             output.push(encode_effect(function.effect));
@@ -198,6 +211,15 @@ impl Module {
             }
             put_u32(
                 &mut output,
+                u32::try_from(function.loop_bounds.len())
+                    .expect("loop-bound count exceeds wire format"),
+            );
+            for loop_bound in &function.loop_bounds {
+                put_u32(&mut output, loop_bound.back_edge);
+                put_u32(&mut output, loop_bound.max_iterations);
+            }
+            put_u32(
+                &mut output,
                 u32::try_from(function.code.len()).expect("instruction count exceeds wire format"),
             );
             for instruction in &function.code {
@@ -207,6 +229,7 @@ impl Module {
         output
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader { bytes, cursor: 0 };
         if reader.take(4)? != MAGIC {
@@ -231,11 +254,12 @@ impl Module {
             }
             let mut parameters = Vec::with_capacity(parameter_count);
             for _ in 0..parameter_count {
-                parameters.push(decode_type(reader.u8()?)?);
+                parameters.push(decode_type(&mut reader)?);
             }
             let result = match reader.u8()? {
                 0 => None,
-                value => Some(decode_type(value - 1)?),
+                1 => Some(decode_type(&mut reader)?),
+                value => return Err(DecodeError::InvalidBoolean(value)),
             };
             let registers = reader.u16()?;
             let frame_bytes = reader.u32()?;
@@ -275,6 +299,15 @@ impl Module {
             for _ in 0..safepoint_count {
                 safepoints.push(reader.u32()?);
             }
+            let loop_bound_count =
+                usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            let mut loop_bounds = Vec::with_capacity(loop_bound_count);
+            for _ in 0..loop_bound_count {
+                loop_bounds.push(LoopBound {
+                    back_edge: reader.u32()?,
+                    max_iterations: reader.u32()?,
+                });
+            }
             let instruction_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
             if instruction_count > reader.remaining() {
@@ -291,6 +324,7 @@ impl Module {
                 root_bitmap,
                 root_maps,
                 safepoints,
+                loop_bounds,
                 effect,
                 max_static_call_depth,
                 code,
@@ -328,19 +362,24 @@ fn decode_effect(value: u8) -> Result<FunctionEffect, DecodeError> {
     }
 }
 
-fn encode_type(ty: ValueType) -> u8 {
+fn encode_type(output: &mut Vec<u8>, ty: ValueType) {
     match ty {
-        ValueType::I32 => 0,
-        ValueType::Bool => 1,
-        ValueType::Ref => 2,
+        ValueType::I32 => output.push(0),
+        ValueType::Bool => output.push(1),
+        ValueType::Ref => output.push(2),
+        ValueType::Named(id) => {
+            output.push(3);
+            put_u64(output, id.0);
+        }
     }
 }
 
-fn decode_type(value: u8) -> Result<ValueType, DecodeError> {
-    match value {
+fn decode_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
+    match reader.u8()? {
         0 => Ok(ValueType::I32),
         1 => Ok(ValueType::Bool),
         2 => Ok(ValueType::Ref),
+        3 => Ok(ValueType::Named(StableId(reader.u64()?))),
         value => Err(DecodeError::InvalidType(value)),
     }
 }
@@ -612,6 +651,7 @@ pub struct FunctionBuilder {
     registers: u16,
     frame_bytes: u32,
     root_bitmap: Vec<bool>,
+    loop_bounds: Vec<LoopBound>,
     effect: FunctionEffect,
     code: Vec<Instruction>,
 }
@@ -624,6 +664,7 @@ impl FunctionBuilder {
             registers,
             frame_bytes: u32::from(registers) * 8,
             root_bitmap: vec![false; usize::from(registers)],
+            loop_bounds: Vec::new(),
             effect: FunctionEffect::Ordinary,
             code: Vec::new(),
         }
@@ -651,6 +692,14 @@ impl FunctionBuilder {
             .ok_or(BuildError::TooManyRegisters)?;
         *root = true;
         Ok(self)
+    }
+
+    pub fn loop_bound(&mut self, back_edge: u32, max_iterations: u32) -> &mut Self {
+        self.loop_bounds.push(LoopBound {
+            back_edge,
+            max_iterations,
+        });
+        self
     }
 
     pub fn finish(self) -> Result<Function, BuildError> {
@@ -697,6 +746,7 @@ impl FunctionBuilder {
             root_bitmap: self.root_bitmap,
             root_maps,
             safepoints,
+            loop_bounds: self.loop_bounds,
             effect: self.effect,
             max_static_call_depth: 1,
             code: self.code,
@@ -737,7 +787,13 @@ mod tests {
         );
         function
             .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::DeferPush {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+            })
             .emit(Instruction::Return { source: 0 });
+        function.loop_bound(99, 3);
         let mut builder = ModuleBuilder::new();
         builder.function(function.finish().unwrap());
         let module = builder.finish();

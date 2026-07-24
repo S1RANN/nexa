@@ -1,0 +1,7 @@
+interface GameHost {
+    sync fn update(entity: i32, delta: i32) -> i32;
+    request fn animation(entity: i32) -> host_request;
+    sync fn action_lock(entity: i32) -> resource_token;
+    sync fn world_snapshot() -> snapshot;
+    export Update;
+}

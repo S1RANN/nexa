@@ -8,6 +8,10 @@ pub enum RuntimeValue {
     I32(i32),
     Bool(bool),
     Ref(GcRef),
+    NamedRef {
+        reference: GcRef,
+        type_id: nexa_core::StableId,
+    },
     #[default]
     Unit,
 }
@@ -117,6 +121,7 @@ impl FrameArena {
         {
             return Err(FrameError::ReservationExceedsLimit);
         }
+        crate::allocation::record(crate::allocation::AllocationPhase::Admission, 3);
         Ok(Self {
             frames: Vec::with_capacity(reservation.frame_capacity as usize),
             registers: Vec::with_capacity(reservation.register_capacity as usize),
@@ -297,7 +302,9 @@ impl FrameArena {
         self.registers
             .iter()
             .filter_map(|value| match value {
-                RuntimeValue::Ref(reference) => Some(*reference),
+                RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
+                    Some(*reference)
+                }
                 RuntimeValue::I32(_) | RuntimeValue::Bool(_) | RuntimeValue::Unit => None,
             })
             .collect()
@@ -315,11 +322,13 @@ impl FrameArena {
                 return Err(FrameError::RegisterOutOfRange);
             }
             for (register, is_root) in bitmap.into_iter().enumerate() {
-                if is_root
-                    && let RuntimeValue::Ref(reference) =
-                        self.registers[frame.register_start as usize + register]
-                {
-                    roots.push(reference);
+                if is_root {
+                    match self.registers[frame.register_start as usize + register] {
+                        RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
+                            roots.push(reference);
+                        }
+                        RuntimeValue::I32(_) | RuntimeValue::Bool(_) | RuntimeValue::Unit => {}
+                    }
                 }
             }
         }

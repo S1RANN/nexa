@@ -44,7 +44,7 @@ impl RuntimeAdapter {
                     max_tasks: u32::try_from(config.max_tasks).unwrap(),
                     max_frame_segments: u32::try_from(config.max_tasks).unwrap(),
                     max_scheduler_tokens: u32::try_from(config.max_tasks).unwrap(),
-                    max_trace_records: u32::try_from(config.max_tasks).unwrap(),
+                    max_trace_records: 10_000,
                     max_transient_children_per_scope: u32::try_from(config.max_tasks).unwrap(),
                     max_persistent_children_per_scope: u32::try_from(config.max_tasks).unwrap(),
                 },
@@ -299,8 +299,17 @@ impl RuntimeAdapter {
             }
         }
 
-        for (sequence, record) in self.runtime.trace().records().iter().enumerate() {
-            assert_eq!(record.sequence, u64::try_from(sequence).unwrap());
+        let trace_start = self
+            .runtime
+            .trace()
+            .records()
+            .first()
+            .map_or(0, |record| record.sequence);
+        for (offset, record) in self.runtime.trace().records().iter().enumerate() {
+            assert_eq!(
+                record.sequence,
+                trace_start + u64::try_from(offset).unwrap()
+            );
         }
     }
 

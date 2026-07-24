@@ -15,10 +15,12 @@ Functions
 Code
 RootBitmaps
 Safepoints
+LoopBounds
 SourceMap
 ReloadMetadata
 ```
 
 The core verifier independently validates section bounds, instruction boundaries, CFG edges,
 register types, call signatures, field slots, root bitmaps, safepoints, frame quotas, host
-signatures, and immediate-function cost.
+signatures, and immediate-function WCET. Immediate loops require an explicit static upper bound;
+recursive immediate call graphs are rejected.

@@ -44,7 +44,8 @@ pub struct StepConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StepResult<T> {
+#[cfg(test)]
+pub(crate) enum StepResult<T> {
     Completed(T),
     Promoted(TaskHandle),
 }
@@ -343,6 +344,14 @@ impl TaskRuntime {
 
     pub(crate) fn task_handles(&self) -> Vec<TaskHandle> {
         self.tasks.handles()
+    }
+
+    pub(crate) fn record_charge(
+        &mut self,
+        task: TaskHandle,
+        charge: crate::ExecutionCharge,
+    ) -> Result<crate::ExecutionCharge, RuntimeError> {
+        Ok(self.tasks.record_charge(task, charge)?)
     }
 
     fn apply_task(&mut self, task: TaskHandle, event: TaskEvent) -> Result<(), RuntimeError> {

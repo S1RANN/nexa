@@ -1,0 +1,8 @@
+result=Completed(Some(I32(7)))
+scope_state=Active
+terminal_state=Some(Completed)
+terminal_reason=Some(Completed(Some(I32(7))))
+epoch=Some(1)
+charge=Some(ExecutionCharge { instructions: 2, fuel_used: 2 })
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 7404412225518122269), (5, 6238175855663382976), (6, 13768332670135816418), (7, 7854662167629336809), (8, 7484891473089443046)]
+first=Pending(ExplicitYield)

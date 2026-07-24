@@ -10,5 +10,8 @@ nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-core = { path = "../nexa-core" }
 nexa-verifier = { path = "../nexa-verifier" }
 
+[features]
+allocation-counting = []
+
 [lints]
 workspace = true

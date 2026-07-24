@@ -82,8 +82,9 @@ fn runtime_task_trace_matches_reference_model_for_acceptance_path() {
         runtime
             .trace()
             .records()
-            .windows(2)
-            .all(|window| window[0].sequence + 1 == window[1].sequence)
+            .iter()
+            .zip(runtime.trace().records().iter().skip(1))
+            .all(|(previous, current)| previous.sequence + 1 == current.sequence)
     );
     assert!(
         runtime

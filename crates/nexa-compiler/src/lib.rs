@@ -6,12 +6,16 @@ use std::fmt;
 use nexa_bytecode::{
     Function, FunctionEffect, Instruction, Module, ModuleBuilder, RootMap, Signature, ValueType,
 };
+use nexa_core::StableId;
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TokenKind {
     Fn,
     Task,
+    Immediate,
+    Migration,
+    Cleanup,
     Return,
     Let,
     Var,
@@ -67,6 +71,7 @@ pub enum CompileError {
     TypeMismatch,
     MissingReturn,
     SuspendingDefer,
+    DeferCaptureLimit,
     InvalidEffect,
     TooManyRegisters,
     Verify(String),
@@ -106,6 +111,7 @@ pub enum AstTypeKind {
 pub struct AstFunction {
     pub name: String,
     pub is_task: bool,
+    pub effect: FunctionEffect,
     pub parameters: Vec<(String, AstType)>,
     pub result: AstType,
     pub body: Vec<AstStatement>,
@@ -226,6 +232,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 match text.as_str() {
                     "fn" => TokenKind::Fn,
                     "task" => TokenKind::Task,
+                    "immediate" => TokenKind::Immediate,
+                    "migration" => TokenKind::Migration,
+                    "cleanup" => TokenKind::Cleanup,
                     "return" => TokenKind::Return,
                     "let" => TokenKind::Let,
                     "var" => TokenKind::Var,
@@ -323,7 +332,18 @@ impl Parser<'_> {
     }
 
     fn function(&mut self) -> Result<AstFunction, CompileError> {
-        let is_task = self.take(&TokenKind::Task);
+        let effect = if self.take(&TokenKind::Task) {
+            FunctionEffect::Task
+        } else if self.take(&TokenKind::Immediate) {
+            FunctionEffect::Immediate
+        } else if self.take(&TokenKind::Migration) {
+            FunctionEffect::Migration
+        } else if self.take(&TokenKind::Cleanup) {
+            FunctionEffect::Cleanup
+        } else {
+            FunctionEffect::Ordinary
+        };
+        let is_task = effect == FunctionEffect::Task;
         self.expect(&TokenKind::Fn, "fn")?;
         let name = self.ident()?;
         self.expect(&TokenKind::LParen, "(")?;
@@ -345,6 +365,7 @@ impl Parser<'_> {
         Ok(AstFunction {
             name,
             is_task,
+            effect,
             parameters,
             result,
             body,
@@ -555,7 +576,8 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
         }
     }
     let mut functions = Vec::new();
-    for function in ast.functions {
+    for mut function in ast.functions {
+        resolve_local_scopes(&mut function)?;
         let signature = signatures[&function.name].clone();
         let mut locals = BTreeMap::new();
         for (index, ((name, _), ty)) in function
@@ -569,31 +591,125 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
                 return Err(CompileError::DuplicateName(name.clone()));
             }
         }
-        if !function.is_task && statements_contain_await(&function.body) {
+        if function.effect != FunctionEffect::Task && statements_contain_await(&function.body) {
             return Err(CompileError::InvalidEffect);
         }
+        let mut next_register =
+            u16::try_from(function.parameters.len()).map_err(|_| CompileError::TooManyRegisters)?;
         let flow = check_statements(
             &function.body,
             &mut locals,
             &signatures,
             signature.result.expect("result is required"),
+            &mut next_register,
         )?;
         if flow == Flow::FallsThrough {
             return Err(CompileError::MissingReturn);
         }
         functions.push(HirFunction {
             name: function.name,
-            effect: if function.is_task {
-                FunctionEffect::Task
-            } else {
-                FunctionEffect::Ordinary
-            },
+            effect: function.effect,
             signature,
             body: function.body,
             locals,
         });
     }
     Ok(HirModule { functions })
+}
+
+fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> {
+    let mut root = BTreeMap::new();
+    for (name, _) in &function.parameters {
+        if root.insert(name.clone(), name.clone()).is_some() {
+            return Err(CompileError::DuplicateName(name.clone()));
+        }
+    }
+    let mut scopes = vec![root];
+    let mut next_local = 0_u32;
+    resolve_statements(&mut function.body, &mut scopes, &mut next_local)
+}
+
+fn resolve_statements(
+    statements: &mut [AstStatement],
+    scopes: &mut Vec<BTreeMap<String, String>>,
+    next_local: &mut u32,
+) -> Result<(), CompileError> {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { name, value } => {
+                resolve_expression(value, scopes)?;
+                let source_name = name.clone();
+                if scopes
+                    .last()
+                    .expect("a function always has a lexical scope")
+                    .contains_key(&source_name)
+                {
+                    return Err(CompileError::DuplicateName(source_name));
+                }
+                let resolved = format!("{source_name}#{}", *next_local);
+                *next_local = next_local
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                scopes
+                    .last_mut()
+                    .expect("a function always has a lexical scope")
+                    .insert(source_name, resolved.clone());
+                *name = resolved;
+            }
+            AstStatement::Return(expression)
+            | AstStatement::Expression(expression)
+            | AstStatement::Defer(expression) => resolve_expression(expression, scopes)?,
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                resolve_expression(condition, scopes)?;
+                scopes.push(BTreeMap::new());
+                resolve_statements(then_body, scopes, next_local)?;
+                scopes.pop();
+                scopes.push(BTreeMap::new());
+                resolve_statements(else_body, scopes, next_local)?;
+                scopes.pop();
+            }
+            AstStatement::While { condition, body } => {
+                resolve_expression(condition, scopes)?;
+                scopes.push(BTreeMap::new());
+                resolve_statements(body, scopes, next_local)?;
+                scopes.pop();
+            }
+        }
+    }
+    Ok(())
+}
+
+fn resolve_expression(
+    expression: &mut AstExpression,
+    scopes: &[BTreeMap<String, String>],
+) -> Result<(), CompileError> {
+    match expression {
+        AstExpression::Name(name) => {
+            let resolved = scopes
+                .iter()
+                .rev()
+                .find_map(|scope| scope.get(name))
+                .cloned()
+                .ok_or_else(|| CompileError::UnknownName(name.clone()))?;
+            *name = resolved;
+        }
+        AstExpression::Binary { lhs, rhs, .. } => {
+            resolve_expression(lhs, scopes)?;
+            resolve_expression(rhs, scopes)?;
+        }
+        AstExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                resolve_expression(argument, scopes)?;
+            }
+        }
+        AstExpression::Await(expression) => resolve_expression(expression, scopes)?,
+        AstExpression::Integer(_) | AstExpression::Bool(_) => {}
+    }
+    Ok(())
 }
 
 fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), CompileError> {
@@ -617,17 +733,17 @@ fn check_statements(
     locals: &mut BTreeMap<String, (u16, ValueType)>,
     signatures: &BTreeMap<String, Signature>,
     result: ValueType,
+    next_register: &mut u16,
 ) -> Result<Flow, CompileError> {
     let mut flow = Flow::FallsThrough;
     for statement in statements {
-        if flow != Flow::FallsThrough {
-            break;
-        }
         match statement {
             AstStatement::Bind { name, value } => {
                 let ty = expression_type(value, locals, signatures)?;
-                let register =
-                    u16::try_from(locals.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                let register = *next_register;
+                *next_register = next_register
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
                 if locals.insert(name.clone(), (register, ty)).is_some() {
                     return Err(CompileError::DuplicateName(name.clone()));
                 }
@@ -651,8 +767,23 @@ fn check_statements(
                 }
                 let mut then_locals = locals.clone();
                 let mut else_locals = locals.clone();
-                let then_flow = check_statements(then_body, &mut then_locals, signatures, result)?;
-                let else_flow = check_statements(else_body, &mut else_locals, signatures, result)?;
+                let then_flow = check_statements(
+                    then_body,
+                    &mut then_locals,
+                    signatures,
+                    result,
+                    next_register,
+                )?;
+                let else_flow = check_statements(
+                    else_body,
+                    &mut else_locals,
+                    signatures,
+                    result,
+                    next_register,
+                )?;
+                for (name, binding) in then_locals.into_iter().chain(else_locals) {
+                    locals.entry(name).or_insert(binding);
+                }
                 if then_flow == Flow::Returns && else_flow == Flow::Returns {
                     flow = Flow::Returns;
                 } else if then_flow != Flow::FallsThrough && else_flow != Flow::FallsThrough {
@@ -664,7 +795,11 @@ fn check_statements(
                     return Err(CompileError::TypeMismatch);
                 }
                 let mut loop_locals = locals.clone();
-                let body_flow = check_statements(body, &mut loop_locals, signatures, result)?;
+                let body_flow =
+                    check_statements(body, &mut loop_locals, signatures, result, next_register)?;
+                for (name, binding) in loop_locals {
+                    locals.entry(name).or_insert(binding);
+                }
                 if matches!(condition, AstExpression::Bool(true)) && body_flow != Flow::FallsThrough
                 {
                     flow = body_flow;
@@ -757,7 +892,7 @@ fn lower_type(ty: &AstType) -> ValueType {
     match ty {
         AstType::I32 => ValueType::I32,
         AstType::Bool => ValueType::Bool,
-        AstType::Named(_) => ValueType::Ref,
+        AstType::Named(name) => ValueType::Named(StableId::from_name(name)),
     }
 }
 
@@ -789,9 +924,13 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             u16::try_from(function.locals.len() + 8).map_err(|_| CompileError::TooManyRegisters)?;
         let mut root_bitmap = vec![false; usize::from(registers)];
         for (register, ty) in function.locals.values() {
-            root_bitmap[usize::from(*register)] = *ty == ValueType::Ref;
+            root_bitmap[usize::from(*register)] = ty.is_reference();
         }
-        if function.signature.result == Some(ValueType::Ref) {
+        if function
+            .signature
+            .result
+            .is_some_and(ValueType::is_reference)
+        {
             root_bitmap[function.locals.len()] = true;
         }
         let mut changed = true;
@@ -806,7 +945,10 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
                         ..
                     } => (
                         *dst,
-                        hir.functions[*callee as usize].signature.result == Some(ValueType::Ref),
+                        hir.functions[*callee as usize]
+                            .signature
+                            .result
+                            .is_some_and(ValueType::is_reference),
                     ),
                     _ => continue,
                 };
@@ -831,6 +973,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             root_bitmap,
             root_maps,
             safepoints,
+            loop_bounds: Vec::new(),
             effect: function.effect,
             max_static_call_depth: 1,
             code,
@@ -862,6 +1005,9 @@ fn emit_statements(
                 function,
                 arguments,
             }) => {
+                if arguments.len() > 8 {
+                    return Err(CompileError::DeferCaptureLimit);
+                }
                 let args_base = temporary
                     .checked_add(1)
                     .ok_or(CompileError::TooManyRegisters)?;
@@ -1052,19 +1198,40 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
 }
 
 pub fn compile(source: &str) -> Result<VerifiedModule, CompileError> {
+    compile_module(source, None)
+}
+
+pub fn compile_with_metadata(
+    source: &str,
+    host_hash: StableId,
+    schema_hash: StableId,
+) -> Result<VerifiedModule, CompileError> {
+    compile_module(source, Some((host_hash, schema_hash)))
+}
+
+fn compile_module(
+    source: &str,
+    metadata: Option<(StableId, StableId)>,
+) -> Result<VerifiedModule, CompileError> {
     let tokens = lex(source)?;
     let ast = parse(&tokens)?;
     let hir = resolve_and_typecheck(ast)?;
-    let module = emit_bytecode(&hir)?;
+    let mut module = emit_bytecode(&hir)?;
+    if let Some((host_hash, schema_hash)) = metadata {
+        module.host_interface_hash = Some(host_hash);
+        module.schema_hash = Some(schema_hash);
+    }
     verify(module, VerifierLimits::default())
         .map_err(|error| CompileError::Verify(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
+    use nexa_bytecode::FunctionEffect;
+    use nexa_core::StableId;
     use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue};
 
-    use super::compile;
+    use super::{CompileError, compile};
 
     #[test]
     fn arithmetic_function_compiles_verifies_and_executes() {
@@ -1126,10 +1293,13 @@ mod tests {
             }",
         )
         .unwrap();
-        let value = RuntimeValue::Ref(GcRef {
-            index: 3,
-            generation: 4,
-        });
+        let value = RuntimeValue::NamedRef {
+            reference: GcRef {
+                index: 3,
+                generation: 4,
+            },
+            type_id: StableId::from_name("Entity"),
+        };
         assert!(matches!(
             CheckedInterpreter::run(&reference, 0, &[value], 100).unwrap(),
             InterpreterOutcome::Returned {
@@ -1151,6 +1321,95 @@ mod tests {
             CheckedInterpreter::resume(&task, continuation, 100).unwrap(),
             InterpreterOutcome::Returned {
                 value: Some(RuntimeValue::I32(8)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn effects_flow_scopes_defer_and_nominal_types_are_enforced() {
+        assert_eq!(
+            compile(
+                "fn id(value: i32) -> i32 { return value; }
+                 fn bad(value: i32) -> i32 { return await id(value); }"
+            )
+            .unwrap_err(),
+            CompileError::InvalidEffect
+        );
+        let immediate = compile("immediate fn one() -> i32 { return 1; }").unwrap();
+        assert_eq!(
+            immediate.module().functions[0].effect,
+            FunctionEffect::Immediate
+        );
+        assert_eq!(
+            compile(
+                "fn id(value: i32) -> i32 { return value; }
+                 cleanup fn bad(value: i32) -> i32 { return await id(value); }"
+            )
+            .unwrap_err(),
+            CompileError::InvalidEffect
+        );
+        assert_eq!(
+            compile("fn partial(flag: bool) -> i32 { if flag { return 1; } }").unwrap_err(),
+            CompileError::MissingReturn
+        );
+        assert!(matches!(
+            compile(
+                "fn scoped(flag: bool) -> i32 {
+                    if flag { let hidden = 1; hidden; }
+                    return hidden;
+                 }"
+            ),
+            Err(CompileError::UnknownName(name)) if name == "hidden"
+        ));
+        assert_eq!(
+            compile(
+                "struct A { value: i32; }
+                 struct B { value: i32; }
+                 fn take(value: A) -> A { return value; }
+                 fn bad(value: B) -> A { return take(value); }"
+            )
+            .unwrap_err(),
+            CompileError::TypeMismatch
+        );
+
+        let shadow = compile(
+            "fn shadow() -> i32 {
+                let value = 1;
+                if true { let value = 2; value; }
+                return value;
+             }",
+        )
+        .unwrap();
+        assert!(matches!(
+            CheckedInterpreter::run(&shadow, 0, &[], 100).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(1)),
+                ..
+            }
+        ));
+
+        let deferred = compile(
+            "fn finalize(value: i32) -> i32 { return value; }
+             fn run(value: i32) -> i32 {
+                defer finalize(value);
+                return value;
+             }",
+        )
+        .unwrap();
+        assert!(matches!(
+            deferred.module().functions[1].code.as_slice(),
+            [
+                nexa_bytecode::Instruction::Move { .. },
+                nexa_bytecode::Instruction::DeferPush { .. },
+                ..,
+                nexa_bytecode::Instruction::Return { .. }
+            ]
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run(&deferred, 1, &[RuntimeValue::I32(5)], 100).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(5)),
                 ..
             }
         ));
