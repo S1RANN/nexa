@@ -1,0 +1,27 @@
+machine Scope
+
+state Created initial
+state Active
+state CancelRequested
+state Cancelling
+state Cancelled
+state Destroyed terminal
+
+event Activate
+event RequestCancel
+event ChildrenObserved
+event ChildrenFinished
+event Destroy
+
+resource active_scope
+
+invariant inactive_scope_rejects_child_admission
+invariant destroyed_scope_has_no_children
+
+transition SCOPE_CREATED_ACTIVATE_ACTIVE Created Activate Active delta=active_scope:+1
+transition SCOPE_CANCEL_REQUESTED_CHILDREN_OBSERVED_CANCELLING CancelRequested ChildrenObserved Cancelling
+transition SCOPE_ACTIVE_CANCEL_REQUESTED Active RequestCancel CancelRequested
+transition SCOPE_CANCELLING_CHILDREN_FINISHED Cancelling ChildrenFinished Cancelled
+transition SCOPE_CANCELLED_DESTROY_DESTROYED Cancelled Destroy Destroyed delta=active_scope:-1
+
+end

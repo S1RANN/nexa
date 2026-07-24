@@ -1,0 +1,35 @@
+machine Module
+
+state Prepared initial
+state Quiescing
+state Staged
+state Activating
+state Active
+state ActivationFaulted terminal
+state Faulted terminal
+
+event BeginQuiesce
+event QuiesceSucceeded
+event QuiesceFailed
+event StageFailed
+event Commit
+event ActivationSucceeded
+event ActivationFailed
+event RuntimeFault
+event BeginReload
+
+invariant commit_has_single_epoch_root_publication
+invariant precommit_failure_can_restore_old_module
+invariant activation_failure_never_restores_old_tasks
+
+transition MODULE_PREPARED_BEGIN_QUIESCE Prepared BeginQuiesce Quiescing
+transition MODULE_QUIESCING_SUCCEEDED_STAGED Quiescing QuiesceSucceeded Staged
+transition MODULE_QUIESCING_FAILED_ACTIVE Quiescing QuiesceFailed Active
+transition MODULE_STAGED_FAILED_ACTIVE Staged StageFailed Active
+transition MODULE_STAGED_COMMIT_ACTIVATING Staged Commit Activating
+transition MODULE_ACTIVATING_SUCCEEDED_ACTIVE Activating ActivationSucceeded Active
+transition MODULE_ACTIVATING_FAILED_FAULTED Activating ActivationFailed ActivationFaulted
+transition MODULE_ACTIVE_RUNTIME_FAULT Active RuntimeFault Faulted
+transition MODULE_ACTIVE_BEGIN_RELOAD Active BeginReload Quiescing
+
+end

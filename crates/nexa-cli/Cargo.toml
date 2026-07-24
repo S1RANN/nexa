@@ -1,0 +1,17 @@
+[package]
+name = "nexa-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nexa-machine = { path = "../nexa-machine" }
+nexa-model = { path = "../nexa-model" }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "nexa"
+path = "src/main.rs"

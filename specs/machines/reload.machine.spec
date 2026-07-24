@@ -1,0 +1,41 @@
+machine Reload
+
+state Planned initial
+state Preparing
+state Quiescing
+state Staging
+state Committing
+state Activating
+state Completed terminal
+state RolledBack terminal
+state ActivationFaulted terminal
+
+event Start
+event PrepareSucceeded
+event PrepareFailed
+event QuiesceSucceeded
+event QuiesceFailed
+event StageSucceeded
+event StageFailed
+event Publish
+event ActivationSucceeded
+event ActivationFailed
+
+resource staging_heap
+
+invariant old_tasks_are_paused_not_cancelled_before_commit
+invariant epoch_root_has_one_publish_point
+invariant staging_failure_discards_all_new_state
+
+transition RELOAD_PLANNED_START_PREPARING Planned Start Preparing
+transition RELOAD_PREPARE_SUCCEEDED_QUIESCING Preparing PrepareSucceeded Quiescing delta=staging_heap:+1
+transition RELOAD_PREPARE_FAILED_ROLLED_BACK Preparing PrepareFailed RolledBack
+transition RELOAD_QUIESCE_SUCCEEDED_STAGING Quiescing QuiesceSucceeded Staging
+transition RELOAD_QUIESCE_FAILED_ROLLED_BACK Quiescing QuiesceFailed RolledBack delta=staging_heap:-1
+transition RELOAD_STAGE_SUCCEEDED_COMMITTING Staging StageSucceeded Committing
+transition RELOAD_STAGE_FAILED_ROLLED_BACK Staging StageFailed RolledBack delta=staging_heap:-1
+transition RELOAD_COMMIT_PUBLISH_ACTIVATING Committing Publish Activating delta=staging_heap:-1
+transition RELOAD_ACTIVATION_SUCCEEDED_COMPLETED Activating ActivationSucceeded Completed
+transition RELOAD_ACTIVATION_FAILED_FAULTED Activating ActivationFailed ActivationFaulted
+
+end

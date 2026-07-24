@@ -1,0 +1,61 @@
+# Nexa MVR task lifecycle.
+machine Task
+
+state Created initial
+state Ready
+state Running
+state FuelYielded
+state Waiting
+state ReloadPauseRequested
+state ReloadPaused
+state CancelRequested
+state Cancelling
+state Completed terminal
+state Cancelled terminal
+state Trapped terminal
+
+event Admit
+event Poll
+event YieldFuel
+event AwaitHost
+event Resume
+event RequestReloadPause
+event ReachSafepoint
+event RollbackReload
+event CommitReload
+event RequestCancel
+event Clean
+event Finish
+event Trap
+
+guard owner_scope_valid
+guard continuation_reserved
+
+resource task_slot
+
+invariant task_always_has_owner
+invariant terminal_task_has_no_vm_resources
+invariant promotion_cannot_allocate
+
+transition TASK_CREATED_ADMIT_READY Created Admit Ready when=owner_scope_valid when=continuation_reserved delta=task_slot:+1
+transition TASK_READY_POLL_RUNNING Ready Poll Running
+transition TASK_FUEL_YIELDED_RESUME_RUNNING FuelYielded Resume Running
+transition TASK_RUNNING_FUEL_YIELDED Running YieldFuel FuelYielded
+transition TASK_RUNNING_AWAIT_WAITING Running AwaitHost Waiting
+transition TASK_WAITING_RESUME_RUNNING Waiting Resume Running
+transition TASK_RUNNING_RELOAD_PAUSE_REQUESTED Running RequestReloadPause ReloadPauseRequested
+transition TASK_WAITING_RELOAD_PAUSED Waiting RequestReloadPause ReloadPaused
+transition TASK_FUEL_YIELDED_RELOAD_PAUSED FuelYielded RequestReloadPause ReloadPaused
+transition TASK_RELOAD_REQUEST_REACH_PAUSED ReloadPauseRequested ReachSafepoint ReloadPaused
+transition TASK_RELOAD_PAUSED_ROLLBACK_RUNNING ReloadPaused RollbackReload Running
+transition TASK_RELOAD_PAUSED_COMMIT_CANCELLING ReloadPaused CommitReload Cancelling
+transition TASK_RUNNING_CANCEL_REQUESTED Running RequestCancel CancelRequested
+transition TASK_WAITING_CANCEL_REQUESTED Waiting RequestCancel CancelRequested
+transition TASK_FUEL_YIELDED_CANCEL_REQUESTED FuelYielded RequestCancel CancelRequested
+transition TASK_CANCEL_REQUEST_REACH_CANCELLING CancelRequested ReachSafepoint Cancelling
+transition TASK_CANCELLING_CLEAN_CANCELLED Cancelling Clean Cancelled delta=task_slot:-1
+transition TASK_RUNNING_FINISH_COMPLETED Running Finish Completed delta=task_slot:-1
+transition TASK_RUNNING_TRAP_TRAPPED Running Trap Trapped delta=task_slot:-1
+transition TASK_CANCELLING_TRAP_TRAPPED Cancelling Trap Trapped delta=task_slot:-1
+
+end

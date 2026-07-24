@@ -1,0 +1,16 @@
+[package]
+name = "nexa-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nexa-core = { path = "../nexa-core" }
+nexa-machine = { path = "../nexa-machine" }
+
+[dev-dependencies]
+nexa-runtime = { path = "../nexa-runtime" }
+
+[lints]
+workspace = true

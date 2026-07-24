@@ -1,0 +1,20 @@
+machine ReleaseQueue
+
+state Healthy initial
+state ReleaseBacklog
+state ResourceStalled
+
+event SoftLimit
+event HardLimit
+event Drained
+event Recover
+
+invariant existing_release_enqueue_is_never_rejected
+invariant stalled_state_rejects_at_resource_acquisition_point
+
+transition RELEASE_QUEUE_HEALTHY_SOFT_BACKLOG Healthy SoftLimit ReleaseBacklog
+transition RELEASE_QUEUE_BACKLOG_HARD_STALLED ReleaseBacklog HardLimit ResourceStalled
+transition RELEASE_QUEUE_BACKLOG_DRAINED_HEALTHY ReleaseBacklog Drained Healthy
+transition RELEASE_QUEUE_STALLED_RECOVER_HEALTHY ResourceStalled Recover Healthy
+
+end

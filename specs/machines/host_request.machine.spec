@@ -1,0 +1,35 @@
+machine HostRequest
+
+state Created initial
+state Submitted
+state InFlight
+state CancelRequested
+state Detached
+state Completed
+state Discarded
+state Released terminal
+
+event Submit
+event Dispatch
+event RequestCancel
+event Detach
+event Complete
+event Discard
+event Release
+
+resource release_record
+
+invariant terminal_request_cannot_deliver_to_task
+invariant release_record_is_reserved_before_publish
+
+transition HOST_REQUEST_CREATED_SUBMIT_SUBMITTED Created Submit Submitted delta=release_record:+1
+transition HOST_REQUEST_SUBMITTED_DISPATCH_IN_FLIGHT Submitted Dispatch InFlight
+transition HOST_REQUEST_IN_FLIGHT_CANCEL_REQUESTED InFlight RequestCancel CancelRequested
+transition HOST_REQUEST_CANCEL_REQUESTED_DETACHED CancelRequested Detach Detached
+transition HOST_REQUEST_IN_FLIGHT_COMPLETED InFlight Complete Completed
+transition HOST_REQUEST_IN_FLIGHT_DISCARDED InFlight Discard Discarded
+transition HOST_REQUEST_DETACHED_RELEASED Detached Release Released delta=release_record:-1
+transition HOST_REQUEST_COMPLETED_RELEASED Completed Release Released delta=release_record:-1
+transition HOST_REQUEST_DISCARDED_RELEASED Discarded Release Released delta=release_record:-1
+
+end
