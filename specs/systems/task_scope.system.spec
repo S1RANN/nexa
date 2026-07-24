@@ -1,0 +1,24 @@
+system TaskScope
+max_scopes 2
+max_tasks 2
+max_depth 24
+
+operation CreateScope
+operation AdmitTask
+operation PollTask
+operation YieldFuel
+operation AwaitHost
+operation ResumeTask
+operation FinishTask
+operation CancelScope
+operation ReachSafepoint
+operation DestroyScope
+
+invariant task_has_valid_owner
+invariant transient_membership_matches
+invariant persistent_membership_matches
+invariant terminal_task_not_counted
+invariant cancelled_scope_rejects_admission
+invariant destroyed_scope_has_no_task
+
+end

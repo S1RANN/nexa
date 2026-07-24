@@ -1,51 +1,65 @@
 use nexa_core::{machine_event_id, machine_invariant_hash, machine_state_id};
 use nexa_machine::MachineSpec;
 use nexa_model::ReferenceMachine;
-use nexa_runtime::{ScopeManager, TaskError, TaskEvent, TaskManager, TaskState};
+use nexa_runtime::{RuntimeError, RuntimeLimits, TaskError, TaskRuntime, TaskState};
+
+type TaskOperation = fn(&mut TaskRuntime, nexa_runtime::TaskHandle) -> Result<(), RuntimeError>;
 
 #[test]
 fn runtime_task_trace_matches_reference_model_for_acceptance_path() {
     let spec = MachineSpec::parse(include_str!("../../../specs/machines/task.machine.spec"))
         .expect("task spec is valid");
     let mut model = ReferenceMachine::new(&spec);
-    let mut scopes = ScopeManager::new(17);
-    let owner = scopes.create(None).unwrap();
-    let mut runtime = TaskManager::new(17);
+    let mut runtime = TaskRuntime::new(17, RuntimeLimits::default());
+    let owner = runtime.create_scope(None).unwrap();
     let module_epoch = 23;
 
     let mut expected = Vec::new();
     let admission = model.apply("Admit", |_| true).unwrap();
     expected.push(expected_trace(&admission, owner.raw()));
-    let task = runtime
-        .admit(&mut scopes, owner, module_epoch, true)
-        .unwrap();
+    let task = runtime.admit_task(owner, module_epoch, true).unwrap();
 
     let trace_len = runtime.trace().records().len();
     assert!(matches!(
-        runtime.apply(&mut scopes, task, TaskEvent::YieldFuel),
-        Err(TaskError::Transition(_))
+        runtime.yield_task(task),
+        Err(RuntimeError::Task(TaskError::Transition(_)))
     ));
-    assert_eq!(runtime.trace().records().len(), trace_len);
-    assert_eq!(runtime.snapshot(task).unwrap().state, TaskState::Ready);
+    assert_eq!(runtime.trace().records().len(), trace_len + 1);
+    let rejected = runtime.trace().records().last().unwrap();
+    assert_eq!(
+        rejected.disposition,
+        nexa_core::TransitionDisposition::Undefined
+    );
+    assert_eq!(rejected.old_state, rejected.new_state);
+    assert!(rejected.resource_deltas.is_empty());
+    assert_eq!(runtime.task_snapshot(task).unwrap().state, TaskState::Ready);
 
-    let events = [
-        ("Poll", TaskEvent::Poll),
-        ("YieldFuel", TaskEvent::YieldFuel),
-        ("Resume", TaskEvent::Resume),
-        ("RequestReloadPause", TaskEvent::RequestReloadPause),
-        ("ReachSafepoint", TaskEvent::ReachSafepoint),
-        ("RollbackReload", TaskEvent::RollbackReload),
-        ("RequestCancel", TaskEvent::RequestCancel),
-        ("ReachSafepoint", TaskEvent::ReachSafepoint),
-        ("Clean", TaskEvent::Clean),
+    let events: &[(&str, TaskOperation)] = &[
+        ("Poll", TaskRuntime::poll_task),
+        ("YieldFuel", TaskRuntime::yield_task),
+        ("Resume", TaskRuntime::resume_task),
+        ("RequestReloadPause", TaskRuntime::request_reload_pause),
+        ("ReachSafepoint", TaskRuntime::reach_task_safepoint),
+        ("RollbackReload", TaskRuntime::rollback_reload),
+        ("RequestCancel", TaskRuntime::request_task_cancel),
+        ("ReachSafepoint", TaskRuntime::reach_task_safepoint),
+        ("Clean", TaskRuntime::clean_task),
     ];
-    for (name, event) in events {
+    for (name, operation) in events {
         let step = model.apply(name, |_| true).unwrap();
         expected.push(expected_trace(&step, owner.raw()));
-        runtime.apply(&mut scopes, task, event).unwrap();
+        operation(&mut runtime, task).unwrap();
     }
 
-    let actual = runtime.trace().records();
+    let actual = runtime
+        .trace()
+        .records()
+        .iter()
+        .filter(|record| {
+            record.machine_kind == nexa_core::MachineKind::Task
+                && record.disposition == nexa_core::TransitionDisposition::Applied
+        })
+        .collect::<Vec<_>>();
     assert_eq!(actual.len(), expected.len());
     for (record, expected) in actual.iter().zip(&expected) {
         assert_eq!(record.transition_id, expected.transition_id);
@@ -60,10 +74,24 @@ fn runtime_task_trace_matches_reference_model_for_acceptance_path() {
 
     assert_eq!(model.state(), "Cancelled");
     assert_eq!(model.resources()["task_slot"], 0);
-    assert_eq!(runtime.active_len(), 0);
-    let owner_snapshot = scopes.snapshot(owner).unwrap();
+    assert!(runtime.task_snapshot(task).is_err());
+    let owner_snapshot = runtime.scope_snapshot(owner).unwrap();
     assert_eq!(owner_snapshot.transient_children, 0);
     assert_eq!(owner_snapshot.persistent_children, 0);
+    assert!(
+        runtime
+            .trace()
+            .records()
+            .windows(2)
+            .all(|window| window[0].sequence + 1 == window[1].sequence)
+    );
+    assert!(
+        runtime
+            .trace()
+            .records()
+            .iter()
+            .any(|record| record.machine_kind == nexa_core::MachineKind::Scope)
+    );
 }
 
 struct ExpectedTrace {

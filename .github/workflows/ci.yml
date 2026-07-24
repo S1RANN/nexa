@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            experimental: false
+          - os: windows-latest
+            experimental: true
+          - os: macos-latest
+            experimental: true
+
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Check workspace
+        run: cargo check --workspace --all-targets
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test workspace
+        run: cargo test --workspace --all-targets
+      - name: Check baseline
+        run: cargo run -p nexa-cli -- baseline check
+      - name: Check machine specifications
+        run: cargo run -p nexa-cli -- machine check
+      - name: Check generated machine code
+        run: cargo run -p nexa-machine -- check-generated
+      - name: Check bounded models
+        run: cargo run -p nexa-cli -- model check
+      - name: Upload shortest model path
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-path-${{ matrix.os }}
+          path: target/model-artifacts/shortest-failure.txt

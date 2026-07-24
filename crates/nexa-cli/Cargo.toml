@@ -6,6 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+nexa-compiler = { path = "../nexa-compiler" }
+nexa-idl = { path = "../nexa-idl" }
 nexa-machine = { path = "../nexa-machine" }
 nexa-model = { path = "../nexa-model" }
 

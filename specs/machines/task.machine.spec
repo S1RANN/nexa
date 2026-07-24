@@ -33,9 +33,9 @@ guard continuation_reserved
 
 resource task_slot
 
-invariant task_always_has_owner
-invariant terminal_task_has_no_vm_resources
-invariant promotion_cannot_allocate
+invariant nonnegative task_slot
+invariant terminal_zero task_slot
+invariant state_requires Running task_slot 1
 
 transition TASK_CREATED_ADMIT_READY Created Admit Ready when=owner_scope_valid when=continuation_reserved delta=task_slot:+1
 transition TASK_READY_POLL_RUNNING Ready Poll Running

@@ -23,9 +23,8 @@ event ActivationFailed
 
 resource staging_heap
 
-invariant old_tasks_are_paused_not_cancelled_before_commit
-invariant epoch_root_has_one_publish_point
-invariant staging_failure_discards_all_new_state
+invariant nonnegative staging_heap
+invariant terminal_zero staging_heap
 
 transition RELOAD_PLANNED_START_PREPARING Planned Start Preparing
 transition RELOAD_PREPARE_SUCCEEDED_QUIESCING Preparing PrepareSucceeded Quiescing delta=staging_heap:+1

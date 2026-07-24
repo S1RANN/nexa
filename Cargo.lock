@@ -6,21 +6,50 @@ version = 4
 name = "nexa"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
+ "nexa-compiler",
  "nexa-core",
+ "nexa-idl",
  "nexa-runtime",
+ "nexa-verifier",
+]
+
+[[package]]
+name = "nexa-bytecode"
+version = "0.1.0"
+dependencies = [
+ "nexa-core",
 ]
 
 [[package]]
 name = "nexa-cli"
 version = "0.1.0"
 dependencies = [
+ "nexa-compiler",
+ "nexa-idl",
  "nexa-machine",
  "nexa-model",
 ]
 
 [[package]]
+name = "nexa-compiler"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
+ "nexa-runtime",
+ "nexa-verifier",
+]
+
+[[package]]
 name = "nexa-core"
 version = "0.1.0"
+
+[[package]]
+name = "nexa-idl"
+version = "0.1.0"
+dependencies = [
+ "nexa-core",
+]
 
 [[package]]
 name = "nexa-machine"
@@ -42,6 +71,14 @@ dependencies = [
 name = "nexa-runtime"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
  "nexa-core",
- "nexa-machine",
+ "nexa-verifier",
+]
+
+[[package]]
+name = "nexa-verifier"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
 ]

@@ -12,16 +12,41 @@ event RequestCancel
 event ChildrenObserved
 event ChildrenFinished
 event Destroy
+event AddTransient
+event PromoteChild
+event CompleteTransient
+event CompletePersistent
 
 resource active_scope
+resource transient_child
+resource persistent_child
 
-invariant inactive_scope_rejects_child_admission
-invariant destroyed_scope_has_no_children
+invariant nonnegative active_scope
+invariant terminal_zero active_scope
+invariant state_requires Active active_scope 1
+invariant nonnegative transient_child
+invariant nonnegative persistent_child
+invariant terminal_zero transient_child
+invariant terminal_zero persistent_child
+
+guard children_zero
+guard has_transient
+guard has_persistent
 
 transition SCOPE_CREATED_ACTIVATE_ACTIVE Created Activate Active delta=active_scope:+1
 transition SCOPE_CANCEL_REQUESTED_CHILDREN_OBSERVED_CANCELLING CancelRequested ChildrenObserved Cancelling
 transition SCOPE_ACTIVE_CANCEL_REQUESTED Active RequestCancel CancelRequested
-transition SCOPE_CANCELLING_CHILDREN_FINISHED Cancelling ChildrenFinished Cancelled
+transition SCOPE_CANCELLING_CHILDREN_FINISHED Cancelling ChildrenFinished Cancelled when=children_zero
 transition SCOPE_CANCELLED_DESTROY_DESTROYED Cancelled Destroy Destroyed delta=active_scope:-1
+transition SCOPE_ACTIVE_ADD_TRANSIENT Active AddTransient Active delta=transient_child:+1
+transition SCOPE_ACTIVE_PROMOTE_CHILD Active PromoteChild Active when=has_transient delta=transient_child:-1 delta=persistent_child:+1
+transition SCOPE_CANCEL_REQUESTED_PROMOTE_CHILD CancelRequested PromoteChild CancelRequested when=has_transient delta=transient_child:-1 delta=persistent_child:+1
+transition SCOPE_CANCELLING_PROMOTE_CHILD Cancelling PromoteChild Cancelling when=has_transient delta=transient_child:-1 delta=persistent_child:+1
+transition SCOPE_ACTIVE_COMPLETE_TRANSIENT Active CompleteTransient Active when=has_transient delta=transient_child:-1
+transition SCOPE_CANCEL_REQUESTED_COMPLETE_TRANSIENT CancelRequested CompleteTransient CancelRequested when=has_transient delta=transient_child:-1
+transition SCOPE_CANCELLING_COMPLETE_TRANSIENT Cancelling CompleteTransient Cancelling when=has_transient delta=transient_child:-1
+transition SCOPE_ACTIVE_COMPLETE_PERSISTENT Active CompletePersistent Active when=has_persistent delta=persistent_child:-1
+transition SCOPE_CANCEL_REQUESTED_COMPLETE_PERSISTENT CancelRequested CompletePersistent CancelRequested when=has_persistent delta=persistent_child:-1
+transition SCOPE_CANCELLING_COMPLETE_PERSISTENT Cancelling CompletePersistent Cancelling when=has_persistent delta=persistent_child:-1
 
 end

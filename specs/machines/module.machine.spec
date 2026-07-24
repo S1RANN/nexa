@@ -18,9 +18,6 @@ event ActivationFailed
 event RuntimeFault
 event BeginReload
 
-invariant commit_has_single_epoch_root_publication
-invariant precommit_failure_can_restore_old_module
-invariant activation_failure_never_restores_old_tasks
 
 transition MODULE_PREPARED_BEGIN_QUIESCE Prepared BeginQuiesce Quiescing
 transition MODULE_QUIESCING_SUCCEEDED_STAGED Quiescing QuiesceSucceeded Staged

@@ -1,22 +1,42 @@
 use nexa_core::{MachineKind, TraceRecord};
 
-/// Monotonic in-memory trace sink used by the first runtime milestone and differential tests.
-#[derive(Clone, Debug, Default)]
-pub struct TraceRecorder {
+/// Realm-wide monotonic trace sink. All VM-thread machines append to this single total order.
+#[derive(Clone, Debug)]
+pub struct RuntimeTrace {
     next_sequence: u64,
     records: Vec<TraceRecord>,
+    enabled: bool,
 }
 
-impl TraceRecorder {
+impl Default for RuntimeTrace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RuntimeTrace {
     #[must_use]
     pub const fn new() -> Self {
         Self {
             next_sequence: 0,
             records: Vec::new(),
+            enabled: true,
+        }
+    }
+
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            next_sequence: 0,
+            records: Vec::with_capacity(capacity),
+            enabled: true,
         }
     }
 
     pub fn record(&mut self, mut record: TraceRecord) {
+        if !self.enabled {
+            return;
+        }
         record.sequence = self.next_sequence;
         self.next_sequence = self
             .next_sequence
@@ -40,5 +60,9 @@ impl TraceRecorder {
             .iter()
             .filter(|record| record.machine_kind == kind)
             .count()
+    }
+
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
     }
 }

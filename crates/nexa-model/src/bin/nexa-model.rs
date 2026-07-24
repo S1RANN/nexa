@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
+use nexa_model::system::{SystemConfig, explore_task_scope};
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
@@ -65,6 +66,22 @@ fn run(path: &Path) -> Result<(), String> {
         "model exploration passed for {} machines, {transitions} transitions, {snapshots} snapshots",
         paths.len()
     );
+    if path.is_dir() {
+        let config = SystemConfig::parse(include_str!(
+            "../../../../specs/systems/task_scope.system.spec"
+        ))?;
+        let report = explore_task_scope(config);
+        if !report.failures.is_empty() {
+            return Err(format!(
+                "TaskScope system model failed: {:?}",
+                report.failures
+            ));
+        }
+        println!(
+            "TaskScope: {} worlds, {} rejected operations",
+            report.visited_worlds, report.rejected_operations
+        );
+    }
     Ok(())
 }
 

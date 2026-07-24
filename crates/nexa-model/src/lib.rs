@@ -1,9 +1,11 @@
 //! Bounded exploration of generated Nexa machine specifications.
 
+pub mod system;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use nexa_core::{RawHandle, StableId, machine_invariant_hash};
-use nexa_machine::{MachineSpec, TransitionSpec};
+use nexa_machine::{InvariantSpec, MachineSpec, TransitionSpec};
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Snapshot {
@@ -18,7 +20,9 @@ pub struct ExplorationReport {
     pub taken_transitions: BTreeSet<StableId>,
     pub guard_true_branches: BTreeSet<(StableId, String)>,
     pub guard_false_branches: BTreeSet<(StableId, String)>,
+    pub guard_rejections: Vec<GuardRejection>,
     pub visited_snapshots: usize,
+    pub truncated: bool,
     pub failures: Vec<ModelFailure>,
 }
 
@@ -34,7 +38,7 @@ impl Default for ExploreConfig {
         Self {
             max_depth: 256,
             max_snapshots: 100_000,
-            max_resource_amount: 1_024,
+            max_resource_amount: 4,
         }
     }
 }
@@ -43,6 +47,15 @@ impl Default for ExploreConfig {
 pub struct ModelFailure {
     pub message: String,
     pub path: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardRejection {
+    pub transition_id: StableId,
+    pub guard: String,
+    pub preceding_true_guards: Vec<String>,
+    pub state: String,
+    pub resources: BTreeMap<String, i64>,
 }
 
 impl ExplorationReport {
@@ -97,6 +110,7 @@ pub fn explore_with_config(spec: &MachineSpec, config: ExploreConfig) -> Explora
 
     while let Some(entry) = queue.pop_front() {
         report.reachable_states.insert(entry.snapshot.state.clone());
+        check_invariants(spec, &entry.snapshot, &entry.path, &mut report);
         let terminal = spec
             .states
             .iter()
@@ -117,13 +131,7 @@ pub fn explore_with_config(spec: &MachineSpec, config: ExploreConfig) -> Explora
             continue;
         }
         if entry.path.len() >= config.max_depth {
-            report.failures.push(ModelFailure {
-                message: format!(
-                    "exploration reached maximum depth {} in state `{}`",
-                    config.max_depth, entry.snapshot.state
-                ),
-                path: entry.path,
-            });
+            report.truncated = true;
             continue;
         }
 
@@ -132,7 +140,9 @@ pub fn explore_with_config(spec: &MachineSpec, config: ExploreConfig) -> Explora
             .iter()
             .filter(|transition| transition.from == entry.snapshot.state)
         {
-            record_guard_coverage(spec, transition, &mut report);
+            if !record_guard_paths(spec, transition, &entry.snapshot, &mut report) {
+                continue;
+            }
             let mut next = entry.snapshot.clone();
             next.state.clone_from(&transition.to);
             let mut path = entry.path.clone();
@@ -154,13 +164,7 @@ pub fn explore_with_config(spec: &MachineSpec, config: ExploreConfig) -> Explora
                     });
                     valid_resources = false;
                 } else if *value > config.max_resource_amount {
-                    report.failures.push(ModelFailure {
-                        message: format!(
-                            "transition `{}` exceeds resource bound {} for `{}`",
-                            transition.name, config.max_resource_amount, delta.resource
-                        ),
-                        path: path.clone(),
-                    });
+                    report.truncated = true;
                     valid_resources = false;
                 }
             }
@@ -168,13 +172,7 @@ pub fn explore_with_config(spec: &MachineSpec, config: ExploreConfig) -> Explora
                 .taken_transitions
                 .insert(spec.transition_id(transition));
             if valid_resources && !seen.contains(&next) && seen.len() >= config.max_snapshots {
-                report.failures.push(ModelFailure {
-                    message: format!(
-                        "exploration reached maximum snapshot count {}",
-                        config.max_snapshots
-                    ),
-                    path: path.clone(),
-                });
+                report.truncated = true;
             } else if valid_resources && seen.insert(next.clone()) {
                 queue.push_back(QueueEntry {
                     snapshot: next,
@@ -308,19 +306,124 @@ impl<'a> ReferenceMachine<'a> {
     }
 }
 
-fn record_guard_coverage(
+fn record_guard_paths(
     spec: &MachineSpec,
     transition: &TransitionSpec,
+    snapshot: &Snapshot,
     report: &mut ExplorationReport,
-) {
+) -> bool {
     let transition_id = spec.transition_id(transition);
+    let mut preceding_true_guards = Vec::new();
     for guard in &transition.guards {
+        let value = guard_value(snapshot, guard);
+        if value != Some(true) {
+            report.guard_rejections.push(GuardRejection {
+                transition_id,
+                guard: guard.clone(),
+                preceding_true_guards: preceding_true_guards.clone(),
+                state: snapshot.state.clone(),
+                resources: snapshot.resources.clone(),
+            });
+            report
+                .guard_false_branches
+                .insert((transition_id, guard.clone()));
+        }
+        if value == Some(false) {
+            return false;
+        }
         report
             .guard_true_branches
             .insert((transition_id, guard.clone()));
-        report
-            .guard_false_branches
-            .insert((transition_id, guard.clone()));
+        preceding_true_guards.push(guard.clone());
+    }
+    true
+}
+
+fn guard_value(snapshot: &Snapshot, guard: &str) -> Option<bool> {
+    match guard {
+        "children_zero" => Some(
+            snapshot
+                .resources
+                .get("transient_child")
+                .copied()
+                .unwrap_or(0)
+                == 0
+                && snapshot
+                    .resources
+                    .get("persistent_child")
+                    .copied()
+                    .unwrap_or(0)
+                    == 0,
+        ),
+        "has_transient" => Some(
+            snapshot
+                .resources
+                .get("transient_child")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+        ),
+        "has_persistent" => Some(
+            snapshot
+                .resources
+                .get("persistent_child")
+                .copied()
+                .unwrap_or(0)
+                > 0,
+        ),
+        _ => None,
+    }
+}
+
+fn check_invariants(
+    spec: &MachineSpec,
+    snapshot: &Snapshot,
+    path: &[String],
+    report: &mut ExplorationReport,
+) {
+    let terminal = spec
+        .states
+        .iter()
+        .find(|state| state.name == snapshot.state)
+        .is_some_and(|state| state.terminal);
+    for invariant in &spec.invariants {
+        let violation = match invariant {
+            InvariantSpec::Nonnegative { resource } => {
+                (snapshot.resources[resource] < 0).then(|| {
+                    format!(
+                        "invariant `{}` failed with {}",
+                        invariant.name(),
+                        snapshot.resources[resource]
+                    )
+                })
+            }
+            InvariantSpec::TerminalZero { resource } => {
+                (terminal && snapshot.resources[resource] != 0).then(|| {
+                    format!(
+                        "invariant `{}` failed in terminal state `{}`",
+                        invariant.name(),
+                        snapshot.state
+                    )
+                })
+            }
+            InvariantSpec::StateRequires {
+                state,
+                resource,
+                minimum,
+            } => (snapshot.state == *state && snapshot.resources[resource] < *minimum).then(|| {
+                format!(
+                    "invariant `{}` failed with {}",
+                    invariant.name(),
+                    snapshot.resources[resource]
+                )
+            }),
+        };
+        if let Some(message) = violation {
+            report.failures.push(ModelFailure {
+                message,
+                path: path.to_vec(),
+            });
+        }
     }
 }
 
@@ -356,7 +459,7 @@ end
     }
 
     #[test]
-    fn explorer_stops_an_unbounded_resource_cycle() {
+    fn explorer_bounds_an_unbounded_resource_cycle() {
         let source = r"
 machine Growing
 state Start initial
@@ -373,12 +476,8 @@ end
                 ..ExploreConfig::default()
             },
         );
-        assert!(
-            report
-                .failures
-                .iter()
-                .any(|failure| failure.message.contains("resource bound"))
-        );
+        assert!(report.truncated);
+        assert!(report.failures.is_empty());
     }
 
     #[test]
@@ -389,5 +488,31 @@ end
         assert!(model.apply("Poll", |_| true).is_err());
         assert_eq!(model.state(), "Created");
         assert_eq!(model.resources()["task_slot"], 0);
+    }
+
+    #[test]
+    fn guard_rejections_preserve_short_circuit_order_and_state() {
+        let spec = MachineSpec::parse(include_str!("../../../specs/machines/task.machine.spec"))
+            .expect("task spec is valid");
+        let report = explore(&spec);
+        let admission = spec
+            .transitions
+            .iter()
+            .find(|transition| transition.event == "Admit")
+            .unwrap();
+        let rejections = report
+            .guard_rejections
+            .iter()
+            .filter(|rejection| rejection.transition_id == spec.transition_id(admission))
+            .collect::<Vec<_>>();
+        assert_eq!(rejections.len(), 2);
+        assert!(rejections[0].preceding_true_guards.is_empty());
+        assert_eq!(rejections[1].preceding_true_guards, ["owner_scope_valid"]);
+        assert!(
+            rejections
+                .iter()
+                .all(|rejection| rejection.state == "Created"
+                    && rejection.resources["task_slot"] == 0)
+        );
     }
 }

@@ -94,6 +94,11 @@ pub fn machine_event_id(machine: &str, event: &str) -> StableId {
     StableId::from_name(&format!("{machine}::Event::{event}"))
 }
 
+#[must_use]
+pub const fn machine_instance_id(handle: RawHandle) -> u64 {
+    (handle.generation as u64) << 32 | handle.index as u64
+}
+
 /// Hashes the invariant-visible state shared by the runtime trace and reference model.
 #[must_use]
 pub fn machine_invariant_hash(
@@ -138,6 +143,13 @@ pub enum MachineKind {
     Custom(StableId),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TransitionDisposition {
+    Applied,
+    GuardRejected,
+    Undefined,
+}
+
 /// Resource accounting changes caused by one transition.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ResourceDelta {
@@ -153,6 +165,7 @@ pub struct TraceRecord {
     pub machine_kind: MachineKind,
     pub machine_id: u64,
     pub transition_id: StableId,
+    pub disposition: TransitionDisposition,
     pub old_state: StableId,
     pub event: StableId,
     pub new_state: StableId,

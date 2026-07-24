@@ -1,5 +1,5 @@
 use nexa_machine::MachineSpec;
-use nexa_runtime::ScopeManager;
+use nexa_runtime::{RuntimeLimits, TaskRuntime};
 
 #[test]
 fn runtime_scope_trace_matches_normative_transition_ids() {
@@ -24,12 +24,12 @@ fn runtime_scope_trace_matches_normative_transition_ids() {
         })
         .collect::<Vec<_>>();
 
-    let mut runtime = ScopeManager::new(11);
-    let scope = runtime.create(None).unwrap();
-    runtime.request_cancel(scope).unwrap();
-    runtime.begin_cancelling(scope).unwrap();
-    runtime.finish_cancelling(scope).unwrap();
-    runtime.destroy(scope).unwrap();
+    let mut runtime = TaskRuntime::new(11, RuntimeLimits::default());
+    let scope = runtime.create_scope(None).unwrap();
+    runtime.cancel_scope(scope).unwrap();
+    runtime.begin_scope_cancellation(scope).unwrap();
+    runtime.finish_scope_cancellation(scope).unwrap();
+    runtime.destroy_scope(scope).unwrap();
 
     let actual = runtime
         .trace()

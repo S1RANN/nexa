@@ -4,13 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
-build = "build.rs"
 
 [dependencies]
+nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-core = { path = "../nexa-core" }
-
-[build-dependencies]
-nexa-machine = { path = "../nexa-machine" }
+nexa-verifier = { path = "../nexa-verifier" }
 
 [lints]
 workspace = true

@@ -20,6 +20,7 @@ struct Slot<T> {
 #[derive(Debug)]
 pub struct SlotPool<T> {
     realm_id: u32,
+    max_capacity: u32,
     slots: Vec<Slot<T>>,
     free: Vec<u32>,
 }
@@ -45,6 +46,23 @@ pub enum HandleError {
         index: u32,
     },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotAllocError {
+    CapacityExhausted,
+    NoFreeSlot,
+}
+
+impl fmt::Display for SlotAllocError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CapacityExhausted => formatter.write_str("slot capacity exhausted"),
+            Self::NoFreeSlot => formatter.write_str("no free slot is available"),
+        }
+    }
+}
+
+impl std::error::Error for SlotAllocError {}
 
 impl fmt::Display for HandleError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -74,28 +92,44 @@ impl<T> SlotPool<T> {
     pub const fn new(realm_id: u32) -> Self {
         Self {
             realm_id,
+            max_capacity: u32::MAX,
             slots: Vec::new(),
             free: Vec::new(),
         }
     }
 
-    pub fn allocate(&mut self, value: T) -> RawHandle {
+    #[must_use]
+    pub fn with_capacity_limit(realm_id: u32, max_capacity: u32) -> Self {
+        let capacity = usize::try_from(max_capacity).unwrap_or(usize::MAX);
+        Self {
+            realm_id,
+            max_capacity,
+            slots: Vec::with_capacity(capacity),
+            free: Vec::with_capacity(capacity),
+        }
+    }
+
+    pub fn try_allocate(&mut self, value: T) -> Result<RawHandle, SlotAllocError> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert_eq!(slot.state, SlotState::Vacant);
             debug_assert!(slot.value.is_none());
             slot.state = SlotState::Occupied;
             slot.value = Some(value);
-            return RawHandle::new(self.realm_id, index, slot.generation);
+            return Ok(RawHandle::new(self.realm_id, index, slot.generation));
         }
 
-        let index = u32::try_from(self.slots.len()).expect("slot pool exhausted u32 index space");
+        let index =
+            u32::try_from(self.slots.len()).map_err(|_| SlotAllocError::CapacityExhausted)?;
+        if index >= self.max_capacity {
+            return Err(SlotAllocError::CapacityExhausted);
+        }
         self.slots.push(Slot {
             generation: 0,
             state: SlotState::Occupied,
             value: Some(value),
         });
-        RawHandle::new(self.realm_id, index, 0)
+        Ok(RawHandle::new(self.realm_id, index, 0))
     }
 
     pub fn resolve(&self, handle: RawHandle) -> Result<&T, HandleError> {
@@ -133,6 +167,22 @@ impl<T> SlotPool<T> {
             .iter()
             .filter(|slot| slot.state == SlotState::Occupied)
             .count()
+    }
+
+    #[must_use]
+    pub fn occupied_handles(&self) -> Vec<RawHandle> {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.state == SlotState::Occupied)
+            .map(|(index, slot)| {
+                RawHandle::new(
+                    self.realm_id,
+                    u32::try_from(index).expect("slot indices originate as u32"),
+                    slot.generation,
+                )
+            })
+            .collect()
     }
 
     fn resolve_slot(&self, handle: RawHandle) -> Result<&Slot<T>, HandleError> {
@@ -199,9 +249,9 @@ mod tests {
     #[test]
     fn stale_handle_cannot_resolve_a_reused_slot() {
         let mut pool = SlotPool::new(9);
-        let first = pool.allocate("first");
+        let first = pool.try_allocate("first").unwrap();
         assert_eq!(pool.release(first), Ok("first"));
-        let second = pool.allocate("second");
+        let second = pool.try_allocate("second").unwrap();
         assert_eq!(first.index, second.index);
         assert_ne!(first.generation, second.generation);
         assert!(matches!(
@@ -214,11 +264,22 @@ mod tests {
     #[test]
     fn cross_realm_handle_is_rejected_before_index_lookup() {
         let mut pool = SlotPool::new(3);
-        let handle = pool.allocate(42);
+        let handle = pool.try_allocate(42).unwrap();
         let foreign = RawHandle::new(4, handle.index, handle.generation);
         assert!(matches!(
             pool.resolve(foreign),
             Err(HandleError::WrongRealm { .. })
         ));
+    }
+
+    #[test]
+    fn capacity_exhaustion_is_fallible_and_preserves_existing_slots() {
+        let mut pool = SlotPool::with_capacity_limit(3, 1);
+        let handle = pool.try_allocate(42).unwrap();
+        assert_eq!(
+            pool.try_allocate(99),
+            Err(super::SlotAllocError::CapacityExhausted)
+        );
+        assert_eq!(pool.resolve(handle), Ok(&42));
     }
 }

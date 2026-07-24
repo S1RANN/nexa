@@ -19,8 +19,8 @@ event Release
 
 resource release_record
 
-invariant terminal_request_cannot_deliver_to_task
-invariant release_record_is_reserved_before_publish
+invariant nonnegative release_record
+invariant terminal_zero release_record
 
 transition HOST_REQUEST_CREATED_SUBMIT_SUBMITTED Created Submit Submitted delta=release_record:+1
 transition HOST_REQUEST_SUBMITTED_DISPATCH_IN_FLIGHT Submitted Dispatch InFlight

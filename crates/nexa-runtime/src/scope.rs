@@ -1,13 +1,15 @@
 use std::fmt;
 
 use nexa_core::{
-    MachineKind, RawHandle, StableId, TRACE_SCHEMA_VERSION, TraceRecord, machine_event_id,
-    machine_invariant_hash, machine_state_id,
+    MachineKind, RawHandle, StableId, TRACE_SCHEMA_VERSION, TraceRecord, TransitionDisposition,
+    machine_instance_id, machine_invariant_hash,
 };
 
-pub use crate::machines::scope::TransitionError as ScopeTransitionError;
-use crate::machines::scope::{self, Event, State};
-use crate::{HandleError, SlotPool, TraceRecorder};
+use crate::machines::scope::{self, Event};
+pub use crate::machines::scope::{
+    Guard as ScopeGuard, State as ScopeState, TransitionError as ScopeTransitionError,
+};
+use crate::{HandleError, RuntimeTrace, SlotAllocError, SlotPool};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ScopeHandle(RawHandle);
@@ -21,14 +23,16 @@ impl ScopeHandle {
 
 #[derive(Clone, Debug)]
 struct Scope {
-    state: State,
+    state: ScopeState,
     parent: Option<ScopeHandle>,
     transient_children: u32,
     persistent_children: u32,
+    active_scopes: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScopeSnapshot {
+    pub state: ScopeState,
     pub parent: Option<ScopeHandle>,
     pub transient_children: u32,
     pub persistent_children: u32,
@@ -38,8 +42,10 @@ pub struct ScopeSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ScopeError {
     Handle(HandleError),
+    Allocation(SlotAllocError),
     Transition(ScopeTransitionError),
     Admission(&'static str),
+    Invariant(&'static str),
     HasChildren { transient: u32, persistent: u32 },
 }
 
@@ -47,8 +53,9 @@ impl fmt::Display for ScopeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Handle(error) => error.fmt(formatter),
+            Self::Allocation(error) => error.fmt(formatter),
             Self::Transition(error) => error.fmt(formatter),
-            Self::Admission(error) => formatter.write_str(error),
+            Self::Admission(error) | Self::Invariant(error) => formatter.write_str(error),
             Self::HasChildren {
                 transient,
                 persistent,
@@ -68,201 +75,312 @@ impl From<HandleError> for ScopeError {
     }
 }
 
+impl From<SlotAllocError> for ScopeError {
+    fn from(error: SlotAllocError) -> Self {
+        Self::Allocation(error)
+    }
+}
+
 /// Owns scopes for one realm and emits every transition through the shared trace format.
 #[derive(Debug)]
 pub struct ScopeManager {
     realm_id: u32,
     scopes: SlotPool<Scope>,
-    trace: TraceRecorder,
 }
 
 impl ScopeManager {
     #[must_use]
-    pub fn new(realm_id: u32) -> Self {
+    pub fn with_capacity_limit(realm_id: u32, max_scopes: u32) -> Self {
         Self {
             realm_id,
-            scopes: SlotPool::new(realm_id),
-            trace: TraceRecorder::new(),
+            scopes: SlotPool::with_capacity_limit(realm_id, max_scopes),
         }
     }
 
-    pub fn create(&mut self, parent: Option<ScopeHandle>) -> Result<ScopeHandle, ScopeError> {
+    pub fn create(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        parent: Option<ScopeHandle>,
+    ) -> Result<ScopeHandle, ScopeError> {
         if let Some(parent) = parent {
             let parent_scope = self.scopes.resolve(parent.raw())?;
-            if parent_scope.state != State::Active {
+            if parent_scope.state != ScopeState::Active {
                 return Err(ScopeError::Admission("parent scope is not active"));
             }
         }
-        let raw = self.scopes.allocate(Scope {
-            state: State::Created,
+        let raw = self.scopes.try_allocate(Scope {
+            state: ScopeState::Created,
             parent,
             transient_children: 0,
             persistent_children: 0,
-        });
+            active_scopes: 0,
+        })?;
         let handle = ScopeHandle(raw);
-        self.apply(handle, Event::Activate)?;
+        self.apply(trace, handle, Event::Activate)?;
         Ok(handle)
     }
 
-    pub fn request_cancel(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        self.apply(handle, Event::RequestCancel)
+    pub fn request_cancel(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::RequestCancel)
     }
 
-    pub fn begin_cancelling(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        self.apply(handle, Event::ChildrenObserved)
+    pub fn begin_cancelling(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::ChildrenObserved)
     }
 
-    pub fn finish_cancelling(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        let scope = self.scopes.resolve(handle.raw())?;
-        if scope.transient_children != 0 || scope.persistent_children != 0 {
-            return Err(ScopeError::HasChildren {
-                transient: scope.transient_children,
-                persistent: scope.persistent_children,
-            });
-        }
-        self.apply(handle, Event::ChildrenFinished)
+    pub fn finish_cancelling(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::ChildrenFinished)
     }
 
-    pub fn destroy(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        self.apply(handle, Event::Destroy)?;
+    pub fn destroy(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::Destroy)?;
         self.scopes.release(handle.raw())?;
         Ok(())
     }
 
-    pub fn add_transient_child(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        let scope = self.scopes.resolve_mut(handle.raw())?;
-        if scope.state != State::Active {
-            return Err(ScopeError::Admission("scope does not admit new children"));
-        }
-        scope.transient_children = scope
-            .transient_children
-            .checked_add(1)
-            .expect("scope transient child counter exhausted u32");
-        Ok(())
+    pub fn add_transient_child(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::AddTransient)
     }
 
-    pub fn promote_child(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        let scope = self.scopes.resolve_mut(handle.raw())?;
-        scope.transient_children = scope
-            .transient_children
-            .checked_sub(1)
-            .ok_or(ScopeError::Admission("scope has no transient child"))?;
-        scope.persistent_children = scope
-            .persistent_children
-            .checked_add(1)
-            .expect("scope persistent child counter exhausted u32");
-        Ok(())
+    pub fn promote_child(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::PromoteChild)
     }
 
-    pub fn complete_transient_child(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        let scope = self.scopes.resolve_mut(handle.raw())?;
-        scope.transient_children = scope
-            .transient_children
-            .checked_sub(1)
-            .ok_or(ScopeError::Admission("scope has no transient child"))?;
-        Ok(())
+    pub fn complete_transient_child(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::CompleteTransient)
     }
 
-    pub fn complete_persistent_child(&mut self, handle: ScopeHandle) -> Result<(), ScopeError> {
-        let scope = self.scopes.resolve_mut(handle.raw())?;
-        scope.persistent_children = scope
-            .persistent_children
-            .checked_sub(1)
-            .ok_or(ScopeError::Admission("scope has no persistent child"))?;
-        Ok(())
+    pub fn complete_persistent_child(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+    ) -> Result<(), ScopeError> {
+        self.apply(trace, handle, Event::CompletePersistent)
     }
 
     pub fn snapshot(&self, handle: ScopeHandle) -> Result<ScopeSnapshot, ScopeError> {
         let scope = self.scopes.resolve(handle.raw())?;
         Ok(ScopeSnapshot {
+            state: scope.state,
             parent: scope.parent,
             transient_children: scope.transient_children,
             persistent_children: scope.persistent_children,
-            active: scope.state == State::Active,
+            active: scope.state == ScopeState::Active,
         })
     }
 
-    #[must_use]
-    pub fn trace(&self) -> &TraceRecorder {
-        &self.trace
-    }
-
-    fn apply(&mut self, handle: ScopeHandle, event: Event) -> Result<(), ScopeError> {
-        let (old, outcome, invariant_hash) = {
-            let scope = self.scopes.resolve_mut(handle.raw())?;
-            let old = scope.state;
-            let outcome = scope::apply(old, event, |_| true).map_err(ScopeError::Transition)?;
-            scope.state = outcome.state;
-            let invariant_hash = machine_invariant_hash(
-                "Scope",
-                &format!("{:?}", scope.state),
-                Some(handle.raw()),
-                &[
-                    ("persistent_children", i64::from(scope.persistent_children)),
-                    ("transient_children", i64::from(scope.transient_children)),
-                ],
-            );
-            (old, outcome, invariant_hash)
+    fn apply(
+        &mut self,
+        trace: &mut RuntimeTrace,
+        handle: ScopeHandle,
+        event: Event,
+    ) -> Result<(), ScopeError> {
+        let (old, active, transient, persistent) = {
+            let current = self.scopes.resolve(handle.raw())?;
+            (
+                current.state,
+                current.active_scopes,
+                current.transient_children,
+                current.persistent_children,
+            )
         };
-        self.trace.record(TraceRecord {
-            schema_version: TRACE_SCHEMA_VERSION,
-            sequence: 0,
-            machine_kind: MachineKind::Scope,
-            machine_id: u64::from(handle.raw().index),
-            transition_id: StableId(outcome.transition_id),
-            old_state: state_id(old),
-            event: event_id(event),
-            new_state: state_id(outcome.state),
-            realm_id: self.realm_id,
-            module_epoch: 0,
-            owner_scope: Some(handle.raw()),
-            resource_deltas: outcome
-                .deltas
-                .iter()
-                .map(|delta| nexa_core::ResourceDelta {
-                    resource: delta.resource.to_owned(),
-                    amount: delta.amount,
-                })
-                .collect(),
-            error_code: None,
-            invariant_hash,
+        let outcome = scope::apply(old, event, |guard| match guard {
+            ScopeGuard::ChildrenZero => transient == 0 && persistent == 0,
+            ScopeGuard::HasTransient => transient > 0,
+            ScopeGuard::HasPersistent => persistent > 0,
         });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let (transition_id, disposition) = match error {
+                    ScopeTransitionError::GuardRejected { transition_id, .. } => (
+                        StableId(transition_id),
+                        TransitionDisposition::GuardRejected,
+                    ),
+                    ScopeTransitionError::Undefined { .. } => {
+                        (StableId::default(), TransitionDisposition::Undefined)
+                    }
+                };
+                trace.record(scope_trace_record(
+                    self.realm_id,
+                    handle,
+                    old,
+                    event,
+                    old,
+                    transition_id,
+                    disposition,
+                    &[],
+                    active,
+                    transient,
+                    persistent,
+                ));
+                return Err(ScopeError::Transition(error));
+            }
+        };
+        let mut next_active = active;
+        let mut next_transient = transient;
+        let mut next_persistent = persistent;
+        for delta in outcome.deltas {
+            let target = match delta.resource {
+                "active_scope" => &mut next_active,
+                "transient_child" => &mut next_transient,
+                "persistent_child" => &mut next_persistent,
+                _ => return Err(ScopeError::Invariant("unknown scope resource")),
+            };
+            *target = apply_resource_delta(*target, delta.amount)
+                .ok_or(ScopeError::Invariant("scope resource delta overflow"))?;
+        }
+        scope::check_invariants(outcome.state, |resource| match resource {
+            scope::Resource::ActiveScope => i64::from(next_active),
+            scope::Resource::TransientChild => i64::from(next_transient),
+            scope::Resource::PersistentChild => i64::from(next_persistent),
+        })
+        .map_err(|_| ScopeError::Invariant("scope machine invariant failed"))?;
+        {
+            let current = self.scopes.resolve_mut(handle.raw())?;
+            current.state = outcome.state;
+            current.active_scopes = next_active;
+            current.transient_children = next_transient;
+            current.persistent_children = next_persistent;
+        }
+        let deltas = outcome
+            .deltas
+            .iter()
+            .map(|delta| nexa_core::ResourceDelta {
+                resource: delta.resource.to_owned(),
+                amount: delta.amount,
+            })
+            .collect::<Vec<_>>();
+        trace.record(scope_trace_record(
+            self.realm_id,
+            handle,
+            old,
+            event,
+            outcome.state,
+            StableId(outcome.transition_id),
+            TransitionDisposition::Applied,
+            &deltas,
+            next_active,
+            next_transient,
+            next_persistent,
+        ));
         Ok(())
     }
 }
 
-fn state_id(state: State) -> StableId {
-    machine_state_id("Scope", &format!("{state:?}"))
+fn state_id(state: ScopeState) -> StableId {
+    StableId(scope::state_id(state))
 }
 
 fn event_id(event: Event) -> StableId {
-    machine_event_id("Scope", &format!("{event:?}"))
+    StableId(scope::event_id(event))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scope_trace_record(
+    realm_id: u32,
+    handle: ScopeHandle,
+    old: ScopeState,
+    event: Event,
+    new: ScopeState,
+    transition_id: StableId,
+    disposition: TransitionDisposition,
+    deltas: &[nexa_core::ResourceDelta],
+    active: u32,
+    transient: u32,
+    persistent: u32,
+) -> TraceRecord {
+    TraceRecord {
+        schema_version: TRACE_SCHEMA_VERSION,
+        sequence: 0,
+        machine_kind: MachineKind::Scope,
+        machine_id: machine_instance_id(handle.raw()),
+        transition_id,
+        disposition,
+        old_state: state_id(old),
+        event: event_id(event),
+        new_state: state_id(new),
+        realm_id,
+        module_epoch: 0,
+        owner_scope: Some(handle.raw()),
+        resource_deltas: deltas.to_vec(),
+        error_code: None,
+        invariant_hash: machine_invariant_hash(
+            "Scope",
+            &format!("{new:?}"),
+            Some(handle.raw()),
+            &[
+                ("active_scope", i64::from(active)),
+                ("persistent_child", i64::from(persistent)),
+                ("transient_child", i64::from(transient)),
+            ],
+        ),
+    }
+}
+
+fn apply_resource_delta(value: u32, delta: i64) -> Option<u32> {
+    if delta >= 0 {
+        value.checked_add(u32::try_from(delta).ok()?)
+    } else {
+        value.checked_sub(u32::try_from(delta.checked_abs()?).ok()?)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use nexa_core::MachineKind;
 
+    use crate::RuntimeTrace;
+
     use super::{ScopeError, ScopeManager};
 
     #[test]
     fn scope_transitions_emit_monotonic_trace_and_reject_destroy_with_children() {
-        let mut manager = ScopeManager::new(7);
-        let scope = manager.create(None).unwrap();
-        manager.add_transient_child(scope).unwrap();
-        manager.request_cancel(scope).unwrap();
-        manager.begin_cancelling(scope).unwrap();
+        let mut manager = ScopeManager::with_capacity_limit(7, u32::MAX);
+        let mut trace = RuntimeTrace::new();
+        let scope = manager.create(&mut trace, None).unwrap();
+        manager.add_transient_child(&mut trace, scope).unwrap();
+        manager.request_cancel(&mut trace, scope).unwrap();
+        manager.begin_cancelling(&mut trace, scope).unwrap();
         assert!(matches!(
-            manager.finish_cancelling(scope),
-            Err(ScopeError::HasChildren { .. })
+            manager.finish_cancelling(&mut trace, scope),
+            Err(ScopeError::Transition(_))
         ));
-        manager.complete_transient_child(scope).unwrap();
-        manager.finish_cancelling(scope).unwrap();
-        manager.destroy(scope).unwrap();
+        manager.complete_transient_child(&mut trace, scope).unwrap();
+        manager.finish_cancelling(&mut trace, scope).unwrap();
+        manager.destroy(&mut trace, scope).unwrap();
 
-        let records = manager.trace().records();
-        assert_eq!(records.len(), 5);
-        assert_eq!(manager.trace().count_for(MachineKind::Scope), 5);
+        let records = trace.records();
+        assert_eq!(records.len(), 8);
+        assert_eq!(trace.count_for(MachineKind::Scope), 8);
         assert!(
             records
                 .windows(2)
@@ -272,16 +390,24 @@ mod tests {
 
     #[test]
     fn destroyed_scope_handle_cannot_resolve_reused_slot() {
-        let mut manager = ScopeManager::new(7);
-        let first = manager.create(None).unwrap();
-        manager.request_cancel(first).unwrap();
-        manager.begin_cancelling(first).unwrap();
-        manager.finish_cancelling(first).unwrap();
-        manager.destroy(first).unwrap();
+        let mut manager = ScopeManager::with_capacity_limit(7, u32::MAX);
+        let mut trace = RuntimeTrace::new();
+        let first = manager.create(&mut trace, None).unwrap();
+        manager.request_cancel(&mut trace, first).unwrap();
+        manager.begin_cancelling(&mut trace, first).unwrap();
+        manager.finish_cancelling(&mut trace, first).unwrap();
+        manager.destroy(&mut trace, first).unwrap();
 
-        let second = manager.create(None).unwrap();
+        let second = manager.create(&mut trace, None).unwrap();
         assert_eq!(first.raw().index, second.raw().index);
         assert_ne!(first.raw().generation, second.raw().generation);
         assert!(manager.snapshot(first).is_err());
+        let scope_ids = trace
+            .records()
+            .iter()
+            .filter(|record| record.machine_kind == MachineKind::Scope)
+            .map(|record| record.machine_id)
+            .collect::<Vec<_>>();
+        assert_ne!(scope_ids[0], *scope_ids.last().unwrap());
     }
 }
