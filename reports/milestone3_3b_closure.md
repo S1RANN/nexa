@@ -1,13 +1,14 @@
 # Milestone 3.3B Closure
 
-Status: **PASS**
+Status: **PASS — Milestone 3.3B scope only**
 
 ## Immutable implementation identity
 
-The final runtime implementation commit is
-`57672ffe879bc47894bd5c6e8dbbf3991bc5c7cb`. The verification workflow commit is
-`a5fb367e296fdc1e1fda62cffae16896715466c8`; it contains the complete implementation and changes
-only the CI matrix after the implementation commit.
+The four Milestone 3.3B implementation changes end at
+`57672ffe879bc47894bd5c6e8dbbf3991bc5c7cb`. The final test commit is
+`ef3e59e4057220c6c94675edd94791e77893e481`; in addition to adding this report, that commit changes
+`crates/nexa-runtime/src/stateful.rs` to add the generation boundary matrix
+`MAX-2 → MAX-1`, `MAX-1 → MAX`, and `MAX → overflow`.
 
 | Ordered change | Commit |
 | --- | --- |
@@ -15,9 +16,11 @@ only the CI matrix after the implementation commit.
 | PR 2 — Task state-machine/runtime alignment | `f1dc2c3b8932bceaf8525feba3e72594f5a41d9b` |
 | PR 3 — Realm v4 runtime differential | `83b2f010b137aefc7f7e9b66b0e2960b14b128a0` |
 | PR 4 — Hard-capacity migration arena | `57672ffe879bc47894bd5c6e8dbbf3991bc5c7cb` |
-| PR 5 — Required three-platform verification | `a5fb367e296fdc1e1fda62cffae16896715466c8` |
+| Final generation boundary tests and closure evidence | `ef3e59e4057220c6c94675edd94791e77893e481` |
 
-This report-only follow-up does not alter runtime implementation or CI semantics.
+The CI workflow matrix was added separately by
+`a5fb367e296fdc1e1fda62cffae16896715466c8`. CI results below are supplemental evidence, not a
+condition used to assign this report's PASS status.
 
 ## Completion identity and routing evidence
 
@@ -122,12 +125,13 @@ cargo run --manifest-path tools/allocation-observer/Cargo.toml --quiet
 The model gate reported 929 Realm v3 worlds, 16 Realm v4 task worlds, and 18 Realm v4 routing
 worlds. Combat integration, benchmark smoke, and allocator observation all completed.
 
-## Cross-platform CI
+## Supplemental cross-platform CI evidence
 
 GitHub Actions Run
 [30171654681](https://github.com/S1RANN/nexa/actions/runs/30171654681) executed verification commit
-`a5fb367e296fdc1e1fda62cffae16896715466c8`, which contains final implementation commit
-`57672ffe879bc47894bd5c6e8dbbf3991bc5c7cb`.
+`a5fb367e296fdc1e1fda62cffae16896715466c8`, which contains the four implementation changes through
+`57672ffe879bc47894bd5c6e8dbbf3991bc5c7cb`. It predates the final generation boundary tests in
+`ef3e59e4057220c6c94675edd94791e77893e481` and therefore is not evidence for those added tests.
 
 | Platform | Runner | Result | Run |
 | --- | --- | --- | --- |
@@ -140,6 +144,8 @@ None of the three jobs uses `continue-on-error`. The runner architecture is reco
 
 ## Known remaining issues
 
-There are no known remaining Milestone 3.3B contract gaps. GitHub emits a non-blocking deprecation
-annotation for the Node.js runtime embedded in `actions/checkout@v4` and
-`actions/upload-artifact@v4`; GitHub runs those actions on Node.js 24 and all jobs succeed.
+There are no known remaining contract gaps inside the four-item Milestone 3.3B scope documented
+above. This statement does not claim completion of any later Nexa milestone. GitHub emits a
+non-blocking deprecation annotation for the Node.js runtime embedded in `actions/checkout@v4` and
+`actions/upload-artifact@v4`; GitHub ran those actions on Node.js 24 and all three supplemental
+jobs succeeded.
