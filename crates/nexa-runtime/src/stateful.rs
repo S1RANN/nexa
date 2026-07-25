@@ -1329,6 +1329,33 @@ mod tests {
         verify(module.finish(), VerifierLimits::default()).unwrap()
     }
 
+    fn generation_context(old_generation: u32) -> (MigrationContext, StableId, RuntimeValue) {
+        let type_id = StableId::from_name("GenerationLimit");
+        let old_id = StableId::from_name("GenerationLimit::old");
+        let target_id = StableId::from_name("GenerationLimit::target");
+        let mut old = StatefulRegistry::new(StatefulDomainId::new(1));
+        old.objects.push(MigrationObjectSlot {
+            stable_id: old_id,
+            type_id: StableId(0),
+            version: 0,
+            generation: old_generation,
+            field_start: 0,
+            field_len: 0,
+            scalar: Some(StateValue::I32(1)),
+        });
+        old.rebuild_caches();
+        let mut migration = MigrationContext::new(
+            old,
+            StatefulDomainId::new(1),
+            schema(type_id, &[]),
+            false,
+            limits(),
+        )
+        .unwrap();
+        let target = migration.new_create(target_id, type_id).unwrap();
+        (migration, old_id, target)
+    }
+
     #[test]
     fn state_handles_are_generation_and_domain_checked() {
         let mut registry = StatefulRegistry::new(StatefulDomainId::new(1));
@@ -1511,29 +1538,15 @@ mod tests {
 
     #[test]
     fn generation_overflow_is_rejected_before_forwarding_or_target_mutation() {
-        let type_id = StableId::from_name("GenerationLimit");
-        let old_id = StableId::from_name("GenerationLimit::old");
-        let target_id = StableId::from_name("GenerationLimit::target");
-        let mut old = StatefulRegistry::new(StatefulDomainId::new(1));
-        old.objects.push(MigrationObjectSlot {
-            stable_id: old_id,
-            type_id: StableId(0),
-            version: 0,
-            generation: u32::MAX,
-            field_start: 0,
-            field_len: 0,
-            scalar: Some(StateValue::I32(1)),
-        });
-        old.rebuild_caches();
-        let mut migration = MigrationContext::new(
-            old,
-            StatefulDomainId::new(1),
-            schema(type_id, &[]),
-            false,
-            limits(),
-        )
-        .unwrap();
-        let target = migration.new_create(target_id, type_id).unwrap();
+        let (mut below, below_old, below_target) = generation_context(u32::MAX - 2);
+        below.replace(below_old, below_target).unwrap();
+        assert_eq!(below.arena.objects[0].generation, u32::MAX - 1);
+
+        let (mut exact, exact_old, exact_target) = generation_context(u32::MAX - 1);
+        exact.replace(exact_old, exact_target).unwrap();
+        assert_eq!(exact.arena.objects[0].generation, u32::MAX);
+
+        let (mut migration, old_id, target) = generation_context(u32::MAX);
         let target_generation = migration.arena.objects[0].generation;
         assert!(migration.replace(old_id, target).is_err());
         assert_eq!(
