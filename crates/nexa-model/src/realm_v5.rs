@@ -298,9 +298,13 @@ impl RealmV5World {
                 {
                     return Err(RealmV5Rejection::InvalidTaskState);
                 }
-                for request in &mut self.requests {
-                    if request.state == RealmV5RequestState::Pending {
-                        request.state = RealmV5RequestState::Late;
+                for index in 0..self.requests.len() {
+                    if self.requests[index].state == RealmV5RequestState::Pending {
+                        let epoch = usize::from(self.requests[index].epoch);
+                        self.release_backlog[epoch] = self.release_backlog[epoch]
+                            .checked_add(1)
+                            .ok_or(RealmV5Rejection::Capacity)?;
+                        self.requests[index].state = RealmV5RequestState::Late;
                     }
                 }
                 for (task, scheduled) in self.tasks.iter_mut().zip(&mut self.scheduler) {
@@ -492,6 +496,17 @@ impl RealmV5World {
                 self.scheduler[index] = true;
             }
         }
+        self.record_request_releases()?;
+        Ok(())
+    }
+
+    fn record_request_releases(&mut self) -> Result<(), RealmV5Rejection> {
+        for request in self.requests {
+            let epoch = usize::from(request.epoch);
+            self.release_backlog[epoch] = self.release_backlog[epoch]
+                .checked_add(1)
+                .ok_or(RealmV5Rejection::Capacity)?;
+        }
         Ok(())
     }
 
@@ -539,6 +554,19 @@ impl RealmV5World {
             || self.active_epoch >= REALM_V5_RETIRED_EPOCHS_U8
         {
             return Err(RealmV5Rejection::InvalidReloadState);
+        }
+        if self.tasks.iter().any(|task| {
+            task_is_live(task.state)
+                && !matches!(
+                    task.state,
+                    RealmV5TaskState::Ready
+                        | RealmV5TaskState::Running
+                        | RealmV5TaskState::FuelYielded
+                        | RealmV5TaskState::ExplicitYielded
+                        | RealmV5TaskState::Waiting
+                )
+        }) {
+            return Err(RealmV5Rejection::InvalidTaskState);
         }
         for (index, task) in self.tasks.iter_mut().enumerate() {
             if task.epoch == self.active_epoch && task_is_live(task.state) {
@@ -611,13 +639,17 @@ impl RealmV5World {
                 self.finish_task(task, RealmV5TaskState::Cancelled);
             }
         }
-        for request in &mut self.requests {
-            match request.state {
-                RealmV5RequestState::Pending if request.epoch == old_epoch => {
-                    request.state = RealmV5RequestState::Late;
+        for index in 0..self.requests.len() {
+            match self.requests[index].state {
+                RealmV5RequestState::Pending if self.requests[index].epoch == old_epoch => {
+                    let epoch = usize::from(self.requests[index].epoch);
+                    self.release_backlog[epoch] = self.release_backlog[epoch]
+                        .checked_add(1)
+                        .ok_or(RealmV5Rejection::Capacity)?;
+                    self.requests[index].state = RealmV5RequestState::Late;
                 }
                 RealmV5RequestState::Buffered => {
-                    request.state = RealmV5RequestState::Completed;
+                    self.requests[index].state = RealmV5RequestState::Completed;
                 }
                 _ => {}
             }
