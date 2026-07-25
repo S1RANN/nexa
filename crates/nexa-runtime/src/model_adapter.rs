@@ -941,6 +941,7 @@ pub enum RealmV5RuntimeRejection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealmV5RuntimeApplyError {
     Rejected(RealmV5RuntimeRejection),
+    InjectedFailure(crate::RuntimeFailurePoint),
     Invariant(String),
 }
 
@@ -957,6 +958,7 @@ pub enum RealmV5RuntimeTaskState {
     Cleanup,
     Completed,
     Cancelled,
+    Trapped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1115,6 +1117,24 @@ pub struct RealmV5RuntimeAdapter {
     candidate_epoch: Option<u8>,
     retired_epochs: [RealmV5RuntimeRetiredEpoch; REALM_V5_RETIRED_COUNT],
     registries: [Option<StatefulRegistry>; REALM_V5_EPOCH_COUNT],
+    failure_injector: crate::RuntimeFailureInjector,
+}
+
+enum RealmV5CheckedError {
+    Injected(crate::RuntimeFailurePoint),
+    Invariant(String),
+}
+
+impl From<String> for RealmV5CheckedError {
+    fn from(error: String) -> Self {
+        Self::Invariant(error)
+    }
+}
+
+impl From<&str> for RealmV5CheckedError {
+    fn from(error: &str) -> Self {
+        Self::Invariant(error.into())
+    }
 }
 
 impl RealmV5RuntimeAdapter {
@@ -1166,14 +1186,28 @@ impl RealmV5RuntimeAdapter {
             candidate_epoch: None,
             retired_epochs: [RealmV5RuntimeRetiredEpoch::Vacant; REALM_V5_RETIRED_COUNT],
             registries,
+            failure_injector: crate::RuntimeFailureInjector::default(),
         }
+    }
+
+    pub fn failure_injector(&mut self) -> &mut crate::RuntimeFailureInjector {
+        &mut self.failure_injector
     }
 
     pub fn apply(&mut self, event: RealmV5RuntimeEvent) -> Result<(), RealmV5RuntimeApplyError> {
         self.preflight(event)
             .map_err(RealmV5RuntimeApplyError::Rejected)?;
-        self.apply_checked(event)
-            .map_err(RealmV5RuntimeApplyError::Invariant)?;
+        match self.apply_checked(event) {
+            Ok(()) => {}
+            Err(RealmV5CheckedError::Injected(point)) => {
+                self.validate_runtime_storage()
+                    .map_err(RealmV5RuntimeApplyError::Invariant)?;
+                return Err(RealmV5RuntimeApplyError::InjectedFailure(point));
+            }
+            Err(RealmV5CheckedError::Invariant(error)) => {
+                return Err(RealmV5RuntimeApplyError::Invariant(error));
+            }
+        }
         self.validate_runtime_storage()
             .map_err(RealmV5RuntimeApplyError::Invariant)
     }
@@ -1422,9 +1456,15 @@ impl RealmV5RuntimeAdapter {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_checked(&mut self, event: RealmV5RuntimeEvent) -> Result<(), String> {
+    fn apply_checked(&mut self, event: RealmV5RuntimeEvent) -> Result<(), RealmV5CheckedError> {
         match event {
-            RealmV5RuntimeEvent::TaskAdmission => self.admit_tasks()?,
+            RealmV5RuntimeEvent::TaskAdmission => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::ScopeSlot)?;
+                self.fail_if_injected(crate::RuntimeFailurePoint::TaskSlot)?;
+                self.fail_if_injected(crate::RuntimeFailurePoint::FrameSlot)?;
+                self.fail_if_injected(crate::RuntimeFailurePoint::SchedulerSlot)?;
+                self.admit_tasks()?;
+            }
             RealmV5RuntimeEvent::PollTask => {
                 for index in 0..REALM_V5_TASK_COUNT {
                     let task = self.task(index)?;
@@ -1467,8 +1507,20 @@ impl RealmV5RuntimeAdapter {
                     self.finish_task(index, RealmV5RuntimeTaskState::Completed)?;
                 }
             }
-            RealmV5RuntimeEvent::HostWait => self.begin_host_wait()?,
-            RealmV5RuntimeEvent::HostComplete => self.complete_host_requests(false)?,
+            RealmV5RuntimeEvent::HostWait => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::RequestSlot)?;
+                self.begin_host_wait()?;
+            }
+            RealmV5RuntimeEvent::HostComplete => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::CompletionSlot)?;
+                if matches!(
+                    self.reload,
+                    RealmV5RuntimeReloadState::Quiesced | RealmV5RuntimeReloadState::Migrated
+                ) {
+                    self.fail_if_injected(crate::RuntimeFailurePoint::ReloadCompletionSlot)?;
+                }
+                self.complete_host_requests(false)?;
+            }
             RealmV5RuntimeEvent::Cancel => self.cancel_tasks()?,
             RealmV5RuntimeEvent::Cleanup => self.cleanup_tasks()?,
             RealmV5RuntimeEvent::BeginReload => {
@@ -1482,12 +1534,26 @@ impl RealmV5RuntimeAdapter {
             }
             RealmV5RuntimeEvent::Quiesce => self.quiesce_tasks()?,
             RealmV5RuntimeEvent::Migration => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::MigrationObjectSlot)?;
+                self.fail_if_injected(crate::RuntimeFailurePoint::MigrationFieldSlot)?;
+                self.fail_if_injected(crate::RuntimeFailurePoint::MigrationForwardingSlot)?;
                 let candidate = usize::from(self.candidate_epoch.ok_or("missing candidate")?);
                 self.registries[candidate] = Some(v5_registry_with_object());
                 self.reload = RealmV5RuntimeReloadState::Migrated;
             }
             RealmV5RuntimeEvent::Rollback => self.rollback_reload()?,
-            RealmV5RuntimeEvent::Commit => self.publish_reload(false)?,
+            RealmV5RuntimeEvent::Commit => {
+                if self
+                    .failure_injector
+                    .trigger(crate::RuntimeFailurePoint::ActivationTrap)
+                {
+                    self.publish_reload(true)?;
+                    return Err(RealmV5CheckedError::Injected(
+                        crate::RuntimeFailurePoint::ActivationTrap,
+                    ));
+                }
+                self.publish_reload(false)?;
+            }
             RealmV5RuntimeEvent::ActivationFault => self.publish_reload(true)?,
             RealmV5RuntimeEvent::LateCompletion => self.complete_host_requests(true)?,
             RealmV5RuntimeEvent::TokenAcquire => {
@@ -1508,6 +1574,7 @@ impl RealmV5RuntimeAdapter {
                 });
             }
             RealmV5RuntimeEvent::TokenRelease => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::ReleaseSlot)?;
                 let token = self.token.take().ok_or("missing token")?;
                 self.resources
                     .release_token_for_model(self.task(usize::from(token.owner))?, token.handle)
@@ -1515,6 +1582,7 @@ impl RealmV5RuntimeAdapter {
                 self.token_consumed = true;
             }
             RealmV5RuntimeEvent::SnapshotAcquire => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::SnapshotSlot)?;
                 let owner = self.task(0)?;
                 let handle = self
                     .resources
@@ -1532,6 +1600,7 @@ impl RealmV5RuntimeAdapter {
                 });
             }
             RealmV5RuntimeEvent::SnapshotRelease => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::ReleaseSlot)?;
                 let snapshot = self.snapshot.take().ok_or("missing snapshot")?;
                 self.resources
                     .release_snapshot_for_model(
@@ -1545,6 +1614,7 @@ impl RealmV5RuntimeAdapter {
                 let _ = self.resources.drain_releases();
             }
             RealmV5RuntimeEvent::GcRootAttach => {
+                self.fail_if_injected(crate::RuntimeFailurePoint::HeapSlot)?;
                 self.heap_object = Some(
                     self.heap
                         .allocate(crate::Object::I32Array(vec![1]))
@@ -1825,8 +1895,12 @@ impl RealmV5RuntimeAdapter {
         Ok(())
     }
 
-    fn cleanup_tasks(&mut self) -> Result<(), String> {
+    fn cleanup_tasks(&mut self) -> Result<(), RealmV5CheckedError> {
         let entering = self.task_state(0) == RealmV5RuntimeTaskState::Cancelling;
+        let trap = !entering
+            && self
+                .failure_injector
+                .trigger(crate::RuntimeFailurePoint::CleanupTrap);
         for index in 0..REALM_V5_TASK_COUNT {
             let task = self.task(index)?;
             if entering {
@@ -1834,11 +1908,22 @@ impl RealmV5RuntimeAdapter {
                 self.runtime.mark_execution_cleanup(task).map_err(debug)?;
             } else {
                 self.release_task_resources(index)?;
-                self.runtime.finish_cleanup(task).map_err(debug)?;
-                self.terminal[index] = Some(RealmV5RuntimeTaskState::Cancelled);
-                self.terminal_records
-                    .push(RealmV5RuntimeTaskState::Cancelled);
+                if trap {
+                    self.runtime.trap_task(task).map_err(debug)?;
+                    self.terminal[index] = Some(RealmV5RuntimeTaskState::Trapped);
+                    self.terminal_records.push(RealmV5RuntimeTaskState::Trapped);
+                } else {
+                    self.runtime.finish_cleanup(task).map_err(debug)?;
+                    self.terminal[index] = Some(RealmV5RuntimeTaskState::Cancelled);
+                    self.terminal_records
+                        .push(RealmV5RuntimeTaskState::Cancelled);
+                }
             }
+        }
+        if trap {
+            return Err(RealmV5CheckedError::Injected(
+                crate::RuntimeFailurePoint::CleanupTrap,
+            ));
         }
         Ok(())
     }
@@ -2060,7 +2145,8 @@ impl RealmV5RuntimeAdapter {
             Ok(TaskState::Cleanup) => RealmV5RuntimeTaskState::Cleanup,
             Ok(TaskState::Completed) => RealmV5RuntimeTaskState::Completed,
             Ok(TaskState::Cancelled) => RealmV5RuntimeTaskState::Cancelled,
-            Ok(TaskState::Created | TaskState::Trapped) | Err(_) => RealmV5RuntimeTaskState::Vacant,
+            Ok(TaskState::Trapped) => RealmV5RuntimeTaskState::Trapped,
+            Ok(TaskState::Created) | Err(_) => RealmV5RuntimeTaskState::Vacant,
         }
     }
 
@@ -2087,6 +2173,7 @@ impl RealmV5RuntimeAdapter {
             RealmV5RuntimeTaskState::Vacant
                 | RealmV5RuntimeTaskState::Completed
                 | RealmV5RuntimeTaskState::Cancelled
+                | RealmV5RuntimeTaskState::Trapped
         )
     }
 
@@ -2145,6 +2232,7 @@ impl RealmV5RuntimeAdapter {
                         RealmV5RuntimeTaskState::Vacant
                             | RealmV5RuntimeTaskState::Completed
                             | RealmV5RuntimeTaskState::Cancelled
+                            | RealmV5RuntimeTaskState::Trapped
                     )
                 })
                 .count()
@@ -2167,6 +2255,16 @@ impl RealmV5RuntimeAdapter {
         }
         if snapshot.heap_object != (snapshot.ledger.heap_objects != 0) {
             return Err("Heap ledger diverged".into());
+        }
+        Ok(())
+    }
+
+    fn fail_if_injected(
+        &mut self,
+        point: crate::RuntimeFailurePoint,
+    ) -> Result<(), RealmV5CheckedError> {
+        if self.failure_injector.trigger(point) {
+            return Err(RealmV5CheckedError::Injected(point));
         }
         Ok(())
     }
