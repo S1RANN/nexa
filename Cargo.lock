@@ -6,12 +6,10 @@ version = 4
 name = "combat-runtime"
 version = "0.1.0"
 dependencies = [
- "nexa-bytecode",
  "nexa-compiler",
  "nexa-core",
  "nexa-idl",
  "nexa-runtime",
- "nexa-verifier",
 ]
 
 [[package]]

@@ -138,18 +138,11 @@ impl InterpreterHost for RealmHostBridge<'_> {
             .imports
             .get(import as usize)
             .ok_or(HostTrap::UnknownFunction(import))?;
-        let values = arguments
-            .iter()
-            .copied()
-            .map(runtime_to_host_value)
-            .collect::<Vec<_>>();
+        let values = HostArgs::from_runtime(arguments)?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
-        match self
-            .registry
-            .call(import, &mut context, HostArgs::new(&values))?
-        {
+        match self.registry.call(import, &mut context, values)? {
             HostCallOutcome::Immediate(value) => Ok(InterpreterHostOutcome::Immediate(
                 host_to_runtime_value(value, metadata.result)?,
             )),
@@ -162,21 +155,6 @@ impl InterpreterHost for RealmHostBridge<'_> {
                 Ok(InterpreterHostOutcome::Pending(request))
             }
         }
-    }
-}
-
-fn runtime_to_host_value(value: RuntimeValue) -> HostValue {
-    match value {
-        RuntimeValue::I32(value) => HostValue::I32(value),
-        RuntimeValue::Bool(value) => HostValue::Bool(value),
-        RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
-            HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
-        }
-        RuntimeValue::HostRequest(request) => HostValue::Request(request),
-        RuntimeValue::ResourceToken(token) => HostValue::Token(token),
-        RuntimeValue::Snapshot(snapshot) => HostValue::Snapshot(snapshot),
-        RuntimeValue::Opaque { value, .. } => HostValue::Opaque(value),
-        RuntimeValue::Unit => HostValue::Unit,
     }
 }
 
@@ -346,6 +324,7 @@ pub enum RealmError {
     MissingModule(u32),
     HostCapabilitiesUnavailable,
     MissingHostInterfaceHash,
+    RuntimeHostClosed,
     HostHashMismatch,
     SchemaHashMismatch,
     EpochExhausted,
@@ -466,6 +445,9 @@ impl RealmRuntime {
         let host_registry_hash = registry
             .interface_hash()
             .ok_or(RealmError::MissingHostInterfaceHash)?;
+        runtime_host
+            .register_realm()
+            .map_err(|_| RealmError::RuntimeHostClosed)?;
         let resource_config = config.clone();
         let mut realm = Self::base(config);
         realm.host_registry = Some(registry);
@@ -1972,6 +1954,9 @@ impl Drop for RealmRuntime {
             let _ = self.resources.cleanup_task(task, true);
         }
         self.flush_releases();
+        if let Some(runtime_host) = &self.runtime_host {
+            runtime_host.unregister_realm();
+        }
     }
 }
 
@@ -2360,12 +2345,14 @@ mod tests {
             realm.poll_task(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
+        assert_eq!(runtime_host.pending_completions(), 1);
         let mut pending = request
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .expect("registry created request");
         pending.ticket.complete(HostPayload::I32(42)).unwrap();
+        assert_eq!(runtime_host.pending_completions(), 1);
         realm
             .tick(TickBudget {
                 max_tasks: 1,
@@ -2379,7 +2366,31 @@ mod tests {
                 RuntimeValue::I32(42)
             )))
         ));
+        assert_eq!(runtime_host.pending_completions(), 0);
         assert_eq!(runtime_host.pending_releases(), 1);
+        assert_eq!(
+            runtime_host.close(),
+            Err(crate::RuntimeHostCloseError::LiveRealms)
+        );
+        drop(realm);
+        assert_eq!(
+            runtime_host.close(),
+            Err(crate::RuntimeHostCloseError::PendingReleases)
+        );
+        assert_eq!(runtime_host.drain_releases().len(), 1);
+        runtime_host.close().unwrap();
+        assert!(runtime_host.is_closed());
+        assert!(matches!(
+            RealmRuntime::hosted(
+                RealmConfig::default(),
+                runtime_host.clone(),
+                Box::new(AsyncRegistry {
+                    hash: host_hash,
+                    request,
+                }),
+            ),
+            Err(RealmError::RuntimeHostClosed)
+        ));
     }
 
     #[test]

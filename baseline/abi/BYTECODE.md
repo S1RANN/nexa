@@ -28,3 +28,8 @@ recursive immediate call graphs are rejected.
 Bytecode version 3 adds canonical enum metadata, typed async-result policy metadata, and the
 `ENUM_NEW`, `ENUM_TAG`, `ENUM_PAYLOAD`, `STATE_OLD_FIELD_GET`, `STATE_PRESERVE`, `STATE_REPLACE`,
 and `STATE_FINISH` instructions. Async HostImports must reference a matching builtin Result enum.
+
+The compiler lowers `None`, `Some`, `Ok`, `Err`, exhaustive enum `match`, and exact-error `?` to the
+enum instructions. Migration source intrinsics lower to old-state reads, staging writes, explicit
+Preserve/Replace/Delete decisions, and `STATE_FINISH`; examples may not patch migration bytecode in
+Rust.

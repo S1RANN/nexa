@@ -5,3 +5,6 @@ task fn update(value: i32) -> i32 {
     phase: i32;
     legacy_target: i32;
 }
+@stateful(1) class StableBrain {
+    phase: i32;
+}

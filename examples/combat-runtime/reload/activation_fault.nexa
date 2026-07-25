@@ -2,5 +2,8 @@
     phase: i32;
     aggression: i32;
 }
+@stateful(1) class StableBrain {
+    phase: i32;
+}
 migration fn migrate(value: i32) -> i32 { return value; }
 task fn update(value: i32) -> i32 { return value; }

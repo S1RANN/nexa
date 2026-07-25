@@ -14,6 +14,7 @@ The MVR deliberately does not implement or validate:
 - LSP, DAP, package registry, or graphical profiler
 - seamless online hot patching
 - complete-runtime frame stability under an incremental GC
+- custom host release domains; MVR domains are VM thread, render, audio, and IO
 
 These capabilities must not appear in parser syntax, bytecode, public APIs, examples, or empty
 future-facing abstractions during Gate 1.

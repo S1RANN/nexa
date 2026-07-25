@@ -26,3 +26,7 @@ request(return_error|cancel_task, return_error|trap) fn name(...)
 
 Both terminal policies and both Result payload types participate in the exact hash. Generated Rust
 bindings include IDL enums and a typed completion-ticket wrapper.
+
+In Nexa source, an async IDL function evaluates to its declared `Result<Success, Error>`. Scripts
+may consume it with exhaustive `match` or propagate the exact error type with `?`; request handles
+are not exposed to source programs.

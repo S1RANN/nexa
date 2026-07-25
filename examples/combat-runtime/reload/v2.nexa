@@ -2,7 +2,21 @@
     phase: i32;
     aggression: i32;
 }
-migration fn migrate(value: i32) -> i32 { return value; }
+@stateful(1) class StableBrain {
+    phase: i32;
+}
+migration fn migrate(value: i32) -> i32 {
+    let old_brain: EnemyBrain = old.get<EnemyBrain>(boss);
+    let phase: i32 = old.field<i32>(old_brain, EnemyBrain.phase);
+    let brain: EnemyBrain = new.create<EnemyBrain>(boss);
+    new.set(brain, EnemyBrain.phase, phase);
+    new.set(brain, EnemyBrain.aggression, 0);
+    replace(boss, brain);
+    preserve(preserved);
+    delete(deleted);
+    finish_migration();
+    return value;
+}
 fn identity(value: i32) -> i32 { return value; }
 task fn update(value: i32) -> i32 { return value + 1; }
 immediate fn activate(value: i32) -> i32 { return value; }

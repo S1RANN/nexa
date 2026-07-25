@@ -23,6 +23,10 @@ every old identity with `STATE_PRESERVE`, `STATE_REPLACE`, or `STATE_DELETE`, co
 graph, and execute `STATE_FINISH`. An untouched changed-schema migration returns
 `MigrationNoOutput`; incomplete or duplicate forwarding is rejected before publication.
 
+Migration functions use typed source intrinsics: `old.get<T>`, `old.field<T>`, `new.create<T>`,
+`new.set`, `preserve`, `replace`, `delete`, and `finish_migration`. These are available only to
+`migration fn` and lower directly to the restricted migration instruction set.
+
 ## Commit
 
 Publish one immutable `ModuleEpochRoot` on the VM thread. No worker thread may acquire or

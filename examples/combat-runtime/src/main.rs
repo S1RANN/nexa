@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nexa_bytecode::{Instruction, RootMap, ValueType};
 use nexa_core::StableId;
 use nexa_runtime::{
     ActivationEntry, HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime,
@@ -84,8 +83,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Box::new(registry),
     )?;
     let module = realm.load_module(verified, host_hash, schema_hash)?;
-    let enemy_brain = StableId::from_name("EnemyBrain::boss");
-    realm.insert_state(
+    let enemy_brain = StableId::from_name("boss");
+    let replaced_handle = realm.insert_state(
         module,
         enemy_brain,
         nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
@@ -103,10 +102,112 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ]),
         }),
     )?;
+    let preserved_brain = StableId::from_name("preserved");
+    let preserved_handle = realm.insert_state(
+        module,
+        preserved_brain,
+        nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
+            type_id: StableId::from_name("StableBrain"),
+            version: 1,
+            fields: BTreeMap::from([(
+                StableId::from_name("StableBrain::phase"),
+                nexa_runtime::StateValue::I32(5),
+            )]),
+        }),
+    )?;
+    let deleted_brain = StableId::from_name("deleted");
+    let deleted_handle = realm.insert_state(
+        module,
+        deleted_brain,
+        nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
+            type_id: StableId::from_name("EnemyBrain"),
+            version: 1,
+            fields: BTreeMap::from([
+                (
+                    StableId::from_name("EnemyBrain::phase"),
+                    nexa_runtime::StateValue::I32(9),
+                ),
+                (
+                    StableId::from_name("EnemyBrain::legacy_target"),
+                    nexa_runtime::StateValue::I32(23),
+                ),
+            ]),
+        }),
+    )?;
     let scope = realm.create_scope(None)?;
+    let checked = realm.call(
+        module,
+        3,
+        &[RuntimeValue::I32(7)],
+        StepConfig {
+            owner: scope,
+            priority: 10,
+            fuel_slice: 64,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert_eq!(
+        realm.poll_task(checked, 64)?,
+        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
+    );
+    let pending = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("checked animation request was captured by the host");
+    generated::AnimationCompletionTicket(pending.ticket).complete(Ok(7))?;
+    realm.tick(TickBudget {
+        max_tasks: 1,
+        frame_fuel_budget: 64,
+        collect_garbage: false,
+    })?;
+    assert!(matches!(
+        realm.terminal_record(checked).map(|record| &record.reason),
+        Some(nexa_runtime::TaskTerminalReason::Completed(Some(
+            RuntimeValue::NamedRef { .. }
+        )))
+    ));
+    let checked_error = realm.call(
+        module,
+        3,
+        &[RuntimeValue::I32(8)],
+        StepConfig {
+            owner: scope,
+            priority: 10,
+            fuel_slice: 64,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert_eq!(
+        realm.poll_task(checked_error, 64)?,
+        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
+    );
+    let pending = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("failing checked animation request was captured by the host");
+    generated::AnimationCompletionTicket(pending.ticket)
+        .complete(Err(generated::AnimationError::EntityGone))?;
+    realm.tick(TickBudget {
+        max_tasks: 1,
+        frame_fuel_budget: 64,
+        collect_garbage: false,
+    })?;
+    assert!(matches!(
+        realm
+            .terminal_record(checked_error)
+            .map(|record| &record.reason),
+        Some(nexa_runtime::TaskTerminalReason::Completed(Some(
+            RuntimeValue::NamedRef { .. }
+        )))
+    ));
+
     let task = realm.call(
         module,
-        1,
+        4,
         &[RuntimeValue::I32(41)],
         StepConfig {
             owner: scope,
@@ -142,7 +243,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let live = realm.call(
         module,
-        1,
+        4,
         &[RuntimeValue::I32(10)],
         StepConfig {
             owner: scope,
@@ -159,64 +260,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_hash,
         schema_hash_v2,
     )?;
-    let mut v2 = v2.into_module();
-    let migration = &mut v2.functions[0];
-    let phase = StableId::from_name("EnemyBrain::phase");
-    let aggression = StableId::from_name("EnemyBrain::aggression");
-    let brain_type = StableId::from_name("EnemyBrain");
-    migration.code = vec![
-        Instruction::StateOldGet {
-            stable_id: enemy_brain,
-            ty: ValueType::Named(brain_type),
-            dst: 1,
-        },
-        Instruction::StateOldFieldGet {
-            object: 1,
-            field_id: phase,
-            ty: ValueType::I32,
-            dst: 2,
-        },
-        Instruction::LoadI32 { dst: 3, value: 0 },
-        Instruction::StateNewCreate {
-            stable_id: enemy_brain,
-            type_id: brain_type,
-            dst: 4,
-        },
-        Instruction::StateNewSet {
-            object: 4,
-            field_id: phase,
-            source: 2,
-        },
-        Instruction::StateNewSet {
-            object: 4,
-            field_id: aggression,
-            source: 3,
-        },
-        Instruction::StateReplace {
-            old_id: enemy_brain,
-            target: 4,
-        },
-        Instruction::StateFinish,
-        Instruction::Return { source: 0 },
-    ];
-    migration.root_bitmap.fill(false);
-    migration.root_bitmap[1] = true;
-    migration.root_bitmap[4] = true;
-    migration.safepoints = vec![0, 8];
-    let mut terminal_roots = vec![false; usize::from(migration.registers)];
-    terminal_roots[1] = true;
-    terminal_roots[4] = true;
-    migration.root_maps = vec![
-        RootMap {
-            pc: 0,
-            bitmap: vec![false; usize::from(migration.registers)],
-        },
-        RootMap {
-            pc: 8,
-            bitmap: terminal_roots,
-        },
-    ];
-    let v2 = nexa_verifier::verify(v2, nexa_verifier::VerifierLimits::default())?;
     let v2 = realm.prepare_reload_migrating(module, v2, host_hash)?;
     realm.quiesce_reload()?;
     assert_eq!(
@@ -233,6 +276,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .find(|handle| handle.stable_id == enemy_brain)
         .ok_or(HostFailure("EnemyBrain state was not migrated"))?;
+    assert!(realm.resolve_state(v2, replaced_handle).is_err());
+    assert!(realm.resolve_state(v2, deleted_handle).is_err());
+    assert_eq!(
+        realm
+            .state_handles(v2)?
+            .into_iter()
+            .find(|handle| handle.stable_id == preserved_brain),
+        Some(preserved_handle)
+    );
     let nexa_runtime::StateValue::Object(migrated) = realm.resolve_state(v2, migrated_state)?
     else {
         return Err(Box::new(HostFailure("EnemyBrain state is not an object")));
@@ -361,6 +413,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             nexa_runtime::CancelReason::ReloadCommit
         ))
     ));
+    drop(realm);
+    let _releases = runtime_host.drain_releases();
+    runtime_host.close()?;
     println!("combat-runtime completed with deterministic reload activation fault");
     Ok(())
 }

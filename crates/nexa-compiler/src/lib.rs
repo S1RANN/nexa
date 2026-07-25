@@ -25,6 +25,7 @@ pub enum TokenKind {
     If,
     Else,
     While,
+    Match,
     Await,
     Defer,
     For,
@@ -51,6 +52,10 @@ pub enum TokenKind {
     Minus,
     Star,
     Equal,
+    FatArrow,
+    Less,
+    Greater,
+    Question,
     At,
     Dot,
     DotDot,
@@ -77,6 +82,9 @@ pub enum CompileError {
     UnknownName(String),
     UnknownType(String),
     TypeMismatch,
+    CannotInferType,
+    NonExhaustiveMatch,
+    DuplicateMatchVariant,
     MissingReturn,
     SuspendingDefer,
     DeferCaptureLimit,
@@ -160,12 +168,14 @@ pub enum AstType {
     I32,
     Bool,
     Named(String),
+    BuiltinGeneric { name: String, arguments: Vec<Self> },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstStatement {
     Bind {
         name: String,
+        ty: Option<AstType>,
         value: AstExpression,
     },
     Return(AstExpression),
@@ -197,6 +207,77 @@ pub enum AstExpression {
         arguments: Vec<Self>,
     },
     Await(Box<Self>),
+    Constructor {
+        variant: BuiltinVariant,
+        payload: Option<Box<Self>>,
+    },
+    Match {
+        value: Box<Self>,
+        arms: Vec<MatchArm>,
+    },
+    Try(Box<Self>),
+    Migration(MigrationIntrinsic),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinVariant {
+    None,
+    Some,
+    Ok,
+    Err,
+}
+
+impl BuiltinVariant {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Some => "Some",
+            Self::Ok => "Ok",
+            Self::Err => "Err",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MatchArm {
+    pub variant: String,
+    pub binding: Option<String>,
+    pub value: AstExpression,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MigrationIntrinsic {
+    OldGet {
+        stable_id: String,
+        ty: AstType,
+    },
+    OldFieldGet {
+        object: Box<AstExpression>,
+        owner: String,
+        field: String,
+        ty: AstType,
+    },
+    NewCreate {
+        stable_id: String,
+        ty: AstType,
+    },
+    NewSet {
+        object: Box<AstExpression>,
+        owner: String,
+        field: String,
+        value: Box<AstExpression>,
+    },
+    Preserve {
+        stable_id: String,
+    },
+    Replace {
+        stable_id: String,
+        target: Box<AstExpression>,
+    },
+    Delete {
+        stable_id: String,
+    },
+    Finish,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +295,7 @@ pub struct HirModule {
     schema_hash: Option<StableId>,
     state_schema: StateSchema,
     enum_types: Vec<EnumType>,
+    enum_variants: BTreeMap<(StableId, String), EnumVariant>,
 }
 
 #[derive(Clone, Debug)]
@@ -249,7 +331,14 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             ';' => TokenKind::Semicolon,
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
+            '=' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
+                chars.next();
+                TokenKind::FatArrow
+            }
             '=' => TokenKind::Equal,
+            '<' => TokenKind::Less,
+            '>' => TokenKind::Greater,
+            '?' => TokenKind::Question,
             '@' => TokenKind::At,
             '.' if chars.peek().is_some_and(|(_, next)| *next == '.') => {
                 chars.next();
@@ -296,6 +385,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "if" => TokenKind::If,
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,
+                    "match" => TokenKind::Match,
                     "await" => TokenKind::Await,
                     "defer" => TokenKind::Defer,
                     "for" => TokenKind::For,
@@ -471,10 +561,15 @@ impl Parser<'_> {
         }
         if self.take(&TokenKind::Let) || self.take(&TokenKind::Var) {
             let name = self.ident()?;
+            let ty = if self.take(&TokenKind::Colon) {
+                Some(self.ty()?)
+            } else {
+                None
+            };
             self.expect(&TokenKind::Equal, "=")?;
             let value = self.expression(0)?;
             self.expect(&TokenKind::Semicolon, ";")?;
-            return Ok(AstStatement::Bind { name, value });
+            return Ok(AstStatement::Bind { name, ty, value });
         }
         if self.take(&TokenKind::If) {
             let condition = self.expression(0)?;
@@ -533,9 +628,11 @@ impl Parser<'_> {
         Ok(AstStatement::Expression(expression))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn expression(&mut self, minimum_precedence: u8) -> Result<AstExpression, CompileError> {
         let mut lhs = match self.next_kind()? {
             TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
+            TokenKind::Match => self.match_expression()?,
             TokenKind::Integer(value) => AstExpression::Integer(value),
             TokenKind::True => AstExpression::Bool(true),
             TokenKind::False => AstExpression::Bool(false),
@@ -544,7 +641,45 @@ impl Parser<'_> {
                     name.push('.');
                     name.push_str(&self.ident()?);
                 }
-                if self.take(&TokenKind::LParen) {
+                let type_arguments = if self.take(&TokenKind::Less) {
+                    let mut arguments = Vec::new();
+                    loop {
+                        arguments.push(self.ty()?);
+                        if !self.take(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::Greater, ">")?;
+                    arguments
+                } else {
+                    Vec::new()
+                };
+                if is_migration_intrinsic(&name) {
+                    AstExpression::Migration(self.migration_intrinsic(&name, type_arguments)?)
+                } else if name == "None" && type_arguments.is_empty() {
+                    AstExpression::Constructor {
+                        variant: BuiltinVariant::None,
+                        payload: None,
+                    }
+                } else if matches!(name.as_str(), "Some" | "Ok" | "Err")
+                    && type_arguments.is_empty()
+                {
+                    self.expect(&TokenKind::LParen, "(")?;
+                    let payload = self.expression(0)?;
+                    self.expect(&TokenKind::RParen, ")")?;
+                    AstExpression::Constructor {
+                        variant: match name.as_str() {
+                            "Some" => BuiltinVariant::Some,
+                            "Ok" => BuiltinVariant::Ok,
+                            "Err" => BuiltinVariant::Err,
+                            _ => unreachable!(),
+                        },
+                        payload: Some(Box::new(payload)),
+                    }
+                } else if self.take(&TokenKind::LParen) {
+                    if !type_arguments.is_empty() {
+                        return Err(self.unexpected("non-generic function call"));
+                    }
                     let mut arguments = Vec::new();
                     if !self.at(&TokenKind::RParen) {
                         loop {
@@ -560,6 +695,9 @@ impl Parser<'_> {
                         arguments,
                     }
                 } else {
+                    if !type_arguments.is_empty() {
+                        return Err(self.unexpected("generic function call"));
+                    }
                     AstExpression::Name(name)
                 }
             }
@@ -571,6 +709,10 @@ impl Parser<'_> {
             _ => return Err(self.unexpected("expression")),
         };
         loop {
+            if self.take(&TokenKind::Question) {
+                lhs = AstExpression::Try(Box::new(lhs));
+                continue;
+            }
             let (precedence, op) = match self.peek_kind() {
                 Some(TokenKind::Plus) => (1, BinaryOp::Add),
                 Some(TokenKind::Minus) => (1, BinaryOp::Subtract),
@@ -591,6 +733,104 @@ impl Parser<'_> {
         Ok(lhs)
     }
 
+    fn match_expression(&mut self) -> Result<AstExpression, CompileError> {
+        let value = self.expression(0)?;
+        self.expect(&TokenKind::LBrace, "{")?;
+        let mut arms = Vec::new();
+        while !self.take(&TokenKind::RBrace) {
+            let variant = self.ident()?;
+            let binding = if self.take(&TokenKind::LParen) {
+                let binding = self.ident()?;
+                self.expect(&TokenKind::RParen, ")")?;
+                Some(binding)
+            } else {
+                None
+            };
+            self.expect(&TokenKind::FatArrow, "=>")?;
+            let arm_value = self.expression(0)?;
+            arms.push(MatchArm {
+                variant,
+                binding,
+                value: arm_value,
+            });
+            if !self.take(&TokenKind::Comma) && !self.at(&TokenKind::RBrace) {
+                return Err(self.unexpected(", or }"));
+            }
+        }
+        Ok(AstExpression::Match {
+            value: Box::new(value),
+            arms,
+        })
+    }
+
+    fn migration_intrinsic(
+        &mut self,
+        name: &str,
+        type_arguments: Vec<AstType>,
+    ) -> Result<MigrationIntrinsic, CompileError> {
+        self.expect(&TokenKind::LParen, "(")?;
+        let intrinsic = match name {
+            "old.get" => MigrationIntrinsic::OldGet {
+                ty: exactly_one_type(type_arguments)?,
+                stable_id: self.ident()?,
+            },
+            "old.field" => {
+                let object = self.expression(0)?;
+                self.expect(&TokenKind::Comma, ",")?;
+                let (owner, field) = split_field_name(&self.qualified_ident()?)?;
+                MigrationIntrinsic::OldFieldGet {
+                    object: Box::new(object),
+                    owner,
+                    field,
+                    ty: exactly_one_type(type_arguments)?,
+                }
+            }
+            "new.create" => MigrationIntrinsic::NewCreate {
+                ty: exactly_one_type(type_arguments)?,
+                stable_id: self.ident()?,
+            },
+            "new.set" => {
+                if !type_arguments.is_empty() {
+                    return Err(CompileError::TypeMismatch);
+                }
+                let object = self.expression(0)?;
+                self.expect(&TokenKind::Comma, ",")?;
+                let (owner, field) = split_field_name(&self.qualified_ident()?)?;
+                self.expect(&TokenKind::Comma, ",")?;
+                let value = self.expression(0)?;
+                MigrationIntrinsic::NewSet {
+                    object: Box::new(object),
+                    owner,
+                    field,
+                    value: Box::new(value),
+                }
+            }
+            "preserve" => MigrationIntrinsic::Preserve {
+                stable_id: self.ident()?,
+            },
+            "replace" => {
+                let stable_id = self.ident()?;
+                self.expect(&TokenKind::Comma, ",")?;
+                MigrationIntrinsic::Replace {
+                    stable_id,
+                    target: Box::new(self.expression(0)?),
+                }
+            }
+            "delete" => MigrationIntrinsic::Delete {
+                stable_id: self.ident()?,
+            },
+            "finish_migration" => {
+                if !type_arguments.is_empty() {
+                    return Err(CompileError::TypeMismatch);
+                }
+                MigrationIntrinsic::Finish
+            }
+            _ => unreachable!(),
+        };
+        self.expect(&TokenKind::RParen, ")")?;
+        Ok(intrinsic)
+    }
+
     fn block(&mut self) -> Result<Vec<AstStatement>, CompileError> {
         self.expect(&TokenKind::LBrace, "{")?;
         let mut body = Vec::new();
@@ -601,11 +841,25 @@ impl Parser<'_> {
     }
 
     fn ty(&mut self) -> Result<AstType, CompileError> {
-        Ok(match self.ident()?.as_str() {
+        let name = self.ident()?;
+        let base = match name.as_str() {
             "i32" => AstType::I32,
             "bool" => AstType::Bool,
             named => AstType::Named(named.to_owned()),
-        })
+        };
+        if self.take(&TokenKind::Less) {
+            let mut arguments = Vec::new();
+            loop {
+                arguments.push(self.ty()?);
+                if !self.take(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            self.expect(&TokenKind::Greater, ">")?;
+            Ok(AstType::BuiltinGeneric { name, arguments })
+        } else {
+            Ok(base)
+        }
     }
 
     fn ident(&mut self) -> Result<String, CompileError> {
@@ -670,6 +924,59 @@ impl Parser<'_> {
     }
 }
 
+fn is_migration_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "old.get"
+            | "old.field"
+            | "new.create"
+            | "new.set"
+            | "preserve"
+            | "replace"
+            | "delete"
+            | "finish_migration"
+    )
+}
+
+fn exactly_one_type(mut arguments: Vec<AstType>) -> Result<AstType, CompileError> {
+    if arguments.len() != 1 {
+        return Err(CompileError::TypeMismatch);
+    }
+    Ok(arguments.pop().expect("length was checked"))
+}
+
+fn split_field_name(name: &str) -> Result<(String, String), CompileError> {
+    name.rsplit_once('.')
+        .map(|(owner, field)| (owner.to_owned(), field.to_owned()))
+        .ok_or(CompileError::TypeMismatch)
+}
+
+fn migration_expressions(intrinsic: &MigrationIntrinsic) -> Vec<&AstExpression> {
+    match intrinsic {
+        MigrationIntrinsic::OldFieldGet { object, .. } => vec![object],
+        MigrationIntrinsic::NewSet { object, value, .. } => vec![object, value],
+        MigrationIntrinsic::Replace { target, .. } => vec![target],
+        MigrationIntrinsic::OldGet { .. }
+        | MigrationIntrinsic::NewCreate { .. }
+        | MigrationIntrinsic::Preserve { .. }
+        | MigrationIntrinsic::Delete { .. }
+        | MigrationIntrinsic::Finish => Vec::new(),
+    }
+}
+
+fn migration_expressions_mut(intrinsic: &mut MigrationIntrinsic) -> Vec<&mut AstExpression> {
+    match intrinsic {
+        MigrationIntrinsic::OldFieldGet { object, .. } => vec![object],
+        MigrationIntrinsic::NewSet { object, value, .. } => vec![object, value],
+        MigrationIntrinsic::Replace { target, .. } => vec![target],
+        MigrationIntrinsic::OldGet { .. }
+        | MigrationIntrinsic::NewCreate { .. }
+        | MigrationIntrinsic::Preserve { .. }
+        | MigrationIntrinsic::Delete { .. }
+        | MigrationIntrinsic::Finish => Vec::new(),
+    }
+}
+
 fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, value: i32) {
     for statement in statements {
         match statement {
@@ -710,13 +1017,112 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
                 substitute_name(argument, name, value);
             }
         }
-        AstExpression::Await(expression) => substitute_name(expression, name, value),
+        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+            substitute_name(expression, name, value);
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                substitute_name(payload, name, value);
+            }
+        }
+        AstExpression::Match {
+            value: matched,
+            arms,
+        } => {
+            substitute_name(matched, name, value);
+            for arm in arms {
+                substitute_name(&mut arm.value, name, value);
+            }
+        }
+        AstExpression::Migration(intrinsic) => {
+            for expression in migration_expressions_mut(intrinsic) {
+                substitute_name(expression, name, value);
+            }
+        }
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
     }
 }
 
 pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> {
     resolve_and_typecheck_with_hosts(ast, BTreeMap::new(), None, None)
+}
+
+fn builtin_variant_id(name: &str) -> StableId {
+    match name {
+        "None" => StableId::from_parts(&["Option", "::None"]),
+        "Some" => StableId::from_parts(&["Option", "::Some"]),
+        "Ok" => StableId::from_parts(&["Result", "::Ok"]),
+        "Err" => StableId::from_parts(&["Result", "::Err"]),
+        _ => StableId::from_name(name),
+    }
+}
+
+fn collect_builtin_enum_types(ast: &AstModule, enum_types: &mut Vec<EnumType>) {
+    let mut add_type = |ty: &AstType| collect_builtin_enum_type(ty, enum_types);
+    for declaration in &ast.types {
+        for (_, ty) in &declaration.fields {
+            add_type(ty);
+        }
+    }
+    for function in &ast.functions {
+        for (_, ty) in &function.parameters {
+            add_type(ty);
+        }
+        add_type(&function.result);
+        collect_statement_builtin_types(&function.body, &mut add_type);
+    }
+}
+
+fn collect_statement_builtin_types(
+    statements: &[AstStatement],
+    add_type: &mut impl FnMut(&AstType),
+) {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { ty: Some(ty), .. } => add_type(ty),
+            AstStatement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_statement_builtin_types(then_body, add_type);
+                collect_statement_builtin_types(else_body, add_type);
+            }
+            AstStatement::While { body, .. } => {
+                collect_statement_builtin_types(body, add_type);
+            }
+            AstStatement::Bind { ty: None, .. }
+            | AstStatement::Return(_)
+            | AstStatement::Expression(_)
+            | AstStatement::Defer(_) => {}
+        }
+    }
+}
+
+fn collect_builtin_enum_type(ty: &AstType, enum_types: &mut Vec<EnumType>) {
+    let AstType::BuiltinGeneric { name, arguments } = ty else {
+        return;
+    };
+    for argument in arguments {
+        collect_builtin_enum_type(argument, enum_types);
+    }
+    let enum_type = match name.as_str() {
+        "Option" if arguments.len() == 1 => {
+            Some(nexa_bytecode::option_type(lower_type(&arguments[0])))
+        }
+        "Result" if arguments.len() == 2 => Some(nexa_bytecode::result_type(
+            lower_type(&arguments[0]),
+            lower_type(&arguments[1]),
+        )),
+        _ => None,
+    };
+    if let Some(enum_type) = enum_type
+        && !enum_types
+            .iter()
+            .any(|candidate| candidate.type_id == enum_type.type_id)
+    {
+        enum_types.push(enum_type);
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -754,6 +1160,34 @@ fn resolve_and_typecheck_with_hosts(
             .any(|candidate| candidate.type_id == enum_type.type_id)
         {
             enum_types.push(enum_type);
+        }
+    }
+    collect_builtin_enum_types(&ast, &mut enum_types);
+    let mut enum_variants = BTreeMap::new();
+    for declaration in ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Enum)
+    {
+        let type_id = StableId::from_name(&declaration.name);
+        for (name, variant) in declaration.variants.iter().zip(
+            enum_types
+                .iter()
+                .find(|enum_type| enum_type.type_id == type_id)
+                .expect("source enum metadata was built")
+                .variants
+                .iter(),
+        ) {
+            enum_variants.insert((type_id, name.clone()), variant.clone());
+        }
+    }
+    for enum_type in &enum_types {
+        for variant in &enum_type.variants {
+            for name in ["None", "Some", "Ok", "Err"] {
+                if variant.stable_id == builtin_variant_id(name) {
+                    enum_variants.insert((enum_type.type_id, name.to_owned()), variant.clone());
+                }
+            }
         }
     }
     let state_schema = StateSchema {
@@ -819,6 +1253,7 @@ fn resolve_and_typecheck_with_hosts(
             validate_type(ty, &known_types)?;
         }
         validate_type(&function.result, &known_types)?;
+        validate_statement_types(&function.body, &known_types)?;
         let signature = Signature {
             parameters: function
                 .parameters
@@ -856,11 +1291,17 @@ fn resolve_and_typecheck_with_hosts(
         }
         let mut next_register =
             u16::try_from(function.parameters.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        let type_context = TypeContext {
+            signatures: &signatures,
+            enum_types: &enum_types,
+            enum_variants: &enum_variants,
+            function_result: signature.result.expect("result is required"),
+            effect: function.effect,
+        };
         let flow = check_statements(
             &function.body,
             &mut locals,
-            &signatures,
-            signature.result.expect("result is required"),
+            &type_context,
             &mut next_register,
         )?;
         if flow == Flow::FallsThrough {
@@ -881,6 +1322,7 @@ fn resolve_and_typecheck_with_hosts(
         schema_hash,
         state_schema,
         enum_types,
+        enum_variants,
     })
 }
 
@@ -921,7 +1363,11 @@ fn validate_await_expression(
 ) -> Result<(), CompileError> {
     match expression {
         AstExpression::Await(inner) => {
-            let AstExpression::Call { function, .. } = inner.as_ref() else {
+            let awaited = match inner.as_ref() {
+                AstExpression::Try(expression) => expression.as_ref(),
+                expression => expression,
+            };
+            let AstExpression::Call { function, .. } = awaited else {
                 return Err(CompileError::InvalidEffect);
             };
             if !suspending_functions.contains(function) {
@@ -944,6 +1390,28 @@ fn validate_await_expression(
         AstExpression::Binary { lhs, rhs, .. } => {
             validate_await_expression(lhs, suspending_functions, false)?;
             validate_await_expression(rhs, suspending_functions, false)
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                validate_await_expression(payload, suspending_functions, false)?;
+            }
+            Ok(())
+        }
+        AstExpression::Match { value, arms } => {
+            validate_await_expression(value, suspending_functions, false)?;
+            for arm in arms {
+                validate_await_expression(&arm.value, suspending_functions, false)?;
+            }
+            Ok(())
+        }
+        AstExpression::Try(expression) => {
+            validate_await_expression(expression, suspending_functions, awaited)
+        }
+        AstExpression::Migration(intrinsic) => {
+            for expression in migration_expressions(intrinsic) {
+                validate_await_expression(expression, suspending_functions, false)?;
+            }
+            Ok(())
         }
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => Ok(()),
     }
@@ -968,8 +1436,8 @@ fn resolve_statements(
 ) -> Result<(), CompileError> {
     for statement in statements {
         match statement {
-            AstStatement::Bind { name, value } => {
-                resolve_expression(value, scopes)?;
+            AstStatement::Bind { name, value, .. } => {
+                resolve_expression(value, scopes, next_local)?;
                 let source_name = name.clone();
                 if scopes
                     .last()
@@ -990,13 +1458,15 @@ fn resolve_statements(
             }
             AstStatement::Return(expression)
             | AstStatement::Expression(expression)
-            | AstStatement::Defer(expression) => resolve_expression(expression, scopes)?,
+            | AstStatement::Defer(expression) => {
+                resolve_expression(expression, scopes, next_local)?;
+            }
             AstStatement::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                resolve_expression(condition, scopes)?;
+                resolve_expression(condition, scopes, next_local)?;
                 scopes.push(BTreeMap::new());
                 resolve_statements(then_body, scopes, next_local)?;
                 scopes.pop();
@@ -1005,7 +1475,7 @@ fn resolve_statements(
                 scopes.pop();
             }
             AstStatement::While { condition, body } => {
-                resolve_expression(condition, scopes)?;
+                resolve_expression(condition, scopes, next_local)?;
                 scopes.push(BTreeMap::new());
                 resolve_statements(body, scopes, next_local)?;
                 scopes.pop();
@@ -1017,7 +1487,8 @@ fn resolve_statements(
 
 fn resolve_expression(
     expression: &mut AstExpression,
-    scopes: &[BTreeMap<String, String>],
+    scopes: &mut Vec<BTreeMap<String, String>>,
+    next_local: &mut u32,
 ) -> Result<(), CompileError> {
     match expression {
         AstExpression::Name(name) => {
@@ -1030,25 +1501,98 @@ fn resolve_expression(
             *name = resolved;
         }
         AstExpression::Binary { lhs, rhs, .. } => {
-            resolve_expression(lhs, scopes)?;
-            resolve_expression(rhs, scopes)?;
+            resolve_expression(lhs, scopes, next_local)?;
+            resolve_expression(rhs, scopes, next_local)?;
         }
         AstExpression::Call { arguments, .. } => {
             for argument in arguments {
-                resolve_expression(argument, scopes)?;
+                resolve_expression(argument, scopes, next_local)?;
             }
         }
-        AstExpression::Await(expression) => resolve_expression(expression, scopes)?,
+        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+            resolve_expression(expression, scopes, next_local)?;
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                resolve_expression(payload, scopes, next_local)?;
+            }
+        }
+        AstExpression::Match { value, arms } => {
+            resolve_expression(value, scopes, next_local)?;
+            for arm in arms {
+                scopes.push(BTreeMap::new());
+                if let Some(binding) = &mut arm.binding {
+                    let source_name = binding.clone();
+                    let resolved = format!("{source_name}#{}", *next_local);
+                    *next_local = next_local
+                        .checked_add(1)
+                        .ok_or(CompileError::TooManyRegisters)?;
+                    scopes
+                        .last_mut()
+                        .expect("match arm scope exists")
+                        .insert(source_name, resolved.clone());
+                    *binding = resolved;
+                }
+                resolve_expression(&mut arm.value, scopes, next_local)?;
+                scopes.pop();
+            }
+        }
+        AstExpression::Migration(intrinsic) => {
+            for expression in migration_expressions_mut(intrinsic) {
+                resolve_expression(expression, scopes, next_local)?;
+            }
+        }
         AstExpression::Integer(_) | AstExpression::Bool(_) => {}
     }
     Ok(())
 }
 
 fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), CompileError> {
-    if let AstType::Named(name) = ty
-        && !known_types.contains(name)
-    {
-        return Err(CompileError::UnknownType(name.clone()));
+    match ty {
+        AstType::Named(name) if !known_types.contains(name) => {
+            Err(CompileError::UnknownType(name.clone()))
+        }
+        AstType::BuiltinGeneric { name, arguments } => {
+            let expected = match name.as_str() {
+                "Option" => 1,
+                "Result" => 2,
+                _ => return Err(CompileError::UnknownType(name.clone())),
+            };
+            if arguments.len() != expected {
+                return Err(CompileError::TypeMismatch);
+            }
+            for argument in arguments {
+                validate_type(argument, known_types)?;
+            }
+            Ok(())
+        }
+        AstType::I32 | AstType::Bool | AstType::Named(_) => Ok(()),
+    }
+}
+
+fn validate_statement_types(
+    statements: &[AstStatement],
+    known_types: &BTreeSet<String>,
+) -> Result<(), CompileError> {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { ty: Some(ty), .. } => validate_type(ty, known_types)?,
+            AstStatement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                validate_statement_types(then_body, known_types)?;
+                validate_statement_types(else_body, known_types)?;
+            }
+            AstStatement::While { body, .. } => {
+                validate_statement_types(body, known_types)?;
+            }
+            AstStatement::Bind { ty: None, .. }
+            | AstStatement::Return(_)
+            | AstStatement::Expression(_)
+            | AstStatement::Defer(_) => {}
+        }
     }
     Ok(())
 }
@@ -1060,59 +1604,74 @@ enum Flow {
     Diverges,
 }
 
+struct TypeContext<'a> {
+    signatures: &'a BTreeMap<String, Signature>,
+    enum_types: &'a [EnumType],
+    enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
+    function_result: ValueType,
+    effect: FunctionEffect,
+}
+
 fn check_statements(
     statements: &[AstStatement],
     locals: &mut BTreeMap<String, (u16, ValueType)>,
-    signatures: &BTreeMap<String, Signature>,
-    result: ValueType,
+    context: &TypeContext<'_>,
     next_register: &mut u16,
 ) -> Result<Flow, CompileError> {
     let mut flow = Flow::FallsThrough;
     for statement in statements {
         match statement {
-            AstStatement::Bind { name, value } => {
-                let ty = expression_type(value, locals, signatures)?;
+            AstStatement::Bind { name, ty, value } => {
+                let expected = ty.as_ref().map(lower_type);
+                let actual = expression_type(value, locals, context, next_register, expected)?;
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(CompileError::TypeMismatch);
+                }
                 let register = *next_register;
                 *next_register = next_register
                     .checked_add(1)
                     .ok_or(CompileError::TooManyRegisters)?;
-                if locals.insert(name.clone(), (register, ty)).is_some() {
+                if locals.insert(name.clone(), (register, actual)).is_some() {
                     return Err(CompileError::DuplicateName(name.clone()));
                 }
             }
             AstStatement::Return(expression) => {
-                if expression_type(expression, locals, signatures)? != result {
+                if expression_type(
+                    expression,
+                    locals,
+                    context,
+                    next_register,
+                    Some(context.function_result),
+                )? != context.function_result
+                {
                     return Err(CompileError::TypeMismatch);
                 }
                 flow = Flow::Returns;
             }
             AstStatement::Expression(expression) => {
-                expression_type(expression, locals, signatures)?;
+                expression_type(expression, locals, context, next_register, None)?;
             }
             AstStatement::If {
                 condition,
                 then_body,
                 else_body,
             } => {
-                if expression_type(condition, locals, signatures)? != ValueType::Bool {
+                if expression_type(
+                    condition,
+                    locals,
+                    context,
+                    next_register,
+                    Some(ValueType::Bool),
+                )? != ValueType::Bool
+                {
                     return Err(CompileError::TypeMismatch);
                 }
                 let mut then_locals = locals.clone();
                 let mut else_locals = locals.clone();
-                let then_flow = check_statements(
-                    then_body,
-                    &mut then_locals,
-                    signatures,
-                    result,
-                    next_register,
-                )?;
-                let else_flow = check_statements(
-                    else_body,
-                    &mut else_locals,
-                    signatures,
-                    result,
-                    next_register,
-                )?;
+                let then_flow =
+                    check_statements(then_body, &mut then_locals, context, next_register)?;
+                let else_flow =
+                    check_statements(else_body, &mut else_locals, context, next_register)?;
                 for (name, binding) in then_locals.into_iter().chain(else_locals) {
                     locals.entry(name).or_insert(binding);
                 }
@@ -1123,12 +1682,18 @@ fn check_statements(
                 }
             }
             AstStatement::While { condition, body } => {
-                if expression_type(condition, locals, signatures)? != ValueType::Bool {
+                if expression_type(
+                    condition,
+                    locals,
+                    context,
+                    next_register,
+                    Some(ValueType::Bool),
+                )? != ValueType::Bool
+                {
                     return Err(CompileError::TypeMismatch);
                 }
                 let mut loop_locals = locals.clone();
-                let body_flow =
-                    check_statements(body, &mut loop_locals, signatures, result, next_register)?;
+                let body_flow = check_statements(body, &mut loop_locals, context, next_register)?;
                 for (name, binding) in loop_locals {
                     locals.entry(name).or_insert(binding);
                 }
@@ -1141,7 +1706,7 @@ fn check_statements(
                 if contains_await(expression) {
                     return Err(CompileError::SuspendingDefer);
                 }
-                expression_type(expression, locals, signatures)?;
+                expression_type(expression, locals, context, next_register, None)?;
             }
         }
     }
@@ -1174,49 +1739,225 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Await(_) => true,
         AstExpression::Binary { lhs, rhs, .. } => contains_await(lhs) || contains_await(rhs),
         AstExpression::Call { arguments, .. } => arguments.iter().any(contains_await),
+        AstExpression::Constructor { payload, .. } => {
+            payload.as_deref().is_some_and(contains_await)
+        }
+        AstExpression::Match { value, arms } => {
+            contains_await(value) || arms.iter().any(|arm| contains_await(&arm.value))
+        }
+        AstExpression::Try(expression) => contains_await(expression),
+        AstExpression::Migration(intrinsic) => migration_expressions(intrinsic)
+            .into_iter()
+            .any(contains_await),
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => false,
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn expression_type(
     expression: &AstExpression,
-    locals: &BTreeMap<String, (u16, ValueType)>,
-    signatures: &BTreeMap<String, Signature>,
+    locals: &mut BTreeMap<String, (u16, ValueType)>,
+    context: &TypeContext<'_>,
+    next_register: &mut u16,
+    expected: Option<ValueType>,
 ) -> Result<ValueType, CompileError> {
-    match expression {
-        AstExpression::Integer(_) => Ok(ValueType::I32),
-        AstExpression::Bool(_) => Ok(ValueType::Bool),
+    let actual = match expression {
+        AstExpression::Integer(_) => ValueType::I32,
+        AstExpression::Bool(_) => ValueType::Bool,
         AstExpression::Name(name) => locals
             .get(name)
             .map(|(_, ty)| *ty)
-            .ok_or_else(|| CompileError::UnknownName(name.clone())),
+            .ok_or_else(|| CompileError::UnknownName(name.clone()))?,
         AstExpression::Binary { lhs, rhs, .. } => {
-            if expression_type(lhs, locals, signatures)? == ValueType::I32
-                && expression_type(rhs, locals, signatures)? == ValueType::I32
+            if expression_type(lhs, locals, context, next_register, Some(ValueType::I32))?
+                != ValueType::I32
+                || expression_type(rhs, locals, context, next_register, Some(ValueType::I32))?
+                    != ValueType::I32
             {
-                Ok(ValueType::I32)
-            } else {
-                Err(CompileError::TypeMismatch)
+                return Err(CompileError::TypeMismatch);
             }
+            ValueType::I32
         }
         AstExpression::Call {
             function,
             arguments,
         } => {
-            let signature = signatures
+            let signature = context
+                .signatures
                 .get(function)
                 .ok_or_else(|| CompileError::UnknownName(function.clone()))?;
             if arguments.len() != signature.parameters.len() {
                 return Err(CompileError::TypeMismatch);
             }
-            for (argument, expected) in arguments.iter().zip(&signature.parameters) {
-                if expression_type(argument, locals, signatures)? != *expected {
+            for (argument, parameter) in arguments.iter().zip(&signature.parameters) {
+                if expression_type(argument, locals, context, next_register, Some(*parameter))?
+                    != *parameter
+                {
                     return Err(CompileError::TypeMismatch);
                 }
             }
-            Ok(signature.result.expect("functions have results"))
+            signature.result.expect("functions have results")
         }
-        AstExpression::Await(expression) => expression_type(expression, locals, signatures),
+        AstExpression::Await(expression) => {
+            expression_type(expression, locals, context, next_register, expected)?
+        }
+        AstExpression::Constructor { variant, payload } => {
+            let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)? else {
+                return Err(CompileError::TypeMismatch);
+            };
+            let metadata = context
+                .enum_variants
+                .get(&(type_id, variant.name().to_owned()))
+                .ok_or(CompileError::TypeMismatch)?;
+            match (payload, metadata.payload_type) {
+                (Some(payload), Some(payload_type)) => {
+                    if expression_type(payload, locals, context, next_register, Some(payload_type))?
+                        != payload_type
+                    {
+                        return Err(CompileError::TypeMismatch);
+                    }
+                }
+                (None, None) => {}
+                _ => return Err(CompileError::TypeMismatch),
+            }
+            ValueType::Named(type_id)
+        }
+        AstExpression::Match { value, arms } => {
+            let ValueType::Named(type_id) =
+                expression_type(value, locals, context, next_register, None)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            let enum_type = context
+                .enum_types
+                .iter()
+                .find(|enum_type| enum_type.type_id == type_id)
+                .ok_or(CompileError::TypeMismatch)?;
+            let mut covered = BTreeSet::new();
+            let mut result_type = expected;
+            for arm in arms {
+                let variant = context
+                    .enum_variants
+                    .get(&(type_id, arm.variant.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                if !covered.insert(variant.stable_id) {
+                    return Err(CompileError::DuplicateMatchVariant);
+                }
+                match (&arm.binding, variant.payload_type) {
+                    (Some(binding), Some(payload_type)) => {
+                        if !locals.contains_key(binding) {
+                            let register = *next_register;
+                            *next_register = next_register
+                                .checked_add(1)
+                                .ok_or(CompileError::TooManyRegisters)?;
+                            locals.insert(binding.clone(), (register, payload_type));
+                        }
+                    }
+                    (None, None) => {}
+                    _ => return Err(CompileError::TypeMismatch),
+                }
+                let arm_type =
+                    expression_type(&arm.value, locals, context, next_register, result_type)?;
+                if let Some(expected) = result_type
+                    && arm_type != expected
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                result_type = Some(arm_type);
+            }
+            if covered.len() != enum_type.variants.len() {
+                return Err(CompileError::NonExhaustiveMatch);
+            }
+            result_type.ok_or(CompileError::NonExhaustiveMatch)?
+        }
+        AstExpression::Try(expression) => {
+            let ValueType::Named(type_id) =
+                expression_type(expression, locals, context, next_register, None)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            let ok = context
+                .enum_variants
+                .get(&(type_id, "Ok".to_owned()))
+                .ok_or(CompileError::TypeMismatch)?;
+            let error = context
+                .enum_variants
+                .get(&(type_id, "Err".to_owned()))
+                .ok_or(CompileError::TypeMismatch)?;
+            let ValueType::Named(function_result) = context.function_result else {
+                return Err(CompileError::TypeMismatch);
+            };
+            let result_error = context
+                .enum_variants
+                .get(&(function_result, "Err".to_owned()))
+                .ok_or(CompileError::TypeMismatch)?;
+            if error.payload_type != result_error.payload_type {
+                return Err(CompileError::TypeMismatch);
+            }
+            ok.payload_type.ok_or(CompileError::TypeMismatch)?
+        }
+        AstExpression::Migration(intrinsic) => {
+            if context.effect != FunctionEffect::Migration {
+                return Err(CompileError::InvalidEffect);
+            }
+            migration_intrinsic_type(intrinsic, locals, context, next_register)?
+        }
+    };
+    if expected.is_some_and(|expected| actual != expected) {
+        return Err(CompileError::TypeMismatch);
+    }
+    Ok(actual)
+}
+
+fn migration_intrinsic_type(
+    intrinsic: &MigrationIntrinsic,
+    locals: &mut BTreeMap<String, (u16, ValueType)>,
+    context: &TypeContext<'_>,
+    next_register: &mut u16,
+) -> Result<ValueType, CompileError> {
+    match intrinsic {
+        MigrationIntrinsic::OldGet { ty, .. }
+        | MigrationIntrinsic::NewCreate { ty, .. }
+        | MigrationIntrinsic::OldFieldGet { ty, .. } => {
+            if let MigrationIntrinsic::OldFieldGet { object, owner, .. } = intrinsic
+                && expression_type(
+                    object,
+                    locals,
+                    context,
+                    next_register,
+                    Some(ValueType::Named(StableId::from_name(owner))),
+                )? != ValueType::Named(StableId::from_name(owner))
+            {
+                return Err(CompileError::TypeMismatch);
+            }
+            Ok(lower_type(ty))
+        }
+        MigrationIntrinsic::NewSet {
+            object,
+            owner,
+            value,
+            ..
+        } => {
+            expression_type(
+                object,
+                locals,
+                context,
+                next_register,
+                Some(ValueType::Named(StableId::from_name(owner))),
+            )?;
+            expression_type(value, locals, context, next_register, None)?;
+            Ok(ValueType::Bool)
+        }
+        MigrationIntrinsic::Replace { target, .. } => {
+            let target_type = expression_type(target, locals, context, next_register, None)?;
+            if !target_type.is_reference() {
+                return Err(CompileError::TypeMismatch);
+            }
+            Ok(ValueType::Bool)
+        }
+        MigrationIntrinsic::Preserve { .. }
+        | MigrationIntrinsic::Delete { .. }
+        | MigrationIntrinsic::Finish => Ok(ValueType::Bool),
     }
 }
 
@@ -1225,6 +1966,14 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::I32 => ValueType::I32,
         AstType::Bool => ValueType::Bool,
         AstType::Named(name) => ValueType::Named(StableId::from_name(name)),
+        AstType::BuiltinGeneric { name, arguments } if name == "Option" => {
+            ValueType::Named(nexa_bytecode::option_type(lower_type(&arguments[0])).type_id)
+        }
+        AstType::BuiltinGeneric { name, arguments } if name == "Result" => ValueType::Named(
+            nexa_bytecode::result_type(lower_type(&arguments[0]), lower_type(&arguments[1]))
+                .type_id,
+        ),
+        AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
     }
 }
 
@@ -1257,62 +2006,24 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
         let mut code = Vec::new();
         let temporary =
             u16::try_from(function.locals.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        let emit_context = EmitContext {
+            functions: &function_ids,
+            script_functions: &hir.functions,
+            host_functions: &hir.host_functions,
+            enum_variants: &hir.enum_variants,
+            function_result: function.signature.result.expect("result is required"),
+        };
         emit_statements(
             &function.body,
             temporary,
             &function.locals,
-            &function_ids,
-            &hir.host_functions,
+            &emit_context,
             &mut code,
         )?;
         let registers =
             u16::try_from(function.locals.len() + 8).map_err(|_| CompileError::TooManyRegisters)?;
-        let mut root_bitmap = vec![false; usize::from(registers)];
-        for (register, ty) in function.locals.values() {
-            root_bitmap[usize::from(*register)] = ty.is_reference();
-        }
-        if function
-            .signature
-            .result
-            .is_some_and(ValueType::is_reference)
-        {
-            root_bitmap[function.locals.len()] = true;
-        }
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for instruction in &code {
-                let (destination, is_reference) = match instruction {
-                    Instruction::Move { dst, source } => (*dst, root_bitmap[usize::from(*source)]),
-                    Instruction::Call {
-                        function: callee,
-                        dst,
-                        ..
-                    } => (
-                        *dst,
-                        hir.functions[*callee as usize]
-                            .signature
-                            .result
-                            .is_some_and(ValueType::is_reference),
-                    ),
-                    Instruction::HostCall { import, dst, .. } => (
-                        *dst,
-                        hir.host_functions
-                            .values()
-                            .find(|function| function.import == *import)
-                            .and_then(|function| function.metadata.result)
-                            .is_some_and(ValueType::is_reference),
-                    ),
-                    _ => continue,
-                };
-                if is_reference && !root_bitmap[usize::from(destination)] {
-                    root_bitmap[usize::from(destination)] = true;
-                    changed = true;
-                }
-            }
-        }
         let safepoints = collect_safepoints(&code);
-        let root_maps = exact_root_maps(function, &code, &safepoints, hir)?;
+        let (root_bitmap, root_maps) = exact_root_maps(function, &code, &safepoints, hir)?;
         module.function(Function {
             signature: function.signature.clone(),
             registers,
@@ -1335,7 +2046,7 @@ fn exact_root_maps(
     code: &[Instruction],
     safepoints: &[u32],
     module: &HirModule,
-) -> Result<Vec<RootMap>, CompileError> {
+) -> Result<(Vec<bool>, Vec<RootMap>), CompileError> {
     use std::collections::VecDeque;
 
     let register_count = function.locals.len() + 8;
@@ -1389,6 +2100,26 @@ fn exact_root_maps(
             Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
+            Instruction::EnumPayload {
+                source,
+                variant,
+                dst,
+            } => {
+                let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                state[usize::from(dst)] = module
+                    .enum_types
+                    .iter()
+                    .find(|enum_type| enum_type.type_id == type_id)
+                    .and_then(|enum_type| {
+                        enum_type
+                            .variants
+                            .iter()
+                            .find(|candidate| candidate.stable_id == variant)
+                    })
+                    .and_then(|variant| variant.payload_type);
+            }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
                 successors.push(target as usize);
@@ -1402,7 +2133,6 @@ fn exact_root_maps(
             | Instruction::StateDelete { .. }
             | Instruction::StatePreserve { .. }
             | Instruction::StateFinish
-            | Instruction::EnumPayload { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -1448,7 +2178,15 @@ fn exact_root_maps(
             }
         }
     }
-    Ok(safepoints
+    let root_bitmap = (0..register_count)
+        .map(|register| {
+            states
+                .iter()
+                .flatten()
+                .any(|state| state[register].is_some_and(ValueType::is_reference))
+        })
+        .collect();
+    let root_maps = safepoints
         .iter()
         .map(|pc| RootMap {
             pc: *pc,
@@ -1462,7 +2200,16 @@ fn exact_root_maps(
                 },
             ),
         })
-        .collect())
+        .collect();
+    Ok((root_bitmap, root_maps))
+}
+
+struct EmitContext<'a> {
+    functions: &'a BTreeMap<String, u32>,
+    script_functions: &'a [HirFunction],
+    host_functions: &'a BTreeMap<String, HostFunction>,
+    enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
+    function_result: ValueType,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1470,35 +2217,34 @@ fn emit_statements(
     statements: &[AstStatement],
     temporary: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
-    functions: &BTreeMap<String, u32>,
-    host_functions: &BTreeMap<String, HostFunction>,
+    context: &EmitContext<'_>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     for statement in statements {
         match statement {
-            AstStatement::Bind { name, value } => {
+            AstStatement::Bind { name, value, .. } => {
                 emit_expression(
                     value,
                     locals[name].0,
+                    Some(locals[name].1),
                     locals,
-                    functions,
-                    host_functions,
+                    context,
                     code,
                 )?;
             }
             AstStatement::Return(value) => {
-                emit_expression(value, temporary, locals, functions, host_functions, code)?;
+                emit_expression(
+                    value,
+                    temporary,
+                    Some(context.function_result),
+                    locals,
+                    context,
+                    code,
+                )?;
                 code.push(Instruction::Return { source: temporary });
             }
             AstStatement::Expression(expression) => {
-                emit_expression(
-                    expression,
-                    temporary,
-                    locals,
-                    functions,
-                    host_functions,
-                    code,
-                )?;
+                emit_expression(expression, temporary, None, locals, context, code)?;
             }
             AstStatement::Defer(AstExpression::Call {
                 function,
@@ -1518,14 +2264,15 @@ fn emit_statements(
                                 u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
                             )
                             .ok_or(CompileError::TooManyRegisters)?,
+                        None,
                         locals,
-                        functions,
-                        host_functions,
+                        context,
                         code,
                     )?;
                 }
                 code.push(Instruction::DeferPush {
-                    function: *functions
+                    function: *context
+                        .functions
                         .get(function)
                         .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
                     args_base,
@@ -1542,9 +2289,9 @@ fn emit_statements(
                 emit_expression(
                     condition,
                     temporary,
+                    Some(ValueType::Bool),
                     locals,
-                    functions,
-                    host_functions,
+                    context,
                     code,
                 )?;
                 let branch = code.len();
@@ -1552,14 +2299,7 @@ fn emit_statements(
                     condition: temporary,
                     target: 0,
                 });
-                emit_statements(
-                    then_body,
-                    temporary,
-                    locals,
-                    functions,
-                    host_functions,
-                    code,
-                )?;
+                emit_statements(then_body, temporary, locals, context, code)?;
                 let skip_else = code.len();
                 code.push(Instruction::Jump { target: 0 });
                 let else_start =
@@ -1568,14 +2308,7 @@ fn emit_statements(
                     condition: temporary,
                     target: else_start,
                 };
-                emit_statements(
-                    else_body,
-                    temporary,
-                    locals,
-                    functions,
-                    host_functions,
-                    code,
-                )?;
+                emit_statements(else_body, temporary, locals, context, code)?;
                 let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
                 code.push(Instruction::Safepoint);
                 code[skip_else] = Instruction::Jump { target: end };
@@ -1587,9 +2320,9 @@ fn emit_statements(
                 emit_expression(
                     condition,
                     temporary,
+                    Some(ValueType::Bool),
                     locals,
-                    functions,
-                    host_functions,
+                    context,
                     code,
                 )?;
                 let exit = code.len();
@@ -1597,7 +2330,7 @@ fn emit_statements(
                     condition: temporary,
                     target: 0,
                 });
-                emit_statements(body, temporary, locals, functions, host_functions, code)?;
+                emit_statements(body, temporary, locals, context, code)?;
                 code.push(Instruction::Jump { target: loop_start });
                 let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
                 code.push(Instruction::Safepoint);
@@ -1611,12 +2344,13 @@ fn emit_statements(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_expression(
     expression: &AstExpression,
     destination: u16,
+    expected: Option<ValueType>,
     locals: &BTreeMap<String, (u16, ValueType)>,
-    functions: &BTreeMap<String, u32>,
-    host_functions: &BTreeMap<String, HostFunction>,
+    context: &EmitContext<'_>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     match expression {
@@ -1643,8 +2377,22 @@ fn emit_expression(
             let rhs_register = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
-            emit_expression(lhs, lhs_register, locals, functions, host_functions, code)?;
-            emit_expression(rhs, rhs_register, locals, functions, host_functions, code)?;
+            emit_expression(
+                lhs,
+                lhs_register,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            emit_expression(
+                rhs,
+                rhs_register,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
             code.push(match op {
                 BinaryOp::Add => Instruction::Add {
                     dst: destination,
@@ -1670,6 +2418,17 @@ fn emit_expression(
             let args_base = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
+            let signature = context
+                .host_functions
+                .get(function)
+                .map(|function| &function.signature)
+                .or_else(|| {
+                    context
+                        .functions
+                        .get(function)
+                        .and_then(|index| context_function_signature(context, *index))
+                })
+                .ok_or_else(|| CompileError::UnknownName(function.clone()))?;
             for (index, argument) in arguments.iter().enumerate() {
                 emit_expression(
                     argument,
@@ -1678,15 +2437,15 @@ fn emit_expression(
                             u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
                         )
                         .ok_or(CompileError::TooManyRegisters)?,
+                    Some(signature.parameters[index]),
                     locals,
-                    functions,
-                    host_functions,
+                    context,
                     code,
                 )?;
             }
             let args_count =
                 u16::try_from(arguments.len()).map_err(|_| CompileError::TooManyRegisters)?;
-            if let Some(host) = host_functions.get(function) {
+            if let Some(host) = context.host_functions.get(function) {
                 code.push(Instruction::HostCall {
                     import: host.import,
                     args_base,
@@ -1695,7 +2454,8 @@ fn emit_expression(
                 });
             } else {
                 code.push(Instruction::Call {
-                    function: *functions
+                    function: *context
+                        .functions
                         .get(function)
                         .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
                     args_base,
@@ -1705,14 +2465,422 @@ fn emit_expression(
             }
         }
         AstExpression::Await(expression) => {
+            emit_expression(expression, destination, expected, locals, context, code)?;
+        }
+        AstExpression::Constructor { variant, payload } => {
+            let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)? else {
+                return Err(CompileError::TypeMismatch);
+            };
+            let metadata = context
+                .enum_variants
+                .get(&(type_id, variant.name().to_owned()))
+                .ok_or(CompileError::TypeMismatch)?;
+            let payload_register = if let Some(payload) = payload {
+                let register = destination
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    payload,
+                    register,
+                    metadata.payload_type,
+                    locals,
+                    context,
+                    code,
+                )?;
+                Some(register)
+            } else {
+                None
+            };
+            code.push(Instruction::EnumNew {
+                type_id,
+                variant: metadata.stable_id,
+                payload: payload_register,
+                dst: destination,
+            });
+        }
+        AstExpression::Match { value, arms } => {
+            emit_match_expression(value, arms, destination, expected, locals, context, code)?;
+        }
+        AstExpression::Try(expression) => {
+            emit_try_expression(expression, destination, locals, context, code)?;
+        }
+        AstExpression::Migration(intrinsic) => {
+            emit_migration_intrinsic(intrinsic, destination, locals, context, code)?;
+        }
+    }
+    Ok(())
+}
+
+fn context_function_signature<'a>(
+    context: &'a EmitContext<'a>,
+    index: u32,
+) -> Option<&'a Signature> {
+    context
+        .script_functions
+        .get(index as usize)
+        .map(|function| &function.signature)
+}
+
+fn emitted_expression_type(
+    expression: &AstExpression,
+    expected: Option<ValueType>,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+) -> Result<ValueType, CompileError> {
+    match expression {
+        AstExpression::Integer(_) | AstExpression::Binary { .. } => Ok(ValueType::I32),
+        AstExpression::Bool(_) => Ok(ValueType::Bool),
+        AstExpression::Name(name) => locals
+            .get(name)
+            .map(|(_, ty)| *ty)
+            .ok_or_else(|| CompileError::UnknownName(name.clone())),
+        AstExpression::Call { function, .. } => context
+            .host_functions
+            .get(function)
+            .map(|function| &function.signature)
+            .or_else(|| {
+                context
+                    .functions
+                    .get(function)
+                    .and_then(|index| context_function_signature(context, *index))
+            })
+            .and_then(|signature| signature.result)
+            .ok_or_else(|| CompileError::UnknownName(function.clone())),
+        AstExpression::Await(expression) => {
+            emitted_expression_type(expression, expected, locals, context)
+        }
+        AstExpression::Constructor { .. } | AstExpression::Match { .. } => {
+            expected.ok_or(CompileError::CannotInferType)
+        }
+        AstExpression::Try(expression) => {
+            let ValueType::Named(type_id) =
+                emitted_expression_type(expression, None, locals, context)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            context
+                .enum_variants
+                .get(&(type_id, "Ok".to_owned()))
+                .and_then(|variant| variant.payload_type)
+                .ok_or(CompileError::TypeMismatch)
+        }
+        AstExpression::Migration(intrinsic) => Ok(match intrinsic {
+            MigrationIntrinsic::OldGet { ty, .. }
+            | MigrationIntrinsic::OldFieldGet { ty, .. }
+            | MigrationIntrinsic::NewCreate { ty, .. } => lower_type(ty),
+            MigrationIntrinsic::NewSet { .. }
+            | MigrationIntrinsic::Preserve { .. }
+            | MigrationIntrinsic::Replace { .. }
+            | MigrationIntrinsic::Delete { .. }
+            | MigrationIntrinsic::Finish => ValueType::Bool,
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_match_expression(
+    value: &AstExpression,
+    arms: &[MatchArm],
+    destination: u16,
+    expected: Option<ValueType>,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    let result_type = expected.ok_or(CompileError::CannotInferType)?;
+    let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)? else {
+        return Err(CompileError::TypeMismatch);
+    };
+    emit_expression(
+        value,
+        destination,
+        Some(ValueType::Named(type_id)),
+        locals,
+        context,
+        code,
+    )?;
+    let tag_register = destination
+        .checked_add(1)
+        .ok_or(CompileError::TooManyRegisters)?;
+    let expected_tag = destination
+        .checked_add(2)
+        .ok_or(CompileError::TooManyRegisters)?;
+    let condition = destination
+        .checked_add(3)
+        .ok_or(CompileError::TooManyRegisters)?;
+    code.push(Instruction::EnumTag {
+        source: destination,
+        dst: tag_register,
+    });
+    let mut success_jumps = Vec::with_capacity(arms.len());
+    let mut pending_false = None;
+    for arm in arms {
+        let arm_start = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        if let Some(branch) = pending_false.take() {
+            code[branch] = Instruction::JumpIfFalse {
+                condition,
+                target: arm_start,
+            };
+        }
+        let variant = context
+            .enum_variants
+            .get(&(type_id, arm.variant.clone()))
+            .ok_or(CompileError::TypeMismatch)?;
+        code.push(Instruction::LoadI32 {
+            dst: expected_tag,
+            value: i32::from_ne_bytes(variant.tag.to_ne_bytes()),
+        });
+        code.push(Instruction::CompareEq {
+            dst: condition,
+            lhs: tag_register,
+            rhs: expected_tag,
+        });
+        let branch = code.len();
+        code.push(Instruction::JumpIfFalse {
+            condition,
+            target: 0,
+        });
+        pending_false = Some(branch);
+        if let Some(binding) = &arm.binding {
+            code.push(Instruction::EnumPayload {
+                source: destination,
+                variant: variant.stable_id,
+                dst: locals[binding].0,
+            });
+        }
+        emit_expression(
+            &arm.value,
+            destination,
+            Some(result_type),
+            locals,
+            context,
+            code,
+        )?;
+        success_jumps.push(code.len());
+        code.push(Instruction::Jump { target: 0 });
+    }
+    let trap = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    if let Some(branch) = pending_false {
+        code[branch] = Instruction::JumpIfFalse {
+            condition,
+            target: trap,
+        };
+    }
+    code.push(Instruction::Trap);
+    let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    code.push(Instruction::Safepoint);
+    for jump in success_jumps {
+        code[jump] = Instruction::Jump { target: end };
+    }
+    Ok(())
+}
+
+fn emit_try_expression(
+    expression: &AstExpression,
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    let ValueType::Named(type_id) = emitted_expression_type(expression, None, locals, context)?
+    else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let ok = context
+        .enum_variants
+        .get(&(type_id, "Ok".to_owned()))
+        .ok_or(CompileError::TypeMismatch)?;
+    let error = context
+        .enum_variants
+        .get(&(type_id, "Err".to_owned()))
+        .ok_or(CompileError::TypeMismatch)?;
+    let ValueType::Named(function_result) = context.function_result else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let result_error = context
+        .enum_variants
+        .get(&(function_result, "Err".to_owned()))
+        .ok_or(CompileError::TypeMismatch)?;
+    emit_expression(
+        expression,
+        destination,
+        Some(ValueType::Named(type_id)),
+        locals,
+        context,
+        code,
+    )?;
+    let tag = destination
+        .checked_add(1)
+        .ok_or(CompileError::TooManyRegisters)?;
+    let expected_tag = destination
+        .checked_add(2)
+        .ok_or(CompileError::TooManyRegisters)?;
+    let condition = destination
+        .checked_add(3)
+        .ok_or(CompileError::TooManyRegisters)?;
+    code.push(Instruction::EnumTag {
+        source: destination,
+        dst: tag,
+    });
+    code.push(Instruction::LoadI32 {
+        dst: expected_tag,
+        value: i32::from_ne_bytes(ok.tag.to_ne_bytes()),
+    });
+    code.push(Instruction::CompareEq {
+        dst: condition,
+        lhs: tag,
+        rhs: expected_tag,
+    });
+    let error_branch = code.len();
+    code.push(Instruction::JumpIfFalse {
+        condition,
+        target: 0,
+    });
+    code.push(Instruction::EnumPayload {
+        source: destination,
+        variant: ok.stable_id,
+        dst: destination,
+    });
+    let success = code.len();
+    code.push(Instruction::Jump { target: 0 });
+    let error_start = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    code[error_branch] = Instruction::JumpIfFalse {
+        condition,
+        target: error_start,
+    };
+    code.push(Instruction::EnumPayload {
+        source: destination,
+        variant: error.stable_id,
+        dst: tag,
+    });
+    code.push(Instruction::EnumNew {
+        type_id: function_result,
+        variant: result_error.stable_id,
+        payload: Some(tag),
+        dst: destination,
+    });
+    code.push(Instruction::Return {
+        source: destination,
+    });
+    let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    code.push(Instruction::Safepoint);
+    code[success] = Instruction::Jump { target: end };
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn emit_migration_intrinsic(
+    intrinsic: &MigrationIntrinsic,
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    match intrinsic {
+        MigrationIntrinsic::OldGet { stable_id, ty } => {
+            code.push(Instruction::StateOldGet {
+                stable_id: StableId::from_name(stable_id),
+                ty: lower_type(ty),
+                dst: destination,
+            });
+        }
+        MigrationIntrinsic::OldFieldGet {
+            object,
+            owner,
+            field,
+            ty,
+        } => {
+            let object_register = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
             emit_expression(
-                expression,
-                destination,
+                object,
+                object_register,
+                Some(ValueType::Named(StableId::from_name(owner))),
                 locals,
-                functions,
-                host_functions,
+                context,
                 code,
             )?;
+            code.push(Instruction::StateOldFieldGet {
+                object: object_register,
+                field_id: StableId::from_parts(&[owner, "::", field]),
+                ty: lower_type(ty),
+                dst: destination,
+            });
+        }
+        MigrationIntrinsic::NewCreate { stable_id, ty } => {
+            let ValueType::Named(type_id) = lower_type(ty) else {
+                return Err(CompileError::TypeMismatch);
+            };
+            code.push(Instruction::StateNewCreate {
+                stable_id: StableId::from_name(stable_id),
+                type_id,
+                dst: destination,
+            });
+        }
+        MigrationIntrinsic::NewSet {
+            object,
+            owner,
+            field,
+            value,
+        } => {
+            emit_expression(
+                object,
+                destination,
+                Some(ValueType::Named(StableId::from_name(owner))),
+                locals,
+                context,
+                code,
+            )?;
+            let value_register = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(value, value_register, None, locals, context, code)?;
+            code.push(Instruction::StateNewSet {
+                object: destination,
+                field_id: StableId::from_parts(&[owner, "::", field]),
+                source: value_register,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        MigrationIntrinsic::Preserve { stable_id } => {
+            code.push(Instruction::StatePreserve {
+                stable_id: StableId::from_name(stable_id),
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        MigrationIntrinsic::Replace { stable_id, target } => {
+            emit_expression(target, destination, None, locals, context, code)?;
+            code.push(Instruction::StateReplace {
+                old_id: StableId::from_name(stable_id),
+                target: destination,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        MigrationIntrinsic::Delete { stable_id } => {
+            code.push(Instruction::StateDelete {
+                stable_id: StableId::from_name(stable_id),
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        MigrationIntrinsic::Finish => {
+            code.push(Instruction::StateFinish);
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
         }
     }
     Ok(())
@@ -1772,7 +2940,22 @@ pub fn compile_with_interface(
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
     let tokens = lex(source)?;
-    let ast = parse(&tokens)?;
+    let mut ast = parse(&tokens)?;
+    for enumeration in &interface.enums {
+        if !ast
+            .types
+            .iter()
+            .any(|declaration| declaration.name == enumeration.name)
+        {
+            ast.types.push(AstTypeDeclaration {
+                name: enumeration.name.clone(),
+                kind: AstTypeKind::Enum,
+                version: 0,
+                fields: Vec::new(),
+                variants: enumeration.variants.clone(),
+            });
+        }
+    }
     let import = ast
         .imports
         .first()
@@ -1877,21 +3060,6 @@ pub fn compile_with_interface(
     let hir =
         resolve_and_typecheck_with_hosts(ast, host_functions, Some(host_hash), Some(schema_hash))?;
     let mut module = emit_bytecode(&hir)?;
-    for enumeration in &interface.enums {
-        module.enum_types.push(EnumType {
-            type_id: StableId::from_name(&enumeration.name),
-            variants: enumeration
-                .variants
-                .iter()
-                .enumerate()
-                .map(|(tag, variant)| EnumVariant {
-                    stable_id: StableId::from_parts(&[&enumeration.name, "::", variant]),
-                    tag: u32::try_from(tag).expect("IDL enum variant count is bounded"),
-                    payload_type: None,
-                })
-                .collect(),
-        });
-    }
     for export in &interface.exports {
         let (function, hir_function) = hir
             .functions

@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nexa_core::{RawHandle, StableId};
@@ -156,14 +157,105 @@ pub struct ReleaseQueue {
 #[derive(Clone, Debug)]
 pub struct RuntimeHost {
     releases: ReleaseDomain,
+    lifecycle: Arc<Mutex<RuntimeHostLifecycle>>,
+    pending_completions: Arc<AtomicUsize>,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RuntimeHostLifecycle {
+    live_realms: usize,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeHostCloseError {
+    LiveRealms,
+    PendingCompletions,
+    PendingReleases,
+}
+
+impl fmt::Display for RuntimeHostCloseError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for RuntimeHostCloseError {}
 
 impl RuntimeHost {
     #[must_use]
     pub fn new(release_capacity: usize) -> Self {
         Self {
             releases: ReleaseDomain::new(release_capacity),
+            lifecycle: Arc::new(Mutex::new(RuntimeHostLifecycle::default())),
+            pending_completions: Arc::new(AtomicUsize::new(0)),
         }
+    }
+
+    pub(crate) fn register_realm(&self) -> Result<(), RuntimeHostCloseError> {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.closed {
+            return Err(RuntimeHostCloseError::LiveRealms);
+        }
+        lifecycle.live_realms = lifecycle
+            .live_realms
+            .checked_add(1)
+            .expect("hosted realm count cannot overflow");
+        Ok(())
+    }
+
+    pub(crate) fn unregister_realm(&self) {
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.live_realms = lifecycle
+            .live_realms
+            .checked_sub(1)
+            .expect("hosted realm registration is balanced");
+    }
+
+    pub fn close(&self) -> Result<(), RuntimeHostCloseError> {
+        {
+            let lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if lifecycle.live_realms != 0 {
+                return Err(RuntimeHostCloseError::LiveRealms);
+            }
+        }
+        if self.pending_releases() != 0 {
+            return Err(RuntimeHostCloseError::PendingReleases);
+        }
+        if self.pending_completions() != 0 {
+            return Err(RuntimeHostCloseError::PendingCompletions);
+        }
+        let mut lifecycle = self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.live_realms != 0 {
+            return Err(RuntimeHostCloseError::LiveRealms);
+        }
+        lifecycle.closed = true;
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .closed
+    }
+
+    #[must_use]
+    pub fn pending_completions(&self) -> usize {
+        self.pending_completions.load(Ordering::Acquire)
     }
 
     pub(crate) fn release_queue(&self, capacity: usize) -> ReleaseQueue {
@@ -219,6 +311,26 @@ impl RuntimeHost {
             .iter()
             .map(|list| list.len)
             .sum()
+    }
+}
+
+impl Drop for RuntimeHost {
+    fn drop(&mut self) {
+        if cfg!(debug_assertions) && Arc::strong_count(&self.lifecycle) == 1 {
+            let lifecycle = *self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !lifecycle.closed {
+                eprintln!(
+                    "RuntimeHost dropped without close: live_realms={}, pending_completions={}, \
+                     pending_releases={}",
+                    lifecycle.live_realms,
+                    self.pending_completions(),
+                    self.pending_releases()
+                );
+            }
+        }
     }
 }
 
@@ -610,29 +722,68 @@ pub enum HostValue {
     Unit,
 }
 
-#[derive(Clone, Copy, Debug)]
+const MAX_HOST_ARGUMENTS: usize = 8;
+
+#[derive(Clone, Debug)]
 pub struct HostArgs<'a> {
-    values: &'a [HostValue],
+    borrowed: Option<&'a [HostValue]>,
+    inline: [HostValue; MAX_HOST_ARGUMENTS],
+    len: usize,
 }
 
 impl<'a> HostArgs<'a> {
     #[must_use]
-    pub const fn new(values: &'a [HostValue]) -> Self {
-        Self { values }
+    pub fn new(values: &'a [HostValue]) -> Self {
+        Self {
+            borrowed: Some(values),
+            inline: std::array::from_fn(|_| HostValue::Unit),
+            len: values.len(),
+        }
+    }
+
+    pub(crate) fn from_runtime(values: &[crate::RuntimeValue]) -> Result<Self, HostTrap> {
+        if values.len() > MAX_HOST_ARGUMENTS {
+            return Err(HostTrap::Arity);
+        }
+        let mut inline = std::array::from_fn(|_| HostValue::Unit);
+        for (destination, value) in inline.iter_mut().zip(values.iter().copied()) {
+            *destination = runtime_argument_to_host_value(value);
+        }
+        Ok(Self {
+            borrowed: None,
+            inline,
+            len: values.len(),
+        })
     }
 
     #[must_use]
-    pub const fn len(self) -> usize {
-        self.values.len()
+    pub const fn len(&self) -> usize {
+        self.len
     }
 
     #[must_use]
-    pub const fn is_empty(self) -> bool {
-        self.values.is_empty()
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
-    pub fn get(self, index: usize) -> Result<&'a HostValue, HostTrap> {
-        self.values.get(index).ok_or(HostTrap::Arity)
+    pub fn get(&self, index: usize) -> Result<&HostValue, HostTrap> {
+        let values = self.borrowed.unwrap_or(&self.inline[..self.len]);
+        values.get(index).ok_or(HostTrap::Arity)
+    }
+}
+
+fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
+    match value {
+        crate::RuntimeValue::I32(value) => HostValue::I32(value),
+        crate::RuntimeValue::Bool(value) => HostValue::Bool(value),
+        crate::RuntimeValue::Ref(reference) | crate::RuntimeValue::NamedRef { reference, .. } => {
+            HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
+        }
+        crate::RuntimeValue::HostRequest(request) => HostValue::Request(request),
+        crate::RuntimeValue::ResourceToken(token) => HostValue::Token(token),
+        crate::RuntimeValue::Snapshot(snapshot) => HostValue::Snapshot(snapshot),
+        crate::RuntimeValue::Opaque { value, .. } => HostValue::Opaque(value),
+        crate::RuntimeValue::Unit => HostValue::Unit,
     }
 }
 
@@ -725,6 +876,7 @@ struct CompletionQueue {
     epoch_counts: BTreeMap<(u32, u64), usize>,
     closed: bool,
     next_terminal_sequence: u64,
+    global_pending: Option<Arc<AtomicUsize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -781,6 +933,10 @@ fn free_completion_slot(
     queue.slots[reservation] = CompletionSlot::Free;
     queue.free.push(reservation);
     decrement_epoch_count(&mut queue.epoch_counts, metadata.module_id, metadata.epoch);
+    if let Some(global_pending) = &queue.global_pending {
+        let previous = global_pending.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "completion reservations are balanced");
+    }
 }
 
 #[derive(Debug)]
@@ -887,8 +1043,17 @@ pub struct RequestTerminalRecord {
 }
 
 impl HostRequestManager {
+    #[cfg(test)]
     #[must_use]
     pub fn new(realm_id: u32, capacity: u32) -> Self {
+        Self::with_completion_counter(realm_id, capacity, None)
+    }
+
+    fn with_completion_counter(
+        realm_id: u32,
+        capacity: u32,
+        global_pending: Option<Arc<AtomicUsize>>,
+    ) -> Self {
         Self {
             realm_id,
             requests: SlotPool::with_capacity_limit(realm_id, capacity),
@@ -901,6 +1066,7 @@ impl HostRequestManager {
                 epoch_counts: BTreeMap::new(),
                 closed: false,
                 next_terminal_sequence: 1,
+                global_pending,
             })),
             discarded_late_results: 0,
             terminal_records: VecDeque::with_capacity(capacity as usize),
@@ -1208,6 +1374,9 @@ impl HostRequestManager {
             request,
         });
         increment_epoch_count(&mut queue.epoch_counts, module_id, epoch);
+        if let Some(global_pending) = &queue.global_pending {
+            global_pending.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(reservation)
     }
 
@@ -1522,7 +1691,12 @@ pub(crate) struct EpochResourceCounts {
 impl RuntimeResources {
     #[must_use]
     pub fn new(realm_id: u32, capacity: u32, release_capacity: usize) -> Self {
-        Self::with_release_queue(realm_id, capacity, ReleaseQueue::new(release_capacity))
+        Self::with_release_queue(
+            realm_id,
+            capacity,
+            ReleaseQueue::new(release_capacity),
+            None,
+        )
     }
 
     pub(crate) fn with_runtime_host(
@@ -1535,12 +1709,22 @@ impl RuntimeResources {
             realm_id,
             capacity,
             runtime_host.release_queue(release_capacity),
+            Some(Arc::clone(&runtime_host.pending_completions)),
         )
     }
 
-    fn with_release_queue(realm_id: u32, capacity: u32, releases: ReleaseQueue) -> Self {
+    fn with_release_queue(
+        realm_id: u32,
+        capacity: u32,
+        releases: ReleaseQueue,
+        global_pending: Option<Arc<AtomicUsize>>,
+    ) -> Self {
         Self {
-            requests: HostRequestManager::new(realm_id, capacity),
+            requests: HostRequestManager::with_completion_counter(
+                realm_id,
+                capacity,
+                global_pending,
+            ),
             tokens: ResourceTokenManager::new(realm_id, capacity),
             snapshots: SnapshotManager::new(realm_id, capacity),
             releases,

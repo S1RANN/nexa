@@ -110,7 +110,7 @@ fn main() {
         black_box(realm.poll_task(task, 64).unwrap());
     }));
 
-    let (mut realm, module, scope) = loaded_hosted(yielded.clone());
+    let (mut realm, module, scope, generated_host) = loaded_hosted(yielded.clone());
     let task = call(&mut realm, module, scope, 1);
     let mut registry = AddRegistry;
     results.push(bench("generated_rust_thunk_direct_call", samples, || {
@@ -126,11 +126,15 @@ fn main() {
             .unwrap();
         black_box(outcome);
     }));
+    drop(realm);
+    let _ = generated_host.drain_releases();
+    generated_host.close().unwrap();
 
     let host_module = host_call_module();
+    let immediate_host = RuntimeHost::new(1_024);
     let mut host_realm = RealmRuntime::hosted(
         RealmConfig::default(),
-        RuntimeHost::new(1_024),
+        immediate_host.clone(),
         Box::new(AddRegistry),
     )
     .unwrap();
@@ -153,14 +157,18 @@ fn main() {
             .unwrap();
         black_box(host_realm.poll_task(task, 64).unwrap());
     }));
+    drop(host_realm);
+    let _ = immediate_host.drain_releases();
+    immediate_host.close().unwrap();
 
     let host_samples = samples.min(200);
     let async_module = async_host_call_module();
     results.push(bench("nexa_host_call_opcode_async", host_samples, || {
         let pending = Arc::new(Mutex::new(None));
+        let host = RuntimeHost::new(1_024);
         let mut realm = RealmRuntime::hosted(
             RealmConfig::default(),
-            RuntimeHost::new(1_024),
+            host.clone(),
             Box::new(AsyncRegistry {
                 pending: Arc::clone(&pending),
             }),
@@ -183,10 +191,13 @@ fn main() {
         pending.ticket.complete(HostPayload::I32(1)).unwrap();
         black_box(realm.tick(TickBudget::default()).unwrap());
         assert!(realm.terminal_record(task).is_some());
+        drop(realm);
+        let _ = host.drain_releases();
+        host.close().unwrap();
     }));
 
     results.push(bench("nexa_resource_token", host_samples, || {
-        let (mut realm, module, scope) = loaded_hosted(fast.clone());
+        let (mut realm, module, scope, host) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
         black_box(
             realm
@@ -194,13 +205,19 @@ fn main() {
                 .unwrap(),
         );
         black_box(realm.poll_task(task, 64).unwrap());
+        drop(realm);
+        let _ = host.drain_releases();
+        host.close().unwrap();
     }));
 
     results.push(bench("nexa_snapshot_read", host_samples, || {
-        let (mut realm, module, scope) = loaded_hosted(fast.clone());
+        let (mut realm, module, scope, host) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
         let snapshot = realm.create_snapshot(task, [1, 2, 3].into()).unwrap();
         black_box(realm.snapshot_data(snapshot).unwrap());
+        drop(realm);
+        let _ = host.drain_releases();
+        host.close().unwrap();
     }));
 
     let (mut state_realm, state_module, _) = loaded(fast.clone());
@@ -483,16 +500,14 @@ fn loaded_hosted(
     RealmRuntime,
     nexa_runtime::ModuleHandle,
     nexa_runtime::ScopeHandle,
+    RuntimeHost,
 ) {
-    let mut realm = RealmRuntime::hosted(
-        RealmConfig::default(),
-        RuntimeHost::new(1_024),
-        Box::new(AddRegistry),
-    )
-    .unwrap();
+    let host = RuntimeHost::new(1_024);
+    let mut realm =
+        RealmRuntime::hosted(RealmConfig::default(), host.clone(), Box::new(AddRegistry)).unwrap();
     let module = realm.load_module(verified, HOST, SCHEMA).unwrap();
     let scope = realm.create_scope(None).unwrap();
-    (realm, module, scope)
+    (realm, module, scope, host)
 }
 
 fn call(

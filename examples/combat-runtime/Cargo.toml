@@ -5,12 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
-nexa-bytecode = { path = "../../crates/nexa-bytecode" }
 nexa-compiler = { path = "../../crates/nexa-compiler" }
 nexa-core = { path = "../../crates/nexa-core" }
 nexa-idl = { path = "../../crates/nexa-idl" }
 nexa-runtime = { path = "../../crates/nexa-runtime" }
-nexa-verifier = { path = "../../crates/nexa-verifier" }
 
 [build-dependencies]
 nexa-idl = { path = "../../crates/nexa-idl" }

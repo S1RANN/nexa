@@ -6,13 +6,38 @@ import engine;
     legacy_target: i32;
 }
 
+@stateful(1) class StableBrain {
+    phase: i32;
+}
+
 fn identity(value: i32) -> i32 {
     return value;
+}
+
+fn option_value(value: i32) -> i32 {
+    let target: Option<i32> = Some(value);
+    return match target {
+        Some(found) => found,
+        None => 0,
+    };
+}
+
+fn no_target() -> Option<i32> {
+    return None;
+}
+
+task fn animation_checked(value: i32) -> Result<i32, AnimationError> {
+    let completed: i32 = await engine.animation(value)?;
+    return Ok(completed);
 }
 
 task fn update(value: i32) -> i32 {
     let lock = engine.action_lock(value);
     let snapshot = engine.world_snapshot();
-    await engine.animation(value);
+    let animation: Result<i32, AnimationError> = await engine.animation(value);
+    let completed: i32 = match animation {
+        Ok(result) => result,
+        Err(error) => 0,
+    };
     return engine.update(value, 1);
 }
