@@ -57,12 +57,12 @@ pub mod prelude {
         CancelReason, CompletionAccounting, HostArgs, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
         HostTrap, HostValue, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
-        ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError,
-        RealmRuntime, ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError,
-        RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceLedger,
-        RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle,
-        StateValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
-        TaskTerminalRecord, TickBudget, TickReport,
+        MigrationUsageReport, ModuleHandle, PendingHostRequest, PendingReason, PollResult,
+        RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle, RuntimeHost,
+        RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
+        RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
+        SnapshotHandle, StateHandle, StateValue, StatefulDomainId, StepConfig, TaskHandle,
+        TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
     };
     pub use nexa_verifier::VerifierLimits;
 

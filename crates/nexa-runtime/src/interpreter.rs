@@ -267,6 +267,8 @@ pub trait InterpreterHost {
 }
 
 pub trait InterpreterMigration {
+    fn observe_fuel_used(&mut self, _fuel_used: u64) {}
+    fn observe_call_depth(&mut self, _depth: usize) {}
     fn old_get(
         &mut self,
         stable_id: StableId,
@@ -504,6 +506,9 @@ impl CheckedInterpreter {
         continuation.cumulative_exhausted = false;
         let mut charge = ExecutionCharge::default();
         let mut pending_cost = std::mem::take(&mut continuation.pending_fuel);
+        if let Some(migration) = migration.as_deref_mut() {
+            migration.observe_call_depth(continuation.arena.depth());
+        }
         loop {
             let frame = *continuation.arena.current()?;
             continuation.current_function = frame.function;
@@ -554,6 +559,9 @@ impl CheckedInterpreter {
                 fuel.slice_remaining -= settlement;
                 fuel.cumulative_used += settlement;
                 charge.fuel_used += settlement;
+                if let Some(migration) = migration.as_deref_mut() {
+                    migration.observe_fuel_used(charge.fuel_used);
+                }
                 pending_cost = 0;
             } else {
                 pending_cost = settlement;
@@ -647,6 +655,9 @@ impl CheckedInterpreter {
                     continuation
                         .arena
                         .push_call(callee_id, callee.registers, Some(dst))?;
+                    if let Some(migration) = migration.as_deref_mut() {
+                        migration.observe_call_depth(continuation.arena.depth());
+                    }
                     for offset in 0..args_count {
                         let argument = args_base
                             .checked_add(offset)
@@ -864,6 +875,9 @@ impl CheckedInterpreter {
                 }
                 Instruction::Return { source } => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                    if let Some(migration) = migration.as_deref_mut() {
+                        migration.observe_fuel_used(charge.fuel_used);
+                    }
                     if start_next_defer(module, &mut continuation.arena)? {
                         pending_cost = 0;
                         continue;
@@ -903,6 +917,9 @@ impl CheckedInterpreter {
                 }
                 Instruction::ReturnVoid => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                    if let Some(migration) = migration.as_deref_mut() {
+                        migration.observe_fuel_used(charge.fuel_used);
+                    }
                     if start_next_defer(module, &mut continuation.arena)? {
                         pending_cost = 0;
                         continue;
@@ -945,6 +962,9 @@ impl CheckedInterpreter {
                 }
                 Instruction::Trap => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                    if let Some(migration) = migration.as_deref_mut() {
+                        migration.observe_fuel_used(charge.fuel_used);
+                    }
                     return Ok(InterpreterOutcome::Trapped {
                         trap: Trap {
                             kind: TrapKind::BytecodeTrap,
@@ -980,6 +1000,9 @@ impl CheckedInterpreter {
                 }
                 Instruction::CleanupReturn => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                    if let Some(migration) = migration.as_deref_mut() {
+                        migration.observe_fuel_used(charge.fuel_used);
+                    }
                     continuation.arena.pop()?;
                     if continuation.cleanup_mode
                         && continuation.arena.depth() > 0

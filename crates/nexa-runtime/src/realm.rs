@@ -447,6 +447,7 @@ pub struct RealmRuntime {
     retired_epochs: RetiredEpochRegistry,
     reload: ReloadCoordinator,
     migration_limits: MigrationLimits,
+    last_migration_usage_report: Option<crate::MigrationUsageReport>,
     reload_completion_capacity: usize,
     reload_completion_stats: ReloadCompletionStats,
     host_registry: Option<Box<dyn HostRegistry>>,
@@ -480,6 +481,7 @@ impl RealmRuntime {
             retired_epochs: RetiredEpochRegistry::new(config.max_modules as usize),
             reload: ReloadCoordinator::default(),
             migration_limits: config.migration_limits,
+            last_migration_usage_report: None,
             reload_completion_capacity: config.max_host_resources as usize,
             reload_completion_stats: ReloadCompletionStats::default(),
             host_registry: None,
@@ -633,6 +635,11 @@ impl RealmRuntime {
     #[must_use]
     pub fn migration_capacity_report(&self) -> crate::MigrationCapacityReport {
         self.migration_limits.capacity_report()
+    }
+
+    #[must_use]
+    pub const fn last_migration_usage_report(&self) -> Option<crate::MigrationUsageReport> {
+        self.last_migration_usage_report
     }
 
     pub fn load_module(
@@ -804,9 +811,11 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?;
         let Some(migration_entry) = candidate.verified.module().reload_metadata.migration_entry
         else {
+            self.last_migration_usage_report = None;
             self.reload.staged()?;
             return Ok(None);
         };
+        self.last_migration_usage_report = Some(crate::MigrationUsageReport::default());
         let function = candidate
             .verified
             .module()
@@ -846,6 +855,7 @@ impl RealmRuntime {
             },
             &mut migration,
         );
+        self.last_migration_usage_report = Some(migration.usage_report());
         if let Some(error) = migration.limit_error() {
             return Err(ReloadError::MigrationLimit(error).into());
         }
@@ -4004,6 +4014,21 @@ mod tests {
         assert_eq!(
             realm.stage_reload(&[]).unwrap(),
             Some(RuntimeValue::I32(37))
+        );
+        assert_eq!(
+            realm.last_migration_usage_report(),
+            Some(crate::MigrationUsageReport {
+                object_peak: 1,
+                field_peak: 1,
+                forwarding_peak: 1,
+                payload_byte_peak: std::mem::size_of::<StableId>()
+                    + std::mem::size_of::<u32>()
+                    + std::mem::size_of::<StableId>()
+                    + std::mem::size_of::<i32>(),
+                gc_root_peak: 0,
+                fuel_used: 6,
+                max_call_depth_used: 1,
+            })
         );
         realm.commit_reload(&[], 64).unwrap();
         let handle = realm

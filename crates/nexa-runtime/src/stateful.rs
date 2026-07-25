@@ -142,6 +142,17 @@ pub struct MigrationCapacityReport {
     pub metadata_bytes: usize,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MigrationUsageReport {
+    pub object_peak: usize,
+    pub field_peak: usize,
+    pub forwarding_peak: usize,
+    pub payload_byte_peak: usize,
+    pub gc_root_peak: usize,
+    pub fuel_used: u64,
+    pub max_call_depth_used: u16,
+}
+
 impl MigrationLimits {
     #[must_use]
     pub fn capacity_report(self) -> MigrationCapacityReport {
@@ -659,6 +670,7 @@ struct MigrationArena {
     forwarding_capacity: usize,
     byte_capacity: usize,
     gc_root_capacity: usize,
+    usage_report: MigrationUsageReport,
 }
 
 impl MigrationArena {
@@ -678,6 +690,7 @@ impl MigrationArena {
             forwarding_capacity: report.forwarding_capacity,
             byte_capacity: report.payload_byte_capacity,
             gc_root_capacity: limits.max_gc_roots as usize,
+            usage_report: MigrationUsageReport::default(),
         })
     }
 
@@ -727,6 +740,7 @@ impl MigrationArena {
     fn insert_forwarding(&mut self, index: usize, old_id: StableId, target: Option<StableId>) {
         self.forwarding
             .insert(index, ForwardingSlot { old_id, target });
+        self.record_peaks();
     }
 
     fn insert_object(
@@ -776,6 +790,17 @@ impl MigrationArena {
         for field in &self.fields {
             push_root(&field.value, &mut self.gc_roots);
         }
+        self.record_peaks();
+    }
+
+    fn record_peaks(&mut self) {
+        self.usage_report.object_peak = self.usage_report.object_peak.max(self.objects.len());
+        self.usage_report.field_peak = self.usage_report.field_peak.max(self.fields.len());
+        self.usage_report.forwarding_peak =
+            self.usage_report.forwarding_peak.max(self.forwarding.len());
+        self.usage_report.payload_byte_peak =
+            self.usage_report.payload_byte_peak.max(self.payload.len());
+        self.usage_report.gc_root_peak = self.usage_report.gc_root_peak.max(self.gc_roots.len());
     }
 
     fn into_registry(self, domain: StatefulDomainId) -> StatefulRegistry {
@@ -846,6 +871,11 @@ impl MigrationContext {
             Some(ReloadError::MigrationLimit(error)) => Some(error),
             _ => None,
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn usage_report(&self) -> MigrationUsageReport {
+        self.arena.usage_report
     }
 
     fn reject_limit<T>(&mut self, error: MigrationLimitError) -> Result<T, RuntimeMessage> {
@@ -973,6 +1003,18 @@ pub(crate) enum MigrationOutput {
 }
 
 impl InterpreterMigration for MigrationContext {
+    fn observe_fuel_used(&mut self, fuel_used: u64) {
+        self.arena.usage_report.fuel_used = fuel_used;
+    }
+
+    fn observe_call_depth(&mut self, depth: usize) {
+        self.arena.usage_report.max_call_depth_used = self
+            .arena
+            .usage_report
+            .max_call_depth_used
+            .max(u16::try_from(depth).unwrap_or(u16::MAX));
+    }
+
     fn old_get(
         &mut self,
         stable_id: StableId,
@@ -1636,6 +1678,60 @@ mod tests {
         assert_capacities(&migration);
         migration.finish_staging().unwrap();
         assert_capacities(&migration);
+    }
+
+    #[test]
+    fn usage_report_tracks_peaks_fuel_depth_and_failed_admission() {
+        let nested = call_depth_module(3);
+        let mut depth_migration = MigrationContext::new(
+            StatefulRegistry::new(StatefulDomainId::new(1)),
+            StatefulDomainId::new(1),
+            StateSchema { types: Vec::new() },
+            true,
+            limits(),
+        )
+        .unwrap();
+        assert!(matches!(
+            CheckedInterpreter::run_migration(
+                &nested,
+                0,
+                &[],
+                64,
+                FrameLimits {
+                    max_call_depth: 3,
+                    ..FrameLimits::default()
+                },
+                &mut depth_migration,
+            )
+            .unwrap(),
+            InterpreterOutcome::Returned { .. }
+        ));
+        let report = depth_migration.usage_report();
+        assert_eq!(report.fuel_used, 5);
+        assert_eq!(report.max_call_depth_used, 3);
+
+        let type_id = StableId::from_name("UsageReport");
+        let ids = [
+            StableId::from_name("UsageReport::first"),
+            StableId::from_name("UsageReport::second"),
+        ];
+        let mut capacity_migration = context(
+            schema(type_id, &[]),
+            MigrationLimits {
+                max_objects: 1,
+                ..limits()
+            },
+        );
+        capacity_migration.new_create(ids[0], type_id).unwrap();
+        assert!(capacity_migration.new_create(ids[1], type_id).is_err());
+        assert_eq!(
+            capacity_migration.usage_report(),
+            MigrationUsageReport {
+                object_peak: 1,
+                payload_byte_peak: std::mem::size_of::<StableId>() + std::mem::size_of::<u32>(),
+                ..MigrationUsageReport::default()
+            }
+        );
     }
 
     #[test]

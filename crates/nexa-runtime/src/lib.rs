@@ -64,8 +64,8 @@ pub use reload::ReloadError;
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use stateful::{
-    MigrationCapacityReport, MigrationLimitError, MigrationLimits, StateHandle, StateObject,
-    StateValue, StatefulDomainId, StatefulError,
+    MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
+    StateHandle, StateObject, StateValue, StatefulDomainId, StatefulError,
 };
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
 pub use trace::{RuntimeTrace, TraceRecords};
