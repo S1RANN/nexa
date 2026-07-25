@@ -1496,19 +1496,22 @@ impl HostRequestManager {
         }
     }
 
+    #[cfg(test)]
     pub fn drain_completions(
         &mut self,
         releases: &mut ReleaseQueue,
     ) -> Vec<HostCompletionDelivery> {
-        let mut accepted = Vec::new();
-        let completions = {
-            let mut queue = self
+        std::iter::from_fn(|| self.pop_completion(releases)).collect()
+    }
+
+    fn pop_completion(&mut self, releases: &mut ReleaseQueue) -> Option<HostCompletionDelivery> {
+        loop {
+            let completion = self
                 .completions
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            queue.items.drain(..).collect::<Vec<_>>()
-        };
-        for completion in completions {
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .items
+                .pop_front()?;
             let Ok(request) = self.requests.resolve_mut(completion.request.raw()) else {
                 self.discarded_late_results += 1;
                 self.consume_completion(&completion, CompletionTerminal::LateDiscarded);
@@ -1576,7 +1579,7 @@ impl HostRequestManager {
                 .expect("resolved request remains live");
             self.push_terminal(terminal);
             self.consume_completion(&completion, completion_terminal);
-            accepted.push(HostCompletionDelivery {
+            return Some(HostCompletionDelivery {
                 realm_id: completion.realm_id,
                 module_id: completion.module_id,
                 epoch: completion.epoch,
@@ -1585,7 +1588,28 @@ impl HostRequestManager {
                 terminal_sequence: completion.terminal_sequence,
             });
         }
-        accepted
+    }
+
+    fn peek_completion(&self) -> Option<HostCompletionDelivery> {
+        let queue = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.items.iter().find_map(|completion| {
+            let request = self.requests.resolve(completion.request.raw()).ok()?;
+            (completion.realm_id == self.realm_id
+                && request.epoch == completion.epoch
+                && completion.module_id == request.module_id
+                && request.state == host_request::State::InFlight)
+                .then(|| HostCompletionDelivery {
+                    realm_id: completion.realm_id,
+                    module_id: completion.module_id,
+                    epoch: completion.epoch,
+                    request: completion.request,
+                    result: completion.result.clone(),
+                    terminal_sequence: completion.terminal_sequence,
+                })
+        })
     }
 
     fn consume_completion(&self, completion: &HostCompletion, terminal: CompletionTerminal) {
@@ -2223,18 +2247,22 @@ impl RuntimeResources {
     }
 
     pub fn drain_completions(&mut self) -> Vec<HostCompletionDelivery> {
-        self.requests
-            .drain_completions(&mut self.releases)
-            .into_iter()
-            .inspect(|delivery| {
-                self.ownership.retain(|owned| {
-                    !matches!(
-                        owned,
-                        OwnedResource::Request { handle, .. } if *handle == delivery.request
-                    )
-                });
-            })
-            .collect()
+        std::iter::from_fn(|| self.pop_completion()).collect()
+    }
+
+    pub(crate) fn pop_completion(&mut self) -> Option<HostCompletionDelivery> {
+        let delivery = self.requests.pop_completion(&mut self.releases)?;
+        self.ownership.retain(|owned| {
+            !matches!(
+                owned,
+                OwnedResource::Request { handle, .. } if *handle == delivery.request
+            )
+        });
+        Some(delivery)
+    }
+
+    pub(crate) fn peek_completion(&self) -> Option<HostCompletionDelivery> {
+        self.requests.peek_completion()
     }
 
     pub fn cleanup_task(

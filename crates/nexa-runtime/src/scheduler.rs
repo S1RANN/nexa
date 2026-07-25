@@ -82,6 +82,13 @@ impl Scheduler {
         Some(self.waiting.swap_remove(position).1)
     }
 
+    #[must_use]
+    pub(crate) fn task_waiting_for(&self, request: HostRequestHandle) -> Option<TaskHandle> {
+        self.waiting
+            .iter()
+            .find_map(|(waiting_request, task)| (*waiting_request == request).then_some(*task))
+    }
+
     pub fn cancel_task(&mut self, task: TaskHandle) {
         self.deschedule(task);
         self.waiting

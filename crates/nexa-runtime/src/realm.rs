@@ -6,6 +6,7 @@ use nexa_bytecode::{AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, Va
 use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
+use crate::heap::HeapReservation;
 use crate::machines::retired_epoch;
 use crate::reload::{ReloadCompletionBuffer, ReloadCoordinator, ReloadTransaction};
 use crate::scheduler::Scheduler;
@@ -248,6 +249,42 @@ pub enum CompletionRoute {
     Delivered,
     BufferedForReload,
     DiscardedForCommittedEpoch,
+}
+
+#[derive(Debug)]
+enum PlannedResultPayload {
+    Value(RuntimeValue),
+    Enum {
+        type_id: StableId,
+        variant: StableId,
+        tag: u32,
+    },
+}
+
+#[derive(Debug)]
+enum ResultWritebackAction {
+    ResumeDirect(RuntimeValue),
+    ResumeAsync {
+        result: AsyncResultType,
+        success: bool,
+        payload: PlannedResultPayload,
+        heap: HeapReservation,
+    },
+    Cancel,
+    TrapFailure(u32),
+    TrapMessage(&'static str),
+}
+
+#[derive(Debug)]
+struct ResultWritebackPreflight {
+    action: ResultWritebackAction,
+}
+
+#[derive(Debug)]
+struct DeliveryWritebackPreflight {
+    task: TaskHandle,
+    snapshot: crate::TaskSnapshot,
+    result: ResultWritebackPreflight,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -965,7 +1002,8 @@ impl RealmRuntime {
             .release(transaction.candidate.raw())
             .map_err(RealmError::ModuleHandle)?;
         for delivery in transaction.completions.drain_ordered() {
-            if !self.deliver_host_completion(delivery)? {
+            let preflight = self.preflight_delivery_writeback(&delivery)?;
+            if !self.deliver_host_completion(delivery.request, preflight)? {
                 return Err(ReloadError::InvalidState.into());
             }
             self.reload_completion_stats.replayed =
@@ -1635,25 +1673,76 @@ impl RealmRuntime {
 
     fn drain_host_completions(&mut self) -> Result<usize, RealmError> {
         let mut count = 0;
-        for delivery in self.resources.drain_completions() {
-            self.route_host_completion(delivery)?;
+        loop {
+            let preflight = match self.resources.peek_completion() {
+                Some(delivery) => self.preflight_delivery_writeback(&delivery)?,
+                None => None,
+            };
+            let Some(delivery) = self.resources.pop_completion() else {
+                break;
+            };
+            self.route_host_completion(delivery, preflight)?;
             count += 1;
         }
         Ok(count)
     }
 
     fn buffer_reload_completions(&mut self) -> Result<usize, RealmError> {
-        let deliveries = self.resources.drain_completions();
-        let count = deliveries.len();
-        for delivery in deliveries {
-            self.route_host_completion(delivery)?;
+        let mut count = 0;
+        loop {
+            let preflight = match self.resources.peek_completion() {
+                Some(delivery) => self.preflight_delivery_writeback(&delivery)?,
+                None => None,
+            };
+            let Some(delivery) = self.resources.pop_completion() else {
+                break;
+            };
+            self.route_host_completion(delivery, preflight)?;
+            count += 1;
         }
         Ok(count)
+    }
+
+    fn preflight_delivery_writeback(
+        &mut self,
+        delivery: &HostCompletionDelivery,
+    ) -> Result<Option<DeliveryWritebackPreflight>, RealmError> {
+        if delivery.realm_id != self.realm_id {
+            return Err(ReloadError::InvalidState.into());
+        }
+        if self.reload.active() {
+            let old = self.reload.transaction()?.old_module;
+            let root = self
+                .modules
+                .resolve(old.raw())
+                .map_err(RealmError::ModuleHandle)?;
+            if delivery.module_id == root.module_id && delivery.epoch == root.epoch {
+                return Ok(None);
+            }
+        }
+        if self.completion_targets_committed_epoch(delivery) {
+            return Ok(None);
+        }
+        let Some(task) = self.scheduler.task_waiting_for(delivery.request) else {
+            return Ok(None);
+        };
+        let snapshot = self.tasks.task_snapshot(task)?;
+        if snapshot.state != TaskState::Waiting {
+            return Ok(None);
+        }
+        let result =
+            self.preflight_result_writeback(task, delivery.request, snapshot, &delivery.result)?;
+        Ok(Some(DeliveryWritebackPreflight {
+            task,
+            snapshot,
+            result,
+        }))
     }
 
     fn route_host_completion(
         &mut self,
         delivery: HostCompletionDelivery,
+        preflight: Option<DeliveryWritebackPreflight>,
     ) -> Result<CompletionRoute, RealmError> {
         if delivery.realm_id != self.realm_id {
             return Err(ReloadError::InvalidState.into());
@@ -1679,7 +1768,7 @@ impl RealmRuntime {
                 .saturating_add(1);
             return Ok(CompletionRoute::DiscardedForCommittedEpoch);
         }
-        let _ = self.deliver_host_completion(delivery)?;
+        let _ = self.deliver_host_completion(delivery.request, preflight)?;
         Ok(CompletionRoute::Delivered)
     }
 
@@ -1695,102 +1784,229 @@ impl RealmRuntime {
 
     fn deliver_host_completion(
         &mut self,
-        delivery: HostCompletionDelivery,
+        request: HostRequestHandle,
+        preflight: Option<DeliveryWritebackPreflight>,
     ) -> Result<bool, RealmError> {
-        let request = delivery.request;
-        let Some(task) = self.scheduler.wake_request(request) else {
+        let Some(preflight) = preflight else {
             return Ok(false);
         };
-        let snapshot = self.tasks.task_snapshot(task)?;
-        if snapshot.state != TaskState::Waiting {
+        if self.scheduler.task_waiting_for(request) != Some(preflight.task) {
             return Ok(false);
         }
-        self.handle_host_completion(task, request, snapshot, delivery.result)?;
+        debug_assert_eq!(self.scheduler.wake_request(request), Some(preflight.task));
+        self.commit_result_writeback(
+            preflight.task,
+            request,
+            preflight.snapshot,
+            preflight.result,
+        )?;
         Ok(true)
     }
 
-    fn handle_host_completion(
+    fn preflight_result_writeback(
         &mut self,
         task: TaskHandle,
         request: HostRequestHandle,
         snapshot: crate::TaskSnapshot,
-        result: HostCompletionResult,
-    ) -> Result<(), RealmError> {
-        match result {
-            HostCompletionResult::Success(payload) => {
-                let execution = self.tasks.take_execution(task)?;
-                let TaskExecution::Waiting {
-                    mut continuation,
-                    request: waiting_request,
-                    destination,
-                    expected_type,
-                    async_result,
-                } = execution
-                else {
-                    return Err(RealmError::TaskWaiting);
-                };
-                if waiting_request != request {
-                    return Err(RealmError::TaskWaiting);
-                }
-                let value = if let Some(async_result) = async_result {
-                    let payload = completion_to_runtime(payload, Some(async_result.success))?;
-                    self.allocate_async_result(async_result, true, payload)
-                } else {
-                    completion_to_runtime(payload, expected_type)
-                };
-                if let Ok(value) = value {
-                    continuation.write_resume_value(destination, expected_type, value)?;
-                    self.tasks.resume_waiting_task(task)?;
-                    self.tasks.put_execution(
-                        task,
-                        TaskExecution::Running(continuation),
-                        snapshot.fuel,
-                    )?;
-                    self.scheduler.schedule(task, snapshot.priority);
-                } else {
-                    self.trap_host_task(
-                        task,
-                        snapshot,
-                        "host completion payload type mismatch".into(),
-                    )?;
-                }
-            }
-            HostCompletionResult::Error(error) => {
-                self.resume_async_error(task, request, snapshot, error.code)?;
-            }
-            HostCompletionResult::Cancelled => {
-                if let Some(result) = self.waiting_async_result(task)? {
-                    if result.cancel_policy == CancelPolicy::ReturnError {
-                        self.resume_async_error(
-                            task,
-                            request,
-                            snapshot,
-                            result.cancel_error.ok_or(RealmError::TaskWaiting)?,
-                        )?;
-                    } else {
-                        self.cancel_waiting_host_task(task, snapshot)?;
-                    }
-                } else {
-                    self.cancel_waiting_host_task(task, snapshot)?;
-                }
-            }
-            HostCompletionResult::Abandoned => {
-                if let Some(result) = self.waiting_async_result(task)? {
-                    if result.abandon_policy == AbandonPolicy::ReturnError {
-                        self.resume_async_error(
-                            task,
-                            request,
-                            snapshot,
-                            result.abandon_error.ok_or(RealmError::TaskWaiting)?,
-                        )?;
-                    } else {
-                        self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
-                    }
-                } else {
-                    self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
-                }
-            }
+        result: &HostCompletionResult,
+    ) -> Result<ResultWritebackPreflight, RealmError> {
+        let (waiting_request, expected_type, async_result) = match self.tasks.execution(task)? {
+            TaskExecution::Waiting {
+                request,
+                expected_type,
+                async_result,
+                ..
+            } => (*request, *expected_type, *async_result),
+            _ => return Err(RealmError::TaskWaiting),
+        };
+        if waiting_request != request {
+            return Err(RealmError::TaskWaiting);
         }
+
+        let action = match result {
+            HostCompletionResult::Success(payload) => {
+                if let Some(result) = async_result {
+                    let payload = completion_to_runtime(payload.clone(), Some(result.success))?;
+                    self.preflight_async_result(result, true, PlannedResultPayload::Value(payload))?
+                } else {
+                    ResultWritebackAction::ResumeDirect(completion_to_runtime(
+                        payload.clone(),
+                        expected_type,
+                    )?)
+                }
+            }
+            HostCompletionResult::Error(error) => match async_result {
+                Some(result) => self.preflight_async_error(snapshot, result, error.code)?,
+                None => ResultWritebackAction::TrapFailure(error.code),
+            },
+            HostCompletionResult::Cancelled => match async_result {
+                Some(result) if result.cancel_policy == CancelPolicy::ReturnError => self
+                    .preflight_async_error(
+                        snapshot,
+                        result,
+                        result.cancel_error.ok_or(RealmError::TaskWaiting)?,
+                    )?,
+                _ => ResultWritebackAction::Cancel,
+            },
+            HostCompletionResult::Abandoned => match async_result {
+                Some(result) if result.abandon_policy == AbandonPolicy::ReturnError => self
+                    .preflight_async_error(
+                        snapshot,
+                        result,
+                        result.abandon_error.ok_or(RealmError::TaskWaiting)?,
+                    )?,
+                _ => ResultWritebackAction::TrapMessage("host request was abandoned"),
+            },
+        };
+        Ok(ResultWritebackPreflight { action })
+    }
+
+    fn preflight_async_error(
+        &mut self,
+        snapshot: crate::TaskSnapshot,
+        result: AsyncResultType,
+        code: u32,
+    ) -> Result<ResultWritebackAction, RealmError> {
+        let payload = match result.error {
+            ValueType::I32 => PlannedResultPayload::Value(RuntimeValue::I32(i32::from_ne_bytes(
+                code.to_ne_bytes(),
+            ))),
+            ValueType::Named(type_id) => {
+                let variant = self
+                    .module_for_id(snapshot.module_id)?
+                    .verified
+                    .module()
+                    .enum_types
+                    .iter()
+                    .find(|enum_type| enum_type.type_id == type_id)
+                    .and_then(|enum_type| {
+                        enum_type
+                            .variants
+                            .iter()
+                            .find(|variant| variant.tag == code)
+                    });
+                let Some(variant) = variant else {
+                    return Ok(ResultWritebackAction::TrapFailure(code));
+                };
+                PlannedResultPayload::Enum {
+                    type_id,
+                    variant: variant.stable_id,
+                    tag: variant.tag,
+                }
+            }
+            ValueType::Bool | ValueType::Ref => {
+                return Ok(ResultWritebackAction::TrapMessage(
+                    "host error payload type mismatch",
+                ));
+            }
+        };
+        self.preflight_async_result(result, false, payload)
+    }
+
+    fn preflight_async_result(
+        &mut self,
+        result: AsyncResultType,
+        success: bool,
+        payload: PlannedResultPayload,
+    ) -> Result<ResultWritebackAction, RealmError> {
+        let slots = 1 + usize::from(matches!(payload, PlannedResultPayload::Enum { .. }));
+        let heap = self.heap.preflight(slots)?;
+        Ok(ResultWritebackAction::ResumeAsync {
+            result,
+            success,
+            payload,
+            heap,
+        })
+    }
+
+    fn commit_result_writeback(
+        &mut self,
+        task: TaskHandle,
+        request: HostRequestHandle,
+        snapshot: crate::TaskSnapshot,
+        preflight: ResultWritebackPreflight,
+    ) -> Result<(), RealmError> {
+        let value = match preflight.action {
+            ResultWritebackAction::ResumeDirect(value) => value,
+            ResultWritebackAction::ResumeAsync {
+                result,
+                success,
+                payload,
+                mut heap,
+            } => {
+                let payload = match payload {
+                    PlannedResultPayload::Value(value) => value,
+                    PlannedResultPayload::Enum {
+                        type_id,
+                        variant,
+                        tag,
+                    } => {
+                        let reference = self.heap.commit(
+                            &mut heap,
+                            Object::Enum {
+                                type_id,
+                                variant,
+                                tag,
+                                payload: None,
+                            },
+                        );
+                        RuntimeValue::NamedRef { reference, type_id }
+                    }
+                };
+                let (variant, tag) = if success {
+                    (StableId::from_parts(&["Result", "::Ok"]), 0)
+                } else {
+                    (StableId::from_parts(&["Result", "::Err"]), 1)
+                };
+                let reference = self.heap.commit(
+                    &mut heap,
+                    Object::Enum {
+                        type_id: result.result_type,
+                        variant,
+                        tag,
+                        payload: Some(payload),
+                    },
+                );
+                debug_assert!(Heap::reservation_complete(&heap));
+                RuntimeValue::NamedRef {
+                    reference,
+                    type_id: result.result_type,
+                }
+            }
+            ResultWritebackAction::Cancel => {
+                return self.cancel_waiting_host_task(task, snapshot);
+            }
+            ResultWritebackAction::TrapFailure(code) => {
+                return self.trap_host_task(
+                    task,
+                    snapshot,
+                    format!("host request failed with code {code}"),
+                );
+            }
+            ResultWritebackAction::TrapMessage(message) => {
+                return self.trap_host_task(task, snapshot, message.into());
+            }
+        };
+
+        let execution = self.tasks.take_execution(task)?;
+        let TaskExecution::Waiting {
+            mut continuation,
+            request: waiting_request,
+            destination,
+            expected_type,
+            ..
+        } = execution
+        else {
+            return Err(RealmError::TaskWaiting);
+        };
+        if waiting_request != request {
+            return Err(RealmError::TaskWaiting);
+        }
+        continuation.write_resume_value(destination, expected_type, value)?;
+        self.tasks.resume_waiting_task(task)?;
+        self.tasks
+            .put_execution(task, TaskExecution::Running(continuation), snapshot.fuel)?;
+        self.scheduler.schedule(task, snapshot.priority);
         Ok(())
     }
 
@@ -1807,139 +2023,6 @@ impl RealmRuntime {
             snapshot.charge,
         )?;
         Ok(())
-    }
-
-    fn waiting_async_result(
-        &self,
-        task: TaskHandle,
-    ) -> Result<Option<AsyncResultType>, RealmError> {
-        match self.tasks.execution(task)? {
-            TaskExecution::Waiting { async_result, .. } => Ok(*async_result),
-            _ => Err(RealmError::TaskWaiting),
-        }
-    }
-
-    fn resume_async_error(
-        &mut self,
-        task: TaskHandle,
-        request: HostRequestHandle,
-        snapshot: crate::TaskSnapshot,
-        code: u32,
-    ) -> Result<(), RealmError> {
-        let execution = self.tasks.take_execution(task)?;
-        let TaskExecution::Waiting {
-            mut continuation,
-            request: waiting_request,
-            destination,
-            expected_type,
-            async_result,
-        } = execution
-        else {
-            return Err(RealmError::TaskWaiting);
-        };
-        if waiting_request != request {
-            return Err(RealmError::TaskWaiting);
-        }
-        let Some(async_result) = async_result else {
-            self.tasks.put_execution(
-                task,
-                TaskExecution::Waiting {
-                    continuation,
-                    request,
-                    destination,
-                    expected_type,
-                    async_result: None,
-                },
-                snapshot.fuel,
-            )?;
-            return self.trap_host_task(
-                task,
-                snapshot,
-                format!("host request failed with code {code}"),
-            );
-        };
-        let payload = match async_result.error {
-            ValueType::I32 => RuntimeValue::I32(i32::from_ne_bytes(code.to_ne_bytes())),
-            ValueType::Named(type_id) => {
-                let variant = self
-                    .module_for_id(snapshot.module_id)?
-                    .verified
-                    .module()
-                    .enum_types
-                    .iter()
-                    .find(|enum_type| enum_type.type_id == type_id)
-                    .and_then(|enum_type| {
-                        enum_type
-                            .variants
-                            .iter()
-                            .find(|variant| variant.tag == code)
-                    })
-                    .map(|variant| (variant.stable_id, variant.tag));
-                if let Some((variant, tag)) = variant {
-                    self.heap
-                        .allocate_enum(type_id, variant, tag, None)
-                        .map_err(RealmError::Heap)?
-                } else {
-                    self.tasks.put_execution(
-                        task,
-                        TaskExecution::Waiting {
-                            continuation,
-                            request,
-                            destination,
-                            expected_type,
-                            async_result: Some(async_result),
-                        },
-                        snapshot.fuel,
-                    )?;
-                    return self.trap_host_task(
-                        task,
-                        snapshot,
-                        format!("host error enum has no variant for code {code}"),
-                    );
-                }
-            }
-            ValueType::Bool | ValueType::Ref => {
-                self.tasks.put_execution(
-                    task,
-                    TaskExecution::Waiting {
-                        continuation,
-                        request,
-                        destination,
-                        expected_type,
-                        async_result: Some(async_result),
-                    },
-                    snapshot.fuel,
-                )?;
-                return self.trap_host_task(
-                    task,
-                    snapshot,
-                    "host error payload type mismatch".into(),
-                );
-            }
-        };
-        let value = self.allocate_async_result(async_result, false, payload)?;
-        continuation.write_resume_value(destination, expected_type, value)?;
-        self.tasks.resume_waiting_task(task)?;
-        self.tasks
-            .put_execution(task, TaskExecution::Running(continuation), snapshot.fuel)?;
-        self.scheduler.schedule(task, snapshot.priority);
-        Ok(())
-    }
-
-    fn allocate_async_result(
-        &mut self,
-        result: AsyncResultType,
-        success: bool,
-        payload: RuntimeValue,
-    ) -> Result<RuntimeValue, InterpreterError> {
-        let (variant, tag) = if success {
-            (StableId::from_parts(&["Result", "::Ok"]), 0)
-        } else {
-            (StableId::from_parts(&["Result", "::Err"]), 1)
-        };
-        Ok(self
-            .heap
-            .allocate_enum(result.result_type, variant, tag, Some(payload))?)
     }
 
     fn trap_host_task(

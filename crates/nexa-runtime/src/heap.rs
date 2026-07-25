@@ -68,6 +68,11 @@ impl fmt::Display for HeapError {
 
 impl std::error::Error for HeapError {}
 
+#[derive(Debug)]
+pub(crate) struct HeapReservation {
+    remaining: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcRoots {
     pub running_frames: Vec<GcRef>,
@@ -117,31 +122,53 @@ impl Heap {
     }
 
     pub fn allocate(&mut self, object: Object) -> Result<GcRef, HeapError> {
+        let mut reservation = self.preflight(1)?;
+        Ok(self.commit(&mut reservation, object))
+    }
+
+    pub(crate) fn preflight(&mut self, count: usize) -> Result<HeapReservation, HeapError> {
         if self.fail_next_allocation {
             self.fail_next_allocation = false;
             return Err(HeapError::InjectedAllocationFailure);
         }
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
-            slot.object = Some(object);
-            return Ok(GcRef {
-                index,
-                generation: slot.generation,
-            });
-        }
-        let index = u32::try_from(self.slots.len()).map_err(|_| HeapError::CapacityExhausted)?;
-        if index >= self.max_objects {
+        let unused = usize::try_from(self.max_objects)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(self.slots.len());
+        if self.free.len().saturating_add(unused) < count {
             return Err(HeapError::CapacityExhausted);
         }
+        Ok(HeapReservation { remaining: count })
+    }
+
+    pub(crate) fn commit(&mut self, reservation: &mut HeapReservation, object: Object) -> GcRef {
+        reservation.remaining = reservation
+            .remaining
+            .checked_sub(1)
+            .expect("heap allocation was preflighted");
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            debug_assert!(slot.object.is_none());
+            slot.object = Some(object);
+            return GcRef {
+                index,
+                generation: slot.generation,
+            };
+        }
+        let index = u32::try_from(self.slots.len()).expect("heap capacity was preflighted");
+        debug_assert!(index < self.max_objects);
         self.slots.push(ObjectSlot {
             generation: 0,
             marked: false,
             object: Some(object),
         });
-        Ok(GcRef {
+        GcRef {
             index,
             generation: 0,
-        })
+        }
+    }
+
+    pub(crate) const fn reservation_complete(reservation: &HeapReservation) -> bool {
+        reservation.remaining == 0
     }
 
     pub fn allocate_enum(
@@ -309,5 +336,16 @@ mod tests {
             Err(HeapError::InjectedAllocationFailure)
         );
         assert!(heap.resolve(live).is_ok());
+    }
+
+    #[test]
+    fn multi_slot_preflight_rejects_before_any_heap_mutation() {
+        let mut heap = Heap::new(1);
+        assert!(matches!(
+            heap.preflight(2),
+            Err(HeapError::CapacityExhausted)
+        ));
+        assert_eq!(heap.live_len(), 0);
+        assert!(heap.allocate(Object::Class { fields: Vec::new() }).is_ok());
     }
 }
