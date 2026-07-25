@@ -1019,6 +1019,47 @@ enum CompletionSlot {
     Free,
     Reserved(CompletionReservation),
     Queued(CompletionReservation),
+    Consumed(CompletionReservation),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletionAccounting {
+    pub reserved: u64,
+    pub queued: u64,
+    pub delivered: u64,
+    pub cancelled: u64,
+    pub abandoned: u64,
+    pub reload_discarded: u64,
+    pub late_discarded: u64,
+}
+
+impl CompletionAccounting {
+    #[must_use]
+    pub const fn terminal_total(self) -> u64 {
+        self.delivered
+            .saturating_add(self.cancelled)
+            .saturating_add(self.abandoned)
+            .saturating_add(self.reload_discarded)
+            .saturating_add(self.late_discarded)
+    }
+
+    #[must_use]
+    pub const fn accounted_total(self) -> u64 {
+        self.terminal_total().saturating_add(self.pending())
+    }
+
+    #[must_use]
+    pub const fn pending(self) -> u64 {
+        self.reserved.saturating_sub(self.terminal_total())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CompletionTerminal {
+    Delivered,
+    Cancelled,
+    Abandoned,
+    LateDiscarded,
 }
 
 #[derive(Debug)]
@@ -1032,6 +1073,7 @@ struct CompletionQueue {
     next_terminal_sequence: u64,
     global_pending: Option<Arc<AtomicUsize>>,
     host_admission: Option<HostAdmissionGate>,
+    accounting: CompletionAccounting,
 }
 
 #[derive(Clone, Debug)]
@@ -1051,22 +1093,32 @@ impl HostCompletionSender {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let metadata = match queue.slots.get(reservation).copied() {
             Some(CompletionSlot::Reserved(metadata)) => metadata,
-            Some(CompletionSlot::Free | CompletionSlot::Queued(_)) | None => {
+            Some(
+                CompletionSlot::Free | CompletionSlot::Queued(_) | CompletionSlot::Consumed(_),
+            )
+            | None => {
                 return Err(HostRequestError::AlreadyCompleted);
             }
         };
         if queue.closed {
+            queue.slots[reservation] = CompletionSlot::Consumed(metadata);
+            queue.accounting.late_discarded = queue.accounting.late_discarded.saturating_add(1);
             free_completion_slot(&mut queue, reservation, metadata);
+            assert_completion_invariant(&queue);
             return Err(HostRequestError::CompletionQueueClosed);
         }
         debug_assert!(queue.items.len() < queue.capacity);
         let terminal_sequence = queue.next_terminal_sequence;
         let Some(next_terminal_sequence) = terminal_sequence.checked_add(1) else {
+            queue.slots[reservation] = CompletionSlot::Consumed(metadata);
+            queue.accounting.late_discarded = queue.accounting.late_discarded.saturating_add(1);
             free_completion_slot(&mut queue, reservation, metadata);
+            assert_completion_invariant(&queue);
             return Err(HostRequestError::CompletionQueueFull);
         };
         queue.next_terminal_sequence = next_terminal_sequence;
         queue.slots[reservation] = CompletionSlot::Queued(metadata);
+        queue.accounting.queued = queue.accounting.queued.saturating_add(1);
         queue.items.push_back(HostCompletion {
             realm_id: metadata.realm_id,
             module_id: metadata.module_id,
@@ -1076,6 +1128,7 @@ impl HostCompletionSender {
             reservation,
             terminal_sequence,
         });
+        assert_completion_invariant(&queue);
         Ok(())
     }
 }
@@ -1092,6 +1145,42 @@ fn free_completion_slot(
         let previous = global_pending.fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0, "completion reservations are balanced");
     }
+}
+
+fn assert_completion_invariant(queue: &CompletionQueue) {
+    let (reserved, queued, consumed) =
+        queue
+            .slots
+            .iter()
+            .fold((0_u64, 0_u64, 0_u64), |counts, slot| match slot {
+                CompletionSlot::Free => counts,
+                CompletionSlot::Reserved(_) => (counts.0 + 1, counts.1, counts.2),
+                CompletionSlot::Queued(_) => (counts.0, counts.1 + 1, counts.2),
+                CompletionSlot::Consumed(_) => (counts.0, counts.1, counts.2 + 1),
+            });
+    debug_assert_eq!(
+        consumed, 0,
+        "Consumed is a terminal transition, not storage"
+    );
+    debug_assert_eq!(queue.accounting.queued, queued);
+    debug_assert!(
+        queue.accounting.reserved >= queue.accounting.terminal_total(),
+        "terminal completions cannot exceed reservations"
+    );
+    debug_assert_eq!(
+        queue.accounting.pending(),
+        reserved.saturating_add(queued),
+        "pending accounting matches Reserved and Queued slots"
+    );
+    debug_assert_eq!(
+        queue.accounting.reserved,
+        queue
+            .accounting
+            .terminal_total()
+            .saturating_add(reserved)
+            .saturating_add(queued),
+        "every completion reservation has exactly one active or terminal classification"
+    );
 }
 
 #[derive(Debug)]
@@ -1230,6 +1319,7 @@ impl HostRequestManager {
                 next_terminal_sequence: 1,
                 global_pending,
                 host_admission,
+                accounting: CompletionAccounting::default(),
             })),
             discarded_late_results: 0,
             terminal_records: VecDeque::with_capacity(capacity as usize),
@@ -1320,33 +1410,12 @@ impl HostRequestManager {
                 .completions
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let completions = queue.items.drain(..).collect::<Vec<_>>();
-            for completion in &completions {
-                debug_assert_eq!(
-                    queue.slots[completion.reservation],
-                    CompletionSlot::Queued(CompletionReservation {
-                        realm_id: completion.realm_id,
-                        module_id: completion.module_id,
-                        epoch: completion.epoch,
-                        request: completion.request,
-                    })
-                );
-                free_completion_slot(
-                    &mut queue,
-                    completion.reservation,
-                    CompletionReservation {
-                        realm_id: completion.realm_id,
-                        module_id: completion.module_id,
-                        epoch: completion.epoch,
-                        request: completion.request,
-                    },
-                );
-            }
-            completions
+            queue.items.drain(..).collect::<Vec<_>>()
         };
         for completion in completions {
             let Ok(request) = self.requests.resolve_mut(completion.request.raw()) else {
                 self.discarded_late_results += 1;
+                self.consume_completion(&completion, CompletionTerminal::LateDiscarded);
                 continue;
             };
             if completion.realm_id != self.realm_id
@@ -1355,30 +1424,37 @@ impl HostRequestManager {
                 || request.state != host_request::State::InFlight
             {
                 self.discarded_late_results += 1;
+                let _ = request;
+                self.consume_completion(&completion, CompletionTerminal::LateDiscarded);
                 continue;
             }
-            let (queue_event, deliver_event, terminal_state) = match &completion.result {
-                HostCompletionResult::Success(_) => (
-                    host_request::Event::QueueSuccess,
-                    host_request::Event::DeliverSuccess,
-                    HostRequestState::Completed,
-                ),
-                HostCompletionResult::Error(_) => (
-                    host_request::Event::QueueFailure,
-                    host_request::Event::DeliverFailure,
-                    HostRequestState::Failed,
-                ),
-                HostCompletionResult::Cancelled => (
-                    host_request::Event::HostCancelled,
-                    host_request::Event::DeliverCancelled,
-                    HostRequestState::Cancelled,
-                ),
-                HostCompletionResult::Abandoned => (
-                    host_request::Event::HostAbandoned,
-                    host_request::Event::DeliverAbandoned,
-                    HostRequestState::Abandoned,
-                ),
-            };
+            let (queue_event, deliver_event, terminal_state, completion_terminal) =
+                match &completion.result {
+                    HostCompletionResult::Success(_) => (
+                        host_request::Event::QueueSuccess,
+                        host_request::Event::DeliverSuccess,
+                        HostRequestState::Completed,
+                        CompletionTerminal::Delivered,
+                    ),
+                    HostCompletionResult::Error(_) => (
+                        host_request::Event::QueueFailure,
+                        host_request::Event::DeliverFailure,
+                        HostRequestState::Failed,
+                        CompletionTerminal::Delivered,
+                    ),
+                    HostCompletionResult::Cancelled => (
+                        host_request::Event::HostCancelled,
+                        host_request::Event::DeliverCancelled,
+                        HostRequestState::Cancelled,
+                        CompletionTerminal::Cancelled,
+                    ),
+                    HostCompletionResult::Abandoned => (
+                        host_request::Event::HostAbandoned,
+                        host_request::Event::DeliverAbandoned,
+                        HostRequestState::Abandoned,
+                        CompletionTerminal::Abandoned,
+                    ),
+                };
             request.state = host_request::apply(request.state, queue_event, |_| true)
                 .expect("generated host request queue transition exists")
                 .state;
@@ -1403,6 +1479,7 @@ impl HostRequestManager {
                 .release(completion.request.raw())
                 .expect("resolved request remains live");
             self.push_terminal(terminal);
+            self.consume_completion(&completion, completion_terminal);
             accepted.push(HostCompletionDelivery {
                 realm_id: completion.realm_id,
                 module_id: completion.module_id,
@@ -1413,6 +1490,45 @@ impl HostRequestManager {
             });
         }
         accepted
+    }
+
+    fn consume_completion(&self, completion: &HostCompletion, terminal: CompletionTerminal) {
+        let metadata = CompletionReservation {
+            realm_id: completion.realm_id,
+            module_id: completion.module_id,
+            epoch: completion.epoch,
+            request: completion.request,
+        };
+        let mut queue = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        debug_assert_eq!(
+            queue.slots[completion.reservation],
+            CompletionSlot::Queued(metadata)
+        );
+        queue.slots[completion.reservation] = CompletionSlot::Consumed(metadata);
+        queue.accounting.queued = queue
+            .accounting
+            .queued
+            .checked_sub(1)
+            .expect("consumed completion is queued");
+        match terminal {
+            CompletionTerminal::Delivered => {
+                queue.accounting.delivered = queue.accounting.delivered.saturating_add(1);
+            }
+            CompletionTerminal::Cancelled => {
+                queue.accounting.cancelled = queue.accounting.cancelled.saturating_add(1);
+            }
+            CompletionTerminal::Abandoned => {
+                queue.accounting.abandoned = queue.accounting.abandoned.saturating_add(1);
+            }
+            CompletionTerminal::LateDiscarded => {
+                queue.accounting.late_discarded = queue.accounting.late_discarded.saturating_add(1);
+            }
+        }
+        free_completion_slot(&mut queue, completion.reservation, metadata);
+        assert_completion_invariant(&queue);
     }
 
     pub fn cancel(
@@ -1494,8 +1610,34 @@ impl HostRequestManager {
             .fold((0, 0), |(reserved, queued), slot| match slot {
                 CompletionSlot::Reserved(_) => (reserved + 1, queued),
                 CompletionSlot::Queued(_) => (reserved, queued + 1),
-                CompletionSlot::Free => (reserved, queued),
+                CompletionSlot::Free | CompletionSlot::Consumed(_) => (reserved, queued),
             })
+    }
+
+    fn completion_accounting(&self) -> CompletionAccounting {
+        self.completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .accounting
+    }
+
+    fn account_reload_discarded(&self, result: &HostCompletionResult) {
+        let mut queue = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let source = match result {
+            HostCompletionResult::Success(_) | HostCompletionResult::Error(_) => {
+                &mut queue.accounting.delivered
+            }
+            HostCompletionResult::Cancelled => &mut queue.accounting.cancelled,
+            HostCompletionResult::Abandoned => &mut queue.accounting.abandoned,
+        };
+        *source = source
+            .checked_sub(1)
+            .expect("reload discard reclassifies one accepted completion");
+        queue.accounting.reload_discarded = queue.accounting.reload_discarded.saturating_add(1);
+        assert_completion_invariant(&queue);
     }
 
     fn completion_count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
@@ -1551,10 +1693,12 @@ impl HostRequestManager {
             epoch,
             request,
         });
+        queue.accounting.reserved = queue.accounting.reserved.saturating_add(1);
         increment_epoch_count(&mut queue.epoch_counts, module_id, epoch);
         if let Some(global_pending) = &queue.global_pending {
             global_pending.fetch_add(1, Ordering::AcqRel);
         }
+        assert_completion_invariant(&queue);
         Ok(reservation)
     }
 
@@ -1576,7 +1720,10 @@ impl HostRequestManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(CompletionSlot::Reserved(metadata)) = queue.slots.get(reservation).copied() {
+            queue.slots[reservation] = CompletionSlot::Consumed(metadata);
+            queue.accounting.cancelled = queue.accounting.cancelled.saturating_add(1);
             free_completion_slot(&mut queue, reservation, metadata);
+            assert_completion_invariant(&queue);
         }
     }
 
@@ -1590,10 +1737,32 @@ impl HostRequestManager {
 
 impl Drop for HostRequestManager {
     fn drop(&mut self) {
-        self.completions
+        let mut queue = self
+            .completions
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed = true;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.closed = true;
+        while let Some(completion) = queue.items.pop_front() {
+            let metadata = CompletionReservation {
+                realm_id: completion.realm_id,
+                module_id: completion.module_id,
+                epoch: completion.epoch,
+                request: completion.request,
+            };
+            debug_assert_eq!(
+                queue.slots[completion.reservation],
+                CompletionSlot::Queued(metadata)
+            );
+            queue.slots[completion.reservation] = CompletionSlot::Consumed(metadata);
+            queue.accounting.queued = queue
+                .accounting
+                .queued
+                .checked_sub(1)
+                .expect("queued completion is accounted during Realm drop");
+            queue.accounting.late_discarded = queue.accounting.late_discarded.saturating_add(1);
+            free_completion_slot(&mut queue, completion.reservation, metadata);
+        }
+        assert_completion_invariant(&queue);
     }
 }
 
@@ -2023,6 +2192,15 @@ impl RuntimeResources {
     }
 
     #[must_use]
+    pub fn completion_accounting(&self) -> CompletionAccounting {
+        self.requests.completion_accounting()
+    }
+
+    pub(crate) fn account_reload_discarded(&self, delivery: &HostCompletionDelivery) {
+        self.requests.account_reload_discarded(&delivery.result);
+    }
+
+    #[must_use]
     pub(crate) fn reserved_capacities(&self) -> (usize, usize) {
         (
             self.requests.requests.reserved_capacity(),
@@ -2166,7 +2344,7 @@ impl<T> CopyBuffer<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
 
     use nexa_core::RawHandle;
@@ -2189,6 +2367,14 @@ mod tests {
         pending.ticket.complete(HostPayload::I32(9)).unwrap();
         assert!(requests.drain_completions(&mut releases).is_empty());
         assert_eq!(requests.discarded_late_results(), 1);
+        assert_eq!(
+            requests.completion_accounting(),
+            super::CompletionAccounting {
+                reserved: 1,
+                late_discarded: 1,
+                ..super::CompletionAccounting::default()
+            }
+        );
         let records = releases.drain().collect::<Vec<_>>();
         assert_eq!(records[0].kind, ReleaseKind::HostRequest);
     }
@@ -2288,6 +2474,7 @@ mod tests {
         let mut abandoned = requests.create_for_module(4, 8, &mut releases).unwrap();
         let dropped = requests.create_for_module(4, 8, &mut releases).unwrap();
         assert_eq!(requests.completion_counts(), (5, 0));
+        assert_eq!(requests.completion_accounting().reserved, 5);
 
         success.ticket.complete(HostPayload::I32(1)).unwrap();
         failure.ticket.fail(HostErrorPayload { code: 42 }).unwrap();
@@ -2295,6 +2482,7 @@ mod tests {
         abandoned.ticket.abandon().unwrap();
         drop(dropped);
         assert_eq!(requests.completion_counts(), (0, 5));
+        assert_eq!(requests.completion_accounting().queued, 5);
 
         let deliveries = requests.drain_completions(&mut releases);
         assert_eq!(deliveries.len(), 5);
@@ -2319,7 +2507,175 @@ mod tests {
             super::HostCompletionResult::Abandoned
         ));
         assert_eq!(requests.completion_counts(), (0, 0));
+        assert_eq!(
+            requests.completion_accounting(),
+            super::CompletionAccounting {
+                reserved: 5,
+                delivered: 2,
+                cancelled: 1,
+                abandoned: 2,
+                ..super::CompletionAccounting::default()
+            }
+        );
         assert_eq!(releases.drain().count(), 5);
+    }
+
+    #[test]
+    fn completion_and_request_cancel_race_has_one_terminal_classification() {
+        let mut releases = ReleaseQueue::new(1);
+        let mut requests = HostRequestManager::new(5, 1);
+        let pending = requests.create_for_module(2, 3, &mut releases).unwrap();
+        let request = pending.request;
+        let mut ticket = pending.ticket;
+        let requests = Arc::new(Mutex::new(requests));
+        let releases = Arc::new(Mutex::new(releases));
+        let barrier = Arc::new(Barrier::new(3));
+
+        let complete_barrier = Arc::clone(&barrier);
+        let complete = thread::spawn(move || {
+            complete_barrier.wait();
+            ticket.complete(HostPayload::Unit)
+        });
+        let cancel_requests = Arc::clone(&requests);
+        let cancel_releases = Arc::clone(&releases);
+        let cancel_barrier = Arc::clone(&barrier);
+        let cancel = thread::spawn(move || {
+            cancel_barrier.wait();
+            cancel_requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .cancel(
+                    request,
+                    false,
+                    &mut cancel_releases
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                )
+        });
+        barrier.wait();
+        let completion_result = complete.join().unwrap();
+        cancel.join().unwrap().unwrap();
+        assert!(matches!(
+            completion_result,
+            Ok(()) | Err(HostRequestError::AlreadyCompleted)
+        ));
+
+        let mut requests = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut releases = releases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(requests.drain_completions(&mut releases).is_empty());
+        let accounting = requests.completion_accounting();
+        assert_eq!(accounting.reserved, 1);
+        assert_eq!(accounting.queued, 0);
+        assert_eq!(accounting.terminal_total(), 1);
+        assert_eq!(accounting.pending(), 0);
+        assert_eq!(accounting.cancelled + accounting.late_discarded, 1);
+        assert_eq!(accounting.accounted_total(), accounting.reserved);
+    }
+
+    #[test]
+    fn completion_terminal_operations_are_pairwise_exactly_once() {
+        #[derive(Clone, Copy)]
+        enum Operation {
+            Complete,
+            Cancel,
+            Abandon,
+            Drop,
+        }
+
+        fn terminate(mut ticket: super::HostCompletionTicket, operation: Operation) {
+            match operation {
+                Operation::Complete => {
+                    let _ = ticket.complete(HostPayload::Unit);
+                }
+                Operation::Cancel => {
+                    let _ = ticket.cancelled();
+                }
+                Operation::Abandon => {
+                    let _ = ticket.abandon();
+                }
+                Operation::Drop => drop(ticket),
+            }
+        }
+
+        for (left, right) in [
+            (Operation::Complete, Operation::Drop),
+            (Operation::Complete, Operation::Cancel),
+            (Operation::Complete, Operation::Abandon),
+            (Operation::Cancel, Operation::Abandon),
+        ] {
+            let mut releases = ReleaseQueue::new(1);
+            let mut requests = HostRequestManager::new(6, 1);
+            let pending = requests.create_for_module(2, 3, &mut releases).unwrap();
+            let duplicate = super::HostCompletionTicket {
+                sender: pending.ticket.sender.clone(),
+                reservation: pending.ticket.reservation,
+                consumed: false,
+            };
+            let barrier = Arc::new(Barrier::new(3));
+            let left_barrier = Arc::clone(&barrier);
+            let left_worker = thread::spawn(move || {
+                left_barrier.wait();
+                terminate(pending.ticket, left);
+            });
+            let right_barrier = Arc::clone(&barrier);
+            let right_worker = thread::spawn(move || {
+                right_barrier.wait();
+                terminate(duplicate, right);
+            });
+            barrier.wait();
+            left_worker.join().unwrap();
+            right_worker.join().unwrap();
+
+            assert_eq!(requests.drain_completions(&mut releases).len(), 1);
+            let accounting = requests.completion_accounting();
+            assert_eq!(accounting.reserved, 1);
+            assert_eq!(accounting.pending(), 0);
+            assert_eq!(accounting.terminal_total(), 1);
+        }
+    }
+
+    #[test]
+    fn realm_drop_and_completion_race_consumes_the_reservation() {
+        let mut releases = ReleaseQueue::new(1);
+        let mut requests = HostRequestManager::new(8, 1);
+        let pending = requests.create_for_module(2, 3, &mut releases).unwrap();
+        let observer = pending.ticket.sender.clone();
+        let mut ticket = pending.ticket;
+        let barrier = Arc::new(Barrier::new(3));
+        let drop_barrier = Arc::clone(&barrier);
+        let drop_realm = thread::spawn(move || {
+            drop_barrier.wait();
+            drop(requests);
+        });
+        let complete_barrier = Arc::clone(&barrier);
+        let complete = thread::spawn(move || {
+            complete_barrier.wait();
+            ticket.complete(HostPayload::Unit)
+        });
+        barrier.wait();
+        drop_realm.join().unwrap();
+        let result = complete.join().unwrap();
+        assert!(matches!(
+            result,
+            Ok(()) | Err(HostRequestError::CompletionQueueClosed)
+        ));
+        let queue = observer
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            queue.accounting,
+            super::CompletionAccounting {
+                reserved: 1,
+                late_discarded: 1,
+                ..super::CompletionAccounting::default()
+            }
+        );
+        assert!(matches!(queue.slots[0], super::CompletionSlot::Free));
     }
 
     #[test]

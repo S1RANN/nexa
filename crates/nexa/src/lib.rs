@@ -53,11 +53,11 @@ pub mod prelude {
     pub use nexa_core::{FileId, FunctionId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_idl::{exact_hash as exact_idl_hash, generate_rust as generate_rust_bindings};
     pub use nexa_runtime::{
-        CancelReason, HostArgs, HostCallOutcome, HostCompletionResult, HostCompletionTicket,
-        HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle, HostTrap, HostValue,
-        MigrationCapacityReport, MigrationLimitError, MigrationLimits, ModuleHandle,
-        PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
-        ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError,
+        CancelReason, CompletionAccounting, HostArgs, HostCallOutcome, HostCompletionResult,
+        HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
+        HostTrap, HostValue, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
+        ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError,
+        RealmRuntime, ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError,
         RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeValue, ScopeHandle,
         ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle, StateValue, StatefulDomainId,
         StepConfig, TaskHandle, TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget,

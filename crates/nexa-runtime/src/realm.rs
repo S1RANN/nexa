@@ -1002,6 +1002,7 @@ impl RealmRuntime {
                 old_identity,
                 "reload buffer contains an unrelated completion"
             );
+            self.resources.account_reload_discarded(&delivery);
             discarded = discarded.saturating_add(1);
         }
         self.reload_completion_stats.discarded_after_commit = self
@@ -1535,6 +1536,11 @@ impl RealmRuntime {
     }
 
     #[must_use]
+    pub fn completion_accounting(&self) -> crate::CompletionAccounting {
+        self.resources.completion_accounting()
+    }
+
+    #[must_use]
     pub fn resource_snapshot(&self) -> crate::RuntimeResourceSnapshot {
         self.resources.model_snapshot()
     }
@@ -1606,6 +1612,7 @@ impl RealmRuntime {
             }
         }
         if self.completion_targets_committed_epoch(&delivery) {
+            self.resources.account_reload_discarded(&delivery);
             self.reload_completion_stats.discarded_after_commit = self
                 .reload_completion_stats
                 .discarded_after_commit
@@ -2286,7 +2293,7 @@ fn reservation_for_module(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
         FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
@@ -3014,6 +3021,14 @@ mod tests {
                 discarded_after_commit: 1,
             }
         );
+        assert_eq!(
+            realm.completion_accounting(),
+            crate::CompletionAccounting {
+                reserved: 1,
+                reload_discarded: 1,
+                ..crate::CompletionAccounting::default()
+            }
+        );
         realm
             .tick(TickBudget {
                 max_tasks: 0,
@@ -3034,6 +3049,86 @@ mod tests {
     #[test]
     fn activation_fault_explicitly_discards_buffered_old_completion() {
         old_completion_during_reload_publication(true);
+    }
+
+    #[test]
+    fn reload_commit_and_completion_race_has_one_terminal_classification() {
+        let host_hash = StableId::from_name("commit-completion-race-host");
+        let schema = StableId::from_name("commit-completion-race-schema");
+        let requests = Arc::new(Mutex::new(VecDeque::new()));
+        let runtime_host = RuntimeHost::new(2);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            runtime_host.clone(),
+            Box::new(QueueAsyncRegistry {
+                hash: host_hash,
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .unwrap();
+        let old = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
+        assert_eq!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        let mut pending = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap();
+        realm
+            .prepare_reload(
+                old,
+                reload_candidate_module(host_hash, schema, false),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let completion_barrier = Arc::clone(&barrier);
+        let completion = std::thread::spawn(move || {
+            completion_barrier.wait();
+            pending.ticket.complete(HostPayload::I32(77))
+        });
+        barrier.wait();
+        realm
+            .commit_reload(super::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 32,
+            })
+            .unwrap();
+        completion.join().unwrap().unwrap();
+        realm
+            .tick(TickBudget {
+                max_tasks: 0,
+                frame_fuel_budget: 0,
+                collect_garbage: false,
+            })
+            .unwrap();
+
+        let accounting = realm.completion_accounting();
+        assert_eq!(accounting.reserved, 1);
+        assert_eq!(accounting.pending(), 0);
+        assert_eq!(accounting.terminal_total(), 1);
+        assert_eq!(accounting.reload_discarded + accounting.late_discarded, 1);
+        assert_eq!(
+            accounting.reserved,
+            accounting.terminal_total() + accounting.pending()
+        );
+        assert_eq!(runtime_host.pending_completions(), 0);
+        assert_eq!(runtime_host.drain_releases().len(), 1);
     }
 
     #[test]
@@ -3547,6 +3642,14 @@ mod tests {
                 buffered: 1,
                 replayed: 1,
                 discarded_after_commit: 0,
+            }
+        );
+        assert_eq!(
+            realm.completion_accounting(),
+            crate::CompletionAccounting {
+                reserved: 1,
+                delivered: 1,
+                ..crate::CompletionAccounting::default()
             }
         );
         realm
