@@ -163,7 +163,7 @@ impl ReleaseDomain {
 #[derive(Debug)]
 pub struct ReleaseQueue {
     domain: ReleaseDomain,
-    host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+    host_admission: Option<HostAdmissionGate>,
     lists: [IntrusiveReleaseList; RELEASE_DOMAIN_COUNT],
     epoch_pending: BTreeMap<(u32, u64), EpochReleaseCount>,
     transfer_generation: u64,
@@ -176,7 +176,7 @@ pub struct ReleaseQueue {
 #[derive(Clone, Debug)]
 pub struct RuntimeHost {
     releases: ReleaseDomain,
-    lifecycle: Arc<Mutex<RuntimeHostLifecycle>>,
+    admission: HostAdmissionGate,
     pending_completions: Arc<AtomicUsize>,
 }
 
@@ -192,6 +192,99 @@ pub enum RuntimeHostState {
 struct RuntimeHostLifecycle {
     live_realms: usize,
     state: RuntimeHostState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostAdmissionKind {
+    HostedRealm,
+    AsyncHostCall,
+    HostRequest,
+    CompletionReservation,
+    ResourceToken,
+    Snapshot,
+    ReleaseReservation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HostAdmissionError {
+    Closing,
+    Closed,
+}
+
+/// The only fact source for process-host admission decisions.
+#[derive(Clone, Debug)]
+struct HostAdmissionGate {
+    inner: Arc<Mutex<RuntimeHostLifecycle>>,
+}
+
+impl HostAdmissionGate {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(RuntimeHostLifecycle::default())),
+        }
+    }
+
+    fn admit(&self, kind: HostAdmissionKind) -> Result<(), HostAdmissionError> {
+        Self::decision(
+            self.inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state,
+            kind,
+        )
+    }
+
+    const fn decision(
+        state: RuntimeHostState,
+        _kind: HostAdmissionKind,
+    ) -> Result<(), HostAdmissionError> {
+        match state {
+            RuntimeHostState::Open => Ok(()),
+            RuntimeHostState::Closing => Err(HostAdmissionError::Closing),
+            RuntimeHostState::Closed => Err(HostAdmissionError::Closed),
+        }
+    }
+
+    fn register_realm(&self) -> Result<(), HostAdmissionError> {
+        let mut lifecycle = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::decision(lifecycle.state, HostAdmissionKind::HostedRealm)?;
+        lifecycle.live_realms = lifecycle
+            .live_realms
+            .checked_add(1)
+            .expect("hosted realm count cannot overflow");
+        Ok(())
+    }
+
+    fn unregister_realm(&self) {
+        let mut lifecycle = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        lifecycle.live_realms = lifecycle
+            .live_realms
+            .checked_sub(1)
+            .expect("hosted realm registration is balanced");
+    }
+
+    fn begin_close(&self) {
+        let mut lifecycle = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if lifecycle.state == RuntimeHostState::Open {
+            lifecycle.state = RuntimeHostState::Closing;
+        }
+    }
+
+    fn snapshot(&self) -> RuntimeHostLifecycle {
+        *self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,55 +323,36 @@ impl RuntimeHost {
     pub fn new(release_capacity: usize) -> Self {
         Self {
             releases: ReleaseDomain::new(release_capacity),
-            lifecycle: Arc::new(Mutex::new(RuntimeHostLifecycle::default())),
+            admission: HostAdmissionGate::new(),
             pending_completions: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     pub(crate) fn register_realm(&self) -> Result<(), RuntimeHostState> {
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lifecycle.state != RuntimeHostState::Open {
-            return Err(lifecycle.state);
-        }
-        lifecycle.live_realms = lifecycle
-            .live_realms
-            .checked_add(1)
-            .expect("hosted realm count cannot overflow");
-        Ok(())
+        self.admission
+            .register_realm()
+            .map_err(|error| match error {
+                HostAdmissionError::Closing => RuntimeHostState::Closing,
+                HostAdmissionError::Closed => RuntimeHostState::Closed,
+            })
     }
 
     pub(crate) fn unregister_realm(&self) {
-        let mut lifecycle = self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        lifecycle.live_realms = lifecycle
-            .live_realms
-            .checked_sub(1)
-            .expect("hosted realm registration is balanced");
+        self.admission.unregister_realm();
     }
 
     /// Starts the idempotent close protocol and rejects all later admissions.
+    #[must_use]
     pub fn begin_close(&self) -> RuntimeHostCloseStatus {
-        {
-            let mut lifecycle = self
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if lifecycle.state == RuntimeHostState::Open {
-                lifecycle.state = RuntimeHostState::Closing;
-            }
-        }
+        self.admission.begin_close();
         self.close_status()
     }
 
     /// Finishes close only after every previously admitted resource has drained.
     pub fn try_finish_close(&self) -> Result<RuntimeHostCloseStatus, RuntimeHostCloseError> {
         let mut lifecycle = self
-            .lifecycle
+            .admission
+            .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         match lifecycle.state {
@@ -315,18 +389,12 @@ impl RuntimeHost {
 
     #[must_use]
     pub fn state(&self) -> RuntimeHostState {
-        self.lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .state
+        self.admission.snapshot().state
     }
 
     #[must_use]
     pub fn close_status(&self) -> RuntimeHostCloseStatus {
-        let lifecycle = *self
-            .lifecycle
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lifecycle = self.admission.snapshot();
         RuntimeHostCloseStatus {
             state: lifecycle.state,
             live_realms: lifecycle.live_realms,
@@ -344,7 +412,7 @@ impl RuntimeHost {
         ReleaseQueue::with_domain(
             self.releases.clone(),
             capacity,
-            Some(Arc::clone(&self.lifecycle)),
+            Some(self.admission.clone()),
         )
     }
 
@@ -397,11 +465,8 @@ impl RuntimeHost {
 
 impl Drop for RuntimeHost {
     fn drop(&mut self) {
-        if cfg!(debug_assertions) && Arc::strong_count(&self.lifecycle) == 1 {
-            let lifecycle = *self
-                .lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cfg!(debug_assertions) && Arc::strong_count(&self.admission.inner) == 1 {
+            let lifecycle = self.admission.snapshot();
             if lifecycle.state != RuntimeHostState::Closed {
                 eprintln!(
                     "RuntimeHost dropped in {:?}: live_realms={}, pending_completions={}, \
@@ -425,11 +490,11 @@ impl ReleaseQueue {
     fn with_domain(
         domain: ReleaseDomain,
         capacity: usize,
-        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+        host_admission: Option<HostAdmissionGate>,
     ) -> Self {
         Self {
             domain,
-            host_lifecycle,
+            host_admission,
             lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
             epoch_pending: BTreeMap::new(),
             transfer_generation: 0,
@@ -444,16 +509,13 @@ impl ReleaseQueue {
         module_id: u32,
         epoch: u64,
     ) -> Result<ReleaseReservation, ReleaseQueueError> {
-        if let Some(lifecycle) = &self.host_lifecycle {
-            match lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .state
-            {
-                RuntimeHostState::Open => {}
-                RuntimeHostState::Closing => return Err(ReleaseQueueError::HostClosing),
-                RuntimeHostState::Closed => return Err(ReleaseQueueError::HostClosed),
-            }
+        if let Some(admission) = &self.host_admission {
+            admission
+                .admit(HostAdmissionKind::ReleaseReservation)
+                .map_err(|error| match error {
+                    HostAdmissionError::Closing => ReleaseQueueError::HostClosing,
+                    HostAdmissionError::Closed => ReleaseQueueError::HostClosed,
+                })?;
         }
         if self.queued_len() + self.reserved >= self.capacity {
             self.transition_to_stalled();
@@ -969,7 +1031,7 @@ struct CompletionQueue {
     closed: bool,
     next_terminal_sequence: u64,
     global_pending: Option<Arc<AtomicUsize>>,
-    host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+    host_admission: Option<HostAdmissionGate>,
 }
 
 #[derive(Clone, Debug)]
@@ -1152,7 +1214,7 @@ impl HostRequestManager {
         realm_id: u32,
         capacity: u32,
         global_pending: Option<Arc<AtomicUsize>>,
-        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+        host_admission: Option<HostAdmissionGate>,
     ) -> Self {
         Self {
             realm_id,
@@ -1167,7 +1229,7 @@ impl HostRequestManager {
                 closed: false,
                 next_terminal_sequence: 1,
                 global_pending,
-                host_lifecycle,
+                host_admission,
             })),
             discarded_late_results: 0,
             terminal_records: VecDeque::with_capacity(capacity as usize),
@@ -1196,6 +1258,7 @@ impl HostRequestManager {
         epoch: u64,
         releases: &mut ReleaseQueue,
     ) -> Result<PendingHostRequest, HostRequestError> {
+        self.admit(HostAdmissionKind::HostRequest)?;
         let release = releases.reserve(module_id, epoch)?;
         let submitted = host_request::apply(
             host_request::State::Created,
@@ -1460,21 +1523,16 @@ impl HostRequestManager {
         epoch: u64,
         request: HostRequestHandle,
     ) -> Result<usize, HostRequestError> {
-        if let Some(lifecycle) = &self
+        let admission = self
             .completions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .host_lifecycle
-        {
-            match lifecycle
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .state
-            {
-                RuntimeHostState::Open => {}
-                RuntimeHostState::Closing => return Err(HostRequestError::HostClosing),
-                RuntimeHostState::Closed => return Err(HostRequestError::HostClosed),
-            }
+            .host_admission
+            .clone();
+        if let Some(admission) = admission {
+            admission
+                .admit(HostAdmissionKind::CompletionReservation)
+                .map_err(host_admission_error)?;
         }
         let mut queue = self
             .completions
@@ -1498,6 +1556,18 @@ impl HostRequestManager {
             global_pending.fetch_add(1, Ordering::AcqRel);
         }
         Ok(reservation)
+    }
+
+    fn admit(&self, kind: HostAdmissionKind) -> Result<(), HostRequestError> {
+        let admission = self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .host_admission
+            .clone();
+        admission.map_or(Ok(()), |admission| {
+            admission.admit(kind).map_err(host_admission_error)
+        })
     }
 
     fn cancel_completion_reservation(&self, reservation: usize) {
@@ -1786,6 +1856,7 @@ pub struct RuntimeResources {
     snapshots: SnapshotManager,
     releases: ReleaseQueue,
     ownership: BTreeMap<TaskHandle, TaskResourceSet>,
+    host_admission: Option<HostAdmissionGate>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1817,6 +1888,7 @@ impl RuntimeResources {
             ReleaseQueue::new(release_capacity),
             None,
             None,
+            None,
         )
     }
 
@@ -1831,7 +1903,8 @@ impl RuntimeResources {
             capacity,
             runtime_host.release_queue(release_capacity),
             Some(Arc::clone(&runtime_host.pending_completions)),
-            Some(Arc::clone(&runtime_host.lifecycle)),
+            Some(runtime_host.admission.clone()),
+            Some(runtime_host.admission.clone()),
         )
     }
 
@@ -1840,19 +1913,21 @@ impl RuntimeResources {
         capacity: u32,
         releases: ReleaseQueue,
         global_pending: Option<Arc<AtomicUsize>>,
-        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+        host_admission: Option<HostAdmissionGate>,
+        resource_admission: Option<HostAdmissionGate>,
     ) -> Self {
         Self {
             requests: HostRequestManager::with_completion_counter(
                 realm_id,
                 capacity,
                 global_pending,
-                host_lifecycle,
+                host_admission,
             ),
             tokens: ResourceTokenManager::new(realm_id, capacity),
             snapshots: SnapshotManager::new(realm_id, capacity),
             releases,
             ownership: BTreeMap::new(),
+            host_admission: resource_admission,
         }
     }
 
@@ -1993,6 +2068,7 @@ pub struct ResourceContext<'a> {
 
 impl ResourceContext<'_> {
     pub fn create_request(&mut self) -> Result<PendingHostRequest, HostRequestError> {
+        self.admit(HostAdmissionKind::AsyncHostCall)?;
         let pending = self.resources.requests.create_for_module(
             self.module_id,
             self.epoch,
@@ -2011,6 +2087,7 @@ impl ResourceContext<'_> {
         &mut self,
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
+        self.admit(HostAdmissionKind::ResourceToken)?;
         let token = self.resources.tokens.create(
             self.task,
             self.module_id,
@@ -2031,6 +2108,7 @@ impl ResourceContext<'_> {
         &mut self,
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, HostRequestError> {
+        self.admit(HostAdmissionKind::Snapshot)?;
         let snapshot = self.resources.snapshots.create(
             self.task,
             self.module_id,
@@ -2045,6 +2123,22 @@ impl ResourceContext<'_> {
             .snapshots
             .insert(snapshot);
         Ok(snapshot)
+    }
+
+    fn admit(&self, kind: HostAdmissionKind) -> Result<(), HostRequestError> {
+        self.resources
+            .host_admission
+            .as_ref()
+            .map_or(Ok(()), |gate| {
+                gate.admit(kind).map_err(host_admission_error)
+            })
+    }
+}
+
+fn host_admission_error(error: HostAdmissionError) -> HostRequestError {
+    match error {
+        HostAdmissionError::Closing => HostRequestError::HostClosing,
+        HostAdmissionError::Closed => HostRequestError::HostClosed,
     }
 }
 
@@ -2078,9 +2172,10 @@ mod tests {
     use nexa_core::RawHandle;
 
     use super::{
-        HostErrorPayload, HostPayload, HostRequestError, HostRequestHandle, HostRequestManager,
-        ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceTokenManager,
-        RuntimeHost, RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotManager,
+        HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload, HostRequestError,
+        HostRequestHandle, HostRequestManager, ReleaseKind, ReleaseQueue, ReleaseQueueError,
+        ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostCloseError,
+        RuntimeHostDomain, RuntimeHostState, SnapshotManager,
     };
     use crate::{RuntimeLimits, TaskRuntime};
 
@@ -2304,7 +2399,7 @@ mod tests {
                 1,
                 1,
                 Some(Arc::clone(&request_host.pending_completions)),
-                Some(Arc::clone(&request_host.lifecycle)),
+                Some(request_host.admission.clone()),
             );
             let mut releases = request_host.release_queue(1);
             request_barrier.wait();
@@ -2318,7 +2413,7 @@ mod tests {
             admitted
         });
         barrier.wait();
-        host.begin_close();
+        let _ = host.begin_close();
         let _admitted_before_close = request.join().unwrap();
         let _ = host.drain_releases();
         assert_eq!(host.pending_completions(), 0);
@@ -2328,9 +2423,9 @@ mod tests {
             1,
             1,
             Some(Arc::clone(&completion_host.pending_completions)),
-            Some(Arc::clone(&completion_host.lifecycle)),
+            Some(completion_host.admission.clone()),
         );
-        completion_host.begin_close();
+        let _ = completion_host.begin_close();
         assert_eq!(
             requests.reserve_completion(2, 3, HostRequestHandle(RawHandle::new(1, 0, 0))),
             Err(HostRequestError::HostClosing)
@@ -2358,7 +2453,7 @@ mod tests {
             }
         });
         barrier.wait();
-        host.begin_close();
+        let _ = host.begin_close();
         assert!(matches!(
             reserve.join().unwrap(),
             Ok(()) | Err(ReleaseQueueError::HostClosing)
@@ -2372,7 +2467,7 @@ mod tests {
             1,
             1,
             Some(Arc::clone(&host.pending_completions)),
-            Some(Arc::clone(&host.lifecycle)),
+            Some(host.admission.clone()),
         );
         assert!(matches!(
             requests.create_for_module(2, 3, &mut request_releases),
@@ -2404,11 +2499,11 @@ mod tests {
             1,
             1,
             Some(Arc::clone(&host.pending_completions)),
-            Some(Arc::clone(&host.lifecycle)),
+            Some(host.admission.clone()),
         );
         let mut releases = host.release_queue(1);
         let mut pending = requests.create_for_module(2, 3, &mut releases).unwrap();
-        host.begin_close();
+        let _ = host.begin_close();
         pending.ticket.complete(HostPayload::Unit).unwrap();
         assert_eq!(
             host.try_finish_close(),
@@ -2428,7 +2523,7 @@ mod tests {
     fn finish_close_races_realm_drop_and_release_drain() {
         let host = RuntimeHost::new(1);
         host.register_realm().unwrap();
-        host.begin_close();
+        let _ = host.begin_close();
         let drop_host = host.clone();
         let unregister = thread::spawn(move || drop_host.unregister_realm());
         let first_finish = host.try_finish_close();
@@ -2458,7 +2553,7 @@ mod tests {
             )
             .unwrap();
         releases.transfer_to_host();
-        host.begin_close();
+        let _ = host.begin_close();
         let drain_host = host.clone();
         let drain = thread::spawn(move || drain_host.drain_releases());
         let first_finish = host.try_finish_close();
@@ -2487,5 +2582,30 @@ mod tests {
         let second = host.try_finish_close().unwrap();
         assert_eq!(first, second);
         assert_eq!(second.state, RuntimeHostState::Closed);
+    }
+
+    #[test]
+    fn one_admission_gate_classifies_every_host_resource_in_each_state() {
+        const KINDS: [HostAdmissionKind; 7] = [
+            HostAdmissionKind::HostedRealm,
+            HostAdmissionKind::AsyncHostCall,
+            HostAdmissionKind::HostRequest,
+            HostAdmissionKind::CompletionReservation,
+            HostAdmissionKind::ResourceToken,
+            HostAdmissionKind::Snapshot,
+            HostAdmissionKind::ReleaseReservation,
+        ];
+        let host = RuntimeHost::new(1);
+        for kind in KINDS {
+            assert_eq!(host.admission.admit(kind), Ok(()));
+        }
+        let _ = host.begin_close();
+        for kind in KINDS {
+            assert_eq!(host.admission.admit(kind), Err(HostAdmissionError::Closing));
+        }
+        host.try_finish_close().unwrap();
+        for kind in KINDS {
+            assert_eq!(host.admission.admit(kind), Err(HostAdmissionError::Closed));
+        }
     }
 }

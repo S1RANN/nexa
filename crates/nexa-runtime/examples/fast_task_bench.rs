@@ -128,7 +128,7 @@ fn main() {
     }));
     drop(realm);
     let _ = generated_host.drain_releases();
-    generated_host.begin_close();
+    let _ = generated_host.begin_close();
     generated_host.try_finish_close().unwrap();
 
     let host_module = host_call_module();
@@ -160,7 +160,7 @@ fn main() {
     }));
     drop(host_realm);
     let _ = immediate_host.drain_releases();
-    immediate_host.begin_close();
+    let _ = immediate_host.begin_close();
     immediate_host.try_finish_close().unwrap();
 
     let host_samples = samples.min(200);
@@ -195,7 +195,7 @@ fn main() {
         assert!(realm.terminal_record(task).is_some());
         drop(realm);
         let _ = host.drain_releases();
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
     }));
 
@@ -210,7 +210,7 @@ fn main() {
         black_box(realm.poll_task(task, 64).unwrap());
         drop(realm);
         let _ = host.drain_releases();
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
     }));
 
@@ -221,7 +221,7 @@ fn main() {
         black_box(realm.snapshot_data(snapshot).unwrap());
         drop(realm);
         let _ = host.drain_releases();
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
     }));
 

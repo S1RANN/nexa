@@ -195,7 +195,7 @@ fn main() {
             ));
         });
         drop(realm);
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(16);
@@ -276,7 +276,7 @@ fn main() {
         });
         drop(realm);
         let _releases = host.drain_releases();
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
@@ -305,7 +305,7 @@ fn main() {
         assert_eq!(host.pending_releases(), 2);
         drop(pending);
         assert_eq!(host.drain_releases().len(), 2);
-        host.begin_close();
+        let _ = host.begin_close();
         host.try_finish_close().unwrap();
 
         for count in &MIGRATION_COUNTS {
