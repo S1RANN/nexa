@@ -48,6 +48,7 @@ pub struct InterpreterContinuation {
     suspend_reason: Option<SuspendReason>,
     pending_fuel: u64,
     cumulative_exhausted: bool,
+    cleanup_mode: bool,
 }
 
 impl InterpreterContinuation {
@@ -75,6 +76,7 @@ impl InterpreterContinuation {
             suspend_reason: None,
             pending_fuel: 0,
             cumulative_exhausted: false,
+            cleanup_mode: false,
         })
     }
 
@@ -183,7 +185,7 @@ pub enum InterpreterOutcome {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Trap {
     pub kind: TrapKind,
-    pub message: String,
+    pub message: crate::RuntimeMessage,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -442,76 +444,43 @@ impl CheckedInterpreter {
 
     pub fn run_cleanup(
         module: &VerifiedModule,
-        continuation: &InterpreterContinuation,
+        mut continuation: InterpreterContinuation,
         max_ops: u32,
         max_fuel: u64,
         costs: &OpcodeCostTable,
     ) -> Result<Result<ExecutionCharge, Trap>, InterpreterError> {
-        let actions = continuation
+        let exceeds_budget = continuation
             .arena
             .defers_rev()
-            .take(max_ops as usize + 1)
-            .collect::<Vec<_>>();
-        if actions.len() > max_ops as usize {
+            .nth(max_ops as usize)
+            .is_some();
+        if exceeds_budget {
             return Ok(Err(Trap {
                 kind: TrapKind::CleanupBudgetExceeded,
                 message: "cleanup operation budget exceeded".into(),
             }));
         }
-        let mut total = ExecutionCharge::default();
-        for action in actions {
-            match action {
-                crate::DeferAction::Call {
-                    function,
-                    args,
-                    args_count,
-                } => {
-                    let limits = FrameLimits::default();
-                    let cleanup = Self::start(
-                        module,
-                        function,
-                        &args[..usize::from(args_count)],
-                        limits,
-                        ContinuationReservation::for_limits(limits),
-                    )?;
-                    let remaining = max_fuel.saturating_sub(total.fuel_used);
-                    let outcome = Self::poll(
-                        module,
-                        cleanup,
-                        FuelState::new(remaining, 0, remaining),
-                        costs,
-                    )?;
-                    match outcome {
-                        InterpreterOutcome::Returned { charge, .. } => {
-                            total.instructions =
-                                total.instructions.saturating_add(charge.instructions);
-                            total.fuel_used = total.fuel_used.saturating_add(charge.fuel_used);
-                        }
-                        InterpreterOutcome::Trapped { trap, .. } => return Ok(Err(trap)),
-                        InterpreterOutcome::HostPending { .. } => {
-                            return Ok(Err(Trap {
-                                kind: TrapKind::CleanupBudgetExceeded,
-                                message: "cleanup attempted a host call".into(),
-                            }));
-                        }
-                        InterpreterOutcome::Suspended { .. } => {
-                            return Ok(Err(Trap {
-                                kind: TrapKind::CleanupBudgetExceeded,
-                                message: "cleanup attempted to suspend or exhausted fuel".into(),
-                            }));
-                        }
-                    }
-                }
-                crate::DeferAction::Trap => {
-                    return Ok(Err(Trap {
-                        kind: TrapKind::BytecodeTrap,
-                        message: "defer trapped".into(),
-                    }));
-                }
-                crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
-            }
+        continuation.cleanup_mode = true;
+        if !start_next_defer(module, &mut continuation.arena)? {
+            return Ok(Ok(ExecutionCharge::default()));
         }
-        Ok(Ok(total))
+        match Self::poll(
+            module,
+            continuation,
+            FuelState::new(max_fuel, 0, max_fuel),
+            costs,
+        )? {
+            InterpreterOutcome::Returned { charge, .. } => Ok(Ok(charge)),
+            InterpreterOutcome::Trapped { trap, .. } => Ok(Err(trap)),
+            InterpreterOutcome::HostPending { .. } => Ok(Err(Trap {
+                kind: TrapKind::CleanupBudgetExceeded,
+                message: "cleanup attempted a host call".into(),
+            })),
+            InterpreterOutcome::Suspended { .. } => Ok(Err(Trap {
+                kind: TrapKind::CleanupBudgetExceeded,
+                message: "cleanup attempted to suspend or exhausted fuel".into(),
+            })),
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -897,6 +866,15 @@ impl CheckedInterpreter {
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
+                        if continuation.cleanup_mode
+                            && !start_next_defer(module, &mut continuation.arena)?
+                        {
+                            return Ok(InterpreterOutcome::Returned {
+                                value: None,
+                                charge,
+                                fuel,
+                            });
+                        }
                         pending_cost = 0;
                         continue;
                     } else if continuation.arena.depth() > 0 {
@@ -926,6 +904,15 @@ impl CheckedInterpreter {
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
+                        if continuation.cleanup_mode
+                            && !start_next_defer(module, &mut continuation.arena)?
+                        {
+                            return Ok(InterpreterOutcome::Returned {
+                                value: None,
+                                charge,
+                                fuel,
+                            });
+                        }
                         pending_cost = 0;
                         continue;
                     } else if continuation.arena.depth() == 0 {
@@ -987,6 +974,16 @@ impl CheckedInterpreter {
                 Instruction::CleanupReturn => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                     continuation.arena.pop()?;
+                    if continuation.cleanup_mode
+                        && continuation.arena.depth() > 0
+                        && !start_next_defer(module, &mut continuation.arena)?
+                    {
+                        return Ok(InterpreterOutcome::Returned {
+                            value: None,
+                            charge,
+                            fuel,
+                        });
+                    }
                     if continuation.arena.depth() == 0 {
                         return Ok(InterpreterOutcome::Returned {
                             value: None,
@@ -1005,28 +1002,30 @@ fn start_next_defer(
     module: &VerifiedModule,
     arena: &mut FrameArena,
 ) -> Result<bool, InterpreterError> {
-    let Some(action) = arena.pop_defer_for_current_frame()? else {
-        return Ok(false);
-    };
-    match action {
-        crate::DeferAction::Call {
-            function,
-            args,
-            args_count,
-        } => {
-            let cleanup = module
-                .module()
-                .functions
-                .get(function as usize)
-                .ok_or(InterpreterError::MissingFunction(function))?;
-            arena.push_call(function, cleanup.registers, None)?;
-            for (index, value) in args[..usize::from(args_count)].iter().copied().enumerate() {
-                arena.set_register(index, value)?;
+    loop {
+        let Some(action) = arena.pop_defer_for_current_frame()? else {
+            return Ok(false);
+        };
+        match action {
+            crate::DeferAction::Call {
+                function,
+                args,
+                args_count,
+            } => {
+                let cleanup = module
+                    .module()
+                    .functions
+                    .get(function as usize)
+                    .ok_or(InterpreterError::MissingFunction(function))?;
+                arena.push_call(function, cleanup.registers, None)?;
+                for (index, value) in args[..usize::from(args_count)].iter().copied().enumerate() {
+                    arena.set_register(index, value)?;
+                }
+                return Ok(true);
             }
-            Ok(true)
+            crate::DeferAction::Trap => return Err(InterpreterError::TypeMismatch),
+            crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
         }
-        crate::DeferAction::Trap => Err(InterpreterError::TypeMismatch),
-        crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => Ok(false),
     }
 }
 

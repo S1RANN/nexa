@@ -13,8 +13,8 @@ use nexa_runtime::{
     CancelReason, HeapError, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
     HostTrap, HostValue, MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult,
     RealmConfig, RealmError, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
-    RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskState, TickBudget,
-    set_migration_allocation_observer,
+    RuntimeLimits, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskRuntime,
+    TaskState, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -196,6 +196,84 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
     allocations
 }
 
+fn make_cleanup_realm(cleanup_traps: bool) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+    let host = StableId::from_name("allocation-observer-cleanup-host");
+    let schema = StableId::from_name("allocation-observer-cleanup-schema");
+    let mut cleanup = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: None,
+        },
+        0,
+    );
+    cleanup.effect(FunctionEffect::Cleanup);
+    if cleanup_traps {
+        cleanup.emit(Instruction::Trap);
+    } else {
+        cleanup.emit(Instruction::CleanupReturn);
+    }
+    let mut task = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::I32],
+            result: Some(ValueType::I32),
+        },
+        1,
+    );
+    task.effect(FunctionEffect::Task)
+        .emit(Instruction::DeferPush {
+            function: 0,
+            args_base: 0,
+            args_count: 0,
+        })
+        .emit(Instruction::Yield)
+        .emit(Instruction::Return { source: 0 });
+    let mut builder = ModuleBuilder::new();
+    builder.metadata(host, schema);
+    builder.function(cleanup.finish().unwrap());
+    builder.function(task.finish().unwrap());
+    let verified = verify(builder.finish(), VerifierLimits::default()).unwrap();
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
+    let module = realm.load_module(verified, host, schema).unwrap();
+    (realm, module)
+}
+
+fn observe_cleanup(cleanup_traps: bool) -> u64 {
+    let (mut realm, module) = make_cleanup_realm(cleanup_traps);
+    let scope = realm.create_scope(None).unwrap();
+    let task = realm
+        .call(
+            module,
+            1,
+            &[RuntimeValue::I32(19)],
+            StepConfig {
+                owner: scope,
+                priority: 1,
+                fuel_slice: 16,
+                cumulative_budget: 128,
+                limits: TaskLimits::default(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        realm.poll_task(task, 64).unwrap(),
+        PollResult::Pending(PendingReason::ExplicitYield)
+    );
+    let allocations = observed(|| {
+        realm
+            .cancel_task(task, CancelReason::ScopeCancelled)
+            .unwrap();
+    });
+    assert_eq!(
+        realm.terminal_record(task).unwrap().state,
+        if cleanup_traps {
+            TaskState::Trapped
+        } else {
+            TaskState::Cancelled
+        }
+    );
+    allocations
+}
+
 fn main() {
     let mut runs = Vec::new();
     let mut migration_runs = Vec::new();
@@ -226,11 +304,125 @@ fn main() {
                 PollResult::Pending(PendingReason::ExplicitYield)
             ));
         });
-        let resume = observed(|| {
+        let explicit_resume = observed(|| {
             assert!(matches!(
                 realm.poll_task(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
+        });
+
+        let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(21)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 0).unwrap(),
+            PollResult::Pending(PendingReason::Fuel)
+        );
+        let fuel_resume = observed(|| {
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                PollResult::Completed(_)
+            ));
+        });
+
+        let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(22)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let task_completed = observed(|| {
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                PollResult::Completed(_)
+            ));
+        });
+
+        let (mut realm, module) = make_realm(vec![Instruction::Trap]);
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(23)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let task_trapped = observed(|| {
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                PollResult::Trapped(_)
+            ));
+        });
+
+        let (mut realm, module) = make_realm(vec![
+            Instruction::Yield,
+            Instruction::Return { source: 0 },
+        ]);
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(24)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 64).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        );
+        let task_cancelled = observed(|| {
+            realm
+                .cancel_task(task, CancelReason::ScopeCancelled)
+                .unwrap();
+        });
+        let cleanup_success = observe_cleanup(false);
+        let cleanup_trap = observe_cleanup(true);
+        let mut task_runtime = TaskRuntime::new(91, RuntimeLimits::default());
+        let reload_scope = task_runtime.create_scope(None).unwrap();
+        let reload_task = task_runtime
+            .admit_task(reload_scope, 1, true)
+            .unwrap();
+        task_runtime.poll_task(reload_task).unwrap();
+        task_runtime.pause_task_for_reload(reload_task).unwrap();
+        let reload_commit_cancel = observed(|| {
+            task_runtime.commit_reload_cancel(reload_task).unwrap();
         });
 
         let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
@@ -362,6 +554,7 @@ fn main() {
                 })
                 .unwrap();
         });
+        let host_resume = success_result_writeback;
         drop(realm);
         let _releases = host.drain_releases();
         let _ = host.begin_close();
@@ -545,7 +738,15 @@ fn main() {
         runs.push((
             repeat,
             promotion,
-            resume,
+            explicit_resume,
+            fuel_resume,
+            host_resume,
+            cleanup_success,
+            cleanup_trap,
+            task_completed,
+            task_cancelled,
+            task_trapped,
+            reload_commit_cancel,
             trace_off,
             immediate_host_call,
             async_admission,
@@ -567,7 +768,15 @@ fn main() {
             |(
                 _,
                 promotion,
-                resume,
+                explicit_resume,
+                fuel_resume,
+                host_resume,
+                cleanup_success,
+                cleanup_trap,
+                task_completed,
+                task_cancelled,
+                task_trapped,
+                reload_commit_cancel,
                 trace_off,
                 immediate_host_call,
                 async_admission,
@@ -582,7 +791,15 @@ fn main() {
                 realm_drop_transfer,
             )| {
                 *promotion
-                    + *resume
+                    + *explicit_resume
+                    + *fuel_resume
+                    + *host_resume
+                    + *cleanup_success
+                    + *cleanup_trap
+                    + *task_completed
+                    + *task_cancelled
+                    + *task_trapped
+                    + *reload_commit_cancel
                     + *trace_off
                     + *immediate_host_call
                     + *async_admission
@@ -602,7 +819,15 @@ fn main() {
         |(
             _,
             promotion,
-            resume,
+            explicit_resume,
+            fuel_resume,
+            host_resume,
+            cleanup_success,
+            cleanup_trap,
+            task_completed,
+            task_cancelled,
+            task_trapped,
+            reload_commit_cancel,
             trace_off,
             immediate_host_call,
             async_admission,
@@ -617,7 +842,15 @@ fn main() {
             realm_drop_transfer,
         )| {
             *promotion
-                + *resume
+                + *explicit_resume
+                + *fuel_resume
+                + *host_resume
+                + *cleanup_success
+                + *cleanup_trap
+                + *task_completed
+                + *task_cancelled
+                + *task_trapped
+                + *reload_commit_cancel
                 + *trace_off
                 + *immediate_host_call
                 + *async_admission
@@ -663,8 +896,8 @@ fn main() {
     println!(
         "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
-            .map(|(repeat, promotion, resume, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, realm_drop_transfer)| format!(
-                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"resume\":{resume},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
+            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, realm_drop_transfer)| format!(
+                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
             .join(","),

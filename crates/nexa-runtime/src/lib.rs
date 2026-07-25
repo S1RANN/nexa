@@ -7,6 +7,7 @@ mod host;
 mod interpreter;
 mod kernel;
 mod ledger;
+mod message;
 mod metrics;
 #[cfg(any(test, feature = "model-adapter"))]
 pub mod model_adapter;
@@ -29,6 +30,7 @@ pub use allocation::{
 };
 pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
+pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
 pub use nexa_core::StableId;
 
 #[cfg(test)]

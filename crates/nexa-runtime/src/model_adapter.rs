@@ -231,9 +231,9 @@ impl RealmV4RuntimeAdapter {
                 let cleanup = CheckedInterpreter::run_cleanup(
                     &self.module,
                     self.runtime
-                        .execution(self.task)
+                        .take_execution(self.task)
                         .map_err(debug)?
-                        .continuation(),
+                        .into_continuation(),
                     16,
                     128,
                     &OpcodeCostTable::default(),
@@ -251,9 +251,9 @@ impl RealmV4RuntimeAdapter {
                 let cleanup = CheckedInterpreter::run_cleanup(
                     &self.trap_cleanup_module,
                     self.runtime
-                        .execution(self.task)
+                        .take_execution(self.task)
                         .map_err(debug)?
-                        .continuation(),
+                        .into_continuation(),
                     16,
                     128,
                     &OpcodeCostTable::default(),

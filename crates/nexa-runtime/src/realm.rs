@@ -13,14 +13,14 @@ use crate::scheduler::Scheduler;
 use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, StatefulRegistry};
 use crate::task::TaskExecution;
 use crate::{
-    CheckedInterpreter, CollectionStats, ContinuationReservation, ExecutionCharge, FuelState,
-    GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionDelivery,
+    CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
+    FuelState, GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionDelivery,
     HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
     HostValue, InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
     Object, OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
-    RuntimeHost, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeResources,
-    RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig,
-    SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
+    RuntimeHost, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage,
+    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
+    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -922,7 +922,7 @@ impl RealmRuntime {
                 Err(ReloadError::Migration("migration attempted a host call".into()).into())
             }
             InterpreterOutcome::Trapped { trap, .. } => {
-                Err(ReloadError::Migration(trap.message).into())
+                Err(ReloadError::Migration(trap.message.render()).into())
             }
         }
     }
@@ -959,7 +959,7 @@ impl RealmRuntime {
             .map_err(|error| error.to_string())?
             {
                 InterpreterOutcome::Returned { .. } => Ok(()),
-                InterpreterOutcome::Trapped { trap, .. } => Err(trap.message),
+                InterpreterOutcome::Trapped { trap, .. } => Err(trap.message.render()),
                 InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
                     Err("activation entry attempted to suspend".into())
                 }
@@ -1980,11 +1980,14 @@ impl RealmRuntime {
                 return self.trap_host_task(
                     task,
                     snapshot,
-                    format!("host request failed with code {code}"),
+                    RuntimeMessage::Code {
+                        code: DiagnosticCode::new("NX5001"),
+                        argument: u64::from(code),
+                    },
                 );
             }
             ResultWritebackAction::TrapMessage(message) => {
-                return self.trap_host_task(task, snapshot, message.into());
+                return self.trap_host_task(task, snapshot, RuntimeMessage::Static(message));
             }
         };
 
@@ -2029,7 +2032,7 @@ impl RealmRuntime {
         &mut self,
         task: TaskHandle,
         snapshot: crate::TaskSnapshot,
-        message: String,
+        message: RuntimeMessage,
     ) -> Result<(), RealmError> {
         self.tasks.request_task_cancel(task)?;
         self.tasks.reach_task_safepoint(task)?;
@@ -2141,10 +2144,11 @@ impl RealmRuntime {
             self.tasks.mark_execution_cleanup(task)?;
         }
         let cleanup = if run_user_cleanup {
-            let module = self.module_for_id(snapshot.module_id)?;
+            let verified = Arc::clone(&self.module_for_id(snapshot.module_id)?.verified);
+            let continuation = self.tasks.take_execution(task)?.into_continuation();
             CheckedInterpreter::run_cleanup(
-                &module.verified,
-                self.tasks.execution(task)?.continuation(),
+                &verified,
+                continuation,
                 snapshot.limits.max_cleanup_ops,
                 snapshot.limits.max_cleanup_fuel,
                 &self.cost_table,
@@ -2422,13 +2426,20 @@ fn reservation_for_module(
         .max()
         .unwrap_or(1)
         .max(1);
+    let cleanup_depth = u32::from(module.module().functions.iter().any(|function| {
+        function
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, nexa_bytecode::Instruction::DeferPush { .. }))
+    }));
+    let reserved_depth = max_depth.saturating_add(cleanup_depth);
     ContinuationReservation {
-        frame_capacity: limits.max_call_depth.min(max_depth),
+        frame_capacity: limits.max_call_depth.min(reserved_depth),
         register_capacity: u32::try_from(
             limits.max_frame_bytes / std::mem::size_of::<RuntimeValue>(),
         )
         .unwrap_or(u32::MAX)
-        .min(max_registers.saturating_mul(max_depth)),
+        .min(max_registers.saturating_mul(reserved_depth)),
         defer_capacity: limits.max_defer_records,
     }
 }
