@@ -61,6 +61,7 @@ pub(crate) enum TaskExecution {
     Ready(InterpreterContinuation),
     Running(InterpreterContinuation),
     FuelYielded(InterpreterContinuation),
+    ExplicitYielded(InterpreterContinuation),
     Waiting {
         continuation: InterpreterContinuation,
         request: HostRequestHandle,
@@ -70,6 +71,7 @@ pub(crate) enum TaskExecution {
     },
     ReloadPaused(InterpreterContinuation),
     Cancelling(InterpreterContinuation),
+    Cleanup(InterpreterContinuation),
 }
 
 impl TaskExecution {
@@ -78,9 +80,24 @@ impl TaskExecution {
             Self::Ready(continuation)
             | Self::Running(continuation)
             | Self::FuelYielded(continuation)
+            | Self::ExplicitYielded(continuation)
             | Self::Waiting { continuation, .. }
             | Self::ReloadPaused(continuation)
-            | Self::Cancelling(continuation) => continuation,
+            | Self::Cancelling(continuation)
+            | Self::Cleanup(continuation) => continuation,
+        }
+    }
+
+    pub(crate) fn into_continuation(self) -> InterpreterContinuation {
+        match self {
+            Self::Ready(continuation)
+            | Self::Running(continuation)
+            | Self::FuelYielded(continuation)
+            | Self::ExplicitYielded(continuation)
+            | Self::Waiting { continuation, .. }
+            | Self::ReloadPaused(continuation)
+            | Self::Cancelling(continuation)
+            | Self::Cleanup(continuation) => continuation,
         }
     }
 }
@@ -285,7 +302,10 @@ impl TaskManager {
 
         let promotes = child_kind == ChildKind::Transient
             && old_state == TaskState::Running
-            && matches!(event, TaskEvent::YieldFuel | TaskEvent::AwaitHost);
+            && matches!(
+                event,
+                TaskEvent::YieldFuel | TaskEvent::YieldExplicit | TaskEvent::AwaitHost
+            );
         let terminal = is_terminal(outcome.state);
         if promotes {
             scopes.promote_child(trace, owner)?;

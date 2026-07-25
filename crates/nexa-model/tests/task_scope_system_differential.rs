@@ -85,7 +85,9 @@ impl RuntimeAdapter {
             }
             SystemEvent::YieldFuel(task) => {
                 let task = self.live_task(task)?;
-                self.runtime.yield_task(task).map_err(runtime_error_kind)?;
+                self.runtime
+                    .yield_fuel_task(task)
+                    .map_err(runtime_error_kind)?;
             }
             SystemEvent::AwaitHost(task) => {
                 let task = self.live_task(task)?;
@@ -93,7 +95,9 @@ impl RuntimeAdapter {
             }
             SystemEvent::ResumeTask(task) => {
                 let task = self.live_task(task)?;
-                self.runtime.resume_task(task).map_err(runtime_error_kind)?;
+                self.runtime
+                    .resume_fuel_task(task)
+                    .map_err(runtime_error_kind)?;
             }
             SystemEvent::FinishTask(task_index) => {
                 let task = self.live_task(task_index)?;
@@ -135,7 +139,7 @@ impl RuntimeAdapter {
                 self.runtime
                     .request_task_cancel(task)
                     .and_then(|()| self.runtime.reach_task_safepoint(task))
-                    .and_then(|()| self.runtime.clean_task(task))
+                    .and_then(|()| self.runtime.finish_cancel_without_cleanup(task))
                     .map_err(runtime_error_kind)?;
                 self.tasks[task_index] = Some(TaskBinding::Terminal(task, TaskState::Cancelled));
                 let scope = self
@@ -384,11 +388,13 @@ fn task_state_name(state: TaskState) -> &'static str {
         TaskState::Ready => "Ready",
         TaskState::Running => "Running",
         TaskState::FuelYielded => "FuelYielded",
+        TaskState::ExplicitYielded => "ExplicitYielded",
         TaskState::Waiting => "Waiting",
         TaskState::ReloadPauseRequested => "ReloadPauseRequested",
         TaskState::ReloadPaused => "ReloadPaused",
         TaskState::CancelRequested => "CancelRequested",
         TaskState::Cancelling => "Cancelling",
+        TaskState::Cleanup => "Cleanup",
         TaskState::Completed => "Completed",
         TaskState::Cancelled => "Cancelled",
         TaskState::Trapped => "Trapped",

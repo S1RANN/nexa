@@ -775,12 +775,13 @@ impl RealmRuntime {
                     self.tasks.pause_task_for_reload(*task)?;
                 }
                 TaskState::Running => self.tasks.pause_task_for_reload(*task)?,
-                TaskState::FuelYielded | TaskState::Waiting => {
+                TaskState::FuelYielded | TaskState::ExplicitYielded | TaskState::Waiting => {
                     self.tasks.request_reload_pause(*task)?;
                 }
                 _ => {}
             }
             if self.tasks.task_snapshot(*task)?.state == TaskState::ReloadPaused {
+                self.tasks.mark_execution_reload_paused(*task)?;
                 self.scheduler.cancel_task(*task);
                 self.reload
                     .transaction_mut()?
@@ -1135,7 +1136,8 @@ impl RealmRuntime {
         );
         match snapshot.state {
             TaskState::Ready => self.tasks.poll_task(task)?,
-            TaskState::FuelYielded => self.tasks.resume_task(task)?,
+            TaskState::FuelYielded => self.tasks.resume_fuel_task(task)?,
+            TaskState::ExplicitYielded => self.tasks.resume_explicit_task(task)?,
             TaskState::Waiting => return Ok(PollResult::Pending(PendingReason::HostRequest)),
             TaskState::ReloadPaused => return Ok(PollResult::Pending(PendingReason::ReloadPause)),
             TaskState::Running => {}
@@ -1146,7 +1148,9 @@ impl RealmRuntime {
             TaskExecution::Ready(continuation)
             | TaskExecution::Running(continuation)
             | TaskExecution::FuelYielded(continuation)
-            | TaskExecution::Cancelling(continuation) => continuation,
+            | TaskExecution::ExplicitYielded(continuation)
+            | TaskExecution::Cancelling(continuation)
+            | TaskExecution::Cleanup(continuation) => continuation,
             TaskExecution::Waiting {
                 continuation,
                 request,
@@ -1260,9 +1264,20 @@ impl RealmRuntime {
                     SuspendReason::HostRequest => PendingReason::HostRequest,
                     SuspendReason::ReloadPause => PendingReason::ReloadPause,
                 };
-                self.tasks.yield_task(task)?;
-                self.tasks
-                    .put_execution(task, TaskExecution::FuelYielded(continuation), fuel)?;
+                let execution = match reason {
+                    SuspendReason::Fuel => {
+                        self.tasks.yield_fuel_task(task)?;
+                        TaskExecution::FuelYielded(continuation)
+                    }
+                    SuspendReason::ExplicitYield => {
+                        self.tasks.yield_explicit_task(task)?;
+                        TaskExecution::ExplicitYielded(continuation)
+                    }
+                    SuspendReason::HostRequest | SuspendReason::ReloadPause => {
+                        return Err(RealmError::TaskWaiting);
+                    }
+                };
+                self.tasks.put_execution(task, execution, fuel)?;
                 self.scheduler.schedule(task, snapshot.priority);
                 Ok(PollResult::Pending(pending))
             }
@@ -1425,7 +1440,8 @@ impl RealmRuntime {
         let snapshot = self.tasks.task_snapshot(task)?;
         match snapshot.state {
             TaskState::Ready => self.tasks.poll_task(task)?,
-            TaskState::FuelYielded => self.tasks.resume_task(task)?,
+            TaskState::FuelYielded => self.tasks.resume_fuel_task(task)?,
+            TaskState::ExplicitYielded => self.tasks.resume_explicit_task(task)?,
             TaskState::Running => {}
             _ => return Err(RealmError::TaskWaiting),
         }
@@ -1433,7 +1449,8 @@ impl RealmRuntime {
         let continuation = match execution {
             TaskExecution::Ready(continuation)
             | TaskExecution::Running(continuation)
-            | TaskExecution::FuelYielded(continuation) => continuation,
+            | TaskExecution::FuelYielded(continuation)
+            | TaskExecution::ExplicitYielded(continuation) => continuation,
             other => {
                 self.tasks.put_execution(task, other, snapshot.fuel)?;
                 return Err(RealmError::TaskWaiting);
@@ -1650,7 +1667,7 @@ impl RealmRuntime {
                 };
                 if let Ok(value) = value {
                     continuation.write_resume_value(destination, expected_type, value)?;
-                    self.tasks.resume_task(task)?;
+                    self.tasks.resume_waiting_task(task)?;
                     self.tasks.put_execution(
                         task,
                         TaskExecution::Running(continuation),
@@ -1829,7 +1846,7 @@ impl RealmRuntime {
         };
         let value = self.allocate_async_result(async_result, false, payload)?;
         continuation.write_resume_value(destination, expected_type, value)?;
-        self.tasks.resume_task(task)?;
+        self.tasks.resume_waiting_task(task)?;
         self.tasks
             .put_execution(task, TaskExecution::Running(continuation), snapshot.fuel)?;
         self.scheduler.schedule(task, snapshot.priority);
@@ -1860,6 +1877,7 @@ impl RealmRuntime {
     ) -> Result<(), RealmError> {
         self.tasks.request_task_cancel(task)?;
         self.tasks.reach_task_safepoint(task)?;
+        self.tasks.mark_execution_cancelling(task)?;
         self.trap_task(
             task,
             snapshot.module_epoch,
@@ -1946,24 +1964,37 @@ impl RealmRuntime {
         self.scheduler.cancel_task(task);
         if reason == CancelReason::ReloadCommit {
             self.tasks.begin_reload_commit_cancel(task)?;
+            self.tasks.mark_execution_cancelling(task)?;
         } else {
             self.tasks.request_task_cancel(task)?;
             self.tasks.reach_task_safepoint(task)?;
+            self.tasks.mark_execution_cancelling(task)?;
         }
         let snapshot = self.tasks.task_snapshot(task)?;
-        let execution = self.tasks.take_execution(task)?;
-        let continuation = execution.continuation();
-        let cleanup = if reason == CancelReason::ReloadCommit {
-            Ok(ExecutionCharge::default())
-        } else {
+        let has_user_defer = self
+            .tasks
+            .execution(task)?
+            .continuation()
+            .arena()
+            .defers_rev()
+            .next()
+            .is_some();
+        let run_user_cleanup = reason != CancelReason::ReloadCommit && has_user_defer;
+        if run_user_cleanup {
+            self.tasks.begin_cleanup(task)?;
+            self.tasks.mark_execution_cleanup(task)?;
+        }
+        let cleanup = if run_user_cleanup {
             let module = self.module_for_id(snapshot.module_id)?;
             CheckedInterpreter::run_cleanup(
                 &module.verified,
-                continuation,
+                self.tasks.execution(task)?.continuation(),
                 snapshot.limits.max_cleanup_ops,
                 snapshot.limits.max_cleanup_fuel,
                 &self.cost_table,
             )?
+        } else {
+            Ok(ExecutionCharge::default())
         };
         self.resources
             .cleanup_task(task, reason == CancelReason::ReloadCommit)?;
@@ -1988,7 +2019,11 @@ impl RealmRuntime {
             .instructions
             .saturating_add(cleanup_charge.instructions);
         charge.fuel_used = charge.fuel_used.saturating_add(cleanup_charge.fuel_used);
-        self.tasks.clean_task(task)?;
+        if run_user_cleanup {
+            self.tasks.finish_cleanup(task)?;
+        } else {
+            self.tasks.finish_cancel_without_cleanup(task)?;
+        }
         self.record_terminal(
             task,
             TaskTerminalRecord {
@@ -2258,6 +2293,7 @@ mod tests {
         CancelReason, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
         TaskTerminalReason,
     };
+    use crate::task::TaskExecution;
     use crate::{
         HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, Object,
         ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig,
@@ -2429,11 +2465,195 @@ mod tests {
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         assert_eq!(
+            realm.tasks.task_snapshot(task).unwrap().state,
+            crate::TaskState::ExplicitYielded
+        );
+        assert!(matches!(
+            realm.tasks.execution(task).unwrap(),
+            TaskExecution::ExplicitYielded(_)
+        ));
+        assert_eq!(
             realm.poll_task(task, 10).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(7)))
         );
         assert!(realm.terminal_record(task).is_some());
         assert_eq!(realm.poll_task(task, 10), Err(RealmError::TerminalTask));
+    }
+
+    #[test]
+    fn fuel_and_explicit_yield_have_distinct_runtime_execution_states() {
+        let (fuel_module, host, schema) = module(false);
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let fuel_module = realm.load_module(fuel_module, host, schema).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let fuel_task = realm
+            .call(fuel_module, 0, &[RuntimeValue::I32(7)], task_config(scope))
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(fuel_task, 0).unwrap(),
+            PollResult::Pending(PendingReason::Fuel)
+        );
+        assert_eq!(
+            realm.tasks.task_snapshot(fuel_task).unwrap().state,
+            crate::TaskState::FuelYielded
+        );
+        assert!(matches!(
+            realm.tasks.execution(fuel_task).unwrap(),
+            TaskExecution::FuelYielded(_)
+        ));
+        assert_eq!(
+            realm.poll_task(fuel_task, 32).unwrap(),
+            PollResult::Completed(Some(RuntimeValue::I32(7)))
+        );
+
+        let (explicit_candidate, _, _) = module(true);
+        let (explicit_module, _, _) = module(true);
+        let explicit_module = realm.load_module(explicit_module, host, schema).unwrap();
+        let explicit_task = realm
+            .call(
+                explicit_module,
+                0,
+                &[RuntimeValue::I32(9)],
+                task_config(scope),
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(explicit_task, 32).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        );
+        realm
+            .prepare_reload(explicit_module, explicit_candidate, host, schema)
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        assert_eq!(
+            realm.tasks.task_snapshot(explicit_task).unwrap().state,
+            crate::TaskState::ReloadPaused
+        );
+        assert!(matches!(
+            realm.tasks.execution(explicit_task).unwrap(),
+            TaskExecution::ReloadPaused(_)
+        ));
+        realm.rollback_reload().unwrap();
+        assert_eq!(
+            realm.tasks.task_snapshot(explicit_task).unwrap().state,
+            crate::TaskState::ExplicitYielded
+        );
+        assert!(matches!(
+            realm.tasks.execution(explicit_task).unwrap(),
+            TaskExecution::ExplicitYielded(_)
+        ));
+        assert_eq!(
+            realm.poll_task(explicit_task, 32).unwrap(),
+            PollResult::Completed(Some(RuntimeValue::I32(9)))
+        );
+    }
+
+    #[test]
+    fn ordinary_cancel_enters_cleanup_and_cleanup_trap_is_terminal() {
+        for cleanup_traps in [false, true] {
+            let host = StableId::from_name("cleanup-host");
+            let schema = StableId::from_name("cleanup-schema");
+            let mut realm = RealmRuntime::isolated(RealmConfig::default());
+            let module = realm
+                .load_module(
+                    cancellation_module(host, schema, cleanup_traps),
+                    host,
+                    schema,
+                )
+                .unwrap();
+            let scope = realm.create_scope(None).unwrap();
+            let task = realm
+                .call(module, 1, &[RuntimeValue::I32(3)], task_config(scope))
+                .unwrap();
+            assert_eq!(
+                realm.poll_task(task, 32).unwrap(),
+                PollResult::Pending(PendingReason::ExplicitYield)
+            );
+            realm
+                .cancel_task(task, CancelReason::ScopeCancelled)
+                .unwrap();
+            let terminal = realm.terminal_record(task).unwrap();
+            if cleanup_traps {
+                assert!(matches!(terminal.reason, TaskTerminalReason::Trapped(_)));
+                assert_eq!(terminal.state, crate::TaskState::Trapped);
+            } else {
+                assert_eq!(
+                    terminal.reason,
+                    TaskTerminalReason::Cancelled(CancelReason::ScopeCancelled)
+                );
+                assert_eq!(terminal.state, crate::TaskState::Cancelled);
+            }
+            assert!(realm.trace().records().iter().any(|record| {
+                record.machine_kind == nexa_core::MachineKind::Task
+                    && record.new_state
+                        == StableId(crate::machines::task::state_id(crate::TaskState::Cleanup))
+            }));
+            assert!(realm.trace().records().iter().any(|record| {
+                record.machine_kind == nexa_core::MachineKind::Task
+                    && record.old_state
+                        == StableId(crate::machines::task::state_id(
+                            crate::TaskState::ExplicitYielded,
+                        ))
+                    && record.new_state
+                        == StableId(crate::machines::task::state_id(
+                            crate::TaskState::CancelRequested,
+                        ))
+            }));
+            assert_eq!(
+                realm.scheduler.checkpoint(task),
+                crate::scheduler::SchedulerCheckpoint::Detached
+            );
+            assert!(realm.tasks.execution(task).is_err());
+        }
+    }
+
+    #[test]
+    fn reload_commit_cancel_skips_trapping_user_cleanup() {
+        let host = StableId::from_name("reload-cleanup-host");
+        let schema = StableId::from_name("reload-cleanup-schema");
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let old = realm
+            .load_module(cancellation_module(host, schema, true), host, schema)
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(old, 1, &[RuntimeValue::I32(3)], task_config(scope))
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        );
+        realm
+            .prepare_reload(
+                old,
+                reload_candidate_module(host, schema, false),
+                host,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm
+            .commit_reload(super::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 32,
+            })
+            .unwrap();
+        assert_eq!(
+            realm.terminal_record(task).map(|record| &record.reason),
+            Some(&TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
+        );
+        assert!(!realm.trace().records().iter().any(|record| {
+            record.machine_kind == nexa_core::MachineKind::Task
+                && record.new_state
+                    == StableId(crate::machines::task::state_id(crate::TaskState::Cleanup))
+        }));
+        assert_eq!(
+            realm.scheduler.checkpoint(task),
+            crate::scheduler::SchedulerCheckpoint::Detached
+        );
+        assert!(realm.tasks.execution(task).is_err());
     }
 
     struct AsyncRegistry {
@@ -2557,6 +2777,46 @@ mod tests {
         module.metadata(host, schema);
         module.function(migration.finish().unwrap());
         module.function(activation.finish().unwrap());
+        verify(module.finish(), VerifierLimits::default()).unwrap()
+    }
+
+    fn cancellation_module(
+        host: StableId,
+        schema: StableId,
+        cleanup_traps: bool,
+    ) -> nexa_verifier::VerifiedModule {
+        let mut cleanup = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        cleanup.effect(FunctionEffect::Cleanup);
+        if cleanup_traps {
+            cleanup.emit(Instruction::Trap);
+        } else {
+            cleanup.emit(Instruction::CleanupReturn);
+        }
+        let mut task = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32],
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        task.effect(FunctionEffect::Task)
+            .emit(Instruction::DeferPush {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+            })
+            .emit(Instruction::Yield)
+            .emit(Instruction::Return { source: 0 });
+        let mut module = ModuleBuilder::new();
+        module.metadata(host, schema);
+        module.function(cleanup.finish().unwrap());
+        module.function(task.finish().unwrap());
         verify(module.finish(), VerifierLimits::default()).unwrap()
     }
 

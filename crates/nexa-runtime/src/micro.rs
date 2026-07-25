@@ -109,7 +109,7 @@ impl MicroExecutor {
         config: StepConfig,
         continuation: MicroContinuation,
     ) -> Result<(StepResult<()>, Option<MicroContinuation>), MicroError> {
-        runtime.resume_task(continuation.task)?;
+        runtime.resume_fuel_task(continuation.task)?;
         self.execute(runtime, config, continuation)
     }
 
@@ -134,7 +134,7 @@ impl MicroExecutor {
                 MicroOp::Compute(cost) => {
                     let cost = u64::from(cost);
                     if cost > slice_remaining {
-                        runtime.yield_task(continuation.task)?;
+                        runtime.yield_fuel_task(continuation.task)?;
                         return Ok((StepResult::Promoted(continuation.task), Some(continuation)));
                     }
                     continuation.arena.current_mut()?.pc += 1;
@@ -143,7 +143,7 @@ impl MicroExecutor {
                     continuation.pending_budget_cancel =
                         continuation.fuel_used >= config.cumulative_budget;
                     if slice_remaining == 0 {
-                        runtime.yield_task(continuation.task)?;
+                        runtime.yield_fuel_task(continuation.task)?;
                         return Ok((StepResult::Promoted(continuation.task), Some(continuation)));
                     }
                 }
@@ -171,7 +171,7 @@ impl MicroExecutor {
                 }
                 MicroOp::YieldFuel => {
                     continuation.arena.current_mut()?.pc += 1;
-                    runtime.yield_task(continuation.task)?;
+                    runtime.yield_fuel_task(continuation.task)?;
                     return Ok((StepResult::Promoted(continuation.task), Some(continuation)));
                 }
                 MicroOp::Await(_request) => {
@@ -200,7 +200,9 @@ impl MicroExecutor {
     ) -> Result<(), MicroError> {
         runtime.request_task_cancel(continuation.task)?;
         runtime.reach_task_safepoint(continuation.task)?;
-        if run_user_defers {
+        let has_user_defers = run_user_defers && continuation.arena.defers_rev().next().is_some();
+        if has_user_defers {
+            runtime.begin_cleanup(continuation.task)?;
             for (used, action) in continuation.arena.defers_rev().enumerate() {
                 if used >= cleanup_budget as usize {
                     runtime.trap_task(continuation.task)?;
@@ -220,7 +222,11 @@ impl MicroExecutor {
                 }
             }
         }
-        runtime.clean_task(continuation.task)?;
+        if has_user_defers {
+            runtime.finish_cleanup(continuation.task)?;
+        } else {
+            runtime.finish_cancel_without_cleanup(continuation.task)?;
+        }
         Ok(())
     }
 }

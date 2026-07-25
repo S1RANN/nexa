@@ -21,7 +21,7 @@ fn runtime_task_trace_matches_reference_model_for_acceptance_path() {
 
     let trace_len = runtime.trace().records().len();
     assert!(matches!(
-        runtime.yield_task(task),
+        runtime.yield_fuel_task(task),
         Err(RuntimeError::Task(TaskError::Transition(_)))
     ));
     assert_eq!(runtime.trace().records().len(), trace_len + 1);
@@ -36,14 +36,14 @@ fn runtime_task_trace_matches_reference_model_for_acceptance_path() {
 
     let events: &[(&str, TaskOperation)] = &[
         ("Poll", TaskRuntime::poll_task),
-        ("YieldFuel", TaskRuntime::yield_task),
-        ("Resume", TaskRuntime::resume_task),
+        ("YieldFuel", TaskRuntime::yield_fuel_task),
+        ("Resume", TaskRuntime::resume_fuel_task),
         ("RequestReloadPause", TaskRuntime::request_reload_pause),
         ("ReachSafepoint", TaskRuntime::reach_task_safepoint),
         ("RollbackReload", TaskRuntime::rollback_reload),
         ("RequestCancel", TaskRuntime::request_task_cancel),
         ("ReachSafepoint", TaskRuntime::reach_task_safepoint),
-        ("Clean", TaskRuntime::clean_task),
+        ("Clean", TaskRuntime::finish_cancel_without_cleanup),
     ];
     for (name, operation) in events {
         let step = model.apply(name, |_| true).unwrap();

@@ -1560,11 +1560,13 @@ pub mod task {
         Ready,
         Running,
         FuelYielded,
+        ExplicitYielded,
         Waiting,
         ReloadPauseRequested,
         ReloadPaused,
         CancelRequested,
         Cancelling,
+        Cleanup,
         Completed,
         Cancelled,
         Trapped,
@@ -1574,13 +1576,16 @@ pub mod task {
         Admit,
         Poll,
         YieldFuel,
+        YieldExplicit,
         AwaitHost,
         Resume,
+        ResumeExplicit,
         RequestReloadPause,
         ReachSafepoint,
         RollbackReload,
         CommitReload,
         RequestCancel,
+        BeginCleanup,
         Clean,
         Finish,
         Trap,
@@ -1596,11 +1601,13 @@ pub mod task {
             State::Ready => 0xf1b6994bc9d2db2c,
             State::Running => 0xdea09298c549e674,
             State::FuelYielded => 0xadbe8fe0281b749f,
+            State::ExplicitYielded => 0xed851c8a5a1144fb,
             State::Waiting => 0x5447948e75ea0140,
             State::ReloadPauseRequested => 0x80d8be47d22c1942,
             State::ReloadPaused => 0xa7b471e10fb0d0be,
             State::CancelRequested => 0xba516e653d36e67d,
             State::Cancelling => 0xa1ca100144949773,
+            State::Cleanup => 0xbdd365952617cc5b,
             State::Completed => 0x6c75e407f783264a,
             State::Cancelled => 0x9bc275ec95177e14,
             State::Trapped => 0x93cf523c4debf63f,
@@ -1611,13 +1618,16 @@ pub mod task {
             Event::Admit => 0xc15725f05c78fc31,
             Event::Poll => 0x8f1fa41af19679c1,
             Event::YieldFuel => 0xd394aafac02b6fc5,
+            Event::YieldExplicit => 0x91966edb083c4c71,
             Event::AwaitHost => 0x0b1cc87ec802ba78,
             Event::Resume => 0x0ecc5e7a1f354f4f,
+            Event::ResumeExplicit => 0x7ff29e1a92f0509f,
             Event::RequestReloadPause => 0xfd6e941bb3626b76,
             Event::ReachSafepoint => 0xacf24316bdf54b84,
             Event::RollbackReload => 0x72802f4e207aed8d,
             Event::CommitReload => 0xd8daf5a1e05370a0,
             Event::RequestCancel => 0x9eacfbf595f8760b,
+            Event::BeginCleanup => 0x93e72ba0d76b9ed7,
             Event::Clean => 0x1fcba8185ae9e1a5,
             Event::Finish => 0x2008eb3d1408781b,
             Event::Trap => 0x199a86f75a98ab57,
@@ -1752,144 +1762,206 @@ pub mod task {
                     deltas: DELTAS_3,
                 })
             }
-            (State::Running, Event::AwaitHost) => {
+            (State::ExplicitYielded, Event::ResumeExplicit) => {
                 const DELTAS_4: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Waiting,
-                    transition_id: 0xe9638667af8a9f13,
+                    state: State::Running,
+                    transition_id: 0x6f0781d41c2512de,
                     deltas: DELTAS_4,
                 })
             }
-            (State::Waiting, Event::Resume) => {
+            (State::Running, Event::YieldExplicit) => {
                 const DELTAS_5: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Running,
-                    transition_id: 0x25ce06ef1f51f0d8,
+                    state: State::ExplicitYielded,
+                    transition_id: 0x410438e37b497794,
                     deltas: DELTAS_5,
                 })
             }
-            (State::Running, Event::RequestReloadPause) => {
+            (State::Running, Event::AwaitHost) => {
                 const DELTAS_6: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::ReloadPauseRequested,
-                    transition_id: 0x7c3f54009eb053b8,
+                    state: State::Waiting,
+                    transition_id: 0xe9638667af8a9f13,
                     deltas: DELTAS_6,
                 })
             }
-            (State::Waiting, Event::RequestReloadPause) => {
+            (State::Waiting, Event::Resume) => {
                 const DELTAS_7: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::ReloadPaused,
-                    transition_id: 0x2072399217994e55,
+                    state: State::Running,
+                    transition_id: 0x25ce06ef1f51f0d8,
                     deltas: DELTAS_7,
                 })
             }
-            (State::FuelYielded, Event::RequestReloadPause) => {
+            (State::Running, Event::RequestReloadPause) => {
                 const DELTAS_8: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::ReloadPaused,
-                    transition_id: 0x0f34a54079b3fbd3,
+                    state: State::ReloadPauseRequested,
+                    transition_id: 0x7c3f54009eb053b8,
                     deltas: DELTAS_8,
                 })
             }
-            (State::ReloadPauseRequested, Event::ReachSafepoint) => {
+            (State::Waiting, Event::RequestReloadPause) => {
                 const DELTAS_9: &[ResourceDelta] = &[];
                 Ok(Outcome {
                     state: State::ReloadPaused,
-                    transition_id: 0xda2cc0471e2a1dcf,
+                    transition_id: 0x2072399217994e55,
                     deltas: DELTAS_9,
                 })
             }
-            (State::ReloadPaused, Event::RollbackReload) => {
+            (State::FuelYielded, Event::RequestReloadPause) => {
                 const DELTAS_10: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Running,
-                    transition_id: 0x518e50bc8d1d1af2,
+                    state: State::ReloadPaused,
+                    transition_id: 0x0f34a54079b3fbd3,
                     deltas: DELTAS_10,
                 })
             }
-            (State::ReloadPaused, Event::CommitReload) => {
+            (State::ExplicitYielded, Event::RequestReloadPause) => {
                 const DELTAS_11: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Cancelling,
-                    transition_id: 0x4472803594888b8a,
+                    state: State::ReloadPaused,
+                    transition_id: 0x6913315827697ea7,
                     deltas: DELTAS_11,
                 })
             }
-            (State::Running, Event::RequestCancel) => {
+            (State::ReloadPauseRequested, Event::ReachSafepoint) => {
                 const DELTAS_12: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::CancelRequested,
-                    transition_id: 0xce3678978ce2b832,
+                    state: State::ReloadPaused,
+                    transition_id: 0xda2cc0471e2a1dcf,
                     deltas: DELTAS_12,
                 })
             }
-            (State::Waiting, Event::RequestCancel) => {
+            (State::ReloadPaused, Event::RollbackReload) => {
                 const DELTAS_13: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::CancelRequested,
-                    transition_id: 0x81ecb0f507ca850e,
+                    state: State::Running,
+                    transition_id: 0x518e50bc8d1d1af2,
                     deltas: DELTAS_13,
                 })
             }
-            (State::FuelYielded, Event::RequestCancel) => {
+            (State::ReloadPaused, Event::CommitReload) => {
                 const DELTAS_14: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::CancelRequested,
-                    transition_id: 0xb08482206912b160,
+                    state: State::Cancelling,
+                    transition_id: 0x4472803594888b8a,
                     deltas: DELTAS_14,
                 })
             }
-            (State::CancelRequested, Event::ReachSafepoint) => {
+            (State::Running, Event::RequestCancel) => {
                 const DELTAS_15: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Cancelling,
-                    transition_id: 0x128bbb45e3c0bb3a,
+                    state: State::CancelRequested,
+                    transition_id: 0xce3678978ce2b832,
                     deltas: DELTAS_15,
                 })
             }
+            (State::Waiting, Event::RequestCancel) => {
+                const DELTAS_16: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::CancelRequested,
+                    transition_id: 0x81ecb0f507ca850e,
+                    deltas: DELTAS_16,
+                })
+            }
+            (State::FuelYielded, Event::RequestCancel) => {
+                const DELTAS_17: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::CancelRequested,
+                    transition_id: 0xb08482206912b160,
+                    deltas: DELTAS_17,
+                })
+            }
+            (State::ExplicitYielded, Event::RequestCancel) => {
+                const DELTAS_18: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::CancelRequested,
+                    transition_id: 0x47b1814ab6313dac,
+                    deltas: DELTAS_18,
+                })
+            }
+            (State::CancelRequested, Event::ReachSafepoint) => {
+                const DELTAS_19: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Cancelling,
+                    transition_id: 0x128bbb45e3c0bb3a,
+                    deltas: DELTAS_19,
+                })
+            }
+            (State::Cancelling, Event::BeginCleanup) => {
+                const DELTAS_20: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Cleanup,
+                    transition_id: 0x54afebc412017c14,
+                    deltas: DELTAS_20,
+                })
+            }
             (State::Cancelling, Event::Clean) => {
-                const DELTAS_16: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_21: &[ResourceDelta] = &[ResourceDelta {
                     resource: "task_slot",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Cancelled,
                     transition_id: 0x55242361c16cfb43,
-                    deltas: DELTAS_16,
+                    deltas: DELTAS_21,
+                })
+            }
+            (State::Cleanup, Event::Clean) => {
+                const DELTAS_22: &[ResourceDelta] = &[ResourceDelta {
+                    resource: "task_slot",
+                    amount: -1,
+                }];
+                Ok(Outcome {
+                    state: State::Cancelled,
+                    transition_id: 0x1c634c387fb4b623,
+                    deltas: DELTAS_22,
                 })
             }
             (State::Running, Event::Finish) => {
-                const DELTAS_17: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_23: &[ResourceDelta] = &[ResourceDelta {
                     resource: "task_slot",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Completed,
                     transition_id: 0x67dfad235bd8b4e6,
-                    deltas: DELTAS_17,
+                    deltas: DELTAS_23,
                 })
             }
             (State::Running, Event::Trap) => {
-                const DELTAS_18: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_24: &[ResourceDelta] = &[ResourceDelta {
                     resource: "task_slot",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Trapped,
                     transition_id: 0x826c97af2c35ea33,
-                    deltas: DELTAS_18,
+                    deltas: DELTAS_24,
                 })
             }
             (State::Cancelling, Event::Trap) => {
-                const DELTAS_19: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_25: &[ResourceDelta] = &[ResourceDelta {
                     resource: "task_slot",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Trapped,
                     transition_id: 0xff757f56b13072da,
-                    deltas: DELTAS_19,
+                    deltas: DELTAS_25,
+                })
+            }
+            (State::Cleanup, Event::Trap) => {
+                const DELTAS_26: &[ResourceDelta] = &[ResourceDelta {
+                    resource: "task_slot",
+                    amount: -1,
+                }];
+                Ok(Outcome {
+                    state: State::Trapped,
+                    transition_id: 0x499f7ebca822507a,
+                    deltas: DELTAS_26,
                 })
             }
             (state, event) => Err(TransitionError::Undefined { state, event }),

@@ -1,6 +1,6 @@
 use std::fmt;
 
-use nexa_bytecode::{AsyncResultType, FunctionEffect, HostCallMode, Instruction, ValueType};
+use nexa_bytecode::{AsyncResultType, HostCallMode, Instruction, ValueType};
 use nexa_core::StableId;
 use nexa_verifier::VerifiedModule;
 
@@ -896,7 +896,7 @@ impl CheckedInterpreter {
                     let completed = continuation.arena.pop()?;
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
-                    if returning_cleanup || function.effect == FunctionEffect::Cleanup {
+                    if returning_cleanup {
                         pending_cost = 0;
                         continue;
                     } else if continuation.arena.depth() > 0 {
@@ -925,7 +925,7 @@ impl CheckedInterpreter {
                     let completed = continuation.arena.pop()?;
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
-                    if returning_cleanup || function.effect == FunctionEffect::Cleanup {
+                    if returning_cleanup {
                         pending_cost = 0;
                         continue;
                     } else if continuation.arena.depth() == 0 {
@@ -987,6 +987,13 @@ impl CheckedInterpreter {
                 Instruction::CleanupReturn => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                     continuation.arena.pop()?;
+                    if continuation.arena.depth() == 0 {
+                        return Ok(InterpreterOutcome::Returned {
+                            value: None,
+                            charge,
+                            fuel,
+                        });
+                    }
                     pending_cost = 0;
                 }
             }

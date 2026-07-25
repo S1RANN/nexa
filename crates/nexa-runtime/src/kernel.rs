@@ -192,7 +192,17 @@ impl TaskRuntime {
         self.apply_task(task, TaskEvent::Poll)
     }
 
-    pub fn yield_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+    pub fn yield_fuel_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.require_promotion_capacity(task)?;
+        self.apply_task(task, TaskEvent::YieldFuel)
+    }
+
+    pub fn yield_explicit_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.require_promotion_capacity(task)?;
+        self.apply_task(task, TaskEvent::YieldExplicit)
+    }
+
+    fn require_promotion_capacity(&self, task: TaskHandle) -> Result<(), RuntimeError> {
         let owner = self.tasks.snapshot(task)?.owner;
         let scope = self.scopes.snapshot(owner)?;
         if !self.tasks.snapshot(task)?.persistent
@@ -200,7 +210,7 @@ impl TaskRuntime {
         {
             return Err(RuntimeError::ResourceLimit("persistent child limit"));
         }
-        self.apply_task(task, TaskEvent::YieldFuel)
+        Ok(())
     }
 
     pub fn await_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
@@ -214,7 +224,15 @@ impl TaskRuntime {
         self.apply_task(task, TaskEvent::AwaitHost)
     }
 
-    pub fn resume_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+    pub fn resume_fuel_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.apply_task(task, TaskEvent::Resume)
+    }
+
+    pub fn resume_explicit_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.apply_task(task, TaskEvent::ResumeExplicit)
+    }
+
+    pub(crate) fn resume_waiting_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
         self.apply_task(task, TaskEvent::Resume)
     }
 
@@ -230,7 +248,15 @@ impl TaskRuntime {
         self.apply_task(task, TaskEvent::ReachSafepoint)
     }
 
-    pub fn clean_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+    pub fn begin_cleanup(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.apply_task(task, TaskEvent::BeginCleanup)
+    }
+
+    pub fn finish_cleanup(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        self.apply_terminal_task(task, TaskEvent::Clean)
+    }
+
+    pub fn finish_cancel_without_cleanup(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
         self.apply_terminal_task(task, TaskEvent::Clean)
     }
 
@@ -252,7 +278,7 @@ impl TaskRuntime {
 
     pub fn commit_reload_cancel(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
         self.begin_reload_commit_cancel(task)?;
-        self.clean_task(task)
+        self.finish_cancel_without_cleanup(task)
     }
 
     pub(crate) fn begin_reload_commit_cancel(
@@ -364,6 +390,36 @@ impl TaskRuntime {
 
     pub(crate) fn execution(&self, task: TaskHandle) -> Result<&TaskExecution, RuntimeError> {
         Ok(self.tasks.execution(task)?)
+    }
+
+    pub(crate) fn mark_execution_reload_paused(
+        &mut self,
+        task: TaskHandle,
+    ) -> Result<(), RuntimeError> {
+        let fuel = self.tasks.snapshot(task)?.fuel;
+        let continuation = self.tasks.take_execution(task)?.into_continuation();
+        Ok(self
+            .tasks
+            .put_execution(task, TaskExecution::ReloadPaused(continuation), fuel)?)
+    }
+
+    pub(crate) fn mark_execution_cancelling(
+        &mut self,
+        task: TaskHandle,
+    ) -> Result<(), RuntimeError> {
+        let fuel = self.tasks.snapshot(task)?.fuel;
+        let continuation = self.tasks.take_execution(task)?.into_continuation();
+        Ok(self
+            .tasks
+            .put_execution(task, TaskExecution::Cancelling(continuation), fuel)?)
+    }
+
+    pub(crate) fn mark_execution_cleanup(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
+        let fuel = self.tasks.snapshot(task)?.fuel;
+        let continuation = self.tasks.take_execution(task)?.into_continuation();
+        Ok(self
+            .tasks
+            .put_execution(task, TaskExecution::Cleanup(continuation), fuel)?)
     }
 
     pub(crate) fn task_handles(&self) -> Vec<TaskHandle> {
