@@ -207,7 +207,7 @@ pub enum InterpreterError {
     RootMapMismatch,
     HostUnavailable,
     Host(crate::HostTrap),
-    Migration(String),
+    Migration(crate::RuntimeMessage),
     Heap(HeapError),
 }
 
@@ -267,29 +267,36 @@ pub trait InterpreterHost {
 }
 
 pub trait InterpreterMigration {
-    fn old_get(&mut self, stable_id: StableId, expected: ValueType)
-    -> Result<RuntimeValue, String>;
+    fn old_get(
+        &mut self,
+        stable_id: StableId,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, crate::RuntimeMessage>;
     fn old_field_get(
         &mut self,
         object: RuntimeValue,
         field_id: StableId,
         expected: ValueType,
-    ) -> Result<RuntimeValue, String>;
+    ) -> Result<RuntimeValue, crate::RuntimeMessage>;
     fn new_create(
         &mut self,
         stable_id: StableId,
         type_id: StableId,
-    ) -> Result<RuntimeValue, String>;
+    ) -> Result<RuntimeValue, crate::RuntimeMessage>;
     fn new_set(
         &mut self,
         object: RuntimeValue,
         field_id: StableId,
         value: RuntimeValue,
-    ) -> Result<(), String>;
-    fn preserve(&mut self, stable_id: StableId) -> Result<(), String>;
-    fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String>;
-    fn delete(&mut self, stable_id: StableId) -> Result<(), String>;
-    fn finish_staging(&mut self) -> Result<(), String>;
+    ) -> Result<(), crate::RuntimeMessage>;
+    fn preserve(&mut self, stable_id: StableId) -> Result<(), crate::RuntimeMessage>;
+    fn replace(
+        &mut self,
+        old_id: StableId,
+        target: RuntimeValue,
+    ) -> Result<(), crate::RuntimeMessage>;
+    fn delete(&mut self, stable_id: StableId) -> Result<(), crate::RuntimeMessage>;
+    fn finish_staging(&mut self) -> Result<(), crate::RuntimeMessage>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

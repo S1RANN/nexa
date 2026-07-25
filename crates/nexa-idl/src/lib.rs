@@ -320,7 +320,8 @@ pub fn generate_rust(idl: &Idl) -> String {
         }
         output.push_str(
             "))).map_err(|_| nexa_runtime::HostTrap::Panicked)?\
-             .map_err(|error| nexa_runtime::HostTrap::Host(error.0))?;\n",
+             .map_err(|error| nexa_runtime::HostTrap::Host(\
+                 nexa_runtime::RuntimeMessage::inline(&error.0)))?;\n",
         );
         writeln!(
             output,

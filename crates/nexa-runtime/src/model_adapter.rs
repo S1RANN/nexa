@@ -910,7 +910,7 @@ impl HostRegistry for RoutingRegistry {
         }
         let pending = context
             .create_request()
-            .map_err(|error| HostTrap::Host(error.to_string()))?;
+            .map_err(|_| HostTrap::Host("host request admission failed".into()))?;
         let request = pending.request;
         self.requests
             .lock()

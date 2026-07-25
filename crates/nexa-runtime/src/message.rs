@@ -78,20 +78,14 @@ impl fmt::Debug for RuntimeMessage {
 
 impl RuntimeMessage {
     #[must_use]
-    pub fn render(self) -> String {
-        self.to_string()
+    pub fn inline(message: &str) -> Self {
+        Self::Inline(InlineMessage::new(message))
     }
 }
 
 impl From<&'static str> for RuntimeMessage {
     fn from(message: &'static str) -> Self {
         Self::Static(message)
-    }
-}
-
-impl From<String> for RuntimeMessage {
-    fn from(message: String) -> Self {
-        Self::Inline(InlineMessage::new(&message))
     }
 }
 
@@ -102,5 +96,35 @@ impl fmt::Display for RuntimeMessage {
             Self::Code { code, argument } => write!(formatter, "{code} ({argument})"),
             Self::Inline(message) => message.fmt(formatter),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::size_of;
+
+    use super::{DiagnosticCode, InlineMessage, RuntimeMessage};
+
+    #[test]
+    fn inline_message_has_fixed_storage_and_preserves_utf8_boundaries() {
+        let source = "界".repeat(33);
+        let message = InlineMessage::new(&source);
+
+        assert_eq!(size_of::<InlineMessage>(), 97);
+        assert_eq!(message.as_str(), "界".repeat(32));
+        assert_eq!(message.as_str().len(), 96);
+    }
+
+    #[test]
+    fn runtime_message_renders_without_owned_storage() {
+        let code = RuntimeMessage::Code {
+            code: DiagnosticCode::new("NX5001"),
+            argument: 7,
+        };
+        let inline = RuntimeMessage::inline("host rejected request");
+
+        assert_eq!(RuntimeMessage::Static("trap").to_string(), "trap");
+        assert_eq!(code.to_string(), "NX5001 (7)");
+        assert_eq!(inline.to_string(), "host rejected request");
     }
 }

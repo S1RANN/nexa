@@ -5,7 +5,7 @@ use crate::machines::reload;
 use crate::scheduler::SchedulerCheckpoint;
 use crate::stateful::MigrationLimitError;
 use crate::task::TaskExecution;
-use crate::{HostCompletionDelivery, ModuleHandle, TaskHandle, TaskSnapshot};
+use crate::{HostCompletionDelivery, ModuleHandle, RuntimeMessage, TaskHandle, TaskSnapshot};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReloadError {
@@ -20,10 +20,10 @@ pub enum ReloadError {
     InvalidStateHandle,
     MigrationLimit(MigrationLimitError),
     CompletionBufferCapacity,
-    Migration(String),
+    Migration(RuntimeMessage),
     GraphCheck,
     QuiesceTimeout,
-    Activation(String),
+    Activation(RuntimeMessage),
 }
 
 #[derive(Debug)]

@@ -922,7 +922,7 @@ impl RealmRuntime {
                 Err(ReloadError::Migration("migration attempted a host call".into()).into())
             }
             InterpreterOutcome::Trapped { trap, .. } => {
-                Err(ReloadError::Migration(trap.message.render()).into())
+                Err(ReloadError::Migration(trap.message).into())
             }
         }
     }
@@ -940,14 +940,16 @@ impl RealmRuntime {
             .verified
             .clone();
         self.publish_reload_root()?;
-        let activation_result = (|| {
+        let activation_result: Result<(), RuntimeMessage> = (|| {
             let function = verified
                 .module()
                 .functions
                 .get(activation.function_id as usize)
-                .ok_or_else(|| "activation function is missing".to_owned())?;
+                .ok_or(RuntimeMessage::Static("activation function is missing"))?;
             if function.effect != nexa_bytecode::FunctionEffect::Immediate {
-                return Err("activation entry must have Immediate effect".into());
+                return Err(RuntimeMessage::Static(
+                    "activation entry must have Immediate effect",
+                ));
             }
             match CheckedInterpreter::run_with_heap(
                 &verified,
@@ -956,12 +958,14 @@ impl RealmRuntime {
                 activation.fuel,
                 &mut self.heap,
             )
-            .map_err(|error| error.to_string())?
+            .map_err(|_| RuntimeMessage::Static("activation interpreter failed"))?
             {
                 InterpreterOutcome::Returned { .. } => Ok(()),
-                InterpreterOutcome::Trapped { trap, .. } => Err(trap.message.render()),
+                InterpreterOutcome::Trapped { trap, .. } => Err(trap.message),
                 InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
-                    Err("activation entry attempted to suspend".into())
+                    Err(RuntimeMessage::Static(
+                        "activation entry attempted to suspend",
+                    ))
                 }
             }
         })();
@@ -2844,7 +2848,7 @@ mod tests {
             }
             let pending = context
                 .create_request()
-                .map_err(|error| HostTrap::Host(error.to_string()))?;
+                .map_err(|_| HostTrap::Host("host request admission failed".into()))?;
             let request = pending.request;
             *self
                 .request
@@ -2875,7 +2879,7 @@ mod tests {
             }
             let pending = context
                 .create_request()
-                .map_err(|error| HostTrap::Host(error.to_string()))?;
+                .map_err(|_| HostTrap::Host("host request admission failed".into()))?;
             let request = pending.request;
             self.requests
                 .lock()

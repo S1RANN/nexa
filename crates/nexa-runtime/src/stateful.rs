@@ -6,7 +6,7 @@ use nexa_core::StableId;
 use crate::allocation::{AllocationBoundary, MigrationAllocationPhase, observe_migration};
 use crate::interpreter::InterpreterMigration;
 use crate::reload::ReloadError;
-use crate::{GcRef, RuntimeValue};
+use crate::{GcRef, RuntimeMessage, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatefulDomainId(u64);
@@ -698,22 +698,22 @@ impl MigrationContext {
         }
     }
 
-    fn reject_limit<T>(&mut self, error: MigrationLimitError) -> Result<T, String> {
+    fn reject_limit<T>(&mut self, error: MigrationLimitError) -> Result<T, RuntimeMessage> {
         self.invalid = Some(ReloadError::MigrationLimit(error));
-        Err(String::new())
+        Err(RuntimeMessage::Static("migration limit exceeded"))
     }
 
-    fn precheck(&mut self, usage: MigrationUsage) -> Result<(), String> {
+    fn precheck(&mut self, usage: MigrationUsage) -> Result<(), RuntimeMessage> {
         self.arena.check_usage(usage).map_err(|error| {
             self.invalid = Some(ReloadError::MigrationLimit(error));
-            String::new()
+            RuntimeMessage::Static("migration capacity exceeded")
         })
     }
 
-    fn precheck_forwarding(&mut self) -> Result<(), String> {
+    fn precheck_forwarding(&mut self) -> Result<(), RuntimeMessage> {
         self.arena.check_forwarding().map_err(|error| {
             self.invalid = Some(ReloadError::MigrationLimit(error));
-            String::new()
+            RuntimeMessage::Static("migration forwarding capacity exceeded")
         })
     }
 
@@ -804,7 +804,7 @@ impl MigrationContext {
         }
     }
 
-    fn old_slot(&self, stable_id: StableId) -> Result<&MigrationObjectSlot, String> {
+    fn old_slot(&self, stable_id: StableId) -> Result<&MigrationObjectSlot, RuntimeMessage> {
         self.old
             .object(stable_id)
             .map_err(|_| "old state does not exist".into())
@@ -816,7 +816,7 @@ impl InterpreterMigration for MigrationContext {
         &mut self,
         stable_id: StableId,
         expected: nexa_bytecode::ValueType,
-    ) -> Result<RuntimeValue, String> {
+    ) -> Result<RuntimeValue, RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::OldGet);
         self.ensure_open()?;
         let slot = self.old_slot(stable_id)?;
@@ -832,7 +832,7 @@ impl InterpreterMigration for MigrationContext {
         object: RuntimeValue,
         field_id: StableId,
         expected: nexa_bytecode::ValueType,
-    ) -> Result<RuntimeValue, String> {
+    ) -> Result<RuntimeValue, RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::OldFieldGet);
         self.ensure_open()?;
         let RuntimeValue::Opaque {
@@ -850,7 +850,7 @@ impl InterpreterMigration for MigrationContext {
         let field = fields
             .binary_search_by_key(&field_id, |field| field.field_id)
             .map(|index| &fields[index])
-            .map_err(|_| "old state field does not exist".to_string())?;
+            .map_err(|_| RuntimeMessage::Static("old state field does not exist"))?;
         let value = state_to_runtime_value(field_id, &field.value);
         if runtime_state_type(value) != expected {
             return Err("old state field type mismatch".into());
@@ -862,7 +862,7 @@ impl InterpreterMigration for MigrationContext {
         &mut self,
         stable_id: StableId,
         type_id: StableId,
-    ) -> Result<RuntimeValue, String> {
+    ) -> Result<RuntimeValue, RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::NewCreate);
         self.ensure_open()?;
         let version = self
@@ -871,7 +871,9 @@ impl InterpreterMigration for MigrationContext {
             .iter()
             .find(|state_type| state_type.stable_id == type_id)
             .map(|state_type| state_type.version)
-            .ok_or_else(|| "candidate state type does not exist".to_string())?;
+            .ok_or(RuntimeMessage::Static(
+                "candidate state type does not exist",
+            ))?;
         let Err(index) = self.arena.object_index(stable_id) else {
             return Err("new state object already exists".into());
         };
@@ -898,7 +900,7 @@ impl InterpreterMigration for MigrationContext {
         object: RuntimeValue,
         field_id: StableId,
         value: RuntimeValue,
-    ) -> Result<(), String> {
+    ) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::NewSet);
         self.ensure_open()?;
         let RuntimeValue::Opaque {
@@ -912,7 +914,7 @@ impl InterpreterMigration for MigrationContext {
         let object_index = self
             .arena
             .object_index(StableId(object_id))
-            .map_err(|_| "staging object does not exist".to_string())?;
+            .map_err(|_| RuntimeMessage::Static("staging object does not exist"))?;
         let slot = &self.arena.objects[object_index];
         if slot.scalar.is_some() || slot.type_id != type_id {
             return Err("staging object type mismatch".into());
@@ -929,7 +931,9 @@ impl InterpreterMigration for MigrationContext {
                     .find(|field| field.stable_id == field_id)
             })
             .map(|field| field.ty)
-            .ok_or_else(|| "candidate state field does not exist".to_string())?;
+            .ok_or(RuntimeMessage::Static(
+                "candidate state field does not exist",
+            ))?;
         if !state_value_matches(value.clone(), expected) {
             return Err("candidate state field type mismatch".into());
         }
@@ -968,7 +972,7 @@ impl InterpreterMigration for MigrationContext {
         Ok(())
     }
 
-    fn preserve(&mut self, stable_id: StableId) -> Result<(), String> {
+    fn preserve(&mut self, stable_id: StableId) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::Preserve);
         self.ensure_open()?;
         let Err(forwarding_index) = self.arena.forwarding_index(stable_id) else {
@@ -980,7 +984,7 @@ impl InterpreterMigration for MigrationContext {
             .old
             .objects
             .binary_search_by_key(&stable_id, |slot| slot.stable_id)
-            .map_err(|_| "STATE_PRESERVE source does not exist".to_string())?;
+            .map_err(|_| RuntimeMessage::Static("STATE_PRESERVE source does not exist"))?;
         let old_slot = &self.old.objects[old_index];
         let Err(object_index) = self.arena.object_index(stable_id) else {
             self.invalid = Some(ReloadError::DuplicateForwarding);
@@ -1038,7 +1042,7 @@ impl InterpreterMigration for MigrationContext {
         Ok(())
     }
 
-    fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String> {
+    fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::Replace);
         self.ensure_open()?;
         let RuntimeValue::Opaque {
@@ -1051,7 +1055,7 @@ impl InterpreterMigration for MigrationContext {
         let target_index = self
             .arena
             .object_index(target_id)
-            .map_err(|_| "remap target does not exist".to_string())?;
+            .map_err(|_| RuntimeMessage::Static("remap target does not exist"))?;
         if self.arena.objects[target_index].scalar.is_some() {
             return Err("remap target is not an object".into());
         }
@@ -1071,7 +1075,7 @@ impl InterpreterMigration for MigrationContext {
         Ok(())
     }
 
-    fn delete(&mut self, stable_id: StableId) -> Result<(), String> {
+    fn delete(&mut self, stable_id: StableId) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::Delete);
         self.ensure_open()?;
         self.old_slot(stable_id)?;
@@ -1086,7 +1090,7 @@ impl InterpreterMigration for MigrationContext {
         Ok(())
     }
 
-    fn finish_staging(&mut self) -> Result<(), String> {
+    fn finish_staging(&mut self) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::StateFinish);
         self.ensure_open()?;
         self.set_flag(FINALIZED);
@@ -1125,7 +1129,7 @@ impl Drop for MigrationObservation {
 }
 
 impl MigrationContext {
-    fn ensure_open(&self) -> Result<(), String> {
+    fn ensure_open(&self) -> Result<(), RuntimeMessage> {
         if self.has_flag(FINALIZED) {
             Err("STATE_FINISH already executed".into())
         } else {
@@ -1164,7 +1168,7 @@ fn runtime_to_state_value(
     value: RuntimeValue,
     arena: &MigrationArena,
     domain: StatefulDomainId,
-) -> Result<StateValue, String> {
+) -> Result<StateValue, RuntimeMessage> {
     match value {
         RuntimeValue::I32(value) => Ok(StateValue::I32(value)),
         RuntimeValue::Bool(value) => Ok(StateValue::Bool(value)),
@@ -1176,7 +1180,7 @@ fn runtime_to_state_value(
             let generation = arena
                 .object_index(stable_id)
                 .map(|index| arena.objects[index].generation)
-                .map_err(|_| "state handle target does not exist".to_string())?;
+                .map_err(|_| RuntimeMessage::Static("state handle target does not exist"))?;
             Ok(StateValue::Handle(StateHandle {
                 domain,
                 stable_id,

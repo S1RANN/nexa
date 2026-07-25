@@ -1100,7 +1100,7 @@ pub enum HostTrap {
     Arity,
     Type,
     Panicked,
-    Host(String),
+    Host(crate::RuntimeMessage),
 }
 
 pub trait HostRegistry {
