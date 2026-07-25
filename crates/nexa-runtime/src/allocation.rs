@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -14,6 +15,29 @@ static FIRST_SLICE: AtomicU64 = AtomicU64::new(0);
 static PROMOTION: AtomicU64 = AtomicU64::new(0);
 static RESUME: AtomicU64 = AtomicU64::new(0);
 static TERMINAL_CLEANUP: AtomicU64 = AtomicU64::new(0);
+type MigrationObserver = fn(MigrationAllocationPhase, AllocationBoundary);
+static MIGRATION_OBSERVER: Mutex<Option<MigrationObserver>> = Mutex::new(None);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationAllocationPhase {
+    ContextConstruction,
+    FirstOpcode,
+    OldGet,
+    OldFieldGet,
+    NewCreate,
+    NewSet,
+    Preserve,
+    Replace,
+    Delete,
+    StateFinish,
+    Finish,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AllocationBoundary {
+    Begin,
+    End,
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum AllocationPhase {
@@ -46,6 +70,21 @@ pub fn allocation_snapshot() -> AllocationSnapshot {
         promotion: PROMOTION.load(Ordering::Relaxed),
         resume: RESUME.load(Ordering::Relaxed),
         terminal_cleanup: TERMINAL_CLEANUP.load(Ordering::Relaxed),
+    }
+}
+
+pub fn set_migration_allocation_observer(observer: Option<MigrationObserver>) {
+    *MIGRATION_OBSERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = observer;
+}
+
+pub(crate) fn observe_migration(phase: MigrationAllocationPhase, boundary: AllocationBoundary) {
+    let observer = *MIGRATION_OBSERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(observer) = observer {
+        observer(phase, boundary);
     }
 }
 

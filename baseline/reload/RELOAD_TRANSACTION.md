@@ -32,9 +32,18 @@ Migration functions use typed source intrinsics: `old.get<T>`, `old.field<T>`, `
 `new.set`, `preserve`, `replace`, `delete`, and `finish_migration`. These are available only to
 `migration fn` and lower directly to the restricted migration instruction set.
 
-`RealmConfig::migration_limits` bounds objects, fields, forwarding entries, state bytes, GC roots,
-fuel, and call depth. Every staging mutation is preflighted against those limits. A limit failure
-occurs before root publication and leaves the old root available for rollback.
+`RealmConfig::migration_limits` is a hard arena contract for objects, fields, forwarding entries,
+payload bytes, GC roots, fuel, and call depth. `MigrationContext` reserves all object, field,
+forwarding, payload-byte, and root storage once during construction. From the first migration
+opcode through `STATE_FINISH`, the sorted slot vectors do not grow and no system allocation is
+permitted. Each mutation preflights its exact object, field, payload-byte, and root delta before
+changing the arena. `max_state_bytes` means available staging payload bytes; fixed object, field,
+and forwarding metadata is reported separately by `MigrationCapacityReport`.
+
+Successful staging moves the arena's object, field, payload, and root vectors directly into the
+candidate `StatefulRegistry`; it does not rebuild a map or copy the completed graph. A limit
+failure occurs before root publication, performs no partial opcode mutation, and leaves the old
+root available for rollback.
 
 ## Commit
 

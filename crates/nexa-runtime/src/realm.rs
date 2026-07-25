@@ -7,11 +7,9 @@ use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
 use crate::machines::retired_epoch;
-use crate::reload::{
-    MigrationLimitError, MigrationLimits, ReloadCompletionBuffer, ReloadCoordinator,
-    ReloadTransaction, StatefulDomainId, StatefulRegistry,
-};
+use crate::reload::{ReloadCompletionBuffer, ReloadCoordinator, ReloadTransaction};
 use crate::scheduler::Scheduler;
+use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, StatefulRegistry};
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, ExecutionCharge, FuelState,
@@ -589,13 +587,18 @@ impl RealmRuntime {
         &self,
         module: ModuleHandle,
         handle: crate::StateHandle,
-    ) -> Result<&crate::StateValue, RealmError> {
+    ) -> Result<crate::StateValue, RealmError> {
         Ok(self
             .modules
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?
             .state
             .resolve(handle)?)
+    }
+
+    #[must_use]
+    pub fn migration_capacity_report(&self) -> crate::MigrationCapacityReport {
+        self.migration_limits.capacity_report()
     }
 
     pub fn load_module(
@@ -830,13 +833,13 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?;
         let schema_unchanged = old_root.verified.module().state_schema == candidate_schema;
         let old_state = old_root.state.clone();
-        let mut migration = crate::reload::MigrationContext::new(
+        let mut migration = crate::stateful::MigrationContext::new(
             old_state,
             candidate_domain,
             candidate_schema,
             schema_unchanged,
             self.migration_limits,
-        );
+        )?;
         let execution = CheckedInterpreter::run_migration(
             &candidate.verified,
             migration_function,
@@ -3650,6 +3653,8 @@ mod tests {
             .emit(Instruction::ReturnVoid);
         candidate.function(activation.finish().unwrap());
         let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
+        let failure_old_module = old_module.clone();
+        let failure_candidate = candidate.clone();
 
         let mut realm = RealmRuntime::isolated(RealmConfig::default());
         let old = realm
@@ -3681,11 +3686,47 @@ mod tests {
             .unwrap();
         assert_eq!(
             realm.resolve_state(candidate, handle).unwrap(),
-            &crate::StateValue::Object(crate::StateObject {
+            crate::StateValue::Object(crate::StateObject {
                 type_id: brain_type,
                 version: 2,
                 fields: BTreeMap::from([(phase, crate::StateValue::I32(37))]),
             })
+        );
+
+        let mut failure_config = RealmConfig::default();
+        failure_config.migration_limits.max_objects = 0;
+        let mut failure_realm = RealmRuntime::isolated(failure_config);
+        let failure_old = failure_realm
+            .load_module(failure_old_module, host, old_schema_hash)
+            .unwrap();
+        let failure_handle = failure_realm
+            .insert_state(failure_old, old_health, crate::StateValue::I32(37))
+            .unwrap();
+        let failure_candidate = failure_realm
+            .prepare_reload_migrating(failure_old, failure_candidate, host)
+            .unwrap();
+        failure_realm.quiesce_reload().unwrap();
+        assert_eq!(
+            failure_realm.stage_reload(0, &[]),
+            Err(RealmError::Reload(ReloadError::MigrationLimit(
+                crate::MigrationLimitError::Objects
+            )))
+        );
+        assert_eq!(failure_realm.active_root(), Some(failure_old));
+        assert_eq!(
+            failure_realm.module_lifecycle(failure_old).unwrap(),
+            super::ModuleLifecycle::Active
+        );
+        assert_eq!(
+            failure_realm.module_lifecycle(failure_candidate).unwrap(),
+            super::ModuleLifecycle::Staging
+        );
+        assert!(failure_realm.root_publications().is_empty());
+        assert_eq!(
+            failure_realm
+                .resolve_state(failure_old, failure_handle)
+                .unwrap(),
+            crate::StateValue::I32(37)
         );
     }
 

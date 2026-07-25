@@ -14,12 +14,12 @@ pub mod prelude {
     pub use nexa_runtime::{
         CancelReason, HostArgs, HostCallOutcome, HostCompletionResult, HostCompletionTicket,
         HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle, HostTrap, HostValue,
-        MigrationLimitError, MigrationLimits, ModuleHandle, PendingHostRequest, PendingReason,
-        PollResult, RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle,
-        RuntimeHost, RuntimeHostCloseError, RuntimeHostDomain, RuntimeValue, ScopeHandle,
-        ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle, StateValue, StatefulDomainId,
-        StepConfig, TaskHandle, TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget,
-        TickReport,
+        MigrationCapacityReport, MigrationLimitError, MigrationLimits, ModuleHandle,
+        PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
+        ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError,
+        RuntimeHostDomain, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
+        SnapshotHandle, StateHandle, StateValue, StatefulDomainId, StepConfig, TaskHandle,
+        TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
     };
     pub use nexa_verifier::{VerifierLimits, verify};
 }

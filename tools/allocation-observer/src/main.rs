@@ -1,16 +1,19 @@
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use nexa_bytecode::{
     AsyncResultType, CancelPolicy, Function, FunctionBuilder, FunctionEffect, HostCallMode,
-    HostImport, Instruction, ModuleBuilder, RootMap, Signature, ValueType,
+    HostImport, Instruction, ModuleBuilder, RootMap, Signature, StateField, StateSchema, StateType,
+    ValueType,
 };
 use nexa_core::StableId;
 use nexa_runtime::{
     HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, HostValue,
-    PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StateObject,
+    StateValue, StepConfig, TaskLimits, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -18,6 +21,8 @@ struct CountingAllocator;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static FIRST_OPCODE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static MIGRATION_COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -57,8 +62,57 @@ fn observed(operation: impl FnOnce()) -> u64 {
     ALLOCATIONS.load(Ordering::SeqCst)
 }
 
+fn migration_observer(
+    phase: MigrationAllocationPhase,
+    boundary: nexa_runtime::AllocationBoundary,
+) {
+    let index = migration_phase_index(phase);
+    match boundary {
+        nexa_runtime::AllocationBoundary::Begin => {
+            if phase == MigrationAllocationPhase::FirstOpcode {
+                FIRST_OPCODE_ACTIVE.store(true, Ordering::SeqCst);
+                ALLOCATIONS.store(0, Ordering::SeqCst);
+                ENABLED.store(true, Ordering::SeqCst);
+            } else if !FIRST_OPCODE_ACTIVE.load(Ordering::SeqCst) {
+                ALLOCATIONS.store(0, Ordering::SeqCst);
+                ENABLED.store(true, Ordering::SeqCst);
+            }
+        }
+        nexa_runtime::AllocationBoundary::End => {
+            MIGRATION_COUNTS[index].store(ALLOCATIONS.load(Ordering::SeqCst), Ordering::SeqCst);
+            if phase == MigrationAllocationPhase::FirstOpcode {
+                ENABLED.store(false, Ordering::SeqCst);
+                FIRST_OPCODE_ACTIVE.store(false, Ordering::SeqCst);
+            } else if !FIRST_OPCODE_ACTIVE.load(Ordering::SeqCst) {
+                ENABLED.store(false, Ordering::SeqCst);
+            }
+        }
+    }
+}
+
+const fn migration_phase_index(phase: MigrationAllocationPhase) -> usize {
+    match phase {
+        MigrationAllocationPhase::ContextConstruction => 0,
+        MigrationAllocationPhase::FirstOpcode => 1,
+        MigrationAllocationPhase::OldGet => 2,
+        MigrationAllocationPhase::OldFieldGet => 3,
+        MigrationAllocationPhase::NewCreate => 4,
+        MigrationAllocationPhase::NewSet => 5,
+        MigrationAllocationPhase::Preserve => 6,
+        MigrationAllocationPhase::Replace => 7,
+        MigrationAllocationPhase::Delete => 8,
+        MigrationAllocationPhase::StateFinish => 9,
+        MigrationAllocationPhase::Finish => 10,
+    }
+}
+
+fn migration_count(phase: MigrationAllocationPhase) -> u64 {
+    MIGRATION_COUNTS[migration_phase_index(phase)].load(Ordering::SeqCst)
+}
+
 fn main() {
     let mut runs = Vec::new();
+    let mut migration_runs = Vec::new();
     for repeat in 1..=3 {
         let (mut realm, module) = make_realm(vec![
             Instruction::Safepoint,
@@ -250,6 +304,30 @@ fn main() {
         drop(pending);
         assert_eq!(host.drain_releases().len(), 2);
         host.close().unwrap();
+
+        for count in &MIGRATION_COUNTS {
+            count.store(0, Ordering::SeqCst);
+        }
+        let mut migration_realm = make_migration_realm();
+        set_migration_allocation_observer(Some(migration_observer));
+        assert_eq!(
+            migration_realm.stage_reload(0, &[]).unwrap(),
+            Some(RuntimeValue::I32(7))
+        );
+        set_migration_allocation_observer(None);
+        migration_runs.push((
+            repeat,
+            migration_count(MigrationAllocationPhase::ContextConstruction),
+            migration_count(MigrationAllocationPhase::FirstOpcode),
+            migration_count(MigrationAllocationPhase::OldGet),
+            migration_count(MigrationAllocationPhase::NewCreate),
+            migration_count(MigrationAllocationPhase::NewSet),
+            migration_count(MigrationAllocationPhase::Preserve),
+            migration_count(MigrationAllocationPhase::Replace),
+            migration_count(MigrationAllocationPhase::Delete),
+            migration_count(MigrationAllocationPhase::StateFinish),
+            migration_count(MigrationAllocationPhase::Finish),
+        ));
         runs.push((
             repeat,
             promotion,
@@ -308,19 +386,206 @@ fn main() {
                 == 0
         },
     );
+    let migration_hot_paths_zero = migration_runs.iter().all(
+        |(
+            _,
+            construction,
+            first_opcode,
+            old_get,
+            new_create,
+            new_set,
+            preserve,
+            replace,
+            delete,
+            state_finish,
+            finish,
+        )| {
+            *construction > 0
+                && *first_opcode
+                    + *old_get
+                    + *new_create
+                    + *new_set
+                    + *preserve
+                    + *replace
+                    + *delete
+                    + *state_finish
+                    + *finish
+                    == 0
+        },
+    );
     println!(
-        "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero}}}",
+        "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
             .map(|(repeat, promotion, resume, trace_off, immediate_host_call, async_admission, success_result_writeback, error_result_writeback, realm_drop_transfer)| format!(
                 "{{\"repeat\":{repeat},\"promotion\":{promotion},\"resume\":{resume},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
-            .join(",")
+            .join(","),
+        migration_runs
+            .iter()
+            .map(
+                |(
+                    repeat,
+                    construction,
+                    first_opcode,
+                    old_get,
+                    new_create,
+                    new_set,
+                    preserve,
+                    replace,
+                    delete,
+                    state_finish,
+                    finish,
+                )| format!(
+                    "{{\"repeat\":{repeat},\"construction\":{construction},\"first_opcode\":{first_opcode},\"old_get\":{old_get},\"new_create\":{new_create},\"new_set\":{new_set},\"preserve\":{preserve},\"replace\":{replace},\"delete\":{delete},\"state_finish\":{state_finish},\"finish\":{finish}}}"
+                ),
+            )
+            .collect::<Vec<_>>()
+            .join(","),
     );
     assert!(
         required_paths_zero,
         "an allocation-free contract path allocated"
     );
+    assert!(
+        migration_hot_paths_zero,
+        "a migration opcode or finish allocated"
+    );
+}
+
+fn make_migration_realm() -> RealmRuntime {
+    let host = StableId::from_name("allocation-observer-migration-host");
+    let old_schema_hash = StableId::from_name("allocation-observer-state-v1");
+    let new_schema_hash = StableId::from_name("allocation-observer-state-v2");
+    let new_type = StableId::from_name("ObserverState");
+    let new_field = StableId::from_name("ObserverState::value");
+    let preserved_type = StableId::from_name("PreservedState");
+    let preserved_field = StableId::from_name("PreservedState::value");
+    let replaced_id = StableId::from_name("migration-replaced");
+    let preserved_id = StableId::from_name("migration-preserved");
+    let deleted_id = StableId::from_name("migration-deleted");
+    let target_id = StableId::from_name("migration-target");
+
+    let preserved_schema = StateType {
+        stable_id: preserved_type,
+        version: 1,
+        fields: vec![StateField {
+            stable_id: preserved_field,
+            ty: ValueType::I32,
+        }],
+    };
+    let mut old_entry = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: None,
+        },
+        0,
+    );
+    old_entry
+        .effect(FunctionEffect::Immediate)
+        .emit(Instruction::ReturnVoid);
+    let mut old_module = ModuleBuilder::new();
+    old_module
+        .metadata(host, old_schema_hash)
+        .state_schema(StateSchema {
+            types: vec![preserved_schema.clone()],
+        })
+        .function(old_entry.finish().unwrap());
+    let old_module = verify(old_module.finish(), VerifierLimits::default()).unwrap();
+
+    let mut migration = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: Some(ValueType::I32),
+        },
+        2,
+    );
+    migration
+        .effect(FunctionEffect::Migration)
+        .emit(Instruction::StateOldGet {
+            stable_id: replaced_id,
+            ty: ValueType::I32,
+            dst: 0,
+        })
+        .emit(Instruction::StateNewCreate {
+            stable_id: target_id,
+            type_id: new_type,
+            dst: 1,
+        })
+        .emit(Instruction::StateNewSet {
+            object: 1,
+            field_id: new_field,
+            source: 0,
+        })
+        .emit(Instruction::StatePreserve {
+            stable_id: preserved_id,
+        })
+        .emit(Instruction::StateReplace {
+            old_id: replaced_id,
+            target: 1,
+        })
+        .emit(Instruction::StateDelete {
+            stable_id: deleted_id,
+        })
+        .emit(Instruction::StateFinish)
+        .emit(Instruction::Return { source: 0 });
+    let mut migration = migration.finish().unwrap();
+    migration.root_bitmap = vec![false, true];
+    migration.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: vec![false, false],
+        },
+        RootMap {
+            pc: 7,
+            bitmap: vec![false, true],
+        },
+    ];
+    let mut candidate = ModuleBuilder::new();
+    candidate
+        .metadata(host, new_schema_hash)
+        .state_schema(StateSchema {
+            types: vec![
+                StateType {
+                    stable_id: new_type,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: new_field,
+                        ty: ValueType::I32,
+                    }],
+                },
+                preserved_schema,
+            ],
+        })
+        .function(migration);
+    let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
+
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
+    let old = realm
+        .load_module(old_module, host, old_schema_hash)
+        .unwrap();
+    realm
+        .insert_state(old, replaced_id, StateValue::I32(7))
+        .unwrap();
+    realm
+        .insert_state(
+            old,
+            preserved_id,
+            StateValue::Object(StateObject {
+                type_id: preserved_type,
+                version: 1,
+                fields: BTreeMap::from([(preserved_field, StateValue::I32(3))]),
+            }),
+        )
+        .unwrap();
+    realm
+        .insert_state(old, deleted_id, StateValue::I32(9))
+        .unwrap();
+    realm
+        .prepare_reload_migrating(old, candidate, host)
+        .unwrap();
+    realm.quiesce_reload().unwrap();
+    realm
 }
 
 fn make_async_host_realm(

@@ -14,6 +14,7 @@ mod reload;
 mod scheduler;
 mod scope;
 mod slot_pool;
+mod stateful;
 mod task;
 mod trace;
 
@@ -21,7 +22,10 @@ mod trace;
 #[path = "generated/machines.rs"]
 mod machines;
 
-pub use allocation::{AllocationSnapshot, allocation_snapshot};
+pub use allocation::{
+    AllocationBoundary, AllocationSnapshot, MigrationAllocationPhase, allocation_snapshot,
+    set_migration_allocation_observer,
+};
 pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 pub use nexa_core::StableId;
 
@@ -52,11 +56,12 @@ pub use realm::{
     RetiredEpochSnapshot, RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport,
     TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
-pub use reload::{
-    MigrationLimitError, MigrationLimits, ReloadError, StateHandle, StateObject, StateValue,
-    StatefulDomainId, StatefulError,
-};
+pub use reload::ReloadError;
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
+pub use stateful::{
+    MigrationCapacityReport, MigrationLimitError, MigrationLimits, StateHandle, StateObject,
+    StateValue, StatefulDomainId, StatefulError,
+};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
 pub use trace::{RuntimeTrace, TraceRecords};
