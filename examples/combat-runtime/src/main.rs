@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    ActivationEntry, HostCompletion, HostPayload, ModuleLifecycle, PollResult, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction,
-    StepConfig, TaskLimits, TickBudget,
+    ActivationEntry, HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime,
+    ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig,
+    TaskLimits, TickBudget,
 };
 
 #[allow(dead_code)]
@@ -14,7 +14,7 @@ mod generated {
 }
 
 struct EngineHost {
-    last_request: Arc<Mutex<Option<nexa_runtime::HostRequestHandle>>>,
+    last_request: Arc<Mutex<Option<nexa_runtime::PendingHostRequest>>>,
 }
 
 impl generated::GameHost for EngineHost {
@@ -32,13 +32,14 @@ impl generated::GameHost for EngineHost {
         context: &mut ResourceContext<'_>,
         _: i32,
     ) -> Result<nexa_runtime::HostRequestHandle, generated::HostError> {
-        let request = context
+        let pending = context
             .create_request()
             .map_err(|error| generated::HostError(error.to_string()))?;
+        let request = pending.request;
         *self
             .last_request
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(pending);
         Ok(request)
     }
 
@@ -119,17 +120,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         realm.poll_task(task, 32)?,
         PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
     );
-    let request = last_request
+    let mut pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
         .expect("animation request was captured by the host");
-    realm.completion_sender().complete(HostCompletion {
-        realm_id: realm.realm_id(),
-        module_id: module.raw().index,
-        epoch: realm.module_epoch(module)?,
-        request,
-        payload: HostPayload::Opaque(1),
-    })?;
+    pending.ticket.complete(HostPayload::Opaque(1))?;
     realm.tick(TickBudget {
         max_tasks: 1,
         frame_fuel_budget: 32,
@@ -154,10 +150,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limits: TaskLimits::default(),
         },
     )?;
-    let late_request = realm.create_host_request(live)?;
-    realm.wait_for_request(live, late_request)?;
-    let late_sender = realm.completion_sender();
-    let old_epoch = realm.module_epoch(module)?;
+    let mut late_pending = realm.create_host_request(live)?;
+    realm.wait_for_request(live, late_pending.request)?;
     let v2 = nexa_compiler::compile_with_metadata(
         include_str!("../reload/v2.nexa"),
         host_hash,
@@ -216,13 +210,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     );
 
-    late_sender.complete(HostCompletion {
-        realm_id: realm.realm_id(),
-        module_id: module.raw().index,
-        epoch: old_epoch,
-        request: late_request,
-        payload: HostPayload::I32(99),
-    })?;
+    late_pending.ticket.complete(HostPayload::I32(99))?;
     realm.tick(TickBudget {
         max_tasks: 0,
         frame_fuel_budget: 0,

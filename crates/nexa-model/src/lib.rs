@@ -1,5 +1,6 @@
 //! Bounded exploration of generated Nexa machine specifications.
 
+pub mod realm_v3;
 pub mod system;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};

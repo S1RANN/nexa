@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt;
 
 use nexa_bytecode::ValueType;
@@ -144,6 +145,7 @@ impl From<ScopeError> for TaskError {
 pub(crate) struct TaskManager {
     realm_id: u32,
     tasks: SlotPool<Task>,
+    epoch_counts: BTreeMap<(u32, u64), usize>,
 }
 
 impl TaskManager {
@@ -152,6 +154,7 @@ impl TaskManager {
         Self {
             realm_id,
             tasks: SlotPool::with_capacity_limit(realm_id, max_tasks),
+            epoch_counts: BTreeMap::new(),
         }
     }
 
@@ -196,6 +199,7 @@ impl TaskManager {
             let _ = scopes.complete_transient_child(trace, owner);
             return Err(error);
         }
+        *self.epoch_counts.entry((0, module_epoch)).or_default() += 1;
         Ok(handle)
     }
 
@@ -334,6 +338,17 @@ impl TaskManager {
         if terminal {
             let released = self.tasks.release(handle.raw())?;
             debug_assert_eq!(released.reserved_slots, 0);
+            let key = (released.module_id, released.module_epoch);
+            let count = self
+                .epoch_counts
+                .get_mut(&key)
+                .expect("terminal task has epoch ownership");
+            *count = count
+                .checked_sub(1)
+                .expect("task epoch ownership count is positive");
+            if *count == 0 {
+                self.epoch_counts.remove(&key);
+            }
         }
         Ok(())
     }
@@ -363,15 +378,36 @@ impl TaskManager {
         module_id: u32,
         limits: crate::TaskLimits,
     ) -> Result<(), TaskError> {
-        let task = self.tasks.resolve_mut(handle.raw())?;
-        if task.execution.is_some() {
-            return Err(TaskError::Invariant("task already owns a continuation"));
+        let (old_module_id, module_epoch) = {
+            let task = self.tasks.resolve_mut(handle.raw())?;
+            if task.execution.is_some() {
+                return Err(TaskError::Invariant("task already owns a continuation"));
+            }
+            let old_module_id = task.module_id;
+            task.priority = priority;
+            task.module_id = module_id;
+            task.fuel = fuel;
+            task.execution = Some(execution);
+            task.limits = limits;
+            (old_module_id, task.module_epoch)
+        };
+        if old_module_id != module_id {
+            let old_key = (old_module_id, module_epoch);
+            let old_count = self
+                .epoch_counts
+                .get_mut(&old_key)
+                .expect("admitted task has epoch ownership");
+            *old_count = old_count
+                .checked_sub(1)
+                .expect("task epoch ownership count is positive");
+            if *old_count == 0 {
+                self.epoch_counts.remove(&old_key);
+            }
+            *self
+                .epoch_counts
+                .entry((module_id, module_epoch))
+                .or_default() += 1;
         }
-        task.priority = priority;
-        task.module_id = module_id;
-        task.fuel = fuel;
-        task.execution = Some(execution);
-        task.limits = limits;
         Ok(())
     }
 
@@ -441,8 +477,19 @@ impl TaskManager {
             .collect()
     }
 
+    pub(crate) fn handles_iter(&self) -> impl Iterator<Item = TaskHandle> + '_ {
+        self.tasks.occupied_handles_iter().map(TaskHandle)
+    }
+
     pub(crate) fn reserved_capacity(&self) -> usize {
         self.tasks.reserved_capacity()
+    }
+
+    pub(crate) fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
+        self.epoch_counts
+            .get(&(module_id, epoch))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(crate) fn record_charge(

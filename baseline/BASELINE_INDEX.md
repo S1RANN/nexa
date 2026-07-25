@@ -1,6 +1,6 @@
 # Nexa Architecture Baseline Index
 
-Version: **1.0.1**
+Version: **1.0.2**
 
 This is the only entry point for normative Nexa specifications. Historical design documents are
 non-normative rationale. When texts conflict, precedence is:
@@ -28,6 +28,9 @@ MVR Scope 1.0
 | D55 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | fallible release enqueue |
 | D56 | Active | Experiment | `testing/EXPERIMENT_PROTOCOL.md` | binary experiment outcomes |
 | D57 | Active | Experiment | `testing/GATE0_KILL_CRITERIA.md` | unbounded inconclusive retesting |
+| D58 | Active | MVR | `runtime/HOST_REQUEST_MACHINE.md` | sender-wide completion reservation |
+| D59 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | allocating Realm release transfer |
+| D60 | Active | MVR | `runtime/RETIRED_EPOCH.md` | per-frame retired-module scan |
 
 ## Deferred decisions
 

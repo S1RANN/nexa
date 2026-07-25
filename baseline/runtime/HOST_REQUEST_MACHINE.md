@@ -1,11 +1,20 @@
-# Host Request Machine Specification 1.0
+# Host Request Machine Specification 1.1
 
 ```text
-Created → Submitted → InFlight → Completed → Released
-                         ├──────→ Discarded → Released
-                         └──────→ CancelRequested → Detached → Released
+Created → Submitted → InFlight → CompletionQueued
+                         │              ├→ Completed → Released
+                         │              ├→ Failed → Released
+                         │              ├→ Cancelled → Released
+                         │              └→ Abandoned → Released
+                         └→ CancelRequested → Detached → Released
 ```
 
-Worker threads only enqueue completions tagged with realm, module, epoch, and request identity.
-Only the VM thread may resolve tasks or epoch state. A terminal task has no request that can still
-deliver to it; detached physical work is owned by the host-resource domain.
+Every request owns exactly one `HostCompletionTicket`. The ticket carries realm, module, epoch,
+request identity, and one pre-reserved completion slot. It is not cloneable and supports exactly
+one of `complete`, `fail`, `cancelled`, or `abandon`; Drop submits `Abandoned`. A repeated terminal
+operation is rejected without consuming another slot.
+
+Worker threads only consume tickets. Only the VM thread resolves tasks or epoch state. Success
+writes the destination and resumes the task, expected host failure traps until language `Result`
+is available, host cancellation cancels the task, and abandonment traps. Detached physical work
+retains the ticket but cannot deliver to the released request generation.

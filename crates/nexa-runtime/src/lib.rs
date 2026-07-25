@@ -30,11 +30,12 @@ pub use frame::{
 };
 pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, Object};
 pub use host::{
-    CopyBuffer, HostArgs, HostCallOutcome, HostCompletion, HostCompletionSender, HostPayload,
-    HostRegistry, HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue,
-    ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceContext,
-    ResourceTokenHandle, RuntimeHost, RuntimeHostDomain, RuntimeResourceSnapshot, RuntimeResources,
-    ScriptFunction, SnapshotHandle, TaskResourceSet,
+    CopyBuffer, HostArgs, HostCallOutcome, HostCompletionDelivery, HostCompletionResult,
+    HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest, ReleaseKind,
+    ReleaseQueue, ReleaseQueueError, ReleaseQueueState, RequestTerminalRecord, ResourceContext,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostDomain, RuntimeHostError, RuntimeResourceSnapshot,
+    RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
@@ -44,8 +45,9 @@ pub use interpreter::{
 pub use metrics::ExecutionMetrics;
 pub use realm::{
     ActivationEntry, CancelReason, ModuleEpochRoot, ModuleHandle, ModuleLifecycle, PendingReason,
-    PollResult, RealmConfig, RealmError, RealmRuntime, RootPublicationRecord,
-    RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+    PollResult, RealmConfig, RealmError, RealmRuntime, RetiredEpochSnapshot, RetiredEpochState,
+    RootPublicationRecord, RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord,
+    TickBudget, TickReport,
 };
 pub use reload::{ReloadError, StateHandle, StateObject, StateValue, StatefulError};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};

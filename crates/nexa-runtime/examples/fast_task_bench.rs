@@ -8,9 +8,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    ActivationEntry, HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry,
-    HostRequestHandle, HostTrap, HostValue, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    ActivationEntry, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, HostValue,
+    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHostDomain,
+    RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -169,21 +169,12 @@ fn main() {
             realm.poll_task(task, 64).unwrap(),
             PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
         );
-        let request = pending
+        let mut pending = pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap();
-        realm
-            .completion_sender()
-            .complete(HostCompletion {
-                realm_id: realm.realm_id(),
-                module_id: module.raw().index,
-                epoch: realm.module_epoch(module).unwrap(),
-                request,
-                payload: HostPayload::I32(1),
-            })
-            .unwrap();
+        pending.ticket.complete(HostPayload::I32(1)).unwrap();
         black_box(realm.tick(TickBudget::default()).unwrap());
         assert!(realm.terminal_record(task).is_some());
     }));
@@ -487,7 +478,7 @@ impl HostRegistry for AddRegistry {
 }
 
 struct AsyncRegistry {
-    pending: Arc<Mutex<Option<HostRequestHandle>>>,
+    pending: Arc<Mutex<Option<PendingHostRequest>>>,
 }
 
 impl HostRegistry for AsyncRegistry {
@@ -500,13 +491,14 @@ impl HostRegistry for AsyncRegistry {
         if id != 0 || args.len() != 1 {
             return Err(HostTrap::UnknownFunction(id));
         }
-        let request = context
+        let pending = context
             .create_request()
             .map_err(|error| HostTrap::Host(error.to_string()))?;
+        let request = pending.request;
         *self
             .pending
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
         Ok(HostCallOutcome::Pending(request))
     }
 }

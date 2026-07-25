@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
+use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -95,6 +96,20 @@ fn run(path: &Path) -> Result<(), String> {
         println!(
             "RealmRuntime: {} worlds, {} rejected operations",
             realm.visited_worlds, realm.rejected_operations
+        );
+        let realm_v3 = explore_realm_v3(RealmV3Config {
+            max_depth: 14,
+            max_worlds: 4_096,
+        });
+        if !realm_v3.failures.is_empty() || realm_v3.truncated {
+            return Err(format!(
+                "Realm v3 model failed: {:?}, truncated={}",
+                realm_v3.failures, realm_v3.truncated
+            ));
+        }
+        println!(
+            "RealmV3: {} worlds, {} rejected operations",
+            realm_v3.visited_worlds, realm_v3.rejected_operations
         );
     }
     Ok(())

@@ -6,10 +6,9 @@ use nexa_model::system::{
     RealmSystemConfig, RealmSystemEvent, RealmSystemSnapshot, replay_realm_runtime,
 };
 use nexa_runtime::{
-    ActivationEntry, CancelReason, HostArgs, HostCallOutcome, HostCompletion, HostPayload,
-    HostRegistry, HostTrap, ModuleLifecycle, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskTerminalReason,
-    TickBudget,
+    ActivationEntry, CancelReason, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap,
+    ModuleLifecycle, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
+    RuntimeValue, StepConfig, TaskLimits, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -59,8 +58,8 @@ fn realm_resource_sequence_matches_composite_reference_model() {
             },
         )
         .unwrap();
-    let request = realm.create_host_request(task).unwrap();
-    realm.wait_for_request(task, request).unwrap();
+    let mut pending = realm.create_host_request(task).unwrap();
+    realm.wait_for_request(task, pending.request).unwrap();
     realm
         .create_resource_token(task, RuntimeHostDomain::Render)
         .unwrap();
@@ -70,16 +69,7 @@ fn realm_resource_sequence_matches_composite_reference_model() {
     model.apply(RealmSystemEvent::AcquireToken, config).unwrap();
     assert_runtime_resources(&realm, host.pending_releases(), model);
 
-    realm
-        .completion_sender()
-        .complete(HostCompletion {
-            realm_id: realm.realm_id(),
-            module_id: module.raw().index,
-            epoch: realm.module_epoch(module).unwrap(),
-            request,
-            payload: HostPayload::I32(9),
-        })
-        .unwrap();
+    pending.ticket.complete(HostPayload::I32(9)).unwrap();
     realm
         .tick(TickBudget {
             max_tasks: 0,

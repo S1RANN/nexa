@@ -5,20 +5,29 @@ pub mod host_request {
         Created,
         Submitted,
         InFlight,
+        CompletionQueued,
         CancelRequested,
         Detached,
         Completed,
-        Discarded,
+        Failed,
+        Cancelled,
+        Abandoned,
         Released,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
     pub enum Event {
         Submit,
         Dispatch,
+        QueueSuccess,
+        QueueFailure,
         RequestCancel,
         Detach,
-        Complete,
-        Discard,
+        HostCancelled,
+        HostAbandoned,
+        DeliverSuccess,
+        DeliverFailure,
+        DeliverCancelled,
+        DeliverAbandoned,
         Release,
     }
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -28,10 +37,13 @@ pub mod host_request {
             State::Created => 0x04236676381b8f9f,
             State::Submitted => 0xb8776cdfcbe7c486,
             State::InFlight => 0x7b34ebf4bb8d4b80,
+            State::CompletionQueued => 0x5dda75129421fe8a,
             State::CancelRequested => 0xa1cd3d13b7843251,
             State::Detached => 0xcbbb25a5cfeb0d87,
             State::Completed => 0x2e26e6ea6602733e,
-            State::Discarded => 0xf803bc390bb5d12c,
+            State::Failed => 0xed2682c18ee93710,
+            State::Cancelled => 0x34172962f5d1bbd0,
+            State::Abandoned => 0xb3957ee398c7fb0b,
             State::Released => 0x3233f6ba9fe41022,
         }
     }
@@ -39,10 +51,16 @@ pub mod host_request {
         match event {
             Event::Submit => 0x1eb6f877e2a02a58,
             Event::Dispatch => 0xeceb19e789ee6d42,
+            Event::QueueSuccess => 0x62cf769043f5e3f2,
+            Event::QueueFailure => 0xd3c604dd91084477,
             Event::RequestCancel => 0x632669f8ded0d35f,
             Event::Detach => 0xe40dd23fdcfe4a57,
-            Event::Complete => 0x2a68480f7e644857,
-            Event::Discard => 0x28aff355bc18437a,
+            Event::HostCancelled => 0x2ebacf1e9f6babd5,
+            Event::HostAbandoned => 0x757ab863fcf76272,
+            Event::DeliverSuccess => 0xd7d830e4aded8804,
+            Event::DeliverFailure => 0xe15e860e1f1cb715,
+            Event::DeliverCancelled => 0xd853113a7fdd0080,
+            Event::DeliverAbandoned => 0x1ef0035758353afb,
             Event::Release => 0x40271fbd14b3855d,
         }
     }
@@ -140,69 +158,139 @@ pub mod host_request {
                     deltas: DELTAS_1,
                 })
             }
-            (State::InFlight, Event::RequestCancel) => {
+            (State::InFlight, Event::QueueSuccess) => {
                 const DELTAS_2: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::CancelRequested,
-                    transition_id: 0x6047af6eb1d8f2d2,
+                    state: State::CompletionQueued,
+                    transition_id: 0xbba12f7bc20cdc8a,
                     deltas: DELTAS_2,
                 })
             }
-            (State::CancelRequested, Event::Detach) => {
+            (State::InFlight, Event::QueueFailure) => {
                 const DELTAS_3: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Detached,
-                    transition_id: 0xf666bf418bb0d5cc,
+                    state: State::CompletionQueued,
+                    transition_id: 0x7163966522d41baf,
                     deltas: DELTAS_3,
                 })
             }
-            (State::InFlight, Event::Complete) => {
+            (State::InFlight, Event::HostCancelled) => {
                 const DELTAS_4: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Completed,
-                    transition_id: 0x0d35fb5b6f2aabdc,
+                    state: State::CompletionQueued,
+                    transition_id: 0xd6519bb92968d251,
                     deltas: DELTAS_4,
                 })
             }
-            (State::InFlight, Event::Discard) => {
+            (State::InFlight, Event::HostAbandoned) => {
                 const DELTAS_5: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Discarded,
-                    transition_id: 0x983fdb76d5f1185e,
+                    state: State::CompletionQueued,
+                    transition_id: 0xfa9481509689417e,
                     deltas: DELTAS_5,
                 })
             }
+            (State::InFlight, Event::RequestCancel) => {
+                const DELTAS_6: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::CancelRequested,
+                    transition_id: 0x6047af6eb1d8f2d2,
+                    deltas: DELTAS_6,
+                })
+            }
+            (State::CancelRequested, Event::Detach) => {
+                const DELTAS_7: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Detached,
+                    transition_id: 0xf666bf418bb0d5cc,
+                    deltas: DELTAS_7,
+                })
+            }
+            (State::CompletionQueued, Event::DeliverSuccess) => {
+                const DELTAS_8: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Completed,
+                    transition_id: 0xd117124db3b930eb,
+                    deltas: DELTAS_8,
+                })
+            }
+            (State::CompletionQueued, Event::DeliverFailure) => {
+                const DELTAS_9: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Failed,
+                    transition_id: 0xce862d912e9b54fa,
+                    deltas: DELTAS_9,
+                })
+            }
+            (State::CompletionQueued, Event::DeliverCancelled) => {
+                const DELTAS_10: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Cancelled,
+                    transition_id: 0x1919e9fe63d1e30b,
+                    deltas: DELTAS_10,
+                })
+            }
+            (State::CompletionQueued, Event::DeliverAbandoned) => {
+                const DELTAS_11: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Abandoned,
+                    transition_id: 0xdd508e9d6549263c,
+                    deltas: DELTAS_11,
+                })
+            }
             (State::Detached, Event::Release) => {
-                const DELTAS_6: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_12: &[ResourceDelta] = &[ResourceDelta {
                     resource: "release_record",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Released,
                     transition_id: 0x1eb71786dc76c9ec,
-                    deltas: DELTAS_6,
+                    deltas: DELTAS_12,
                 })
             }
             (State::Completed, Event::Release) => {
-                const DELTAS_7: &[ResourceDelta] = &[ResourceDelta {
+                const DELTAS_13: &[ResourceDelta] = &[ResourceDelta {
                     resource: "release_record",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Released,
                     transition_id: 0x3eecbeb75ae73cad,
-                    deltas: DELTAS_7,
+                    deltas: DELTAS_13,
                 })
             }
-            (State::Discarded, Event::Release) => {
-                const DELTAS_8: &[ResourceDelta] = &[ResourceDelta {
+            (State::Failed, Event::Release) => {
+                const DELTAS_14: &[ResourceDelta] = &[ResourceDelta {
                     resource: "release_record",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Released,
-                    transition_id: 0x52a02b3ac74f3d97,
-                    deltas: DELTAS_8,
+                    transition_id: 0x1bcfdb211a56dc61,
+                    deltas: DELTAS_14,
+                })
+            }
+            (State::Cancelled, Event::Release) => {
+                const DELTAS_15: &[ResourceDelta] = &[ResourceDelta {
+                    resource: "release_record",
+                    amount: -1,
+                }];
+                Ok(Outcome {
+                    state: State::Released,
+                    transition_id: 0x698c70acfd74c4ef,
+                    deltas: DELTAS_15,
+                })
+            }
+            (State::Abandoned, Event::Release) => {
+                const DELTAS_16: &[ResourceDelta] = &[ResourceDelta {
+                    resource: "release_record",
+                    amount: -1,
+                }];
+                Ok(Outcome {
+                    state: State::Released,
+                    transition_id: 0x8c6c161be5dab21a,
+                    deltas: DELTAS_16,
                 })
             }
             (state, event) => Err(TransitionError::Undefined { state, event }),
@@ -948,6 +1036,112 @@ pub mod resource_token {
                     state: State::Released,
                     transition_id: 0x1dda166f303d5d52,
                     deltas: DELTAS_3,
+                })
+            }
+            (state, event) => Err(TransitionError::Undefined { state, event }),
+        }
+    }
+}
+
+// @generated by nexa-machine; do not edit.
+pub mod retired_epoch {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum State {
+        Retired,
+        Draining,
+        Drained,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Event {
+        BeginDrain,
+        DrainCompleted,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Guard {}
+    pub const fn state_id(state: State) -> u64 {
+        match state {
+            State::Retired => 0xb71b606a12656c5d,
+            State::Draining => 0x7eb016094c163daa,
+            State::Drained => 0x9fa86c0cf7ce4ae7,
+        }
+    }
+    pub const fn event_id(event: Event) -> u64 {
+        match event {
+            Event::BeginDrain => 0x24371f3f89a93ebc,
+            Event::DrainCompleted => 0xac02537e896e79be,
+        }
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Resource {}
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+    pub enum Invariant {}
+    pub const fn invariant_id(invariant: Invariant) -> u64 {
+        match invariant {}
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct InvariantViolation {
+        pub invariant: Invariant,
+    }
+    pub fn check_invariants(
+        state: State,
+        resource: impl Fn(Resource) -> i64,
+    ) -> Result<(), InvariantViolation> {
+        let _ = &resource;
+        let terminal = matches!(state, State::Drained);
+        let _ = state;
+        let _ = terminal;
+        Ok(())
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ResourceDelta {
+        pub resource: &'static str,
+        pub amount: i64,
+    }
+    pub struct Outcome {
+        pub state: State,
+        pub transition_id: u64,
+        pub deltas: &'static [ResourceDelta],
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum TransitionError {
+        GuardRejected { guard: Guard, transition_id: u64 },
+        Undefined { state: State, event: Event },
+    }
+    impl std::fmt::Display for TransitionError {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::GuardRejected { guard, .. } => {
+                    write!(formatter, "guard `{guard:?}` rejected transition")
+                }
+                Self::Undefined { state, event } => write!(
+                    formatter,
+                    "transition is not defined for {state:?} + {event:?}"
+                ),
+            }
+        }
+    }
+    impl std::error::Error for TransitionError {}
+    pub fn apply(
+        state: State,
+        event: Event,
+        guard: impl Fn(Guard) -> bool,
+    ) -> Result<Outcome, TransitionError> {
+        let _ = &guard;
+        match (state, event) {
+            (State::Retired, Event::BeginDrain) => {
+                const DELTAS_0: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Draining,
+                    transition_id: 0xfb881e28ec4dd04a,
+                    deltas: DELTAS_0,
+                })
+            }
+            (State::Draining, Event::DrainCompleted) => {
+                const DELTAS_1: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Drained,
+                    transition_id: 0x1608c0ca9388756c,
+                    deltas: DELTAS_1,
                 })
             }
             (state, event) => Err(TransitionError::Undefined { state, event }),

@@ -3,18 +3,27 @@ machine HostRequest
 state Created initial
 state Submitted
 state InFlight
+state CompletionQueued
 state CancelRequested
 state Detached
 state Completed
-state Discarded
+state Failed
+state Cancelled
+state Abandoned
 state Released terminal
 
 event Submit
 event Dispatch
+event QueueSuccess
+event QueueFailure
 event RequestCancel
 event Detach
-event Complete
-event Discard
+event HostCancelled
+event HostAbandoned
+event DeliverSuccess
+event DeliverFailure
+event DeliverCancelled
+event DeliverAbandoned
 event Release
 
 resource release_record
@@ -24,12 +33,20 @@ invariant terminal_zero release_record
 
 transition HOST_REQUEST_CREATED_SUBMIT_SUBMITTED Created Submit Submitted delta=release_record:+1
 transition HOST_REQUEST_SUBMITTED_DISPATCH_IN_FLIGHT Submitted Dispatch InFlight
+transition HOST_REQUEST_IN_FLIGHT_QUEUE_SUCCESS InFlight QueueSuccess CompletionQueued
+transition HOST_REQUEST_IN_FLIGHT_QUEUE_FAILURE InFlight QueueFailure CompletionQueued
+transition HOST_REQUEST_IN_FLIGHT_HOST_CANCELLED InFlight HostCancelled CompletionQueued
+transition HOST_REQUEST_IN_FLIGHT_HOST_ABANDONED InFlight HostAbandoned CompletionQueued
 transition HOST_REQUEST_IN_FLIGHT_CANCEL_REQUESTED InFlight RequestCancel CancelRequested
 transition HOST_REQUEST_CANCEL_REQUESTED_DETACHED CancelRequested Detach Detached
-transition HOST_REQUEST_IN_FLIGHT_COMPLETED InFlight Complete Completed
-transition HOST_REQUEST_IN_FLIGHT_DISCARDED InFlight Discard Discarded
+transition HOST_REQUEST_QUEUED_DELIVER_SUCCESS CompletionQueued DeliverSuccess Completed
+transition HOST_REQUEST_QUEUED_DELIVER_FAILURE CompletionQueued DeliverFailure Failed
+transition HOST_REQUEST_QUEUED_DELIVER_CANCELLED CompletionQueued DeliverCancelled Cancelled
+transition HOST_REQUEST_QUEUED_DELIVER_ABANDONED CompletionQueued DeliverAbandoned Abandoned
 transition HOST_REQUEST_DETACHED_RELEASED Detached Release Released delta=release_record:-1
 transition HOST_REQUEST_COMPLETED_RELEASED Completed Release Released delta=release_record:-1
-transition HOST_REQUEST_DISCARDED_RELEASED Discarded Release Released delta=release_record:-1
+transition HOST_REQUEST_FAILED_RELEASED Failed Release Released delta=release_record:-1
+transition HOST_REQUEST_CANCELLED_RELEASED Cancelled Release Released delta=release_record:-1
+transition HOST_REQUEST_ABANDONED_RELEASED Abandoned Release Released delta=release_record:-1
 
 end

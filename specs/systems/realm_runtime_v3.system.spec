@@ -1,0 +1,37 @@
+system RealmRuntimeV3
+max_depth 14
+max_worlds 4096
+
+object ModuleEpoch 2
+object Task 2
+object Scope 2
+object HostRequest 2
+object ResourceToken 1
+object Snapshot 1
+object ReloadTransaction 1
+
+event CreateScope
+event SpawnTask
+event BeginHostRequest
+event HostSuccess
+event HostError
+event HostCancel
+event HostAbandon
+event BeginReload
+event RollbackPreCommit
+event PublishActivationSuccess
+event PublishActivationFailure
+event LateHostSuccess
+event DrainHostReleases
+
+invariant waiting_task_has_one_live_request
+invariant terminal_task_owns_no_resource
+invariant request_terminal_consumes_completion_reservation
+invariant published_root_forbids_rollback
+invariant activation_fault_keeps_candidate_root
+invariant published_root_never_restores_old_task
+invariant retired_epoch_rejects_new_task
+invariant resource_has_exactly_one_release_record
+invariant drained_epoch_has_no_root_resource_or_completion
+
+end

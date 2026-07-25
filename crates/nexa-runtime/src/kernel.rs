@@ -370,6 +370,14 @@ impl TaskRuntime {
         self.tasks.handles()
     }
 
+    pub(crate) fn task_handles_iter(&self) -> impl Iterator<Item = TaskHandle> + '_ {
+        self.tasks.handles_iter()
+    }
+
+    pub(crate) fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
+        self.tasks.count_for_epoch(module_id, epoch)
+    }
+
     pub(crate) fn record_charge(
         &mut self,
         task: TaskHandle,

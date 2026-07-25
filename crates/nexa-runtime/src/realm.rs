@@ -6,17 +6,19 @@ use nexa_bytecode::{HostImport, ValueType};
 use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
+use crate::machines::retired_epoch;
 use crate::reload::{ReloadCoordinator, ReloadTransaction, StatefulRegistry};
 use crate::scheduler::Scheduler;
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, ExecutionCharge, FuelState,
-    GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionSender, HostPayload,
+    GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionResult, HostPayload,
     HostRegistry, HostRequestError, HostRequestHandle, HostTrap, HostValue, InterpreterError,
     InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, Object, OpcodeCostTable,
-    ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostDomain, RuntimeLimits,
-    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
-    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
+    PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost,
+    RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle,
+    SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime,
+    TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -57,6 +59,56 @@ pub struct RootPublicationRecord {
     pub old_root: ModuleHandle,
     pub candidate_root: ModuleHandle,
     pub candidate_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RetiredEpochState {
+    Retired,
+    Drained,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredEpochSnapshot {
+    pub module: ModuleHandle,
+    pub epoch: u64,
+    pub state: RetiredEpochState,
+    pub task_count: usize,
+    pub request_count: usize,
+    pub token_count: usize,
+    pub snapshot_count: usize,
+    pub gc_root_count: usize,
+    pub pending_releases: usize,
+    pub pending_completions: usize,
+}
+
+#[derive(Debug)]
+struct RetiredEpochRegistry {
+    entries: VecDeque<RetiredEpochSnapshot>,
+    capacity: usize,
+}
+
+impl RetiredEpochRegistry {
+    fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn retire(&mut self, entry: RetiredEpochSnapshot) {
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            let drained = self
+                .entries
+                .iter()
+                .position(|entry| entry.state == RetiredEpochState::Drained)
+                .expect("live retired epochs cannot exhaust the module-sized registry");
+            self.entries.remove(drained);
+        }
+        self.entries.push_back(entry);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -359,6 +411,7 @@ pub struct RealmRuntime {
     tombstones: VecDeque<(TaskHandle, TaskTerminalRecord)>,
     tombstone_capacity: usize,
     next_epoch: u64,
+    retired_epochs: RetiredEpochRegistry,
     reload: ReloadCoordinator,
     host_registry: Option<Box<dyn HostRegistry>>,
     host_registry_hash: Option<StableId>,
@@ -388,6 +441,7 @@ impl RealmRuntime {
             tombstones: VecDeque::with_capacity(config.tombstone_capacity),
             tombstone_capacity: config.tombstone_capacity,
             next_epoch: 1,
+            retired_epochs: RetiredEpochRegistry::new(config.max_modules as usize),
             reload: ReloadCoordinator::default(),
             host_registry: None,
             host_registry_hash: None,
@@ -410,7 +464,14 @@ impl RealmRuntime {
         runtime_host: RuntimeHost,
         registry: Box<dyn HostRegistry>,
     ) -> Self {
+        let resource_config = config.clone();
         let mut realm = Self::with_host_registry(config, registry);
+        realm.resources = RuntimeResources::with_runtime_host(
+            resource_config.realm_id,
+            resource_config.max_host_resources,
+            resource_config.release_capacity,
+            &runtime_host,
+        );
         realm.runtime_host = Some(runtime_host);
         realm
     }
@@ -469,6 +530,11 @@ impl RealmRuntime {
     #[must_use]
     pub fn root_publications(&self) -> &VecDeque<RootPublicationRecord> {
         &self.root_publications
+    }
+
+    #[must_use]
+    pub fn retired_epochs(&self) -> &VecDeque<RetiredEpochSnapshot> {
+        &self.retired_epochs.entries
     }
 
     pub fn insert_state(
@@ -867,6 +933,7 @@ impl RealmRuntime {
         for task in paused_tasks {
             self.cancel_task(task, CancelReason::ReloadCommit)?;
         }
+        self.register_retired_epoch(old)?;
         Ok(())
     }
 
@@ -1148,7 +1215,6 @@ impl RealmRuntime {
 
     pub fn tick(&mut self, budget: TickBudget) -> Result<TickReport, RealmError> {
         let completions = self.drain_host_completions()?;
-        self.reap_retired_modules();
         let mut report = TickReport::default();
         for _ in 0..budget.max_tasks {
             let Some(task) = self.scheduler.pop_ready() else {
@@ -1165,6 +1231,7 @@ impl RealmRuntime {
             report.polled += 1;
         }
         report.releases = self.flush_releases();
+        self.reap_retired_epochs();
         if budget.collect_garbage {
             report.collection = Some(self.collect_garbage()?);
         }
@@ -1201,7 +1268,7 @@ impl RealmRuntime {
     pub fn create_host_request(
         &mut self,
         task: TaskHandle,
-    ) -> Result<HostRequestHandle, RealmError> {
+    ) -> Result<PendingHostRequest, RealmError> {
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1300,13 +1367,20 @@ impl RealmRuntime {
     }
 
     #[must_use]
-    pub fn completion_sender(&self) -> HostCompletionSender {
-        self.resources.completion_sender()
+    pub fn resource_snapshot(&self) -> crate::RuntimeResourceSnapshot {
+        self.resources.model_snapshot()
+    }
+
+    pub fn task_snapshot(&self, task: TaskHandle) -> Result<crate::TaskSnapshot, RealmError> {
+        Ok(self.tasks.task_snapshot(task)?)
     }
 
     #[must_use]
-    pub fn resource_snapshot(&self) -> crate::RuntimeResourceSnapshot {
-        self.resources.model_snapshot()
+    pub fn request_terminal_record(
+        &self,
+        request: HostRequestHandle,
+    ) -> Option<&crate::RequestTerminalRecord> {
+        self.resources.request_terminal_record(request)
     }
 
     #[must_use]
@@ -1329,48 +1403,92 @@ impl RealmRuntime {
         if self.reload.active() {
             return Ok(0);
         }
-        let epochs = self
-            .modules
-            .occupied_handles()
-            .into_iter()
-            .filter_map(|raw| self.modules.resolve(raw).ok().map(|module| module.epoch))
-            .collect::<Vec<_>>();
         let mut count = 0;
-        for epoch in epochs {
-            for (request, payload) in self.resources.drain_completions(epoch) {
-                let _ = payload;
-                if let Some(task) = self.scheduler.wake_request(request) {
-                    let snapshot = self.tasks.task_snapshot(task)?;
-                    if snapshot.module_epoch != epoch || snapshot.state != TaskState::Waiting {
-                        continue;
-                    }
-                    let execution = self.tasks.take_execution(task)?;
-                    let TaskExecution::Waiting {
-                        mut continuation,
-                        request: waiting_request,
-                        destination,
-                        expected_type,
-                    } = execution
-                    else {
-                        return Err(RealmError::TaskWaiting);
-                    };
-                    if waiting_request != request {
-                        return Err(RealmError::TaskWaiting);
-                    }
-                    let value = completion_to_runtime(payload, expected_type)?;
-                    continuation.write_resume_value(destination, expected_type, value)?;
-                    self.tasks.resume_task(task)?;
-                    self.tasks.put_execution(
-                        task,
-                        TaskExecution::Running(continuation),
-                        snapshot.fuel,
-                    )?;
-                    self.scheduler.schedule(task, snapshot.priority);
-                    count += 1;
+        for delivery in self.resources.drain_completions() {
+            let request = delivery.request;
+            if let Some(task) = self.scheduler.wake_request(request) {
+                let snapshot = self.tasks.task_snapshot(task)?;
+                if snapshot.state != TaskState::Waiting {
+                    continue;
                 }
+                match delivery.result {
+                    HostCompletionResult::Success(payload) => {
+                        let execution = self.tasks.take_execution(task)?;
+                        let TaskExecution::Waiting {
+                            mut continuation,
+                            request: waiting_request,
+                            destination,
+                            expected_type,
+                        } = execution
+                        else {
+                            return Err(RealmError::TaskWaiting);
+                        };
+                        if waiting_request != request {
+                            return Err(RealmError::TaskWaiting);
+                        }
+                        if let Ok(value) = completion_to_runtime(payload, expected_type) {
+                            continuation.write_resume_value(destination, expected_type, value)?;
+                            self.tasks.resume_task(task)?;
+                            self.tasks.put_execution(
+                                task,
+                                TaskExecution::Running(continuation),
+                                snapshot.fuel,
+                            )?;
+                            self.scheduler.schedule(task, snapshot.priority);
+                        } else {
+                            self.trap_host_task(
+                                task,
+                                snapshot,
+                                "host completion payload type mismatch".into(),
+                            )?;
+                        }
+                    }
+                    HostCompletionResult::Error(error) => {
+                        self.trap_host_task(
+                            task,
+                            snapshot,
+                            error.message.unwrap_or_else(|| {
+                                format!("host request failed with code {}", error.code)
+                            }),
+                        )?;
+                    }
+                    HostCompletionResult::Cancelled => {
+                        let _ = self.cancel_task_internal(
+                            task,
+                            CancelReason::HostCancelled,
+                            snapshot.module_epoch,
+                            self.trace_cursor(),
+                            snapshot.charge,
+                        )?;
+                    }
+                    HostCompletionResult::Abandoned => {
+                        self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
+                    }
+                }
+                count += 1;
             }
         }
         Ok(count)
+    }
+
+    fn trap_host_task(
+        &mut self,
+        task: TaskHandle,
+        snapshot: crate::TaskSnapshot,
+        message: String,
+    ) -> Result<(), RealmError> {
+        self.tasks.request_task_cancel(task)?;
+        self.tasks.reach_task_safepoint(task)?;
+        self.trap_task(
+            task,
+            snapshot.module_epoch,
+            self.trace_cursor(),
+            snapshot.charge,
+            Trap {
+                kind: TrapKind::Host,
+                message,
+            },
+        )
     }
 
     fn module_for_id(&self, module_id: u32) -> Result<&ModuleEpochRoot, RealmError> {
@@ -1514,45 +1632,97 @@ impl RealmRuntime {
     }
 
     fn flush_releases(&mut self) -> usize {
-        let releases = self.resources.drain_releases();
-        let count = releases.len();
-        if let Some(host) = &self.runtime_host {
-            host.submit_releases(releases);
+        if self.runtime_host.is_some() {
+            self.resources.transfer_releases_to_host()
+        } else {
+            self.resources.drain_releases().len()
         }
-        count
     }
 
-    fn reap_retired_modules(&mut self) {
-        let live_module_ids = self
-            .tasks
-            .task_handles()
-            .into_iter()
-            .filter_map(|task| {
-                self.tasks
-                    .task_snapshot(task)
-                    .ok()
-                    .map(|task| task.module_id)
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let retired = self
+    fn register_retired_epoch(&mut self, module: ModuleHandle) -> Result<(), RealmError> {
+        let root = self
             .modules
-            .occupied_handles_iter()
-            .filter(|raw| {
-                self.modules.resolve(*raw).is_ok_and(|module| {
-                    module.lifecycle == ModuleLifecycle::Retired
-                        && !live_module_ids.contains(&module.module_id)
-                })
-            })
-            .collect::<Vec<_>>();
-        for module in retired {
-            let _ = self.modules.release(module);
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let resources = self.resources.epoch_counts(root.module_id, root.epoch);
+        let task_count = self.tasks.count_for_epoch(root.module_id, root.epoch);
+        self.retired_epochs.retire(RetiredEpochSnapshot {
+            module,
+            epoch: root.epoch,
+            state: RetiredEpochState::Retired,
+            task_count,
+            request_count: resources.requests,
+            token_count: resources.tokens,
+            snapshot_count: resources.snapshots,
+            gc_root_count: root.globals.len()
+                + root.state.gc_roots().len()
+                + root.staging_roots.len(),
+            pending_releases: resources.pending_releases,
+            pending_completions: resources.pending_completions,
+        });
+        Ok(())
+    }
+
+    fn reap_retired_epochs(&mut self) {
+        for index in 0..self.retired_epochs.entries.len() {
+            let entry = self.retired_epochs.entries[index];
+            if entry.state == RetiredEpochState::Drained {
+                continue;
+            }
+            let Ok(root) = self.modules.resolve(entry.module.raw()) else {
+                self.retired_epochs.entries[index].state = RetiredEpochState::Drained;
+                continue;
+            };
+            let module_id = root.module_id;
+            let epoch = root.epoch;
+            let task_count = self.tasks.count_for_epoch(module_id, epoch);
+            let resources = self.resources.epoch_counts(module_id, epoch);
+            let root_count =
+                root.globals.len() + root.state.gc_roots().len() + root.staging_roots.len();
+            let snapshot = &mut self.retired_epochs.entries[index];
+            snapshot.task_count = task_count;
+            snapshot.request_count = resources.requests;
+            snapshot.token_count = resources.tokens;
+            snapshot.snapshot_count = resources.snapshots;
+            snapshot.gc_root_count = root_count;
+            snapshot.pending_releases = resources.pending_releases;
+            snapshot.pending_completions = resources.pending_completions;
+            if task_count == 0
+                && resources.requests == 0
+                && resources.tokens == 0
+                && resources.snapshots == 0
+                && resources.pending_releases == 0
+                && resources.pending_completions == 0
+            {
+                if let Ok(root) = self.modules.resolve_mut(entry.module.raw()) {
+                    root.globals.clear();
+                    root.state = StatefulRegistry::new(root.module_id);
+                    root.staging_roots.clear();
+                }
+                let _ = self.modules.release(entry.module.raw());
+                let draining = retired_epoch::apply(
+                    retired_epoch::State::Retired,
+                    retired_epoch::Event::BeginDrain,
+                    |_| true,
+                )
+                .expect("retired epoch drain transition exists");
+                let drained = retired_epoch::apply(
+                    draining.state,
+                    retired_epoch::Event::DrainCompleted,
+                    |_| true,
+                )
+                .expect("retired epoch completion transition exists");
+                debug_assert_eq!(drained.state, retired_epoch::State::Drained);
+                snapshot.gc_root_count = 0;
+                snapshot.state = RetiredEpochState::Drained;
+            }
         }
     }
 }
 
 impl Drop for RealmRuntime {
     fn drop(&mut self) {
-        for task in self.tasks.task_handles() {
+        for task in self.tasks.task_handles_iter() {
             let _ = self.resources.cleanup_task(task, true);
         }
         self.flush_releases();
@@ -1603,8 +1773,8 @@ mod tests {
 
     use super::{PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime};
     use crate::{
-        HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry, HostTrap,
-        ResourceContext, RuntimeHost, RuntimeValue, StepConfig, TaskLimits, TickBudget,
+        HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, ResourceContext,
+        RuntimeHost, RuntimeValue, StepConfig, TaskLimits, TickBudget,
     };
 
     fn module(yields: bool) -> (nexa_verifier::VerifiedModule, StableId, StableId) {
@@ -1631,6 +1801,74 @@ mod tests {
             host,
             schema,
         )
+    }
+
+    fn reloadable_async_module(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32],
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::Return { source: 0 });
+
+        let mut activation = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        activation
+            .effect(FunctionEffect::Immediate)
+            .emit(Instruction::ReturnVoid);
+
+        let mut async_task = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        async_task
+            .effect(FunctionEffect::Task)
+            .emit(Instruction::HostCall {
+                import: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+
+        let mut yielding_task = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32],
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        yielding_task
+            .effect(FunctionEffect::Task)
+            .emit(Instruction::Yield)
+            .emit(Instruction::Return { source: 0 });
+
+        let mut module = ModuleBuilder::new();
+        module.metadata(host, schema);
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("Host::pending"),
+            parameters: Vec::new(),
+            result: Some(ValueType::I32),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+        });
+        module.function(migration.finish().unwrap());
+        module.function(activation.finish().unwrap());
+        module.function(async_task.finish().unwrap());
+        module.function(yielding_task.finish().unwrap());
+        verify(module.finish(), VerifierLimits::default()).unwrap()
     }
 
     #[test]
@@ -1667,7 +1905,7 @@ mod tests {
 
     struct AsyncRegistry {
         hash: StableId,
-        request: Arc<Mutex<Option<crate::HostRequestHandle>>>,
+        request: Arc<Mutex<Option<crate::PendingHostRequest>>>,
     }
 
     impl HostRegistry for AsyncRegistry {
@@ -1684,13 +1922,14 @@ mod tests {
             if id != 0 || !args.is_empty() {
                 return Err(HostTrap::Arity);
             }
-            let request = context
+            let pending = context
                 .create_request()
                 .map_err(|error| HostTrap::Host(error.to_string()))?;
+            let request = pending.request;
             *self
                 .request
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
             Ok(HostCallOutcome::Pending(request))
         }
     }
@@ -1757,20 +1996,12 @@ mod tests {
             realm.poll_task(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
-        let request = request
+        let mut pending = request
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
             .expect("registry created request");
-        realm
-            .completion_sender()
-            .complete(HostCompletion {
-                realm_id: realm.realm_id(),
-                module_id: module.raw().index,
-                epoch: realm.module_epoch(module).unwrap(),
-                request,
-                payload: HostPayload::I32(42),
-            })
-            .unwrap();
+        pending.ticket.complete(HostPayload::I32(42)).unwrap();
         realm
             .tick(TickBudget {
                 max_tasks: 1,
@@ -1785,6 +2016,137 @@ mod tests {
             )))
         ));
         assert_eq!(runtime_host.pending_releases(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn three_epochs_retain_late_completion_and_release_backlog_until_drain() {
+        let host_hash = StableId::from_name("three-epoch-host");
+        let schema = StableId::from_name("three-epoch-schema");
+        let request = Arc::new(Mutex::new(None));
+        let runtime_host = RuntimeHost::new(8);
+        let mut realm = RealmRuntime::with_runtime_host(
+            RealmConfig {
+                max_modules: 3,
+                max_host_resources: 8,
+                release_capacity: 8,
+                ..RealmConfig::default()
+            },
+            runtime_host.clone(),
+            Box::new(AsyncRegistry {
+                hash: host_hash,
+                request: Arc::clone(&request),
+            }),
+        );
+        let epoch_one = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let waiting = realm
+            .call(
+                epoch_one,
+                2,
+                &[],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            realm.poll_task(waiting, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        ));
+        let mut late = request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap();
+
+        let epoch_two = realm
+            .prepare_reload(
+                epoch_one,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm
+            .commit_reload(super::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 32,
+            })
+            .unwrap();
+
+        let token_owner = realm
+            .call(
+                epoch_two,
+                3,
+                &[RuntimeValue::I32(7)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            realm.poll_task(token_owner, 32).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        ));
+        realm
+            .create_resource_token(token_owner, crate::RuntimeHostDomain::Render)
+            .unwrap();
+
+        let epoch_three = realm
+            .prepare_reload(
+                epoch_two,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(0, &[RuntimeValue::I32(2)]).unwrap();
+        realm
+            .commit_reload(super::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 32,
+            })
+            .unwrap();
+
+        assert_eq!(realm.active_root(), Some(epoch_three));
+        assert_eq!(realm.retired_epochs().len(), 2);
+        assert_eq!(realm.retired_epochs()[0].pending_completions, 1);
+        assert_eq!(realm.retired_epochs()[1].pending_releases, 1);
+
+        late.ticket.complete(HostPayload::I32(99)).unwrap();
+        realm
+            .tick(TickBudget {
+                max_tasks: 0,
+                frame_fuel_budget: 0,
+                collect_garbage: false,
+            })
+            .unwrap();
+        assert!(realm.retired_epochs().iter().all(|entry| {
+            entry.state == super::RetiredEpochState::Drained
+                && entry.pending_completions == 0
+                && entry.pending_releases == 0
+        }));
+        assert_eq!(runtime_host.pending_releases(), 2);
     }
 
     #[test]
@@ -1864,24 +2226,16 @@ mod tests {
             realm.poll_task(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         ));
-        let request = request
+        let mut pending = request
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
             .unwrap();
         realm
             .prepare_reload(old, candidate, host_hash, schema)
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm
-            .completion_sender()
-            .complete(HostCompletion {
-                realm_id: realm.realm_id(),
-                module_id: old.raw().index,
-                epoch: realm.module_epoch(old).unwrap(),
-                request,
-                payload: HostPayload::I32(99),
-            })
-            .unwrap();
+        pending.ticket.complete(HostPayload::I32(99)).unwrap();
         realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
         realm.rollback_reload().unwrap();
         realm

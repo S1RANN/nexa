@@ -3,21 +3,15 @@ fn host_request() {
     let (mut realm, module, _, _) =
         super::support::realm_with([nexa_bytecode::Instruction::Return { source: 0 }]);
     let (scope, task) = super::support::spawn(&mut realm, module);
-    let request = realm.create_host_request(task).unwrap();
-    realm.wait_for_request(task, request).unwrap();
+    let mut pending = realm.create_host_request(task).unwrap();
+    realm.wait_for_request(task, pending.request).unwrap();
     assert_eq!(
         realm.poll_task(task, 16).unwrap(),
         nexa_runtime::PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
     );
-    realm
-        .completion_sender()
-        .complete(nexa_runtime::HostCompletion {
-            realm_id: realm.realm_id(),
-            module_id: module.raw().index,
-            epoch: realm.module_epoch(module).unwrap(),
-            request,
-            payload: nexa_runtime::HostPayload::I32(9),
-        })
+    pending
+        .ticket
+        .complete(nexa_runtime::HostPayload::I32(9))
         .unwrap();
     let report = realm
         .tick(nexa_runtime::TickBudget {
