@@ -201,6 +201,10 @@ impl ScopeManager {
         self.scopes.reserved_capacity()
     }
 
+    pub(crate) fn live_len(&self) -> usize {
+        self.scopes.occupied_len()
+    }
+
     fn apply(
         &mut self,
         trace: &mut RuntimeTrace,

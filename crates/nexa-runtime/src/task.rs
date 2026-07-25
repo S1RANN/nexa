@@ -506,6 +506,20 @@ impl TaskManager {
         self.tasks.reserved_capacity()
     }
 
+    pub(crate) fn ledger_counts(&self) -> (usize, usize) {
+        let tasks = self.tasks.occupied_len();
+        let continuations = self
+            .tasks
+            .occupied_handles_iter()
+            .filter(|handle| {
+                self.tasks
+                    .resolve(*handle)
+                    .is_ok_and(|task| task.execution.is_some())
+            })
+            .count();
+        (tasks, continuations)
+    }
+
     pub(crate) fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
         self.epoch_counts
             .get(&(module_id, epoch))

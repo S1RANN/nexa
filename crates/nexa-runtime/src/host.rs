@@ -379,12 +379,14 @@ impl RuntimeHost {
             return Err(RuntimeHostCloseError::PendingReleases);
         }
         lifecycle.state = RuntimeHostState::Closed;
-        Ok(RuntimeHostCloseStatus {
+        let status = RuntimeHostCloseStatus {
             state: RuntimeHostState::Closed,
             live_realms: 0,
             pending_completions,
             pending_releases,
-        })
+        };
+        debug_assert!(self.resource_ledger().is_zero());
+        Ok(status)
     }
 
     #[must_use]
@@ -400,6 +402,15 @@ impl RuntimeHost {
             live_realms: lifecycle.live_realms,
             pending_completions: self.pending_completions(),
             pending_releases: self.pending_releases(),
+        }
+    }
+
+    #[must_use]
+    pub fn resource_ledger(&self) -> crate::RuntimeResourceLedger {
+        crate::RuntimeResourceLedger {
+            completion_reservations: crate::ledger::count(self.pending_completions()),
+            queued_releases: crate::ledger::count(self.pending_releases()),
+            ..crate::RuntimeResourceLedger::default()
         }
     }
 
@@ -2219,6 +2230,24 @@ impl RuntimeResources {
             release_reservations: self.releases.reserved,
             completion_reservations,
             completion_queued,
+        }
+    }
+
+    #[must_use]
+    pub fn resource_ledger(&self) -> crate::RuntimeResourceLedger {
+        let snapshot = self.model_snapshot();
+        crate::RuntimeResourceLedger {
+            requests: crate::ledger::count(snapshot.requests),
+            completion_reservations: crate::ledger::count(
+                snapshot
+                    .completion_reservations
+                    .saturating_add(snapshot.completion_queued),
+            ),
+            tokens: crate::ledger::count(snapshot.tokens),
+            snapshots: crate::ledger::count(snapshot.snapshots),
+            release_reservations: crate::ledger::count(snapshot.release_reservations),
+            queued_releases: crate::ledger::count(snapshot.release_records),
+            ..crate::RuntimeResourceLedger::default()
         }
     }
 

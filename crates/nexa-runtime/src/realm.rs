@@ -1545,6 +1545,67 @@ impl RealmRuntime {
         self.resources.model_snapshot()
     }
 
+    #[must_use]
+    pub fn resource_ledger(&self) -> crate::RuntimeResourceLedger {
+        let (tasks, scopes, continuations) = self.tasks.ledger_counts();
+        let mut ledger = self.resources.resource_ledger();
+        ledger.tasks = crate::ledger::count(tasks);
+        ledger.scopes = crate::ledger::count(scopes);
+        ledger.continuations = crate::ledger::count(continuations);
+        ledger.scheduler_tokens = crate::ledger::count(self.scheduler.token_count());
+        ledger.heap_objects = crate::ledger::count(self.heap.live_len());
+        ledger.state_objects = crate::ledger::count(
+            self.modules
+                .occupied_handles_iter()
+                .filter_map(|handle| self.modules.resolve(handle).ok())
+                .map(|root| root.state.object_count())
+                .sum(),
+        );
+        ledger.retired_epochs = crate::ledger::count(
+            self.retired_epochs
+                .entries
+                .iter()
+                .filter(|entry| entry.state != RetiredEpochState::Drained)
+                .count(),
+        );
+        ledger
+    }
+
+    #[must_use]
+    pub fn resource_invariants_hold(&self) -> bool {
+        let terminal_tasks_have_no_continuation = self
+            .tombstones
+            .iter()
+            .all(|(task, _)| self.tasks.execution(*task).is_err());
+        let waiting_tasks_have_one_request = self.tasks.task_handles_iter().all(|task| {
+            let Ok(snapshot) = self.tasks.task_snapshot(task) else {
+                return false;
+            };
+            if snapshot.state != TaskState::Waiting {
+                return true;
+            }
+            let Ok(TaskExecution::Waiting { request, .. }) = self.tasks.execution(task) else {
+                return false;
+            };
+            self.resources.ownership(task).is_some_and(|resources| {
+                resources.requests.len() == 1 && resources.requests.contains(request)
+            })
+        });
+        let drained_epochs_are_empty = self.retired_epochs.entries.iter().all(|entry| {
+            entry.state != RetiredEpochState::Drained
+                || (entry.task_count == 0
+                    && entry.request_count == 0
+                    && entry.token_count == 0
+                    && entry.snapshot_count == 0
+                    && entry.gc_root_count == 0
+                    && entry.pending_releases == 0
+                    && entry.pending_completions == 0)
+        });
+        terminal_tasks_have_no_continuation
+            && waiting_tasks_have_one_request
+            && drained_epochs_are_empty
+    }
+
     pub fn task_snapshot(&self, task: TaskHandle) -> Result<crate::TaskSnapshot, RealmError> {
         Ok(self.tasks.task_snapshot(task)?)
     }
@@ -3326,6 +3387,16 @@ mod tests {
             realm.poll_task(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
+        let waiting_ledger = realm.resource_ledger();
+        assert_eq!(waiting_ledger.tasks, 1);
+        assert_eq!(waiting_ledger.scopes, 1);
+        assert_eq!(waiting_ledger.continuations, 1);
+        assert_eq!(waiting_ledger.scheduler_tokens, 1);
+        assert_eq!(waiting_ledger.requests, 1);
+        assert_eq!(waiting_ledger.completion_reservations, 1);
+        assert_eq!(waiting_ledger.release_reservations, 1);
+        assert!(realm.resource_invariants_hold());
+        assert_eq!(runtime_host.resource_ledger().completion_reservations, 1);
         assert_eq!(runtime_host.pending_completions(), 1);
         let mut pending = request
             .lock()
@@ -3347,8 +3418,17 @@ mod tests {
                 RuntimeValue::I32(42)
             )))
         ));
+        let terminal_ledger = realm.resource_ledger();
+        assert_eq!(terminal_ledger.tasks, 0);
+        assert_eq!(terminal_ledger.continuations, 0);
+        assert_eq!(terminal_ledger.scheduler_tokens, 0);
+        assert_eq!(terminal_ledger.requests, 0);
+        assert_eq!(terminal_ledger.completion_reservations, 0);
+        assert_eq!(terminal_ledger.release_reservations, 0);
+        assert!(realm.resource_invariants_hold());
         assert_eq!(runtime_host.pending_completions(), 0);
         assert_eq!(runtime_host.pending_releases(), 1);
+        assert_eq!(runtime_host.resource_ledger().queued_releases, 1);
         assert_eq!(
             runtime_host.begin_close().state,
             crate::RuntimeHostState::Closing
@@ -3365,6 +3445,7 @@ mod tests {
         assert_eq!(runtime_host.drain_releases().len(), 1);
         runtime_host.try_finish_close().unwrap();
         assert_eq!(runtime_host.state(), crate::RuntimeHostState::Closed);
+        assert!(runtime_host.resource_ledger().is_zero());
         assert!(matches!(
             RealmRuntime::hosted(
                 RealmConfig::default(),
@@ -3507,7 +3588,93 @@ mod tests {
                 && entry.pending_completions == 0
                 && entry.pending_releases == 0
         }));
+        assert_eq!(realm.resource_ledger().retired_epochs, 0);
+        assert!(realm.resource_invariants_hold());
         assert_eq!(runtime_host.pending_releases(), 2);
+    }
+
+    #[test]
+    fn ledger_tracks_token_snapshot_heap_and_state_lifetimes() {
+        struct LedgerHost(StableId);
+
+        impl HostRegistry for LedgerHost {
+            fn interface_hash(&self) -> Option<StableId> {
+                Some(self.0)
+            }
+
+            fn call(
+                &mut self,
+                _id: u32,
+                _context: &mut ResourceContext<'_>,
+                _args: HostArgs<'_>,
+            ) -> Result<HostCallOutcome, HostTrap> {
+                Err(HostTrap::UnknownFunction(0))
+            }
+        }
+
+        let (verified, host_hash, schema) = module(false);
+        let runtime_host = RuntimeHost::new(8);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            runtime_host.clone(),
+            Box::new(LedgerHost(host_hash)),
+        )
+        .unwrap();
+        let module = realm.load_module(verified, host_hash, schema).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(7)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        realm
+            .create_resource_token(task, RuntimeHostDomain::Render)
+            .unwrap();
+        realm.create_snapshot(task, Arc::from([1, 2, 3])).unwrap();
+        realm.allocate(Object::String("ledger".to_owned())).unwrap();
+        realm
+            .insert_state(
+                module,
+                StableId::from_name("ledger-state"),
+                crate::StateValue::I32(1),
+            )
+            .unwrap();
+        let live = realm.resource_ledger();
+        assert_eq!(live.tokens, 1);
+        assert_eq!(live.snapshots, 1);
+        assert_eq!(live.release_reservations, 2);
+        assert_eq!(live.heap_objects, 1);
+        assert_eq!(live.state_objects, 1);
+
+        assert!(matches!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Completed(Some(RuntimeValue::I32(7)))
+        ));
+        let terminal = realm.resource_ledger();
+        assert_eq!(terminal.tasks, 0);
+        assert_eq!(terminal.continuations, 0);
+        assert_eq!(terminal.tokens, 0);
+        assert_eq!(terminal.snapshots, 0);
+        assert_eq!(terminal.release_reservations, 0);
+        assert_eq!(terminal.heap_objects, 1);
+        assert_eq!(terminal.state_objects, 1);
+        assert!(realm.resource_invariants_hold());
+
+        drop(realm);
+        assert_eq!(runtime_host.resource_ledger().queued_releases, 2);
+        assert_eq!(runtime_host.drain_releases().len(), 2);
+        let _ = runtime_host.begin_close();
+        runtime_host.try_finish_close().unwrap();
+        assert!(runtime_host.resource_ledger().is_zero());
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod heap;
 mod host;
 mod interpreter;
 mod kernel;
+mod ledger;
 mod metrics;
 #[cfg(any(test, feature = "model-adapter"))]
 pub mod model_adapter;
@@ -27,6 +28,7 @@ pub use allocation::{
     set_migration_allocation_observer,
 };
 pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
+pub use ledger::RuntimeResourceLedger;
 pub use nexa_core::StableId;
 
 #[cfg(test)]

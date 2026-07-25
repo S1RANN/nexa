@@ -128,6 +128,11 @@ impl Scheduler {
     pub(crate) fn reserved_capacities(&self) -> (usize, usize) {
         (self.ready.capacity(), self.waiting.capacity())
     }
+
+    #[must_use]
+    pub(crate) fn token_count(&self) -> usize {
+        self.ready.len().saturating_add(self.waiting.len())
+    }
 }
 
 #[cfg(test)]

@@ -349,6 +349,11 @@ impl TaskRuntime {
         )
     }
 
+    pub(crate) fn ledger_counts(&self) -> (usize, usize, usize) {
+        let (tasks, continuations) = self.tasks.ledger_counts();
+        (tasks, self.scopes.live_len(), continuations)
+    }
+
     pub fn inject_failure_once(&mut self, point: FailurePoint) {
         self.injected_failure = Some(point);
     }

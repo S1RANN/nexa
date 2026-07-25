@@ -179,6 +179,11 @@ impl StatefulRegistry {
         }
     }
 
+    #[must_use]
+    pub(crate) fn object_count(&self) -> usize {
+        self.objects.len()
+    }
+
     pub fn insert(
         &mut self,
         stable_id: StableId,
