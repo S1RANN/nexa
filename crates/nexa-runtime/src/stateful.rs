@@ -824,6 +824,92 @@ fn reserve<T>(capacity: usize, error: MigrationLimitError) -> Result<Vec<T>, Mig
     Ok(values)
 }
 
+#[derive(Clone, Copy)]
+struct DeterministicMigrationHasher {
+    value: u64,
+}
+
+impl DeterministicMigrationHasher {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    const fn new() -> Self {
+        Self {
+            value: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.value ^= u64::from(*byte);
+            self.value = self.value.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn write_u8(&mut self, value: u8) {
+        self.write(&[value]);
+    }
+
+    fn write_u32(&mut self, value: u32) {
+        self.write(&value.to_le_bytes());
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.write(&value.to_le_bytes());
+    }
+}
+
+fn migration_registry_hash(
+    mut hash: DeterministicMigrationHasher,
+    registry: &StatefulRegistry,
+) -> StableId {
+    hash.write_u8(0x53);
+    hash.write_u64(registry.domain.get());
+    hash.write_u64(u64::try_from(registry.objects.len()).unwrap_or(u64::MAX));
+    for slot in &registry.objects {
+        hash.write_u64(slot.stable_id.0);
+        hash.write_u64(slot.type_id.0);
+        hash.write_u32(slot.version);
+        hash.write_u32(slot.generation);
+        if let Some(value) = &slot.scalar {
+            hash.write_u8(1);
+            hash_state_value(&mut hash, value);
+        } else {
+            hash.write_u8(0);
+            let fields = registry.object_fields(slot);
+            hash.write_u64(u64::try_from(fields.len()).unwrap_or(u64::MAX));
+            for field in fields {
+                hash.write_u64(field.field_id.0);
+                hash_state_value(&mut hash, &field.value);
+            }
+        }
+    }
+    StableId(hash.value)
+}
+
+fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue) {
+    match value {
+        StateValue::I32(value) => {
+            hash.write_u8(1);
+            hash.write(&value.to_le_bytes());
+        }
+        StateValue::Bool(value) => {
+            hash.write_u8(2);
+            hash.write_u8(u8::from(*value));
+        }
+        StateValue::Ref(_) => {
+            // GC slot coordinates are deliberately excluded from the stable migration identity.
+            hash.write_u8(3);
+        }
+        StateValue::Handle(handle) => {
+            hash.write_u8(4);
+            hash.write_u64(handle.domain.get());
+            hash.write_u64(handle.stable_id.0);
+            hash.write_u32(handle.generation);
+        }
+        StateValue::Object(_) => unreachable!("nested state objects are rejected at admission"),
+    }
+}
+
 pub(crate) struct MigrationContext {
     old: Arc<StatefulRegistry>,
     arena: MigrationArena,
@@ -831,6 +917,7 @@ pub(crate) struct MigrationContext {
     schema: nexa_bytecode::StateSchema,
     flags: u8,
     invalid: Option<ReloadError>,
+    operation_hash: DeterministicMigrationHasher,
 }
 
 const SCHEMA_UNCHANGED: u8 = 1 << 0;
@@ -856,6 +943,9 @@ impl MigrationContext {
             AllocationBoundary::End,
         );
         let arena = arena?;
+        let mut operation_hash = DeterministicMigrationHasher::new();
+        operation_hash.write_u8(0x4d);
+        operation_hash.write_u64(domain.get());
         Ok(Self {
             old: old.into(),
             arena,
@@ -863,6 +953,7 @@ impl MigrationContext {
             schema,
             flags: u8::from(schema_unchanged) * SCHEMA_UNCHANGED,
             invalid: None,
+            operation_hash,
         })
     }
 
@@ -911,7 +1002,11 @@ impl MigrationContext {
                 self.old
                     .validate_handles()
                     .map_err(|_| ReloadError::InvalidStateHandle)?;
-                return Ok(MigrationOutput::Shared(self.old));
+                let hash = migration_registry_hash(self.operation_hash, &self.old);
+                return Ok(MigrationOutput::Shared {
+                    registry: self.old,
+                    hash,
+                });
             }
             return Err(ReloadError::MigrationNoOutput);
         }
@@ -937,7 +1032,8 @@ impl MigrationContext {
         registry
             .validate_handles()
             .map_err(|_| ReloadError::InvalidStateHandle)?;
-        Ok(MigrationOutput::Owned(registry))
+        let hash = migration_registry_hash(self.operation_hash, &registry);
+        Ok(MigrationOutput::Owned { registry, hash })
     }
 
     fn observe_opcode(&mut self, phase: MigrationAllocationPhase) -> MigrationObservation {
@@ -998,8 +1094,14 @@ impl MigrationContext {
 }
 
 pub(crate) enum MigrationOutput {
-    Owned(StatefulRegistry),
-    Shared(Arc<StatefulRegistry>),
+    Owned {
+        registry: StatefulRegistry,
+        hash: StableId,
+    },
+    Shared {
+        registry: Arc<StatefulRegistry>,
+        hash: StableId,
+    },
 }
 
 impl InterpreterMigration for MigrationContext {
@@ -1244,6 +1346,8 @@ impl InterpreterMigration for MigrationContext {
         }
         self.arena
             .insert_forwarding(forwarding_index, stable_id, Some(stable_id));
+        self.operation_hash.write_u8(1);
+        self.operation_hash.write_u64(stable_id.0);
         self.arena.rebuild_caches();
         self.set_flag(TOUCHED);
         Ok(())
@@ -1278,6 +1382,9 @@ impl InterpreterMigration for MigrationContext {
         self.arena.objects[target_index].generation = replacement_generation;
         self.arena
             .insert_forwarding(forwarding_index, old_id, Some(target_id));
+        self.operation_hash.write_u8(2);
+        self.operation_hash.write_u64(old_id.0);
+        self.operation_hash.write_u64(target_id.0);
         self.set_flag(TOUCHED);
         Ok(())
     }
@@ -1293,6 +1400,8 @@ impl InterpreterMigration for MigrationContext {
         self.precheck_forwarding()?;
         self.arena
             .insert_forwarding(forwarding_index, stable_id, None);
+        self.operation_hash.write_u8(3);
+        self.operation_hash.write_u64(stable_id.0);
         self.set_flag(TOUCHED);
         Ok(())
     }
@@ -1735,6 +1844,62 @@ mod tests {
     }
 
     #[test]
+    fn migration_hash_is_stable_for_one_hundred_identical_runs() {
+        fn run_once() -> StableId {
+            let type_id = StableId::from_name("MigrationHash");
+            let field_id = StableId::from_name("MigrationHash::field");
+            let preserved_id = StableId::from_name("MigrationHash::preserved");
+            let replaced_id = StableId::from_name("MigrationHash::replaced");
+            let deleted_id = StableId::from_name("MigrationHash::deleted");
+            let target_id = StableId::from_name("MigrationHash::target");
+            let mut old = StatefulRegistry::new(StatefulDomainId::new(7));
+            old.insert(
+                preserved_id,
+                StateValue::Object(StateObject {
+                    type_id,
+                    version: 1,
+                    fields: BTreeMap::from([(field_id, StateValue::I32(9))]),
+                }),
+            )
+            .unwrap();
+            old.insert(replaced_id, StateValue::I32(2)).unwrap();
+            old.insert(deleted_id, StateValue::Bool(true)).unwrap();
+            let mut migration = MigrationContext::new(
+                old,
+                StatefulDomainId::new(7),
+                schema(type_id, &[(field_id, ValueType::I32)]),
+                false,
+                limits(),
+            )
+            .unwrap();
+            let target = migration.new_create(target_id, type_id).unwrap();
+            migration
+                .new_set(target, field_id, RuntimeValue::I32(11))
+                .unwrap();
+            let before_forwarding = migration.operation_hash.value;
+            migration.preserve(preserved_id).unwrap();
+            let after_preserve = migration.operation_hash.value;
+            migration.replace(replaced_id, target).unwrap();
+            let after_replace = migration.operation_hash.value;
+            migration.delete(deleted_id).unwrap();
+            let after_delete = migration.operation_hash.value;
+            assert_ne!(before_forwarding, after_preserve);
+            assert_ne!(after_preserve, after_replace);
+            assert_ne!(after_replace, after_delete);
+            migration.finish_staging().unwrap();
+            let MigrationOutput::Owned { hash, .. } = migration.finish().unwrap() else {
+                panic!("the migrated graph is owned");
+            };
+            hash
+        }
+
+        let expected = run_once();
+        for _ in 1..100 {
+            assert_eq!(run_once(), expected);
+        }
+    }
+
+    #[test]
     fn object_capacity_accepts_limit_minus_one_and_limit_then_rejects_limit_plus_one() {
         let type_id = StableId::from_name("ObjectLimit");
         let ids = [
@@ -1953,7 +2118,7 @@ mod tests {
         let objects_pointer = migration.arena.objects.as_ptr();
         let fields_pointer = migration.arena.fields.as_ptr();
         let payload_pointer = migration.arena.payload.as_ptr();
-        let MigrationOutput::Owned(registry) = migration.finish().unwrap() else {
+        let MigrationOutput::Owned { registry, .. } = migration.finish().unwrap() else {
             panic!("a touched migration owns its completed registry");
         };
         assert_eq!(registry.objects.as_ptr(), objects_pointer);

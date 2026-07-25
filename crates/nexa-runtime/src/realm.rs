@@ -448,6 +448,7 @@ pub struct RealmRuntime {
     reload: ReloadCoordinator,
     migration_limits: MigrationLimits,
     last_migration_usage_report: Option<crate::MigrationUsageReport>,
+    last_migration_hash: Option<StableId>,
     reload_completion_capacity: usize,
     reload_completion_stats: ReloadCompletionStats,
     host_registry: Option<Box<dyn HostRegistry>>,
@@ -482,6 +483,7 @@ impl RealmRuntime {
             reload: ReloadCoordinator::default(),
             migration_limits: config.migration_limits,
             last_migration_usage_report: None,
+            last_migration_hash: None,
             reload_completion_capacity: config.max_host_resources as usize,
             reload_completion_stats: ReloadCompletionStats::default(),
             host_registry: None,
@@ -640,6 +642,11 @@ impl RealmRuntime {
     #[must_use]
     pub const fn last_migration_usage_report(&self) -> Option<crate::MigrationUsageReport> {
         self.last_migration_usage_report
+    }
+
+    #[must_use]
+    pub const fn last_migration_hash(&self) -> Option<StableId> {
+        self.last_migration_hash
     }
 
     pub fn load_module(
@@ -803,6 +810,7 @@ impl RealmRuntime {
         &mut self,
         arguments: &[RuntimeValue],
     ) -> Result<Option<RuntimeValue>, RealmError> {
+        self.last_migration_hash = None;
         self.buffer_reload_completions()?;
         let candidate_handle = self.reload.transaction()?.candidate;
         let candidate = self
@@ -868,10 +876,13 @@ impl RealmRuntime {
         };
         match execution {
             InterpreterOutcome::Returned { value, .. } => {
-                let migrated = match migration.finish()? {
-                    crate::stateful::MigrationOutput::Owned(registry) => Arc::new(registry),
-                    crate::stateful::MigrationOutput::Shared(registry) => registry,
+                let (migrated, hash) = match migration.finish()? {
+                    crate::stateful::MigrationOutput::Owned { registry, hash } => {
+                        (Arc::new(registry), hash)
+                    }
+                    crate::stateful::MigrationOutput::Shared { registry, hash } => (registry, hash),
                 };
+                self.last_migration_hash = Some(hash);
                 self.modules
                     .resolve_mut(candidate_handle.raw())
                     .map_err(RealmError::ModuleHandle)?
@@ -4030,6 +4041,7 @@ mod tests {
                 max_call_depth_used: 1,
             })
         );
+        assert!(realm.last_migration_hash().is_some());
         realm.commit_reload(&[], 64).unwrap();
         let handle = realm
             .state_handles(candidate)
