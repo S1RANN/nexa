@@ -1,7 +1,9 @@
 interface GameHost {
+    opaque ActionLock;
+    opaque EnemyView;
     sync fn update(entity: i32, delta: i32) -> i32;
-    request fn animation(entity: i32) -> host_request;
-    sync fn action_lock(entity: i32) -> resource_token;
-    sync fn world_snapshot() -> snapshot;
-    export Update;
+    request fn animation(entity: i32) -> request<i32>;
+    sync fn action_lock(entity: i32) -> token<ActionLock>;
+    sync fn world_snapshot() -> snapshot<EnemyView>;
+    export Update(entity: i32) -> i32;
 }

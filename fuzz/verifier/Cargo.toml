@@ -1,0 +1,20 @@
+[package]
+name = "nexa-verifier-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexa-bytecode = { path = "../../crates/nexa-bytecode" }
+nexa-verifier = { path = "../../crates/nexa-verifier" }
+
+[[bin]]
+name = "verifier"
+path = "fuzz_targets/verifier.rs"
+test = false
+doc = false
+bench = false

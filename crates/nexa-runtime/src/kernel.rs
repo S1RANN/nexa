@@ -286,6 +286,22 @@ impl TaskRuntime {
         Ok(self.tasks.snapshot(task)?)
     }
 
+    pub(crate) fn execution_checkpoint(
+        &self,
+        task: TaskHandle,
+    ) -> Result<TaskExecution, RuntimeError> {
+        Ok(self.tasks.execution(task)?.clone())
+    }
+
+    pub(crate) fn restore_task_checkpoint(
+        &mut self,
+        task: TaskHandle,
+        snapshot: TaskSnapshot,
+        execution: TaskExecution,
+    ) -> Result<(), RuntimeError> {
+        Ok(self.tasks.restore_checkpoint(task, snapshot, execution)?)
+    }
+
     pub fn scope_snapshot(&self, scope: ScopeHandle) -> Result<ScopeSnapshot, RuntimeError> {
         Ok(self.scopes.snapshot(scope)?)
     }
@@ -297,6 +313,14 @@ impl TaskRuntime {
 
     pub fn set_trace_enabled(&mut self, enabled: bool) {
         self.trace.set_enabled(enabled);
+    }
+
+    pub(crate) fn reserved_capacities(&self) -> (usize, usize, usize) {
+        (
+            self.tasks.reserved_capacity(),
+            self.scopes.reserved_capacity(),
+            self.trace.reserved_capacity(),
+        )
     }
 
     pub fn inject_failure_once(&mut self, point: FailurePoint) {

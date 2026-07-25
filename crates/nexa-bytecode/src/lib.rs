@@ -51,6 +51,46 @@ pub struct LoopBound {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCallMode {
+    Immediate,
+    Async,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostImport {
+    pub stable_id: StableId,
+    pub parameters: Vec<ValueType>,
+    pub result: Option<ValueType>,
+    pub mode: HostCallMode,
+    pub fuel_cost: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateField {
+    pub stable_id: StableId,
+    pub ty: ValueType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateType {
+    pub stable_id: StableId,
+    pub version: u32,
+    pub fields: Vec<StateField>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StateSchema {
+    pub types: Vec<StateType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptExport {
+    pub stable_id: StableId,
+    pub function: u32,
+    pub signature: Signature,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Instruction {
     LoadI32 {
         dst: u16,
@@ -97,6 +137,34 @@ pub enum Instruction {
         args_count: u16,
         dst: u16,
     },
+    HostCall {
+        import: u32,
+        args_base: u16,
+        args_count: u16,
+        dst: u16,
+    },
+    StateOldGet {
+        stable_id: StableId,
+        ty: ValueType,
+        dst: u16,
+    },
+    StateNewCreate {
+        stable_id: StableId,
+        type_id: StableId,
+        dst: u16,
+    },
+    StateNewSet {
+        object: u16,
+        field_id: StableId,
+        source: u16,
+    },
+    StateHandleRemap {
+        old_id: StableId,
+        target: u16,
+    },
+    StateDelete {
+        stable_id: StableId,
+    },
     DeferPush {
         function: u32,
         args_base: u16,
@@ -130,6 +198,9 @@ pub struct Function {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
     pub functions: Vec<Function>,
+    pub host_imports: Vec<HostImport>,
+    pub exports: Vec<ScriptExport>,
+    pub state_schema: StateSchema,
     pub host_interface_hash: Option<StableId>,
     pub schema_hash: Option<StableId>,
 }
@@ -144,6 +215,40 @@ pub enum DecodeError {
     InvalidBoolean(u8),
     TrailingBytes,
     SizeOverflow,
+    InvalidSectionDirectory,
+    ChecksumMismatch(u8),
+    ResourceLimit(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_bytes: usize,
+    pub max_sections: usize,
+    pub max_functions: usize,
+    pub max_instructions: usize,
+    pub max_registers: usize,
+    pub max_root_maps: usize,
+    pub max_loop_bounds: usize,
+    pub max_host_imports: usize,
+    pub max_state_types: usize,
+    pub max_exports: usize,
+}
+
+impl Default for DecodeLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: 16 * 1024 * 1024,
+            max_sections: 16,
+            max_functions: 65_536,
+            max_instructions: 1_000_000,
+            max_registers: u16::MAX as usize,
+            max_root_maps: 1_000_000,
+            max_loop_bounds: 1_000_000,
+            max_host_imports: 65_536,
+            max_state_types: 65_536,
+            max_exports: 65_536,
+        }
+    }
 }
 
 impl fmt::Display for DecodeError {
@@ -156,12 +261,75 @@ impl std::error::Error for DecodeError {}
 
 impl Module {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
-        output.extend_from_slice(&MAGIC);
-        put_u16(&mut output, BYTECODE_VERSION);
         put_optional_id(&mut output, self.host_interface_hash);
         put_optional_id(&mut output, self.schema_hash);
+        put_u32(
+            &mut output,
+            u32::try_from(self.host_imports.len()).expect("host import count exceeds wire format"),
+        );
+        for import in &self.host_imports {
+            put_u64(&mut output, import.stable_id.0);
+            output.push(match import.mode {
+                HostCallMode::Immediate => 0,
+                HostCallMode::Async => 1,
+            });
+            put_u32(&mut output, import.fuel_cost);
+            put_u16(
+                &mut output,
+                u16::try_from(import.parameters.len())
+                    .expect("host parameter count exceeds wire format"),
+            );
+            for ty in &import.parameters {
+                encode_type(&mut output, *ty);
+            }
+            output.push(u8::from(import.result.is_some()));
+            if let Some(result) = import.result {
+                encode_type(&mut output, result);
+            }
+        }
+        put_u32(
+            &mut output,
+            u32::try_from(self.state_schema.types.len())
+                .expect("state type count exceeds wire format"),
+        );
+        for state_type in &self.state_schema.types {
+            put_u64(&mut output, state_type.stable_id.0);
+            put_u32(&mut output, state_type.version);
+            put_u16(
+                &mut output,
+                u16::try_from(state_type.fields.len())
+                    .expect("state field count exceeds wire format"),
+            );
+            for field in &state_type.fields {
+                put_u64(&mut output, field.stable_id.0);
+                encode_type(&mut output, field.ty);
+            }
+        }
+        put_u32(
+            &mut output,
+            u32::try_from(self.exports.len()).expect("export count exceeds wire format"),
+        );
+        for export in &self.exports {
+            put_u64(&mut output, export.stable_id.0);
+            put_u32(&mut output, export.function);
+            put_u16(
+                &mut output,
+                u16::try_from(export.signature.parameters.len())
+                    .expect("export parameter count exceeds wire format"),
+            );
+            for ty in &export.signature.parameters {
+                encode_type(&mut output, *ty);
+            }
+            output.push(u8::from(export.signature.result.is_some()));
+            if let Some(result) = export.signature.result {
+                encode_type(&mut output, result);
+            }
+        }
+        let metadata = output;
+        let mut output = Vec::new();
         put_u32(
             &mut output,
             u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
@@ -226,27 +394,145 @@ impl Module {
                 encode_instruction(&mut output, *instruction);
             }
         }
-        output
+        encode_sections(&[(1, metadata), (2, output)])
     }
 
     #[allow(clippy::too_many_lines)]
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let mut reader = Reader { bytes, cursor: 0 };
-        if reader.take(4)? != MAGIC {
-            return Err(DecodeError::InvalidMagic);
+        Self::decode_with_limits(bytes, DecodeLimits::default())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn decode_with_limits(bytes: &[u8], limits: DecodeLimits) -> Result<Self, DecodeError> {
+        if bytes.len() > limits.max_bytes {
+            return Err(DecodeError::ResourceLimit("byte length"));
         }
-        let version = reader.u16()?;
-        if version != BYTECODE_VERSION {
-            return Err(DecodeError::UnsupportedVersion(version));
-        }
+        let sections = decode_sections(bytes, limits.max_sections)?;
+        let metadata = sections
+            .iter()
+            .find_map(|(kind, bytes)| (*kind == 1).then_some(*bytes))
+            .ok_or(DecodeError::InvalidSectionDirectory)?;
+        let function_bytes = sections
+            .iter()
+            .find_map(|(kind, bytes)| (*kind == 2).then_some(*bytes))
+            .ok_or(DecodeError::InvalidSectionDirectory)?;
+        let mut reader = Reader {
+            bytes: metadata,
+            cursor: 0,
+        };
         let host_interface_hash = read_optional_id(&mut reader)?;
         let schema_hash = read_optional_id(&mut reader)?;
+        let host_import_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if host_import_count > limits.max_host_imports {
+            return Err(DecodeError::ResourceLimit("host imports"));
+        }
+        if host_import_count > reader.remaining() {
+            return Err(DecodeError::Truncated);
+        }
+        let mut host_imports = Vec::with_capacity(host_import_count);
+        for _ in 0..host_import_count {
+            let stable_id = StableId(reader.u64()?);
+            let mode = match reader.u8()? {
+                0 => HostCallMode::Immediate,
+                1 => HostCallMode::Async,
+                value => return Err(DecodeError::InvalidType(value)),
+            };
+            let fuel_cost = reader.u32()?;
+            let parameter_count = usize::from(reader.u16()?);
+            if parameter_count > reader.remaining() {
+                return Err(DecodeError::Truncated);
+            }
+            let mut parameters = Vec::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                parameters.push(decode_type(&mut reader)?);
+            }
+            let result = match reader.u8()? {
+                0 => None,
+                1 => Some(decode_type(&mut reader)?),
+                value => return Err(DecodeError::InvalidBoolean(value)),
+            };
+            host_imports.push(HostImport {
+                stable_id,
+                parameters,
+                result,
+                mode,
+                fuel_cost,
+            });
+        }
+        let state_type_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if state_type_count > limits.max_state_types {
+            return Err(DecodeError::ResourceLimit("state types"));
+        }
+        if state_type_count > reader.remaining() {
+            return Err(DecodeError::Truncated);
+        }
+        let mut state_types = Vec::with_capacity(state_type_count);
+        for _ in 0..state_type_count {
+            let stable_id = StableId(reader.u64()?);
+            let version = reader.u32()?;
+            let field_count = usize::from(reader.u16()?);
+            if field_count > reader.remaining() {
+                return Err(DecodeError::Truncated);
+            }
+            let mut fields = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                fields.push(StateField {
+                    stable_id: StableId(reader.u64()?),
+                    ty: decode_type(&mut reader)?,
+                });
+            }
+            state_types.push(StateType {
+                stable_id,
+                version,
+                fields,
+            });
+        }
+        let export_count = usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if export_count > limits.max_exports {
+            return Err(DecodeError::ResourceLimit("exports"));
+        }
+        let mut exports = Vec::with_capacity(export_count);
+        for _ in 0..export_count {
+            let stable_id = StableId(reader.u64()?);
+            let function = reader.u32()?;
+            let parameter_count = usize::from(reader.u16()?);
+            if parameter_count > reader.remaining() {
+                return Err(DecodeError::Truncated);
+            }
+            let mut parameters = Vec::with_capacity(parameter_count);
+            for _ in 0..parameter_count {
+                parameters.push(decode_type(&mut reader)?);
+            }
+            let result = match reader.u8()? {
+                0 => None,
+                1 => Some(decode_type(&mut reader)?),
+                value => return Err(DecodeError::InvalidBoolean(value)),
+            };
+            exports.push(ScriptExport {
+                stable_id,
+                function,
+                signature: Signature { parameters, result },
+            });
+        }
+        if reader.cursor != metadata.len() {
+            return Err(DecodeError::TrailingBytes);
+        }
+        let mut reader = Reader {
+            bytes: function_bytes,
+            cursor: 0,
+        };
         let function_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if function_count > limits.max_functions {
+            return Err(DecodeError::ResourceLimit("functions"));
+        }
         if function_count > reader.remaining() {
             return Err(DecodeError::Truncated);
         }
         let mut functions = Vec::with_capacity(function_count);
+        let mut total_instructions = 0_usize;
         for _ in 0..function_count {
             let parameter_count = usize::from(reader.u16()?);
             if parameter_count > reader.remaining() {
@@ -262,10 +548,16 @@ impl Module {
                 value => return Err(DecodeError::InvalidBoolean(value)),
             };
             let registers = reader.u16()?;
+            if usize::from(registers) > limits.max_registers {
+                return Err(DecodeError::ResourceLimit("registers"));
+            }
             let frame_bytes = reader.u32()?;
             let effect = decode_effect(reader.u8()?)?;
             let max_static_call_depth = reader.u16()?;
             let root_count = usize::from(reader.u16()?);
+            if root_count > limits.max_registers {
+                return Err(DecodeError::ResourceLimit("root bitmap"));
+            }
             if root_count > reader.remaining() {
                 return Err(DecodeError::Truncated);
             }
@@ -279,10 +571,16 @@ impl Module {
             }
             let root_map_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            if root_map_count > limits.max_root_maps {
+                return Err(DecodeError::ResourceLimit("root maps"));
+            }
             let mut root_maps = Vec::with_capacity(root_map_count);
             for _ in 0..root_map_count {
                 let pc = reader.u32()?;
                 let bitmap_len = usize::from(reader.u16()?);
+                if bitmap_len > limits.max_registers {
+                    return Err(DecodeError::ResourceLimit("root bitmap"));
+                }
                 let mut bitmap = Vec::with_capacity(bitmap_len);
                 for _ in 0..bitmap_len {
                     bitmap.push(match reader.u8()? {
@@ -301,6 +599,9 @@ impl Module {
             }
             let loop_bound_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            if loop_bound_count > limits.max_loop_bounds {
+                return Err(DecodeError::ResourceLimit("loop bounds"));
+            }
             let mut loop_bounds = Vec::with_capacity(loop_bound_count);
             for _ in 0..loop_bound_count {
                 loop_bounds.push(LoopBound {
@@ -310,6 +611,12 @@ impl Module {
             }
             let instruction_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            total_instructions = total_instructions
+                .checked_add(instruction_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            if total_instructions > limits.max_instructions {
+                return Err(DecodeError::ResourceLimit("instructions"));
+            }
             if instruction_count > reader.remaining() {
                 return Err(DecodeError::Truncated);
             }
@@ -330,15 +637,113 @@ impl Module {
                 code,
             });
         }
-        if reader.cursor != bytes.len() {
+        if reader.cursor != function_bytes.len() {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(Self {
             functions,
+            host_imports,
+            exports,
+            state_schema: StateSchema { types: state_types },
             host_interface_hash,
             schema_hash,
         })
     }
+}
+
+fn encode_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
+    const DIRECTORY_ENTRY_BYTES: usize = 13;
+    let header_bytes = 8_usize
+        .checked_add(sections.len().saturating_mul(DIRECTORY_ENTRY_BYTES))
+        .expect("section directory size overflow");
+    let mut offset = header_bytes;
+    let mut output = Vec::with_capacity(
+        header_bytes + sections.iter().map(|(_, bytes)| bytes.len()).sum::<usize>(),
+    );
+    output.extend_from_slice(&MAGIC);
+    put_u16(&mut output, BYTECODE_VERSION);
+    put_u16(
+        &mut output,
+        u16::try_from(sections.len()).expect("section count exceeds wire format"),
+    );
+    for (kind, bytes) in sections {
+        output.push(*kind);
+        put_u32(
+            &mut output,
+            u32::try_from(offset).expect("section offset exceeds wire format"),
+        );
+        put_u32(
+            &mut output,
+            u32::try_from(bytes.len()).expect("section length exceeds wire format"),
+        );
+        put_u32(&mut output, checksum(bytes));
+        offset = offset
+            .checked_add(bytes.len())
+            .expect("section offset overflow");
+    }
+    for (_, bytes) in sections {
+        output.extend_from_slice(bytes);
+    }
+    output
+}
+
+fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u8, &[u8])>, DecodeError> {
+    let mut reader = Reader { bytes, cursor: 0 };
+    if reader.take(4)? != MAGIC {
+        return Err(DecodeError::InvalidMagic);
+    }
+    let version = reader.u16()?;
+    if version != BYTECODE_VERSION {
+        return Err(DecodeError::UnsupportedVersion(version));
+    }
+    let count = usize::from(reader.u16()?);
+    if count == 0 || count > max_sections {
+        return Err(DecodeError::InvalidSectionDirectory);
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push((reader.u8()?, reader.u32()?, reader.u32()?, reader.u32()?));
+    }
+    let directory_end = reader.cursor;
+    entries.sort_by_key(|(_, offset, _, _)| *offset);
+    let mut previous_end = directory_end;
+    let mut kinds = 0_u32;
+    let mut sections = Vec::with_capacity(count);
+    for (kind, offset, length, expected_checksum) in entries {
+        let bit = 1_u32
+            .checked_shl(u32::from(kind))
+            .ok_or(DecodeError::InvalidSectionDirectory)?;
+        if kinds & bit != 0 {
+            return Err(DecodeError::InvalidSectionDirectory);
+        }
+        kinds |= bit;
+        let start = usize::try_from(offset).map_err(|_| DecodeError::SizeOverflow)?;
+        let end = start
+            .checked_add(usize::try_from(length).map_err(|_| DecodeError::SizeOverflow)?)
+            .ok_or(DecodeError::SizeOverflow)?;
+        if start < previous_end || end > bytes.len() {
+            return Err(DecodeError::InvalidSectionDirectory);
+        }
+        let section = &bytes[start..end];
+        if checksum(section) != expected_checksum {
+            return Err(DecodeError::ChecksumMismatch(kind));
+        }
+        sections.push((kind, section));
+        previous_end = end;
+    }
+    if previous_end != bytes.len() {
+        return Err(DecodeError::TrailingBytes);
+    }
+    Ok(sections)
+}
+
+fn checksum(bytes: &[u8]) -> u32 {
+    let mut hash = 0x811c_9dc5_u32;
+    for byte in bytes {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
 }
 
 fn encode_effect(effect: FunctionEffect) -> u8 {
@@ -438,6 +843,53 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, args_count);
             put_u16(output, dst);
         }
+        Instruction::HostCall {
+            import,
+            args_base,
+            args_count,
+            dst,
+        } => {
+            output.push(18);
+            put_u32(output, import);
+            put_u16(output, args_base);
+            put_u16(output, args_count);
+            put_u16(output, dst);
+        }
+        Instruction::StateOldGet { stable_id, ty, dst } => {
+            output.push(19);
+            put_u64(output, stable_id.0);
+            encode_type(output, ty);
+            put_u16(output, dst);
+        }
+        Instruction::StateNewCreate {
+            stable_id,
+            type_id,
+            dst,
+        } => {
+            output.push(20);
+            put_u64(output, stable_id.0);
+            put_u64(output, type_id.0);
+            put_u16(output, dst);
+        }
+        Instruction::StateNewSet {
+            object,
+            field_id,
+            source,
+        } => {
+            output.push(21);
+            put_u16(output, object);
+            put_u64(output, field_id.0);
+            put_u16(output, source);
+        }
+        Instruction::StateHandleRemap { old_id, target } => {
+            output.push(22);
+            put_u64(output, old_id.0);
+            put_u16(output, target);
+        }
+        Instruction::StateDelete { stable_id } => {
+            output.push(23);
+            put_u64(output, stable_id.0);
+        }
         Instruction::Return { source } => {
             output.push(10);
             put_u16(output, source);
@@ -518,6 +970,34 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         },
         16 => Instruction::DeferPop,
         17 => Instruction::CleanupReturn,
+        18 => Instruction::HostCall {
+            import: reader.u32()?,
+            args_base: reader.u16()?,
+            args_count: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        19 => Instruction::StateOldGet {
+            stable_id: StableId(reader.u64()?),
+            ty: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        20 => Instruction::StateNewCreate {
+            stable_id: StableId(reader.u64()?),
+            type_id: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        21 => Instruction::StateNewSet {
+            object: reader.u16()?,
+            field_id: StableId(reader.u64()?),
+            source: reader.u16()?,
+        },
+        22 => Instruction::StateHandleRemap {
+            old_id: StableId(reader.u64()?),
+            target: reader.u16()?,
+        },
+        23 => Instruction::StateDelete {
+            stable_id: StableId(reader.u64()?),
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -610,6 +1090,9 @@ impl std::error::Error for BuildError {}
 #[derive(Default)]
 pub struct ModuleBuilder {
     functions: Vec<Function>,
+    host_imports: Vec<HostImport>,
+    exports: Vec<ScriptExport>,
+    state_schema: StateSchema,
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
 }
@@ -619,6 +1102,9 @@ impl ModuleBuilder {
     pub const fn new() -> Self {
         Self {
             functions: Vec::new(),
+            host_imports: Vec::new(),
+            exports: Vec::new(),
+            state_schema: StateSchema { types: Vec::new() },
             host_interface_hash: None,
             schema_hash: None,
         }
@@ -636,10 +1122,29 @@ impl ModuleBuilder {
         id
     }
 
+    pub fn host_import(&mut self, import: HostImport) -> u32 {
+        let id = u32::try_from(self.host_imports.len()).expect("host import count exceeds u32");
+        self.host_imports.push(import);
+        id
+    }
+
+    pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
+        self.exports.push(export);
+        self
+    }
+
+    pub fn state_schema(&mut self, schema: StateSchema) -> &mut Self {
+        self.state_schema = schema;
+        self
+    }
+
     #[must_use]
     pub fn finish(self) -> Module {
         Module {
             functions: self.functions,
+            host_imports: self.host_imports,
+            exports: self.exports,
+            state_schema: self.state_schema,
             host_interface_hash: self.host_interface_hash,
             schema_hash: self.schema_hash,
         }
@@ -717,6 +1222,7 @@ impl FunctionBuilder {
                     Instruction::Safepoint
                         | Instruction::Yield
                         | Instruction::Call { .. }
+                        | Instruction::HostCall { .. }
                         | Instruction::Return { .. }
                         | Instruction::ReturnVoid
                         | Instruction::Trap
@@ -801,14 +1307,14 @@ mod tests {
         assert_eq!(Module::decode(&encoded), Ok(module));
         assert_eq!(
             Module::decode(&encoded[..encoded.len() - 1]),
-            Err(DecodeError::Truncated)
+            Err(DecodeError::InvalidSectionDirectory)
         );
         let mut corrupt = encoded;
         let opcode = corrupt.len() - 3;
         corrupt[opcode] = u8::MAX;
         assert_eq!(
             Module::decode(&corrupt),
-            Err(DecodeError::InvalidOpcode(u8::MAX))
+            Err(DecodeError::ChecksumMismatch(2))
         );
     }
 }

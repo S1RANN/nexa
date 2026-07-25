@@ -75,10 +75,17 @@ impl StableId {
     /// Uses fixed FNV-1a instead of a process-randomized hash so generated IDs are reproducible.
     #[must_use]
     pub fn from_name(name: &str) -> Self {
+        Self::from_parts(&[name])
+    }
+
+    #[must_use]
+    pub fn from_parts(parts: &[&str]) -> Self {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in name.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        for part in parts {
+            for byte in part.bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
         }
         Self(hash)
     }
@@ -86,12 +93,12 @@ impl StableId {
 
 #[must_use]
 pub fn machine_state_id(machine: &str, state: &str) -> StableId {
-    StableId::from_name(&format!("{machine}::State::{state}"))
+    StableId::from_parts(&[machine, "::State::", state])
 }
 
 #[must_use]
 pub fn machine_event_id(machine: &str, event: &str) -> StableId {
-    StableId::from_name(&format!("{machine}::Event::{event}"))
+    StableId::from_parts(&[machine, "::Event::", event])
 }
 
 #[must_use]
@@ -107,21 +114,49 @@ pub fn machine_invariant_hash(
     owner_scope: Option<RawHandle>,
     resources: &[(&str, i64)],
 ) -> u64 {
-    let mut canonical = format!("{machine}::{state}");
-    if let Some(owner) = owner_scope {
-        use std::fmt::Write as _;
-        write!(
-            canonical,
-            "::owner={}:{}:{}",
-            owner.realm_id, owner.index, owner.generation
-        )
-        .expect("writing String cannot fail");
+    let resource_ids = resources
+        .iter()
+        .map(|(resource, amount)| (StableId::from_name(resource), *amount));
+    machine_invariant_hash_ids(
+        StableId::from_name(machine),
+        machine_state_id(machine, state),
+        owner_scope,
+        resource_ids,
+    )
+}
+
+/// Allocation-free invariant hashing for runtime hot paths.
+#[must_use]
+pub fn machine_invariant_hash_ids(
+    machine: StableId,
+    state: StableId,
+    owner_scope: Option<RawHandle>,
+    resources: impl IntoIterator<Item = (StableId, i64)>,
+) -> u64 {
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut update = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    update(&machine.0.to_le_bytes());
+    update(&state.0.to_le_bytes());
+    match owner_scope {
+        Some(owner) => {
+            update(&[1]);
+            update(&owner.realm_id.to_le_bytes());
+            update(&owner.index.to_le_bytes());
+            update(&owner.generation.to_le_bytes());
+        }
+        None => update(&[0]),
     }
     for (resource, amount) in resources {
-        use std::fmt::Write as _;
-        write!(canonical, "::{resource}={amount}").expect("writing String cannot fail");
+        update(&resource.0.to_le_bytes());
+        update(&amount.to_le_bytes());
     }
-    StableId::from_name(&canonical).0
+    hash
 }
 
 impl fmt::Display for StableId {
@@ -151,10 +186,67 @@ pub enum TransitionDisposition {
 }
 
 /// Resource accounting changes caused by one transition.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResourceDelta {
-    pub resource: String,
+    pub resource: StableId,
     pub amount: i64,
+}
+
+pub const MAX_INLINE_RESOURCE_DELTAS: usize = 4;
+
+/// Fixed-capacity transition deltas, sized for every generated Nexa machine transition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InlineDeltas {
+    values: [ResourceDelta; MAX_INLINE_RESOURCE_DELTAS],
+    len: u8,
+}
+
+impl Default for InlineDeltas {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InlineDeltas {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            values: [ResourceDelta {
+                resource: StableId(0),
+                amount: 0,
+            }; MAX_INLINE_RESOURCE_DELTAS],
+            len: 0,
+        }
+    }
+
+    pub fn try_push(&mut self, delta: ResourceDelta) -> Result<(), ResourceDelta> {
+        let index = usize::from(self.len);
+        let Some(slot) = self.values.get_mut(index) else {
+            return Err(delta);
+        };
+        *slot = delta;
+        self.len += 1;
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn as_slice(&self) -> &[ResourceDelta] {
+        self.values.split_at(self.len as usize).0
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ResourceDelta> {
+        self.as_slice().iter()
+    }
 }
 
 /// Versioned trace record emitted by generated state-machine transitions.
@@ -172,7 +264,7 @@ pub struct TraceRecord {
     pub realm_id: u32,
     pub module_epoch: u64,
     pub owner_scope: Option<RawHandle>,
-    pub resource_deltas: Vec<ResourceDelta>,
+    pub resource_deltas: InlineDeltas,
     pub error_code: Option<u32>,
     pub invariant_hash: u64,
 }

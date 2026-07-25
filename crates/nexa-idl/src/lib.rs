@@ -11,7 +11,7 @@ pub struct Idl {
     pub opaque_handles: Vec<String>,
     pub structs: Vec<Struct>,
     pub functions: Vec<HostFunction>,
-    pub exports: Vec<String>,
+    pub exports: Vec<Export>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,14 +35,21 @@ pub struct HostFunction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Export {
+    pub name: String,
+    pub parameters: Vec<Field>,
+    pub result: Option<TypeRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeRef {
     I32,
     F32,
     Bool,
     String,
-    HostRequest,
-    ResourceToken,
-    Snapshot,
+    HostRequest(Option<Box<TypeRef>>),
+    ResourceToken(Option<Box<TypeRef>>),
+    Snapshot(Option<Box<TypeRef>>),
     Named(String),
 }
 
@@ -111,7 +118,16 @@ pub fn canonical(idl: &Idl) -> String {
         write!(output, ")->{};", type_name(&function.result)).expect("String writes do not fail");
     }
     for export in &idl.exports {
-        write!(output, "export:{export};").expect("String writes do not fail");
+        write!(output, "export:{}(", export.name).expect("String writes do not fail");
+        for parameter in &export.parameters {
+            write!(output, "{}:{};", parameter.name, type_name(&parameter.ty))
+                .expect("String writes do not fail");
+        }
+        if let Some(result) = &export.result {
+            write!(output, ")->{};", type_name(result)).expect("String writes do not fail");
+        } else {
+            output.push_str(")->void;");
+        }
     }
     output
 }
@@ -183,6 +199,13 @@ pub fn generate_rust(idl: &Idl) -> String {
         idl.interface
     )
     .expect("String writes do not fail");
+    writeln!(
+        output,
+        "fn interface_hash(&self) -> Option<nexa_runtime::StableId> {{ \
+         Some(nexa_runtime::StableId({})) }}",
+        exact_hash(idl).0
+    )
+    .expect("String writes do not fail");
     output.push_str(
         "fn call(&mut self, id: u32, context: &mut nexa_runtime::ResourceContext<'_>, \
          args: nexa_runtime::HostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n\
@@ -237,13 +260,31 @@ pub fn generate_rust(idl: &Idl) -> String {
          }\n}\n}\n",
     );
     for (index, export) in idl.exports.iter().enumerate() {
+        let args = if export.parameters.is_empty() {
+            format!("pub struct {}Args;", export.name)
+        } else {
+            let fields = export
+                .parameters
+                .iter()
+                .map(|field| format!("pub {}: {}", field.name, rust_type(&field.ty)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("pub struct {}Args {{ {fields} }}", export.name)
+        };
+        let output_type = export
+            .result
+            .as_ref()
+            .map_or("()".to_owned(), |ty| rust_type(ty).to_owned());
         writeln!(
             output,
-            "pub enum {export} {{}}\n\
-             impl nexa_runtime::ScriptFunction for {export} {{\n\
-             type Args = (); type Output = nexa_runtime::RuntimeValue;\n\
+            "{args}\n\
+             pub type {name}Output = {output_type};\n\
+             pub enum {name} {{}}\n\
+             impl nexa_runtime::ScriptFunction for {name} {{\n\
+             type Args = {name}Args; type Output = {name}Output;\n\
              const FUNCTION_ID: u32 = {index}; }}\n\
-             impl {export} {{ pub const EXPORT_NAME: &'static str = \"{export}\"; }}"
+             impl {name} {{ pub const EXPORT_NAME: &'static str = \"{name}\"; }}",
+            name = export.name,
         )
         .expect("String writes do not fail");
     }
@@ -260,9 +301,9 @@ fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::F32 => decode_match(source, "F32", "*value"),
         TypeRef::Bool => decode_match(source, "Bool", "*value"),
         TypeRef::String => decode_match(source, "String", "value.clone()"),
-        TypeRef::HostRequest => decode_match(source, "Request", "*value"),
-        TypeRef::ResourceToken => decode_match(source, "Token", "*value"),
-        TypeRef::Snapshot => decode_match(source, "Snapshot", "*value"),
+        TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
+        TypeRef::ResourceToken(_) => decode_match(source, "Token", "*value"),
+        TypeRef::Snapshot(_) => decode_match(source, "Snapshot", "*value"),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
             "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
              _ => return Err(nexa_runtime::HostTrap::Type) }}"
@@ -303,7 +344,7 @@ fn decode_match(source: &str, variant: &str, value: &str) -> String {
 }
 
 fn encode_host_result(idl: &Idl, ty: &TypeRef) -> String {
-    if *ty == TypeRef::HostRequest {
+    if matches!(ty, TypeRef::HostRequest(_)) {
         "nexa_runtime::HostCallOutcome::Pending(result)".into()
     } else {
         format!(
@@ -319,9 +360,9 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::F32 => format!("nexa_runtime::HostValue::F32({source})"),
         TypeRef::Bool => format!("nexa_runtime::HostValue::Bool({source})"),
         TypeRef::String => format!("nexa_runtime::HostValue::String({source})"),
-        TypeRef::HostRequest => format!("nexa_runtime::HostValue::Request({source})"),
-        TypeRef::ResourceToken => format!("nexa_runtime::HostValue::Token({source})"),
-        TypeRef::Snapshot => format!("nexa_runtime::HostValue::Snapshot({source})"),
+        TypeRef::HostRequest(_) => format!("nexa_runtime::HostValue::Request({source})"),
+        TypeRef::ResourceToken(_) => format!("nexa_runtime::HostValue::Token({source})"),
+        TypeRef::Snapshot(_) => format!("nexa_runtime::HostValue::Snapshot({source})"),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("nexa_runtime::HostValue::Opaque({source}.0)")
         }
@@ -342,17 +383,24 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     }
 }
 
-fn type_name(ty: &TypeRef) -> &str {
+fn type_name(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 => "i32",
-        TypeRef::F32 => "f32",
-        TypeRef::Bool => "bool",
-        TypeRef::String => "string",
-        TypeRef::HostRequest => "host_request",
-        TypeRef::ResourceToken => "resource_token",
-        TypeRef::Snapshot => "snapshot",
-        TypeRef::Named(name) => name,
+        TypeRef::I32 => "i32".into(),
+        TypeRef::F32 => "f32".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::String => "string".into(),
+        TypeRef::HostRequest(inner) => parameterized_type_name("request", inner.as_deref()),
+        TypeRef::ResourceToken(inner) => parameterized_type_name("token", inner.as_deref()),
+        TypeRef::Snapshot(inner) => parameterized_type_name("snapshot", inner.as_deref()),
+        TypeRef::Named(name) => name.clone(),
     }
+}
+
+fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
+    inner.map_or_else(
+        || name.to_owned(),
+        |inner| format!("{name}<{}>", type_name(inner)),
+    )
 }
 
 fn rust_type(ty: &TypeRef) -> &str {
@@ -361,9 +409,9 @@ fn rust_type(ty: &TypeRef) -> &str {
         TypeRef::F32 => "f32",
         TypeRef::Bool => "bool",
         TypeRef::String => "String",
-        TypeRef::HostRequest => "nexa_runtime::HostRequestHandle",
-        TypeRef::ResourceToken => "nexa_runtime::ResourceTokenHandle",
-        TypeRef::Snapshot => "nexa_runtime::SnapshotHandle",
+        TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle",
+        TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle",
+        TypeRef::Snapshot(_) => "nexa_runtime::SnapshotHandle",
         TypeRef::Named(name) => name,
     }
 }
@@ -371,16 +419,16 @@ fn rust_type(ty: &TypeRef) -> &str {
 fn tokenize(source: &str) -> Vec<String> {
     let mut output = String::new();
     for character in source.chars() {
-        if "{}(),:;".contains(character) {
+        if character == '>' && output.ends_with('-') {
+            output.push(character);
+            output.push(' ');
+        } else if "{}(),:;<>".contains(character) {
             output.push(' ');
             output.push(character);
             output.push(' ');
         } else if character == '-' {
             output.push(' ');
             output.push(character);
-        } else if character == '>' {
-            output.push(character);
-            output.push(' ');
         } else {
             output.push(character);
         }
@@ -458,8 +506,32 @@ impl Parser {
                 Some("export") => {
                     self.cursor += 1;
                     let name = self.word()?;
+                    self.expect("(")?;
+                    let mut parameters = Vec::new();
+                    if !self.take(")") {
+                        loop {
+                            parameters.push(self.field()?);
+                            if self.take(")") {
+                                break;
+                            }
+                            self.expect(",")?;
+                        }
+                    }
+                    self.expect("->")?;
+                    let result = if self.take("void") {
+                        None
+                    } else {
+                        Some(self.ty()?)
+                    };
                     self.expect(";")?;
-                    insert_unique(&mut idl.exports, name)?;
+                    if idl.exports.iter().any(|item| item.name == name) {
+                        return Err(IdlError::Duplicate(name));
+                    }
+                    idl.exports.push(Export {
+                        name,
+                        parameters,
+                        result,
+                    });
                 }
                 token => return Err(IdlError::Syntax(format!("unexpected {token:?}"))),
             }
@@ -478,15 +550,24 @@ impl Parser {
     }
 
     fn ty(&mut self) -> Result<TypeRef, IdlError> {
-        Ok(match self.word()?.as_str() {
+        let name = self.word()?;
+        let inner = if self.take("<") {
+            let inner = self.ty()?;
+            self.expect(">")?;
+            Some(Box::new(inner))
+        } else {
+            None
+        };
+        Ok(match name.as_str() {
             "i32" => TypeRef::I32,
             "f32" => TypeRef::F32,
             "bool" => TypeRef::Bool,
             "string" => TypeRef::String,
-            "host_request" => TypeRef::HostRequest,
-            "resource_token" => TypeRef::ResourceToken,
-            "snapshot" => TypeRef::Snapshot,
-            named => TypeRef::Named(named.to_owned()),
+            "host_request" | "request" => TypeRef::HostRequest(inner),
+            "resource_token" | "token" => TypeRef::ResourceToken(inner),
+            "snapshot" => TypeRef::Snapshot(inner),
+            named if inner.is_none() => TypeRef::Named(named.to_owned()),
+            named => return Err(IdlError::UnknownType(named.to_owned())),
         })
     }
 
@@ -550,14 +631,27 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
                 .map(|field| &field.ty)
                 .chain(std::iter::once(&function.result))
         }))
+        .chain(idl.exports.iter().flat_map(|export| {
+            export
+                .parameters
+                .iter()
+                .map(|field| &field.ty)
+                .chain(export.result.iter())
+        }))
     {
-        if let TypeRef::Named(name) = ty
-            && !known(name)
-        {
-            return Err(IdlError::UnknownType(name.clone()));
-        }
+        validate_type_ref(ty, &known)?;
     }
     Ok(())
+}
+
+fn validate_type_ref(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), IdlError> {
+    match ty {
+        TypeRef::Named(name) if !known(name) => Err(IdlError::UnknownType(name.clone())),
+        TypeRef::HostRequest(Some(inner))
+        | TypeRef::ResourceToken(Some(inner))
+        | TypeRef::Snapshot(Some(inner)) => validate_type_ref(inner, known),
+        _ => Ok(()),
+    }
 }
 
 #[cfg(test)]
@@ -573,7 +667,7 @@ mod tests {
             opaque Entity;
             struct Vec3 { x: f32; y: f32; z: f32; }
             sync fn entity_position(entity: Entity) -> Vec3;
-            export Update;
+            export Update(entity: Entity, dt: f32) -> void;
         }
     ";
 
@@ -605,7 +699,7 @@ mod tests {
                 sync fn add(lhs: i32, rhs: i32) -> i32;
                 sync fn position(entity: Entity, value: Vec3) -> Vec3;
                 sync fn explode() -> i32;
-                export Update;
+                export Update(value: i32) -> i32;
             }",
         )
         .unwrap();
@@ -703,7 +797,7 @@ fn main() {
         )
         .unwrap();
         let output = Command::new("cargo")
-            .args(["+1.97.0", "run", "--quiet"])
+            .args(["+1.97.1", "run", "--quiet"])
             .current_dir(&directory)
             .output()
             .unwrap();

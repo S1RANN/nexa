@@ -10,6 +10,13 @@ struct ScheduledTask {
     sequence: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SchedulerCheckpoint {
+    Ready { priority: u32, sequence: u64 },
+    Waiting { request: HostRequestHandle },
+    Detached,
+}
+
 impl Ord for ScheduledTask {
     fn cmp(&self, other: &Self) -> Ordering {
         self.priority
@@ -81,8 +88,45 @@ impl Scheduler {
             .retain(|(_, waiting_task)| *waiting_task != task);
     }
 
+    #[must_use]
+    pub(crate) fn checkpoint(&self, task: TaskHandle) -> SchedulerCheckpoint {
+        if let Some(scheduled) = self.ready.iter().find(|scheduled| scheduled.task == task) {
+            return SchedulerCheckpoint::Ready {
+                priority: scheduled.priority,
+                sequence: scheduled.sequence,
+            };
+        }
+        self.waiting
+            .iter()
+            .find_map(|(request, waiting)| {
+                (*waiting == task).then_some(SchedulerCheckpoint::Waiting { request: *request })
+            })
+            .unwrap_or(SchedulerCheckpoint::Detached)
+    }
+
+    pub(crate) fn restore(&mut self, task: TaskHandle, checkpoint: SchedulerCheckpoint) {
+        self.cancel_task(task);
+        match checkpoint {
+            SchedulerCheckpoint::Ready { priority, sequence } => {
+                self.ready.push(ScheduledTask {
+                    task,
+                    priority,
+                    sequence,
+                });
+                self.sequence = self.sequence.max(sequence.saturating_add(1));
+            }
+            SchedulerCheckpoint::Waiting { request } => self.wait_for(request, task),
+            SchedulerCheckpoint::Detached => {}
+        }
+    }
+
     pub fn pop_ready(&mut self) -> Option<TaskHandle> {
         self.ready.pop().map(|scheduled| scheduled.task)
+    }
+
+    #[must_use]
+    pub(crate) fn reserved_capacities(&self) -> (usize, usize) {
+        (self.ready.capacity(), self.waiting.capacity())
     }
 }
 

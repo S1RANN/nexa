@@ -719,31 +719,42 @@ pub mod reload {
                     deltas: DELTAS_6,
                 })
             }
-            (State::Committing, Event::Publish) => {
+            (State::Committing, Event::StageFailed) => {
                 const DELTAS_7: &[ResourceDelta] = &[ResourceDelta {
+                    resource: "staging_heap",
+                    amount: -1,
+                }];
+                Ok(Outcome {
+                    state: State::RolledBack,
+                    transition_id: 0x737622a5508ba4e2,
+                    deltas: DELTAS_7,
+                })
+            }
+            (State::Committing, Event::Publish) => {
+                const DELTAS_8: &[ResourceDelta] = &[ResourceDelta {
                     resource: "staging_heap",
                     amount: -1,
                 }];
                 Ok(Outcome {
                     state: State::Activating,
                     transition_id: 0xfe4afa8977a89515,
-                    deltas: DELTAS_7,
-                })
-            }
-            (State::Activating, Event::ActivationSucceeded) => {
-                const DELTAS_8: &[ResourceDelta] = &[];
-                Ok(Outcome {
-                    state: State::Completed,
-                    transition_id: 0x30f7e22becba3d13,
                     deltas: DELTAS_8,
                 })
             }
-            (State::Activating, Event::ActivationFailed) => {
+            (State::Activating, Event::ActivationSucceeded) => {
                 const DELTAS_9: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Completed,
+                    transition_id: 0x30f7e22becba3d13,
+                    deltas: DELTAS_9,
+                })
+            }
+            (State::Activating, Event::ActivationFailed) => {
+                const DELTAS_10: &[ResourceDelta] = &[];
                 Ok(Outcome {
                     state: State::ActivationFaulted,
                     transition_id: 0xea7a0b46de1aa6db,
-                    deltas: DELTAS_9,
+                    deltas: DELTAS_10,
                 })
             }
             (state, event) => Err(TransitionError::Undefined { state, event }),

@@ -1,14 +1,15 @@
 //! Structural, type and continuation verification for Nexa bytecode.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use nexa_bytecode::{Function, FunctionEffect, Instruction, Module, ValueType};
+use nexa_bytecode::{Function, FunctionEffect, HostCallMode, Instruction, Module, ValueType};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifierLimits {
     pub max_frame_bytes: u32,
     pub max_immediate_cost: u32,
+    pub max_wcet_states: u32,
 }
 
 impl Default for VerifierLimits {
@@ -16,6 +17,7 @@ impl Default for VerifierLimits {
         Self {
             max_frame_bytes: 64 * 1024,
             max_immediate_cost: 1_024,
+            max_wcet_states: 100_000,
         }
     }
 }
@@ -32,6 +34,10 @@ pub enum VerifyErrorKind {
     EmptyFunction,
     RegisterOutOfRange(u16),
     FunctionOutOfRange(u32),
+    HostImportOutOfRange(u32),
+    ExportOutOfRange(u32),
+    InvalidExportSignature,
+    DuplicateExport,
     JumpOutOfRange(u32),
     TypeMismatch,
     ConflictingControlFlowTypes,
@@ -46,6 +52,7 @@ pub enum VerifyErrorKind {
     InvalidLoopBound(u32),
     InvalidEffect,
     ImmediateRecursion,
+    WcetComplexityLimit,
 }
 
 impl fmt::Display for VerifyError {
@@ -71,6 +78,31 @@ impl VerifiedModule {
 }
 
 pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
+    let mut export_ids = BTreeSet::new();
+    for export in &module.exports {
+        if !export_ids.insert(export.stable_id) {
+            return Err(VerifyError {
+                function: export.function as usize,
+                instruction: None,
+                kind: VerifyErrorKind::DuplicateExport,
+            });
+        }
+        let function = module
+            .functions
+            .get(export.function as usize)
+            .ok_or(VerifyError {
+                function: export.function as usize,
+                instruction: None,
+                kind: VerifyErrorKind::ExportOutOfRange(export.function),
+            })?;
+        if function.signature != export.signature {
+            return Err(VerifyError {
+                function: export.function as usize,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidExportSignature,
+            });
+        }
+    }
     let depths = static_call_depths(&module)?;
     for (function, depth) in module.functions.iter_mut().zip(depths) {
         function.max_static_call_depth = depth;
@@ -78,7 +110,8 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     for (index, function) in module.functions.iter().enumerate() {
         verify_function(&module, index, function, limits)?;
         if function.effect == FunctionEffect::Immediate
-            && immediate_wcet(&module, index, &mut Vec::new())? > limits.max_immediate_cost
+            && immediate_wcet(&module, index, &mut Vec::new(), limits.max_wcet_states)?
+                > limits.max_immediate_cost
         {
             return Err(VerifyError {
                 function: index,
@@ -191,6 +224,13 @@ fn verify_function(
                     && callee.effect != FunctionEffect::Immediate)
                     || (callee.effect == FunctionEffect::Task
                         && function.effect != FunctionEffect::Task)
+                    || (function.effect == FunctionEffect::Migration
+                        && !matches!(
+                            callee.effect,
+                            FunctionEffect::Ordinary | FunctionEffect::Migration
+                        ))
+                    || (callee.effect == FunctionEffect::Migration
+                        && function.effect != FunctionEffect::Migration)
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
@@ -207,6 +247,94 @@ fn verify_function(
                 }
                 if let Some(result) = callee.signature.result {
                     state[register(dst)?] = Some(result);
+                }
+            }
+            Instruction::HostCall {
+                import,
+                args_base,
+                args_count,
+                dst,
+            } => {
+                let host = module.host_imports.get(import as usize).ok_or_else(|| {
+                    error(Some(pc), VerifyErrorKind::HostImportOutOfRange(import))
+                })?;
+                if usize::from(args_count) != host.parameters.len()
+                    || matches!(
+                        function.effect,
+                        FunctionEffect::Migration | FunctionEffect::Cleanup
+                    )
+                    || (host.mode == HostCallMode::Async && function.effect != FunctionEffect::Task)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                for (argument, ty) in host.parameters.iter().copied().enumerate() {
+                    let argument = args_base
+                        .checked_add(u16::try_from(argument).unwrap())
+                        .ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?;
+                    require(&state, argument, ty)?;
+                }
+                if let Some(result) = host.result {
+                    state[register(dst)?] = Some(result);
+                }
+            }
+            Instruction::StateOldGet { ty, dst, .. } => {
+                if function.effect != FunctionEffect::Migration {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                state[register(dst)?] = Some(ty);
+            }
+            Instruction::StateNewCreate { type_id, dst, .. } => {
+                if function.effect != FunctionEffect::Migration
+                    || !module
+                        .state_schema
+                        .types
+                        .iter()
+                        .any(|state_type| state_type.stable_id == type_id)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::StateNewSet {
+                object,
+                field_id,
+                source,
+            } => {
+                if function.effect != FunctionEffect::Migration {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                let object = register(object)?;
+                let Some(ValueType::Named(type_id)) = state[object] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field = module
+                    .state_schema
+                    .types
+                    .iter()
+                    .find(|state_type| state_type.stable_id == type_id)
+                    .and_then(|state_type| {
+                        state_type
+                            .fields
+                            .iter()
+                            .find(|field| field.stable_id == field_id)
+                    })
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                require(&state, source, field.ty)?;
+            }
+            Instruction::StateHandleRemap { target, .. } => {
+                if function.effect != FunctionEffect::Migration {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                let target = register(target)?;
+                if !matches!(state[target], Some(ValueType::Named(_))) {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+            }
+            Instruction::StateDelete { .. } => {
+                if function.effect != FunctionEffect::Migration {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
             }
             Instruction::Return { source } => {
@@ -299,7 +427,6 @@ fn verify_function(
             }
         }
     }
-    verify_safepoints(function_index, function)?;
     for register in 0..register_count {
         let can_hold_ref = states
             .iter()
@@ -321,6 +448,7 @@ fn verify_function(
             _ => {}
         }
     }
+    verify_safepoints(function_index, function, &states)?;
     Ok(())
 }
 
@@ -355,7 +483,25 @@ fn verify_loop_bounds(
     Ok(())
 }
 
-fn verify_safepoints(function_index: usize, function: &Function) -> Result<(), VerifyError> {
+fn verify_safepoints(
+    function_index: usize,
+    function: &Function,
+    states: &[Option<Vec<Option<ValueType>>>],
+) -> Result<(), VerifyError> {
+    let mut mapped = BTreeSet::new();
+    for root_map in &function.root_maps {
+        let pc = usize::try_from(root_map.pc).unwrap_or(usize::MAX);
+        if pc >= function.code.len()
+            || root_map.bitmap.len() != usize::from(function.registers)
+            || !mapped.insert(root_map.pc)
+        {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: (pc < function.code.len()).then_some(pc),
+                kind: VerifyErrorKind::InvalidRootMap(root_map.pc),
+            });
+        }
+    }
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
         let required = pc == 0
@@ -364,6 +510,7 @@ fn verify_safepoints(function_index: usize, function: &Function) -> Result<(), V
                 Instruction::Safepoint
                     | Instruction::Yield
                     | Instruction::Call { .. }
+                    | Instruction::HostCall { .. }
                     | Instruction::Return { .. }
                     | Instruction::ReturnVoid
                     | Instruction::Trap
@@ -381,12 +528,31 @@ fn verify_safepoints(function_index: usize, function: &Function) -> Result<(), V
                 kind: VerifyErrorKind::MissingSafepoint(pc_u32),
             });
         }
-        if required
-            && !function
-                .root_maps
-                .iter()
-                .any(|map| map.pc == pc_u32 && map.bitmap.len() == usize::from(function.registers))
-        {
+        if required {
+            let Some(root_map) = function.root_maps.iter().find(|map| map.pc == pc_u32) else {
+                return Err(VerifyError {
+                    function: function_index,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::InvalidRootMap(pc_u32),
+                });
+            };
+            let exact = states[pc].as_ref().map_or_else(
+                || vec![false; usize::from(function.registers)],
+                |state| {
+                    state
+                        .iter()
+                        .map(|ty| ty.is_some_and(ValueType::is_reference))
+                        .collect()
+                },
+            );
+            if root_map.bitmap != exact {
+                return Err(VerifyError {
+                    function: function_index,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::InvalidRootMap(pc_u32),
+                });
+            }
+        } else if mapped.contains(&pc_u32) {
             return Err(VerifyError {
                 function: function_index,
                 instruction: Some(pc),
@@ -458,6 +624,7 @@ fn immediate_wcet(
     module: &Module,
     function: usize,
     visiting: &mut Vec<usize>,
+    max_states: u32,
 ) -> Result<u32, VerifyError> {
     if visiting.contains(&function) {
         return Err(VerifyError {
@@ -472,24 +639,63 @@ fn immediate_wcet(
         .iter()
         .map(|loop_bound| (loop_bound.back_edge, loop_bound.max_iterations))
         .collect::<Vec<_>>();
-    let cost = longest_path(module, function, 0, visiting, &mut remaining)?;
+    let mut memo = BTreeMap::new();
+    let mut explored = 0_u32;
+    let cost = longest_path(
+        module,
+        function,
+        0,
+        visiting,
+        &mut remaining,
+        &mut memo,
+        &mut explored,
+        max_states,
+    )?;
     visiting.pop();
     Ok(cost)
 }
 
+type WcetMemo = BTreeMap<(usize, Vec<(u32, u32)>), u32>;
+
+#[allow(clippy::too_many_arguments)]
 fn longest_path(
     module: &Module,
     function: usize,
     pc: usize,
     visiting: &mut Vec<usize>,
     remaining: &mut [(u32, u32)],
+    memo: &mut WcetMemo,
+    explored: &mut u32,
+    max_states: u32,
 ) -> Result<u32, VerifyError> {
+    let key = (pc, remaining.to_vec());
+    if let Some(cost) = memo.get(&key) {
+        return Ok(*cost);
+    }
+    *explored = explored.saturating_add(1);
+    if *explored > max_states {
+        return Err(VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::WcetComplexityLimit,
+        });
+    }
     let instruction = module.functions[function].code[pc];
     let callee_cost = if let Instruction::Call {
         function: callee, ..
     } = instruction
     {
-        immediate_wcet(module, callee as usize, visiting)?
+        immediate_wcet(module, callee as usize, visiting, max_states)?
+    } else if let Instruction::HostCall { import, .. } = instruction {
+        module
+            .host_imports
+            .get(import as usize)
+            .ok_or(VerifyError {
+                function,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::HostImportOutOfRange(import),
+            })?
+            .fuel_cost
     } else {
         0
     };
@@ -537,6 +743,9 @@ fn longest_path(
             successor,
             visiting,
             &mut branch_remaining,
+            memo,
+            explored,
+            max_states,
         )?);
     }
     let cost = 1_u32
@@ -547,13 +756,14 @@ fn longest_path(
             instruction: Some(pc),
             kind: VerifyErrorKind::ImmediateCostLimit,
         })?;
+    memo.insert(key, cost);
     Ok(cost)
 }
 
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
+        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature, ValueType,
     };
 
     use super::{VerifierLimits, VerifyErrorKind, verify};
@@ -649,5 +859,47 @@ mod tests {
             VerifyErrorKind::ImmediateCostLimit
         ));
         assert!(verify(immediate_loop(Some(3)), VerifierLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn root_maps_are_exact_for_each_safepoint_program_counter() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Ref],
+                result: Some(ValueType::Ref),
+            },
+            2,
+        );
+        function
+            .set_root(0)
+            .unwrap()
+            .set_root(1)
+            .unwrap()
+            .emit(Instruction::Move { dst: 1, source: 0 })
+            .emit(Instruction::Return { source: 1 });
+        let mut function = function.finish().unwrap();
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true, true],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.function(function.clone());
+        assert!(verify(module.finish(), VerifierLimits::default()).is_ok());
+
+        function.root_maps[0].bitmap[1] = true;
+        let mut module = ModuleBuilder::new();
+        module.function(function);
+        assert!(matches!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidRootMap(0)
+        ));
     }
 }

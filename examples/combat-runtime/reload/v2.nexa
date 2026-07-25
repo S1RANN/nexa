@@ -1,4 +1,7 @@
-@stateful class EnemyBrain { phase: i32; }
+@stateful(2) class EnemyBrain {
+    phase: i32;
+    aggression: i32;
+}
 migration fn migrate(value: i32) -> i32 { return value; }
 fn identity(value: i32) -> i32 { return value; }
-task fn update(value: i32) -> i32 { return await identity(value + 1); }
+task fn update(value: i32) -> i32 { return value + 1; }

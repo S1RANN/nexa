@@ -12,6 +12,13 @@ pub enum RuntimeValue {
         reference: GcRef,
         type_id: nexa_core::StableId,
     },
+    HostRequest(crate::HostRequestHandle),
+    ResourceToken(crate::ResourceTokenHandle),
+    Snapshot(crate::SnapshotHandle),
+    Opaque {
+        value: u64,
+        type_id: nexa_core::StableId,
+    },
     #[default]
     Unit,
 }
@@ -305,7 +312,13 @@ impl FrameArena {
                 RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
                     Some(*reference)
                 }
-                RuntimeValue::I32(_) | RuntimeValue::Bool(_) | RuntimeValue::Unit => None,
+                RuntimeValue::I32(_)
+                | RuntimeValue::Bool(_)
+                | RuntimeValue::HostRequest(_)
+                | RuntimeValue::ResourceToken(_)
+                | RuntimeValue::Snapshot(_)
+                | RuntimeValue::Opaque { .. }
+                | RuntimeValue::Unit => None,
             })
             .collect()
     }
@@ -327,7 +340,13 @@ impl FrameArena {
                         RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
                             roots.push(reference);
                         }
-                        RuntimeValue::I32(_) | RuntimeValue::Bool(_) | RuntimeValue::Unit => {}
+                        RuntimeValue::I32(_)
+                        | RuntimeValue::Bool(_)
+                        | RuntimeValue::HostRequest(_)
+                        | RuntimeValue::ResourceToken(_)
+                        | RuntimeValue::Snapshot(_)
+                        | RuntimeValue::Opaque { .. }
+                        | RuntimeValue::Unit => {}
                     }
                 }
             }

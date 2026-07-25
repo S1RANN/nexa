@@ -1,0 +1,19 @@
+[package]
+name = "nexa-bytecode-decode-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexa-bytecode = { path = "../../crates/nexa-bytecode" }
+
+[[bin]]
+name = "bytecode_decode"
+path = "fuzz_targets/bytecode_decode.rs"
+test = false
+doc = false
+bench = false

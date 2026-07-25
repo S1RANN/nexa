@@ -173,6 +173,10 @@ impl<T> SlotPool<T> {
 
     #[must_use]
     pub fn occupied_handles(&self) -> Vec<RawHandle> {
+        self.occupied_handles_iter().collect()
+    }
+
+    pub fn occupied_handles_iter(&self) -> impl Iterator<Item = RawHandle> + '_ {
         self.slots
             .iter()
             .enumerate()
@@ -184,7 +188,11 @@ impl<T> SlotPool<T> {
                     slot.generation,
                 )
             })
-            .collect()
+    }
+
+    #[must_use]
+    pub fn reserved_capacity(&self) -> usize {
+        self.slots.capacity().min(self.free.capacity())
     }
 
     fn resolve_slot(&self, handle: RawHandle) -> Result<&Slot<T>, HandleError> {

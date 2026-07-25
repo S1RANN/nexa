@@ -56,7 +56,7 @@ fn reload_activation_fault() {
         &[nexa_runtime::RuntimeValue::I32(1)],
         super::support::task_config(scope),
     );
-    let result = nexa_runtime::PollResult::Cancelled(nexa_runtime::CancelReason::ReloadCommit);
+    let result = realm.poll_task(task, 32).unwrap();
     let extra = format!("activation={activation:?}\nrejected={rejected:?}\n");
     super::support::assert_snapshot(
         "reload_activation_fault",

@@ -1,9 +1,9 @@
-result=Cancelled(ReloadCommit)
+result=Pending(ExplicitYield)
 scope_state=Active
-terminal_state=Some(Cancelled)
-terminal_reason=Some(Cancelled(ReloadCommit))
-epoch=Some(1)
-charge=Some(ExecutionCharge { instructions: 0, fuel_used: 0 })
-trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 8952966945874924472), (5, 15721151810924846543), (6, 4932145509537713034), (7, 8679550066159350682), (8, 6135067495149402947)]
+terminal_state=None
+terminal_reason=None
+epoch=None
+charge=None
+trace=[(0, 855334369944695628), (1, 8550076509591047502), (2, 17379933176099013699), (3, 10498498088478377910), (4, 8952966945874924472), (5, 15721151810924846543), (6, 10498498088478377910), (7, 7404412225518122269), (8, 6238175855663382976)]
 activation=Err(Reload(Activation("activation")))
-rejected=Err(ModuleNotCallable)
+rejected=Err(ModuleHandle(StaleGeneration { index: 1, expected: 1, actual: 0 }))

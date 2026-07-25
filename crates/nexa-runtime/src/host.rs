@@ -2,8 +2,11 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use nexa_core::RawHandle;
+use nexa_core::{RawHandle, StableId};
 
+use crate::machines::host_request;
+use crate::machines::release_queue;
+use crate::machines::resource_token;
 use crate::{HandleError, SlotAllocError, SlotPool, TaskHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +39,7 @@ pub struct ReleaseRecord {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReleaseQueueState {
     Healthy,
+    Backlog,
     Stalled,
 }
 
@@ -51,7 +55,55 @@ pub struct ReleaseQueue {
     capacity: usize,
     reserved: BTreeSet<u64>,
     next_reservation: u64,
-    state: ReleaseQueueState,
+    machine_state: release_queue::State,
+}
+
+/// Process-level host domain that outlives realms and owns deferred release delivery.
+#[derive(Clone, Debug)]
+pub struct RuntimeHost {
+    releases: Arc<Mutex<VecDeque<ReleaseRecord>>>,
+}
+
+impl RuntimeHost {
+    #[must_use]
+    pub fn new(release_capacity: usize) -> Self {
+        Self {
+            releases: Arc::new(Mutex::new(VecDeque::with_capacity(release_capacity))),
+        }
+    }
+
+    pub(crate) fn submit_releases(
+        &self,
+        records: impl IntoIterator<Item = ReleaseRecord>,
+    ) -> usize {
+        let mut queue = self
+            .releases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut submitted = 0;
+        for record in records {
+            queue.push_back(record);
+            submitted += 1;
+        }
+        submitted
+    }
+
+    #[must_use]
+    pub fn drain_releases(&self) -> Vec<ReleaseRecord> {
+        self.releases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain(..)
+            .collect()
+    }
+
+    #[must_use]
+    pub fn pending_releases(&self) -> usize {
+        self.releases
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
 }
 
 impl ReleaseQueue {
@@ -62,13 +114,13 @@ impl ReleaseQueue {
             capacity,
             reserved: BTreeSet::new(),
             next_reservation: 0,
-            state: ReleaseQueueState::Healthy,
+            machine_state: release_queue::State::Healthy,
         }
     }
 
     pub fn reserve(&mut self) -> Result<ReleaseReservation, ReleaseQueueError> {
         if self.records.len() + self.reserved.len() >= self.capacity {
-            self.state = ReleaseQueueState::Stalled;
+            self.transition_to_stalled();
             return Err(ReleaseQueueError::Capacity);
         }
         let reservation = self.next_reservation;
@@ -77,6 +129,7 @@ impl ReleaseQueue {
             .checked_add(1)
             .ok_or(ReleaseQueueError::Capacity)?;
         self.reserved.insert(reservation);
+        self.refresh_state();
         Ok(ReleaseReservation(reservation))
     }
 
@@ -89,16 +142,19 @@ impl ReleaseQueue {
             return Err(ReleaseQueueError::NotReserved);
         }
         self.records.push_back(record);
+        self.refresh_state();
         Ok(())
     }
 
     pub fn cancel_reservation(&mut self, reservation: ReleaseReservation) {
         self.reserved.remove(&reservation.0);
+        self.refresh_state();
     }
 
-    pub fn drain(&mut self) -> impl Iterator<Item = ReleaseRecord> + '_ {
-        self.state = ReleaseQueueState::Healthy;
-        self.records.drain(..)
+    pub fn drain(&mut self) -> impl Iterator<Item = ReleaseRecord> {
+        let records = self.records.drain(..).collect::<Vec<_>>();
+        self.refresh_state();
+        records.into_iter()
     }
 
     pub fn reparent_realm(&mut self, old_realm: u32, new_realm: u32) {
@@ -111,7 +167,50 @@ impl ReleaseQueue {
 
     #[must_use]
     pub const fn state(&self) -> ReleaseQueueState {
-        self.state
+        match self.machine_state {
+            release_queue::State::Healthy => ReleaseQueueState::Healthy,
+            release_queue::State::ReleaseBacklog => ReleaseQueueState::Backlog,
+            release_queue::State::ResourceStalled => ReleaseQueueState::Stalled,
+        }
+    }
+
+    fn refresh_state(&mut self) {
+        let used = self.records.len() + self.reserved.len();
+        if used >= self.capacity {
+            self.transition_to_stalled();
+        } else if used > 0 {
+            if self.machine_state == release_queue::State::ResourceStalled {
+                self.apply_release_event(release_queue::Event::Recover);
+            }
+            if self.machine_state == release_queue::State::Healthy {
+                self.apply_release_event(release_queue::Event::SoftLimit);
+            }
+        } else {
+            match self.machine_state {
+                release_queue::State::ReleaseBacklog => {
+                    self.apply_release_event(release_queue::Event::Drained);
+                }
+                release_queue::State::ResourceStalled => {
+                    self.apply_release_event(release_queue::Event::Recover);
+                }
+                release_queue::State::Healthy => {}
+            }
+        }
+    }
+
+    fn transition_to_stalled(&mut self) {
+        if self.machine_state == release_queue::State::Healthy {
+            self.apply_release_event(release_queue::Event::SoftLimit);
+        }
+        if self.machine_state == release_queue::State::ReleaseBacklog {
+            self.apply_release_event(release_queue::Event::HardLimit);
+        }
+    }
+
+    fn apply_release_event(&mut self, event: release_queue::Event) {
+        self.machine_state = release_queue::apply(self.machine_state, event, |_| true)
+            .expect("release queue event follows generated state machine")
+            .state;
     }
 }
 
@@ -137,13 +236,17 @@ pub enum HostRequestState {
 struct HostRequest {
     module_id: u32,
     epoch: u64,
-    state: HostRequestState,
+    state: host_request::State,
     release: Option<ReleaseReservation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostPayload {
     I32(i32),
+    Bool(bool),
+    Opaque(u64),
+    Token(ResourceTokenHandle),
+    Snapshot(SnapshotHandle),
     Unit,
 }
 
@@ -203,6 +306,10 @@ pub enum HostTrap {
 }
 
 pub trait HostRegistry {
+    fn interface_hash(&self) -> Option<StableId> {
+        None
+    }
+
     fn call(
         &mut self,
         id: u32,
@@ -241,7 +348,10 @@ pub struct HostCompletionSender {
 
 impl HostCompletionSender {
     pub fn complete(&self, completion: HostCompletion) -> Result<(), HostRequestError> {
-        let mut queue = self.queue.lock().expect("completion queue mutex poisoned");
+        let mut queue = self
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if queue.closed || queue.reserved == 0 || queue.items.len() >= queue.capacity {
             return Err(HostRequestError::CompletionQueueFull);
         }
@@ -346,17 +456,26 @@ impl HostRequestManager {
             let mut queue = self
                 .completions
                 .lock()
-                .expect("completion queue mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if queue.items.len() + queue.reserved >= queue.capacity {
                 releases.cancel_reservation(release);
                 return Err(HostRequestError::CompletionQueueFull);
             }
             queue.reserved += 1;
         }
+        let submitted = host_request::apply(
+            host_request::State::Created,
+            host_request::Event::Submit,
+            |_| true,
+        )
+        .expect("generated host request submit transition exists");
+        let in_flight =
+            host_request::apply(submitted.state, host_request::Event::Dispatch, |_| true)
+                .expect("generated host request dispatch transition exists");
         match self.requests.try_allocate(HostRequest {
             module_id,
             epoch,
-            state: HostRequestState::Pending,
+            state: in_flight.state,
             release: Some(release),
         }) {
             Ok(handle) => Ok(HostRequestHandle(handle)),
@@ -388,13 +507,13 @@ impl HostRequestManager {
         &mut self,
         current_epoch: u64,
         releases: &mut ReleaseQueue,
-    ) -> Vec<(HostRequestHandle, i32)> {
+    ) -> Vec<(HostRequestHandle, HostPayload)> {
         let mut accepted = Vec::new();
         let completions = {
             let mut queue = self
                 .completions
                 .lock()
-                .expect("completion queue mutex poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             queue.items.drain(..).collect::<Vec<_>>()
         };
         for completion in completions {
@@ -406,18 +525,21 @@ impl HostRequestManager {
                 || request.epoch != current_epoch
                 || completion.epoch != current_epoch
                 || completion.module_id != request.module_id
-                || request.state != HostRequestState::Pending
+                || request.state != host_request::State::InFlight
             {
                 self.discarded_late_results += 1;
                 continue;
             }
-            request.state = HostRequestState::Completed;
-            let HostPayload::I32(value) = completion.payload else {
-                self.discarded_late_results += 1;
-                continue;
-            };
-            accepted.push((completion.request, value));
+            request.state =
+                host_request::apply(request.state, host_request::Event::Complete, |_| true)
+                    .expect("generated host request complete transition exists")
+                    .state;
+            accepted.push((completion.request, completion.payload));
             enqueue_request_release(self.realm_id, completion.request, request, releases);
+            request.state =
+                host_request::apply(request.state, host_request::Event::Release, |_| true)
+                    .expect("generated completed request release transition exists")
+                    .state;
             let terminal = RequestTerminalRecord {
                 request: completion.request,
                 state: HostRequestState::Completed,
@@ -438,22 +560,36 @@ impl HostRequestManager {
         detach: bool,
         releases: &mut ReleaseQueue,
     ) -> Result<(), HostRequestError> {
-        if self.requests.resolve(request.raw())?.state != HostRequestState::Pending {
+        if self.requests.resolve(request.raw())?.state != host_request::State::InFlight {
             return Err(HostRequestError::InvalidState);
         }
         if !detach {
             self.cancel_completion_reservation();
         }
         let request_state = self.requests.resolve_mut(request.raw())?;
-        request_state.state = if detach {
-            HostRequestState::Detached
-        } else {
-            HostRequestState::Cancelled
-        };
+        request_state.state = host_request::apply(
+            request_state.state,
+            host_request::Event::RequestCancel,
+            |_| true,
+        )
+        .expect("generated host request cancellation transition exists")
+        .state;
+        request_state.state =
+            host_request::apply(request_state.state, host_request::Event::Detach, |_| true)
+                .expect("generated host request detach transition exists")
+                .state;
         enqueue_request_release(self.realm_id, request, request_state, releases);
+        request_state.state =
+            host_request::apply(request_state.state, host_request::Event::Release, |_| true)
+                .expect("generated detached request release transition exists")
+                .state;
         let terminal = RequestTerminalRecord {
             request,
-            state: request_state.state,
+            state: if detach {
+                HostRequestState::Detached
+            } else {
+                HostRequestState::Cancelled
+            },
             epoch: request_state.epoch,
         };
         let _ = request_state;
@@ -471,7 +607,7 @@ impl HostRequestManager {
         let mut queue = self
             .completions
             .lock()
-            .expect("completion queue mutex poisoned");
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue.reserved = queue.reserved.saturating_sub(1);
     }
 
@@ -487,7 +623,7 @@ impl Drop for HostRequestManager {
     fn drop(&mut self) {
         self.completions
             .lock()
-            .expect("completion queue mutex poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .closed = true;
     }
 }
@@ -520,7 +656,7 @@ pub struct ResourceTokenHandle(RawHandle);
 #[derive(Debug)]
 struct ResourceToken {
     domain: RuntimeHostDomain,
-    released: bool,
+    state: resource_token::State,
     release: Option<ReleaseReservation>,
 }
 
@@ -550,9 +686,18 @@ impl ResourceTokenManager {
         releases: &mut ReleaseQueue,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
         let release = releases.reserve()?;
+        let acquired = resource_token::apply(
+            resource_token::State::Reserved,
+            resource_token::Event::HostAcquire,
+            |_| true,
+        )
+        .expect("generated resource acquire transition exists");
+        let published =
+            resource_token::apply(acquired.state, resource_token::Event::Publish, |_| true)
+                .expect("generated resource publish transition exists");
         match self.tokens.try_allocate(ResourceToken {
             domain,
-            released: false,
+            state: published.state,
             release: Some(release),
         }) {
             Ok(handle) => Ok(ResourceTokenHandle(handle)),
@@ -572,7 +717,10 @@ impl ResourceTokenManager {
             return Ok(false);
         }
         let token = self.tokens.resolve_mut(handle.0)?;
-        token.released = true;
+        token.state =
+            resource_token::apply(token.state, resource_token::Event::EnqueueRelease, |_| true)
+                .expect("generated resource enqueue transition exists")
+                .state;
         let reservation = token
             .release
             .take()
@@ -587,6 +735,10 @@ impl ResourceTokenManager {
                 domain,
             },
         )?;
+        token.state =
+            resource_token::apply(token.state, resource_token::Event::HostRelease, |_| true)
+                .expect("generated resource release transition exists")
+                .state;
         let _ = token;
         self.tokens.release(handle.0)?;
         if self.terminal.len() == self.terminal_capacity {
@@ -696,6 +848,15 @@ pub struct RuntimeResources {
     ownership: BTreeMap<TaskHandle, TaskResourceSet>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeResourceSnapshot {
+    pub requests: usize,
+    pub tokens: usize,
+    pub snapshots: usize,
+    pub release_records: usize,
+    pub release_reservations: usize,
+}
+
 impl RuntimeResources {
     #[must_use]
     pub fn new(realm_id: u32, capacity: u32, release_capacity: usize) -> Self {
@@ -726,11 +887,11 @@ impl RuntimeResources {
         self.requests
             .drain_completions(epoch, &mut self.releases)
             .into_iter()
-            .map(|(request, value)| {
+            .map(|(request, payload)| {
                 for resources in self.ownership.values_mut() {
                     resources.requests.remove(&request);
                 }
-                (request, HostPayload::I32(value))
+                (request, payload)
             })
             .collect()
     }
@@ -791,6 +952,25 @@ impl RuntimeResources {
     #[must_use]
     pub const fn discarded_late_results(&self) -> u64 {
         self.requests.discarded_late_results()
+    }
+
+    #[must_use]
+    pub(crate) fn reserved_capacities(&self) -> (usize, usize) {
+        (
+            self.requests.requests.reserved_capacity(),
+            self.releases.records.capacity(),
+        )
+    }
+
+    #[must_use]
+    pub fn model_snapshot(&self) -> RuntimeResourceSnapshot {
+        RuntimeResourceSnapshot {
+            requests: self.requests.requests.occupied_len(),
+            tokens: self.tokens.tokens.occupied_len(),
+            snapshots: self.snapshots.snapshots.occupied_len(),
+            release_records: self.releases.records.len(),
+            release_reservations: self.releases.reserved.len(),
+        }
     }
 }
 

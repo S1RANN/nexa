@@ -1,6 +1,7 @@
 use std::fmt;
 
-use nexa_bytecode::{FunctionEffect, Instruction, ValueType};
+use nexa_bytecode::{FunctionEffect, HostCallMode, Instruction, ValueType};
+use nexa_core::StableId;
 use nexa_verifier::VerifiedModule;
 
 use crate::{ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, RuntimeValue};
@@ -94,6 +95,21 @@ impl InterpreterContinuation {
         self.cumulative_exhausted
     }
 
+    pub(crate) fn write_resume_value(
+        &mut self,
+        destination: u16,
+        expected: Option<ValueType>,
+        value: RuntimeValue,
+    ) -> Result<(), InterpreterError> {
+        if runtime_value_type(value) != expected {
+            return Err(InterpreterError::TypeMismatch);
+        }
+        if expected.is_some() {
+            set_register(&mut self.arena, destination, value)?;
+        }
+        Ok(())
+    }
+
     pub fn gc_roots(&self, module: &VerifiedModule) -> Result<Vec<GcRef>, InterpreterError> {
         self.arena
             .iter_gc_roots(|function, pc| {
@@ -145,6 +161,14 @@ pub enum InterpreterOutcome {
         charge: ExecutionCharge,
         fuel: FuelState,
     },
+    HostPending {
+        continuation: InterpreterContinuation,
+        request: crate::HostRequestHandle,
+        destination: u16,
+        expected_type: Option<ValueType>,
+        charge: ExecutionCharge,
+        fuel: FuelState,
+    },
     Trapped {
         trap: Trap,
         charge: ExecutionCharge,
@@ -175,6 +199,9 @@ pub enum InterpreterError {
     FellOffFunction,
     ContinuationLimit(FrameError),
     RootMapMismatch,
+    HostUnavailable,
+    Host(crate::HostTrap),
+    Migration(String),
 }
 
 impl fmt::Display for InterpreterError {
@@ -197,14 +224,14 @@ impl From<FrameError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 18],
+    costs: [u16; 24],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 18],
+            costs: [1; 24],
         }
     }
 }
@@ -217,6 +244,38 @@ impl OpcodeCostTable {
 }
 
 pub struct CheckedInterpreter;
+
+pub trait InterpreterHost {
+    fn call(
+        &mut self,
+        import: u32,
+        arguments: &[RuntimeValue],
+    ) -> Result<InterpreterHostOutcome, crate::HostTrap>;
+}
+
+pub trait InterpreterMigration {
+    fn old_get(&mut self, stable_id: StableId, expected: ValueType)
+    -> Result<RuntimeValue, String>;
+    fn new_create(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+    ) -> Result<RuntimeValue, String>;
+    fn new_set(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        value: RuntimeValue,
+    ) -> Result<(), String>;
+    fn remap(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String>;
+    fn delete(&mut self, stable_id: StableId) -> Result<(), String>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InterpreterHostOutcome {
+    Immediate(RuntimeValue),
+    Pending(crate::HostRequestHandle),
+}
 
 impl CheckedInterpreter {
     pub fn start(
@@ -235,7 +294,17 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs)
+        Self::execute(module, continuation, fuel, costs, None, None)
+    }
+
+    pub fn poll_with_host(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        host: &mut dyn InterpreterHost,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(module, continuation, fuel, costs, Some(host), None)
     }
 
     pub fn run(
@@ -257,6 +326,31 @@ impl CheckedInterpreter {
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
             &OpcodeCostTable::default(),
+        )
+    }
+
+    pub fn run_migration(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: u64,
+        migration: &mut dyn InterpreterMigration,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        let limits = FrameLimits::default();
+        let continuation = Self::start(
+            module,
+            function,
+            arguments,
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )?;
+        Self::execute(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            &OpcodeCostTable::default(),
+            None,
+            Some(migration),
         )
     }
 
@@ -321,6 +415,12 @@ impl CheckedInterpreter {
                             total.fuel_used = total.fuel_used.saturating_add(charge.fuel_used);
                         }
                         InterpreterOutcome::Trapped { trap, .. } => return Ok(Err(trap)),
+                        InterpreterOutcome::HostPending { .. } => {
+                            return Ok(Err(Trap {
+                                kind: TrapKind::CleanupBudgetExceeded,
+                                message: "cleanup attempted a host call".into(),
+                            }));
+                        }
                         InterpreterOutcome::Suspended { .. } => {
                             return Ok(Err(Trap {
                                 kind: TrapKind::CleanupBudgetExceeded,
@@ -347,6 +447,8 @@ impl CheckedInterpreter {
         mut continuation: InterpreterContinuation,
         mut fuel: FuelState,
         costs: &OpcodeCostTable,
+        mut host: Option<&mut dyn InterpreterHost>,
+        mut migration: Option<&mut dyn InterpreterMigration>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         continuation.suspend_reason = None;
         continuation.cumulative_exhausted = false;
@@ -364,7 +466,20 @@ impl CheckedInterpreter {
                 .code
                 .get(frame.pc as usize)
                 .ok_or(InterpreterError::FellOffFunction)?;
-            let instruction_cost = costs.cost(instruction);
+            let instruction_cost = costs.cost(instruction).saturating_add(
+                if let Instruction::HostCall { import, .. } = instruction {
+                    u64::from(
+                        module
+                            .module()
+                            .host_imports
+                            .get(import as usize)
+                            .ok_or(InterpreterError::HostUnavailable)?
+                            .fuel_cost,
+                    )
+                } else {
+                    0
+                },
+            );
             let settlement = pending_cost.saturating_add(instruction_cost);
             if frame.pc == 0 || is_safepoint(instruction, frame.pc) {
                 if settlement > fuel.slice_remaining
@@ -489,6 +604,121 @@ impl CheckedInterpreter {
                     continuation
                         .arena
                         .set_frame_pc(caller_index, frame.pc + 1)?;
+                }
+                Instruction::HostCall {
+                    import,
+                    args_base,
+                    args_count,
+                    dst,
+                } => {
+                    let metadata = module
+                        .module()
+                        .host_imports
+                        .get(import as usize)
+                        .ok_or(InterpreterError::HostUnavailable)?;
+                    if args_count > 8 {
+                        return Err(InterpreterError::ArgumentCount);
+                    }
+                    let mut arguments = [RuntimeValue::Unit; 8];
+                    for offset in 0..args_count {
+                        arguments[usize::from(offset)] = register(
+                            &continuation.arena,
+                            args_base
+                                .checked_add(offset)
+                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?,
+                        )?;
+                    }
+                    let outcome = host
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .call(import, &arguments[..usize::from(args_count)])
+                        .map_err(InterpreterError::Host)?;
+                    match outcome {
+                        InterpreterHostOutcome::Immediate(value) => {
+                            if metadata.result != runtime_value_type(value) {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            if metadata.result.is_some() {
+                                set_register(&mut continuation.arena, dst, value)?;
+                            }
+                            increment_pc(&mut continuation.arena)?;
+                        }
+                        InterpreterHostOutcome::Pending(request) => {
+                            if metadata.mode != HostCallMode::Async {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                            increment_pc(&mut continuation.arena)?;
+                            continuation.suspend_reason = Some(SuspendReason::HostRequest);
+                            continuation.pending_fuel = pending_cost;
+                            return Ok(InterpreterOutcome::HostPending {
+                                continuation,
+                                request,
+                                destination: dst,
+                                expected_type: metadata.result,
+                                charge,
+                                fuel,
+                            });
+                        }
+                    }
+                }
+                Instruction::StateOldGet { stable_id, ty, dst } => {
+                    let value = migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .old_get(stable_id, ty)
+                        .map_err(InterpreterError::Migration)?;
+                    if runtime_value_type(value) != Some(ty) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateNewCreate {
+                    stable_id,
+                    type_id,
+                    dst,
+                } => {
+                    let value = migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .new_create(stable_id, type_id)
+                        .map_err(InterpreterError::Migration)?;
+                    if runtime_value_type(value) != Some(ValueType::Named(type_id)) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateNewSet {
+                    object,
+                    field_id,
+                    source,
+                } => {
+                    let object = register(&continuation.arena, object)?;
+                    let value = register(&continuation.arena, source)?;
+                    migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .new_set(object, field_id, value)
+                        .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleRemap { old_id, target } => {
+                    let target = register(&continuation.arena, target)?;
+                    migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .remap(old_id, target)
+                        .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateDelete { stable_id } => {
+                    migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .delete(stable_id)
+                        .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::Return { source } => {
                     settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
@@ -685,12 +915,23 @@ fn increment_pc(arena: &mut FrameArena) -> Result<(), InterpreterError> {
     Ok(())
 }
 
-const fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
+fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
     match value {
         RuntimeValue::I32(_) => Some(ValueType::I32),
         RuntimeValue::Bool(_) => Some(ValueType::Bool),
         RuntimeValue::Ref(_) => Some(ValueType::Ref),
-        RuntimeValue::NamedRef { type_id, .. } => Some(ValueType::Named(type_id)),
+        RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
+            Some(ValueType::Named(type_id))
+        }
+        RuntimeValue::HostRequest(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
+            "HostRequest",
+        ))),
+        RuntimeValue::ResourceToken(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
+            "ResourceToken",
+        ))),
+        RuntimeValue::Snapshot(_) => {
+            Some(ValueType::Named(nexa_core::StableId::from_name("Snapshot")))
+        }
         RuntimeValue::Unit => None,
     }
 }
@@ -708,6 +949,7 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         Instruction::Safepoint
         | Instruction::Yield
         | Instruction::Call { .. }
+        | Instruction::HostCall { .. }
         | Instruction::Return { .. }
         | Instruction::ReturnVoid
         | Instruction::CleanupReturn
@@ -737,6 +979,12 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::DeferPush { .. } => 15,
         Instruction::DeferPop => 16,
         Instruction::CleanupReturn => 17,
+        Instruction::HostCall { .. } => 18,
+        Instruction::StateOldGet { .. } => 19,
+        Instruction::StateNewCreate { .. } => 20,
+        Instruction::StateNewSet { .. } => 21,
+        Instruction::StateHandleRemap { .. } => 22,
+        Instruction::StateDelete { .. } => 23,
     }
 }
 

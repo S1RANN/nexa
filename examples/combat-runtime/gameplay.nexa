@@ -1,5 +1,9 @@
-@stateful class EnemyBrain {
+module game.combat;
+import engine;
+
+@stateful(1) class EnemyBrain {
     phase: i32;
+    legacy_target: i32;
 }
 
 fn identity(value: i32) -> i32 {
@@ -7,5 +11,8 @@ fn identity(value: i32) -> i32 {
 }
 
 task fn update(value: i32) -> i32 {
-    return await identity(value);
+    let lock = engine.action_lock(value);
+    let snapshot = engine.world_snapshot();
+    await engine.animation(value);
+    return engine.update(value, 1);
 }

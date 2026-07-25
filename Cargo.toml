@@ -1,6 +1,18 @@
 [workspace]
 resolver = "2"
 members = ["crates/*", "examples/combat-runtime"]
+exclude = [
+    "tools/allocation-observer",
+    "fuzz/bytecode",
+    "fuzz/bytecode-decode",
+    "fuzz/verifier",
+    "fuzz/root-map",
+    "fuzz/wcet",
+    "fuzz/host-import",
+    "fuzz/state-schema",
+    "fuzz/source",
+    "fuzz/idl",
+]
 
 [workspace.package]
 version = "0.1.0"

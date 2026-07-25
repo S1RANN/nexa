@@ -3,7 +3,9 @@ use std::path::{Path, PathBuf};
 
 use nexa_machine::{MachineSpec, stable_id_map};
 use nexa_model::explore;
-use nexa_model::system::{SystemConfig, explore_task_scope};
+use nexa_model::system::{
+    RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
+};
 
 const REQUIRED_BASELINE: &[&str] = &[
     "baseline/BASELINE_INDEX.md",
@@ -423,18 +425,29 @@ fn check_models() -> Result<(), String> {
             system_report.failures
         ));
     }
+    let realm_config = RealmSystemConfig::parse(include_str!(
+        "../../../specs/systems/realm_runtime.system.spec"
+    ))?;
+    let realm_report = explore_realm_runtime(realm_config);
+    if !realm_report.failures.is_empty() {
+        return Err(format!(
+            "RealmRuntime system model failed: {:?}",
+            realm_report.failures
+        ));
+    }
     std::fs::write(
         artifact,
         format!(
-            "success: {} machine snapshots, {} task/scope worlds\n",
-            snapshot_count, system_report.visited_worlds
+            "success: {} machine snapshots, {} task/scope worlds, {} realm worlds\n",
+            snapshot_count, system_report.visited_worlds, realm_report.visited_worlds
         ),
     )
     .map_err(|error| format!("could not write model artifact: {error}"))?;
     println!(
-        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} system worlds",
+        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds",
         specs.len(),
-        system_report.visited_worlds
+        system_report.visited_worlds,
+        realm_report.visited_worlds
     );
     Ok(())
 }

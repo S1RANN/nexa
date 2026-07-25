@@ -21,6 +21,7 @@ mod machines;
 
 pub use allocation::{AllocationSnapshot, allocation_snapshot};
 pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
+pub use nexa_core::StableId;
 
 #[cfg(test)]
 mod micro;
@@ -32,19 +33,20 @@ pub use host::{
     CopyBuffer, HostArgs, HostCallOutcome, HostCompletion, HostCompletionSender, HostPayload,
     HostRegistry, HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue,
     ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceContext,
-    ResourceTokenHandle, RuntimeHostDomain, RuntimeResources, ScriptFunction, SnapshotHandle,
-    TaskResourceSet,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostDomain, RuntimeResourceSnapshot, RuntimeResources,
+    ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
-    InterpreterOutcome, OpcodeCostTable, SuspendReason, Trap, TrapKind,
+    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, OpcodeCostTable, SuspendReason,
+    Trap, TrapKind,
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
     CancelReason, ModuleHandle, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
-    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+    RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
-pub use reload::{ReloadError, StateHandle, StateValue, StatefulError};
+pub use reload::{ReloadError, StateHandle, StateObject, StateValue, StatefulError};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};

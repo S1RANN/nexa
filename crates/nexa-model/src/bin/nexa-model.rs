@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
-use nexa_model::system::{SystemConfig, explore_task_scope};
+use nexa_model::system::{
+    RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
+};
 
 fn main() {
     let mut arguments = std::env::args().skip(1);
@@ -80,6 +82,19 @@ fn run(path: &Path) -> Result<(), String> {
         println!(
             "TaskScope: {} worlds, {} rejected operations",
             report.visited_worlds, report.rejected_operations
+        );
+        let realm = explore_realm_runtime(RealmSystemConfig::parse(include_str!(
+            "../../../../specs/systems/realm_runtime.system.spec"
+        ))?);
+        if !realm.failures.is_empty() {
+            return Err(format!(
+                "RealmRuntime system model failed: {:?}",
+                realm.failures
+            ));
+        }
+        println!(
+            "RealmRuntime: {} worlds, {} rejected operations",
+            realm.visited_worlds, realm.rejected_operations
         );
     }
     Ok(())

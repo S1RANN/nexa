@@ -56,6 +56,22 @@ impl RuntimeTrace {
         self.records.push_back(record);
     }
 
+    pub fn record_with(&mut self, create: impl FnOnce() -> TraceRecord) {
+        if self.enabled {
+            self.record(create());
+        }
+    }
+
+    #[must_use]
+    pub const fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    #[must_use]
+    pub fn reserved_capacity(&self) -> usize {
+        self.records.capacity()
+    }
+
     #[must_use]
     pub fn records(&self) -> TraceRecords<'_> {
         let (first, second) = self.records.as_slices();

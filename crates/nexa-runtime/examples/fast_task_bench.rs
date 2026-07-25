@@ -1,13 +1,16 @@
 use std::hint::black_box;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
-    FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
+    FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
+    Signature, ValueType,
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostRegistry, HostTrap, HostValue, PollResult, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits,
+    HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry, HostRequestHandle,
+    HostTrap, HostValue, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHostDomain,
+    RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -27,10 +30,15 @@ struct Stats {
 
 #[allow(clippy::too_many_lines)]
 fn main() {
-    let samples = std::env::var("NEXA_BENCH_SAMPLES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(DEFAULT_SAMPLES);
+    let smoke = std::env::args().any(|argument| argument == "--smoke");
+    let samples = if smoke {
+        10
+    } else {
+        std::env::var("NEXA_BENCH_SAMPLES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(DEFAULT_SAMPLES)
+    };
     let mut results = Vec::new();
     results.push(bench("rust_direct", samples, || {
         black_box(20_i32 + 22);
@@ -105,7 +113,7 @@ fn main() {
     let (mut realm, module, scope) = loaded(yielded.clone());
     let task = call(&mut realm, module, scope, 1);
     let mut registry = AddRegistry;
-    results.push(bench("nexa_sync_host_call", samples, || {
+    results.push(bench("generated_rust_thunk_direct_call", samples, || {
         let outcome = realm
             .with_resource_context(task, |context| {
                 registry.call(
@@ -119,23 +127,65 @@ fn main() {
         black_box(outcome);
     }));
 
+    let host_module = host_call_module();
+    let mut host_realm =
+        RealmRuntime::with_host_registry(RealmConfig::default(), Box::new(AddRegistry));
+    let host_module = host_realm.load_module(host_module, HOST, SCHEMA).unwrap();
+    let host_scope = host_realm.create_scope(None).unwrap();
+    results.push(bench("nexa_host_call_opcode_immediate", samples, || {
+        let task = host_realm
+            .call(
+                host_module,
+                0,
+                &[RuntimeValue::I32(20), RuntimeValue::I32(22)],
+                StepConfig {
+                    owner: host_scope,
+                    priority: 1,
+                    fuel_slice: 64,
+                    cumulative_budget: 1_024,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        black_box(host_realm.poll_task(task, 64).unwrap());
+    }));
+
     let host_samples = samples.min(200);
-    results.push(bench("nexa_async_host_call", host_samples, || {
-        let (mut realm, module, scope) = loaded(yielded.clone());
+    let async_module = async_host_call_module();
+    results.push(bench("nexa_host_call_opcode_async", host_samples, || {
+        let pending = Arc::new(Mutex::new(None));
+        let mut realm = RealmRuntime::with_host_registry(
+            RealmConfig::default(),
+            Box::new(AsyncRegistry {
+                pending: Arc::clone(&pending),
+            }),
+        );
+        let module = realm
+            .load_module(async_module.clone(), HOST, SCHEMA)
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
         let task = call(&mut realm, module, scope, 1);
-        let request = realm.create_host_request(task).unwrap();
-        realm.wait_for_request(task, request).unwrap();
+        assert_eq!(
+            realm.poll_task(task, 64).unwrap(),
+            PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
+        );
+        let request = pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap();
         realm
             .completion_sender()
-            .complete(nexa_runtime::HostCompletion {
+            .complete(HostCompletion {
                 realm_id: realm.realm_id(),
                 module_id: module.raw().index,
                 epoch: realm.module_epoch(module).unwrap(),
                 request,
-                payload: nexa_runtime::HostPayload::I32(1),
+                payload: HostPayload::I32(1),
             })
             .unwrap();
-        black_box(realm.tick(nexa_runtime::TickBudget::default()).unwrap());
+        black_box(realm.tick(TickBudget::default()).unwrap());
+        assert!(realm.terminal_record(task).is_some());
     }));
 
     results.push(bench("nexa_resource_token", host_samples, || {
@@ -198,11 +248,12 @@ fn main() {
         nexa_runtime::allocation_snapshot() - nexa_runtime::AllocationSnapshot::default();
     assert_eq!(allocations.promotion, 0);
     println!(
-        "{{\"toolchain\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\"samples\":{},\
+        "{{\"benchmark_version\":2,\"toolchain\":\"{}\",\"os\":\"{}\",\"arch\":\"{}\",\"samples\":{},\
          \"allocation_events\":{{\"admission\":{},\"first_slice\":{},\"promotion\":{},\"resume\":{},\"terminal_cleanup\":{}}},\
          \"fuel_costs\":{{\"fast_complete\":1,\"yield_resume\":1,\"nested_call\":3}},\
+         \"signals\":{{\"H1\":\"measured\",\"H2\":\"inconclusive\",\"H3\":\"measured\"}},\
          \"promotion_rate\":1.0,\"gc_measured_separately\":true,\"trace_comparison\":true,\"results\":[{}]}}",
-        option_env!("RUSTC_VERSION").unwrap_or("rustc-1.97.0"),
+        option_env!("RUSTC_VERSION").unwrap_or("rustc-1.97.1"),
         std::env::consts::OS,
         std::env::consts::ARCH,
         samples,
@@ -220,6 +271,66 @@ fn main() {
             .collect::<Vec<_>>()
             .join(",")
     );
+}
+
+fn host_call_module() -> VerifiedModule {
+    let mut function = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::I32, ValueType::I32],
+            result: Some(ValueType::I32),
+        },
+        3,
+    );
+    function
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::HostCall {
+            import: 0,
+            args_base: 0,
+            args_count: 2,
+            dst: 2,
+        })
+        .emit(Instruction::Return { source: 2 });
+    let mut module = ModuleBuilder::new();
+    module.metadata(HOST, SCHEMA);
+    module.host_import(HostImport {
+        stable_id: StableId::from_name("BenchHost::add"),
+        parameters: vec![ValueType::I32, ValueType::I32],
+        result: Some(ValueType::I32),
+        mode: HostCallMode::Immediate,
+        fuel_cost: 1,
+    });
+    module.function(function.finish().unwrap());
+    verify(module.finish(), VerifierLimits::default()).unwrap()
+}
+
+fn async_host_call_module() -> VerifiedModule {
+    let mut function = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::I32],
+            result: Some(ValueType::I32),
+        },
+        2,
+    );
+    function
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::HostCall {
+            import: 0,
+            args_base: 0,
+            args_count: 1,
+            dst: 1,
+        })
+        .emit(Instruction::Return { source: 1 });
+    let mut module = ModuleBuilder::new();
+    module.metadata(HOST, SCHEMA);
+    module.host_import(HostImport {
+        stable_id: StableId::from_name("BenchHost::async"),
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+        mode: HostCallMode::Async,
+        fuel_cost: 1,
+    });
+    module.function(function.finish().unwrap());
+    verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
 fn build_module(
@@ -359,6 +470,31 @@ impl HostRegistry for AddRegistry {
             return Err(HostTrap::Type);
         };
         Ok(HostCallOutcome::Immediate(HostValue::I32(lhs + rhs)))
+    }
+}
+
+struct AsyncRegistry {
+    pending: Arc<Mutex<Option<HostRequestHandle>>>,
+}
+
+impl HostRegistry for AsyncRegistry {
+    fn call(
+        &mut self,
+        id: u32,
+        context: &mut ResourceContext<'_>,
+        args: HostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        if id != 0 || args.len() != 1 {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        let request = context
+            .create_request()
+            .map_err(|error| HostTrap::Host(error.to_string()))?;
+        *self
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(request);
+        Ok(HostCallOutcome::Pending(request))
     }
 }
 

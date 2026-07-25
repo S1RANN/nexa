@@ -4,9 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use nexa_bytecode::{
-    Function, FunctionEffect, Instruction, Module, ModuleBuilder, RootMap, Signature, ValueType,
+    Function, FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder,
+    RootMap, ScriptExport, Signature, StateField, StateSchema, StateType, ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{FileId, SourceSpan, StableId};
+use nexa_idl::{Idl, TypeRef};
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +31,9 @@ pub enum TokenKind {
     Enum,
     Class,
     Stateful,
+    Module,
+    Import,
+    In,
     True,
     False,
     Ident(String),
@@ -46,6 +51,8 @@ pub enum TokenKind {
     Star,
     Equal,
     At,
+    Dot,
+    DotDot,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -86,7 +93,36 @@ impl fmt::Display for CompileError {
 impl std::error::Error for CompileError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompileDiagnostic {
+    pub message: String,
+    pub span: SourceSpan,
+}
+
+impl CompileError {
+    #[must_use]
+    pub fn diagnostic(&self, file: FileId) -> CompileDiagnostic {
+        let (start, end) = match self {
+            Self::UnexpectedCharacter { offset, character } => {
+                (*offset, offset.saturating_add(character.len_utf8()))
+            }
+            Self::UnexpectedToken { offset, .. } => (*offset, offset.saturating_add(1)),
+            _ => (0, 0),
+        };
+        CompileDiagnostic {
+            message: self.to_string(),
+            span: SourceSpan::new(
+                file,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstModule {
+    pub name: Option<String>,
+    pub imports: Vec<String>,
     pub types: Vec<AstTypeDeclaration>,
     pub functions: Vec<AstFunction>,
 }
@@ -95,6 +131,7 @@ pub struct AstModule {
 pub struct AstTypeDeclaration {
     pub name: String,
     pub kind: AstTypeKind,
+    pub version: u32,
     pub fields: Vec<(String, AstType)>,
     pub variants: Vec<String>,
 }
@@ -171,6 +208,17 @@ pub enum BinaryOp {
 #[derive(Clone, Debug)]
 pub struct HirModule {
     functions: Vec<HirFunction>,
+    host_functions: BTreeMap<String, HostFunction>,
+    host_interface_hash: Option<StableId>,
+    schema_hash: Option<StableId>,
+    state_schema: StateSchema,
+}
+
+#[derive(Clone, Debug)]
+struct HostFunction {
+    import: u32,
+    signature: Signature,
+    metadata: HostImport,
 }
 
 #[derive(Clone, Debug)]
@@ -201,6 +249,11 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             '*' => TokenKind::Star,
             '=' => TokenKind::Equal,
             '@' => TokenKind::At,
+            '.' if chars.peek().is_some_and(|(_, next)| *next == '.') => {
+                chars.next();
+                TokenKind::DotDot
+            }
+            '.' => TokenKind::Dot,
             '-' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
                 chars.next();
                 TokenKind::Arrow
@@ -248,6 +301,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "enum" => TokenKind::Enum,
                     "class" => TokenKind::Class,
                     "stateful" => TokenKind::Stateful,
+                    "module" => TokenKind::Module,
+                    "import" => TokenKind::Import,
+                    "in" => TokenKind::In,
                     "true" => TokenKind::True,
                     "false" => TokenKind::False,
                     _ => TokenKind::Ident(text),
@@ -273,6 +329,18 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn module(mut self) -> Result<AstModule, CompileError> {
+        let name = if self.take(&TokenKind::Module) {
+            let name = self.qualified_ident()?;
+            self.expect(&TokenKind::Semicolon, ";")?;
+            Some(name)
+        } else {
+            None
+        };
+        let mut imports = Vec::new();
+        while self.take(&TokenKind::Import) {
+            imports.push(self.qualified_ident()?);
+            self.expect(&TokenKind::Semicolon, ";")?;
+        }
         let mut types = Vec::new();
         let mut functions = Vec::new();
         while self.cursor < self.tokens.len() {
@@ -285,15 +353,35 @@ impl Parser<'_> {
                 functions.push(self.function()?);
             }
         }
-        Ok(AstModule { types, functions })
+        Ok(AstModule {
+            name,
+            imports,
+            types,
+            functions,
+        })
     }
 
     fn type_declaration(&mut self) -> Result<AstTypeDeclaration, CompileError> {
-        let stateful = if self.take(&TokenKind::At) {
+        let (stateful, version) = if self.take(&TokenKind::At) {
             self.expect(&TokenKind::Stateful, "stateful")?;
-            true
+            let version = if self.take(&TokenKind::LParen) {
+                let version = match self.tokens.get(self.cursor).map(|token| &token.kind) {
+                    Some(TokenKind::Integer(version)) => {
+                        let version = u32::try_from(*version)
+                            .map_err(|_| self.unexpected("positive schema version"))?;
+                        self.cursor += 1;
+                        version
+                    }
+                    _ => return Err(self.unexpected("schema version")),
+                };
+                self.expect(&TokenKind::RParen, ")")?;
+                version
+            } else {
+                1
+            };
+            (true, version)
         } else {
-            false
+            (false, 0)
         };
         let kind = if self.take(&TokenKind::Struct) {
             AstTypeKind::Struct
@@ -326,6 +414,7 @@ impl Parser<'_> {
         Ok(AstTypeDeclaration {
             name,
             kind,
+            version,
             fields,
             variants,
         })
@@ -399,7 +488,33 @@ impl Parser<'_> {
                 else_body,
             });
         }
-        if self.take(&TokenKind::While) || self.take(&TokenKind::For) {
+        if self.take(&TokenKind::For) {
+            let variable = self.ident()?;
+            self.expect(&TokenKind::In, "in")?;
+            let TokenKind::Integer(start) = self.next_kind()? else {
+                return Err(self.unexpected("static range start"));
+            };
+            self.expect(&TokenKind::DotDot, "..")?;
+            let TokenKind::Integer(end) = self.next_kind()? else {
+                return Err(self.unexpected("static range end"));
+            };
+            if end < start || end.saturating_sub(start) > 1_024 {
+                return Err(CompileError::InvalidEffect);
+            }
+            let body = self.block()?;
+            let mut expanded = Vec::new();
+            for value in start..end {
+                let mut iteration = body.clone();
+                substitute_name_in_statements(&mut iteration, &variable, value);
+                expanded.extend(iteration);
+            }
+            return Ok(AstStatement::If {
+                condition: AstExpression::Bool(true),
+                then_body: expanded,
+                else_body: Vec::new(),
+            });
+        }
+        if self.take(&TokenKind::While) {
             let condition = self.expression(0)?;
             return Ok(AstStatement::While {
                 condition,
@@ -422,23 +537,30 @@ impl Parser<'_> {
             TokenKind::Integer(value) => AstExpression::Integer(value),
             TokenKind::True => AstExpression::Bool(true),
             TokenKind::False => AstExpression::Bool(false),
-            TokenKind::Ident(name) if self.take(&TokenKind::LParen) => {
-                let mut arguments = Vec::new();
-                if !self.at(&TokenKind::RParen) {
-                    loop {
-                        arguments.push(self.expression(0)?);
-                        if !self.take(&TokenKind::Comma) {
-                            break;
+            TokenKind::Ident(mut name) => {
+                while self.take(&TokenKind::Dot) {
+                    name.push('.');
+                    name.push_str(&self.ident()?);
+                }
+                if self.take(&TokenKind::LParen) {
+                    let mut arguments = Vec::new();
+                    if !self.at(&TokenKind::RParen) {
+                        loop {
+                            arguments.push(self.expression(0)?);
+                            if !self.take(&TokenKind::Comma) {
+                                break;
+                            }
                         }
                     }
-                }
-                self.expect(&TokenKind::RParen, ")")?;
-                AstExpression::Call {
-                    function: name,
-                    arguments,
+                    self.expect(&TokenKind::RParen, ")")?;
+                    AstExpression::Call {
+                        function: name,
+                        arguments,
+                    }
+                } else {
+                    AstExpression::Name(name)
                 }
             }
-            TokenKind::Ident(name) => AstExpression::Name(name),
             TokenKind::LParen => {
                 let expression = self.expression(0)?;
                 self.expect(&TokenKind::RParen, ")")?;
@@ -491,6 +613,15 @@ impl Parser<'_> {
         }
     }
 
+    fn qualified_ident(&mut self) -> Result<String, CompileError> {
+        let mut name = self.ident()?;
+        while self.take(&TokenKind::Dot) {
+            name.push('.');
+            name.push_str(&self.ident()?);
+        }
+        Ok(name)
+    }
+
     fn next_kind(&mut self) -> Result<TokenKind, CompileError> {
         let token = self
             .tokens
@@ -537,9 +668,93 @@ impl Parser<'_> {
     }
 }
 
+fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, value: i32) {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind {
+                value: expression, ..
+            }
+            | AstStatement::Return(expression)
+            | AstStatement::Expression(expression)
+            | AstStatement::Defer(expression) => substitute_name(expression, name, value),
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                substitute_name(condition, name, value);
+                substitute_name_in_statements(then_body, name, value);
+                substitute_name_in_statements(else_body, name, value);
+            }
+            AstStatement::While { condition, body } => {
+                substitute_name(condition, name, value);
+                substitute_name_in_statements(body, name, value);
+            }
+        }
+    }
+}
+
+fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
+    match expression {
+        AstExpression::Name(current) if current == name => {
+            *expression = AstExpression::Integer(value);
+        }
+        AstExpression::Binary { lhs, rhs, .. } => {
+            substitute_name(lhs, name, value);
+            substitute_name(rhs, name, value);
+        }
+        AstExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                substitute_name(argument, name, value);
+            }
+        }
+        AstExpression::Await(expression) => substitute_name(expression, name, value),
+        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+    }
+}
+
 pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> {
+    resolve_and_typecheck_with_hosts(ast, BTreeMap::new(), None, None)
+}
+
+#[allow(clippy::too_many_lines)]
+fn resolve_and_typecheck_with_hosts(
+    ast: AstModule,
+    host_functions: BTreeMap<String, HostFunction>,
+    host_interface_hash: Option<StableId>,
+    schema_hash: Option<StableId>,
+) -> Result<HirModule, CompileError> {
+    let state_schema = StateSchema {
+        types: ast
+            .types
+            .iter()
+            .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
+            .map(|declaration| StateType {
+                stable_id: StableId::from_name(&declaration.name),
+                version: declaration.version,
+                fields: declaration
+                    .fields
+                    .iter()
+                    .map(|(name, ty)| StateField {
+                        stable_id: StableId::from_parts(&[&declaration.name, "::", name]),
+                        ty: lower_type(ty),
+                    })
+                    .collect(),
+            })
+            .collect(),
+    };
     let mut known_types = [
-        "string", "rune", "Array", "Map", "Option", "Result", "Task", "Buffer",
+        "string",
+        "rune",
+        "Array",
+        "Map",
+        "Option",
+        "Result",
+        "Task",
+        "Buffer",
+        "HostRequest",
+        "ResourceToken",
+        "Snapshot",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -554,8 +769,20 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
             validate_type(ty, &known_types)?;
         }
     }
-    let mut signatures = BTreeMap::new();
+    let mut signatures = host_functions
+        .iter()
+        .map(|(name, function)| (name.clone(), function.signature.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut suspending_functions = host_functions
+        .iter()
+        .filter_map(|(name, function)| {
+            (function.metadata.mode == HostCallMode::Async).then_some(name.clone())
+        })
+        .collect::<BTreeSet<_>>();
     for function in &ast.functions {
+        if function.effect == FunctionEffect::Task {
+            suspending_functions.insert(function.name.clone());
+        }
         for (_, ty) in &function.parameters {
             validate_type(ty, &known_types)?;
         }
@@ -577,6 +804,7 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
     }
     let mut functions = Vec::new();
     for mut function in ast.functions {
+        validate_awaits(&function.body, &suspending_functions)?;
         resolve_local_scopes(&mut function)?;
         let signature = signatures[&function.name].clone();
         let mut locals = BTreeMap::new();
@@ -614,7 +842,78 @@ pub fn resolve_and_typecheck(ast: AstModule) -> Result<HirModule, CompileError> 
             locals,
         });
     }
-    Ok(HirModule { functions })
+    Ok(HirModule {
+        functions,
+        host_functions,
+        host_interface_hash,
+        schema_hash,
+        state_schema,
+    })
+}
+
+fn validate_awaits(
+    statements: &[AstStatement],
+    suspending_functions: &BTreeSet<String>,
+) -> Result<(), CompileError> {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { value, .. }
+            | AstStatement::Return(value)
+            | AstStatement::Expression(value)
+            | AstStatement::Defer(value) => {
+                validate_await_expression(value, suspending_functions, false)?;
+            }
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                validate_await_expression(condition, suspending_functions, false)?;
+                validate_awaits(then_body, suspending_functions)?;
+                validate_awaits(else_body, suspending_functions)?;
+            }
+            AstStatement::While { condition, body } => {
+                validate_await_expression(condition, suspending_functions, false)?;
+                validate_awaits(body, suspending_functions)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_await_expression(
+    expression: &AstExpression,
+    suspending_functions: &BTreeSet<String>,
+    awaited: bool,
+) -> Result<(), CompileError> {
+    match expression {
+        AstExpression::Await(inner) => {
+            let AstExpression::Call { function, .. } = inner.as_ref() else {
+                return Err(CompileError::InvalidEffect);
+            };
+            if !suspending_functions.contains(function) {
+                return Err(CompileError::InvalidEffect);
+            }
+            validate_await_expression(inner, suspending_functions, true)
+        }
+        AstExpression::Call {
+            function,
+            arguments,
+        } => {
+            if suspending_functions.contains(function) && !awaited {
+                return Err(CompileError::InvalidEffect);
+            }
+            for argument in arguments {
+                validate_await_expression(argument, suspending_functions, false)?;
+            }
+            Ok(())
+        }
+        AstExpression::Binary { lhs, rhs, .. } => {
+            validate_await_expression(lhs, suspending_functions, false)?;
+            validate_await_expression(rhs, suspending_functions, false)
+        }
+        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => Ok(()),
+    }
 }
 
 fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> {
@@ -909,6 +1208,15 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
         })
         .collect::<BTreeMap<_, _>>();
     let mut module = ModuleBuilder::new();
+    let mut host_functions = hir.host_functions.values().collect::<Vec<_>>();
+    host_functions.sort_by_key(|function| function.import);
+    for function in host_functions {
+        module.host_import(function.metadata.clone());
+    }
+    if let (Some(host), Some(schema)) = (hir.host_interface_hash, hir.schema_hash) {
+        module.metadata(host, schema);
+    }
+    module.state_schema(hir.state_schema.clone());
     for function in &hir.functions {
         let mut code = Vec::new();
         let temporary =
@@ -918,6 +1226,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             temporary,
             &function.locals,
             &function_ids,
+            &hir.host_functions,
             &mut code,
         )?;
         let registers =
@@ -950,6 +1259,14 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
                             .result
                             .is_some_and(ValueType::is_reference),
                     ),
+                    Instruction::HostCall { import, dst, .. } => (
+                        *dst,
+                        hir.host_functions
+                            .values()
+                            .find(|function| function.import == *import)
+                            .and_then(|function| function.metadata.result)
+                            .is_some_and(ValueType::is_reference),
+                    ),
                     _ => continue,
                 };
                 if is_reference && !root_bitmap[usize::from(destination)] {
@@ -959,13 +1276,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             }
         }
         let safepoints = collect_safepoints(&code);
-        let root_maps = safepoints
-            .iter()
-            .map(|pc| RootMap {
-                pc: *pc,
-                bitmap: root_bitmap.clone(),
-            })
-            .collect();
+        let root_maps = exact_root_maps(function, &code, &safepoints, hir)?;
         module.function(Function {
             signature: function.signature.clone(),
             registers,
@@ -982,24 +1293,168 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     Ok(module.finish())
 }
 
+#[allow(clippy::too_many_lines)]
+fn exact_root_maps(
+    function: &HirFunction,
+    code: &[Instruction],
+    safepoints: &[u32],
+    module: &HirModule,
+) -> Result<Vec<RootMap>, CompileError> {
+    use std::collections::VecDeque;
+
+    let register_count = function.locals.len() + 8;
+    let mut entry = vec![None; register_count];
+    for (index, ty) in function.signature.parameters.iter().copied().enumerate() {
+        entry[index] = Some(ty);
+    }
+    let mut states = vec![None; code.len()];
+    if !code.is_empty() {
+        states[0] = Some(entry);
+    }
+    let mut queue = VecDeque::from([0_usize]);
+    while let Some(pc) = queue.pop_front() {
+        let Some(mut state) = states[pc].clone() else {
+            continue;
+        };
+        let mut successors = Vec::with_capacity(2);
+        match code[pc] {
+            Instruction::LoadI32 { dst, .. }
+            | Instruction::Add { dst, .. }
+            | Instruction::Sub { dst, .. }
+            | Instruction::Mul { dst, .. } => state[usize::from(dst)] = Some(ValueType::I32),
+            Instruction::LoadBool { dst, .. } | Instruction::CompareEq { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::Bool);
+            }
+            Instruction::Move { dst, source } => {
+                state[usize::from(dst)] = state[usize::from(source)];
+            }
+            Instruction::Call {
+                function: callee,
+                dst,
+                ..
+            } => {
+                state[usize::from(dst)] = module.functions[callee as usize].signature.result;
+            }
+            Instruction::HostCall { import, dst, .. } => {
+                state[usize::from(dst)] = module
+                    .host_functions
+                    .values()
+                    .find(|function| function.import == import)
+                    .and_then(|function| function.metadata.result);
+            }
+            Instruction::StateOldGet { ty, dst, .. } => {
+                state[usize::from(dst)] = Some(ty);
+            }
+            Instruction::StateNewCreate { type_id, dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::Named(type_id));
+            }
+            Instruction::Jump { target } => successors.push(target as usize),
+            Instruction::JumpIfFalse { target, .. } => {
+                successors.push(target as usize);
+                if pc + 1 < code.len() {
+                    successors.push(pc + 1);
+                }
+            }
+            Instruction::DeferPush { .. }
+            | Instruction::StateNewSet { .. }
+            | Instruction::StateHandleRemap { .. }
+            | Instruction::StateDelete { .. }
+            | Instruction::DeferPop
+            | Instruction::CleanupReturn
+            | Instruction::Return { .. }
+            | Instruction::ReturnVoid
+            | Instruction::Safepoint
+            | Instruction::Yield
+            | Instruction::Trap => {}
+        }
+        if !matches!(
+            code[pc],
+            Instruction::Jump { .. }
+                | Instruction::Return { .. }
+                | Instruction::ReturnVoid
+                | Instruction::CleanupReturn
+                | Instruction::Trap
+        ) && successors.is_empty()
+            && pc + 1 < code.len()
+        {
+            successors.push(pc + 1);
+        }
+        for successor in successors {
+            if successor >= states.len() {
+                return Err(CompileError::Verify(
+                    "emitter produced an out-of-range control-flow target".into(),
+                ));
+            }
+            match &mut states[successor] {
+                None => {
+                    states[successor] = Some(state.clone());
+                    queue.push_back(successor);
+                }
+                Some(existing) => {
+                    let mut changed = false;
+                    for (current, incoming) in existing.iter_mut().zip(&state) {
+                        if *current != *incoming && current.take().is_some() {
+                            changed = true;
+                        }
+                    }
+                    if changed {
+                        queue.push_back(successor);
+                    }
+                }
+            }
+        }
+    }
+    Ok(safepoints
+        .iter()
+        .map(|pc| RootMap {
+            pc: *pc,
+            bitmap: states[*pc as usize].as_ref().map_or_else(
+                || vec![false; register_count],
+                |state| {
+                    state
+                        .iter()
+                        .map(|ty| ty.is_some_and(ValueType::is_reference))
+                        .collect()
+                },
+            ),
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_lines)]
 fn emit_statements(
     statements: &[AstStatement],
     temporary: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     functions: &BTreeMap<String, u32>,
+    host_functions: &BTreeMap<String, HostFunction>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     for statement in statements {
         match statement {
             AstStatement::Bind { name, value } => {
-                emit_expression(value, locals[name].0, locals, functions, code)?;
+                emit_expression(
+                    value,
+                    locals[name].0,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
             }
             AstStatement::Return(value) => {
-                emit_expression(value, temporary, locals, functions, code)?;
+                emit_expression(value, temporary, locals, functions, host_functions, code)?;
                 code.push(Instruction::Return { source: temporary });
             }
             AstStatement::Expression(expression) => {
-                emit_expression(expression, temporary, locals, functions, code)?;
+                emit_expression(
+                    expression,
+                    temporary,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
             }
             AstStatement::Defer(AstExpression::Call {
                 function,
@@ -1021,6 +1476,7 @@ fn emit_statements(
                             .ok_or(CompileError::TooManyRegisters)?,
                         locals,
                         functions,
+                        host_functions,
                         code,
                     )?;
                 }
@@ -1039,13 +1495,27 @@ fn emit_statements(
                 then_body,
                 else_body,
             } => {
-                emit_expression(condition, temporary, locals, functions, code)?;
+                emit_expression(
+                    condition,
+                    temporary,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
                 let branch = code.len();
                 code.push(Instruction::JumpIfFalse {
                     condition: temporary,
                     target: 0,
                 });
-                emit_statements(then_body, temporary, locals, functions, code)?;
+                emit_statements(
+                    then_body,
+                    temporary,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
                 let skip_else = code.len();
                 code.push(Instruction::Jump { target: 0 });
                 let else_start =
@@ -1054,7 +1524,14 @@ fn emit_statements(
                     condition: temporary,
                     target: else_start,
                 };
-                emit_statements(else_body, temporary, locals, functions, code)?;
+                emit_statements(
+                    else_body,
+                    temporary,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
                 let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
                 code.push(Instruction::Safepoint);
                 code[skip_else] = Instruction::Jump { target: end };
@@ -1063,13 +1540,20 @@ fn emit_statements(
                 let loop_start =
                     u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
                 code.push(Instruction::Safepoint);
-                emit_expression(condition, temporary, locals, functions, code)?;
+                emit_expression(
+                    condition,
+                    temporary,
+                    locals,
+                    functions,
+                    host_functions,
+                    code,
+                )?;
                 let exit = code.len();
                 code.push(Instruction::JumpIfFalse {
                     condition: temporary,
                     target: 0,
                 });
-                emit_statements(body, temporary, locals, functions, code)?;
+                emit_statements(body, temporary, locals, functions, host_functions, code)?;
                 code.push(Instruction::Jump { target: loop_start });
                 let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
                 code.push(Instruction::Safepoint);
@@ -1088,6 +1572,7 @@ fn emit_expression(
     destination: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     functions: &BTreeMap<String, u32>,
+    host_functions: &BTreeMap<String, HostFunction>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     match expression {
@@ -1114,8 +1599,8 @@ fn emit_expression(
             let rhs_register = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
-            emit_expression(lhs, lhs_register, locals, functions, code)?;
-            emit_expression(rhs, rhs_register, locals, functions, code)?;
+            emit_expression(lhs, lhs_register, locals, functions, host_functions, code)?;
+            emit_expression(rhs, rhs_register, locals, functions, host_functions, code)?;
             code.push(match op {
                 BinaryOp::Add => Instruction::Add {
                     dst: destination,
@@ -1151,22 +1636,39 @@ fn emit_expression(
                         .ok_or(CompileError::TooManyRegisters)?,
                     locals,
                     functions,
+                    host_functions,
                     code,
                 )?;
             }
-            code.push(Instruction::Call {
-                function: *functions
-                    .get(function)
-                    .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
-                args_base,
-                args_count: u16::try_from(arguments.len())
-                    .map_err(|_| CompileError::TooManyRegisters)?,
-                dst: destination,
-            });
+            let args_count =
+                u16::try_from(arguments.len()).map_err(|_| CompileError::TooManyRegisters)?;
+            if let Some(host) = host_functions.get(function) {
+                code.push(Instruction::HostCall {
+                    import: host.import,
+                    args_base,
+                    args_count,
+                    dst: destination,
+                });
+            } else {
+                code.push(Instruction::Call {
+                    function: *functions
+                        .get(function)
+                        .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
+                    args_base,
+                    args_count,
+                    dst: destination,
+                });
+            }
         }
         AstExpression::Await(expression) => {
-            emit_expression(expression, destination, locals, functions, code)?;
-            code.push(Instruction::Yield);
+            emit_expression(
+                expression,
+                destination,
+                locals,
+                functions,
+                host_functions,
+                code,
+            )?;
         }
     }
     Ok(())
@@ -1182,6 +1684,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                 Instruction::Safepoint
                     | Instruction::Yield
                     | Instruction::Call { .. }
+                    | Instruction::HostCall { .. }
                     | Instruction::Return { .. }
                     | Instruction::ReturnVoid
                     | Instruction::Trap
@@ -1207,6 +1710,91 @@ pub fn compile_with_metadata(
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
     compile_module(source, Some((host_hash, schema_hash)))
+}
+
+pub fn compile_with_interface(
+    source: &str,
+    interface: &Idl,
+    schema_hash: StableId,
+) -> Result<VerifiedModule, CompileError> {
+    let tokens = lex(source)?;
+    let ast = parse(&tokens)?;
+    let import = ast
+        .imports
+        .first()
+        .and_then(|name| name.rsplit('.').next())
+        .ok_or_else(|| CompileError::UnknownName("missing host import".into()))?;
+    let mut host_functions = BTreeMap::new();
+    for (index, function) in interface.functions.iter().enumerate() {
+        let parameters = function
+            .parameters
+            .iter()
+            .map(|parameter| lower_idl_type(&parameter.ty))
+            .collect::<Vec<_>>();
+        let result = Some(lower_idl_type(&function.result));
+        let metadata = HostImport {
+            stable_id: StableId::from_parts(&[&interface.interface, "::", &function.name]),
+            parameters: parameters.clone(),
+            result,
+            mode: if function.synchronous {
+                HostCallMode::Immediate
+            } else {
+                HostCallMode::Async
+            },
+            fuel_cost: 1,
+        };
+        host_functions.insert(
+            format!("{import}.{}", function.name),
+            HostFunction {
+                import: u32::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                signature: Signature { parameters, result },
+                metadata,
+            },
+        );
+    }
+    let host_hash = nexa_idl::exact_hash(interface);
+    let hir =
+        resolve_and_typecheck_with_hosts(ast, host_functions, Some(host_hash), Some(schema_hash))?;
+    let mut module = emit_bytecode(&hir)?;
+    for export in &interface.exports {
+        let (function, hir_function) = hir
+            .functions
+            .iter()
+            .enumerate()
+            .find(|(_, function)| function.name.eq_ignore_ascii_case(&export.name))
+            .ok_or_else(|| CompileError::UnknownName(export.name.clone()))?;
+        let signature = Signature {
+            parameters: export
+                .parameters
+                .iter()
+                .map(|parameter| lower_idl_type(&parameter.ty))
+                .collect(),
+            result: export.result.as_ref().map(lower_idl_type),
+        };
+        if hir_function.signature != signature {
+            return Err(CompileError::TypeMismatch);
+        }
+        module.exports.push(ScriptExport {
+            stable_id: StableId::from_parts(&[&interface.interface, "::export::", &export.name]),
+            function: u32::try_from(function).map_err(|_| CompileError::TooManyRegisters)?,
+            signature,
+        });
+    }
+    verify(module, VerifierLimits::default())
+        .map_err(|error| CompileError::Verify(error.to_string()))
+}
+
+fn lower_idl_type(ty: &TypeRef) -> ValueType {
+    match ty {
+        TypeRef::I32 => ValueType::I32,
+        TypeRef::Bool => ValueType::Bool,
+        TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
+        TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
+        TypeRef::Snapshot(_) => ValueType::Named(StableId::from_name("Snapshot")),
+        TypeRef::F32 => ValueType::Named(StableId::from_name("f32")),
+        TypeRef::String => ValueType::Named(StableId::from_name("string")),
+        TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
+    }
 }
 
 fn compile_module(
@@ -1309,21 +1897,53 @@ mod tests {
         ));
 
         let task = compile(
-            "fn id(value: i32) -> i32 { return value; }
+            "task fn id(value: i32) -> i32 { return value; }
              task fn update(value: i32) -> i32 { return await id(value); }",
         )
         .unwrap();
-        let outcome = CheckedInterpreter::run(&task, 1, &[RuntimeValue::I32(8)], 100).unwrap();
-        let InterpreterOutcome::Suspended { continuation, .. } = outcome else {
-            panic!("await must suspend");
-        };
         assert!(matches!(
-            CheckedInterpreter::resume(&task, continuation, 100).unwrap(),
+            CheckedInterpreter::run(&task, 1, &[RuntimeValue::I32(8)], 100).unwrap(),
             InterpreterOutcome::Returned {
                 value: Some(RuntimeValue::I32(8)),
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn qualified_host_import_emits_typed_host_call_without_synthetic_yield() {
+        let idl = nexa_idl::parse(
+            "interface Engine {
+                request fn animation(entity: i32) -> host_request;
+            }",
+        )
+        .unwrap();
+        let module = super::compile_with_interface(
+            "module game.combat;
+             import engine;
+             task fn update(entity: i32) -> HostRequest {
+                 return await engine.animation(entity);
+             }",
+            &idl,
+            StableId::from_name("schema"),
+        )
+        .unwrap();
+        assert_eq!(module.module().host_imports.len(), 1);
+        assert!(
+            module.module().functions[0]
+                .code
+                .iter()
+                .any(|instruction| matches!(
+                    instruction,
+                    nexa_bytecode::Instruction::HostCall { import: 0, .. }
+                ))
+        );
+        assert!(
+            !module.module().functions[0]
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, nexa_bytecode::Instruction::Yield))
+        );
     }
 
     #[test]

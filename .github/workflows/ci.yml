@@ -36,6 +36,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-targets
+      - name: Test documentation
+        run: cargo test --doc --workspace
+      - name: Run combat integration
+        run: cargo run -p combat-runtime --quiet
+      - name: Run benchmark smoke
+        run: cargo run -p nexa-runtime --example fast_task_bench --features allocation-counting -- --smoke
+      - name: Observe real allocator hot paths
+        if: runner.os != 'Windows'
+        run: cargo run --manifest-path tools/allocation-observer/Cargo.toml --quiet
       - name: Check baseline
         run: cargo run -p nexa-cli -- baseline check
       - name: Check machine specifications

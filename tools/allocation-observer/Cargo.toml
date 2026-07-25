@@ -1,0 +1,14 @@
+[package]
+name = "nexa-allocation-observer"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+nexa-bytecode = { path = "../../crates/nexa-bytecode" }
+nexa-core = { path = "../../crates/nexa-core" }
+nexa-runtime = { path = "../../crates/nexa-runtime" }
+nexa-verifier = { path = "../../crates/nexa-verifier" }
+
+[lints.rust]
+unsafe_code = "allow"

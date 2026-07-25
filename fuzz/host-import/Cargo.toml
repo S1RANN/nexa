@@ -1,0 +1,20 @@
+[package]
+name = "nexa-host-import-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexa-bytecode = { path = "../../crates/nexa-bytecode" }
+nexa-verifier = { path = "../../crates/nexa-verifier" }
+
+[[bin]]
+name = "host_import"
+path = "fuzz_targets/host_import.rs"
+test = false
+doc = false
+bench = false

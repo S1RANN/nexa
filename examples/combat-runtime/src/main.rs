@@ -1,17 +1,21 @@
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry, HostTrap, HostValue,
-    PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHostDomain, RuntimeValue,
-    ScriptFunction, StepConfig, TaskLimits, TickBudget,
+    HostCompletion, HostPayload, PollResult, RealmConfig, RealmRuntime, ResourceContext,
+    RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
+    TickBudget,
 };
 
+#[allow(dead_code)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/engine.rs"));
 }
 
-struct EngineHost;
+struct EngineHost {
+    last_request: Arc<Mutex<Option<nexa_runtime::HostRequestHandle>>>,
+}
 
 impl generated::GameHost for EngineHost {
     fn update(
@@ -28,9 +32,14 @@ impl generated::GameHost for EngineHost {
         context: &mut ResourceContext<'_>,
         _: i32,
     ) -> Result<nexa_runtime::HostRequestHandle, generated::HostError> {
-        context
+        let request = context
             .create_request()
-            .map_err(|error| generated::HostError(error.to_string()))
+            .map_err(|error| generated::HostError(error.to_string()))?;
+        *self
+            .last_request
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(request);
+        Ok(request)
     }
 
     fn action_lock(
@@ -59,15 +68,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let idl = nexa_idl::parse(include_str!("../engine.idl"))?;
     let host_hash = nexa_idl::exact_hash(&idl);
     let schema_hash = StableId::from_name("combat-state-v1");
-    let verified = nexa_compiler::compile_with_metadata(
-        include_str!("../gameplay.nexa"),
-        host_hash,
-        schema_hash,
-    )?;
-    let mut realm = RealmRuntime::new(RealmConfig::default());
+    let schema_hash_v2 = StableId::from_name("combat-state-v2");
+    let verified =
+        nexa_compiler::compile_with_interface(include_str!("../gameplay.nexa"), &idl, schema_hash)?;
+    let last_request = Arc::new(Mutex::new(None));
+    let runtime_host = RuntimeHost::new(4_096);
+    let registry = generated::GeneratedHostRegistry::new(EngineHost {
+        last_request: Arc::clone(&last_request),
+    });
+    let mut realm = RealmRuntime::with_runtime_host(
+        RealmConfig::default(),
+        runtime_host.clone(),
+        Box::new(registry),
+    );
     let module = realm.load_module(verified, host_hash, schema_hash)?;
     let enemy_brain = StableId::from_name("EnemyBrain::boss");
-    realm.insert_state(module, enemy_brain, nexa_runtime::StateValue::I32(3))?;
+    realm.insert_state(
+        module,
+        enemy_brain,
+        nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
+            type_id: StableId::from_name("EnemyBrain"),
+            version: 1,
+            fields: BTreeMap::from([
+                (
+                    StableId::from_name("EnemyBrain::phase"),
+                    nexa_runtime::StateValue::I32(3),
+                ),
+                (
+                    StableId::from_name("EnemyBrain::legacy_target"),
+                    nexa_runtime::StateValue::I32(17),
+                ),
+            ]),
+        }),
+    )?;
     let scope = realm.create_scope(None)?;
     let task = realm.call(
         module,
@@ -82,62 +115,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let mut host = generated::GeneratedHostRegistry::new(EngineHost);
-    let update = realm
-        .with_resource_context(task, |context| {
-            host.call(
-                generated::THUNK_UPDATE,
-                context,
-                HostArgs::new(&[HostValue::I32(40), HostValue::I32(2)]),
-            )
-        })?
-        .map_err(HostFailure::from)?;
-    assert_eq!(update, HostCallOutcome::Immediate(HostValue::I32(42)));
-    let request = realm
-        .with_resource_context(task, |context| {
-            host.call(
-                generated::THUNK_ANIMATION,
-                context,
-                HostArgs::new(&[HostValue::I32(7)]),
-            )
-        })?
-        .map_err(HostFailure::from)?;
-    let HostCallOutcome::Pending(request) = request else {
-        return Err(Box::new(HostFailure("animation did not return a request")));
-    };
-    realm
-        .with_resource_context(task, |context| {
-            host.call(
-                generated::THUNK_ACTION_LOCK,
-                context,
-                HostArgs::new(&[HostValue::I32(7)]),
-            )
-        })?
-        .map_err(HostFailure::from)?;
-    let snapshot = realm
-        .with_resource_context(task, |context| {
-            host.call(generated::THUNK_WORLD_SNAPSHOT, context, HostArgs::new(&[]))
-        })?
-        .map_err(HostFailure::from)?;
-    let HostCallOutcome::Immediate(HostValue::Snapshot(snapshot)) = snapshot else {
-        return Err(Box::new(HostFailure("snapshot thunk returned wrong type")));
-    };
-    assert_eq!(realm.snapshot_data(snapshot)?, &[10, 20, 30]);
-
-    assert!(matches!(realm.poll_task(task, 32)?, PollResult::Pending(_)));
-    realm.wait_for_request(task, request)?;
+    assert_eq!(
+        realm.poll_task(task, 32)?,
+        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
+    );
+    let request = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .expect("animation request was captured by the host");
     realm.completion_sender().complete(HostCompletion {
         realm_id: realm.realm_id(),
         module_id: module.raw().index,
         epoch: realm.module_epoch(module)?,
         request,
-        payload: HostPayload::I32(1),
+        payload: HostPayload::Opaque(1),
     })?;
     realm.tick(TickBudget {
         max_tasks: 1,
         frame_fuel_budget: 32,
         collect_garbage: true,
     })?;
+    assert!(matches!(
+        realm.terminal_record(task).map(|record| &record.reason),
+        Some(nexa_runtime::TaskTerminalReason::Completed(Some(
+            RuntimeValue::I32(42)
+        )))
+    ));
 
     let live = realm.call(
         module,
@@ -158,9 +161,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let v2 = nexa_compiler::compile_with_metadata(
         include_str!("../reload/v2.nexa"),
         host_hash,
-        schema_hash,
+        schema_hash_v2,
     )?;
-    let v2 = realm.prepare_reload(module, v2, host_hash, schema_hash)?;
+    let v2 = realm.prepare_reload_migrating(module, v2, host_hash)?;
     realm.quiesce_reload()?;
     assert_eq!(
         realm.stage_reload(0, &[RuntimeValue::I32(10)])?,
@@ -172,9 +175,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .into_iter()
         .find(|handle| handle.stable_id == enemy_brain)
         .ok_or(HostFailure("EnemyBrain state was not migrated"))?;
+    let nexa_runtime::StateValue::Object(migrated) = realm.resolve_state(v2, migrated_state)?
+    else {
+        return Err(Box::new(HostFailure("EnemyBrain state is not an object")));
+    };
+    assert_eq!(migrated.version, 2);
     assert_eq!(
-        realm.resolve_state(v2, migrated_state)?,
-        &nexa_runtime::StateValue::I32(3)
+        migrated
+            .fields
+            .get(&StableId::from_name("EnemyBrain::phase")),
+        Some(&nexa_runtime::StateValue::I32(3))
+    );
+    assert_eq!(
+        migrated
+            .fields
+            .get(&StableId::from_name("EnemyBrain::aggression")),
+        Some(&nexa_runtime::StateValue::I32(0))
+    );
+    assert!(
+        !migrated
+            .fields
+            .contains_key(&StableId::from_name("EnemyBrain::legacy_target"))
     );
     assert!(matches!(
         realm.terminal_record(live).map(|record| &record.reason),
@@ -219,7 +240,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     assert!(matches!(
-        realm.poll_task(cancelled_task, 32)?,
+        realm.poll_task(cancelled_task, 0)?,
         PollResult::Pending(_)
     ));
     assert_eq!(realm.cancel_scope(cancelled_scope)?, 1);
@@ -247,9 +268,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fault = nexa_compiler::compile_with_metadata(
         include_str!("../reload/activation_fault.nexa"),
         host_hash,
-        schema_hash,
+        schema_hash_v2,
     )?;
-    let fault = realm.prepare_reload(v2, fault, host_hash, schema_hash)?;
+    let fault = realm.prepare_reload(v2, fault, host_hash, schema_hash_v2)?;
     realm.quiesce_reload()?;
     realm.stage_reload(0, &[RuntimeValue::I32(1)])?;
     assert!(
@@ -273,7 +294,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .is_err()
     );
-    assert!(realm.terminal_record(live).is_some());
+    assert_eq!(
+        realm.poll_task(live, 32)?,
+        PollResult::Completed(Some(RuntimeValue::I32(2)))
+    );
     println!("combat-runtime completed with deterministic reload activation fault");
     Ok(())
 }
@@ -288,9 +312,3 @@ impl std::fmt::Display for HostFailure {
 }
 
 impl std::error::Error for HostFailure {}
-
-impl From<HostTrap> for HostFailure {
-    fn from(_: HostTrap) -> Self {
-        Self("host trap")
-    }
-}

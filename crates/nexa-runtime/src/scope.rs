@@ -1,8 +1,8 @@
 use std::fmt;
 
 use nexa_core::{
-    MachineKind, RawHandle, StableId, TRACE_SCHEMA_VERSION, TraceRecord, TransitionDisposition,
-    machine_instance_id, machine_invariant_hash,
+    InlineDeltas, MachineKind, RawHandle, ResourceDelta, StableId, TRACE_SCHEMA_VERSION,
+    TraceRecord, TransitionDisposition, machine_instance_id, machine_invariant_hash_ids,
 };
 
 use crate::machines::scope::{self, Event};
@@ -197,6 +197,10 @@ impl ScopeManager {
         })
     }
 
+    pub(crate) fn reserved_capacity(&self) -> usize {
+        self.scopes.reserved_capacity()
+    }
+
     fn apply(
         &mut self,
         trace: &mut RuntimeTrace,
@@ -229,19 +233,21 @@ impl ScopeManager {
                         (StableId::default(), TransitionDisposition::Undefined)
                     }
                 };
-                trace.record(scope_trace_record(
-                    self.realm_id,
-                    handle,
-                    old,
-                    event,
-                    old,
-                    transition_id,
-                    disposition,
-                    &[],
-                    active,
-                    transient,
-                    persistent,
-                ));
+                trace.record_with(|| {
+                    scope_trace_record(
+                        self.realm_id,
+                        handle,
+                        old,
+                        event,
+                        old,
+                        transition_id,
+                        disposition,
+                        InlineDeltas::new(),
+                        active,
+                        transient,
+                        persistent,
+                    )
+                });
                 return Err(ScopeError::Transition(error));
             }
         };
@@ -271,27 +277,21 @@ impl ScopeManager {
             current.transient_children = next_transient;
             current.persistent_children = next_persistent;
         }
-        let deltas = outcome
-            .deltas
-            .iter()
-            .map(|delta| nexa_core::ResourceDelta {
-                resource: delta.resource.to_owned(),
-                amount: delta.amount,
-            })
-            .collect::<Vec<_>>();
-        trace.record(scope_trace_record(
-            self.realm_id,
-            handle,
-            old,
-            event,
-            outcome.state,
-            StableId(outcome.transition_id),
-            TransitionDisposition::Applied,
-            &deltas,
-            next_active,
-            next_transient,
-            next_persistent,
-        ));
+        trace.record_with(|| {
+            scope_trace_record(
+                self.realm_id,
+                handle,
+                old,
+                event,
+                outcome.state,
+                StableId(outcome.transition_id),
+                TransitionDisposition::Applied,
+                inline_deltas(outcome.deltas),
+                next_active,
+                next_transient,
+                next_persistent,
+            )
+        });
         Ok(())
     }
 }
@@ -313,7 +313,7 @@ fn scope_trace_record(
     new: ScopeState,
     transition_id: StableId,
     disposition: TransitionDisposition,
-    deltas: &[nexa_core::ResourceDelta],
+    deltas: InlineDeltas,
     active: u32,
     transient: u32,
     persistent: u32,
@@ -331,19 +331,35 @@ fn scope_trace_record(
         realm_id,
         module_epoch: 0,
         owner_scope: Some(handle.raw()),
-        resource_deltas: deltas.to_vec(),
+        resource_deltas: deltas,
         error_code: None,
-        invariant_hash: machine_invariant_hash(
-            "Scope",
-            &format!("{new:?}"),
+        invariant_hash: machine_invariant_hash_ids(
+            StableId::from_name("Scope"),
+            state_id(new),
             Some(handle.raw()),
-            &[
-                ("active_scope", i64::from(active)),
-                ("persistent_child", i64::from(persistent)),
-                ("transient_child", i64::from(transient)),
+            [
+                (StableId::from_name("active_scope"), i64::from(active)),
+                (
+                    StableId::from_name("persistent_child"),
+                    i64::from(persistent),
+                ),
+                (StableId::from_name("transient_child"), i64::from(transient)),
             ],
         ),
     }
+}
+
+fn inline_deltas(deltas: &[scope::ResourceDelta]) -> InlineDeltas {
+    let mut inline = InlineDeltas::new();
+    for delta in deltas {
+        inline
+            .try_push(ResourceDelta {
+                resource: StableId::from_name(delta.resource),
+                amount: delta.amount,
+            })
+            .expect("generated machine exceeds inline delta capacity");
+    }
+    inline
 }
 
 fn apply_resource_delta(value: u32, delta: i64) -> Option<u32> {

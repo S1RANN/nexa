@@ -1,0 +1,15 @@
+system RealmRuntime
+max_depth 8
+max_requests 1
+max_tokens 1
+
+component HostRequest
+component ResourceToken
+component Reload
+component ReleaseQueue
+
+invariant reservations_match_live_resources
+invariant completed_resources_have_release_records
+invariant reload_has_single_staging_graph
+
+end

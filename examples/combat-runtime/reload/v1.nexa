@@ -1,3 +1,7 @@
 task fn update(value: i32) -> i32 {
-    return await value;
+    return value;
+}
+@stateful(1) class EnemyBrain {
+    phase: i32;
+    legacy_target: i32;
 }

@@ -394,6 +394,164 @@ pub fn explore_task_scope(config: SystemConfig) -> SystemReport {
     report
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RealmSystemConfig {
+    pub max_depth: usize,
+    pub max_requests: usize,
+    pub max_tokens: usize,
+}
+
+impl RealmSystemConfig {
+    pub fn parse(source: &str) -> Result<Self, String> {
+        let mut max_depth = None;
+        let mut max_requests = None;
+        let mut max_tokens = None;
+        for words in source
+            .lines()
+            .map(str::trim)
+            .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        {
+            match words.as_slice() {
+                ["max_depth", value] => max_depth = Some(parse_bound("max_depth", value)?),
+                ["max_requests", value] => {
+                    max_requests = Some(parse_bound("max_requests", value)?);
+                }
+                ["max_tokens", value] => max_tokens = Some(parse_bound("max_tokens", value)?),
+                _ => {}
+            }
+        }
+        Ok(Self {
+            max_depth: max_depth.ok_or("missing max_depth")?,
+            max_requests: max_requests.ok_or("missing max_requests")?,
+            max_tokens: max_tokens.ok_or("missing max_tokens")?,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmSystemEvent {
+    SubmitRequest,
+    CompleteRequest,
+    CancelRequest,
+    AcquireToken,
+    ReleaseToken,
+    BeginReload,
+    CommitReload,
+    RollbackReload,
+    DrainReleases,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RealmSystemSnapshot {
+    pub requests: usize,
+    pub tokens: usize,
+    pub reservations: usize,
+    pub releases: usize,
+    pub reload_staging: bool,
+}
+
+impl RealmSystemSnapshot {
+    pub fn apply(
+        &mut self,
+        event: RealmSystemEvent,
+        config: RealmSystemConfig,
+    ) -> Result<(), &'static str> {
+        match event {
+            RealmSystemEvent::SubmitRequest if self.requests < config.max_requests => {
+                self.requests += 1;
+                self.reservations += 1;
+            }
+            RealmSystemEvent::CompleteRequest | RealmSystemEvent::CancelRequest
+                if self.requests > 0 =>
+            {
+                self.requests -= 1;
+                self.reservations -= 1;
+                self.releases += 1;
+            }
+            RealmSystemEvent::AcquireToken if self.tokens < config.max_tokens => {
+                self.tokens += 1;
+                self.reservations += 1;
+            }
+            RealmSystemEvent::ReleaseToken if self.tokens > 0 => {
+                self.tokens -= 1;
+                self.reservations -= 1;
+                self.releases += 1;
+            }
+            RealmSystemEvent::BeginReload if !self.reload_staging => {
+                self.reload_staging = true;
+            }
+            RealmSystemEvent::CommitReload | RealmSystemEvent::RollbackReload
+                if self.reload_staging =>
+            {
+                self.reload_staging = false;
+            }
+            RealmSystemEvent::DrainReleases if self.releases > 0 => self.releases = 0,
+            _ => return Err("operation rejected"),
+        }
+        if self.reservations != self.requests + self.tokens {
+            return Err("reservation ownership mismatch");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RealmSystemReport {
+    pub visited_worlds: usize,
+    pub rejected_operations: usize,
+    pub failures: Vec<(String, Vec<RealmSystemEvent>)>,
+    pub truncated: bool,
+}
+
+#[must_use]
+pub fn explore_realm_runtime(config: RealmSystemConfig) -> RealmSystemReport {
+    const EVENTS: [RealmSystemEvent; 9] = [
+        RealmSystemEvent::SubmitRequest,
+        RealmSystemEvent::CompleteRequest,
+        RealmSystemEvent::CancelRequest,
+        RealmSystemEvent::AcquireToken,
+        RealmSystemEvent::ReleaseToken,
+        RealmSystemEvent::BeginReload,
+        RealmSystemEvent::CommitReload,
+        RealmSystemEvent::RollbackReload,
+        RealmSystemEvent::DrainReleases,
+    ];
+    let mut report = RealmSystemReport::default();
+    let initial = RealmSystemSnapshot::default();
+    let mut seen = BTreeSet::from([initial]);
+    let mut queue = VecDeque::from([(initial, Vec::new())]);
+    while let Some((world, path)) = queue.pop_front() {
+        if path.len() >= config.max_depth {
+            report.truncated = true;
+            continue;
+        }
+        for event in EVENTS {
+            let mut next = world;
+            let mut next_path = path.clone();
+            next_path.push(event);
+            match next.apply(event, config) {
+                Ok(()) if seen.insert(next) => queue.push_back((next, next_path)),
+                Ok(()) => {}
+                Err("operation rejected") => report.rejected_operations += 1,
+                Err(error) => report.failures.push((error.into(), next_path)),
+            }
+        }
+    }
+    report.visited_worlds = seen.len();
+    report
+}
+
+pub fn replay_realm_runtime(
+    config: RealmSystemConfig,
+    events: impl IntoIterator<Item = RealmSystemEvent>,
+) -> Result<RealmSystemSnapshot, &'static str> {
+    let mut world = RealmSystemSnapshot::default();
+    for event in events {
+        world.apply(event, config)?;
+    }
+    Ok(world)
+}
+
 #[must_use]
 pub fn all_events(config: SystemConfig) -> Vec<SystemEvent> {
     let mut events = Vec::new();
@@ -420,7 +578,7 @@ pub fn all_events(config: SystemConfig) -> Vec<SystemEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SystemConfig, explore_task_scope};
+    use super::{RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope};
 
     #[test]
     fn task_scope_system_explores_two_by_two_without_invariant_failure() {
@@ -432,5 +590,16 @@ mod tests {
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(report.visited_worlds > 100);
         assert!(report.rejected_operations > 0);
+    }
+
+    #[test]
+    fn realm_runtime_composite_model_preserves_cross_machine_reservations() {
+        let config = RealmSystemConfig::parse(include_str!(
+            "../../../specs/systems/realm_runtime.system.spec"
+        ))
+        .unwrap();
+        let report = explore_realm_runtime(config);
+        assert!(report.failures.is_empty(), "{:?}", report.failures);
+        assert!(report.visited_worlds >= 8);
     }
 }

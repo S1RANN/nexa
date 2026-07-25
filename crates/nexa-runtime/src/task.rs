@@ -1,8 +1,9 @@
 use std::fmt;
 
+use nexa_bytecode::ValueType;
 use nexa_core::{
-    MachineKind, RawHandle, StableId, TRACE_SCHEMA_VERSION, TraceRecord, TransitionDisposition,
-    machine_instance_id, machine_invariant_hash,
+    InlineDeltas, MachineKind, RawHandle, ResourceDelta, StableId, TRACE_SCHEMA_VERSION,
+    TraceRecord, TransitionDisposition, machine_instance_id, machine_invariant_hash_ids,
 };
 
 use crate::machines::task;
@@ -62,6 +63,8 @@ pub(crate) enum TaskExecution {
     Waiting {
         continuation: InterpreterContinuation,
         request: HostRequestHandle,
+        destination: u16,
+        expected_type: Option<ValueType>,
     },
     ReloadPaused(InterpreterContinuation),
     Cancelling(InterpreterContinuation),
@@ -234,7 +237,7 @@ impl TaskManager {
                         (StableId::default(), TransitionDisposition::Undefined)
                     }
                 };
-                trace.record(TraceRecord {
+                trace.record_with(|| TraceRecord {
                     schema_version: TRACE_SCHEMA_VERSION,
                     sequence: 0,
                     machine_kind: MachineKind::Task,
@@ -247,13 +250,13 @@ impl TaskManager {
                     realm_id: self.realm_id,
                     module_epoch,
                     owner_scope: Some(owner.raw()),
-                    resource_deltas: Vec::new(),
+                    resource_deltas: InlineDeltas::new(),
                     error_code: None,
-                    invariant_hash: machine_invariant_hash(
-                        "Task",
-                        &format!("{old_state:?}"),
+                    invariant_hash: machine_invariant_hash_ids(
+                        StableId::from_name("Task"),
+                        state_id(old_state),
                         Some(owner.raw()),
-                        &[("task_slot", task_slots)],
+                        [(StableId::from_name("task_slot"), task_slots)],
                     ),
                 });
                 return Err(TaskError::Transition(error));
@@ -305,7 +308,7 @@ impl TaskManager {
             task.reserved_slots = next_task_slots;
         }
 
-        trace.record(TraceRecord {
+        trace.record_with(|| TraceRecord {
             schema_version: TRACE_SCHEMA_VERSION,
             sequence: 0,
             machine_kind: MachineKind::Task,
@@ -318,20 +321,13 @@ impl TaskManager {
             realm_id: self.realm_id,
             module_epoch,
             owner_scope: Some(owner.raw()),
-            resource_deltas: outcome
-                .deltas
-                .iter()
-                .map(|delta| nexa_core::ResourceDelta {
-                    resource: delta.resource.to_owned(),
-                    amount: delta.amount,
-                })
-                .collect(),
+            resource_deltas: inline_deltas(outcome.deltas),
             error_code: None,
-            invariant_hash: machine_invariant_hash(
-                "Task",
-                &format!("{:?}", outcome.state),
+            invariant_hash: machine_invariant_hash_ids(
+                StableId::from_name("Task"),
+                state_id(outcome.state),
                 Some(owner.raw()),
-                &[("task_slot", next_task_slots)],
+                [(StableId::from_name("task_slot"), next_task_slots)],
             ),
         });
 
@@ -412,12 +408,41 @@ impl TaskManager {
             .ok_or(TaskError::Invariant("task has no continuation"))
     }
 
+    pub(crate) fn restore_checkpoint(
+        &mut self,
+        handle: TaskHandle,
+        snapshot: TaskSnapshot,
+        execution: TaskExecution,
+    ) -> Result<(), TaskError> {
+        let task = self.tasks.resolve_mut(handle.raw())?;
+        task.state = snapshot.state;
+        task.owner = snapshot.owner;
+        task.module_epoch = snapshot.module_epoch;
+        task.module_id = snapshot.module_id;
+        task.child_kind = if snapshot.persistent {
+            ChildKind::Persistent
+        } else {
+            ChildKind::Transient
+        };
+        task.reserved_slots = snapshot.task_slots;
+        task.priority = snapshot.priority;
+        task.fuel = snapshot.fuel;
+        task.execution = Some(execution);
+        task.limits = snapshot.limits;
+        task.charge = snapshot.charge;
+        Ok(())
+    }
+
     pub(crate) fn handles(&self) -> Vec<TaskHandle> {
         self.tasks
             .occupied_handles()
             .into_iter()
             .map(TaskHandle)
             .collect()
+    }
+
+    pub(crate) fn reserved_capacity(&self) -> usize {
+        self.tasks.reserved_capacity()
     }
 
     pub(crate) fn record_charge(
@@ -430,6 +455,19 @@ impl TaskManager {
         task.charge.fuel_used = task.charge.fuel_used.saturating_add(charge.fuel_used);
         Ok(task.charge)
     }
+}
+
+fn inline_deltas(deltas: &[task::ResourceDelta]) -> InlineDeltas {
+    let mut inline = InlineDeltas::new();
+    for delta in deltas {
+        inline
+            .try_push(ResourceDelta {
+                resource: StableId::from_name(delta.resource),
+                amount: delta.amount,
+            })
+            .expect("generated machine exceeds inline delta capacity");
+    }
+    inline
 }
 
 fn is_terminal(state: TaskState) -> bool {

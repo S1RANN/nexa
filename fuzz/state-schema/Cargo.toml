@@ -1,0 +1,20 @@
+[package]
+name = "nexa-state-schema-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nexa-bytecode = { path = "../../crates/nexa-bytecode" }
+nexa-verifier = { path = "../../crates/nexa-verifier" }
+
+[[bin]]
+name = "state_schema"
+path = "fuzz_targets/state_schema.rs"
+test = false
+doc = false
+bench = false

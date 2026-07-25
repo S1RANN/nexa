@@ -100,7 +100,7 @@ struct ExpectedTrace {
     old_state: nexa_core::StableId,
     event: nexa_core::StableId,
     new_state: nexa_core::StableId,
-    resource_deltas: Vec<nexa_core::ResourceDelta>,
+    resource_deltas: nexa_core::InlineDeltas,
     invariant_hash: u64,
 }
 
@@ -115,14 +115,18 @@ fn expected_trace(step: &nexa_model::ReferenceStep, owner: nexa_core::RawHandle)
         old_state: machine_state_id("Task", &step.old_state),
         event: machine_event_id("Task", &step.event),
         new_state: machine_state_id("Task", &step.new_state),
-        resource_deltas: step
-            .resource_deltas
-            .iter()
-            .map(|delta| nexa_core::ResourceDelta {
-                resource: delta.resource.clone(),
-                amount: delta.amount,
-            })
-            .collect(),
+        resource_deltas: {
+            let mut deltas = nexa_core::InlineDeltas::new();
+            for delta in &step.resource_deltas {
+                deltas
+                    .try_push(nexa_core::ResourceDelta {
+                        resource: nexa_core::StableId::from_name(&delta.resource),
+                        amount: delta.amount,
+                    })
+                    .unwrap();
+            }
+            deltas
+        },
         invariant_hash: machine_invariant_hash("Task", &step.new_state, Some(owner), &resources),
     }
 }

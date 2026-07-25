@@ -47,6 +47,7 @@ version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
  "nexa-core",
+ "nexa-idl",
  "nexa-runtime",
  "nexa-verifier",
 ]
@@ -73,9 +74,11 @@ dependencies = [
 name = "nexa-model"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
  "nexa-core",
  "nexa-machine",
  "nexa-runtime",
+ "nexa-verifier",
 ]
 
 [[package]]
