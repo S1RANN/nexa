@@ -290,6 +290,30 @@ pub enum BinaryOp {
     Multiply,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StateHandleMethod {
+    Resolve,
+    IsAlive,
+    StableId,
+    Generation,
+    Equality,
+    Hash,
+}
+
+fn state_handle_method(function: &str) -> Option<(&str, StateHandleMethod)> {
+    let (receiver, method) = function.rsplit_once('.')?;
+    let method = match method {
+        "resolve" => StateHandleMethod::Resolve,
+        "is_alive" => StateHandleMethod::IsAlive,
+        "stable_id" => StateHandleMethod::StableId,
+        "generation" => StateHandleMethod::Generation,
+        "equality" => StateHandleMethod::Equality,
+        "hash" => StateHandleMethod::Hash,
+        _ => return None,
+    };
+    Some((receiver, method))
+}
+
 #[derive(Clone, Debug)]
 pub struct HirModule {
     functions: Vec<HirFunction>,
@@ -299,6 +323,7 @@ pub struct HirModule {
     state_schema: StateSchema,
     enum_types: Vec<EnumType>,
     enum_variants: BTreeMap<(StableId, String), EnumVariant>,
+    state_handle_targets: BTreeMap<StableId, ValueType>,
 }
 
 #[derive(Clone, Debug)]
@@ -1087,6 +1112,9 @@ fn builtin_variant_id(name: &str) -> StableId {
         "Some" => StableId::from_parts(&["Option", "::Some"]),
         "Ok" => StableId::from_parts(&["Result", "::Ok"]),
         "Err" => StableId::from_parts(&["Result", "::Err"]),
+        "WrongDomain" | "Missing" | "StaleGeneration" | "GenerationExhausted" => {
+            StableId::from_parts(&["StateHandleError", "::", name])
+        }
         _ => StableId::from_name(name),
     }
 }
@@ -1159,6 +1187,57 @@ fn collect_builtin_enum_type(ty: &AstType, enum_types: &mut Vec<EnumType>) {
     }
 }
 
+fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType> {
+    fn collect(ty: &AstType, targets: &mut BTreeMap<StableId, ValueType>) {
+        let AstType::BuiltinGeneric { name, arguments } = ty else {
+            return;
+        };
+        for argument in arguments {
+            collect(argument, targets);
+        }
+        if name == "StateHandle" && arguments.len() == 1 {
+            let target = lower_type(&arguments[0]);
+            targets.insert(nexa_bytecode::state_handle_type(target), target);
+        }
+    }
+
+    let mut targets = BTreeMap::new();
+    for declaration in &ast.types {
+        for (_, ty) in &declaration.fields {
+            collect(ty, &mut targets);
+        }
+    }
+    for function in &ast.functions {
+        for (_, ty) in &function.parameters {
+            collect(ty, &mut targets);
+        }
+        collect(&function.result, &mut targets);
+        collect_statement_types(&function.body, &mut |ty| collect(ty, &mut targets));
+    }
+    targets
+}
+
+fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { ty: Some(ty), .. } => collect(ty),
+            AstStatement::If {
+                then_body,
+                else_body,
+                ..
+            } => {
+                collect_statement_types(then_body, collect);
+                collect_statement_types(else_body, collect);
+            }
+            AstStatement::While { body, .. } => collect_statement_types(body, collect),
+            AstStatement::Bind { ty: None, .. }
+            | AstStatement::Return(_)
+            | AstStatement::Expression(_)
+            | AstStatement::Defer(_) => {}
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn resolve_and_typecheck_with_hosts(
     ast: AstModule,
@@ -1227,6 +1306,22 @@ fn resolve_and_typecheck_with_hosts(
         }
     }
     collect_builtin_enum_types(&ast, &mut enum_types);
+    let state_handle_targets = collect_state_handle_targets(&ast);
+    if !state_handle_targets.is_empty() {
+        enum_types.push(nexa_bytecode::state_handle_error_type());
+        for target in state_handle_targets.values().copied() {
+            let result = nexa_bytecode::result_type(
+                target,
+                ValueType::Named(nexa_bytecode::state_handle_error_type().type_id),
+            );
+            if !enum_types
+                .iter()
+                .any(|candidate| candidate.type_id == result.type_id)
+            {
+                enum_types.push(result);
+            }
+        }
+    }
     let mut enum_variants = BTreeMap::new();
     for declaration in ast
         .types
@@ -1247,7 +1342,16 @@ fn resolve_and_typecheck_with_hosts(
     }
     for enum_type in &enum_types {
         for variant in &enum_type.variants {
-            for name in ["None", "Some", "Ok", "Err"] {
+            for name in [
+                "None",
+                "Some",
+                "Ok",
+                "Err",
+                "WrongDomain",
+                "Missing",
+                "StaleGeneration",
+                "GenerationExhausted",
+            ] {
                 if variant.stable_id == builtin_variant_id(name) {
                     enum_variants.insert((enum_type.type_id, name.to_owned()), variant.clone());
                 }
@@ -1285,6 +1389,9 @@ fn resolve_and_typecheck_with_hosts(
         "HostRequest",
         "ResourceToken",
         "Snapshot",
+        "StableId",
+        "StateHandle",
+        "StateHandleError",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -1361,6 +1468,7 @@ fn resolve_and_typecheck_with_hosts(
             enum_variants: &enum_variants,
             function_result: signature.result.expect("result is required"),
             effect: function.effect,
+            state_handle_targets: &state_handle_targets,
         };
         let flow = check_statements(
             &function.body,
@@ -1388,6 +1496,7 @@ fn resolve_and_typecheck_with_hosts(
         state_schema,
         enum_types,
         enum_variants,
+        state_handle_targets,
     })
 }
 
@@ -1569,7 +1678,29 @@ fn resolve_expression(
             resolve_expression(lhs, scopes, next_local)?;
             resolve_expression(rhs, scopes, next_local)?;
         }
-        AstExpression::Call { arguments, .. } => {
+        AstExpression::Call {
+            function,
+            arguments,
+        } => {
+            if let Some((receiver, method)) = state_handle_method(function) {
+                let resolved = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(receiver))
+                    .cloned()
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                *function = format!(
+                    "{resolved}.{}",
+                    match method {
+                        StateHandleMethod::Resolve => "resolve",
+                        StateHandleMethod::IsAlive => "is_alive",
+                        StateHandleMethod::StableId => "stable_id",
+                        StateHandleMethod::Generation => "generation",
+                        StateHandleMethod::Equality => "equality",
+                        StateHandleMethod::Hash => "hash",
+                    }
+                );
+            }
             for argument in arguments {
                 resolve_expression(argument, scopes, next_local)?;
             }
@@ -1619,7 +1750,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
-                "Option" => 1,
+                "Option" | "StateHandle" => 1,
                 "Result" => 2,
                 _ => return Err(CompileError::UnknownType(name.clone())),
             };
@@ -1675,6 +1806,7 @@ struct TypeContext<'a> {
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
     function_result: ValueType,
     effect: FunctionEffect,
+    state_handle_targets: &'a BTreeMap<StableId, ValueType>,
 }
 
 fn check_statements(
@@ -1847,6 +1979,82 @@ fn expression_type(
             function,
             arguments,
         } => {
+            if let Some((receiver, method)) = state_handle_method(function) {
+                if matches!(
+                    context.effect,
+                    FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(CompileError::InvalidEffect);
+                }
+                let receiver_type = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                let ValueType::Named(handle_type) = receiver_type else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let target = *context
+                    .state_handle_targets
+                    .get(&handle_type)
+                    .ok_or(CompileError::TypeMismatch)?;
+                let actual = match method {
+                    StateHandleMethod::Equality => {
+                        if arguments.len() != 1
+                            || expression_type(
+                                &arguments[0],
+                                locals,
+                                context,
+                                next_register,
+                                Some(receiver_type),
+                            )? != receiver_type
+                        {
+                            Err(CompileError::TypeMismatch)
+                        } else {
+                            Ok(ValueType::Bool)
+                        }
+                    }
+                    StateHandleMethod::Resolve => {
+                        if arguments.is_empty() {
+                            Ok(ValueType::Named(
+                                nexa_bytecode::result_type(
+                                    target,
+                                    ValueType::Named(
+                                        nexa_bytecode::state_handle_error_type().type_id,
+                                    ),
+                                )
+                                .type_id,
+                            ))
+                        } else {
+                            Err(CompileError::TypeMismatch)
+                        }
+                    }
+                    StateHandleMethod::IsAlive => {
+                        if arguments.is_empty() {
+                            Ok(ValueType::Bool)
+                        } else {
+                            Err(CompileError::TypeMismatch)
+                        }
+                    }
+                    StateHandleMethod::StableId => {
+                        if arguments.is_empty() {
+                            Ok(nexa_bytecode::stable_id_type())
+                        } else {
+                            Err(CompileError::TypeMismatch)
+                        }
+                    }
+                    StateHandleMethod::Generation | StateHandleMethod::Hash => {
+                        if arguments.is_empty() {
+                            Ok(ValueType::I32)
+                        } else {
+                            Err(CompileError::TypeMismatch)
+                        }
+                    }
+                }?;
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(actual);
+            }
             let signature = context
                 .signatures
                 .get(function)
@@ -2038,6 +2246,9 @@ fn lower_type(ty: &AstType) -> ValueType {
             nexa_bytecode::result_type(lower_type(&arguments[0]), lower_type(&arguments[1]))
                 .type_id,
         ),
+        AstType::BuiltinGeneric { name, arguments } if name == "StateHandle" => {
+            ValueType::Named(nexa_bytecode::state_handle_type(lower_type(&arguments[0])))
+        }
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
     }
 }
@@ -2227,6 +2438,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             host_functions: &hir.host_functions,
             enum_variants: &hir.enum_variants,
             function_result: function.signature.result.expect("result is required"),
+            state_handle_targets: &hir.state_handle_targets,
         };
         emit_statements(
             &function.body,
@@ -2298,7 +2510,10 @@ fn exact_root_maps(
             | Instruction::Add { dst, .. }
             | Instruction::Sub { dst, .. }
             | Instruction::Mul { dst, .. } => state[usize::from(dst)] = Some(ValueType::I32),
-            Instruction::LoadBool { dst, .. } | Instruction::CompareEq { dst, .. } => {
+            Instruction::LoadBool { dst, .. }
+            | Instruction::CompareEq { dst, .. }
+            | Instruction::StateHandleIsAlive { dst, .. }
+            | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
             }
             Instruction::Move { dst, source } => {
@@ -2326,7 +2541,15 @@ fn exact_root_maps(
             | Instruction::EnumNew { type_id, dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
             }
-            Instruction::EnumTag { dst, .. } => {
+            Instruction::StateHandleResolve {
+                result_type, dst, ..
+            } => state[usize::from(dst)] = Some(ValueType::Named(result_type)),
+            Instruction::StateHandleStableId { dst, .. } => {
+                state[usize::from(dst)] = Some(nexa_bytecode::stable_id_type());
+            }
+            Instruction::StateHandleGeneration { dst, .. }
+            | Instruction::StateHandleHash { dst, .. }
+            | Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
             Instruction::EnumPayload {
@@ -2439,6 +2662,7 @@ struct EmitContext<'a> {
     host_functions: &'a BTreeMap<String, HostFunction>,
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
     function_result: ValueType,
+    state_handle_targets: &'a BTreeMap<StableId, ValueType>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2586,6 +2810,14 @@ fn emit_expression(
     context: &EmitContext<'_>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
+    if let AstExpression::Call {
+        function,
+        arguments,
+    } = expression
+        && state_handle_method(function).is_some()
+    {
+        return emit_state_handle_method(function, arguments, destination, locals, context, code);
+    }
     match expression {
         AstExpression::Integer(value) => code.push(Instruction::LoadI32 {
             dst: destination,
@@ -2744,6 +2976,80 @@ fn emit_expression(
     Ok(())
 }
 
+fn emit_state_handle_method(
+    function: &str,
+    arguments: &[AstExpression],
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut Vec<Instruction>,
+) -> Result<(), CompileError> {
+    let (receiver, method) =
+        state_handle_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+    let (handle, receiver_type) = *locals
+        .get(receiver)
+        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+    let ValueType::Named(handle_type) = receiver_type else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let target = *context
+        .state_handle_targets
+        .get(&handle_type)
+        .ok_or(CompileError::TypeMismatch)?;
+    match method {
+        StateHandleMethod::Resolve => code.push(Instruction::StateHandleResolve {
+            handle,
+            target,
+            result_type: nexa_bytecode::result_type(
+                target,
+                ValueType::Named(nexa_bytecode::state_handle_error_type().type_id),
+            )
+            .type_id,
+            dst: destination,
+        }),
+        StateHandleMethod::IsAlive => code.push(Instruction::StateHandleIsAlive {
+            handle,
+            target,
+            dst: destination,
+        }),
+        StateHandleMethod::StableId => code.push(Instruction::StateHandleStableId {
+            handle,
+            target,
+            dst: destination,
+        }),
+        StateHandleMethod::Generation => code.push(Instruction::StateHandleGeneration {
+            handle,
+            target,
+            dst: destination,
+        }),
+        StateHandleMethod::Equality => {
+            let rhs = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                rhs,
+                Some(receiver_type),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::StateHandleEqual {
+                lhs: handle,
+                rhs,
+                target,
+                dst: destination,
+            });
+        }
+        StateHandleMethod::Hash => code.push(Instruction::StateHandleHash {
+            handle,
+            target,
+            dst: destination,
+        }),
+    }
+    Ok(())
+}
+
 fn context_function_signature<'a>(
     context: &'a EmitContext<'a>,
     index: u32,
@@ -2767,18 +3073,46 @@ fn emitted_expression_type(
             .get(name)
             .map(|(_, ty)| *ty)
             .ok_or_else(|| CompileError::UnknownName(name.clone())),
-        AstExpression::Call { function, .. } => context
-            .host_functions
-            .get(function)
-            .map(|function| &function.signature)
-            .or_else(|| {
+        AstExpression::Call { function, .. } => {
+            if let Some((receiver, method)) = state_handle_method(function) {
+                let ValueType::Named(handle_type) = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let target = *context
+                    .state_handle_targets
+                    .get(&handle_type)
+                    .ok_or(CompileError::TypeMismatch)?;
+                Ok(match method {
+                    StateHandleMethod::Resolve => ValueType::Named(
+                        nexa_bytecode::result_type(
+                            target,
+                            ValueType::Named(nexa_bytecode::state_handle_error_type().type_id),
+                        )
+                        .type_id,
+                    ),
+                    StateHandleMethod::IsAlive | StateHandleMethod::Equality => ValueType::Bool,
+                    StateHandleMethod::StableId => nexa_bytecode::stable_id_type(),
+                    StateHandleMethod::Generation | StateHandleMethod::Hash => ValueType::I32,
+                })
+            } else {
                 context
-                    .functions
+                    .host_functions
                     .get(function)
-                    .and_then(|index| context_function_signature(context, *index))
-            })
-            .and_then(|signature| signature.result)
-            .ok_or_else(|| CompileError::UnknownName(function.clone())),
+                    .map(|function| &function.signature)
+                    .or_else(|| {
+                        context
+                            .functions
+                            .get(function)
+                            .and_then(|index| context_function_signature(context, *index))
+                    })
+                    .and_then(|signature| signature.result)
+                    .ok_or_else(|| CompileError::UnknownName(function.clone()))
+            }
+        }
         AstExpression::Await(expression) => {
             emitted_expression_type(expression, expected, locals, context)
         }
@@ -3131,6 +3465,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
+                    | Instruction::StateHandleResolve { .. }
                     | Instruction::Return { .. }
                     | Instruction::ReturnVoid
                     | Instruction::Trap
@@ -3358,7 +3693,7 @@ fn compile_module(
 
 #[cfg(test)]
 mod tests {
-    use nexa_bytecode::FunctionEffect;
+    use nexa_bytecode::{FunctionEffect, Instruction};
     use nexa_core::StableId;
     use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue};
 
@@ -3718,6 +4053,52 @@ mod tests {
         assert_eq!(
             compile("@activation task fn invalid() -> bool { return true; }").unwrap_err(),
             CompileError::InvalidReloadMetadata("activation entry must have Immediate effect")
+        );
+    }
+
+    #[test]
+    fn state_handle_generic_methods_compile_to_verified_typed_opcodes() {
+        let module = compile(
+            "@stateful class EnemyBrain { phase: i32; }
+             fn inspect(
+                 handle: StateHandle<EnemyBrain>,
+                 other: StateHandle<EnemyBrain>
+             ) -> i32 {
+                 let resolved: Result<EnemyBrain, StateHandleError> = handle.resolve();
+                 let alive: bool = handle.is_alive();
+                 let id: StableId = handle.stable_id();
+                 let generation: i32 = handle.generation();
+                 let equal: bool = handle.equality(other);
+                 return handle.hash();
+             }",
+        )
+        .unwrap();
+        let code = &module.module().functions[0].code;
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateHandleResolve { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateHandleIsAlive { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateHandleStableId { .. }))
+        );
+        assert!(
+            code.iter().any(|instruction| matches!(
+                instruction,
+                Instruction::StateHandleGeneration { .. }
+            ))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateHandleEqual { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateHandleHash { .. }))
         );
     }
 }

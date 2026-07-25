@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
 
+use nexa_bytecode::ValueType;
 use nexa_core::StableId;
 
 use crate::allocation::{AllocationBoundary, MigrationAllocationPhase, observe_migration};
@@ -29,6 +30,27 @@ pub struct StateHandle {
     pub domain: StatefulDomainId,
     pub stable_id: StableId,
     pub generation: u32,
+}
+
+impl StateHandle {
+    #[must_use]
+    pub const fn stable_id(self) -> StableId {
+        self.stable_id
+    }
+
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn deterministic_hash(self) -> u64 {
+        let mut hash = DeterministicMigrationHasher::new();
+        hash.write_u64(self.domain.get());
+        hash.write_u64(self.stable_id.0);
+        hash.write_u32(self.generation);
+        hash.value
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +116,14 @@ pub enum StatefulError {
     GenerationExhausted,
     NestedObject,
     Capacity(MigrationLimitError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StateHandleError {
+    WrongDomain,
+    Missing,
+    StaleGeneration,
+    GenerationExhausted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,6 +213,14 @@ impl fmt::Display for StatefulError {
 }
 
 impl std::error::Error for StatefulError {}
+
+impl fmt::Display for StateHandleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for StateHandleError {}
 
 impl Clone for StatefulRegistry {
     fn clone(&self) -> Self {
@@ -305,6 +343,58 @@ impl StatefulRegistry {
         Ok(self.materialize(slot))
     }
 
+    pub(crate) fn runtime_handle(
+        &self,
+        handle: StateHandle,
+    ) -> Result<RuntimeValue, StatefulError> {
+        let slot = self.checked_handle_slot(handle)?;
+        let target = slot
+            .scalar
+            .as_ref()
+            .map_or(ValueType::Named(slot.type_id), state_value_type);
+        Ok(RuntimeValue::StateHandle {
+            handle_type: nexa_bytecode::state_handle_type(target),
+            domain: handle.domain.get(),
+            stable_id: handle.stable_id,
+            generation: handle.generation,
+        })
+    }
+
+    pub(crate) fn resolve_runtime_handle(
+        &self,
+        handle: StateHandle,
+        target: ValueType,
+    ) -> Result<RuntimeValue, StateHandleError> {
+        let slot = self.checked_runtime_handle_slot(handle)?;
+        let actual = slot
+            .scalar
+            .as_ref()
+            .map_or(ValueType::Named(slot.type_id), state_value_type);
+        if actual != target {
+            return Err(StateHandleError::Missing);
+        }
+        Ok(slot.scalar.as_ref().map_or(
+            RuntimeValue::Opaque {
+                type_id: slot.type_id,
+                value: slot.stable_id.0,
+            },
+            |value| state_to_runtime_value(slot.stable_id, value),
+        ))
+    }
+
+    pub(crate) fn is_handle_alive(&self, handle: StateHandle) -> bool {
+        if handle.domain != self.domain {
+            return false;
+        }
+        match self
+            .objects
+            .binary_search_by_key(&handle.stable_id, |slot| slot.stable_id)
+        {
+            Ok(index) => self.objects[index].generation == handle.generation,
+            Err(_) => false,
+        }
+    }
+
     #[must_use]
     pub fn handles(&self) -> Vec<StateHandle> {
         self.objects
@@ -350,6 +440,39 @@ impl StatefulRegistry {
             .binary_search_by_key(&stable_id, |slot| slot.stable_id)
             .map(|index| &self.objects[index])
             .map_err(|_| StatefulError::Missing(stable_id))
+    }
+
+    fn checked_handle_slot(
+        &self,
+        handle: StateHandle,
+    ) -> Result<&MigrationObjectSlot, StatefulError> {
+        if handle.domain != self.domain {
+            return Err(StatefulError::WrongDomain {
+                expected: self.domain,
+                actual: handle.domain,
+            });
+        }
+        let slot = self.object(handle.stable_id)?;
+        if slot.generation != handle.generation {
+            return Err(StatefulError::StaleGeneration);
+        }
+        Ok(slot)
+    }
+
+    fn checked_runtime_handle_slot(
+        &self,
+        handle: StateHandle,
+    ) -> Result<&MigrationObjectSlot, StateHandleError> {
+        if handle.domain != self.domain {
+            return Err(StateHandleError::WrongDomain);
+        }
+        let slot = self
+            .object(handle.stable_id)
+            .map_err(|_| StateHandleError::Missing)?;
+        if slot.generation != handle.generation {
+            return Err(StateHandleError::StaleGeneration);
+        }
+        Ok(slot)
     }
 
     fn object_fields(&self, slot: &MigrationObjectSlot) -> &[MigrationFieldSlot] {
@@ -614,6 +737,18 @@ fn state_value_payload_bytes(value: &StateValue) -> usize {
         StateValue::Ref(_) => std::mem::size_of::<GcRef>(),
         StateValue::Handle(_) => std::mem::size_of::<StateHandle>(),
         StateValue::Object(_) => usize::MAX,
+    }
+}
+
+fn state_value_type(value: &StateValue) -> ValueType {
+    match value {
+        StateValue::I32(_) => ValueType::I32,
+        StateValue::Bool(_) => ValueType::Bool,
+        StateValue::Ref(_) => ValueType::Ref,
+        StateValue::Handle(_) => ValueType::Named(nexa_bytecode::state_handle_type(
+            ValueType::Named(StableId::from_name("StateValue")),
+        )),
+        StateValue::Object(object) => ValueType::Named(object.type_id),
     }
 }
 
@@ -1503,6 +1638,16 @@ fn runtime_to_state_value(
                 generation,
             }))
         }
+        RuntimeValue::StateHandle {
+            domain,
+            stable_id,
+            generation,
+            ..
+        } => Ok(StateValue::Handle(StateHandle {
+            domain: StatefulDomainId::new(domain),
+            stable_id,
+            generation,
+        })),
         RuntimeValue::HostRequest(_)
         | RuntimeValue::ResourceToken(_)
         | RuntimeValue::Snapshot(_)
@@ -1517,6 +1662,9 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::Ref(_) => nexa_bytecode::ValueType::Ref,
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             nexa_bytecode::ValueType::Named(type_id)
+        }
+        RuntimeValue::StateHandle { handle_type, .. } => {
+            nexa_bytecode::ValueType::Named(handle_type)
         }
         RuntimeValue::HostRequest(_) => {
             nexa_bytecode::ValueType::Named(StableId::from_name("HostRequest"))
@@ -1690,6 +1838,36 @@ mod tests {
         assert_ne!(old, new);
         assert_eq!(registry.resolve(old), Err(StatefulError::StaleGeneration));
         assert_eq!(registry.resolve(new), Ok(StateValue::I32(2)));
+        let wrong_domain = StateHandle {
+            domain: StatefulDomainId::new(2),
+            ..new
+        };
+        assert!(matches!(
+            registry.checked_runtime_handle_slot(wrong_domain),
+            Err(StateHandleError::WrongDomain)
+        ));
+        let missing = StateHandle {
+            stable_id: StableId::from_name("missing"),
+            ..new
+        };
+        assert!(matches!(
+            registry.checked_runtime_handle_slot(missing),
+            Err(StateHandleError::Missing)
+        ));
+        assert!(matches!(
+            registry.checked_runtime_handle_slot(old),
+            Err(StateHandleError::StaleGeneration)
+        ));
+
+        registry.objects[0].generation = u32::MAX;
+        assert_eq!(
+            registry.insert(id, StateValue::I32(3)),
+            Err(StatefulError::GenerationExhausted)
+        );
+        assert_eq!(new.stable_id(), id);
+        assert_eq!(new.generation(), 1);
+        assert_eq!(new, new);
+        assert_eq!(new.deterministic_hash(), new.deterministic_hash());
     }
 
     #[test]

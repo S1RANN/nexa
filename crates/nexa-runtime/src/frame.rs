@@ -19,6 +19,12 @@ pub enum RuntimeValue {
         value: u64,
         type_id: nexa_core::StableId,
     },
+    StateHandle {
+        handle_type: nexa_core::StableId,
+        domain: u64,
+        stable_id: nexa_core::StableId,
+        generation: u32,
+    },
     #[default]
     Unit,
 }
@@ -72,6 +78,7 @@ impl ContinuationReservation {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum DeferAction {
     ReleaseCounter(u32),
     SetFlag(u32),
@@ -318,6 +325,7 @@ impl FrameArena {
                 | RuntimeValue::ResourceToken(_)
                 | RuntimeValue::Snapshot(_)
                 | RuntimeValue::Opaque { .. }
+                | RuntimeValue::StateHandle { .. }
                 | RuntimeValue::Unit => None,
             })
             .collect()
@@ -346,6 +354,7 @@ impl FrameArena {
                         | RuntimeValue::ResourceToken(_)
                         | RuntimeValue::Snapshot(_)
                         | RuntimeValue::Opaque { .. }
+                        | RuntimeValue::StateHandle { .. }
                         | RuntimeValue::Unit => {}
                     }
                 }

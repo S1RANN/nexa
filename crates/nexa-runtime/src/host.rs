@@ -1084,6 +1084,14 @@ fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
         crate::RuntimeValue::ResourceToken(token) => HostValue::Token(token),
         crate::RuntimeValue::Snapshot(snapshot) => HostValue::Snapshot(snapshot),
         crate::RuntimeValue::Opaque { value, .. } => HostValue::Opaque(value),
+        crate::RuntimeValue::StateHandle {
+            domain,
+            stable_id,
+            generation,
+            ..
+        } => HostValue::Opaque(
+            domain ^ stable_id.0.rotate_left(17) ^ u64::from(generation).rotate_left(41),
+        ),
         crate::RuntimeValue::Unit => HostValue::Unit,
     }
 }

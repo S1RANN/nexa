@@ -6,7 +6,7 @@ use std::fmt;
 use nexa_core::StableId;
 
 pub const MAGIC: [u8; 4] = *b"NXBC";
-pub const BYTECODE_VERSION: u16 = 3;
+pub const BYTECODE_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueType {
@@ -140,6 +140,37 @@ pub fn result_type(success: ValueType, error: ValueType) -> EnumType {
                 payload_type: Some(error),
             },
         ],
+    }
+}
+
+#[must_use]
+pub fn state_handle_type(target: ValueType) -> StableId {
+    parameterized_type_id("StateHandle", &[target])
+}
+
+#[must_use]
+pub fn stable_id_type() -> ValueType {
+    ValueType::Named(StableId::from_name("StableId"))
+}
+
+#[must_use]
+pub fn state_handle_error_type() -> EnumType {
+    EnumType {
+        type_id: StableId::from_name("StateHandleError"),
+        variants: [
+            "WrongDomain",
+            "Missing",
+            "StaleGeneration",
+            "GenerationExhausted",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(tag, name)| EnumVariant {
+            stable_id: StableId::from_parts(&["StateHandleError", "::", name]),
+            tag: u32::try_from(tag).expect("state handle error variant count is fixed"),
+            payload_type: None,
+        })
+        .collect(),
     }
 }
 
@@ -344,6 +375,38 @@ pub enum Instruction {
         object: u16,
         field_id: StableId,
         ty: ValueType,
+        dst: u16,
+    },
+    StateHandleResolve {
+        handle: u16,
+        target: ValueType,
+        result_type: StableId,
+        dst: u16,
+    },
+    StateHandleIsAlive {
+        handle: u16,
+        target: ValueType,
+        dst: u16,
+    },
+    StateHandleStableId {
+        handle: u16,
+        target: ValueType,
+        dst: u16,
+    },
+    StateHandleGeneration {
+        handle: u16,
+        target: ValueType,
+        dst: u16,
+    },
+    StateHandleEqual {
+        lhs: u16,
+        rhs: u16,
+        target: ValueType,
+        dst: u16,
+    },
+    StateHandleHash {
+        handle: u16,
+        target: ValueType,
         dst: u16,
     },
     DeferPush {
@@ -1368,6 +1431,70 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             encode_type(output, ty);
             put_u16(output, dst);
         }
+        Instruction::StateHandleResolve {
+            handle,
+            target,
+            result_type,
+            dst,
+        } => {
+            output.push(30);
+            put_u16(output, handle);
+            encode_type(output, target);
+            put_u64(output, result_type.0);
+            put_u16(output, dst);
+        }
+        Instruction::StateHandleIsAlive {
+            handle,
+            target,
+            dst,
+        } => {
+            output.push(31);
+            put_u16(output, handle);
+            encode_type(output, target);
+            put_u16(output, dst);
+        }
+        Instruction::StateHandleStableId {
+            handle,
+            target,
+            dst,
+        } => {
+            output.push(32);
+            put_u16(output, handle);
+            encode_type(output, target);
+            put_u16(output, dst);
+        }
+        Instruction::StateHandleGeneration {
+            handle,
+            target,
+            dst,
+        } => {
+            output.push(33);
+            put_u16(output, handle);
+            encode_type(output, target);
+            put_u16(output, dst);
+        }
+        Instruction::StateHandleEqual {
+            lhs,
+            rhs,
+            target,
+            dst,
+        } => {
+            output.push(34);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+            encode_type(output, target);
+            put_u16(output, dst);
+        }
+        Instruction::StateHandleHash {
+            handle,
+            target,
+            dst,
+        } => {
+            output.push(35);
+            put_u16(output, handle);
+            encode_type(output, target);
+            put_u16(output, dst);
+        }
         Instruction::Return { source } => {
             output.push(10);
             put_u16(output, source);
@@ -1504,6 +1631,38 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             object: reader.u16()?,
             field_id: StableId(reader.u64()?),
             ty: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        30 => Instruction::StateHandleResolve {
+            handle: reader.u16()?,
+            target: decode_type(reader)?,
+            result_type: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        31 => Instruction::StateHandleIsAlive {
+            handle: reader.u16()?,
+            target: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        32 => Instruction::StateHandleStableId {
+            handle: reader.u16()?,
+            target: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        33 => Instruction::StateHandleGeneration {
+            handle: reader.u16()?,
+            target: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        34 => Instruction::StateHandleEqual {
+            lhs: reader.u16()?,
+            rhs: reader.u16()?,
+            target: decode_type(reader)?,
+            dst: reader.u16()?,
+        },
+        35 => Instruction::StateHandleHash {
+            handle: reader.u16()?,
+            target: decode_type(reader)?,
             dst: reader.u16()?,
         },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
@@ -1817,6 +1976,7 @@ impl FunctionBuilder {
                         | Instruction::Yield
                         | Instruction::Call { .. }
                         | Instruction::HostCall { .. }
+                        | Instruction::StateHandleResolve { .. }
                         | Instruction::Return { .. }
                         | Instruction::ReturnVoid
                         | Instruction::Trap
@@ -1871,7 +2031,7 @@ impl FunctionBuilder {
 mod tests {
     use super::{
         DecodeError, FunctionBuilder, FunctionEffect, Instruction, Module, ModuleBuilder,
-        Signature, ValueType,
+        Signature, ValueType, result_type, state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -1952,6 +2112,63 @@ mod tests {
                 .max_call_depth,
             1
         );
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn state_handle_opcodes_round_trip_in_bytecode_v4() {
+        let target = ValueType::Named(nexa_core::StableId::from_name("EnemyBrain"));
+        let result = result_type(target, ValueType::Named(state_handle_error_type().type_id));
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::Named(state_handle_type(target)),
+                    ValueType::Named(state_handle_type(target)),
+                ],
+                result: Some(ValueType::I32),
+            },
+            8,
+        );
+        function
+            .emit(Instruction::StateHandleResolve {
+                handle: 0,
+                target,
+                result_type: result.type_id,
+                dst: 2,
+            })
+            .emit(Instruction::StateHandleIsAlive {
+                handle: 0,
+                target,
+                dst: 3,
+            })
+            .emit(Instruction::StateHandleStableId {
+                handle: 0,
+                target,
+                dst: 4,
+            })
+            .emit(Instruction::StateHandleGeneration {
+                handle: 0,
+                target,
+                dst: 5,
+            })
+            .emit(Instruction::StateHandleEqual {
+                lhs: 0,
+                rhs: 1,
+                target,
+                dst: 6,
+            })
+            .emit(Instruction::StateHandleHash {
+                handle: 0,
+                target,
+                dst: 7,
+            })
+            .emit(Instruction::Return { source: 7 });
+        let mut builder = ModuleBuilder::new();
+        builder
+            .enum_type(state_handle_error_type())
+            .enum_type(result)
+            .function(function.finish().unwrap());
+        let module = builder.finish();
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 }

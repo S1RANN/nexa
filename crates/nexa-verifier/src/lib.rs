@@ -420,6 +420,106 @@ fn verify_function(
                 }
                 state[register(dst)?] = Some(ty);
             }
+            Instruction::StateHandleResolve {
+                handle,
+                target,
+                result_type,
+                dst,
+            } => {
+                if matches!(
+                    function.effect,
+                    FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                require(
+                    &state,
+                    handle,
+                    ValueType::Named(nexa_bytecode::state_handle_type(target)),
+                )?;
+                let expected_result = nexa_bytecode::result_type(
+                    target,
+                    ValueType::Named(nexa_bytecode::state_handle_error_type().type_id),
+                );
+                if result_type != expected_result.type_id
+                    || !module
+                        .enum_types
+                        .iter()
+                        .any(|enum_type| enum_type == &expected_result)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                state[register(dst)?] = Some(ValueType::Named(result_type));
+            }
+            Instruction::StateHandleIsAlive {
+                handle,
+                target,
+                dst,
+            }
+            | Instruction::StateHandleGeneration {
+                handle,
+                target,
+                dst,
+            }
+            | Instruction::StateHandleHash {
+                handle,
+                target,
+                dst,
+            } => {
+                if matches!(
+                    function.effect,
+                    FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                require(
+                    &state,
+                    handle,
+                    ValueType::Named(nexa_bytecode::state_handle_type(target)),
+                )?;
+                state[register(dst)?] = Some(
+                    if matches!(instruction, Instruction::StateHandleIsAlive { .. }) {
+                        ValueType::Bool
+                    } else {
+                        ValueType::I32
+                    },
+                );
+            }
+            Instruction::StateHandleStableId {
+                handle,
+                target,
+                dst,
+            } => {
+                if matches!(
+                    function.effect,
+                    FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                require(
+                    &state,
+                    handle,
+                    ValueType::Named(nexa_bytecode::state_handle_type(target)),
+                )?;
+                state[register(dst)?] = Some(nexa_bytecode::stable_id_type());
+            }
+            Instruction::StateHandleEqual {
+                lhs,
+                rhs,
+                target,
+                dst,
+            } => {
+                if matches!(
+                    function.effect,
+                    FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                let handle_type = ValueType::Named(nexa_bytecode::state_handle_type(target));
+                require(&state, lhs, handle_type)?;
+                require(&state, rhs, handle_type)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
             Instruction::StateNewCreate { type_id, dst, .. } => {
                 if function.effect != FunctionEffect::Migration
                     || !module
@@ -720,6 +820,7 @@ fn verify_safepoints(
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
+                    | Instruction::StateHandleResolve { .. }
                     | Instruction::Return { .. }
                     | Instruction::ReturnVoid
                     | Instruction::Trap

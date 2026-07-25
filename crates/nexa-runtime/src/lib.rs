@@ -50,8 +50,8 @@ pub use host::{
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
-    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, OpcodeCostTable, SuspendReason,
-    Trap, TrapKind,
+    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, OpcodeCostTable,
+    SuspendReason, Trap, TrapKind,
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
@@ -65,7 +65,7 @@ pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use stateful::{
     MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
-    StateHandle, StateObject, StateValue, StatefulDomainId, StatefulError,
+    StateHandle, StateHandleError, StateObject, StateValue, StatefulDomainId, StatefulError,
 };
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
 pub use trace::{RuntimeTrace, TraceRecords};

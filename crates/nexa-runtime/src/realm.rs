@@ -19,10 +19,11 @@ use crate::{
     FuelState, GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionDelivery,
     HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
     HostValue, InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
-    Object, OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
-    RuntimeHost, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage,
-    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
-    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
+    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
+    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostDomain, RuntimeHostState,
+    RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle,
+    SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime,
+    TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,6 +153,24 @@ impl InterpreterHost for RealmHostBridge<'_> {
                 Ok(InterpreterHostOutcome::Pending(request))
             }
         }
+    }
+}
+
+struct RealmStateBridge<'a> {
+    registry: &'a StatefulRegistry,
+}
+
+impl InterpreterState for RealmStateBridge<'_> {
+    fn resolve(
+        &mut self,
+        handle: crate::StateHandle,
+        target: ValueType,
+    ) -> Result<RuntimeValue, crate::StateHandleError> {
+        self.registry.resolve_runtime_handle(handle, target)
+    }
+
+    fn is_alive(&mut self, handle: crate::StateHandle) -> bool {
+        self.registry.is_handle_alive(handle)
     }
 }
 
@@ -632,6 +651,32 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?
             .state
             .resolve(handle)?)
+    }
+
+    pub fn state_handle_value(
+        &self,
+        module: ModuleHandle,
+        handle: crate::StateHandle,
+    ) -> Result<RuntimeValue, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state
+            .runtime_handle(handle)?)
+    }
+
+    pub fn state_handle_is_alive(
+        &self,
+        module: ModuleHandle,
+        handle: crate::StateHandle,
+    ) -> Result<bool, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state
+            .is_handle_alive(handle))
     }
 
     #[must_use]
@@ -1228,6 +1273,9 @@ impl RealmRuntime {
             snapshot.fuel.cumulative_limit,
         );
         let trace_start = self.trace_cursor();
+        let mut state_bridge = RealmStateBridge {
+            registry: &module.state,
+        };
         let outcome = if let Some(registry) = self.host_registry.as_deref_mut() {
             let mut bridge = RealmHostBridge {
                 registry,
@@ -1237,20 +1285,22 @@ impl RealmRuntime {
                 epoch: snapshot.module_epoch,
                 imports: &module.verified.module().host_imports,
             };
-            CheckedInterpreter::poll_with_host_and_heap(
+            CheckedInterpreter::poll_with_host_heap_and_state(
                 &module.verified,
                 continuation,
                 fuel,
                 &self.cost_table,
                 &mut bridge,
+                &mut state_bridge,
                 &mut self.heap,
             )?
         } else {
-            CheckedInterpreter::poll_with_heap(
+            CheckedInterpreter::poll_with_heap_and_state(
                 &module.verified,
                 continuation,
                 fuel,
                 &self.cost_table,
+                &mut state_bridge,
                 &mut self.heap,
             )?
         };
@@ -2462,8 +2512,8 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
-        RootMap, Signature, StateField, StateSchema, StateType, ValueType,
+        Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
+        ModuleBuilder, RootMap, Signature, StateField, StateSchema, StateType, ValueType,
     };
     use nexa_core::StableId;
     use nexa_verifier::{VerifierLimits, verify};
@@ -4085,6 +4135,249 @@ mod tests {
                 .unwrap(),
             crate::StateValue::I32(37)
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn typed_state_handle_methods_resolve_and_reject_stale_or_foreign_domains() {
+        let host = StableId::from_name("state-handle-host");
+        let schema_hash = StableId::from_name("state-handle-schema");
+        let type_id = StableId::from_name("EnemyBrain");
+        let field_id = StableId::from_parts(&["EnemyBrain", "::phase"]);
+        let target = ValueType::Named(type_id);
+        let handle_type = nexa_bytecode::state_handle_type(target);
+        let error_type = nexa_bytecode::state_handle_error_type();
+        let result_type = nexa_bytecode::result_type(target, ValueType::Named(error_type.type_id));
+
+        let inspect = Function {
+            signature: Signature {
+                parameters: vec![ValueType::Named(handle_type), ValueType::Named(handle_type)],
+                result: Some(ValueType::I32),
+            },
+            registers: 8,
+            frame_bytes: 64,
+            root_bitmap: vec![true, true, true, false, true, false, false, false],
+            root_maps: vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: vec![true, true, false, false, false, false, false, false],
+                },
+                RootMap {
+                    pc: 6,
+                    bitmap: vec![true, true, true, false, true, false, false, false],
+                },
+            ],
+            safepoints: vec![0, 6],
+            loop_bounds: Vec::new(),
+            effect: FunctionEffect::Task,
+            max_static_call_depth: 1,
+            code: vec![
+                Instruction::StateHandleResolve {
+                    handle: 0,
+                    target,
+                    result_type: result_type.type_id,
+                    dst: 2,
+                },
+                Instruction::StateHandleIsAlive {
+                    handle: 0,
+                    target,
+                    dst: 3,
+                },
+                Instruction::StateHandleStableId {
+                    handle: 0,
+                    target,
+                    dst: 4,
+                },
+                Instruction::StateHandleGeneration {
+                    handle: 0,
+                    target,
+                    dst: 5,
+                },
+                Instruction::StateHandleEqual {
+                    lhs: 0,
+                    rhs: 1,
+                    target,
+                    dst: 6,
+                },
+                Instruction::StateHandleHash {
+                    handle: 0,
+                    target,
+                    dst: 7,
+                },
+                Instruction::Return { source: 7 },
+            ],
+        };
+        let resolve = Function {
+            signature: Signature {
+                parameters: vec![ValueType::Named(handle_type)],
+                result: Some(ValueType::Named(result_type.type_id)),
+            },
+            registers: 2,
+            frame_bytes: 16,
+            root_bitmap: vec![true, true],
+            root_maps: vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: vec![true, false],
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: vec![true, true],
+                },
+            ],
+            safepoints: vec![0, 1],
+            loop_bounds: Vec::new(),
+            effect: FunctionEffect::Task,
+            max_static_call_depth: 1,
+            code: vec![
+                Instruction::StateHandleResolve {
+                    handle: 0,
+                    target,
+                    result_type: result_type.type_id,
+                    dst: 1,
+                },
+                Instruction::Return { source: 1 },
+            ],
+        };
+        let mut builder = ModuleBuilder::new();
+        builder
+            .metadata(host, schema_hash)
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: type_id,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: field_id,
+                        ty: ValueType::I32,
+                    }],
+                }],
+            })
+            .enum_type(error_type)
+            .enum_type(result_type)
+            .function(inspect);
+        builder.function(resolve);
+        let verified = verify(builder.finish(), VerifierLimits::default()).unwrap();
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let module = realm.load_module(verified, host, schema_hash).unwrap();
+        let handle = realm
+            .insert_state(
+                module,
+                StableId::from_name("enemy"),
+                crate::StateValue::Object(crate::StateObject {
+                    type_id,
+                    version: 1,
+                    fields: BTreeMap::from([(field_id, crate::StateValue::I32(7))]),
+                }),
+            )
+            .unwrap();
+        let value = realm.state_handle_value(module, handle).unwrap();
+        assert!(realm.state_handle_is_alive(module, handle).unwrap());
+
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[value, value],
+                StepConfig {
+                    owner: scope,
+                    priority: 0,
+                    fuel_slice: 64,
+                    cumulative_budget: 64,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let expected_hash = handle.deterministic_hash().to_le_bytes();
+        assert_eq!(
+            realm.poll_task(task, 64).unwrap(),
+            PollResult::Completed(Some(RuntimeValue::I32(i32::from_le_bytes([
+                expected_hash[0],
+                expected_hash[1],
+                expected_hash[2],
+                expected_hash[3],
+            ]))))
+        );
+
+        let stale_value = value;
+        let current = realm
+            .insert_state(
+                module,
+                handle.stable_id,
+                crate::StateValue::Object(crate::StateObject {
+                    type_id,
+                    version: 1,
+                    fields: BTreeMap::from([(field_id, crate::StateValue::I32(8))]),
+                }),
+            )
+            .unwrap();
+        assert!(!realm.state_handle_is_alive(module, handle).unwrap());
+        assert!(realm.state_handle_is_alive(module, current).unwrap());
+
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                1,
+                &[stale_value],
+                StepConfig {
+                    owner: scope,
+                    priority: 0,
+                    fuel_slice: 64,
+                    cumulative_budget: 64,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let PollResult::Completed(Some(stale_result)) = realm.poll_task(task, 64).unwrap() else {
+            panic!("stale resolve returns a Result");
+        };
+        assert_eq!(realm.heap.enum_tag(stale_result).unwrap(), 1);
+        let stale_error = realm
+            .heap
+            .enum_payload(stale_result, StableId::from_parts(&["Result", "::Err"]))
+            .unwrap();
+        assert_eq!(realm.heap.enum_tag(stale_error).unwrap(), 2);
+
+        let RuntimeValue::StateHandle {
+            handle_type,
+            stable_id,
+            generation,
+            ..
+        } = value
+        else {
+            panic!("realm emits a typed state handle");
+        };
+        let foreign = RuntimeValue::StateHandle {
+            handle_type,
+            domain: 999,
+            stable_id,
+            generation,
+        };
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                1,
+                &[foreign],
+                StepConfig {
+                    owner: scope,
+                    priority: 0,
+                    fuel_slice: 64,
+                    cumulative_budget: 64,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let PollResult::Completed(Some(foreign_result)) = realm.poll_task(task, 64).unwrap() else {
+            panic!("foreign resolve returns a Result");
+        };
+        assert_eq!(realm.heap.enum_tag(foreign_result).unwrap(), 1);
+        let foreign_error = realm
+            .heap
+            .enum_payload(foreign_result, StableId::from_parts(&["Result", "::Err"]))
+            .unwrap();
+        assert_eq!(realm.heap.enum_tag(foreign_error).unwrap(), 0);
     }
 
     #[test]

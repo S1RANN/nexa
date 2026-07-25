@@ -237,14 +237,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 30],
+    costs: [u16; 36],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 30],
+            costs: [1; 36],
         }
     }
 }
@@ -301,6 +301,16 @@ pub trait InterpreterMigration {
     fn finish_staging(&mut self) -> Result<(), crate::RuntimeMessage>;
 }
 
+pub trait InterpreterState {
+    fn resolve(
+        &mut self,
+        handle: crate::StateHandle,
+        target: ValueType,
+    ) -> Result<RuntimeValue, crate::StateHandleError>;
+
+    fn is_alive(&mut self, handle: crate::StateHandle) -> bool;
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum InterpreterHostOutcome {
     Immediate(RuntimeValue),
@@ -324,7 +334,7 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, None, None, None)
+        Self::execute(module, continuation, fuel, costs, None, None, None, None)
     }
 
     pub fn poll_with_host(
@@ -334,7 +344,16 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         host: &mut dyn InterpreterHost,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, Some(host), None, None)
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            Some(host),
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn poll_with_heap(
@@ -344,7 +363,16 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, None, None, Some(heap))
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            None,
+            Some(heap),
+        )
     }
 
     pub fn poll_with_host_and_heap(
@@ -362,6 +390,48 @@ impl CheckedInterpreter {
             costs,
             Some(host),
             None,
+            None,
+            Some(heap),
+        )
+    }
+
+    pub(crate) fn poll_with_heap_and_state(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        state: &mut dyn InterpreterState,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            Some(state),
+            Some(heap),
+        )
+    }
+
+    pub(crate) fn poll_with_host_heap_and_state(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        host: &mut dyn InterpreterHost,
+        state: &mut dyn InterpreterState,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            Some(host),
+            None,
+            Some(state),
             Some(heap),
         )
     }
@@ -435,6 +505,7 @@ impl CheckedInterpreter {
             None,
             Some(migration),
             None,
+            None,
         )
     }
 
@@ -492,7 +563,7 @@ impl CheckedInterpreter {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn execute(
         module: &VerifiedModule,
         mut continuation: InterpreterContinuation,
@@ -500,6 +571,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         mut host: Option<&mut dyn InterpreterHost>,
         mut migration: Option<&mut dyn InterpreterMigration>,
+        mut state_registry: Option<&mut dyn InterpreterState>,
         mut heap: Option<&mut Heap>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         continuation.suspend_reason = None;
@@ -811,6 +883,110 @@ impl CheckedInterpreter {
                         .ok_or(InterpreterError::HostUnavailable)?
                         .delete(stable_id)
                         .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleResolve {
+                    handle,
+                    target,
+                    result_type,
+                    dst,
+                } => {
+                    let handle =
+                        runtime_state_handle(register(&continuation.arena, handle)?, target)?;
+                    let resolved = state_registry
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .resolve(handle, target);
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?;
+                    let result = match resolved {
+                        Ok(value) => {
+                            let variant = StableId::from_parts(&["Result", "::Ok"]);
+                            heap.allocate_enum(result_type, variant, 0, Some(value))?
+                        }
+                        Err(error) => {
+                            let error_type = nexa_bytecode::state_handle_error_type();
+                            let tag = state_handle_error_tag(error);
+                            let variant = error_type.variants[tag as usize].stable_id;
+                            let error_value =
+                                heap.allocate_enum(error_type.type_id, variant, tag, None)?;
+                            let variant = StableId::from_parts(&["Result", "::Err"]);
+                            heap.allocate_enum(result_type, variant, 1, Some(error_value))?
+                        }
+                    };
+                    set_register(&mut continuation.arena, dst, result)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleIsAlive {
+                    handle,
+                    target,
+                    dst,
+                } => {
+                    let handle =
+                        runtime_state_handle(register(&continuation.arena, handle)?, target)?;
+                    let alive = state_registry
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .is_alive(handle);
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(alive))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleStableId {
+                    handle,
+                    target,
+                    dst,
+                } => {
+                    let handle =
+                        runtime_state_handle(register(&continuation.arena, handle)?, target)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Opaque {
+                            value: handle.stable_id.0,
+                            type_id: StableId::from_name("StableId"),
+                        },
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleGeneration {
+                    handle,
+                    target,
+                    dst,
+                } => {
+                    let handle =
+                        runtime_state_handle(register(&continuation.arena, handle)?, target)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(i32::from_le_bytes(handle.generation.to_le_bytes())),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleEqual {
+                    lhs,
+                    rhs,
+                    target,
+                    dst,
+                } => {
+                    let lhs = runtime_state_handle(register(&continuation.arena, lhs)?, target)?;
+                    let rhs = runtime_state_handle(register(&continuation.arena, rhs)?, target)?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(lhs == rhs))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateHandleHash {
+                    handle,
+                    target,
+                    dst,
+                } => {
+                    let handle =
+                        runtime_state_handle(register(&continuation.arena, handle)?, target)?;
+                    let hash = handle.deterministic_hash().to_le_bytes();
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(i32::from_le_bytes([hash[0], hash[1], hash[2], hash[3]])),
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::EnumNew {
@@ -1125,6 +1301,7 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             Some(ValueType::Named(type_id))
         }
+        RuntimeValue::StateHandle { handle_type, .. } => Some(ValueType::Named(handle_type)),
         RuntimeValue::HostRequest(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
             "HostRequest",
         ))),
@@ -1135,6 +1312,38 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
             Some(ValueType::Named(nexa_core::StableId::from_name("Snapshot")))
         }
         RuntimeValue::Unit => None,
+    }
+}
+
+fn runtime_state_handle(
+    value: RuntimeValue,
+    target: ValueType,
+) -> Result<crate::StateHandle, InterpreterError> {
+    let RuntimeValue::StateHandle {
+        handle_type,
+        domain,
+        stable_id,
+        generation,
+    } = value
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    if handle_type != nexa_bytecode::state_handle_type(target) {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    Ok(crate::StateHandle {
+        domain: crate::StatefulDomainId::new(domain),
+        stable_id,
+        generation,
+    })
+}
+
+const fn state_handle_error_tag(error: crate::StateHandleError) -> u32 {
+    match error {
+        crate::StateHandleError::WrongDomain => 0,
+        crate::StateHandleError::Missing => 1,
+        crate::StateHandleError::StaleGeneration => 2,
+        crate::StateHandleError::GenerationExhausted => 3,
     }
 }
 
@@ -1152,6 +1361,7 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::Yield
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
+        | Instruction::StateHandleResolve { .. }
         | Instruction::Return { .. }
         | Instruction::ReturnVoid
         | Instruction::CleanupReturn
@@ -1193,6 +1403,12 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::StatePreserve { .. } => 27,
         Instruction::StateFinish => 28,
         Instruction::StateOldFieldGet { .. } => 29,
+        Instruction::StateHandleResolve { .. } => 30,
+        Instruction::StateHandleIsAlive { .. } => 31,
+        Instruction::StateHandleStableId { .. } => 32,
+        Instruction::StateHandleGeneration { .. } => 33,
+        Instruction::StateHandleEqual { .. } => 34,
+        Instruction::StateHandleHash { .. } => 35,
     }
 }
 
