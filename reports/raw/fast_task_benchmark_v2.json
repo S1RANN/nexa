@@ -1,5 +1,6 @@
 {
   "benchmark_version": 2,
+  "implementation_commit": "0c2c0ee7e008bb334a15ab712d4a5b8b07bd98d7",
   "toolchain": "rustc-1.97.1",
   "os": "macos",
   "arch": "aarch64",

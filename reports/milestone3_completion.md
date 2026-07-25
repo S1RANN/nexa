@@ -2,6 +2,8 @@
 
 Status: completed locally on Rust 1.97.1.
 
+Published implementation: `0c2c0ee7e008bb334a15ab712d4a5b8b07bd98d7`. The corresponding [GitHub Actions run](https://github.com/S1RANN/nexa/actions/runs/30141408369) passed on Linux, macOS, and Windows.
+
 ## Closed execution loop
 
 The combat integration now executes this path without application-side host dispatch or request waiting:

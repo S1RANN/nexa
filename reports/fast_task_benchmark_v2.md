@@ -8,6 +8,7 @@ Version: Milestone 3 Host-Integrated Stateful Runtime
 - Warmup: 100 iterations per case
 - Timed samples: 1,000 for hot paths; 200 for host/resource/reload/GC paths
 - Platform: macOS aarch64
+- Implementation commit: `0c2c0ee7e008bb334a15ab712d4a5b8b07bd98d7`
 - Raw result: `reports/raw/fast_task_benchmark_v2.json`
 - `Generated Rust thunk direct call` is the direct host control. The immediate and async cases both execute verified `HOST_CALL` bytecode through the Realm-owned registry; async includes pending request, completion delivery, destination-register writeback, and resume.
 - GC and trace-disabled execution remain separately measured.
