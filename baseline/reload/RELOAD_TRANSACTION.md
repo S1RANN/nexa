@@ -9,9 +9,12 @@ purity, and reserve staging capacity. The active system continues running.
 
 Stop new task admission for the module. Tasks enter `ReloadPaused` at safepoints. Completion
 delivery is drained from the global queue into a capacity-bounded, transaction-owned completion
-buffer. Tasks, frames, requests, and resources remain intact. Rollback restores scheduler and task
-checkpoints before replaying buffered deliveries; commit discards old-epoch buffered deliveries
-while cancelling the old tasks.
+buffer only when its immutable module/epoch identity matches the transaction's old root.
+Completions for every other module or epoch continue through normal delivery. Tasks, frames,
+requests, and resources remain intact. Rollback restores scheduler and task checkpoints before
+replaying buffered deliveries in terminal-sequence order; commit explicitly accounts for and
+discards old-epoch buffered deliveries while cancelling the old tasks. Activation failure occurs
+after publication and follows the same discard rule.
 
 ## Stage
 

@@ -45,10 +45,10 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
-    ActivationEntry, CancelReason, ModuleEpochRoot, ModuleHandle, ModuleLifecycle, PendingReason,
-    PollResult, RealmConfig, RealmError, RealmRuntime, RetiredEpochSnapshot, RetiredEpochState,
-    RootPublicationRecord, RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord,
-    TickBudget, TickReport,
+    ActivationEntry, CancelReason, CompletionRoute, ModuleEpochRoot, ModuleHandle, ModuleLifecycle,
+    PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime, ReloadCompletionStats,
+    RetiredEpochSnapshot, RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport,
+    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
 pub use reload::{
     MigrationLimitError, MigrationLimits, ReloadError, StateHandle, StateObject, StateValue,

@@ -819,7 +819,10 @@ impl ReloadCompletionBuffer {
         self.entries.len()
     }
 
-    pub(crate) fn drain(&mut self) -> impl Iterator<Item = HostCompletionDelivery> + '_ {
+    pub(crate) fn drain_ordered(&mut self) -> impl Iterator<Item = HostCompletionDelivery> + '_ {
+        self.entries
+            .make_contiguous()
+            .sort_by_key(|delivery| delivery.terminal_sequence);
         self.entries.drain(..)
     }
 }

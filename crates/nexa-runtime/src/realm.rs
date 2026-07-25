@@ -246,6 +246,20 @@ pub enum PendingReason {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionRoute {
+    Delivered,
+    BufferedForReload,
+    DiscardedForCommittedEpoch,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReloadCompletionStats {
+    pub buffered: u64,
+    pub replayed: u64,
+    pub discarded_after_commit: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CancelReason {
     OwnerDestroyed,
     ScopeCancelled,
@@ -403,6 +417,7 @@ pub struct RealmRuntime {
     reload: ReloadCoordinator,
     migration_limits: MigrationLimits,
     reload_completion_capacity: usize,
+    reload_completion_stats: ReloadCompletionStats,
     host_registry: Option<Box<dyn HostRegistry>>,
     host_registry_hash: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
@@ -435,6 +450,7 @@ impl RealmRuntime {
             reload: ReloadCoordinator::default(),
             migration_limits: config.migration_limits,
             reload_completion_capacity: config.max_host_resources as usize,
+            reload_completion_stats: ReloadCompletionStats::default(),
             host_registry: None,
             host_registry_hash: None,
             runtime_host: None,
@@ -912,6 +928,7 @@ impl RealmRuntime {
                     .resolve_mut(candidate.raw())
                     .map_err(RealmError::ModuleHandle)?
                     .lifecycle = ModuleLifecycle::Active;
+                self.discard_reload_completions()?;
                 let transaction = self.reload.finish()?;
                 Ok(transaction.candidate)
             }
@@ -921,6 +938,7 @@ impl RealmRuntime {
                     .resolve_mut(candidate.raw())
                     .map_err(RealmError::ModuleHandle)?
                     .lifecycle = ModuleLifecycle::ActivationFaulted;
+                self.discard_reload_completions()?;
                 self.reload.finish()?;
                 Err(ReloadError::Activation(error).into())
             }
@@ -939,8 +957,12 @@ impl RealmRuntime {
         self.modules
             .release(transaction.candidate.raw())
             .map_err(RealmError::ModuleHandle)?;
-        for delivery in transaction.completions.drain() {
-            self.deliver_host_completion(delivery)?;
+        for delivery in transaction.completions.drain_ordered() {
+            if !self.deliver_host_completion(delivery)? {
+                return Err(ReloadError::InvalidState.into());
+            }
+            self.reload_completion_stats.replayed =
+                self.reload_completion_stats.replayed.saturating_add(1);
         }
         Ok(())
     }
@@ -950,6 +972,36 @@ impl RealmRuntime {
         self.reload
             .transaction()
             .map_or(0, |transaction| transaction.completions.len())
+    }
+
+    #[must_use]
+    pub const fn reload_completion_stats(&self) -> ReloadCompletionStats {
+        self.reload_completion_stats
+    }
+
+    fn discard_reload_completions(&mut self) -> Result<usize, RealmError> {
+        self.buffer_reload_completions()?;
+        let old = self.reload.transaction()?.old_module;
+        let root = self
+            .modules
+            .resolve(old.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let old_identity = (root.module_id, root.epoch);
+        let transaction = self.reload.transaction_mut()?;
+        let mut discarded = 0_u64;
+        for delivery in transaction.completions.drain_ordered() {
+            debug_assert_eq!(
+                (delivery.module_id, delivery.epoch),
+                old_identity,
+                "reload buffer contains an unrelated completion"
+            );
+            discarded = discarded.saturating_add(1);
+        }
+        self.reload_completion_stats.discarded_after_commit = self
+            .reload_completion_stats
+            .discarded_after_commit
+            .saturating_add(discarded);
+        usize::try_from(discarded).map_err(|_| ReloadError::CompletionBufferCapacity.into())
     }
 
     fn publish_reload_root(&mut self) -> Result<(), RealmError> {
@@ -1493,27 +1545,62 @@ impl RealmRuntime {
     }
 
     fn drain_host_completions(&mut self) -> Result<usize, RealmError> {
-        if self.reload.active() {
-            return self.buffer_reload_completions();
-        }
         let mut count = 0;
         for delivery in self.resources.drain_completions() {
-            count += usize::from(self.deliver_host_completion(delivery)?);
+            self.route_host_completion(delivery)?;
+            count += 1;
         }
         Ok(count)
     }
 
     fn buffer_reload_completions(&mut self) -> Result<usize, RealmError> {
-        if !self.reload.active() {
-            return Ok(0);
-        }
         let deliveries = self.resources.drain_completions();
         let count = deliveries.len();
-        let transaction = self.reload.transaction_mut()?;
         for delivery in deliveries {
-            transaction.completions.push(delivery)?;
+            self.route_host_completion(delivery)?;
         }
         Ok(count)
+    }
+
+    fn route_host_completion(
+        &mut self,
+        delivery: HostCompletionDelivery,
+    ) -> Result<CompletionRoute, RealmError> {
+        if delivery.realm_id != self.realm_id {
+            return Err(ReloadError::InvalidState.into());
+        }
+        if self.reload.active() {
+            let old = self.reload.transaction()?.old_module;
+            let root = self
+                .modules
+                .resolve(old.raw())
+                .map_err(RealmError::ModuleHandle)?;
+            if delivery.module_id == root.module_id && delivery.epoch == root.epoch {
+                self.reload.transaction_mut()?.completions.push(delivery)?;
+                self.reload_completion_stats.buffered =
+                    self.reload_completion_stats.buffered.saturating_add(1);
+                return Ok(CompletionRoute::BufferedForReload);
+            }
+        }
+        if self.completion_targets_committed_epoch(&delivery) {
+            self.reload_completion_stats.discarded_after_commit = self
+                .reload_completion_stats
+                .discarded_after_commit
+                .saturating_add(1);
+            return Ok(CompletionRoute::DiscardedForCommittedEpoch);
+        }
+        let _ = self.deliver_host_completion(delivery)?;
+        Ok(CompletionRoute::Delivered)
+    }
+
+    fn completion_targets_committed_epoch(&self, delivery: &HostCompletionDelivery) -> bool {
+        self.modules.occupied_handles_iter().any(|raw| {
+            self.modules.resolve(raw).is_ok_and(|root| {
+                root.module_id == delivery.module_id
+                    && root.epoch == delivery.epoch
+                    && root.lifecycle == ModuleLifecycle::Retired
+            })
+        })
     }
 
     fn deliver_host_completion(
@@ -2157,7 +2244,7 @@ fn reservation_for_module(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::{Arc, Mutex};
 
     use nexa_bytecode::{
@@ -2167,7 +2254,10 @@ mod tests {
     use nexa_core::StableId;
     use nexa_verifier::{VerifierLimits, verify};
 
-    use super::{PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime};
+    use super::{
+        CancelReason, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
+        TaskTerminalReason,
+    };
     use crate::{
         HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, Object,
         ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig,
@@ -2374,6 +2464,406 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
             Ok(HostCallOutcome::Pending(request))
+        }
+    }
+
+    struct QueueAsyncRegistry {
+        hash: StableId,
+        requests: Arc<Mutex<VecDeque<crate::PendingHostRequest>>>,
+    }
+
+    impl HostRegistry for QueueAsyncRegistry {
+        fn interface_hash(&self) -> Option<StableId> {
+            Some(self.hash)
+        }
+
+        fn call(
+            &mut self,
+            id: u32,
+            context: &mut ResourceContext<'_>,
+            args: HostArgs<'_>,
+        ) -> Result<HostCallOutcome, HostTrap> {
+            if id != 0 || !args.is_empty() {
+                return Err(HostTrap::Arity);
+            }
+            let pending = context
+                .create_request()
+                .map_err(|error| HostTrap::Host(error.to_string()))?;
+            let request = pending.request;
+            self.requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(pending);
+            Ok(HostCallOutcome::Pending(request))
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestCompletion {
+        Success,
+        Error,
+        Cancelled,
+        Abandoned,
+    }
+
+    fn submit_test_completion(pending: &mut crate::PendingHostRequest, completion: TestCompletion) {
+        match completion {
+            TestCompletion::Success => pending.ticket.complete(HostPayload::I32(41)).unwrap(),
+            TestCompletion::Error => pending.ticket.fail(HostErrorPayload { code: 7 }).unwrap(),
+            TestCompletion::Cancelled => pending.ticket.cancelled().unwrap(),
+            TestCompletion::Abandoned => pending.ticket.abandon().unwrap(),
+        }
+    }
+
+    fn task_config(scope: crate::ScopeHandle) -> StepConfig {
+        StepConfig {
+            owner: scope,
+            priority: 1,
+            fuel_slice: 32,
+            cumulative_budget: 128,
+            limits: TaskLimits::default(),
+        }
+    }
+
+    fn reload_candidate_module(
+        host: StableId,
+        schema: StableId,
+        activation_fault: bool,
+    ) -> nexa_verifier::VerifiedModule {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32],
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::Return { source: 0 });
+        let mut activation = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        activation.effect(FunctionEffect::Immediate);
+        if activation_fault {
+            activation.emit(Instruction::Trap);
+        } else {
+            activation.emit(Instruction::ReturnVoid);
+        }
+        let mut module = ModuleBuilder::new();
+        module.metadata(host, schema);
+        module.function(migration.finish().unwrap());
+        module.function(activation.finish().unwrap());
+        verify(module.finish(), VerifierLimits::default()).unwrap()
+    }
+
+    fn unrelated_module_completion_during_reload(completion: TestCompletion) {
+        let host_hash = StableId::from_name("routing-host");
+        let schema = StableId::from_name("routing-schema");
+        let requests = Arc::new(Mutex::new(VecDeque::new()));
+        let runtime_host = RuntimeHost::new(8);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            runtime_host.clone(),
+            Box::new(QueueAsyncRegistry {
+                hash: host_hash,
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .unwrap();
+        let module_a = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let module_b = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
+        let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
+        assert_eq!(
+            realm.poll_task(task_a, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        assert_eq!(
+            realm.poll_task(task_b, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        let (mut pending_a, mut pending_b) = {
+            let mut requests = requests
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (requests.pop_front().unwrap(), requests.pop_front().unwrap())
+        };
+        let request_b = pending_b.request;
+        realm
+            .prepare_reload(
+                module_a,
+                reload_candidate_module(host_hash, schema, false),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        submit_test_completion(&mut pending_b, completion);
+        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        assert_eq!(realm.reload_buffered_completions(), 0);
+        assert_eq!(realm.reload_completion_stats().buffered, 0);
+        realm
+            .tick(TickBudget {
+                max_tasks: 1,
+                frame_fuel_budget: 32,
+                collect_garbage: false,
+            })
+            .unwrap();
+        let terminal = realm
+            .terminal_record(task_b)
+            .expect("unrelated module task must leave Waiting");
+        if matches!(completion, TestCompletion::Abandoned) {
+            assert!(matches!(terminal.reason, TaskTerminalReason::Trapped(_)));
+        } else {
+            assert!(matches!(terminal.reason, TaskTerminalReason::Completed(_)));
+        }
+        assert!(realm.request_terminal_record(request_b).is_some());
+
+        realm.rollback_reload().unwrap();
+        pending_a.ticket.complete(HostPayload::I32(42)).unwrap();
+        realm
+            .tick(TickBudget {
+                max_tasks: 1,
+                frame_fuel_budget: 32,
+                collect_garbage: false,
+            })
+            .unwrap();
+        assert!(realm.terminal_record(task_a).is_some());
+        assert_eq!(runtime_host.pending_completions(), 0);
+        assert_eq!(runtime_host.pending_releases(), 2);
+        assert_eq!(runtime_host.drain_releases().len(), 2);
+    }
+
+    #[test]
+    fn reload_routes_other_module_success_completion() {
+        unrelated_module_completion_during_reload(TestCompletion::Success);
+    }
+
+    #[test]
+    fn reload_routes_other_module_error_completion() {
+        unrelated_module_completion_during_reload(TestCompletion::Error);
+    }
+
+    #[test]
+    fn reload_routes_other_module_cancelled_completion() {
+        unrelated_module_completion_during_reload(TestCompletion::Cancelled);
+    }
+
+    #[test]
+    fn reload_routes_other_module_abandoned_completion() {
+        unrelated_module_completion_during_reload(TestCompletion::Abandoned);
+    }
+
+    fn old_completion_during_reload_publication(activation_fault: bool) {
+        let host_hash = StableId::from_name("commit-routing-host");
+        let schema = StableId::from_name("commit-routing-schema");
+        let requests = Arc::new(Mutex::new(VecDeque::new()));
+        let runtime_host = RuntimeHost::new(4);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            runtime_host.clone(),
+            Box::new(QueueAsyncRegistry {
+                hash: host_hash,
+                requests: Arc::clone(&requests),
+            }),
+        )
+        .unwrap();
+        let old = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
+        assert_eq!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        let mut pending = requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pop_front()
+            .unwrap();
+        let request = pending.request;
+        let candidate = realm
+            .prepare_reload(
+                old,
+                reload_candidate_module(host_hash, schema, activation_fault),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        pending.ticket.complete(HostPayload::I32(77)).unwrap();
+        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        assert_eq!(realm.reload_buffered_completions(), 1);
+
+        let result = realm.commit_reload(super::ActivationEntry {
+            function_id: 1,
+            arguments: &[],
+            fuel: 32,
+        });
+        if activation_fault {
+            assert!(matches!(
+                result,
+                Err(RealmError::Reload(ReloadError::Activation(_)))
+            ));
+            assert_eq!(
+                realm.modules.resolve(candidate.raw()).unwrap().lifecycle,
+                super::ModuleLifecycle::ActivationFaulted
+            );
+        } else {
+            assert_eq!(result.unwrap(), candidate);
+        }
+        assert_eq!(realm.active_root(), Some(candidate));
+        assert_eq!(
+            realm.terminal_record(task).map(|record| &record.reason),
+            Some(&TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
+        );
+        assert!(realm.request_terminal_record(request).is_some());
+        assert_eq!(
+            realm.reload_completion_stats(),
+            super::ReloadCompletionStats {
+                buffered: 1,
+                replayed: 0,
+                discarded_after_commit: 1,
+            }
+        );
+        realm
+            .tick(TickBudget {
+                max_tasks: 0,
+                frame_fuel_budget: 0,
+                collect_garbage: false,
+            })
+            .unwrap();
+        assert_eq!(runtime_host.pending_completions(), 0);
+        assert_eq!(runtime_host.pending_releases(), 1);
+        assert_eq!(runtime_host.drain_releases().len(), 1);
+    }
+
+    #[test]
+    fn reload_commit_explicitly_discards_buffered_old_completion() {
+        old_completion_during_reload_publication(false);
+    }
+
+    #[test]
+    fn activation_fault_explicitly_discards_buffered_old_completion() {
+        old_completion_during_reload_publication(true);
+    }
+
+    #[test]
+    fn same_tick_completions_route_by_identity_and_preserve_terminal_sequence() {
+        for complete_b_first in [false, true] {
+            let host_hash = StableId::from_name("same-tick-routing-host");
+            let schema = StableId::from_name("same-tick-routing-schema");
+            let requests = Arc::new(Mutex::new(VecDeque::new()));
+            let runtime_host = RuntimeHost::new(4);
+            let mut realm = RealmRuntime::hosted(
+                RealmConfig {
+                    max_host_resources: 2,
+                    ..RealmConfig::default()
+                },
+                runtime_host.clone(),
+                Box::new(QueueAsyncRegistry {
+                    hash: host_hash,
+                    requests: Arc::clone(&requests),
+                }),
+            )
+            .unwrap();
+            let module_a = realm
+                .load_module(
+                    reloadable_async_module(host_hash, schema),
+                    host_hash,
+                    schema,
+                )
+                .unwrap();
+            let module_b = realm
+                .load_module(
+                    reloadable_async_module(host_hash, schema),
+                    host_hash,
+                    schema,
+                )
+                .unwrap();
+            let scope = realm.create_scope(None).unwrap();
+            let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
+            let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
+            assert!(matches!(
+                realm.poll_task(task_a, 32).unwrap(),
+                PollResult::Pending(PendingReason::HostRequest)
+            ));
+            assert!(matches!(
+                realm.poll_task(task_b, 32).unwrap(),
+                PollResult::Pending(PendingReason::HostRequest)
+            ));
+            let (mut pending_a, mut pending_b) = {
+                let mut requests = requests
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (requests.pop_front().unwrap(), requests.pop_front().unwrap())
+            };
+            let request_a = pending_a.request;
+            let request_b = pending_b.request;
+            realm
+                .prepare_reload(
+                    module_a,
+                    reload_candidate_module(host_hash, schema, false),
+                    host_hash,
+                    schema,
+                )
+                .unwrap();
+            realm.quiesce_reload().unwrap();
+            if complete_b_first {
+                pending_b.ticket.complete(HostPayload::I32(2)).unwrap();
+                pending_a.ticket.complete(HostPayload::I32(1)).unwrap();
+            } else {
+                pending_a.ticket.complete(HostPayload::I32(1)).unwrap();
+                pending_b.ticket.complete(HostPayload::I32(2)).unwrap();
+            }
+            realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+            assert_eq!(realm.reload_buffered_completions(), 1);
+            assert_eq!(realm.reload_completion_stats().buffered, 1);
+            realm.rollback_reload().unwrap();
+            assert_eq!(realm.reload_completion_stats().replayed, 1);
+            realm
+                .tick(TickBudget {
+                    max_tasks: 2,
+                    frame_fuel_budget: 64,
+                    collect_garbage: false,
+                })
+                .unwrap();
+            assert!(realm.terminal_record(task_a).is_some());
+            assert!(realm.terminal_record(task_b).is_some());
+            let sequence_a = realm
+                .request_terminal_record(request_a)
+                .and_then(|record| record.terminal_sequence)
+                .unwrap();
+            let sequence_b = realm
+                .request_terminal_record(request_b)
+                .and_then(|record| record.terminal_sequence)
+                .unwrap();
+            assert_eq!(sequence_b < sequence_a, complete_b_first);
+            assert_eq!(runtime_host.pending_completions(), 0);
+            assert_eq!(runtime_host.pending_releases(), 2);
+            assert_eq!(runtime_host.drain_releases().len(), 2);
         }
     }
 
@@ -2781,6 +3271,14 @@ mod tests {
         realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
         assert_eq!(realm.reload_buffered_completions(), 1);
         realm.rollback_reload().unwrap();
+        assert_eq!(
+            realm.reload_completion_stats(),
+            super::ReloadCompletionStats {
+                buffered: 1,
+                replayed: 1,
+                discarded_after_commit: 0,
+            }
+        );
         realm
             .tick(TickBudget {
                 max_tasks: 1,

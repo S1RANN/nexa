@@ -838,6 +838,9 @@ pub enum HostCompletionResult {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCompletionDelivery {
+    pub realm_id: u32,
+    pub module_id: u32,
+    pub epoch: u64,
     pub request: HostRequestHandle,
     pub result: HostCompletionResult,
     pub terminal_sequence: u64,
@@ -1242,6 +1245,9 @@ impl HostRequestManager {
                 .expect("resolved request remains live");
             self.push_terminal(terminal);
             accepted.push(HostCompletionDelivery {
+                realm_id: completion.realm_id,
+                module_id: completion.module_id,
+                epoch: completion.epoch,
                 request: completion.request,
                 result: completion.result,
                 terminal_sequence: completion.terminal_sequence,
