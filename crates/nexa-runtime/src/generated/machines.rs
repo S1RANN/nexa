@@ -529,6 +529,7 @@ pub mod reload {
         Quiescing,
         Staging,
         Committing,
+        Published,
         Activating,
         Completed,
         RolledBack,
@@ -544,6 +545,7 @@ pub mod reload {
         StageSucceeded,
         StageFailed,
         Publish,
+        BeginActivation,
         ActivationSucceeded,
         ActivationFailed,
     }
@@ -556,6 +558,7 @@ pub mod reload {
             State::Quiescing => 0xb08ae8a7b8d3c309,
             State::Staging => 0x65b4327e7f98a34e,
             State::Committing => 0x3fb525c4fa42a848,
+            State::Published => 0x96dc026e506fe7e1,
             State::Activating => 0xc4d679f97fa48ed3,
             State::Completed => 0x944271d1044a952a,
             State::RolledBack => 0xb227c48b5e4c7a30,
@@ -572,6 +575,7 @@ pub mod reload {
             Event::StageSucceeded => 0x01cb1763e1a7de47,
             Event::StageFailed => 0x5ab4d9fdc38e42fb,
             Event::Publish => 0x2bb22c7d196f5d8f,
+            Event::BeginActivation => 0x882a0aa87da80561,
             Event::ActivationSucceeded => 0x3fa703c4d5e0e1d9,
             Event::ActivationFailed => 0x6b4ceb3faa833ae9,
         }
@@ -736,25 +740,33 @@ pub mod reload {
                     amount: -1,
                 }];
                 Ok(Outcome {
-                    state: State::Activating,
-                    transition_id: 0xfe4afa8977a89515,
+                    state: State::Published,
+                    transition_id: 0xad9848ab7faba56f,
                     deltas: DELTAS_8,
                 })
             }
-            (State::Activating, Event::ActivationSucceeded) => {
+            (State::Published, Event::BeginActivation) => {
                 const DELTAS_9: &[ResourceDelta] = &[];
                 Ok(Outcome {
-                    state: State::Completed,
-                    transition_id: 0x30f7e22becba3d13,
+                    state: State::Activating,
+                    transition_id: 0xe264664cebf884e6,
                     deltas: DELTAS_9,
                 })
             }
-            (State::Activating, Event::ActivationFailed) => {
+            (State::Activating, Event::ActivationSucceeded) => {
                 const DELTAS_10: &[ResourceDelta] = &[];
+                Ok(Outcome {
+                    state: State::Completed,
+                    transition_id: 0x30f7e22becba3d13,
+                    deltas: DELTAS_10,
+                })
+            }
+            (State::Activating, Event::ActivationFailed) => {
+                const DELTAS_11: &[ResourceDelta] = &[];
                 Ok(Outcome {
                     state: State::ActivationFaulted,
                     transition_id: 0xea7a0b46de1aa6db,
-                    deltas: DELTAS_10,
+                    deltas: DELTAS_11,
                 })
             }
             (state, event) => Err(TransitionError::Undefined { state, event }),

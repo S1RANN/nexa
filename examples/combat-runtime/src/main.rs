@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostCompletion, HostPayload, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
-    TickBudget,
+    ActivationEntry, HostCompletion, HostPayload, ModuleLifecycle, PollResult, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction,
+    StepConfig, TaskLimits, TickBudget,
 };
 
 #[allow(dead_code)]
@@ -169,7 +169,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         realm.stage_reload(0, &[RuntimeValue::I32(10)])?,
         Some(RuntimeValue::I32(10))
     );
-    realm.commit_reload(|_| Ok(()))?;
+    realm.commit_reload(ActivationEntry {
+        function_id: 3,
+        arguments: &[RuntimeValue::I32(10)],
+        fuel: 4_096,
+    })?;
     let migrated_state = realm
         .state_handles(v2)?
         .into_iter()
@@ -275,8 +279,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     realm.stage_reload(0, &[RuntimeValue::I32(1)])?;
     assert!(
         realm
-            .commit_reload(|_| Err("activation fault".into()))
+            .commit_reload(ActivationEntry {
+                function_id: u32::MAX,
+                arguments: &[],
+                fuel: 4_096,
+            })
             .is_err()
+    );
+    assert_eq!(realm.active_root(), Some(fault));
+    assert_eq!(
+        realm.module_lifecycle(fault)?,
+        ModuleLifecycle::ActivationFaulted
     );
     assert!(
         realm
@@ -294,10 +307,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
             .is_err()
     );
-    assert_eq!(
-        realm.poll_task(live, 32)?,
-        PollResult::Completed(Some(RuntimeValue::I32(2)))
-    );
+    assert!(matches!(
+        realm.terminal_record(live).map(|record| &record.reason),
+        Some(nexa_runtime::TaskTerminalReason::Cancelled(
+            nexa_runtime::CancelReason::ReloadCommit
+        ))
+    ));
     println!("combat-runtime completed with deterministic reload activation fault");
     Ok(())
 }

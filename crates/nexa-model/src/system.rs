@@ -435,19 +435,63 @@ pub enum RealmSystemEvent {
     CancelRequest,
     AcquireToken,
     ReleaseToken,
+    StartOldTask,
+    FinishOldTask,
     BeginReload,
-    CommitReload,
+    PublishReload,
+    BeginActivation,
+    ActivationSucceeded,
+    ActivationFailed,
     RollbackReload,
     DrainReleases,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmReloadState {
+    #[default]
+    Idle,
+    PreCommit,
+    Published,
+    Activating,
+    ActivationFaulted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmModuleLifecycle {
+    Active,
+    Staging,
+    Activating,
+    ActivationFaulted,
+    Retired,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RealmSystemSnapshot {
     pub requests: usize,
     pub tokens: usize,
     pub reservations: usize,
     pub releases: usize,
-    pub reload_staging: bool,
+    pub reload: RealmReloadState,
+    pub active_epoch: u8,
+    pub old_lifecycle: RealmModuleLifecycle,
+    pub candidate_lifecycle: Option<RealmModuleLifecycle>,
+    pub old_task_live: bool,
+}
+
+impl Default for RealmSystemSnapshot {
+    fn default() -> Self {
+        Self {
+            requests: 0,
+            tokens: 0,
+            reservations: 0,
+            releases: 0,
+            reload: RealmReloadState::Idle,
+            active_epoch: 0,
+            old_lifecycle: RealmModuleLifecycle::Active,
+            candidate_lifecycle: None,
+            old_task_live: false,
+        }
+    }
 }
 
 impl RealmSystemSnapshot {
@@ -477,19 +521,80 @@ impl RealmSystemSnapshot {
                 self.reservations -= 1;
                 self.releases += 1;
             }
-            RealmSystemEvent::BeginReload if !self.reload_staging => {
-                self.reload_staging = true;
-            }
-            RealmSystemEvent::CommitReload | RealmSystemEvent::RollbackReload
-                if self.reload_staging =>
+            RealmSystemEvent::StartOldTask
+                if self.reload == RealmReloadState::Idle
+                    && self.active_epoch == 0
+                    && !self.old_task_live =>
             {
-                self.reload_staging = false;
+                self.old_task_live = true;
+            }
+            RealmSystemEvent::FinishOldTask if self.old_task_live => {
+                self.old_task_live = false;
+            }
+            RealmSystemEvent::BeginReload
+                if self.reload == RealmReloadState::Idle && self.active_epoch == 0 =>
+            {
+                self.reload = RealmReloadState::PreCommit;
+                self.candidate_lifecycle = Some(RealmModuleLifecycle::Staging);
+            }
+            RealmSystemEvent::PublishReload if self.reload == RealmReloadState::PreCommit => {
+                self.reload = RealmReloadState::Published;
+                self.active_epoch = 1;
+                self.old_lifecycle = RealmModuleLifecycle::Retired;
+                self.old_task_live = false;
+            }
+            RealmSystemEvent::BeginActivation if self.reload == RealmReloadState::Published => {
+                self.reload = RealmReloadState::Activating;
+                self.candidate_lifecycle = Some(RealmModuleLifecycle::Activating);
+            }
+            RealmSystemEvent::ActivationSucceeded
+                if self.reload == RealmReloadState::Activating =>
+            {
+                self.reload = RealmReloadState::Idle;
+                self.candidate_lifecycle = Some(RealmModuleLifecycle::Active);
+            }
+            RealmSystemEvent::ActivationFailed if self.reload == RealmReloadState::Activating => {
+                self.reload = RealmReloadState::ActivationFaulted;
+                self.candidate_lifecycle = Some(RealmModuleLifecycle::ActivationFaulted);
+            }
+            RealmSystemEvent::RollbackReload if self.reload == RealmReloadState::PreCommit => {
+                self.reload = RealmReloadState::Idle;
+                self.candidate_lifecycle = None;
             }
             RealmSystemEvent::DrainReleases if self.releases > 0 => self.releases = 0,
             _ => return Err("operation rejected"),
         }
+        self.check_invariants()
+    }
+
+    fn check_invariants(&self) -> Result<(), &'static str> {
         if self.reservations != self.requests + self.tokens {
             return Err("reservation ownership mismatch");
+        }
+        if matches!(
+            self.reload,
+            RealmReloadState::Published
+                | RealmReloadState::Activating
+                | RealmReloadState::ActivationFaulted
+        ) && (self.active_epoch != 1
+            || self.old_lifecycle != RealmModuleLifecycle::Retired
+            || self.old_task_live)
+        {
+            return Err("published root restored old execution");
+        }
+        if self.reload == RealmReloadState::ActivationFaulted
+            && self.candidate_lifecycle != Some(RealmModuleLifecycle::ActivationFaulted)
+        {
+            return Err("activation failure did not fault candidate");
+        }
+        if self.active_epoch == 0 && self.old_lifecycle != RealmModuleLifecycle::Active {
+            return Err("pre-publication old root is not active");
+        }
+        if self.active_epoch == 1
+            && self.candidate_lifecycle == Some(RealmModuleLifecycle::Staging)
+            && self.reload != RealmReloadState::Published
+        {
+            return Err("published candidate remained staging");
         }
         Ok(())
     }
@@ -505,14 +610,19 @@ pub struct RealmSystemReport {
 
 #[must_use]
 pub fn explore_realm_runtime(config: RealmSystemConfig) -> RealmSystemReport {
-    const EVENTS: [RealmSystemEvent; 9] = [
+    const EVENTS: [RealmSystemEvent; 14] = [
         RealmSystemEvent::SubmitRequest,
         RealmSystemEvent::CompleteRequest,
         RealmSystemEvent::CancelRequest,
         RealmSystemEvent::AcquireToken,
         RealmSystemEvent::ReleaseToken,
+        RealmSystemEvent::StartOldTask,
+        RealmSystemEvent::FinishOldTask,
         RealmSystemEvent::BeginReload,
-        RealmSystemEvent::CommitReload,
+        RealmSystemEvent::PublishReload,
+        RealmSystemEvent::BeginActivation,
+        RealmSystemEvent::ActivationSucceeded,
+        RealmSystemEvent::ActivationFailed,
         RealmSystemEvent::RollbackReload,
         RealmSystemEvent::DrainReleases,
     ];

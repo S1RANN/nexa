@@ -43,7 +43,8 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
-    CancelReason, ModuleHandle, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
+    ActivationEntry, CancelReason, ModuleEpochRoot, ModuleHandle, ModuleLifecycle, PendingReason,
+    PollResult, RealmConfig, RealmError, RealmRuntime, RootPublicationRecord,
     RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
 pub use reload::{ReloadError, StateHandle, StateObject, StateValue, StatefulError};

@@ -568,6 +568,10 @@ impl ReloadCoordinator {
         self.apply(reload::Event::Publish)
     }
 
+    pub(crate) fn begin_activation(&mut self) -> Result<(), ReloadError> {
+        self.apply(reload::Event::BeginActivation)
+    }
+
     pub(crate) fn activation_succeeded(&mut self) -> Result<(), ReloadError> {
         self.apply(reload::Event::ActivationSucceeded)
     }

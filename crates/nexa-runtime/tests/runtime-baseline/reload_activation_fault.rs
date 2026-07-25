@@ -36,7 +36,21 @@ fn reload_activation_fault() {
         task.effect(FunctionEffect::Task)
             .emit(Instruction::Yield)
             .emit(Instruction::Return { source: 0 });
-        super::support::verified(vec![migration.finish().unwrap(), task.finish().unwrap()])
+        let mut activation = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        activation
+            .effect(FunctionEffect::Immediate)
+            .emit(Instruction::Trap);
+        super::support::verified(vec![
+            migration.finish().unwrap(),
+            task.finish().unwrap(),
+            activation.finish().unwrap(),
+        ])
     };
     let (host, schema) = super::support::hashes();
     let mut realm = nexa_runtime::RealmRuntime::new(nexa_runtime::RealmConfig::default());
@@ -49,15 +63,31 @@ fn reload_activation_fault() {
     realm
         .stage_reload(0, &[nexa_runtime::RuntimeValue::I32(7)])
         .unwrap();
-    let activation = realm.commit_reload(|_| Err("activation".into()));
+    let activation = realm.commit_reload(nexa_runtime::ActivationEntry {
+        function_id: 2,
+        arguments: &[],
+        fuel: 64,
+    });
     let rejected = realm.call(
         candidate,
         0,
         &[nexa_runtime::RuntimeValue::I32(1)],
         super::support::task_config(scope),
     );
-    let result = realm.poll_task(task, 32).unwrap();
-    let extra = format!("activation={activation:?}\nrejected={rejected:?}\n");
+    let old_rejected = realm.call(
+        old,
+        0,
+        &[nexa_runtime::RuntimeValue::I32(1)],
+        super::support::task_config(scope),
+    );
+    let result = nexa_runtime::PollResult::Cancelled(nexa_runtime::CancelReason::ReloadCommit);
+    let extra = format!(
+        "activation={activation:?}\nrejected={rejected:?}\nold_rejected={old_rejected:?}\nactive_root={:?}\nold_lifecycle={:?}\ncandidate_lifecycle={:?}\npublication_count={}\n",
+        realm.active_root(),
+        realm.module_lifecycle(old).unwrap(),
+        realm.module_lifecycle(candidate).unwrap(),
+        realm.root_publications().len(),
+    );
     super::support::assert_snapshot(
         "reload_activation_fault",
         &super::support::snapshot(&realm, scope, task, &result, &extra),

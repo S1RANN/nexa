@@ -1,8 +1,8 @@
 # Milestone 3 — Host-Integrated Stateful Runtime
 
-Status: completed locally on Rust 1.97.1.
+Status: completed locally on Rust 1.97.1, including the irreversible publication boundary.
 
-Published implementation: `0c2c0ee7e008bb334a15ab712d4a5b8b07bd98d7`. The corresponding [GitHub Actions run](https://github.com/S1RANN/nexa/actions/runs/30141408369) passed on Linux, macOS, and Windows.
+Baseline implementation: `0c2c0ee7e008bb334a15ab712d4a5b8b07bd98d7`. The corresponding [GitHub Actions run](https://github.com/S1RANN/nexa/actions/runs/30141408369) passed on Linux, macOS, and Windows. The irreversible-publication closure described below is validated by the local gates in this report and is included in the next published revision.
 
 ## Closed execution loop
 
@@ -35,18 +35,33 @@ STATE_DELETE
 
 Verifier effect and call-graph rules reject these capabilities outside Migration code and reject HostCall/Yield/Await inside Migration. Staging validates field types, versions, target existence, module ownership, generations, and recursive GC roots before publication.
 
-The combat scenario migrates `EnemyBrain` v1 to v2, preserves `phase`, adds defaulted `aggression`, removes `legacy_target`, commits, handles a late completion, and exercises deterministic ActivationFaulted behavior.
+The combat scenario migrates `EnemyBrain` v1 to v2, preserves `phase`, adds defaulted `aggression`, removes `legacy_target`, commits, handles a late completion, and exercises deterministic `ActivationFaulted` behavior.
+
+### Irreversible publication boundary
+
+Reload now has an explicit `Published` state between `Committing` and `Activating`. A commit publishes one `ModuleEpochRoot` and appends a `RootPublicationRecord` before running a verified Immediate activation entry.
+
+After publication:
+
+- the candidate remains the active root even when activation traps;
+- the candidate lifecycle becomes `ActivationFaulted` and the module handle remains valid;
+- old paused tasks terminate with `Cancelled(ReloadCommit)`;
+- the old scheduler/checkpoint state is never restored;
+- the old module lifecycle is `Retired`;
+- the faulted candidate rejects ordinary calls instead of being released as stale.
+
+Only pre-publication failures may call rollback and restore old execution. The Realm composite model and runtime differential replay cover the publication-to-activation-failure path, including the prohibition on old-task restoration.
 
 ## Safety and evidence
 
 - Exact per-PC RootMaps are independently reconstructed by verifier dataflow.
-- Reload rollback restores continuation, fuel, scheduler state, waiting destination/type, request association, and buffered completions.
+- Pre-publication reload rollback restores continuation, fuel, scheduler state, waiting destination/type, request association, and buffered completions.
 - Bytecode v2 uses a checked section directory and bounded decoding for bytes, sections, functions, instructions, registers, RootMaps, loop bounds, imports, state schemas, and exports.
 - WCET analysis is memoized, bounded, and includes immediate host costs.
 - Dedicated fuzz harnesses cover bytecode decode, verifier, RootMaps, WCET, host imports, and state schemas.
 - The isolated global allocator observer reports zero allocations for promotion, resume, and trace-off paths across three repetitions.
 - Benchmark v2 labels direct generated thunk, immediate HOST_CALL, and async HOST_CALL as distinct real paths.
-- Realm composite model exploration visits 32 worlds; differential replay matches Runtime request/token reservations and releases.
+- Realm composite model exploration covers resource ownership and the explicit `PreCommit → Published → Activating → ActivationFaulted/Active` transaction. Differential replay matches both request/token ownership and the irreversible activation-failure path.
 
 ## Local merge gates
 

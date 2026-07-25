@@ -29,16 +29,41 @@ impl ModuleHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModuleLifecycle {
+    Active,
+    Staging,
+    Activating,
+    ActivationFaulted,
+    Retired,
+}
+
 #[derive(Clone, Debug)]
-struct LoadedModule {
-    module_id: u32,
-    epoch: u64,
-    verified: VerifiedModule,
+pub struct ModuleEpochRoot {
+    pub module_id: u32,
+    pub epoch: u64,
+    pub verified: Arc<VerifiedModule>,
+    pub host_hash: StableId,
+    pub schema_hash: StableId,
+    pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
     state: StatefulRegistry,
     staging_roots: Vec<GcRef>,
-    accepts_calls: bool,
-    retired: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootPublicationRecord {
+    pub publication_id: u64,
+    pub old_root: ModuleHandle,
+    pub candidate_root: ModuleHandle,
+    pub candidate_epoch: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ActivationEntry<'a> {
+    pub function_id: u32,
+    pub arguments: &'a [RuntimeValue],
+    pub fuel: u64,
 }
 
 struct RealmHostBridge<'a> {
@@ -322,7 +347,10 @@ impl From<crate::StatefulError> for RealmError {
 
 pub struct RealmRuntime {
     realm_id: u32,
-    modules: SlotPool<LoadedModule>,
+    modules: SlotPool<ModuleEpochRoot>,
+    active_root: Option<ModuleHandle>,
+    root_publications: VecDeque<RootPublicationRecord>,
+    next_publication_id: u64,
     tasks: TaskRuntime,
     resources: RuntimeResources,
     heap: Heap,
@@ -343,6 +371,9 @@ impl RealmRuntime {
         Self {
             realm_id: config.realm_id,
             modules: SlotPool::with_capacity_limit(config.realm_id, config.max_modules),
+            active_root: None,
+            root_publications: VecDeque::with_capacity(config.max_modules as usize),
+            next_publication_id: 1,
             tasks: TaskRuntime::new(config.realm_id, config.runtime_limits),
             resources: RuntimeResources::new(
                 config.realm_id,
@@ -422,6 +453,24 @@ impl RealmRuntime {
             .epoch)
     }
 
+    #[must_use]
+    pub const fn active_root(&self) -> Option<ModuleHandle> {
+        self.active_root
+    }
+
+    pub fn module_lifecycle(&self, module: ModuleHandle) -> Result<ModuleLifecycle, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .lifecycle)
+    }
+
+    #[must_use]
+    pub fn root_publications(&self) -> &VecDeque<RootPublicationRecord> {
+        &self.root_publications
+    }
+
     pub fn insert_state(
         &mut self,
         module: ModuleHandle,
@@ -486,15 +535,16 @@ impl RealmRuntime {
             .ok_or(RealmError::EpochExhausted)?;
         let raw = self
             .modules
-            .try_allocate(LoadedModule {
+            .try_allocate(ModuleEpochRoot {
                 module_id: 0,
                 epoch,
-                verified,
+                verified: Arc::new(verified),
+                host_hash,
+                schema_hash,
+                lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
                 state: StatefulRegistry::new(0),
                 staging_roots: Vec::new(),
-                accepts_calls: true,
-                retired: false,
             })
             .map_err(RealmError::ModuleAllocation)?;
         let loaded = self
@@ -503,7 +553,11 @@ impl RealmRuntime {
             .expect("new module handle resolves");
         loaded.module_id = raw.index;
         loaded.state = StatefulRegistry::new(raw.index);
-        Ok(ModuleHandle(raw))
+        let handle = ModuleHandle(raw);
+        if self.active_root.is_none() {
+            self.set_active_root(handle);
+        }
+        Ok(handle)
     }
 
     pub fn prepare_reload(
@@ -530,7 +584,7 @@ impl RealmRuntime {
         self.modules
             .resolve_mut(candidate.raw())
             .map_err(RealmError::ModuleHandle)?
-            .accepts_calls = false;
+            .lifecycle = ModuleLifecycle::Staging;
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
@@ -579,7 +633,7 @@ impl RealmRuntime {
         self.modules
             .resolve_mut(candidate.raw())
             .map_err(RealmError::ModuleHandle)?
-            .accepts_calls = false;
+            .lifecycle = ModuleLifecycle::Staging;
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
@@ -700,50 +754,7 @@ impl RealmRuntime {
 
     pub fn commit_reload(
         &mut self,
-        activate: impl FnOnce(ModuleHandle) -> Result<(), String>,
-    ) -> Result<ModuleHandle, RealmError> {
-        self.reload.publish()?;
-        let candidate = self.reload.transaction()?.candidate;
-        if let Err(error) = activate(candidate) {
-            self.reload.activation_failed()?;
-            let transaction = self.reload.finish()?;
-            for paused in transaction.paused_tasks {
-                self.tasks.restore_task_checkpoint(
-                    paused.handle,
-                    paused.snapshot,
-                    paused.execution,
-                )?;
-                self.scheduler.restore(paused.handle, paused.scheduler);
-            }
-            self.modules
-                .release(transaction.candidate.raw())
-                .map_err(RealmError::ModuleHandle)?;
-            return Err(ReloadError::Activation(error).into());
-        }
-        self.reload.activation_succeeded()?;
-        let transaction = self.reload.finish()?;
-        self.modules
-            .resolve_mut(transaction.old_module.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .accepts_calls = false;
-        self.modules
-            .resolve_mut(transaction.old_module.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .retired = true;
-        self.modules
-            .resolve_mut(transaction.candidate.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .accepts_calls = true;
-        for paused in transaction.paused_tasks {
-            self.cancel_task(paused.handle, CancelReason::ReloadCommit)?;
-        }
-        Ok(transaction.candidate)
-    }
-
-    pub fn commit_reload_entry(
-        &mut self,
-        activation_function: u32,
-        arguments: &[RuntimeValue],
+        activation: ActivationEntry<'_>,
     ) -> Result<ModuleHandle, RealmError> {
         let candidate = self.reload.transaction()?.candidate;
         let verified = self
@@ -752,21 +763,23 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?
             .verified
             .clone();
-        let arguments = arguments.to_vec();
-        self.commit_reload(move |_| {
+        self.publish_reload_root()?;
+        let activation_result = (|| {
             let function = verified
                 .module()
                 .functions
-                .get(activation_function as usize)
+                .get(activation.function_id as usize)
                 .ok_or_else(|| "activation function is missing".to_owned())?;
-            if !matches!(
-                function.effect,
-                nexa_bytecode::FunctionEffect::Ordinary | nexa_bytecode::FunctionEffect::Immediate
-            ) {
-                return Err("activation entry must be ordinary or immediate".into());
+            if function.effect != nexa_bytecode::FunctionEffect::Immediate {
+                return Err("activation entry must have Immediate effect".into());
             }
-            match CheckedInterpreter::run(&verified, activation_function, &arguments, 4_096)
-                .map_err(|error| error.to_string())?
+            match CheckedInterpreter::run(
+                &verified,
+                activation.function_id,
+                activation.arguments,
+                activation.fuel,
+            )
+            .map_err(|error| error.to_string())?
             {
                 InterpreterOutcome::Returned { .. } => Ok(()),
                 InterpreterOutcome::Trapped { trap, .. } => Err(trap.message),
@@ -774,7 +787,27 @@ impl RealmRuntime {
                     Err("activation entry attempted to suspend".into())
                 }
             }
-        })
+        })();
+        match activation_result {
+            Ok(()) => {
+                self.reload.activation_succeeded()?;
+                self.modules
+                    .resolve_mut(candidate.raw())
+                    .map_err(RealmError::ModuleHandle)?
+                    .lifecycle = ModuleLifecycle::Active;
+                let transaction = self.reload.finish()?;
+                Ok(transaction.candidate)
+            }
+            Err(error) => {
+                self.reload.activation_failed()?;
+                self.modules
+                    .resolve_mut(candidate.raw())
+                    .map_err(RealmError::ModuleHandle)?
+                    .lifecycle = ModuleLifecycle::ActivationFaulted;
+                self.reload.finish()?;
+                Err(ReloadError::Activation(error).into())
+            }
+        }
     }
 
     pub fn rollback_reload(&mut self) -> Result<(), RealmError> {
@@ -791,6 +824,56 @@ impl RealmRuntime {
         Ok(())
     }
 
+    fn publish_reload_root(&mut self) -> Result<(), RealmError> {
+        let transaction = self.reload.transaction()?;
+        let old = transaction.old_module;
+        let candidate = transaction.candidate;
+        if self.active_root != Some(old) {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let publication_id = self.next_publication_id;
+        let next_publication_id = publication_id
+            .checked_add(1)
+            .ok_or(RealmError::EpochExhausted)?;
+        let candidate_epoch = self.module_epoch(candidate)?;
+        self.reload.publish()?;
+        self.set_active_root(candidate);
+        self.next_publication_id = next_publication_id;
+        if self.root_publications.len() == self.root_publications.capacity() {
+            self.root_publications.pop_front();
+        }
+        self.root_publications.push_back(RootPublicationRecord {
+            publication_id,
+            old_root: old,
+            candidate_root: candidate,
+            candidate_epoch,
+        });
+        self.reload.begin_activation()?;
+        self.modules
+            .resolve_mut(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .lifecycle = ModuleLifecycle::Activating;
+        self.modules
+            .resolve_mut(old.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .lifecycle = ModuleLifecycle::Retired;
+        let paused_tasks = self
+            .reload
+            .transaction()?
+            .paused_tasks
+            .iter()
+            .map(|paused| paused.handle)
+            .collect::<Vec<_>>();
+        for task in paused_tasks {
+            self.cancel_task(task, CancelReason::ReloadCommit)?;
+        }
+        Ok(())
+    }
+
+    fn set_active_root(&mut self, root: ModuleHandle) {
+        self.active_root = Some(root);
+    }
+
     pub fn call(
         &mut self,
         module: ModuleHandle,
@@ -802,7 +885,7 @@ impl RealmRuntime {
             .modules
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?;
-        if !loaded.accepts_calls {
+        if loaded.lifecycle != ModuleLifecycle::Active {
             return Err(RealmError::ModuleNotCallable);
         }
         let reservation = reservation_for_module(&loaded.verified, config.limits.frames);
@@ -1290,7 +1373,7 @@ impl RealmRuntime {
         Ok(count)
     }
 
-    fn module_for_id(&self, module_id: u32) -> Result<&LoadedModule, RealmError> {
+    fn module_for_id(&self, module_id: u32) -> Result<&ModuleEpochRoot, RealmError> {
         self.modules
             .occupied_handles_iter()
             .find(|raw| raw.index == module_id)
@@ -1456,7 +1539,8 @@ impl RealmRuntime {
             .occupied_handles_iter()
             .filter(|raw| {
                 self.modules.resolve(*raw).is_ok_and(|module| {
-                    module.retired && !live_module_ids.contains(&module.module_id)
+                    module.lifecycle == ModuleLifecycle::Retired
+                        && !live_module_ids.contains(&module.module_id)
                 })
             })
             .collect::<Vec<_>>();
@@ -1898,6 +1982,17 @@ mod tests {
             .metadata(host, new_schema_hash)
             .state_schema(schema)
             .function(migration);
+        let mut activation = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        activation
+            .effect(FunctionEffect::Immediate)
+            .emit(Instruction::ReturnVoid);
+        candidate.function(activation.finish().unwrap());
         let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
 
         let mut realm = RealmRuntime::new(RealmConfig::default());
@@ -1915,7 +2010,13 @@ mod tests {
             realm.stage_reload(0, &[]).unwrap(),
             Some(RuntimeValue::I32(37))
         );
-        realm.commit_reload(|_| Ok(())).unwrap();
+        realm
+            .commit_reload(super::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 64,
+            })
+            .unwrap();
         let handle = realm
             .state_handles(candidate)
             .unwrap()

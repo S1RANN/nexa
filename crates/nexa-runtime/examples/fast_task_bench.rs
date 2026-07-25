@@ -8,9 +8,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry, HostRequestHandle,
-    HostTrap, HostValue, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHostDomain,
-    RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    ActivationEntry, HostArgs, HostCallOutcome, HostCompletion, HostPayload, HostRegistry,
+    HostRequestHandle, HostTrap, HostValue, PollResult, RealmConfig, RealmRuntime, ResourceContext,
+    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -228,12 +228,14 @@ fn main() {
         realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
         black_box(
             realm
-                .commit_reload(|module| {
-                    assert_eq!(module, candidate);
-                    Ok(())
+                .commit_reload(ActivationEntry {
+                    function_id: 2,
+                    arguments: &[],
+                    fuel: 64,
                 })
                 .unwrap(),
         );
+        assert_eq!(realm.active_root(), Some(candidate));
         assert!(realm.terminal_record(task).is_some());
     }));
     results.push(bench("nexa_gc_collect", host_samples, || {
@@ -411,11 +413,22 @@ fn reload_module() -> VerifiedModule {
     task.effect(FunctionEffect::Task)
         .emit(Instruction::Yield)
         .emit(Instruction::Return { source: 0 });
+    let mut activation = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: None,
+        },
+        0,
+    );
+    activation
+        .effect(FunctionEffect::Immediate)
+        .emit(Instruction::ReturnVoid);
     let mut module = ModuleBuilder::new();
     module
         .metadata(HOST, SCHEMA)
         .function(migration.finish().unwrap());
     module.function(task.finish().unwrap());
+    module.function(activation.finish().unwrap());
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 

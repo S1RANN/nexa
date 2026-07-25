@@ -5,3 +5,4 @@
 migration fn migrate(value: i32) -> i32 { return value; }
 fn identity(value: i32) -> i32 { return value; }
 task fn update(value: i32) -> i32 { return value + 1; }
+immediate fn activate(value: i32) -> i32 { return value; }

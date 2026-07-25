@@ -5,6 +5,7 @@ state Preparing
 state Quiescing
 state Staging
 state Committing
+state Published
 state Activating
 state Completed terminal
 state RolledBack terminal
@@ -18,6 +19,7 @@ event QuiesceFailed
 event StageSucceeded
 event StageFailed
 event Publish
+event BeginActivation
 event ActivationSucceeded
 event ActivationFailed
 
@@ -34,7 +36,8 @@ transition RELOAD_QUIESCE_FAILED_ROLLED_BACK Quiescing QuiesceFailed RolledBack 
 transition RELOAD_STAGE_SUCCEEDED_COMMITTING Staging StageSucceeded Committing
 transition RELOAD_STAGE_FAILED_ROLLED_BACK Staging StageFailed RolledBack delta=staging_heap:-1
 transition RELOAD_COMMIT_STAGE_FAILED_ROLLED_BACK Committing StageFailed RolledBack delta=staging_heap:-1
-transition RELOAD_COMMIT_PUBLISH_ACTIVATING Committing Publish Activating delta=staging_heap:-1
+transition RELOAD_COMMIT_PUBLISH_PUBLISHED Committing Publish Published delta=staging_heap:-1
+transition RELOAD_PUBLISHED_BEGIN_ACTIVATION Published BeginActivation Activating
 transition RELOAD_ACTIVATION_SUCCEEDED_COMPLETED Activating ActivationSucceeded Completed
 transition RELOAD_ACTIVATION_FAILED_FAULTED Activating ActivationFailed ActivationFaulted
 
