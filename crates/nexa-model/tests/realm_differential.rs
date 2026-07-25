@@ -6,9 +6,9 @@ use nexa_model::system::{
     RealmSystemConfig, RealmSystemEvent, RealmSystemSnapshot, replay_realm_runtime,
 };
 use nexa_runtime::{
-    ActivationEntry, CancelReason, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap,
-    ModuleLifecycle, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
-    RuntimeValue, StepConfig, TaskLimits, TaskTerminalReason, TickBudget,
+    CancelReason, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, ModuleLifecycle,
+    RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue,
+    StepConfig, TaskLimits, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -188,19 +188,11 @@ fn activation_failure_after_publication_matches_irreversible_reload_model() {
         )
         .unwrap();
     let candidate = realm
-        .prepare_reload(old, candidate_module, host_hash, schema_hash)
+        .prepare_reload(old, candidate_module, host_hash)
         .unwrap();
     realm.quiesce_reload().unwrap();
-    realm.stage_reload(0, &[RuntimeValue::I32(7)]).unwrap();
-    assert!(
-        realm
-            .commit_reload(ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 64,
-            })
-            .is_err()
-    );
+    realm.stage_reload(&[RuntimeValue::I32(7)]).unwrap();
+    assert!(realm.commit_reload(&[], 64).is_err());
 
     let model = replay_realm_runtime(
         config,

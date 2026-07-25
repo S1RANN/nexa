@@ -56,18 +56,12 @@ fn reload_activation_fault() {
     let mut realm = nexa_runtime::RealmRuntime::isolated(nexa_runtime::RealmConfig::default());
     let old = realm.load_module(build(), host, schema).unwrap();
     let (scope, task) = super::support::spawn(&mut realm, old);
-    let candidate = realm
-        .prepare_reload(old, build_candidate(), host, schema)
-        .unwrap();
+    let candidate = realm.prepare_reload(old, build_candidate(), host).unwrap();
     realm.quiesce_reload().unwrap();
     realm
-        .stage_reload(0, &[nexa_runtime::RuntimeValue::I32(7)])
+        .stage_reload(&[nexa_runtime::RuntimeValue::I32(7)])
         .unwrap();
-    let activation = realm.commit_reload(nexa_runtime::ActivationEntry {
-        function_id: 2,
-        arguments: &[],
-        fuel: 64,
-    });
+    let activation = realm.commit_reload(&[], 64);
     let rejected = realm.call(
         candidate,
         0,

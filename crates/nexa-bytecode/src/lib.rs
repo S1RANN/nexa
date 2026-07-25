@@ -1720,6 +1720,19 @@ impl ModuleBuilder {
         if module.reload_metadata.migration_entry.is_none() && migration_entries.len() == 1 {
             module.reload_metadata.migration_entry = migration_entries.first().copied();
         }
+        let activation_entries = module
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| function.effect == FunctionEffect::Immediate)
+            .map(|(index, _)| u32::try_from(index).expect("function count exceeds u32"))
+            .collect::<Vec<_>>();
+        if module.reload_metadata.activation_entry.is_none()
+            && migration_entries.len() == 1
+            && activation_entries.len() == 1
+        {
+            module.reload_metadata.activation_entry = activation_entries.first().copied();
+        }
         if module.reload_metadata.stateful_schema_hash == StableId(0) {
             module.reload_metadata.stateful_schema_hash = module.state_schema.stable_hash();
         }

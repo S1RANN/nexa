@@ -7,10 +7,9 @@ use nexa_model::realm_v3::{
     RealmV3World, explore_realm_v3,
 };
 use nexa_runtime::{
-    ActivationEntry, HostErrorPayload, HostPayload, HostRequestHandle, HostRequestState,
-    ModuleHandle, ModuleLifecycle, PendingHostRequest, RealmConfig, RealmRuntime,
-    RetiredEpochState, RuntimeHost, RuntimeValue, StepConfig, TaskHandle, TaskLimits,
-    TaskTerminalReason, TickBudget,
+    HostErrorPayload, HostPayload, HostRequestHandle, HostRequestState, ModuleHandle,
+    ModuleLifecycle, PendingHostRequest, RealmConfig, RealmRuntime, RetiredEpochState, RuntimeHost,
+    RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -207,7 +206,7 @@ impl RuntimeAdapter {
             RealmV3Event::BeginReload => {
                 let candidate = self
                     .realm
-                    .prepare_reload(self.old, candidate_module(), host_hash(), schema_hash())
+                    .prepare_reload(self.old, candidate_module(), host_hash())
                     .map_err(debug)?;
                 self.realm.quiesce_reload().map_err(debug)?;
                 self.candidate = Some(candidate);
@@ -218,28 +217,20 @@ impl RuntimeAdapter {
             }
             RealmV3Event::PublishActivationSuccess => {
                 self.realm
-                    .stage_reload(0, &[RuntimeValue::I32(7)])
+                    .stage_reload(&[RuntimeValue::I32(7)])
                     .map_err(debug)?;
                 self.realm
-                    .commit_reload(ActivationEntry {
-                        function_id: 1,
-                        arguments: &[],
-                        fuel: 64,
-                    })
+                    .commit_reload(&[RuntimeValue::Bool(true)], 64)
                     .map_err(debug)?;
                 self.tick()?;
             }
             RealmV3Event::PublishActivationFailure => {
                 self.realm
-                    .stage_reload(0, &[RuntimeValue::I32(7)])
+                    .stage_reload(&[RuntimeValue::I32(7)])
                     .map_err(debug)?;
                 assert!(
                     self.realm
-                        .commit_reload(ActivationEntry {
-                            function_id: 2,
-                            arguments: &[],
-                            fuel: 64,
-                        })
+                        .commit_reload(&[RuntimeValue::Bool(false)], 64)
                         .is_err()
                 );
                 self.tick()?;
@@ -484,28 +475,22 @@ fn candidate_module() -> nexa_verifier::VerifiedModule {
         .emit(Instruction::Return { source: 0 });
     let mut activation = FunctionBuilder::new(
         Signature {
-            parameters: Vec::new(),
+            parameters: vec![ValueType::Bool],
             result: None,
         },
-        0,
+        1,
     );
     activation
         .effect(FunctionEffect::Immediate)
-        .emit(Instruction::ReturnVoid);
-    let mut activation_fault = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: None,
-        },
-        0,
-    );
-    activation_fault
-        .effect(FunctionEffect::Immediate)
+        .emit(Instruction::JumpIfFalse {
+            condition: 0,
+            target: 2,
+        })
+        .emit(Instruction::ReturnVoid)
         .emit(Instruction::Trap);
     verified(vec![
         migration.finish().unwrap(),
         activation.finish().unwrap(),
-        activation_fault.finish().unwrap(),
     ])
 }
 

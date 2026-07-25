@@ -8,9 +8,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    ActivationEntry, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, HostValue,
-    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost,
-    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, HostValue, PendingHostRequest,
+    PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
+    RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -240,20 +240,10 @@ fn main() {
     results.push(bench("nexa_reload", host_samples, || {
         let (mut realm, old, scope) = loaded(yielded.clone());
         let task = call(&mut realm, old, scope, 1);
-        let candidate = realm
-            .prepare_reload(old, reload_module(), HOST, SCHEMA)
-            .unwrap();
+        let candidate = realm.prepare_reload(old, reload_module(), HOST).unwrap();
         realm.quiesce_reload().unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
-        black_box(
-            realm
-                .commit_reload(ActivationEntry {
-                    function_id: 2,
-                    arguments: &[],
-                    fuel: 64,
-                })
-                .unwrap(),
-        );
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
+        black_box(realm.commit_reload(&[], 64).unwrap());
         assert_eq!(realm.active_root(), Some(candidate));
         assert!(realm.terminal_record(task).is_some());
     }));

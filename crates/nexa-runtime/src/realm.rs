@@ -2,7 +2,9 @@ use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
-use nexa_bytecode::{AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, ValueType};
+use nexa_bytecode::{
+    AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, MigrationLimitRequirements, ValueType,
+};
 use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
@@ -112,13 +114,6 @@ impl RetiredEpochRegistry {
         }
         self.entries.push_back(entry);
     }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct ActivationEntry<'a> {
-    pub function_id: u32,
-    pub arguments: &'a [RuntimeValue],
-    pub fuel: u64,
 }
 
 struct RealmHostBridge<'a> {
@@ -704,44 +699,6 @@ impl RealmRuntime {
         old_module: ModuleHandle,
         candidate: VerifiedModule,
         host_hash: StableId,
-        schema_hash: StableId,
-    ) -> Result<ModuleHandle, RealmError> {
-        if self.reload.active() {
-            return Err(ReloadError::InvalidState.into());
-        }
-        let old = self
-            .modules
-            .resolve(old_module.raw())
-            .map_err(RealmError::ModuleHandle)?;
-        if old.verified.module().host_interface_hash != Some(host_hash) {
-            return Err(RealmError::HostHashMismatch);
-        }
-        if old.verified.module().schema_hash != Some(schema_hash) {
-            return Err(RealmError::SchemaHashMismatch);
-        }
-        let stateful_domain = old.stateful_domain;
-        let candidate = self.load_module(candidate, host_hash, schema_hash)?;
-        let candidate_root = self
-            .modules
-            .resolve_mut(candidate.raw())
-            .map_err(RealmError::ModuleHandle)?;
-        candidate_root.lifecycle = ModuleLifecycle::Staging;
-        candidate_root.stateful_domain = stateful_domain;
-        candidate_root.state = StatefulRegistry::new(stateful_domain);
-        self.reload.begin(ReloadTransaction {
-            old_module,
-            candidate,
-            paused_tasks: Vec::new(),
-            completions: ReloadCompletionBuffer::new(self.reload_completion_capacity),
-        })?;
-        Ok(candidate)
-    }
-
-    pub fn prepare_reload_migrating(
-        &mut self,
-        old_module: ModuleHandle,
-        candidate: VerifiedModule,
-        host_hash: StableId,
     ) -> Result<ModuleHandle, RealmError> {
         if self.reload.active() {
             return Err(ReloadError::InvalidState.into());
@@ -762,6 +719,12 @@ impl RealmRuntime {
             return Err(
                 ReloadError::Migration("schema changes require a migration entry".into()).into(),
             );
+        }
+        if let Some(error) = migration_requirement_error(
+            self.migration_limits,
+            candidate.module().reload_metadata.minimum_migration_limits,
+        ) {
+            return Err(ReloadError::MigrationLimit(error).into());
         }
         let candidate = self.load_module(candidate, host_hash, candidate_schema)?;
         let candidate_root = self
@@ -832,7 +795,6 @@ impl RealmRuntime {
 
     pub fn stage_reload(
         &mut self,
-        migration_function: u32,
         arguments: &[RuntimeValue],
     ) -> Result<Option<RuntimeValue>, RealmError> {
         self.buffer_reload_completions()?;
@@ -841,12 +803,17 @@ impl RealmRuntime {
             .modules
             .resolve(candidate_handle.raw())
             .map_err(RealmError::ModuleHandle)?;
+        let Some(migration_entry) = candidate.verified.module().reload_metadata.migration_entry
+        else {
+            self.reload.staged()?;
+            return Ok(None);
+        };
         let function = candidate
             .verified
             .module()
             .functions
-            .get(migration_function as usize)
-            .ok_or(RealmError::MissingModule(migration_function))?;
+            .get(migration_entry as usize)
+            .ok_or(RealmError::MissingModule(migration_entry))?;
         if function.effect != nexa_bytecode::FunctionEffect::Migration {
             return Err(ReloadError::Migration(
                 "migration entry does not have Migration effect".into(),
@@ -871,7 +838,7 @@ impl RealmRuntime {
         )?;
         let execution = CheckedInterpreter::run_migration(
             &candidate.verified,
-            migration_function,
+            migration_entry,
             arguments,
             self.migration_limits.max_fuel,
             crate::FrameLimits {
@@ -918,7 +885,8 @@ impl RealmRuntime {
 
     pub fn commit_reload(
         &mut self,
-        activation: ActivationEntry<'_>,
+        activation_arguments: &[RuntimeValue],
+        activation_fuel: u64,
     ) -> Result<ModuleHandle, RealmError> {
         self.buffer_reload_completions()?;
         let candidate = self.reload.transaction()?.candidate;
@@ -928,12 +896,16 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?
             .verified
             .clone();
+        let activation_entry = verified.module().reload_metadata.activation_entry;
         self.publish_reload_root()?;
         let activation_result: Result<(), RuntimeMessage> = (|| {
+            let Some(activation_entry) = activation_entry else {
+                return Ok(());
+            };
             let function = verified
                 .module()
                 .functions
-                .get(activation.function_id as usize)
+                .get(activation_entry as usize)
                 .ok_or(RuntimeMessage::Static("activation function is missing"))?;
             if function.effect != nexa_bytecode::FunctionEffect::Immediate {
                 return Err(RuntimeMessage::Static(
@@ -942,9 +914,9 @@ impl RealmRuntime {
             }
             match CheckedInterpreter::run_with_heap(
                 &verified,
-                activation.function_id,
-                activation.arguments,
-                activation.fuel,
+                activation_entry,
+                activation_arguments,
+                activation_fuel,
                 &mut self.heap,
             )
             .map_err(|_| RuntimeMessage::Static("activation interpreter failed"))?
@@ -2354,6 +2326,31 @@ fn module_requires_host_capabilities(module: &nexa_bytecode::Module) -> bool {
         .any(|state_type| state_type.fields.iter().any(|field| requires(field.ty)))
 }
 
+fn migration_requirement_error(
+    available: MigrationLimits,
+    required: MigrationLimitRequirements,
+) -> Option<MigrationLimitError> {
+    if available.max_objects < required.max_objects {
+        Some(MigrationLimitError::Objects)
+    } else if available.max_fields < required.max_fields {
+        Some(MigrationLimitError::Fields)
+    } else if available.max_forwarding_entries < required.max_forwarding_entries {
+        Some(MigrationLimitError::Forwarding)
+    } else if u64::try_from(available.max_state_bytes).unwrap_or(u64::MAX)
+        < required.max_state_bytes
+    {
+        Some(MigrationLimitError::StateBytes)
+    } else if available.max_gc_roots < required.max_gc_roots {
+        Some(MigrationLimitError::GcRoots)
+    } else if available.max_fuel < required.max_fuel {
+        Some(MigrationLimitError::Fuel)
+    } else if available.max_call_depth < required.max_call_depth {
+        Some(MigrationLimitError::CallDepth)
+    } else {
+        None
+    }
+}
+
 fn requires_host_capabilities(
     module: &nexa_bytecode::Module,
     ty: ValueType,
@@ -2601,6 +2598,22 @@ mod tests {
     }
 
     #[test]
+    fn reload_without_optional_entries_uses_metadata_defaults() {
+        let (old, host, schema) = module(false);
+        let (candidate, _, _) = module(false);
+        assert_eq!(candidate.module().reload_metadata.migration_entry, None);
+        assert_eq!(candidate.module().reload_metadata.activation_entry, None);
+
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let old = realm.load_module(old, host, schema).unwrap();
+        let candidate = realm.prepare_reload(old, candidate, host).unwrap();
+        assert_eq!(realm.quiesce_reload().unwrap(), 0);
+        assert_eq!(realm.stage_reload(&[]).unwrap(), None);
+        assert_eq!(realm.commit_reload(&[], 0).unwrap(), candidate);
+        assert_eq!(realm.active_root(), Some(candidate));
+    }
+
+    #[test]
     fn task_handle_is_the_only_resume_credential_and_terminal_record_survives_slot_release() {
         let (module, host, schema) = module(true);
         let mut realm = RealmRuntime::isolated(RealmConfig::default());
@@ -2682,7 +2695,7 @@ mod tests {
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         realm
-            .prepare_reload(explicit_module, explicit_candidate, host, schema)
+            .prepare_reload(explicit_module, explicit_candidate, host)
             .unwrap();
         realm.quiesce_reload().unwrap();
         assert_eq!(
@@ -2784,22 +2797,11 @@ mod tests {
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         realm
-            .prepare_reload(
-                old,
-                reload_candidate_module(host, schema, false),
-                host,
-                schema,
-            )
+            .prepare_reload(old, reload_candidate_module(host, schema, false), host)
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
-        realm
-            .commit_reload(super::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 32,
-            })
-            .unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
         assert_eq!(
             realm.terminal_record(task).map(|record| &record.reason),
             Some(&TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
@@ -3031,12 +3033,11 @@ mod tests {
                 module_a,
                 reload_candidate_module(host_hash, schema, false),
                 host_hash,
-                schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
         submit_test_completion(&mut pending_b, completion);
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
         assert_eq!(realm.reload_buffered_completions(), 0);
         assert_eq!(realm.reload_completion_stats().buffered, 0);
         realm
@@ -3129,19 +3130,14 @@ mod tests {
                 old,
                 reload_candidate_module(host_hash, schema, activation_fault),
                 host_hash,
-                schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
         pending.ticket.complete(HostPayload::I32(77)).unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
         assert_eq!(realm.reload_buffered_completions(), 1);
 
-        let result = realm.commit_reload(super::ActivationEntry {
-            function_id: 1,
-            arguments: &[],
-            fuel: 32,
-        });
+        let result = realm.commit_reload(&[], 32);
         if activation_fault {
             assert!(matches!(
                 result,
@@ -3236,11 +3232,10 @@ mod tests {
                 old,
                 reload_candidate_module(host_hash, schema, false),
                 host_hash,
-                schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
 
         let barrier = Arc::new(Barrier::new(2));
         let completion_barrier = Arc::clone(&barrier);
@@ -3249,13 +3244,7 @@ mod tests {
             pending.ticket.complete(HostPayload::I32(77))
         });
         barrier.wait();
-        realm
-            .commit_reload(super::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 32,
-            })
-            .unwrap();
+        realm.commit_reload(&[], 32).unwrap();
         completion.join().unwrap().unwrap();
         realm
             .tick(TickBudget {
@@ -3335,7 +3324,6 @@ mod tests {
                     module_a,
                     reload_candidate_module(host_hash, schema, false),
                     host_hash,
-                    schema,
                 )
                 .unwrap();
             realm.quiesce_reload().unwrap();
@@ -3346,7 +3334,7 @@ mod tests {
                 pending_a.ticket.complete(HostPayload::I32(1)).unwrap();
                 pending_b.ticket.complete(HostPayload::I32(2)).unwrap();
             }
-            realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+            realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
             assert_eq!(realm.reload_buffered_completions(), 1);
             assert_eq!(realm.reload_completion_stats().buffered, 1);
             realm.rollback_reload().unwrap();
@@ -3603,18 +3591,11 @@ mod tests {
                 epoch_one,
                 reloadable_async_module(host_hash, schema),
                 host_hash,
-                schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
-        realm
-            .commit_reload(super::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 32,
-            })
-            .unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
 
         let token_owner = realm
             .call(
@@ -3643,18 +3624,11 @@ mod tests {
                 epoch_two,
                 reloadable_async_module(host_hash, schema),
                 host_hash,
-                schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(2)]).unwrap();
-        realm
-            .commit_reload(super::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 32,
-            })
-            .unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(2)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
 
         assert_eq!(realm.active_root(), Some(epoch_three));
         assert_eq!(realm.retired_epochs().len(), 2);
@@ -3881,12 +3855,10 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
             .unwrap();
-        realm
-            .prepare_reload(old, candidate, host_hash, schema)
-            .unwrap();
+        realm.prepare_reload(old, candidate, host_hash).unwrap();
         realm.quiesce_reload().unwrap();
         pending.ticket.complete(HostPayload::I32(99)).unwrap();
-        realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
         assert_eq!(realm.reload_buffered_completions(), 1);
         realm.rollback_reload().unwrap();
         assert_eq!(
@@ -4026,21 +3998,13 @@ mod tests {
         realm
             .insert_state(old, old_health, crate::StateValue::I32(37))
             .unwrap();
-        let candidate = realm
-            .prepare_reload_migrating(old, candidate, host)
-            .unwrap();
+        let candidate = realm.prepare_reload(old, candidate, host).unwrap();
         realm.quiesce_reload().unwrap();
         assert_eq!(
-            realm.stage_reload(0, &[]).unwrap(),
+            realm.stage_reload(&[]).unwrap(),
             Some(RuntimeValue::I32(37))
         );
-        realm
-            .commit_reload(super::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 64,
-            })
-            .unwrap();
+        realm.commit_reload(&[], 64).unwrap();
         let handle = realm
             .state_handles(candidate)
             .unwrap()
@@ -4065,12 +4029,8 @@ mod tests {
         let failure_handle = failure_realm
             .insert_state(failure_old, old_health, crate::StateValue::I32(37))
             .unwrap();
-        let failure_candidate = failure_realm
-            .prepare_reload_migrating(failure_old, failure_candidate, host)
-            .unwrap();
-        failure_realm.quiesce_reload().unwrap();
         assert_eq!(
-            failure_realm.stage_reload(0, &[]),
+            failure_realm.prepare_reload(failure_old, failure_candidate, host),
             Err(RealmError::Reload(ReloadError::MigrationLimit(
                 crate::MigrationLimitError::Objects
             )))
@@ -4079,10 +4039,6 @@ mod tests {
         assert_eq!(
             failure_realm.module_lifecycle(failure_old).unwrap(),
             super::ModuleLifecycle::Active
-        );
-        assert_eq!(
-            failure_realm.module_lifecycle(failure_candidate).unwrap(),
-            super::ModuleLifecycle::Staging
         );
         assert!(failure_realm.root_publications().is_empty());
         assert_eq!(
@@ -4283,13 +4239,11 @@ mod tests {
         let mut realm = RealmRuntime::isolated(RealmConfig::default());
         let old = realm.load_module(old, host, old_schema).unwrap();
         let domain = realm.module_stateful_domain(old).unwrap();
-        let candidate = realm
-            .prepare_reload_migrating(old, candidate, host)
-            .unwrap();
+        let candidate = realm.prepare_reload(old, candidate, host).unwrap();
         assert_eq!(realm.module_stateful_domain(candidate).unwrap(), domain);
         realm.quiesce_reload().unwrap();
         assert_eq!(
-            realm.stage_reload(0, &[]),
+            realm.stage_reload(&[]),
             Err(RealmError::Reload(ReloadError::MigrationNoOutput))
         );
     }

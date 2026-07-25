@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    ActivationEntry, HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime,
-    ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig,
-    TaskLimits, TickBudget,
+    HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime, ResourceContext,
+    RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
+    TickBudget,
 };
 
 #[allow(dead_code)]
@@ -260,17 +260,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_hash,
         schema_hash_v2,
     )?;
-    let v2 = realm.prepare_reload_migrating(module, v2, host_hash)?;
+    let v2 = realm.prepare_reload(module, v2, host_hash)?;
     realm.quiesce_reload()?;
     assert_eq!(
-        realm.stage_reload(0, &[RuntimeValue::I32(10)])?,
+        realm.stage_reload(&[RuntimeValue::I32(10)])?,
         Some(RuntimeValue::I32(10))
     );
-    realm.commit_reload(ActivationEntry {
-        function_id: 3,
-        arguments: &[RuntimeValue::I32(10)],
-        fuel: 4_096,
-    })?;
+    realm.commit_reload(&[RuntimeValue::I32(10)], 4_096)?;
     let migrated_state = realm
         .state_handles(v2)?
         .into_iter()
@@ -374,18 +370,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_hash,
         schema_hash_v2,
     )?;
-    let fault = realm.prepare_reload(v2, fault, host_hash, schema_hash_v2)?;
+    let fault = realm.prepare_reload(v2, fault, host_hash)?;
     realm.quiesce_reload()?;
-    realm.stage_reload(0, &[RuntimeValue::I32(1)])?;
-    assert!(
-        realm
-            .commit_reload(ActivationEntry {
-                function_id: u32::MAX,
-                arguments: &[],
-                fuel: 4_096,
-            })
-            .is_err()
-    );
+    realm.stage_reload(&[RuntimeValue::I32(1)])?;
+    assert!(realm.commit_reload(&[], 4_096).is_err());
     assert_eq!(realm.active_root(), Some(fault));
     assert_eq!(
         realm.module_lifecycle(fault)?,

@@ -8,11 +8,10 @@ use std::sync::{Arc, Mutex};
 use crate::scheduler::{Scheduler, SchedulerCheckpoint};
 use crate::task::TaskExecution;
 use crate::{
-    ActivationEntry, CheckedInterpreter, FuelState, HostArgs, HostCallOutcome,
-    HostCompletionResult, HostPayload, HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable,
-    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeLimits,
-    RuntimeResources, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskRuntime, TaskSnapshot,
-    TaskState, TickBudget,
+    CheckedInterpreter, FuelState, HostArgs, HostCallOutcome, HostCompletionResult, HostPayload,
+    HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable, PendingHostRequest, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeLimits, RuntimeResources, RuntimeValue,
+    StepConfig, TaskHandle, TaskLimits, TaskRuntime, TaskSnapshot, TaskState, TickBudget,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -733,7 +732,6 @@ impl RealmV4RoutingRuntimeAdapter {
                 module_a,
                 routing_candidate_module(host_hash, schema_hash),
                 host_hash,
-                schema_hash,
             )
             .expect("module A reload prepares");
         realm.quiesce_reload().expect("module A quiesces");
@@ -766,7 +764,7 @@ impl RealmV4RoutingRuntimeAdapter {
             }
             RealmV4RoutingRuntimeEvent::CommitA => {
                 let before = self.realm.reload_completion_stats().discarded_after_commit;
-                self.publish(1)?;
+                self.publish(true)?;
                 self.reload = RealmV4RoutingRuntimeReloadState::Committed;
                 if self.realm.reload_completion_stats().discarded_after_commit > before {
                     self.completion_a = RealmV4RoutingRuntimeCompletionState::Discarded;
@@ -774,7 +772,7 @@ impl RealmV4RoutingRuntimeAdapter {
             }
             RealmV4RoutingRuntimeEvent::ActivationFaultA => {
                 let before = self.realm.reload_completion_stats().discarded_after_commit;
-                if self.publish(2).is_ok() {
+                if self.publish(false).is_ok() {
                     return Err("faulting activation succeeded".into());
                 }
                 self.reload = RealmV4RoutingRuntimeReloadState::ActivationFaulted;
@@ -852,22 +850,20 @@ impl RealmV4RoutingRuntimeAdapter {
         Ok(())
     }
 
-    fn publish(&mut self, activation_function: u32) -> Result<(), String> {
+    fn publish(&mut self, activation_succeeds: bool) -> Result<(), String> {
         self.realm
-            .stage_reload(0, &[RuntimeValue::I32(1)])
+            .stage_reload(&[RuntimeValue::I32(1)])
             .map_err(debug)?;
-        let result = self.realm.commit_reload(ActivationEntry {
-            function_id: activation_function,
-            arguments: &[],
-            fuel: 32,
-        });
-        if activation_function == 2 {
-            result.map(|_| ()).map_err(debug)
-        } else {
+        let result = self
+            .realm
+            .commit_reload(&[RuntimeValue::Bool(activation_succeeds)], 32);
+        if activation_succeeds {
             if result.map_err(debug)? != self.candidate {
                 return Err("wrong candidate published".into());
             }
             Ok(())
+        } else {
+            result.map(|_| ()).map_err(debug)
         }
     }
 
@@ -986,28 +982,22 @@ fn routing_candidate_module(host: crate::StableId, schema: crate::StableId) -> V
         .emit(Instruction::Return { source: 0 });
     let mut activation = FunctionBuilder::new(
         Signature {
-            parameters: Vec::new(),
+            parameters: vec![ValueType::Bool],
             result: None,
         },
-        0,
+        1,
     );
     activation
         .effect(FunctionEffect::Immediate)
-        .emit(Instruction::ReturnVoid);
-    let mut fault = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: None,
-        },
-        0,
-    );
-    fault
-        .effect(FunctionEffect::Immediate)
+        .emit(Instruction::JumpIfFalse {
+            condition: 0,
+            target: 2,
+        })
+        .emit(Instruction::ReturnVoid)
         .emit(Instruction::Trap);
     let mut module = ModuleBuilder::new();
     module.metadata(host, schema);
     module.function(migration.finish().expect("migration is valid"));
     module.function(activation.finish().expect("activation is valid"));
-    module.function(fault.finish().expect("fault activation is valid"));
     verify(module.finish(), VerifierLimits::default()).expect("routing candidate verifies")
 }

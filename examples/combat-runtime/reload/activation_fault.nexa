@@ -7,3 +7,4 @@
 }
 migration fn migrate(value: i32) -> i32 { return value; }
 task fn update(value: i32) -> i32 { return value; }
+@activation fn activate(value: i32) -> i32 { return value; }

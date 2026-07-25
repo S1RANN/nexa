@@ -858,20 +858,13 @@ fn main() {
                 old,
                 build_retired_epoch_module(retired_host_hash, retired_schema),
                 retired_host_hash,
-                retired_schema,
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
         realm
-            .stage_reload(0, &[RuntimeValue::I32(1)])
+            .stage_reload(&[RuntimeValue::I32(1)])
             .unwrap();
-        realm
-            .commit_reload(nexa_runtime::ActivationEntry {
-                function_id: 1,
-                arguments: &[],
-                fuel: 32,
-            })
-            .unwrap();
+        realm.commit_reload(&[], 32).unwrap();
         let retired_epoch_final_transfer = observed(|| {
             realm
                 .tick(TickBudget {
@@ -894,7 +887,7 @@ fn main() {
         let mut migration_realm = make_migration_realm();
         set_migration_allocation_observer(Some(migration_observer));
         assert_eq!(
-            migration_realm.stage_reload(0, &[]).unwrap(),
+            migration_realm.stage_reload(&[]).unwrap(),
             Some(RuntimeValue::I32(7))
         );
         set_migration_allocation_observer(None);
@@ -1263,7 +1256,7 @@ fn make_migration_realm() -> RealmRuntime {
         .insert_state(old, deleted_id, StateValue::I32(9))
         .unwrap();
     realm
-        .prepare_reload_migrating(old, candidate, host)
+        .prepare_reload(old, candidate, host)
         .unwrap();
     realm.quiesce_reload().unwrap();
     realm

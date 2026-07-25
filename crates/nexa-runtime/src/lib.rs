@@ -55,10 +55,10 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
-    ActivationEntry, CancelReason, CompletionRoute, ModuleEpochRoot, ModuleHandle, ModuleLifecycle,
-    PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime, ReloadCompletionStats,
-    RetiredEpochSnapshot, RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport,
-    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+    CancelReason, CompletionRoute, ModuleEpochRoot, ModuleHandle, ModuleLifecycle, PendingReason,
+    PollResult, RealmConfig, RealmError, RealmRuntime, ReloadCompletionStats, RetiredEpochSnapshot,
+    RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport, TaskTerminalReason,
+    TaskTerminalRecord, TickBudget, TickReport,
 };
 pub use reload::ReloadError;
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
