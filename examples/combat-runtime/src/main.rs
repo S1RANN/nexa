@@ -415,7 +415,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ));
     drop(realm);
     let _releases = runtime_host.drain_releases();
-    runtime_host.close()?;
+    runtime_host.begin_close();
+    runtime_host.try_finish_close()?;
     println!("combat-runtime completed with deterministic reload activation fault");
     Ok(())
 }

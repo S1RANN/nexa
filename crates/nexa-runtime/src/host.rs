@@ -69,6 +69,8 @@ pub enum ReleaseQueueState {
 pub enum ReleaseQueueError {
     Capacity,
     NotReserved,
+    HostClosing,
+    HostClosed,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -161,6 +163,7 @@ impl ReleaseDomain {
 #[derive(Debug)]
 pub struct ReleaseQueue {
     domain: ReleaseDomain,
+    host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
     lists: [IntrusiveReleaseList; RELEASE_DOMAIN_COUNT],
     epoch_pending: BTreeMap<(u32, u64), EpochReleaseCount>,
     transfer_generation: u64,
@@ -177,14 +180,38 @@ pub struct RuntimeHost {
     pending_completions: Arc<AtomicUsize>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RuntimeHostState {
+    #[default]
+    Open,
+    Closing,
+    Closed,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct RuntimeHostLifecycle {
     live_realms: usize,
-    closed: bool,
+    state: RuntimeHostState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeHostCloseStatus {
+    pub state: RuntimeHostState,
+    pub live_realms: usize,
+    pub pending_completions: usize,
+    pub pending_releases: usize,
+}
+
+impl RuntimeHostCloseStatus {
+    #[must_use]
+    pub const fn is_drained(self) -> bool {
+        self.live_realms == 0 && self.pending_completions == 0 && self.pending_releases == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeHostCloseError {
+    NotClosing,
     LiveRealms,
     PendingCompletions,
     PendingReleases,
@@ -208,13 +235,13 @@ impl RuntimeHost {
         }
     }
 
-    pub(crate) fn register_realm(&self) -> Result<(), RuntimeHostCloseError> {
+    pub(crate) fn register_realm(&self) -> Result<(), RuntimeHostState> {
         let mut lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if lifecycle.closed {
-            return Err(RuntimeHostCloseError::LiveRealms);
+        if lifecycle.state != RuntimeHostState::Open {
+            return Err(lifecycle.state);
         }
         lifecycle.live_realms = lifecycle
             .live_realms
@@ -234,39 +261,78 @@ impl RuntimeHost {
             .expect("hosted realm registration is balanced");
     }
 
-    pub fn close(&self) -> Result<(), RuntimeHostCloseError> {
+    /// Starts the idempotent close protocol and rejects all later admissions.
+    pub fn begin_close(&self) -> RuntimeHostCloseStatus {
         {
-            let lifecycle = self
+            let mut lifecycle = self
                 .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if lifecycle.live_realms != 0 {
-                return Err(RuntimeHostCloseError::LiveRealms);
+            if lifecycle.state == RuntimeHostState::Open {
+                lifecycle.state = RuntimeHostState::Closing;
             }
         }
-        if self.pending_releases() != 0 {
-            return Err(RuntimeHostCloseError::PendingReleases);
-        }
-        if self.pending_completions() != 0 {
-            return Err(RuntimeHostCloseError::PendingCompletions);
-        }
+        self.close_status()
+    }
+
+    /// Finishes close only after every previously admitted resource has drained.
+    pub fn try_finish_close(&self) -> Result<RuntimeHostCloseStatus, RuntimeHostCloseError> {
         let mut lifecycle = self
             .lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match lifecycle.state {
+            RuntimeHostState::Open => return Err(RuntimeHostCloseError::NotClosing),
+            RuntimeHostState::Closed => {
+                return Ok(RuntimeHostCloseStatus {
+                    state: RuntimeHostState::Closed,
+                    live_realms: 0,
+                    pending_completions: 0,
+                    pending_releases: 0,
+                });
+            }
+            RuntimeHostState::Closing => {}
+        }
         if lifecycle.live_realms != 0 {
             return Err(RuntimeHostCloseError::LiveRealms);
         }
-        lifecycle.closed = true;
-        Ok(())
+        let pending_completions = self.pending_completions();
+        if pending_completions != 0 {
+            return Err(RuntimeHostCloseError::PendingCompletions);
+        }
+        let pending_releases = self.pending_releases();
+        if pending_releases != 0 {
+            return Err(RuntimeHostCloseError::PendingReleases);
+        }
+        lifecycle.state = RuntimeHostState::Closed;
+        Ok(RuntimeHostCloseStatus {
+            state: RuntimeHostState::Closed,
+            live_realms: 0,
+            pending_completions,
+            pending_releases,
+        })
     }
 
     #[must_use]
-    pub fn is_closed(&self) -> bool {
+    pub fn state(&self) -> RuntimeHostState {
         self.lifecycle
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .closed
+            .state
+    }
+
+    #[must_use]
+    pub fn close_status(&self) -> RuntimeHostCloseStatus {
+        let lifecycle = *self
+            .lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        RuntimeHostCloseStatus {
+            state: lifecycle.state,
+            live_realms: lifecycle.live_realms,
+            pending_completions: self.pending_completions(),
+            pending_releases: self.pending_releases(),
+        }
     }
 
     #[must_use]
@@ -275,7 +341,11 @@ impl RuntimeHost {
     }
 
     pub(crate) fn release_queue(&self, capacity: usize) -> ReleaseQueue {
-        ReleaseQueue::with_domain(self.releases.clone(), capacity)
+        ReleaseQueue::with_domain(
+            self.releases.clone(),
+            capacity,
+            Some(Arc::clone(&self.lifecycle)),
+        )
     }
 
     #[must_use]
@@ -332,10 +402,11 @@ impl Drop for RuntimeHost {
                 .lifecycle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if !lifecycle.closed {
+            if lifecycle.state != RuntimeHostState::Closed {
                 eprintln!(
-                    "RuntimeHost dropped without close: live_realms={}, pending_completions={}, \
+                    "RuntimeHost dropped in {:?}: live_realms={}, pending_completions={}, \
                      pending_releases={}",
+                    lifecycle.state,
                     lifecycle.live_realms,
                     self.pending_completions(),
                     self.pending_releases()
@@ -348,12 +419,17 @@ impl Drop for RuntimeHost {
 impl ReleaseQueue {
     #[must_use]
     pub fn new(capacity: usize) -> Self {
-        Self::with_domain(ReleaseDomain::new(capacity), capacity)
+        Self::with_domain(ReleaseDomain::new(capacity), capacity, None)
     }
 
-    fn with_domain(domain: ReleaseDomain, capacity: usize) -> Self {
+    fn with_domain(
+        domain: ReleaseDomain,
+        capacity: usize,
+        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
+    ) -> Self {
         Self {
             domain,
+            host_lifecycle,
             lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
             epoch_pending: BTreeMap::new(),
             transfer_generation: 0,
@@ -368,6 +444,17 @@ impl ReleaseQueue {
         module_id: u32,
         epoch: u64,
     ) -> Result<ReleaseReservation, ReleaseQueueError> {
+        if let Some(lifecycle) = &self.host_lifecycle {
+            match lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+            {
+                RuntimeHostState::Open => {}
+                RuntimeHostState::Closing => return Err(ReleaseQueueError::HostClosing),
+                RuntimeHostState::Closed => return Err(ReleaseQueueError::HostClosed),
+            }
+        }
         if self.queued_len() + self.reserved >= self.capacity {
             self.transition_to_stalled();
             return Err(ReleaseQueueError::Capacity);
@@ -882,6 +969,7 @@ struct CompletionQueue {
     closed: bool,
     next_terminal_sequence: u64,
     global_pending: Option<Arc<AtomicUsize>>,
+    host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -996,6 +1084,8 @@ pub enum HostRequestError {
     Handle(HandleError),
     Allocation(SlotAllocError),
     ReleaseQueue(ReleaseQueueError),
+    HostClosing,
+    HostClosed,
     CompletionQueueFull,
     CompletionQueueClosed,
     UnknownCustomDomain(u32),
@@ -1025,7 +1115,11 @@ impl From<SlotAllocError> for HostRequestError {
 
 impl From<ReleaseQueueError> for HostRequestError {
     fn from(error: ReleaseQueueError) -> Self {
-        Self::ReleaseQueue(error)
+        match error {
+            ReleaseQueueError::HostClosing => Self::HostClosing,
+            ReleaseQueueError::HostClosed => Self::HostClosed,
+            error => Self::ReleaseQueue(error),
+        }
     }
 }
 
@@ -1051,13 +1145,14 @@ impl HostRequestManager {
     #[cfg(test)]
     #[must_use]
     pub fn new(realm_id: u32, capacity: u32) -> Self {
-        Self::with_completion_counter(realm_id, capacity, None)
+        Self::with_completion_counter(realm_id, capacity, None, None)
     }
 
     fn with_completion_counter(
         realm_id: u32,
         capacity: u32,
         global_pending: Option<Arc<AtomicUsize>>,
+        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
     ) -> Self {
         Self {
             realm_id,
@@ -1072,6 +1167,7 @@ impl HostRequestManager {
                 closed: false,
                 next_terminal_sequence: 1,
                 global_pending,
+                host_lifecycle,
             })),
             discarded_late_results: 0,
             terminal_records: VecDeque::with_capacity(capacity as usize),
@@ -1364,6 +1460,22 @@ impl HostRequestManager {
         epoch: u64,
         request: HostRequestHandle,
     ) -> Result<usize, HostRequestError> {
+        if let Some(lifecycle) = &self
+            .completions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .host_lifecycle
+        {
+            match lifecycle
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .state
+            {
+                RuntimeHostState::Open => {}
+                RuntimeHostState::Closing => return Err(HostRequestError::HostClosing),
+                RuntimeHostState::Closed => return Err(HostRequestError::HostClosed),
+            }
+        }
         let mut queue = self
             .completions
             .lock()
@@ -1704,6 +1816,7 @@ impl RuntimeResources {
             capacity,
             ReleaseQueue::new(release_capacity),
             None,
+            None,
         )
     }
 
@@ -1718,6 +1831,7 @@ impl RuntimeResources {
             capacity,
             runtime_host.release_queue(release_capacity),
             Some(Arc::clone(&runtime_host.pending_completions)),
+            Some(Arc::clone(&runtime_host.lifecycle)),
         )
     }
 
@@ -1726,12 +1840,14 @@ impl RuntimeResources {
         capacity: u32,
         releases: ReleaseQueue,
         global_pending: Option<Arc<AtomicUsize>>,
+        host_lifecycle: Option<Arc<Mutex<RuntimeHostLifecycle>>>,
     ) -> Self {
         Self {
             requests: HostRequestManager::with_completion_counter(
                 realm_id,
                 capacity,
                 global_pending,
+                host_lifecycle,
             ),
             tokens: ResourceTokenManager::new(realm_id, capacity),
             snapshots: SnapshotManager::new(realm_id, capacity),
@@ -1956,13 +2072,15 @@ impl<T> CopyBuffer<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Barrier};
     use std::thread;
 
+    use nexa_core::RawHandle;
+
     use super::{
-        HostErrorPayload, HostPayload, HostRequestError, HostRequestManager, ReleaseKind,
-        ReleaseQueue, ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostDomain,
-        SnapshotManager,
+        HostErrorPayload, HostPayload, HostRequestError, HostRequestHandle, HostRequestManager,
+        ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceTokenManager,
+        RuntimeHost, RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotManager,
     };
     use crate::{RuntimeLimits, TaskRuntime};
 
@@ -2140,5 +2258,234 @@ mod tests {
         assert_eq!(host.drain_releases().len(), 2);
         assert_eq!(host.pending_releases(), 0);
         assert!(releases.reserve(3, 6).is_ok());
+    }
+
+    #[test]
+    fn begin_close_and_realm_registration_are_linearized() {
+        let host = RuntimeHost::new(1);
+        let barrier = Arc::new(Barrier::new(3));
+        let register_host = host.clone();
+        let register_barrier = Arc::clone(&barrier);
+        let register = thread::spawn(move || {
+            register_barrier.wait();
+            let result = register_host.register_realm();
+            if result.is_ok() {
+                register_host.unregister_realm();
+            }
+            result
+        });
+        let close_host = host.clone();
+        let close_barrier = Arc::clone(&barrier);
+        let close = thread::spawn(move || {
+            close_barrier.wait();
+            close_host.begin_close()
+        });
+        barrier.wait();
+        let admission = register.join().unwrap();
+        let status = close.join().unwrap();
+
+        assert!(matches!(admission, Ok(()) | Err(RuntimeHostState::Closing)));
+        assert_eq!(status.state, RuntimeHostState::Closing);
+        assert_eq!(host.close_status().live_realms, 0);
+        assert_eq!(
+            host.try_finish_close().unwrap().state,
+            RuntimeHostState::Closed
+        );
+    }
+
+    #[test]
+    fn begin_close_races_request_and_completion_reservations_without_leaks() {
+        let host = RuntimeHost::new(2);
+        let barrier = Arc::new(Barrier::new(2));
+        let request_host = host.clone();
+        let request_barrier = Arc::clone(&barrier);
+        let request = thread::spawn(move || {
+            let mut requests = HostRequestManager::with_completion_counter(
+                1,
+                1,
+                Some(Arc::clone(&request_host.pending_completions)),
+                Some(Arc::clone(&request_host.lifecycle)),
+            );
+            let mut releases = request_host.release_queue(1);
+            request_barrier.wait();
+            let outcome = requests.create_for_module(2, 3, &mut releases);
+            let admitted = outcome.is_ok();
+            if let Ok(pending) = outcome {
+                drop(pending);
+                requests.drain_completions(&mut releases);
+                releases.transfer_to_host();
+            }
+            admitted
+        });
+        barrier.wait();
+        host.begin_close();
+        let _admitted_before_close = request.join().unwrap();
+        let _ = host.drain_releases();
+        assert_eq!(host.pending_completions(), 0);
+
+        let completion_host = RuntimeHost::new(1);
+        let requests = HostRequestManager::with_completion_counter(
+            1,
+            1,
+            Some(Arc::clone(&completion_host.pending_completions)),
+            Some(Arc::clone(&completion_host.lifecycle)),
+        );
+        completion_host.begin_close();
+        assert_eq!(
+            requests.reserve_completion(2, 3, HostRequestHandle(RawHandle::new(1, 0, 0))),
+            Err(HostRequestError::HostClosing)
+        );
+        completion_host.try_finish_close().unwrap();
+
+        host.try_finish_close().unwrap();
+    }
+
+    #[test]
+    fn begin_close_races_release_reservation_and_rejects_all_new_resources() {
+        let host = RuntimeHost::new(3);
+        let barrier = Arc::new(Barrier::new(2));
+        let reserve_host = host.clone();
+        let reserve_barrier = Arc::clone(&barrier);
+        let reserve = thread::spawn(move || {
+            let mut releases = reserve_host.release_queue(1);
+            reserve_barrier.wait();
+            let result = releases.reserve(4, 5);
+            if let Ok(reservation) = result {
+                releases.cancel_reservation(reservation);
+                Ok(())
+            } else {
+                result.map(|_| ())
+            }
+        });
+        barrier.wait();
+        host.begin_close();
+        assert!(matches!(
+            reserve.join().unwrap(),
+            Ok(()) | Err(ReleaseQueueError::HostClosing)
+        ));
+
+        let mut runtime = TaskRuntime::new(1, RuntimeLimits::default());
+        let scope = runtime.create_scope(None).unwrap();
+        let task = runtime.admit_task(scope, 1, true).unwrap();
+        let mut request_releases = host.release_queue(1);
+        let mut requests = HostRequestManager::with_completion_counter(
+            1,
+            1,
+            Some(Arc::clone(&host.pending_completions)),
+            Some(Arc::clone(&host.lifecycle)),
+        );
+        assert!(matches!(
+            requests.create_for_module(2, 3, &mut request_releases),
+            Err(HostRequestError::HostClosing)
+        ));
+        let mut token_releases = host.release_queue(1);
+        let mut tokens = ResourceTokenManager::new(1, 1);
+        assert_eq!(
+            tokens.create(task, 2, 3, RuntimeHostDomain::Render, &mut token_releases),
+            Err(HostRequestError::HostClosing)
+        );
+        let mut snapshot_releases = host.release_queue(1);
+        let mut snapshots = SnapshotManager::new(1, 1);
+        assert_eq!(
+            snapshots.create(task, 2, 3, Arc::from([1]), &mut snapshot_releases),
+            Err(HostRequestError::HostClosing)
+        );
+        host.try_finish_close().unwrap();
+        assert_eq!(
+            host.release_queue(1).reserve(4, 5),
+            Err(ReleaseQueueError::HostClosed)
+        );
+    }
+
+    #[test]
+    fn old_completion_ticket_can_finish_while_host_is_closing() {
+        let host = RuntimeHost::new(1);
+        let mut requests = HostRequestManager::with_completion_counter(
+            1,
+            1,
+            Some(Arc::clone(&host.pending_completions)),
+            Some(Arc::clone(&host.lifecycle)),
+        );
+        let mut releases = host.release_queue(1);
+        let mut pending = requests.create_for_module(2, 3, &mut releases).unwrap();
+        host.begin_close();
+        pending.ticket.complete(HostPayload::Unit).unwrap();
+        assert_eq!(
+            host.try_finish_close(),
+            Err(RuntimeHostCloseError::PendingCompletions)
+        );
+        assert_eq!(requests.drain_completions(&mut releases).len(), 1);
+        assert_eq!(releases.transfer_to_host(), 1);
+        assert_eq!(
+            host.try_finish_close(),
+            Err(RuntimeHostCloseError::PendingReleases)
+        );
+        assert_eq!(host.drain_releases().len(), 1);
+        host.try_finish_close().unwrap();
+    }
+
+    #[test]
+    fn finish_close_races_realm_drop_and_release_drain() {
+        let host = RuntimeHost::new(1);
+        host.register_realm().unwrap();
+        host.begin_close();
+        let drop_host = host.clone();
+        let unregister = thread::spawn(move || drop_host.unregister_realm());
+        let first_finish = host.try_finish_close();
+        unregister.join().unwrap();
+        assert!(matches!(
+            first_finish,
+            Ok(_) | Err(RuntimeHostCloseError::LiveRealms)
+        ));
+        if host.state() == RuntimeHostState::Closing {
+            host.try_finish_close().unwrap();
+        }
+
+        let host = RuntimeHost::new(1);
+        let mut releases = host.release_queue(1);
+        let reservation = releases.reserve(1, 1).unwrap();
+        releases
+            .enqueue_reserved(
+                reservation,
+                super::ReleaseRecord {
+                    realm_id: 1,
+                    module_id: 1,
+                    epoch: 1,
+                    kind: ReleaseKind::ResourceToken,
+                    object_id: 1,
+                    domain: RuntimeHostDomain::Render,
+                },
+            )
+            .unwrap();
+        releases.transfer_to_host();
+        host.begin_close();
+        let drain_host = host.clone();
+        let drain = thread::spawn(move || drain_host.drain_releases());
+        let first_finish = host.try_finish_close();
+        let drained = drain.join().unwrap();
+        assert_eq!(drained.len(), 1);
+        assert!(matches!(
+            first_finish,
+            Ok(_) | Err(RuntimeHostCloseError::PendingReleases)
+        ));
+        if host.state() == RuntimeHostState::Closing {
+            host.try_finish_close().unwrap();
+        }
+    }
+
+    #[test]
+    fn close_protocol_is_idempotent_but_cannot_skip_closing() {
+        let host = RuntimeHost::new(1);
+        assert_eq!(
+            host.try_finish_close(),
+            Err(RuntimeHostCloseError::NotClosing)
+        );
+        let first = host.begin_close();
+        let second = host.begin_close();
+        assert_eq!(first, second);
+        let first = host.try_finish_close().unwrap();
+        let second = host.try_finish_close().unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.state, RuntimeHostState::Closed);
     }
 }

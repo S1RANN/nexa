@@ -41,8 +41,8 @@ pub use host::{
     HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest,
     RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
     RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
-    RuntimeHostCloseError, RuntimeHostDomain, RuntimeResourceSnapshot, RuntimeResources,
-    ScriptFunction, SnapshotHandle, TaskResourceSet,
+    RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
+    RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,

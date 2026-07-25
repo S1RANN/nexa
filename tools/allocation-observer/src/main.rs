@@ -195,7 +195,8 @@ fn main() {
             ));
         });
         drop(realm);
-        host.close().unwrap();
+        host.begin_close();
+        host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(16);
         let pending = Arc::new(Mutex::new(None));
@@ -275,7 +276,8 @@ fn main() {
         });
         drop(realm);
         let _releases = host.drain_releases();
-        host.close().unwrap();
+        host.begin_close();
+        host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
         let (mut realm, module) = make_realm_with_host(host.clone());
@@ -303,7 +305,8 @@ fn main() {
         assert_eq!(host.pending_releases(), 2);
         drop(pending);
         assert_eq!(host.drain_releases().len(), 2);
-        host.close().unwrap();
+        host.begin_close();
+        host.try_finish_close().unwrap();
 
         for count in &MIGRATION_COUNTS {
             count.store(0, Ordering::SeqCst);

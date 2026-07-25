@@ -58,9 +58,10 @@ pub mod prelude {
         MigrationCapacityReport, MigrationLimitError, MigrationLimits, ModuleHandle,
         PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
         ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError,
-        RuntimeHostDomain, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
-        SnapshotHandle, StateHandle, StateValue, StatefulDomainId, StepConfig, TaskHandle,
-        TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+        RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeValue, ScopeHandle,
+        ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle, StateValue, StatefulDomainId,
+        StepConfig, TaskHandle, TaskLimits, TaskTerminalReason, TaskTerminalRecord, TickBudget,
+        TickReport,
     };
     pub use nexa_verifier::VerifierLimits;
 

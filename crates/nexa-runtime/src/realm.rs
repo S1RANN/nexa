@@ -17,9 +17,9 @@ use crate::{
     HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
     HostValue, InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
     Object, OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
-    RuntimeHost, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeTrace, RuntimeValue,
-    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
-    TaskRuntime, TaskState, Trap, TrapKind,
+    RuntimeHost, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeResources,
+    RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig,
+    SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -341,6 +341,7 @@ pub enum RealmError {
     MissingModule(u32),
     HostCapabilitiesUnavailable,
     MissingHostInterfaceHash,
+    RuntimeHostClosing,
     RuntimeHostClosed,
     HostHashMismatch,
     SchemaHashMismatch,
@@ -468,9 +469,11 @@ impl RealmRuntime {
         let host_registry_hash = registry
             .interface_hash()
             .ok_or(RealmError::MissingHostInterfaceHash)?;
-        runtime_host
-            .register_realm()
-            .map_err(|_| RealmError::RuntimeHostClosed)?;
+        runtime_host.register_realm().map_err(|state| match state {
+            RuntimeHostState::Closing => RealmError::RuntimeHostClosing,
+            RuntimeHostState::Closed => RealmError::RuntimeHostClosed,
+            RuntimeHostState::Open => unreachable!("open hosts admit realms"),
+        })?;
         let resource_config = config.clone();
         let mut realm = Self::base(config);
         realm.host_registry = Some(registry);
@@ -3252,17 +3255,21 @@ mod tests {
         assert_eq!(runtime_host.pending_completions(), 0);
         assert_eq!(runtime_host.pending_releases(), 1);
         assert_eq!(
-            runtime_host.close(),
+            runtime_host.begin_close().state,
+            crate::RuntimeHostState::Closing
+        );
+        assert_eq!(
+            runtime_host.try_finish_close(),
             Err(crate::RuntimeHostCloseError::LiveRealms)
         );
         drop(realm);
         assert_eq!(
-            runtime_host.close(),
+            runtime_host.try_finish_close(),
             Err(crate::RuntimeHostCloseError::PendingReleases)
         );
         assert_eq!(runtime_host.drain_releases().len(), 1);
-        runtime_host.close().unwrap();
-        assert!(runtime_host.is_closed());
+        runtime_host.try_finish_close().unwrap();
+        assert_eq!(runtime_host.state(), crate::RuntimeHostState::Closed);
         assert!(matches!(
             RealmRuntime::hosted(
                 RealmConfig::default(),

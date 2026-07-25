@@ -571,6 +571,8 @@ fn host_request_code(error: &HostRequestError) -> ErrorCode {
         HostRequestError::UnknownCustomDomain(_) => ErrorCode::new("NX4002"),
         HostRequestError::Handle(_)
         | HostRequestError::ReleaseQueue(_)
+        | HostRequestError::HostClosing
+        | HostRequestError::HostClosed
         | HostRequestError::CompletionQueueClosed
         | HostRequestError::AlreadyCompleted
         | HostRequestError::InvalidState => ErrorCode::new("NX5001"),
@@ -583,7 +585,8 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
             ErrorCode::new("NX4001")
         }
         RealmError::HostCapabilitiesUnavailable => ErrorCode::new("NX4002"),
-        RealmError::RuntimeHostClosed
+        RealmError::RuntimeHostClosing
+        | RealmError::RuntimeHostClosed
         | RealmError::ModuleAllocation(_)
         | RealmError::EpochExhausted => ErrorCode::new("NX5004"),
         RealmError::Reload(error) => error.metadata().code,
