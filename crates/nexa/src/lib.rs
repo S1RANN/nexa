@@ -4,8 +4,9 @@
 
 pub mod prelude {
     pub use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
-        Signature, StateField, StateSchema, StateType, ValueType,
+        AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, FunctionBuilder,
+        FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, Signature,
+        StateField, StateSchema, StateType, ValueType, option_type, result_type,
     };
     pub use nexa_compiler::{compile, compile_with_interface};
     pub use nexa_core::{FileId, FunctionId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
@@ -16,8 +17,8 @@ pub mod prelude {
         ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError,
         RealmRuntime, ResourceContext, ResourceTokenHandle, RuntimeHost, RuntimeHostDomain,
         RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle,
-        StateValue, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason, TaskTerminalRecord,
-        TickBudget, TickReport,
+        StateValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
+        TaskTerminalRecord, TickBudget, TickReport,
     };
     pub use nexa_verifier::{VerifierLimits, verify};
 }

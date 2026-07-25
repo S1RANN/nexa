@@ -17,6 +17,12 @@ Snapshot registered stateful objects, build the new graph in a staging heap, val
 handles, and compute a migration hash. Migration uses VM pure operations only and cannot call the
 host. Failure discards staging and resumes the old system.
 
+If the state schema is unchanged, an untouched migration performs an identity clone and preserves
+the Stateful Domain and generations. If the schema changed, migration must explicitly account for
+every old identity with `STATE_PRESERVE`, `STATE_REPLACE`, or `STATE_DELETE`, construct the staging
+graph, and execute `STATE_FINISH`. An untouched changed-schema migration returns
+`MigrationNoOutput`; incomplete or duplicate forwarding is rejected before publication.
+
 ## Commit
 
 Publish one immutable `ModuleEpochRoot` on the VM thread. No worker thread may acquire or

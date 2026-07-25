@@ -60,8 +60,12 @@ impl RuntimeAdapter {
         let host_hash = host_hash();
         let schema_hash = schema_hash();
         let host = RuntimeHost::new(16);
-        let mut realm =
-            RealmRuntime::with_runtime_host(RealmConfig::default(), host.clone(), Box::new(NoHost));
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            host.clone(),
+            Box::new(NoHost(host_hash)),
+        )
+        .unwrap();
         let old = realm
             .load_module(old_module(), host_hash, schema_hash)
             .unwrap();
@@ -173,10 +177,7 @@ impl RuntimeAdapter {
                     .as_mut()
                     .expect("model owns ticket")
                     .ticket
-                    .fail(HostErrorPayload {
-                        code: 7,
-                        message: Some("model host failure".into()),
-                    })
+                    .fail(HostErrorPayload { code: 7 })
                     .map_err(debug)?;
                 self.tick()?;
                 self.pending[index] = None;
@@ -440,9 +441,13 @@ impl RuntimeAdapter {
     }
 }
 
-struct NoHost;
+struct NoHost(StableId);
 
 impl nexa_runtime::HostRegistry for NoHost {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
     fn call(
         &mut self,
         id: u32,

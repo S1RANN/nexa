@@ -1,10 +1,13 @@
 use std::fmt;
 
-use nexa_bytecode::{FunctionEffect, HostCallMode, Instruction, ValueType};
+use nexa_bytecode::{AsyncResultType, FunctionEffect, HostCallMode, Instruction, ValueType};
 use nexa_core::StableId;
 use nexa_verifier::VerifiedModule;
 
-use crate::{ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, RuntimeValue};
+use crate::{
+    ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, Heap, HeapError,
+    RuntimeValue,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SuspendReason {
@@ -166,6 +169,7 @@ pub enum InterpreterOutcome {
         request: crate::HostRequestHandle,
         destination: u16,
         expected_type: Option<ValueType>,
+        async_result: Option<AsyncResultType>,
         charge: ExecutionCharge,
         fuel: FuelState,
     },
@@ -202,6 +206,7 @@ pub enum InterpreterError {
     HostUnavailable,
     Host(crate::HostTrap),
     Migration(String),
+    Heap(HeapError),
 }
 
 impl fmt::Display for InterpreterError {
@@ -221,17 +226,23 @@ impl From<FrameError> for InterpreterError {
     }
 }
 
+impl From<HeapError> for InterpreterError {
+    fn from(error: HeapError) -> Self {
+        Self::Heap(error)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 24],
+    costs: [u16; 30],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 24],
+            costs: [1; 30],
         }
     }
 }
@@ -256,6 +267,12 @@ pub trait InterpreterHost {
 pub trait InterpreterMigration {
     fn old_get(&mut self, stable_id: StableId, expected: ValueType)
     -> Result<RuntimeValue, String>;
+    fn old_field_get(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, String>;
     fn new_create(
         &mut self,
         stable_id: StableId,
@@ -267,8 +284,10 @@ pub trait InterpreterMigration {
         field_id: StableId,
         value: RuntimeValue,
     ) -> Result<(), String>;
-    fn remap(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String>;
+    fn preserve(&mut self, stable_id: StableId) -> Result<(), String>;
+    fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String>;
     fn delete(&mut self, stable_id: StableId) -> Result<(), String>;
+    fn finish_staging(&mut self) -> Result<(), String>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -294,7 +313,7 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, None, None)
+        Self::execute(module, continuation, fuel, costs, None, None, None)
     }
 
     pub fn poll_with_host(
@@ -304,7 +323,36 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         host: &mut dyn InterpreterHost,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, Some(host), None)
+        Self::execute(module, continuation, fuel, costs, Some(host), None, None)
+    }
+
+    pub fn poll_with_heap(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(module, continuation, fuel, costs, None, None, Some(heap))
+    }
+
+    pub fn poll_with_host_and_heap(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        host: &mut dyn InterpreterHost,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            Some(host),
+            None,
+            Some(heap),
+        )
     }
 
     pub fn run(
@@ -326,6 +374,30 @@ impl CheckedInterpreter {
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
             &OpcodeCostTable::default(),
+        )
+    }
+
+    pub fn run_with_heap(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: u64,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        let limits = FrameLimits::default();
+        let continuation = Self::start(
+            module,
+            function,
+            arguments,
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )?;
+        Self::poll_with_heap(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            &OpcodeCostTable::default(),
+            heap,
         )
     }
 
@@ -351,6 +423,7 @@ impl CheckedInterpreter {
             &OpcodeCostTable::default(),
             None,
             Some(migration),
+            None,
         )
     }
 
@@ -449,6 +522,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         mut host: Option<&mut dyn InterpreterHost>,
         mut migration: Option<&mut dyn InterpreterMigration>,
+        mut heap: Option<&mut Heap>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         continuation.suspend_reason = None;
         continuation.cumulative_exhausted = false;
@@ -481,7 +555,12 @@ impl CheckedInterpreter {
                 },
             );
             let settlement = pending_cost.saturating_add(instruction_cost);
-            if frame.pc == 0 || is_safepoint(instruction, frame.pc) {
+            let host_resume = frame.pc > 0
+                && matches!(
+                    function.code.get(frame.pc as usize - 1),
+                    Some(Instruction::HostCall { .. })
+                );
+            if frame.pc == 0 || host_resume || is_safepoint(instruction, frame.pc) {
                 if settlement > fuel.slice_remaining
                     || fuel.cumulative_used.saturating_add(settlement) > fuel.cumulative_limit
                 {
@@ -655,6 +734,7 @@ impl CheckedInterpreter {
                                 request,
                                 destination: dst,
                                 expected_type: metadata.result,
+                                async_result: metadata.async_result,
                                 charge,
                                 fuel,
                             });
@@ -666,6 +746,24 @@ impl CheckedInterpreter {
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
                         .old_get(stable_id, ty)
+                        .map_err(InterpreterError::Migration)?;
+                    if runtime_value_type(value) != Some(ty) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateOldFieldGet {
+                    object,
+                    field_id,
+                    ty,
+                    dst,
+                } => {
+                    let object = register(&continuation.arena, object)?;
+                    let value = migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .old_field_get(object, field_id, ty)
                         .map_err(InterpreterError::Migration)?;
                     if runtime_value_type(value) != Some(ty) {
                         return Err(InterpreterError::TypeMismatch);
@@ -703,12 +801,20 @@ impl CheckedInterpreter {
                         .map_err(InterpreterError::Migration)?;
                     increment_pc(&mut continuation.arena)?;
                 }
-                Instruction::StateHandleRemap { old_id, target } => {
+                Instruction::StateReplace { old_id, target } => {
                     let target = register(&continuation.arena, target)?;
                     migration
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
-                        .remap(old_id, target)
+                        .replace(old_id, target)
+                        .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StatePreserve { stable_id } => {
+                    migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .preserve(stable_id)
                         .map_err(InterpreterError::Migration)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -717,6 +823,66 @@ impl CheckedInterpreter {
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
                         .delete(stable_id)
+                        .map_err(InterpreterError::Migration)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::EnumNew {
+                    type_id,
+                    variant,
+                    payload,
+                    dst,
+                } => {
+                    let variant = module
+                        .module()
+                        .enum_types
+                        .iter()
+                        .find(|enum_type| enum_type.type_id == type_id)
+                        .and_then(|enum_type| {
+                            enum_type
+                                .variants
+                                .iter()
+                                .find(|candidate| candidate.stable_id == variant)
+                        })
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let payload = payload
+                        .map(|payload| register(&continuation.arena, payload))
+                        .transpose()?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?;
+                    let value =
+                        heap.allocate_enum(type_id, variant.stable_id, variant.tag, payload)?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::EnumTag { source, dst } => {
+                    let value = register(&continuation.arena, source)?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?;
+                    let tag = i32::try_from(heap.enum_tag(value)?)
+                        .map_err(|_| InterpreterError::TypeMismatch)?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::I32(tag))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::EnumPayload {
+                    source,
+                    variant,
+                    dst,
+                } => {
+                    let value = register(&continuation.arena, source)?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?;
+                    let payload = heap.enum_payload(value, variant)?;
+                    set_register(&mut continuation.arena, dst, payload)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StateFinish => {
+                    migration
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HostUnavailable)?
+                        .finish_staging()
                         .map_err(InterpreterError::Migration)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -983,8 +1149,14 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::StateOldGet { .. } => 19,
         Instruction::StateNewCreate { .. } => 20,
         Instruction::StateNewSet { .. } => 21,
-        Instruction::StateHandleRemap { .. } => 22,
+        Instruction::StateReplace { .. } => 22,
         Instruction::StateDelete { .. } => 23,
+        Instruction::EnumNew { .. } => 24,
+        Instruction::EnumTag { .. } => 25,
+        Instruction::EnumPayload { .. } => 26,
+        Instruction::StatePreserve { .. } => 27,
+        Instruction::StateFinish => 28,
+        Instruction::StateOldFieldGet { .. } => 29,
     }
 }
 
@@ -993,6 +1165,7 @@ mod tests {
     use nexa_bytecode::{
         FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
     };
+    use nexa_core::StableId;
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{CheckedInterpreter, InterpreterOutcome, SuspendReason};
@@ -1082,5 +1255,56 @@ mod tests {
             } if value == reference
         ));
         assert_eq!(heap.collect(&GcRoots::default()).unwrap().reclaimed, 1);
+    }
+
+    #[test]
+    fn enum_new_tag_and_payload_execute_through_the_gc_heap() {
+        let enum_type = nexa_bytecode::option_type(ValueType::I32);
+        let some = StableId::from_parts(&["Option", "::Some"]);
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32],
+                result: Some(ValueType::I32),
+            },
+            3,
+        );
+        function
+            .emit(Instruction::EnumNew {
+                type_id: enum_type.type_id,
+                variant: some,
+                payload: Some(0),
+                dst: 1,
+            })
+            .emit(Instruction::EnumTag { source: 1, dst: 2 })
+            .emit(Instruction::EnumPayload {
+                source: 1,
+                variant: some,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut function = function.finish().unwrap();
+        function.root_bitmap[1] = true;
+        function.root_maps = vec![
+            nexa_bytecode::RootMap {
+                pc: 0,
+                bitmap: vec![false, false, false],
+            },
+            nexa_bytecode::RootMap {
+                pc: 3,
+                bitmap: vec![false, true, false],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.enum_type(enum_type).function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+        let mut heap = Heap::new(8);
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[RuntimeValue::I32(41)], 32, &mut heap,)
+                .unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(41)),
+                ..
+            }
+        ));
     }
 }

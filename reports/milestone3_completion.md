@@ -27,10 +27,13 @@ State metadata carries stable type/field IDs and explicit schema versions. Schem
 
 ```text
 STATE_OLD_GET
+STATE_OLD_FIELD_GET
 STATE_NEW_CREATE
 STATE_NEW_SET
-STATE_HANDLE_REMAP
+STATE_PRESERVE
+STATE_REPLACE
 STATE_DELETE
+STATE_FINISH
 ```
 
 Verifier effect and call-graph rules reject these capabilities outside Migration code and reject HostCall/Yield/Await inside Migration. Staging validates field types, versions, target existence, module ownership, generations, and recursive GC roots before publication.
@@ -56,7 +59,7 @@ Only pre-publication failures may call rollback and restore old execution. The R
 
 - Exact per-PC RootMaps are independently reconstructed by verifier dataflow.
 - Pre-publication reload rollback restores continuation, fuel, scheduler state, waiting destination/type, request association, and buffered completions.
-- Bytecode v2 uses a checked section directory and bounded decoding for bytes, sections, functions, instructions, registers, RootMaps, loop bounds, imports, state schemas, and exports.
+- Bytecode v3 uses a checked section directory and bounded decoding for bytes, sections, functions, instructions, registers, RootMaps, loop bounds, imports, enums, state schemas, and exports.
 - WCET analysis is memoized, bounded, and includes immediate host costs.
 - Dedicated fuzz harnesses cover bytecode decode, verifier, RootMaps, WCET, host imports, and state schemas.
 - The isolated global allocator observer reports zero allocations for promotion, resume, and trace-off paths across three repetitions.

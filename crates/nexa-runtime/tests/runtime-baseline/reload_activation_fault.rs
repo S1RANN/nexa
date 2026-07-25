@@ -53,7 +53,7 @@ fn reload_activation_fault() {
         ])
     };
     let (host, schema) = super::support::hashes();
-    let mut realm = nexa_runtime::RealmRuntime::new(nexa_runtime::RealmConfig::default());
+    let mut realm = nexa_runtime::RealmRuntime::isolated(nexa_runtime::RealmConfig::default());
     let old = realm.load_module(build(), host, schema).unwrap();
     let (scope, task) = super::support::spawn(&mut realm, old);
     let candidate = realm

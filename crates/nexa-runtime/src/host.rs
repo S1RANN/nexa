@@ -15,7 +15,6 @@ pub enum RuntimeHostDomain {
     Render,
     Audio,
     Io,
-    Custom(u32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -53,11 +52,6 @@ pub enum ReleaseQueueState {
 pub enum ReleaseQueueError {
     Capacity,
     NotReserved,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuntimeHostError {
-    UnknownCustomDomain(u32),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -121,7 +115,7 @@ impl ReleaseNodePool {
 #[derive(Debug)]
 struct ReleaseDomainState {
     pool: ReleaseNodePool,
-    host_lists: [IntrusiveReleaseList; 5],
+    host_lists: [IntrusiveReleaseList; 4],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -141,7 +135,7 @@ impl ReleaseDomain {
         Self {
             inner: Arc::new(Mutex::new(ReleaseDomainState {
                 pool: ReleaseNodePool::new(capacity),
-                host_lists: [IntrusiveReleaseList::default(); 5],
+                host_lists: [IntrusiveReleaseList::default(); 4],
             })),
         }
     }
@@ -185,26 +179,13 @@ impl RuntimeHost {
             RuntimeHostDomain::Render,
             RuntimeHostDomain::Audio,
             RuntimeHostDomain::Io,
-            RuntimeHostDomain::Custom(0),
         ] {
-            records.extend(
-                self.drain(domain, usize::MAX)
-                    .expect("built-in release domain is valid"),
-            );
+            records.extend(self.drain(domain, usize::MAX));
         }
         records
     }
 
-    pub fn drain(
-        &self,
-        domain: RuntimeHostDomain,
-        max_items: usize,
-    ) -> Result<Vec<ReleaseRecord>, RuntimeHostError> {
-        if let RuntimeHostDomain::Custom(id) = domain
-            && id != 0
-        {
-            return Err(RuntimeHostError::UnknownCustomDomain(id));
-        }
+    pub fn drain(&self, domain: RuntimeHostDomain, max_items: usize) -> Vec<ReleaseRecord> {
         let bucket = release_domain_bucket(domain);
         let mut state = self
             .releases
@@ -225,7 +206,7 @@ impl RuntimeHost {
             );
             pool.release(node);
         }
-        Ok(records)
+        records
     }
 
     #[must_use]
@@ -518,7 +499,6 @@ fn release_domain_bucket(domain: RuntimeHostDomain) -> usize {
         RuntimeHostDomain::Render => 1,
         RuntimeHostDomain::Audio => 2,
         RuntimeHostDomain::Io => 3,
-        RuntimeHostDomain::Custom(_) => 4,
     }
 }
 
@@ -693,7 +673,6 @@ pub trait ScriptFunction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostErrorPayload {
     pub code: u32,
-    pub message: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1724,11 +1703,6 @@ impl ResourceContext<'_> {
         &mut self,
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
-        if let RuntimeHostDomain::Custom(id) = domain
-            && id != 0
-        {
-            return Err(HostRequestError::UnknownCustomDomain(id));
-        }
         let token = self.resources.tokens.create(
             self.task,
             self.module_id,
@@ -1796,7 +1770,7 @@ mod tests {
     use super::{
         HostErrorPayload, HostPayload, HostRequestError, HostRequestManager, ReleaseKind,
         ReleaseQueue, ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostDomain,
-        RuntimeHostError, SnapshotManager,
+        SnapshotManager,
     };
     use crate::{RuntimeLimits, TaskRuntime};
 
@@ -1884,13 +1858,7 @@ mod tests {
         );
         assert_eq!(releases.drain().count(), COUNT as usize);
         let mut pending = requests.create_for_module(3, 9, &mut releases).unwrap();
-        pending
-            .ticket
-            .fail(HostErrorPayload {
-                code: 7,
-                message: None,
-            })
-            .unwrap();
+        pending.ticket.fail(HostErrorPayload { code: 7 }).unwrap();
         assert_eq!(
             pending.ticket.cancelled(),
             Err(HostRequestError::AlreadyCompleted)
@@ -1917,13 +1885,7 @@ mod tests {
         assert_eq!(requests.completion_counts(), (5, 0));
 
         success.ticket.complete(HostPayload::I32(1)).unwrap();
-        failure
-            .ticket
-            .fail(HostErrorPayload {
-                code: 42,
-                message: Some("failure".into()),
-            })
-            .unwrap();
+        failure.ticket.fail(HostErrorPayload { code: 42 }).unwrap();
         cancelled.ticket.cancelled().unwrap();
         abandoned.ticket.abandon().unwrap();
         drop(dropped);
@@ -1981,12 +1943,8 @@ mod tests {
         }
         assert_eq!(releases.transfer_to_host(), 3);
         assert_eq!(host.pending_releases(), 3);
-        assert_eq!(host.drain(RuntimeHostDomain::Render, 1).unwrap().len(), 1);
+        assert_eq!(host.drain(RuntimeHostDomain::Render, 1).len(), 1);
         assert_eq!(host.pending_releases(), 2);
-        assert_eq!(
-            host.drain(RuntimeHostDomain::Custom(7), 1),
-            Err(RuntimeHostError::UnknownCustomDomain(7))
-        );
         assert_eq!(host.drain_releases().len(), 2);
         assert_eq!(host.pending_releases(), 0);
         assert!(releases.reserve(3, 6).is_ok());

@@ -53,6 +53,9 @@ pub enum VerifyErrorKind {
     InvalidEffect,
     ImmediateRecursion,
     WcetComplexityLimit,
+    InvalidEnumMetadata,
+    EnumTypeOutOfRange(u64),
+    EnumVariantOutOfRange(u64),
 }
 
 impl fmt::Display for VerifyError {
@@ -75,9 +78,62 @@ impl VerifiedModule {
     pub const fn module(&self) -> &Module {
         &self.0
     }
+
+    #[must_use]
+    pub fn into_module(self) -> Module {
+        self.0
+    }
 }
 
 pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
+    let mut enum_ids = BTreeSet::new();
+    for enum_type in &module.enum_types {
+        let mut variant_ids = BTreeSet::new();
+        let mut tags = BTreeSet::new();
+        if !enum_ids.insert(enum_type.type_id)
+            || enum_type.variants.is_empty()
+            || enum_type
+                .variants
+                .iter()
+                .any(|variant| !variant_ids.insert(variant.stable_id) || !tags.insert(variant.tag))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidEnumMetadata,
+            });
+        }
+    }
+    for import in &module.host_imports {
+        let valid = match (import.mode, import.async_result) {
+            (HostCallMode::Immediate, None) => true,
+            (HostCallMode::Async, Some(async_result)) => {
+                import.result == Some(ValueType::Named(async_result.result_type))
+                    && matches!(
+                        (async_result.cancel_policy, async_result.cancel_error),
+                        (nexa_bytecode::CancelPolicy::ReturnError, Some(_))
+                            | (nexa_bytecode::CancelPolicy::CancelTask, None)
+                    )
+                    && matches!(
+                        (async_result.abandon_policy, async_result.abandon_error),
+                        (nexa_bytecode::AbandonPolicy::ReturnError, Some(_))
+                            | (nexa_bytecode::AbandonPolicy::Trap, None)
+                    )
+                    && module.enum_types.iter().any(|enum_type| {
+                        enum_type
+                            == &nexa_bytecode::result_type(async_result.success, async_result.error)
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidEnumMetadata,
+            });
+        }
+    }
     let mut export_ids = BTreeSet::new();
     for export in &module.exports {
         if !export_ids.insert(export.stable_id) {
@@ -285,6 +341,16 @@ fn verify_function(
                 }
                 state[register(dst)?] = Some(ty);
             }
+            Instruction::StateOldFieldGet {
+                object, ty, dst, ..
+            } => {
+                if function.effect != FunctionEffect::Migration
+                    || !matches!(state[register(object)?], Some(ValueType::Named(_)))
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                state[register(dst)?] = Some(ty);
+            }
             Instruction::StateNewCreate { type_id, dst, .. } => {
                 if function.effect != FunctionEffect::Migration
                     || !module
@@ -323,7 +389,7 @@ fn verify_function(
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
                 require(&state, source, field.ty)?;
             }
-            Instruction::StateHandleRemap { target, .. } => {
+            Instruction::StateReplace { target, .. } => {
                 if function.effect != FunctionEffect::Migration {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
@@ -332,10 +398,83 @@ fn verify_function(
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
             }
-            Instruction::StateDelete { .. } => {
+            Instruction::StateDelete { .. }
+            | Instruction::StatePreserve { .. }
+            | Instruction::StateFinish => {
                 if function.effect != FunctionEffect::Migration {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
+            }
+            Instruction::EnumNew {
+                type_id,
+                variant,
+                payload,
+                dst,
+            } => {
+                let enum_type = module
+                    .enum_types
+                    .iter()
+                    .find(|enum_type| enum_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumTypeOutOfRange(type_id.0))
+                    })?;
+                let variant = enum_type
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.stable_id == variant)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
+                    })?;
+                match (variant.payload_type, payload) {
+                    (Some(expected), Some(payload)) => {
+                        require(&state, payload, expected)?;
+                    }
+                    (None, None) => {}
+                    _ => return Err(error(Some(pc), VerifyErrorKind::TypeMismatch)),
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::EnumTag { source, dst } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                if !module
+                    .enum_types
+                    .iter()
+                    .any(|enum_type| enum_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::EnumTypeOutOfRange(type_id.0),
+                    ));
+                }
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::EnumPayload {
+                source,
+                variant,
+                dst,
+            } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let payload_type = module
+                    .enum_types
+                    .iter()
+                    .find(|enum_type| enum_type.type_id == type_id)
+                    .and_then(|enum_type| {
+                        enum_type
+                            .variants
+                            .iter()
+                            .find(|candidate| candidate.stable_id == variant)
+                    })
+                    .and_then(|variant| variant.payload_type)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
+                    })?;
+                state[register(dst)?] = Some(payload_type);
             }
             Instruction::Return { source } => {
                 let result = function
@@ -505,6 +644,7 @@ fn verify_safepoints(
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
         let required = pc == 0
+            || (pc > 0 && matches!(function.code[pc - 1], Instruction::HostCall { .. }))
             || matches!(
                 instruction,
                 Instruction::Safepoint

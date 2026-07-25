@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use nexa_bytecode::{
-    Function, FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder,
-    RootMap, ScriptExport, Signature, StateField, StateSchema, StateType, ValueType,
+    AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, Function, FunctionEffect,
+    HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap, ScriptExport, Signature,
+    StateField, StateSchema, StateType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -212,6 +213,7 @@ pub struct HirModule {
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
     state_schema: StateSchema,
+    enum_types: Vec<EnumType>,
 }
 
 #[derive(Clone, Debug)]
@@ -724,6 +726,36 @@ fn resolve_and_typecheck_with_hosts(
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
 ) -> Result<HirModule, CompileError> {
+    let mut enum_types = ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Enum)
+        .map(|declaration| EnumType {
+            type_id: StableId::from_name(&declaration.name),
+            variants: declaration
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(tag, variant)| EnumVariant {
+                    stable_id: StableId::from_parts(&[&declaration.name, "::", variant]),
+                    tag: u32::try_from(tag).expect("enum variant count is parser bounded"),
+                    payload_type: None,
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    for async_result in host_functions
+        .values()
+        .filter_map(|function| function.metadata.async_result)
+    {
+        let enum_type = nexa_bytecode::result_type(async_result.success, async_result.error);
+        if !enum_types
+            .iter()
+            .any(|candidate| candidate.type_id == enum_type.type_id)
+        {
+            enum_types.push(enum_type);
+        }
+    }
     let state_schema = StateSchema {
         types: ast
             .types
@@ -848,6 +880,7 @@ fn resolve_and_typecheck_with_hosts(
         host_interface_hash,
         schema_hash,
         state_schema,
+        enum_types,
     })
 }
 
@@ -1217,6 +1250,9 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
         module.metadata(host, schema);
     }
     module.state_schema(hir.state_schema.clone());
+    for enum_type in &hir.enum_types {
+        module.enum_type(enum_type.clone());
+    }
     for function in &hir.functions {
         let mut code = Vec::new();
         let temporary =
@@ -1342,11 +1378,16 @@ fn exact_root_maps(
                     .find(|function| function.import == import)
                     .and_then(|function| function.metadata.result);
             }
-            Instruction::StateOldGet { ty, dst, .. } => {
+            Instruction::StateOldGet { ty, dst, .. }
+            | Instruction::StateOldFieldGet { ty, dst, .. } => {
                 state[usize::from(dst)] = Some(ty);
             }
-            Instruction::StateNewCreate { type_id, dst, .. } => {
+            Instruction::StateNewCreate { type_id, dst, .. }
+            | Instruction::EnumNew { type_id, dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
+            }
+            Instruction::EnumTag { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::I32);
             }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
@@ -1357,8 +1398,11 @@ fn exact_root_maps(
             }
             Instruction::DeferPush { .. }
             | Instruction::StateNewSet { .. }
-            | Instruction::StateHandleRemap { .. }
+            | Instruction::StateReplace { .. }
             | Instruction::StateDelete { .. }
+            | Instruction::StatePreserve { .. }
+            | Instruction::StateFinish
+            | Instruction::EnumPayload { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -1675,7 +1719,8 @@ fn emit_expression(
 }
 
 fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
-    code.iter()
+    let mut safepoints = code
+        .iter()
         .enumerate()
         .filter_map(|(pc, instruction)| {
             let pc = u32::try_from(pc).ok()?;
@@ -1697,7 +1742,15 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                 );
             (pc == 0 || explicit || back_edge).then_some(pc)
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for (pc, instruction) in code.iter().enumerate() {
+        if matches!(instruction, Instruction::HostCall { .. }) && pc + 1 < code.len() {
+            safepoints.push(u32::try_from(pc + 1).expect("instruction index is bounded"));
+        }
+    }
+    safepoints.sort_unstable();
+    safepoints.dedup();
+    safepoints
 }
 
 pub fn compile(source: &str) -> Result<VerifiedModule, CompileError> {
@@ -1712,6 +1765,7 @@ pub fn compile_with_metadata(
     compile_module(source, Some((host_hash, schema_hash)))
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn compile_with_interface(
     source: &str,
     interface: &Idl,
@@ -1731,7 +1785,73 @@ pub fn compile_with_interface(
             .iter()
             .map(|parameter| lower_idl_type(&parameter.ty))
             .collect::<Vec<_>>();
-        let result = Some(lower_idl_type(&function.result));
+        let (result, async_result) = if function.synchronous {
+            (Some(lower_idl_type(&function.result)), None)
+        } else {
+            let (success, error) = match &function.result {
+                TypeRef::HostRequest(Some(result)) => match result.as_ref() {
+                    TypeRef::Result(success, error) => {
+                        (lower_idl_type(success), lower_idl_type(error))
+                    }
+                    _ => return Err(CompileError::TypeMismatch),
+                },
+                _ => return Err(CompileError::TypeMismatch),
+            };
+            let result_type = nexa_bytecode::result_type(success, error).type_id;
+            let policy_error = |ty: &TypeRef, variant: &str, fallback: u32| match ty {
+                TypeRef::I32 => Some(fallback),
+                TypeRef::Named(name) => interface
+                    .enums
+                    .iter()
+                    .find(|enumeration| enumeration.name == *name)
+                    .and_then(|enumeration| {
+                        enumeration
+                            .variants
+                            .iter()
+                            .position(|candidate| candidate == variant)
+                    })
+                    .and_then(|tag| u32::try_from(tag).ok()),
+                _ => None,
+            };
+            let TypeRef::HostRequest(Some(request_result)) = &function.result else {
+                unreachable!("typed request shape checked above");
+            };
+            let TypeRef::Result(_, error_ref) = request_result.as_ref() else {
+                unreachable!("typed request shape checked above");
+            };
+            let cancel_error = match function.cancel_policy {
+                nexa_idl::CancelPolicy::ReturnError => Some(
+                    policy_error(error_ref, "Cancelled", u32::MAX - 1)
+                        .ok_or(CompileError::TypeMismatch)?,
+                ),
+                nexa_idl::CancelPolicy::CancelTask => None,
+            };
+            let abandon_error = match function.abandon_policy {
+                nexa_idl::AbandonPolicy::ReturnError => Some(
+                    policy_error(error_ref, "Abandoned", u32::MAX)
+                        .ok_or(CompileError::TypeMismatch)?,
+                ),
+                nexa_idl::AbandonPolicy::Trap => None,
+            };
+            (
+                Some(ValueType::Named(result_type)),
+                Some(AsyncResultType {
+                    result_type,
+                    success,
+                    error,
+                    cancel_policy: match function.cancel_policy {
+                        nexa_idl::CancelPolicy::ReturnError => CancelPolicy::ReturnError,
+                        nexa_idl::CancelPolicy::CancelTask => CancelPolicy::CancelTask,
+                    },
+                    abandon_policy: match function.abandon_policy {
+                        nexa_idl::AbandonPolicy::ReturnError => AbandonPolicy::ReturnError,
+                        nexa_idl::AbandonPolicy::Trap => AbandonPolicy::Trap,
+                    },
+                    cancel_error,
+                    abandon_error,
+                }),
+            )
+        };
         let metadata = HostImport {
             stable_id: StableId::from_parts(&[&interface.interface, "::", &function.name]),
             parameters: parameters.clone(),
@@ -1742,6 +1862,7 @@ pub fn compile_with_interface(
                 HostCallMode::Async
             },
             fuel_cost: 1,
+            async_result,
         };
         host_functions.insert(
             format!("{import}.{}", function.name),
@@ -1756,6 +1877,21 @@ pub fn compile_with_interface(
     let hir =
         resolve_and_typecheck_with_hosts(ast, host_functions, Some(host_hash), Some(schema_hash))?;
     let mut module = emit_bytecode(&hir)?;
+    for enumeration in &interface.enums {
+        module.enum_types.push(EnumType {
+            type_id: StableId::from_name(&enumeration.name),
+            variants: enumeration
+                .variants
+                .iter()
+                .enumerate()
+                .map(|(tag, variant)| EnumVariant {
+                    stable_id: StableId::from_parts(&[&enumeration.name, "::", variant]),
+                    tag: u32::try_from(tag).expect("IDL enum variant count is bounded"),
+                    payload_type: None,
+                })
+                .collect(),
+        });
+    }
     for export in &interface.exports {
         let (function, hir_function) = hir
             .functions
@@ -1791,6 +1927,12 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
         TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
         TypeRef::Snapshot(_) => ValueType::Named(StableId::from_name("Snapshot")),
+        TypeRef::Option(inner) => {
+            ValueType::Named(nexa_bytecode::option_type(lower_idl_type(inner)).type_id)
+        }
+        TypeRef::Result(success, error) => ValueType::Named(
+            nexa_bytecode::result_type(lower_idl_type(success), lower_idl_type(error)).type_id,
+        ),
         TypeRef::F32 => ValueType::Named(StableId::from_name("f32")),
         TypeRef::String => ValueType::Named(StableId::from_name("string")),
         TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
@@ -1914,15 +2056,18 @@ mod tests {
     fn qualified_host_import_emits_typed_host_call_without_synthetic_yield() {
         let idl = nexa_idl::parse(
             "interface Engine {
-                request fn animation(entity: i32) -> host_request;
+                enum AnimationError { MissingClip, Interrupted, Cancelled }
+                request(return_error, trap) fn animation(entity: i32)
+                    -> request<Result<i32, AnimationError>>;
             }",
         )
         .unwrap();
         let module = super::compile_with_interface(
             "module game.combat;
              import engine;
-             task fn update(entity: i32) -> HostRequest {
-                 return await engine.animation(entity);
+             task fn update(entity: i32) -> i32 {
+                 await engine.animation(entity);
+                 return entity;
              }",
             &idl,
             StableId::from_name("schema"),

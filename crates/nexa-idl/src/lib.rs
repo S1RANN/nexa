@@ -10,8 +10,15 @@ pub struct Idl {
     pub interface: String,
     pub opaque_handles: Vec<String>,
     pub structs: Vec<Struct>,
+    pub enums: Vec<Enum>,
     pub functions: Vec<HostFunction>,
     pub exports: Vec<Export>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Enum {
+    pub name: String,
+    pub variants: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,6 +39,20 @@ pub struct HostFunction {
     pub parameters: Vec<Field>,
     pub result: TypeRef,
     pub synchronous: bool,
+    pub cancel_policy: CancelPolicy,
+    pub abandon_policy: AbandonPolicy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelPolicy {
+    ReturnError,
+    CancelTask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbandonPolicy {
+    ReturnError,
+    Trap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,6 +71,8 @@ pub enum TypeRef {
     HostRequest(Option<Box<TypeRef>>),
     ResourceToken(Option<Box<TypeRef>>),
     Snapshot(Option<Box<TypeRef>>),
+    Option(Box<TypeRef>),
+    Result(Box<TypeRef>, Box<TypeRef>),
     Named(String),
 }
 
@@ -99,16 +122,31 @@ pub fn canonical(idl: &Idl) -> String {
         }
         output.push('}');
     }
+    for enumeration in &idl.enums {
+        write!(output, "enum:{}{{", enumeration.name).expect("String writes do not fail");
+        for variant in &enumeration.variants {
+            write!(output, "{variant};").expect("String writes do not fail");
+        }
+        output.push('}');
+    }
     for function in &idl.functions {
         write!(
             output,
-            "fn:{}:{}(",
+            "fn:{}:{}:{}:{}(",
             if function.synchronous {
                 "sync"
             } else {
                 "request"
             },
-            function.name
+            function.name,
+            match function.cancel_policy {
+                CancelPolicy::ReturnError => "return_error",
+                CancelPolicy::CancelTask => "cancel_task",
+            },
+            match function.abandon_policy {
+                AbandonPolicy::ReturnError => "return_error",
+                AbandonPolicy::Trap => "trap",
+            },
         )
         .expect("String writes do not fail");
         for parameter in &function.parameters {
@@ -145,6 +183,18 @@ pub fn generate_rust(idl: &Idl) -> String {
             "#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)] pub struct {handle}(pub u64);"
         )
         .expect("String writes do not fail");
+    }
+    for enumeration in &idl.enums {
+        writeln!(
+            output,
+            "#[repr(u32)]\n#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum {} {{",
+            enumeration.name
+        )
+        .expect("String writes do not fail");
+        for (tag, variant) in enumeration.variants.iter().enumerate() {
+            writeln!(output, "    {variant} = {tag},").expect("String writes do not fail");
+        }
+        output.push_str("}\n");
     }
     for structure in &idl.structs {
         writeln!(
@@ -186,6 +236,30 @@ pub fn generate_rust(idl: &Idl) -> String {
             function.name.to_ascii_uppercase()
         )
         .expect("String writes do not fail");
+        if !function.synchronous {
+            let TypeRef::HostRequest(Some(result)) = &function.result else {
+                continue;
+            };
+            let TypeRef::Result(success, error) = result.as_ref() else {
+                continue;
+            };
+            let ticket = format!("{}CompletionTicket", pascal_case(&function.name));
+            let success_payload = encode_completion_payload(idl, success, "value");
+            let error_code = encode_completion_error(idl, error, "error");
+            writeln!(
+                output,
+                "pub struct {ticket}(pub nexa_runtime::HostCompletionTicket);\n\
+                 impl {ticket} {{\n\
+                 pub fn complete(&mut self, result: Result<{success}, {error}>) \
+                 -> Result<(), nexa_runtime::HostRequestError> {{\n\
+                 match result {{ Ok(value) => self.0.complete({success_payload}), \
+                 Err(error) => self.0.fail(nexa_runtime::HostErrorPayload {{ code: {error_code} }}) }}\
+                 \n}}\n}}",
+                success = rust_type(success),
+                error = rust_type(error),
+            )
+            .expect("String writes do not fail");
+        }
     }
     writeln!(
         output,
@@ -271,10 +345,7 @@ pub fn generate_rust(idl: &Idl) -> String {
                 .join(", ");
             format!("pub struct {}Args {{ {fields} }}", export.name)
         };
-        let output_type = export
-            .result
-            .as_ref()
-            .map_or("()".to_owned(), |ty| rust_type(ty).to_owned());
+        let output_type = export.result.as_ref().map_or("()".to_owned(), rust_type);
         writeln!(
             output,
             "{args}\n\
@@ -291,6 +362,47 @@ pub fn generate_rust(idl: &Idl) -> String {
     output
 }
 
+fn pascal_case(name: &str) -> String {
+    name.split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            characters.next().map_or_else(String::new, |first| {
+                first.to_uppercase().collect::<String>() + characters.as_str()
+            })
+        })
+        .collect()
+}
+
+fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("nexa_runtime::HostPayload::I32({source})"),
+        TypeRef::Bool => format!("nexa_runtime::HostPayload::Bool({source})"),
+        TypeRef::ResourceToken(_) => format!("nexa_runtime::HostPayload::Token({source})"),
+        TypeRef::Snapshot(_) => format!("nexa_runtime::HostPayload::Snapshot({source})"),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
+            format!("nexa_runtime::HostPayload::Opaque({source}.0)")
+        }
+        TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
+            format!("nexa_runtime::HostPayload::Opaque({source} as u64)")
+        }
+        _ => "nexa_runtime::HostPayload::Unit".into(),
+    }
+}
+
+fn encode_completion_error(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("u32::from_ne_bytes({source}.to_ne_bytes())"),
+        TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
+            format!("{source} as u32")
+        }
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
+            format!("{source}.0 as u32")
+        }
+        _ => "u32::MAX".into(),
+    }
+}
+
 fn decode_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> String {
     decode_value(idl, ty, &format!("args.get({index})?"))
 }
@@ -304,6 +416,21 @@ fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
         TypeRef::ResourceToken(_) => decode_match(source, "Token", "*value"),
         TypeRef::Snapshot(_) => decode_match(source, "Snapshot", "*value"),
+        TypeRef::Option(inner) => format!(
+            "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == 1 => \
+             Some({}), nexa_runtime::HostValue::Struct(values) if values.is_empty() => None, \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            decode_value(idl, inner, "&values[0]")
+        ),
+        TypeRef::Result(success, error) => format!(
+            "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == 2 => \
+             match &values[0] {{ nexa_runtime::HostValue::Bool(true) => Ok({}), \
+             nexa_runtime::HostValue::Bool(false) => Err({}), \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}, \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            decode_value(idl, success, "&values[1]"),
+            decode_value(idl, error, "&values[1]")
+        ),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
             "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
              _ => return Err(nexa_runtime::HostTrap::Type) }}"
@@ -363,6 +490,18 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::HostRequest(_) => format!("nexa_runtime::HostValue::Request({source})"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostValue::Token({source})"),
         TypeRef::Snapshot(_) => format!("nexa_runtime::HostValue::Snapshot({source})"),
+        TypeRef::Option(inner) => format!(
+            "match {source} {{ Some(value) => nexa_runtime::HostValue::Struct(vec![{}]), \
+             None => nexa_runtime::HostValue::Struct(vec![]) }}",
+            encode_value(idl, inner, "value")
+        ),
+        TypeRef::Result(success, error) => format!(
+            "match {source} {{ Ok(value) => nexa_runtime::HostValue::Struct(vec![\
+             nexa_runtime::HostValue::Bool(true), {}]), Err(error) => \
+             nexa_runtime::HostValue::Struct(vec![nexa_runtime::HostValue::Bool(false), {}]) }}",
+            encode_value(idl, success, "value"),
+            encode_value(idl, error, "error")
+        ),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("nexa_runtime::HostValue::Opaque({source}.0)")
         }
@@ -392,6 +531,10 @@ fn type_name(ty: &TypeRef) -> String {
         TypeRef::HostRequest(inner) => parameterized_type_name("request", inner.as_deref()),
         TypeRef::ResourceToken(inner) => parameterized_type_name("token", inner.as_deref()),
         TypeRef::Snapshot(inner) => parameterized_type_name("snapshot", inner.as_deref()),
+        TypeRef::Option(inner) => format!("Option<{}>", type_name(inner)),
+        TypeRef::Result(success, error) => {
+            format!("Result<{},{}>", type_name(success), type_name(error))
+        }
         TypeRef::Named(name) => name.clone(),
     }
 }
@@ -403,16 +546,20 @@ fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
     )
 }
 
-fn rust_type(ty: &TypeRef) -> &str {
+fn rust_type(ty: &TypeRef) -> String {
     match ty {
-        TypeRef::I32 => "i32",
-        TypeRef::F32 => "f32",
-        TypeRef::Bool => "bool",
-        TypeRef::String => "String",
-        TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle",
-        TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle",
-        TypeRef::Snapshot(_) => "nexa_runtime::SnapshotHandle",
-        TypeRef::Named(name) => name,
+        TypeRef::I32 => "i32".into(),
+        TypeRef::F32 => "f32".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::String => "String".into(),
+        TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle".into(),
+        TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle".into(),
+        TypeRef::Snapshot(_) => "nexa_runtime::SnapshotHandle".into(),
+        TypeRef::Option(inner) => format!("Option<{}>", rust_type(inner)),
+        TypeRef::Result(success, error) => {
+            format!("Result<{}, {}>", rust_type(success), rust_type(error))
+        }
+        TypeRef::Named(name) => name.clone(),
     }
 }
 
@@ -442,6 +589,7 @@ struct Parser {
 }
 
 impl Parser {
+    #[allow(clippy::too_many_lines)]
     fn parse(&mut self) -> Result<Idl, IdlError> {
         self.expect("interface")?;
         let interface = self.word()?;
@@ -450,6 +598,7 @@ impl Parser {
             interface,
             opaque_handles: Vec::new(),
             structs: Vec::new(),
+            enums: Vec::new(),
             functions: Vec::new(),
             exports: Vec::new(),
         };
@@ -475,8 +624,51 @@ impl Parser {
                     }
                     idl.structs.push(Struct { name, fields });
                 }
+                Some("enum") => {
+                    self.cursor += 1;
+                    let name = self.word()?;
+                    self.expect("{")?;
+                    let mut variants = Vec::new();
+                    while !self.take("}") {
+                        let variant = self.word()?;
+                        if variants.contains(&variant) {
+                            return Err(IdlError::Duplicate(format!("{name}::{variant}")));
+                        }
+                        variants.push(variant);
+                        self.take(",");
+                    }
+                    if idl.enums.iter().any(|item| item.name == name) {
+                        return Err(IdlError::Duplicate(name));
+                    }
+                    idl.enums.push(Enum { name, variants });
+                }
                 Some("sync" | "request") => {
                     let synchronous = self.word()? == "sync";
+                    let (cancel_policy, abandon_policy) = if !synchronous && self.take("(") {
+                        let cancel_policy = match self.word()?.as_str() {
+                            "return_error" => CancelPolicy::ReturnError,
+                            "cancel_task" => CancelPolicy::CancelTask,
+                            value => {
+                                return Err(IdlError::Syntax(format!(
+                                    "unknown cancel policy {value}"
+                                )));
+                            }
+                        };
+                        self.expect(",")?;
+                        let abandon_policy = match self.word()?.as_str() {
+                            "return_error" => AbandonPolicy::ReturnError,
+                            "trap" => AbandonPolicy::Trap,
+                            value => {
+                                return Err(IdlError::Syntax(format!(
+                                    "unknown abandon policy {value}"
+                                )));
+                            }
+                        };
+                        self.expect(")")?;
+                        (cancel_policy, abandon_policy)
+                    } else {
+                        (CancelPolicy::ReturnError, AbandonPolicy::Trap)
+                    };
                     self.expect("fn")?;
                     let name = self.word()?;
                     self.expect("(")?;
@@ -501,6 +693,8 @@ impl Parser {
                         parameters,
                         result,
                         synchronous,
+                        cancel_policy,
+                        abandon_policy,
                     });
                 }
                 Some("export") => {
@@ -551,24 +745,41 @@ impl Parser {
 
     fn ty(&mut self) -> Result<TypeRef, IdlError> {
         let name = self.word()?;
-        let inner = if self.take("<") {
-            let inner = self.ty()?;
-            self.expect(">")?;
-            Some(Box::new(inner))
-        } else {
-            None
-        };
         Ok(match name.as_str() {
             "i32" => TypeRef::I32,
             "f32" => TypeRef::F32,
             "bool" => TypeRef::Bool,
             "string" => TypeRef::String,
-            "host_request" | "request" => TypeRef::HostRequest(inner),
-            "resource_token" | "token" => TypeRef::ResourceToken(inner),
-            "snapshot" => TypeRef::Snapshot(inner),
-            named if inner.is_none() => TypeRef::Named(named.to_owned()),
+            "host_request" | "request" => TypeRef::HostRequest(self.optional_type_argument()?),
+            "resource_token" | "token" => TypeRef::ResourceToken(self.optional_type_argument()?),
+            "snapshot" => TypeRef::Snapshot(self.optional_type_argument()?),
+            "Option" => {
+                self.expect("<")?;
+                let inner = self.ty()?;
+                self.expect(">")?;
+                TypeRef::Option(Box::new(inner))
+            }
+            "Result" => {
+                self.expect("<")?;
+                let success = self.ty()?;
+                self.expect(",")?;
+                let error = self.ty()?;
+                self.expect(">")?;
+                TypeRef::Result(Box::new(success), Box::new(error))
+            }
+            named if self.peek() != Some("<") => TypeRef::Named(named.to_owned()),
             named => return Err(IdlError::UnknownType(named.to_owned())),
         })
+    }
+
+    fn optional_type_argument(&mut self) -> Result<Option<Box<TypeRef>>, IdlError> {
+        if self.take("<") {
+            let inner = self.ty()?;
+            self.expect(">")?;
+            Ok(Some(Box::new(inner)))
+        } else {
+            Ok(None)
+        }
     }
 
     fn peek(&self) -> Option<&str> {
@@ -619,6 +830,7 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
     let known = |name: &str| {
         idl.opaque_handles.iter().any(|item| item == name)
             || idl.structs.iter().any(|item| item.name == name)
+            || idl.enums.iter().any(|item| item.name == name)
     };
     for ty in idl
         .structs
@@ -641,6 +853,18 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
     {
         validate_type_ref(ty, &known)?;
     }
+    if idl.functions.iter().any(|function| {
+        !function.synchronous
+            && !matches!(
+                function.result,
+                TypeRef::HostRequest(Some(ref inner))
+                    if matches!(inner.as_ref(), TypeRef::Result(_, _))
+            )
+    }) {
+        return Err(IdlError::Syntax(
+            "request functions must return request<Result<Success, Error>>".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -649,7 +873,12 @@ fn validate_type_ref(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), 
         TypeRef::Named(name) if !known(name) => Err(IdlError::UnknownType(name.clone())),
         TypeRef::HostRequest(Some(inner))
         | TypeRef::ResourceToken(Some(inner))
-        | TypeRef::Snapshot(Some(inner)) => validate_type_ref(inner, known),
+        | TypeRef::Snapshot(Some(inner))
+        | TypeRef::Option(inner) => validate_type_ref(inner, known),
+        TypeRef::Result(success, error) => {
+            validate_type_ref(success, known)?;
+            validate_type_ref(error, known)
+        }
         _ => Ok(()),
     }
 }
@@ -687,6 +916,32 @@ mod tests {
         assert!(generated.contains("entity_position"));
         assert!(generated.contains("THUNK_ENTITY_POSITION"));
         assert!(generated.contains("pub enum Update"));
+    }
+
+    #[test]
+    fn typed_request_hashes_policies_and_generates_completion_wrapper() {
+        let typed = parse(
+            "interface Engine {
+                enum LoadError { Missing, Cancelled }
+                request(return_error, trap) fn load()
+                    -> request<Result<i32, LoadError>>;
+            }",
+        )
+        .unwrap();
+        let generated = generate_rust(&typed);
+        assert!(generated.contains("pub enum LoadError"));
+        assert!(generated.contains("pub struct LoadCompletionTicket"));
+        assert!(generated.contains("Result<i32, LoadError>"));
+
+        let cancel_task = parse(
+            "interface Engine {
+                enum LoadError { Missing, Cancelled }
+                request(cancel_task, trap) fn load()
+                    -> request<Result<i32, LoadError>>;
+            }",
+        )
+        .unwrap();
+        assert_ne!(exact_hash(&typed), exact_hash(&cancel_task));
     }
 
     #[test]

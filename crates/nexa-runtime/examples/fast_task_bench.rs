@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
-    FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
+    FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap,
     Signature, ValueType,
 };
 use nexa_core::StableId;
 use nexa_runtime::{
     ActivationEntry, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, HostValue,
-    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHostDomain,
-    RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost,
+    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -110,7 +110,7 @@ fn main() {
         black_box(realm.poll_task(task, 64).unwrap());
     }));
 
-    let (mut realm, module, scope) = loaded(yielded.clone());
+    let (mut realm, module, scope) = loaded_hosted(yielded.clone());
     let task = call(&mut realm, module, scope, 1);
     let mut registry = AddRegistry;
     results.push(bench("generated_rust_thunk_direct_call", samples, || {
@@ -128,8 +128,12 @@ fn main() {
     }));
 
     let host_module = host_call_module();
-    let mut host_realm =
-        RealmRuntime::with_host_registry(RealmConfig::default(), Box::new(AddRegistry));
+    let mut host_realm = RealmRuntime::hosted(
+        RealmConfig::default(),
+        RuntimeHost::new(1_024),
+        Box::new(AddRegistry),
+    )
+    .unwrap();
     let host_module = host_realm.load_module(host_module, HOST, SCHEMA).unwrap();
     let host_scope = host_realm.create_scope(None).unwrap();
     results.push(bench("nexa_host_call_opcode_immediate", samples, || {
@@ -154,12 +158,14 @@ fn main() {
     let async_module = async_host_call_module();
     results.push(bench("nexa_host_call_opcode_async", host_samples, || {
         let pending = Arc::new(Mutex::new(None));
-        let mut realm = RealmRuntime::with_host_registry(
+        let mut realm = RealmRuntime::hosted(
             RealmConfig::default(),
+            RuntimeHost::new(1_024),
             Box::new(AsyncRegistry {
                 pending: Arc::clone(&pending),
             }),
-        );
+        )
+        .unwrap();
         let module = realm
             .load_module(async_module.clone(), HOST, SCHEMA)
             .unwrap();
@@ -180,7 +186,7 @@ fn main() {
     }));
 
     results.push(bench("nexa_resource_token", host_samples, || {
-        let (mut realm, module, scope) = loaded(fast.clone());
+        let (mut realm, module, scope) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
         black_box(
             realm
@@ -191,7 +197,7 @@ fn main() {
     }));
 
     results.push(bench("nexa_snapshot_read", host_samples, || {
-        let (mut realm, module, scope) = loaded(fast.clone());
+        let (mut realm, module, scope) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
         let snapshot = realm.create_snapshot(task, [1, 2, 3].into()).unwrap();
         black_box(realm.snapshot_data(snapshot).unwrap());
@@ -291,6 +297,7 @@ fn host_call_module() -> VerifiedModule {
         result: Some(ValueType::I32),
         mode: HostCallMode::Immediate,
         fuel_cost: 1,
+        async_result: None,
     });
     module.function(function.finish().unwrap());
     verify(module.finish(), VerifierLimits::default()).unwrap()
@@ -302,7 +309,7 @@ fn async_host_call_module() -> VerifiedModule {
             parameters: vec![ValueType::I32],
             result: Some(ValueType::I32),
         },
-        2,
+        3,
     );
     function
         .effect(FunctionEffect::Task)
@@ -312,17 +319,51 @@ fn async_host_call_module() -> VerifiedModule {
             args_count: 1,
             dst: 1,
         })
-        .emit(Instruction::Return { source: 1 });
+        .emit(Instruction::EnumPayload {
+            source: 1,
+            variant: StableId::from_parts(&["Result", "::Ok"]),
+            dst: 2,
+        })
+        .emit(Instruction::Return { source: 2 });
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, SCHEMA);
+    let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+    let async_result = nexa_bytecode::AsyncResultType {
+        result_type: async_enum.type_id,
+        success: ValueType::I32,
+        error: ValueType::I32,
+        cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+        cancel_error: Some(u32::MAX - 1),
+        abandon_error: None,
+    };
+    module.enum_type(async_enum);
     module.host_import(HostImport {
         stable_id: StableId::from_name("BenchHost::async"),
         parameters: vec![ValueType::I32],
-        result: Some(ValueType::I32),
+        result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
         fuel_cost: 1,
+        async_result: Some(async_result),
     });
-    module.function(function.finish().unwrap());
+    let mut function = function.finish().unwrap();
+    function.root_bitmap[1] = true;
+    function.safepoints = vec![0, 1, 2];
+    function.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: vec![false, false, false],
+        },
+        RootMap {
+            pc: 1,
+            bitmap: vec![false, true, false],
+        },
+        RootMap {
+            pc: 2,
+            bitmap: vec![false, true, false],
+        },
+    ];
+    module.function(function);
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
@@ -430,7 +471,25 @@ fn loaded(
     nexa_runtime::ModuleHandle,
     nexa_runtime::ScopeHandle,
 ) {
-    let mut realm = RealmRuntime::new(RealmConfig::default());
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
+    let module = realm.load_module(verified, HOST, SCHEMA).unwrap();
+    let scope = realm.create_scope(None).unwrap();
+    (realm, module, scope)
+}
+
+fn loaded_hosted(
+    verified: VerifiedModule,
+) -> (
+    RealmRuntime,
+    nexa_runtime::ModuleHandle,
+    nexa_runtime::ScopeHandle,
+) {
+    let mut realm = RealmRuntime::hosted(
+        RealmConfig::default(),
+        RuntimeHost::new(1_024),
+        Box::new(AddRegistry),
+    )
+    .unwrap();
     let module = realm.load_module(verified, HOST, SCHEMA).unwrap();
     let scope = realm.create_scope(None).unwrap();
     (realm, module, scope)
@@ -461,6 +520,10 @@ fn call(
 struct AddRegistry;
 
 impl HostRegistry for AddRegistry {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(HOST)
+    }
+
     fn call(
         &mut self,
         id: u32,
@@ -482,6 +545,10 @@ struct AsyncRegistry {
 }
 
 impl HostRegistry for AsyncRegistry {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(HOST)
+    }
+
     fn call(
         &mut self,
         id: u32,

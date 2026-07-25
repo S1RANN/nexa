@@ -40,8 +40,12 @@ fn realm_resource_sequence_matches_composite_reference_model() {
     let module = verify(module.finish(), VerifierLimits::default()).unwrap();
 
     let host = RuntimeHost::new(16);
-    let mut realm =
-        RealmRuntime::with_runtime_host(RealmConfig::default(), host.clone(), Box::new(NoHost));
+    let mut realm = RealmRuntime::hosted(
+        RealmConfig::default(),
+        host.clone(),
+        Box::new(NoHost(host_hash)),
+    )
+    .unwrap();
     let module = realm.load_module(module, host_hash, schema_hash).unwrap();
     let scope = realm.create_scope(None).unwrap();
     let task = realm
@@ -164,7 +168,7 @@ fn activation_failure_after_publication_matches_irreversible_reload_model() {
         vec![migration.finish().unwrap(), activation.finish().unwrap()],
     );
 
-    let mut realm = RealmRuntime::new(RealmConfig::default());
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let old = realm
         .load_module(old_module, host_hash, schema_hash)
         .unwrap();
@@ -240,9 +244,13 @@ fn verified_module(
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
-struct NoHost;
+struct NoHost(StableId);
 
 impl HostRegistry for NoHost {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
     fn call(
         &mut self,
         id: u32,

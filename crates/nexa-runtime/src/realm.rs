@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::Arc;
 
-use nexa_bytecode::{HostImport, ValueType};
+use nexa_bytecode::{AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, ValueType};
 use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
 use crate::machines::retired_epoch;
-use crate::reload::{ReloadCoordinator, ReloadTransaction, StatefulRegistry};
+use crate::reload::{ReloadCoordinator, ReloadTransaction, StatefulDomainId, StatefulRegistry};
 use crate::scheduler::Scheduler;
 use crate::task::TaskExecution;
 use crate::{
@@ -43,6 +43,7 @@ pub enum ModuleLifecycle {
 #[derive(Clone, Debug)]
 pub struct ModuleEpochRoot {
     pub module_id: u32,
+    pub stateful_domain: StatefulDomainId,
     pub epoch: u64,
     pub verified: Arc<VerifiedModule>,
     pub host_hash: StableId,
@@ -343,6 +344,8 @@ pub enum RealmError {
     ModuleAllocation(SlotAllocError),
     ModuleHandle(crate::HandleError),
     MissingModule(u32),
+    HostCapabilitiesUnavailable,
+    MissingHostInterfaceHash,
     HostHashMismatch,
     SchemaHashMismatch,
     EpochExhausted,
@@ -411,6 +414,7 @@ pub struct RealmRuntime {
     tombstones: VecDeque<(TaskHandle, TaskTerminalRecord)>,
     tombstone_capacity: usize,
     next_epoch: u64,
+    next_stateful_domain: u64,
     retired_epochs: RetiredEpochRegistry,
     reload: ReloadCoordinator,
     host_registry: Option<Box<dyn HostRegistry>>,
@@ -419,8 +423,7 @@ pub struct RealmRuntime {
 }
 
 impl RealmRuntime {
-    #[must_use]
-    pub fn new(config: RealmConfig) -> Self {
+    fn base(config: RealmConfig) -> Self {
         Self {
             realm_id: config.realm_id,
             modules: SlotPool::with_capacity_limit(config.realm_id, config.max_modules),
@@ -441,6 +444,7 @@ impl RealmRuntime {
             tombstones: VecDeque::with_capacity(config.tombstone_capacity),
             tombstone_capacity: config.tombstone_capacity,
             next_epoch: 1,
+            next_stateful_domain: 1,
             retired_epochs: RetiredEpochRegistry::new(config.max_modules as usize),
             reload: ReloadCoordinator::default(),
             host_registry: None,
@@ -450,22 +454,22 @@ impl RealmRuntime {
     }
 
     #[must_use]
-    pub fn with_host_registry(config: RealmConfig, registry: Box<dyn HostRegistry>) -> Self {
-        let host_registry_hash = registry.interface_hash();
-        let mut realm = Self::new(config);
-        realm.host_registry = Some(registry);
-        realm.host_registry_hash = host_registry_hash;
-        realm
+    pub fn isolated(config: RealmConfig) -> Self {
+        Self::base(config)
     }
 
-    #[must_use]
-    pub fn with_runtime_host(
+    pub fn hosted(
         config: RealmConfig,
         runtime_host: RuntimeHost,
         registry: Box<dyn HostRegistry>,
-    ) -> Self {
+    ) -> Result<Self, RealmError> {
+        let host_registry_hash = registry
+            .interface_hash()
+            .ok_or(RealmError::MissingHostInterfaceHash)?;
         let resource_config = config.clone();
-        let mut realm = Self::with_host_registry(config, registry);
+        let mut realm = Self::base(config);
+        realm.host_registry = Some(registry);
+        realm.host_registry_hash = Some(host_registry_hash);
         realm.resources = RuntimeResources::with_runtime_host(
             resource_config.realm_id,
             resource_config.max_host_resources,
@@ -473,7 +477,7 @@ impl RealmRuntime {
             &runtime_host,
         );
         realm.runtime_host = Some(runtime_host);
-        realm
+        Ok(realm)
     }
 
     pub fn create_scope(&mut self, parent: Option<ScopeHandle>) -> Result<ScopeHandle, RealmError> {
@@ -512,6 +516,17 @@ impl RealmRuntime {
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?
             .epoch)
+    }
+
+    pub fn module_stateful_domain(
+        &self,
+        module: ModuleHandle,
+    ) -> Result<StatefulDomainId, RealmError> {
+        Ok(self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .stateful_domain)
     }
 
     #[must_use]
@@ -582,6 +597,9 @@ impl RealmRuntime {
         host_hash: StableId,
         schema_hash: StableId,
     ) -> Result<ModuleHandle, RealmError> {
+        if self.runtime_host.is_none() && module_requires_host_capabilities(verified.module()) {
+            return Err(RealmError::HostCapabilitiesUnavailable);
+        }
         if self
             .host_registry_hash
             .is_some_and(|registry_hash| registry_hash != host_hash)
@@ -599,17 +617,23 @@ impl RealmRuntime {
             .next_epoch
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
+        let stateful_domain = StatefulDomainId::new(self.next_stateful_domain);
+        self.next_stateful_domain = self
+            .next_stateful_domain
+            .checked_add(1)
+            .ok_or(RealmError::EpochExhausted)?;
         let raw = self
             .modules
             .try_allocate(ModuleEpochRoot {
                 module_id: 0,
+                stateful_domain,
                 epoch,
                 verified: Arc::new(verified),
                 host_hash,
                 schema_hash,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
-                state: StatefulRegistry::new(0),
+                state: StatefulRegistry::new(stateful_domain),
                 staging_roots: Vec::new(),
             })
             .map_err(RealmError::ModuleAllocation)?;
@@ -618,7 +642,6 @@ impl RealmRuntime {
             .resolve_mut(raw)
             .expect("new module handle resolves");
         loaded.module_id = raw.index;
-        loaded.state = StatefulRegistry::new(raw.index);
         let handle = ModuleHandle(raw);
         if self.active_root.is_none() {
             self.set_active_root(handle);
@@ -646,11 +669,15 @@ impl RealmRuntime {
         if old.verified.module().schema_hash != Some(schema_hash) {
             return Err(RealmError::SchemaHashMismatch);
         }
+        let stateful_domain = old.stateful_domain;
         let candidate = self.load_module(candidate, host_hash, schema_hash)?;
-        self.modules
+        let candidate_root = self
+            .modules
             .resolve_mut(candidate.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .lifecycle = ModuleLifecycle::Staging;
+            .map_err(RealmError::ModuleHandle)?;
+        candidate_root.lifecycle = ModuleLifecycle::Staging;
+        candidate_root.stateful_domain = stateful_domain;
+        candidate_root.state = StatefulRegistry::new(stateful_domain);
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
@@ -680,6 +707,7 @@ impl RealmRuntime {
             .module()
             .schema_hash
             .ok_or(RealmError::SchemaHashMismatch)?;
+        let stateful_domain = old.stateful_domain;
         let candidate_schema = candidate
             .module()
             .schema_hash
@@ -696,10 +724,13 @@ impl RealmRuntime {
             );
         }
         let candidate = self.load_module(candidate, host_hash, candidate_schema)?;
-        self.modules
+        let candidate_root = self
+            .modules
             .resolve_mut(candidate.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .lifecycle = ModuleLifecycle::Staging;
+            .map_err(RealmError::ModuleHandle)?;
+        candidate_root.lifecycle = ModuleLifecycle::Staging;
+        candidate_root.stateful_domain = stateful_domain;
+        candidate_root.state = StatefulRegistry::new(stateful_domain);
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
@@ -779,17 +810,21 @@ impl RealmRuntime {
             )
             .into());
         }
-        let candidate_module_id = candidate.module_id;
+        let candidate_domain = candidate.stateful_domain;
         let candidate_schema = candidate.verified.module().state_schema.clone();
         let old_module = self.reload.transaction()?.old_module;
-        let old_state = self
+        let old_root = self
             .modules
             .resolve(old_module.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .state
-            .clone();
-        let mut migration =
-            crate::reload::MigrationContext::new(old_state, candidate_module_id, candidate_schema);
+            .map_err(RealmError::ModuleHandle)?;
+        let schema_unchanged = old_root.verified.module().state_schema == candidate_schema;
+        let old_state = old_root.state.clone();
+        let mut migration = crate::reload::MigrationContext::new(
+            old_state,
+            candidate_domain,
+            candidate_schema,
+            schema_unchanged,
+        );
         match CheckedInterpreter::run_migration(
             &candidate.verified,
             migration_function,
@@ -798,7 +833,7 @@ impl RealmRuntime {
             &mut migration,
         )? {
             InterpreterOutcome::Returned { value, .. } => {
-                let migrated = migration.finish().map_err(|_| ReloadError::GraphCheck)?;
+                let migrated = migration.finish()?;
                 self.modules
                     .resolve_mut(candidate_handle.raw())
                     .map_err(RealmError::ModuleHandle)?
@@ -839,11 +874,12 @@ impl RealmRuntime {
             if function.effect != nexa_bytecode::FunctionEffect::Immediate {
                 return Err("activation entry must have Immediate effect".into());
             }
-            match CheckedInterpreter::run(
+            match CheckedInterpreter::run_with_heap(
                 &verified,
                 activation.function_id,
                 activation.arguments,
                 activation.fuel,
+                &mut self.heap,
             )
             .map_err(|error| error.to_string())?
             {
@@ -1031,6 +1067,7 @@ impl RealmRuntime {
                 request,
                 destination,
                 expected_type,
+                async_result,
             } => {
                 self.tasks.put_execution(
                     task,
@@ -1039,6 +1076,7 @@ impl RealmRuntime {
                         request,
                         destination,
                         expected_type,
+                        async_result,
                     },
                     snapshot.fuel,
                 )?;
@@ -1077,15 +1115,22 @@ impl RealmRuntime {
                 epoch: snapshot.module_epoch,
                 imports: &module.verified.module().host_imports,
             };
-            CheckedInterpreter::poll_with_host(
+            CheckedInterpreter::poll_with_host_and_heap(
                 &module.verified,
                 continuation,
                 fuel,
                 &self.cost_table,
                 &mut bridge,
+                &mut self.heap,
             )?
         } else {
-            CheckedInterpreter::poll(&module.verified, continuation, fuel, &self.cost_table)?
+            CheckedInterpreter::poll_with_heap(
+                &module.verified,
+                continuation,
+                fuel,
+                &self.cost_table,
+                &mut self.heap,
+            )?
         };
         match outcome {
             InterpreterOutcome::Returned {
@@ -1141,6 +1186,7 @@ impl RealmRuntime {
                 request,
                 destination,
                 expected_type,
+                async_result,
                 charge,
                 fuel,
             } => {
@@ -1153,6 +1199,7 @@ impl RealmRuntime {
                         request,
                         destination,
                         expected_type,
+                        async_result,
                     },
                     fuel,
                 )?;
@@ -1265,10 +1312,15 @@ impl RealmRuntime {
         Ok(self.heap.allocate(object)?)
     }
 
+    pub fn resolve_heap_object(&self, reference: GcRef) -> Result<&Object, RealmError> {
+        Ok(self.heap.resolve(reference)?)
+    }
+
     pub fn create_host_request(
         &mut self,
         task: TaskHandle,
     ) -> Result<PendingHostRequest, RealmError> {
+        self.require_host_capabilities()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1309,6 +1361,7 @@ impl RealmRuntime {
                 request,
                 destination: 0,
                 expected_type: None,
+                async_result: None,
             },
             snapshot.fuel,
         )?;
@@ -1322,6 +1375,7 @@ impl RealmRuntime {
         task: TaskHandle,
         operation: impl FnOnce(&mut crate::ResourceContext<'_>) -> T,
     ) -> Result<T, RealmError> {
+        self.require_host_capabilities()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         let mut context = self
             .resources
@@ -1334,6 +1388,7 @@ impl RealmRuntime {
         task: TaskHandle,
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, RealmError> {
+        self.require_host_capabilities()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1346,6 +1401,7 @@ impl RealmRuntime {
         task: TaskHandle,
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, RealmError> {
+        self.require_host_capabilities()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1411,64 +1467,244 @@ impl RealmRuntime {
                 if snapshot.state != TaskState::Waiting {
                     continue;
                 }
-                match delivery.result {
-                    HostCompletionResult::Success(payload) => {
-                        let execution = self.tasks.take_execution(task)?;
-                        let TaskExecution::Waiting {
-                            mut continuation,
-                            request: waiting_request,
-                            destination,
-                            expected_type,
-                        } = execution
-                        else {
-                            return Err(RealmError::TaskWaiting);
-                        };
-                        if waiting_request != request {
-                            return Err(RealmError::TaskWaiting);
-                        }
-                        if let Ok(value) = completion_to_runtime(payload, expected_type) {
-                            continuation.write_resume_value(destination, expected_type, value)?;
-                            self.tasks.resume_task(task)?;
-                            self.tasks.put_execution(
-                                task,
-                                TaskExecution::Running(continuation),
-                                snapshot.fuel,
-                            )?;
-                            self.scheduler.schedule(task, snapshot.priority);
-                        } else {
-                            self.trap_host_task(
-                                task,
-                                snapshot,
-                                "host completion payload type mismatch".into(),
-                            )?;
-                        }
-                    }
-                    HostCompletionResult::Error(error) => {
-                        self.trap_host_task(
-                            task,
-                            snapshot,
-                            error.message.unwrap_or_else(|| {
-                                format!("host request failed with code {}", error.code)
-                            }),
-                        )?;
-                    }
-                    HostCompletionResult::Cancelled => {
-                        let _ = self.cancel_task_internal(
-                            task,
-                            CancelReason::HostCancelled,
-                            snapshot.module_epoch,
-                            self.trace_cursor(),
-                            snapshot.charge,
-                        )?;
-                    }
-                    HostCompletionResult::Abandoned => {
-                        self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
-                    }
-                }
+                self.handle_host_completion(task, request, snapshot, delivery.result)?;
                 count += 1;
             }
         }
         Ok(count)
+    }
+
+    fn handle_host_completion(
+        &mut self,
+        task: TaskHandle,
+        request: HostRequestHandle,
+        snapshot: crate::TaskSnapshot,
+        result: HostCompletionResult,
+    ) -> Result<(), RealmError> {
+        match result {
+            HostCompletionResult::Success(payload) => {
+                let execution = self.tasks.take_execution(task)?;
+                let TaskExecution::Waiting {
+                    mut continuation,
+                    request: waiting_request,
+                    destination,
+                    expected_type,
+                    async_result,
+                } = execution
+                else {
+                    return Err(RealmError::TaskWaiting);
+                };
+                if waiting_request != request {
+                    return Err(RealmError::TaskWaiting);
+                }
+                let value = if let Some(async_result) = async_result {
+                    let payload = completion_to_runtime(payload, Some(async_result.success))?;
+                    self.allocate_async_result(async_result, true, payload)
+                } else {
+                    completion_to_runtime(payload, expected_type)
+                };
+                if let Ok(value) = value {
+                    continuation.write_resume_value(destination, expected_type, value)?;
+                    self.tasks.resume_task(task)?;
+                    self.tasks.put_execution(
+                        task,
+                        TaskExecution::Running(continuation),
+                        snapshot.fuel,
+                    )?;
+                    self.scheduler.schedule(task, snapshot.priority);
+                } else {
+                    self.trap_host_task(
+                        task,
+                        snapshot,
+                        "host completion payload type mismatch".into(),
+                    )?;
+                }
+            }
+            HostCompletionResult::Error(error) => {
+                self.resume_async_error(task, request, snapshot, error.code)?;
+            }
+            HostCompletionResult::Cancelled => {
+                if let Some(result) = self.waiting_async_result(task)? {
+                    if result.cancel_policy == CancelPolicy::ReturnError {
+                        self.resume_async_error(
+                            task,
+                            request,
+                            snapshot,
+                            result.cancel_error.ok_or(RealmError::TaskWaiting)?,
+                        )?;
+                    } else {
+                        self.cancel_waiting_host_task(task, snapshot)?;
+                    }
+                } else {
+                    self.cancel_waiting_host_task(task, snapshot)?;
+                }
+            }
+            HostCompletionResult::Abandoned => {
+                if let Some(result) = self.waiting_async_result(task)? {
+                    if result.abandon_policy == AbandonPolicy::ReturnError {
+                        self.resume_async_error(
+                            task,
+                            request,
+                            snapshot,
+                            result.abandon_error.ok_or(RealmError::TaskWaiting)?,
+                        )?;
+                    } else {
+                        self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
+                    }
+                } else {
+                    self.trap_host_task(task, snapshot, "host request was abandoned".into())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cancel_waiting_host_task(
+        &mut self,
+        task: TaskHandle,
+        snapshot: crate::TaskSnapshot,
+    ) -> Result<(), RealmError> {
+        let _ = self.cancel_task_internal(
+            task,
+            CancelReason::HostCancelled,
+            snapshot.module_epoch,
+            self.trace_cursor(),
+            snapshot.charge,
+        )?;
+        Ok(())
+    }
+
+    fn waiting_async_result(
+        &self,
+        task: TaskHandle,
+    ) -> Result<Option<AsyncResultType>, RealmError> {
+        match self.tasks.execution(task)? {
+            TaskExecution::Waiting { async_result, .. } => Ok(*async_result),
+            _ => Err(RealmError::TaskWaiting),
+        }
+    }
+
+    fn resume_async_error(
+        &mut self,
+        task: TaskHandle,
+        request: HostRequestHandle,
+        snapshot: crate::TaskSnapshot,
+        code: u32,
+    ) -> Result<(), RealmError> {
+        let execution = self.tasks.take_execution(task)?;
+        let TaskExecution::Waiting {
+            mut continuation,
+            request: waiting_request,
+            destination,
+            expected_type,
+            async_result,
+        } = execution
+        else {
+            return Err(RealmError::TaskWaiting);
+        };
+        if waiting_request != request {
+            return Err(RealmError::TaskWaiting);
+        }
+        let Some(async_result) = async_result else {
+            self.tasks.put_execution(
+                task,
+                TaskExecution::Waiting {
+                    continuation,
+                    request,
+                    destination,
+                    expected_type,
+                    async_result: None,
+                },
+                snapshot.fuel,
+            )?;
+            return self.trap_host_task(
+                task,
+                snapshot,
+                format!("host request failed with code {code}"),
+            );
+        };
+        let payload = match async_result.error {
+            ValueType::I32 => RuntimeValue::I32(i32::from_ne_bytes(code.to_ne_bytes())),
+            ValueType::Named(type_id) => {
+                let variant = self
+                    .module_for_id(snapshot.module_id)?
+                    .verified
+                    .module()
+                    .enum_types
+                    .iter()
+                    .find(|enum_type| enum_type.type_id == type_id)
+                    .and_then(|enum_type| {
+                        enum_type
+                            .variants
+                            .iter()
+                            .find(|variant| variant.tag == code)
+                    })
+                    .map(|variant| (variant.stable_id, variant.tag));
+                if let Some((variant, tag)) = variant {
+                    self.heap
+                        .allocate_enum(type_id, variant, tag, None)
+                        .map_err(RealmError::Heap)?
+                } else {
+                    self.tasks.put_execution(
+                        task,
+                        TaskExecution::Waiting {
+                            continuation,
+                            request,
+                            destination,
+                            expected_type,
+                            async_result: Some(async_result),
+                        },
+                        snapshot.fuel,
+                    )?;
+                    return self.trap_host_task(
+                        task,
+                        snapshot,
+                        format!("host error enum has no variant for code {code}"),
+                    );
+                }
+            }
+            ValueType::Bool | ValueType::Ref => {
+                self.tasks.put_execution(
+                    task,
+                    TaskExecution::Waiting {
+                        continuation,
+                        request,
+                        destination,
+                        expected_type,
+                        async_result: Some(async_result),
+                    },
+                    snapshot.fuel,
+                )?;
+                return self.trap_host_task(
+                    task,
+                    snapshot,
+                    "host error payload type mismatch".into(),
+                );
+            }
+        };
+        let value = self.allocate_async_result(async_result, false, payload)?;
+        continuation.write_resume_value(destination, expected_type, value)?;
+        self.tasks.resume_task(task)?;
+        self.tasks
+            .put_execution(task, TaskExecution::Running(continuation), snapshot.fuel)?;
+        self.scheduler.schedule(task, snapshot.priority);
+        Ok(())
+    }
+
+    fn allocate_async_result(
+        &mut self,
+        result: AsyncResultType,
+        success: bool,
+        payload: RuntimeValue,
+    ) -> Result<RuntimeValue, InterpreterError> {
+        let (variant, tag) = if success {
+            (StableId::from_parts(&["Result", "::Ok"]), 0)
+        } else {
+            (StableId::from_parts(&["Result", "::Err"]), 1)
+        };
+        Ok(self
+            .heap
+            .allocate_enum(result.result_type, variant, tag, Some(payload))?)
     }
 
     fn trap_host_task(
@@ -1632,11 +1868,21 @@ impl RealmRuntime {
     }
 
     fn flush_releases(&mut self) -> usize {
-        if self.runtime_host.is_some() {
-            self.resources.transfer_releases_to_host()
-        } else {
-            self.resources.drain_releases().len()
-        }
+        debug_assert!(
+            self.runtime_host.is_some()
+                || self.resources.model_snapshot() == crate::RuntimeResourceSnapshot::default(),
+            "isolated realms cannot own host release records"
+        );
+        self.runtime_host
+            .as_ref()
+            .map_or(0, |_| self.resources.transfer_releases_to_host())
+    }
+
+    fn require_host_capabilities(&self) -> Result<(), RealmError> {
+        self.runtime_host
+            .as_ref()
+            .map(|_| ())
+            .ok_or(RealmError::HostCapabilitiesUnavailable)
     }
 
     fn register_retired_epoch(&mut self, module: ModuleHandle) -> Result<(), RealmError> {
@@ -1696,7 +1942,7 @@ impl RealmRuntime {
             {
                 if let Ok(root) = self.modules.resolve_mut(entry.module.raw()) {
                     root.globals.clear();
-                    root.state = StatefulRegistry::new(root.module_id);
+                    root.state = StatefulRegistry::new(root.stateful_domain);
                     root.staging_roots.clear();
                 }
                 let _ = self.modules.release(entry.module.raw());
@@ -1727,6 +1973,41 @@ impl Drop for RealmRuntime {
         }
         self.flush_releases();
     }
+}
+
+fn module_requires_host_capabilities(module: &nexa_bytecode::Module) -> bool {
+    if !module.host_imports.is_empty() {
+        return true;
+    }
+    let is_host_type = |ty: ValueType| {
+        matches!(ty, ValueType::Named(id) if [
+            StableId::from_name("HostRequest"),
+            StableId::from_name("ResourceToken"),
+            StableId::from_name("Snapshot"),
+            StableId::from_name("Buffer"),
+        ].contains(&id))
+    };
+    module.functions.iter().any(|function| {
+        function
+            .signature
+            .parameters
+            .iter()
+            .copied()
+            .any(&is_host_type)
+            || function.signature.result.is_some_and(&is_host_type)
+    }) || module.exports.iter().any(|export| {
+        export
+            .signature
+            .parameters
+            .iter()
+            .copied()
+            .any(&is_host_type)
+            || export.signature.result.is_some_and(&is_host_type)
+    }) || module
+        .state_schema
+        .types
+        .iter()
+        .any(|state_type| state_type.fields.iter().any(|field| is_host_type(field.ty)))
 }
 
 fn reservation_for_module(
@@ -1773,8 +2054,9 @@ mod tests {
 
     use super::{PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime};
     use crate::{
-        HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, ResourceContext,
-        RuntimeHost, RuntimeValue, StepConfig, TaskLimits, TickBudget,
+        HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, Object,
+        ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig,
+        TaskLimits, TickBudget,
     };
 
     fn module(yields: bool) -> (nexa_verifier::VerifiedModule, StableId, StableId) {
@@ -1803,7 +2085,29 @@ mod tests {
         )
     }
 
+    fn test_host_error_enum() -> nexa_bytecode::EnumType {
+        let type_id = StableId::from_name("TestHostError");
+        nexa_bytecode::EnumType {
+            type_id,
+            variants: vec![
+                nexa_bytecode::EnumVariant {
+                    stable_id: StableId::from_parts(&["TestHostError", "::Cancelled"]),
+                    tag: 6,
+                    payload_type: None,
+                },
+                nexa_bytecode::EnumVariant {
+                    stable_id: StableId::from_parts(&["TestHostError", "::Failed"]),
+                    tag: 7,
+                    payload_type: None,
+                },
+            ],
+        }
+    }
+
     fn reloadable_async_module(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
+        let error_enum = test_host_error_enum();
+        let error_type = error_enum.type_id;
+        let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::Named(error_type));
         let mut migration = FunctionBuilder::new(
             Signature {
                 parameters: vec![ValueType::I32],
@@ -1829,7 +2133,7 @@ mod tests {
         let mut async_task = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
-                result: Some(ValueType::I32),
+                result: Some(ValueType::Named(async_enum.type_id)),
             },
             1,
         );
@@ -1857,16 +2161,40 @@ mod tests {
 
         let mut module = ModuleBuilder::new();
         module.metadata(host, schema);
+        let async_result = nexa_bytecode::AsyncResultType {
+            result_type: async_enum.type_id,
+            success: ValueType::I32,
+            error: ValueType::Named(error_type),
+            cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+            cancel_error: Some(6),
+            abandon_error: None,
+        };
+        module.enum_type(error_enum);
+        module.enum_type(async_enum);
         module.host_import(HostImport {
             stable_id: StableId::from_name("Host::pending"),
             parameters: Vec::new(),
-            result: Some(ValueType::I32),
+            result: Some(ValueType::Named(async_result.result_type)),
             mode: HostCallMode::Async,
             fuel_cost: 1,
+            async_result: Some(async_result),
         });
         module.function(migration.finish().unwrap());
         module.function(activation.finish().unwrap());
-        module.function(async_task.finish().unwrap());
+        let mut async_task = async_task.finish().unwrap();
+        async_task.root_bitmap[0] = true;
+        async_task.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true],
+            },
+        ];
+        module.function(async_task);
         module.function(yielding_task.finish().unwrap());
         verify(module.finish(), VerifierLimits::default()).unwrap()
     }
@@ -1874,7 +2202,7 @@ mod tests {
     #[test]
     fn task_handle_is_the_only_resume_credential_and_terminal_record_survives_slot_release() {
         let (module, host, schema) = module(true);
-        let mut realm = RealmRuntime::new(RealmConfig::default());
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
         let module = realm.load_module(module, host, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
@@ -1935,6 +2263,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn host_call_pending_completion_writes_destination_and_runtime_host_keeps_releases() {
         let host_hash = StableId::from_name("integrated-host");
         let schema = StableId::from_name("integrated-schema");
@@ -1943,7 +2272,7 @@ mod tests {
                 parameters: Vec::new(),
                 result: Some(ValueType::I32),
             },
-            1,
+            2,
         );
         function
             .effect(FunctionEffect::Task)
@@ -1953,29 +2282,64 @@ mod tests {
                 args_count: 0,
                 dst: 0,
             })
-            .emit(Instruction::Return { source: 0 });
+            .emit(Instruction::EnumPayload {
+                source: 0,
+                variant: StableId::from_parts(&["Result", "::Ok"]),
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
         let mut builder = ModuleBuilder::new();
         builder.metadata(host_hash, schema);
+        let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+        let async_result = nexa_bytecode::AsyncResultType {
+            result_type: async_enum.type_id,
+            success: ValueType::I32,
+            error: ValueType::I32,
+            cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+            cancel_error: Some(u32::MAX - 1),
+            abandon_error: None,
+        };
+        builder.enum_type(async_enum);
         builder.host_import(HostImport {
             stable_id: StableId::from_name("Engine::load"),
             parameters: Vec::new(),
-            result: Some(ValueType::I32),
+            result: Some(ValueType::Named(async_result.result_type)),
             mode: HostCallMode::Async,
             fuel_cost: 3,
+            async_result: Some(async_result),
         });
-        builder.function(function.finish().unwrap());
+        let mut function = function.finish().unwrap();
+        function.root_bitmap[0] = true;
+        function.safepoints = vec![0, 1, 2];
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true, false],
+            },
+            RootMap {
+                pc: 2,
+                bitmap: vec![true, false],
+            },
+        ];
+        builder.function(function);
         let module = verify(builder.finish(), VerifierLimits::default()).unwrap();
 
         let request = Arc::new(Mutex::new(None));
         let runtime_host = RuntimeHost::new(8);
-        let mut realm = RealmRuntime::with_runtime_host(
+        let mut realm = RealmRuntime::hosted(
             RealmConfig::default(),
             runtime_host.clone(),
             Box::new(AsyncRegistry {
                 hash: host_hash,
                 request: Arc::clone(&request),
             }),
-        );
+        )
+        .unwrap();
         let module = realm.load_module(module, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
@@ -2025,7 +2389,7 @@ mod tests {
         let schema = StableId::from_name("three-epoch-schema");
         let request = Arc::new(Mutex::new(None));
         let runtime_host = RuntimeHost::new(8);
-        let mut realm = RealmRuntime::with_runtime_host(
+        let mut realm = RealmRuntime::hosted(
             RealmConfig {
                 max_modules: 3,
                 max_host_resources: 8,
@@ -2037,7 +2401,8 @@ mod tests {
                 hash: host_hash,
                 request: Arc::clone(&request),
             }),
-        );
+        )
+        .unwrap();
         let epoch_one = realm
             .load_module(
                 reloadable_async_module(host_hash, schema),
@@ -2159,7 +2524,7 @@ mod tests {
                 parameters: Vec::new(),
                 result: Some(ValueType::I32),
             },
-            1,
+            2,
         );
         task_function
             .effect(FunctionEffect::Task)
@@ -2169,17 +2534,51 @@ mod tests {
                 args_count: 0,
                 dst: 0,
             })
-            .emit(Instruction::Return { source: 0 });
+            .emit(Instruction::EnumPayload {
+                source: 0,
+                variant: StableId::from_parts(&["Result", "::Ok"]),
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
         let mut old = ModuleBuilder::new();
         old.metadata(host_hash, schema);
+        let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+        let async_result = nexa_bytecode::AsyncResultType {
+            result_type: async_enum.type_id,
+            success: ValueType::I32,
+            error: ValueType::I32,
+            cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+            cancel_error: Some(u32::MAX - 1),
+            abandon_error: None,
+        };
+        old.enum_type(async_enum);
         old.host_import(HostImport {
             stable_id: StableId::from_name("Host::pending"),
             parameters: Vec::new(),
-            result: Some(ValueType::I32),
+            result: Some(ValueType::Named(async_result.result_type)),
             mode: HostCallMode::Async,
             fuel_cost: 1,
+            async_result: Some(async_result),
         });
-        old.function(task_function.finish().unwrap());
+        let mut task_function = task_function.finish().unwrap();
+        task_function.root_bitmap[0] = true;
+        task_function.safepoints = vec![0, 1, 2];
+        task_function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true, false],
+            },
+            RootMap {
+                pc: 2,
+                bitmap: vec![true, false],
+            },
+        ];
+        old.function(task_function);
         let old = verify(old.finish(), VerifierLimits::default()).unwrap();
 
         let mut migration = FunctionBuilder::new(
@@ -2199,13 +2598,15 @@ mod tests {
         let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
 
         let request = Arc::new(Mutex::new(None));
-        let mut realm = RealmRuntime::with_host_registry(
+        let mut realm = RealmRuntime::hosted(
             RealmConfig::default(),
+            RuntimeHost::new(8),
             Box::new(AsyncRegistry {
                 hash: host_hash,
                 request: Arc::clone(&request),
             }),
-        );
+        )
+        .unwrap();
         let old = realm.load_module(old, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
@@ -2304,10 +2705,11 @@ mod tests {
                 field_id: phase,
                 source: 0,
             })
-            .emit(Instruction::StateHandleRemap {
+            .emit(Instruction::StateReplace {
                 old_id: old_health,
                 target: 1,
             })
+            .emit(Instruction::StateFinish)
             .emit(Instruction::Return { source: 0 });
         let mut migration = migration.finish().unwrap();
         migration.root_bitmap = vec![false, true];
@@ -2317,7 +2719,7 @@ mod tests {
                 bitmap: vec![false, false],
             },
             RootMap {
-                pc: 4,
+                pc: 5,
                 bitmap: vec![false, true],
             },
         ];
@@ -2349,7 +2751,7 @@ mod tests {
         candidate.function(activation.finish().unwrap());
         let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
 
-        let mut realm = RealmRuntime::new(RealmConfig::default());
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
         let old = realm
             .load_module(old_module, host, old_schema_hash)
             .unwrap();
@@ -2384,6 +2786,185 @@ mod tests {
                 version: 2,
                 fields: BTreeMap::from([(phase, crate::StateValue::I32(37))]),
             })
+        );
+    }
+
+    #[test]
+    fn isolated_realm_rejects_host_modules_and_resource_apis() {
+        let host = StableId::from_name("isolated-host");
+        let schema = StableId::from_name("isolated-schema");
+        let host_module = reloadable_async_module(host, schema);
+        let mut isolated = RealmRuntime::isolated(RealmConfig::default());
+        assert_eq!(
+            isolated.load_module(host_module, host, schema),
+            Err(RealmError::HostCapabilitiesUnavailable)
+        );
+
+        let (pure, host, schema) = module(false);
+        let module = isolated.load_module(pure, host, schema).unwrap();
+        let scope = isolated.create_scope(None).unwrap();
+        let task = isolated
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(1)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 8,
+                    cumulative_budget: 32,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            isolated.create_resource_token(task, RuntimeHostDomain::Render),
+            Err(RealmError::HostCapabilitiesUnavailable)
+        );
+    }
+
+    #[test]
+    fn typed_async_error_resumes_as_result_err() {
+        let host = StableId::from_name("typed-error-host");
+        let schema = StableId::from_name("typed-error-schema");
+        let request = Arc::new(Mutex::new(None));
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            RuntimeHost::new(8),
+            Box::new(AsyncRegistry {
+                hash: host,
+                request: Arc::clone(&request),
+            }),
+        )
+        .unwrap();
+        let module = realm
+            .load_module(reloadable_async_module(host, schema), host, schema)
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                2,
+                &[],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap()
+            .ticket
+            .fail(HostErrorPayload { code: 7 })
+            .unwrap();
+        realm
+            .tick(TickBudget {
+                max_tasks: 1,
+                frame_fuel_budget: 32,
+                collect_garbage: false,
+            })
+            .unwrap();
+        let Some(super::TaskTerminalReason::Completed(Some(RuntimeValue::NamedRef {
+            reference,
+            ..
+        }))) = realm.terminal_record(task).map(|record| &record.reason)
+        else {
+            panic!("typed host error did not complete with Result::Err");
+        };
+        let Object::Enum {
+            tag: 1,
+            payload:
+                Some(RuntimeValue::NamedRef {
+                    reference: error_reference,
+                    ..
+                }),
+            ..
+        } = realm.resolve_heap_object(*reference).unwrap()
+        else {
+            panic!("Result::Err did not contain the typed host error enum");
+        };
+        let error_reference = *error_reference;
+        assert!(matches!(
+            realm.resolve_heap_object(error_reference).unwrap(),
+            Object::Enum { tag: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn schema_change_requires_explicit_finished_migration_output() {
+        let host = StableId::from_name("strict-migration-host");
+        let old_schema = StableId::from_name("strict-schema-v1");
+        let new_schema = StableId::from_name("strict-schema-v2");
+        let type_id = StableId::from_name("StrictState");
+        let field_id = StableId::from_name("StrictState::value");
+
+        let mut old_entry = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        old_entry.emit(Instruction::ReturnVoid);
+        let mut old = ModuleBuilder::new();
+        old.metadata(host, old_schema)
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: type_id,
+                    version: 1,
+                    fields: Vec::new(),
+                }],
+            })
+            .function(old_entry.finish().unwrap());
+        let old = verify(old.finish(), VerifierLimits::default()).unwrap();
+
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::ReturnVoid);
+        let mut candidate = ModuleBuilder::new();
+        candidate
+            .metadata(host, new_schema)
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: type_id,
+                    version: 2,
+                    fields: vec![StateField {
+                        stable_id: field_id,
+                        ty: ValueType::I32,
+                    }],
+                }],
+            })
+            .function(migration.finish().unwrap());
+        let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
+
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let old = realm.load_module(old, host, old_schema).unwrap();
+        let domain = realm.module_stateful_domain(old).unwrap();
+        let candidate = realm
+            .prepare_reload_migrating(old, candidate, host)
+            .unwrap();
+        assert_eq!(realm.module_stateful_domain(candidate).unwrap(), domain);
+        realm.quiesce_reload().unwrap();
+        assert_eq!(
+            realm.stage_reload(0, &[]),
+            Err(RealmError::Reload(ReloadError::MigrationNoOutput))
         );
     }
 }

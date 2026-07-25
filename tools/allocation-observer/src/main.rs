@@ -172,7 +172,7 @@ fn make_realm_with_host(
     let schema = StableId::from_name("allocation-observer-schema");
     let verified = build_module(host_hash, schema, vec![Instruction::Return { source: 0 }]);
     let mut realm =
-        RealmRuntime::with_runtime_host(RealmConfig::default(), host, Box::new(NoHost));
+        RealmRuntime::hosted(RealmConfig::default(), host, Box::new(NoHost(host_hash))).unwrap();
     let module = realm.load_module(verified, host_hash, schema).unwrap();
     (realm, module)
 }
@@ -181,7 +181,7 @@ fn make_realm(code: Vec<Instruction>) -> (RealmRuntime, nexa_runtime::ModuleHand
     let host = StableId::from_name("allocation-observer-host");
     let schema = StableId::from_name("allocation-observer-schema");
     let verified = build_module(host, schema, code);
-    let mut realm = RealmRuntime::new(RealmConfig::default());
+    let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let module = realm.load_module(verified, host, schema).unwrap();
     (realm, module)
 }
@@ -209,9 +209,13 @@ fn build_module(
     verify(builder.finish(), VerifierLimits::default()).unwrap()
 }
 
-struct NoHost;
+struct NoHost(StableId);
 
 impl HostRegistry for NoHost {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
     fn call(
         &mut self,
         id: u32,

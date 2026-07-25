@@ -1,8 +1,9 @@
 interface GameHost {
     opaque ActionLock;
     opaque EnemyView;
+    enum AnimationError { MissingClip, EntityGone, Interrupted, Internal, Cancelled }
     sync fn update(entity: i32, delta: i32) -> i32;
-    request fn animation(entity: i32) -> request<i32>;
+    request(return_error, trap) fn animation(entity: i32) -> request<Result<i32, AnimationError>>;
     sync fn action_lock(entity: i32) -> token<ActionLock>;
     sync fn world_snapshot() -> snapshot<EnemyView>;
     export Update(entity: i32) -> i32;

@@ -10,8 +10,23 @@ use crate::task::TaskExecution;
 use crate::{GcRef, ModuleHandle, RuntimeValue, TaskHandle, TaskSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StatefulDomainId(u64);
+
+impl StatefulDomainId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StateHandle {
-    pub module_id: u32,
+    pub domain: StatefulDomainId,
     pub stable_id: StableId,
     pub generation: u32,
 }
@@ -40,13 +55,16 @@ struct StateEntry {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StatefulRegistry {
-    module_id: u32,
+    domain: StatefulDomainId,
     entries: BTreeMap<StableId, StateEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StatefulError {
-    WrongModule { expected: u32, actual: u32 },
+    WrongDomain {
+        expected: StatefulDomainId,
+        actual: StatefulDomainId,
+    },
     Missing(StableId),
     StaleGeneration,
     GenerationExhausted,
@@ -62,9 +80,9 @@ impl std::error::Error for StatefulError {}
 
 impl StatefulRegistry {
     #[must_use]
-    pub const fn new(module_id: u32) -> Self {
+    pub const fn new(domain: StatefulDomainId) -> Self {
         Self {
-            module_id,
+            domain,
             entries: BTreeMap::new(),
         }
     }
@@ -83,17 +101,17 @@ impl StatefulRegistry {
         self.entries
             .insert(stable_id, StateEntry { generation, value });
         Ok(StateHandle {
-            module_id: self.module_id,
+            domain: self.domain,
             stable_id,
             generation,
         })
     }
 
     pub fn resolve(&self, handle: StateHandle) -> Result<&StateValue, StatefulError> {
-        if handle.module_id != self.module_id {
-            return Err(StatefulError::WrongModule {
-                expected: self.module_id,
-                actual: handle.module_id,
+        if handle.domain != self.domain {
+            return Err(StatefulError::WrongDomain {
+                expected: self.domain,
+                actual: handle.domain,
             });
         }
         let entry = self
@@ -111,32 +129,11 @@ impl StatefulRegistry {
         self.entries
             .iter()
             .map(|(stable_id, entry)| StateHandle {
-                module_id: self.module_id,
+                domain: self.domain,
                 stable_id: *stable_id,
                 generation: entry.generation,
             })
             .collect()
-    }
-
-    pub fn migrate_for_module(
-        &self,
-        module_id: u32,
-        schema: &nexa_bytecode::StateSchema,
-    ) -> Result<Self, StatefulError> {
-        let mut entries = BTreeMap::new();
-        for (stable_id, entry) in &self.entries {
-            entries.insert(
-                *stable_id,
-                StateEntry {
-                    generation: entry.generation,
-                    value: migrate_state_value(&entry.value, module_id, schema)?,
-                },
-            );
-        }
-        let migrated = Self { module_id, entries };
-        migrated.validate_schema(schema)?;
-        migrated.validate_handles()?;
-        Ok(migrated)
     }
 
     pub fn validate_schema(
@@ -171,36 +168,76 @@ pub(crate) struct MigrationContext {
     staging: StatefulRegistry,
     schema: nexa_bytecode::StateSchema,
     forwarding: BTreeMap<StableId, StableId>,
+    decisions: BTreeMap<StableId, Option<StableId>>,
+    schema_unchanged: bool,
     touched: bool,
+    finalized: bool,
+    invalid: Option<ReloadError>,
 }
 
 impl MigrationContext {
     #[must_use]
     pub(crate) fn new(
         old: StatefulRegistry,
-        module_id: u32,
+        domain: StatefulDomainId,
         schema: nexa_bytecode::StateSchema,
+        schema_unchanged: bool,
     ) -> Self {
         Self {
             old,
-            staging: StatefulRegistry::new(module_id),
+            staging: StatefulRegistry::new(domain),
             schema,
             forwarding: BTreeMap::new(),
+            decisions: BTreeMap::new(),
+            schema_unchanged,
             touched: false,
+            finalized: false,
+            invalid: None,
         }
     }
 
-    pub(crate) fn finish(mut self) -> Result<StatefulRegistry, StatefulError> {
+    pub(crate) fn finish(mut self) -> Result<StatefulRegistry, ReloadError> {
         if !self.touched {
-            return self
-                .old
-                .migrate_for_module(self.staging.module_id, &self.schema);
+            if self.schema_unchanged {
+                self.old
+                    .validate_schema(&self.schema)
+                    .map_err(|_| ReloadError::InvalidStateHandle)?;
+                self.old
+                    .validate_handles()
+                    .map_err(|_| ReloadError::InvalidStateHandle)?;
+                return Ok(self.old);
+            }
+            return Err(ReloadError::MigrationNoOutput);
         }
+        if let Some(error) = self.invalid {
+            return Err(error);
+        }
+        if !self.finalized {
+            return Err(ReloadError::MigrationNotFinished);
+        }
+        if self
+            .old
+            .entries
+            .keys()
+            .any(|stable_id| !self.decisions.contains_key(stable_id))
+        {
+            return Err(ReloadError::MissingForwarding);
+        }
+        let generations = self
+            .staging
+            .entries
+            .iter()
+            .map(|(stable_id, entry)| (*stable_id, entry.generation))
+            .collect::<BTreeMap<_, _>>();
         for entry in self.staging.entries.values_mut() {
-            remap_state_handles(&mut entry.value, &self.forwarding);
+            remap_state_handles(&mut entry.value, &self.forwarding, &generations);
         }
-        self.staging.validate_schema(&self.schema)?;
-        self.staging.validate_handles()?;
+        self.staging
+            .validate_schema(&self.schema)
+            .map_err(|_| ReloadError::GraphCheck)?;
+        self.staging
+            .validate_handles()
+            .map_err(|_| ReloadError::InvalidStateHandle)?;
         Ok(self.staging)
     }
 }
@@ -211,6 +248,9 @@ impl InterpreterMigration for MigrationContext {
         stable_id: StableId,
         expected: nexa_bytecode::ValueType,
     ) -> Result<RuntimeValue, String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
         let entry = self
             .old
             .entries
@@ -223,11 +263,52 @@ impl InterpreterMigration for MigrationContext {
         Ok(value)
     }
 
+    fn old_field_get(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        expected: nexa_bytecode::ValueType,
+    ) -> Result<RuntimeValue, String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
+        let RuntimeValue::Opaque {
+            type_id,
+            value: stable_id,
+        } = object
+        else {
+            return Err("STATE_OLD_FIELD_GET requires an old state object".into());
+        };
+        let entry = self
+            .old
+            .entries
+            .get(&StableId(stable_id))
+            .ok_or_else(|| "old state object does not exist".to_string())?;
+        let StateValue::Object(object) = &entry.value else {
+            return Err("old state value is not an object".into());
+        };
+        if object.type_id != type_id {
+            return Err("old state object type mismatch".into());
+        }
+        let field = object
+            .fields
+            .get(&field_id)
+            .ok_or_else(|| "old state field does not exist".to_string())?;
+        let value = state_to_runtime_value(field_id, field);
+        if runtime_state_type(value) != expected {
+            return Err("old state field type mismatch".into());
+        }
+        Ok(value)
+    }
+
     fn new_create(
         &mut self,
         stable_id: StableId,
         type_id: StableId,
     ) -> Result<RuntimeValue, String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
         let schema = self
             .schema
             .types
@@ -261,6 +342,9 @@ impl InterpreterMigration for MigrationContext {
         field_id: StableId,
         value: RuntimeValue,
     ) -> Result<(), String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
         let RuntimeValue::Opaque {
             type_id,
             value: object_id,
@@ -285,25 +369,89 @@ impl InterpreterMigration for MigrationContext {
         Ok(())
     }
 
-    fn remap(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String> {
+    fn preserve(&mut self, stable_id: StableId) -> Result<(), String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
+        if self.decisions.contains_key(&stable_id) {
+            self.invalid = Some(ReloadError::DuplicateForwarding);
+            return Ok(());
+        }
+        let entry = self
+            .old
+            .entries
+            .get(&stable_id)
+            .ok_or_else(|| "STATE_PRESERVE source does not exist".to_string())?
+            .clone();
+        if self.staging.entries.insert(stable_id, entry).is_some() {
+            self.invalid = Some(ReloadError::DuplicateForwarding);
+            return Ok(());
+        }
+        self.forwarding.insert(stable_id, stable_id);
+        self.decisions.insert(stable_id, Some(stable_id));
+        self.touched = true;
+        Ok(())
+    }
+
+    fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
         let RuntimeValue::Opaque {
             value: target_id, ..
         } = target
         else {
-            return Err("STATE_HANDLE_REMAP requires a staging object".into());
+            return Err("STATE_REPLACE requires a staging object".into());
         };
         let target_id = StableId(target_id);
         if !self.staging.entries.contains_key(&target_id) {
             return Err("remap target does not exist".into());
         }
+        if self.decisions.contains_key(&old_id) {
+            self.invalid = Some(ReloadError::DuplicateForwarding);
+            return Ok(());
+        }
+        let old_generation = self
+            .old
+            .entries
+            .get(&old_id)
+            .ok_or_else(|| "STATE_REPLACE source does not exist".to_string())?
+            .generation;
+        let replacement_generation = old_generation
+            .checked_add(1)
+            .ok_or_else(|| "replacement generation exhausted".to_string())?;
+        self.staging
+            .entries
+            .get_mut(&target_id)
+            .expect("target existence checked")
+            .generation = replacement_generation;
         self.forwarding.insert(old_id, target_id);
+        self.decisions.insert(old_id, Some(target_id));
         self.touched = true;
         Ok(())
     }
 
     fn delete(&mut self, stable_id: StableId) -> Result<(), String> {
+        if self.finalized {
+            return Err("STATE_FINISH already executed".into());
+        }
+        if !self.old.entries.contains_key(&stable_id) {
+            return Err("STATE_DELETE source does not exist".into());
+        }
+        if self.decisions.insert(stable_id, None).is_some() {
+            self.invalid = Some(ReloadError::DuplicateForwarding);
+            return Ok(());
+        }
         self.staging.entries.remove(&stable_id);
         self.touched = true;
+        Ok(())
+    }
+
+    fn finish_staging(&mut self) -> Result<(), String> {
+        if self.finalized {
+            return Err("STATE_FINISH may execute only once".into());
+        }
+        self.finalized = true;
         Ok(())
     }
 }
@@ -342,7 +490,7 @@ fn runtime_to_state_value(
                 .ok_or_else(|| "state handle target does not exist".to_string())?
                 .generation;
             Ok(StateValue::Handle(StateHandle {
-                module_id: staging.module_id,
+                domain: staging.domain,
                 stable_id,
                 generation,
             }))
@@ -375,16 +523,23 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
     }
 }
 
-fn remap_state_handles(value: &mut StateValue, forwarding: &BTreeMap<StableId, StableId>) {
+fn remap_state_handles(
+    value: &mut StateValue,
+    forwarding: &BTreeMap<StableId, StableId>,
+    generations: &BTreeMap<StableId, u32>,
+) {
     match value {
         StateValue::Handle(handle) => {
             if let Some(target) = forwarding.get(&handle.stable_id) {
                 handle.stable_id = *target;
+                if let Some(generation) = generations.get(target) {
+                    handle.generation = *generation;
+                }
             }
         }
         StateValue::Object(object) => {
             for value in object.fields.values_mut() {
-                remap_state_handles(value, forwarding);
+                remap_state_handles(value, forwarding, generations);
             }
         }
         StateValue::I32(_) | StateValue::Bool(_) | StateValue::Ref(_) => {}
@@ -400,50 +555,6 @@ fn collect_state_roots(value: &StateValue, roots: &mut Vec<GcRef>) {
             }
         }
         StateValue::I32(_) | StateValue::Bool(_) | StateValue::Handle(_) => {}
-    }
-}
-
-fn migrate_state_value(
-    value: &StateValue,
-    module_id: u32,
-    schema: &nexa_bytecode::StateSchema,
-) -> Result<StateValue, StatefulError> {
-    let StateValue::Object(object) = value else {
-        return Ok(match value {
-            StateValue::Handle(handle) => StateValue::Handle(StateHandle {
-                module_id,
-                stable_id: handle.stable_id,
-                generation: handle.generation,
-            }),
-            value => value.clone(),
-        });
-    };
-    let state_type = schema
-        .types
-        .iter()
-        .find(|state_type| state_type.stable_id == object.type_id)
-        .ok_or(StatefulError::Missing(object.type_id))?;
-    let mut fields = BTreeMap::new();
-    for field in &state_type.fields {
-        let value = if let Some(value) = object.fields.get(&field.stable_id) {
-            migrate_state_value(value, module_id, schema)?
-        } else {
-            default_state_value(field.ty).ok_or(StatefulError::Missing(field.stable_id))?
-        };
-        fields.insert(field.stable_id, value);
-    }
-    Ok(StateValue::Object(StateObject {
-        type_id: object.type_id,
-        version: state_type.version,
-        fields,
-    }))
-}
-
-fn default_state_value(ty: nexa_bytecode::ValueType) -> Option<StateValue> {
-    match ty {
-        nexa_bytecode::ValueType::I32 => Some(StateValue::I32(0)),
-        nexa_bytecode::ValueType::Bool => Some(StateValue::Bool(false)),
-        nexa_bytecode::ValueType::Ref | nexa_bytecode::ValueType::Named(_) => None,
     }
 }
 
@@ -512,6 +623,11 @@ pub enum ReloadError {
     EpochNotNewer,
     HostHashMismatch,
     StagingCapacity,
+    MigrationNoOutput,
+    MigrationNotFinished,
+    MissingForwarding,
+    DuplicateForwarding,
+    InvalidStateHandle,
     Migration(String),
     GraphCheck,
     QuiesceTimeout,
@@ -650,11 +766,11 @@ impl std::error::Error for ReloadError {}
 mod tests {
     use nexa_core::StableId;
 
-    use super::{StateValue, StatefulError, StatefulRegistry};
+    use super::{StateValue, StatefulDomainId, StatefulError, StatefulRegistry};
 
     #[test]
-    fn state_handles_are_generation_and_module_checked() {
-        let mut registry = StatefulRegistry::new(1);
+    fn state_handles_are_generation_and_domain_checked() {
+        let mut registry = StatefulRegistry::new(StatefulDomainId::new(1));
         let id = StableId::from_name("score");
         let old = registry.insert(id, StateValue::I32(1)).unwrap();
         let new = registry.insert(id, StateValue::I32(2)).unwrap();

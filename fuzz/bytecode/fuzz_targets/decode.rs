@@ -15,6 +15,7 @@ fuzz_target!(|bytes: &[u8]| {
             max_loop_bounds: 4_096,
             max_host_imports: 1_024,
             max_state_types: 1_024,
+            max_enum_types: 1_024,
             max_exports: 1_024,
         },
     );

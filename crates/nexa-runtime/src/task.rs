@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use nexa_bytecode::ValueType;
+use nexa_bytecode::{AsyncResultType, ValueType};
 use nexa_core::{
     InlineDeltas, MachineKind, RawHandle, ResourceDelta, StableId, TRACE_SCHEMA_VERSION,
     TraceRecord, TransitionDisposition, machine_instance_id, machine_invariant_hash_ids,
@@ -66,6 +66,7 @@ pub(crate) enum TaskExecution {
         request: HostRequestHandle,
         destination: u16,
         expected_type: Option<ValueType>,
+        async_result: Option<AsyncResultType>,
     },
     ReloadPaused(InterpreterContinuation),
     Cancelling(InterpreterContinuation),

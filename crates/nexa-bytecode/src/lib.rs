@@ -1,11 +1,12 @@
 //! Versioned, safe-to-construct Nexa bytecode representation.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use nexa_core::StableId;
 
 pub const MAGIC: [u8; 4] = *b"NXBC";
-pub const BYTECODE_VERSION: u16 = 2;
+pub const BYTECODE_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueType {
@@ -56,6 +57,29 @@ pub enum HostCallMode {
     Async,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CancelPolicy {
+    ReturnError,
+    CancelTask,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AbandonPolicy {
+    ReturnError,
+    Trap,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AsyncResultType {
+    pub result_type: StableId,
+    pub success: ValueType,
+    pub error: ValueType,
+    pub cancel_policy: CancelPolicy,
+    pub abandon_policy: AbandonPolicy,
+    pub cancel_error: Option<u32>,
+    pub abandon_error: Option<u32>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostImport {
     pub stable_id: StableId,
@@ -63,6 +87,82 @@ pub struct HostImport {
     pub result: Option<ValueType>,
     pub mode: HostCallMode,
     pub fuel_cost: u32,
+    pub async_result: Option<AsyncResultType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub stable_id: StableId,
+    pub tag: u32,
+    pub payload_type: Option<ValueType>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumType {
+    pub type_id: StableId,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[must_use]
+pub fn option_type(payload: ValueType) -> EnumType {
+    let type_id = parameterized_type_id("Option", &[payload]);
+    EnumType {
+        type_id,
+        variants: vec![
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Option", "::None"]),
+                tag: 0,
+                payload_type: None,
+            },
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Option", "::Some"]),
+                tag: 1,
+                payload_type: Some(payload),
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn result_type(success: ValueType, error: ValueType) -> EnumType {
+    let type_id = parameterized_type_id("Result", &[success, error]);
+    EnumType {
+        type_id,
+        variants: vec![
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Result", "::Ok"]),
+                tag: 0,
+                payload_type: Some(success),
+            },
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Result", "::Err"]),
+                tag: 1,
+                payload_type: Some(error),
+            },
+        ],
+    }
+}
+
+#[must_use]
+pub fn parameterized_type_id(name: &str, arguments: &[ValueType]) -> StableId {
+    let mut canonical = String::from(name);
+    canonical.push('<');
+    for (index, argument) in arguments.iter().enumerate() {
+        if index != 0 {
+            canonical.push(',');
+        }
+        match argument {
+            ValueType::I32 => canonical.push_str("i32"),
+            ValueType::Bool => canonical.push_str("bool"),
+            ValueType::Ref => canonical.push_str("ref"),
+            ValueType::Named(id) => {
+                use std::fmt::Write;
+                write!(canonical, "named:{:016x}", id.0).expect("String writes do not fail");
+            }
+        }
+    }
+    canonical.push('>');
+    StableId::from_name(&canonical)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,12 +258,37 @@ pub enum Instruction {
         field_id: StableId,
         source: u16,
     },
-    StateHandleRemap {
+    StateReplace {
         old_id: StableId,
         target: u16,
     },
+    StatePreserve {
+        stable_id: StableId,
+    },
     StateDelete {
         stable_id: StableId,
+    },
+    EnumNew {
+        type_id: StableId,
+        variant: StableId,
+        payload: Option<u16>,
+        dst: u16,
+    },
+    EnumTag {
+        source: u16,
+        dst: u16,
+    },
+    EnumPayload {
+        source: u16,
+        variant: StableId,
+        dst: u16,
+    },
+    StateFinish,
+    StateOldFieldGet {
+        object: u16,
+        field_id: StableId,
+        ty: ValueType,
+        dst: u16,
     },
     DeferPush {
         function: u32,
@@ -198,6 +323,7 @@ pub struct Function {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
     pub functions: Vec<Function>,
+    pub enum_types: Vec<EnumType>,
     pub host_imports: Vec<HostImport>,
     pub exports: Vec<ScriptExport>,
     pub state_schema: StateSchema,
@@ -231,6 +357,7 @@ pub struct DecodeLimits {
     pub max_loop_bounds: usize,
     pub max_host_imports: usize,
     pub max_state_types: usize,
+    pub max_enum_types: usize,
     pub max_exports: usize,
 }
 
@@ -246,6 +373,7 @@ impl Default for DecodeLimits {
             max_loop_bounds: 1_000_000,
             max_host_imports: 65_536,
             max_state_types: 65_536,
+            max_enum_types: 65_536,
             max_exports: 65_536,
         }
     }
@@ -288,6 +416,42 @@ impl Module {
             output.push(u8::from(import.result.is_some()));
             if let Some(result) = import.result {
                 encode_type(&mut output, result);
+            }
+            output.push(u8::from(import.async_result.is_some()));
+            if let Some(async_result) = import.async_result {
+                put_u64(&mut output, async_result.result_type.0);
+                encode_type(&mut output, async_result.success);
+                encode_type(&mut output, async_result.error);
+                output.push(match async_result.cancel_policy {
+                    CancelPolicy::ReturnError => 0,
+                    CancelPolicy::CancelTask => 1,
+                });
+                output.push(match async_result.abandon_policy {
+                    AbandonPolicy::ReturnError => 0,
+                    AbandonPolicy::Trap => 1,
+                });
+                put_optional_u32(&mut output, async_result.cancel_error);
+                put_optional_u32(&mut output, async_result.abandon_error);
+            }
+        }
+        put_u32(
+            &mut output,
+            u32::try_from(self.enum_types.len()).expect("enum type count exceeds wire format"),
+        );
+        for enum_type in &self.enum_types {
+            put_u64(&mut output, enum_type.type_id.0);
+            put_u16(
+                &mut output,
+                u16::try_from(enum_type.variants.len())
+                    .expect("enum variant count exceeds wire format"),
+            );
+            for variant in &enum_type.variants {
+                put_u64(&mut output, variant.stable_id.0);
+                put_u32(&mut output, variant.tag);
+                output.push(u8::from(variant.payload_type.is_some()));
+                if let Some(payload_type) = variant.payload_type {
+                    encode_type(&mut output, payload_type);
+                }
             }
         }
         put_u32(
@@ -452,13 +616,70 @@ impl Module {
                 1 => Some(decode_type(&mut reader)?),
                 value => return Err(DecodeError::InvalidBoolean(value)),
             };
+            let async_result = match reader.u8()? {
+                0 => None,
+                1 => {
+                    let result_type = StableId(reader.u64()?);
+                    let success = decode_type(&mut reader)?;
+                    let error = decode_type(&mut reader)?;
+                    let cancel_policy = match reader.u8()? {
+                        0 => CancelPolicy::ReturnError,
+                        1 => CancelPolicy::CancelTask,
+                        value => return Err(DecodeError::InvalidType(value)),
+                    };
+                    let abandon_policy = match reader.u8()? {
+                        0 => AbandonPolicy::ReturnError,
+                        1 => AbandonPolicy::Trap,
+                        value => return Err(DecodeError::InvalidType(value)),
+                    };
+                    let cancel_error = read_optional_u32(&mut reader)?;
+                    let abandon_error = read_optional_u32(&mut reader)?;
+                    Some(AsyncResultType {
+                        result_type,
+                        success,
+                        error,
+                        cancel_policy,
+                        abandon_policy,
+                        cancel_error,
+                        abandon_error,
+                    })
+                }
+                value => return Err(DecodeError::InvalidBoolean(value)),
+            };
             host_imports.push(HostImport {
                 stable_id,
                 parameters,
                 result,
                 mode,
                 fuel_cost,
+                async_result,
             });
+        }
+        let enum_type_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if enum_type_count > limits.max_enum_types {
+            return Err(DecodeError::ResourceLimit("enum types"));
+        }
+        let mut enum_types = Vec::with_capacity(enum_type_count);
+        for _ in 0..enum_type_count {
+            let type_id = StableId(reader.u64()?);
+            let variant_count = usize::from(reader.u16()?);
+            let mut variants = Vec::with_capacity(variant_count);
+            for _ in 0..variant_count {
+                let stable_id = StableId(reader.u64()?);
+                let tag = reader.u32()?;
+                let payload_type = match reader.u8()? {
+                    0 => None,
+                    1 => Some(decode_type(&mut reader)?),
+                    value => return Err(DecodeError::InvalidBoolean(value)),
+                };
+                variants.push(EnumVariant {
+                    stable_id,
+                    tag,
+                    payload_type,
+                });
+            }
+            enum_types.push(EnumType { type_id, variants });
         }
         let state_type_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
@@ -642,6 +863,7 @@ impl Module {
         }
         Ok(Self {
             functions,
+            enum_types,
             host_imports,
             exports,
             state_schema: StateSchema { types: state_types },
@@ -881,7 +1103,7 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u64(output, field_id.0);
             put_u16(output, source);
         }
-        Instruction::StateHandleRemap { old_id, target } => {
+        Instruction::StateReplace { old_id, target } => {
             output.push(22);
             put_u64(output, old_id.0);
             put_u16(output, target);
@@ -889,6 +1111,53 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
         Instruction::StateDelete { stable_id } => {
             output.push(23);
             put_u64(output, stable_id.0);
+        }
+        Instruction::EnumNew {
+            type_id,
+            variant,
+            payload,
+            dst,
+        } => {
+            output.push(24);
+            put_u64(output, type_id.0);
+            put_u64(output, variant.0);
+            output.push(u8::from(payload.is_some()));
+            if let Some(payload) = payload {
+                put_u16(output, payload);
+            }
+            put_u16(output, dst);
+        }
+        Instruction::EnumTag { source, dst } => {
+            output.push(25);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::EnumPayload {
+            source,
+            variant,
+            dst,
+        } => {
+            output.push(26);
+            put_u16(output, source);
+            put_u64(output, variant.0);
+            put_u16(output, dst);
+        }
+        Instruction::StatePreserve { stable_id } => {
+            output.push(27);
+            put_u64(output, stable_id.0);
+        }
+        Instruction::StateFinish => output.push(28),
+        Instruction::StateOldFieldGet {
+            object,
+            field_id,
+            ty,
+            dst,
+        } => {
+            output.push(29);
+            put_u16(output, object);
+            put_u64(output, field_id.0);
+            encode_type(output, ty);
+            put_u16(output, dst);
         }
         Instruction::Return { source } => {
             output.push(10);
@@ -913,6 +1182,7 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeError> {
     Ok(match reader.u8()? {
         0 => Instruction::LoadI32 {
@@ -991,12 +1261,41 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             field_id: StableId(reader.u64()?),
             source: reader.u16()?,
         },
-        22 => Instruction::StateHandleRemap {
+        22 => Instruction::StateReplace {
             old_id: StableId(reader.u64()?),
             target: reader.u16()?,
         },
         23 => Instruction::StateDelete {
             stable_id: StableId(reader.u64()?),
+        },
+        24 => Instruction::EnumNew {
+            type_id: StableId(reader.u64()?),
+            variant: StableId(reader.u64()?),
+            payload: match reader.u8()? {
+                0 => None,
+                1 => Some(reader.u16()?),
+                value => return Err(DecodeError::InvalidBoolean(value)),
+            },
+            dst: reader.u16()?,
+        },
+        25 => Instruction::EnumTag {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        26 => Instruction::EnumPayload {
+            source: reader.u16()?,
+            variant: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        27 => Instruction::StatePreserve {
+            stable_id: StableId(reader.u64()?),
+        },
+        28 => Instruction::StateFinish,
+        29 => Instruction::StateOldFieldGet {
+            object: reader.u16()?,
+            field_id: StableId(reader.u64()?),
+            ty: decode_type(reader)?,
+            dst: reader.u16()?,
         },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
@@ -1021,10 +1320,25 @@ fn put_optional_id(output: &mut Vec<u8>, value: Option<StableId>) {
     }
 }
 
+fn put_optional_u32(output: &mut Vec<u8>, value: Option<u32>) {
+    output.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        put_u32(output, value);
+    }
+}
+
 fn read_optional_id(reader: &mut Reader<'_>) -> Result<Option<StableId>, DecodeError> {
     match reader.u8()? {
         0 => Ok(None),
         1 => Ok(Some(StableId(reader.u64()?))),
+        value => Err(DecodeError::InvalidBoolean(value)),
+    }
+}
+
+fn read_optional_u32(reader: &mut Reader<'_>) -> Result<Option<u32>, DecodeError> {
+    match reader.u8()? {
+        0 => Ok(None),
+        1 => Ok(Some(reader.u32()?)),
         value => Err(DecodeError::InvalidBoolean(value)),
     }
 }
@@ -1090,6 +1404,7 @@ impl std::error::Error for BuildError {}
 #[derive(Default)]
 pub struct ModuleBuilder {
     functions: Vec<Function>,
+    enum_types: Vec<EnumType>,
     host_imports: Vec<HostImport>,
     exports: Vec<ScriptExport>,
     state_schema: StateSchema,
@@ -1102,6 +1417,7 @@ impl ModuleBuilder {
     pub const fn new() -> Self {
         Self {
             functions: Vec::new(),
+            enum_types: Vec::new(),
             host_imports: Vec::new(),
             exports: Vec::new(),
             state_schema: StateSchema { types: Vec::new() },
@@ -1128,6 +1444,11 @@ impl ModuleBuilder {
         id
     }
 
+    pub fn enum_type(&mut self, enum_type: EnumType) -> &mut Self {
+        self.enum_types.push(enum_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -1142,6 +1463,7 @@ impl ModuleBuilder {
     pub fn finish(self) -> Module {
         Module {
             functions: self.functions,
+            enum_types: self.enum_types,
             host_imports: self.host_imports,
             exports: self.exports,
             state_schema: self.state_schema,
@@ -1237,6 +1559,19 @@ impl FunctionBuilder {
                 );
                 (pc == 0 || explicit || back_edge).then_some(pc)
             })
+            .chain(
+                self.code
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(pc, instruction)| {
+                        (matches!(instruction, Instruction::HostCall { .. })
+                            && pc + 1 < self.code.len())
+                        .then(|| u32::try_from(pc + 1).ok())
+                        .flatten()
+                    }),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect::<Vec<_>>();
         let root_maps = safepoints
             .iter()

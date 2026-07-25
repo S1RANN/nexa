@@ -1,6 +1,10 @@
 use std::collections::VecDeque;
 use std::fmt;
 
+use nexa_core::StableId;
+
+use crate::RuntimeValue;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GcRef {
     pub index: u32,
@@ -12,8 +16,15 @@ pub enum Object {
     String(String),
     I32Array(Vec<i32>),
     Map(Vec<(String, GcRef)>),
-    Enum { tag: u32, payload: Option<GcRef> },
-    Class { fields: Vec<GcRef> },
+    Enum {
+        type_id: StableId,
+        variant: StableId,
+        tag: u32,
+        payload: Option<RuntimeValue>,
+    },
+    Class {
+        fields: Vec<GcRef>,
+    },
 }
 
 impl Object {
@@ -21,7 +32,15 @@ impl Object {
         match self {
             Self::Class { fields } => fields.clone(),
             Self::Map(entries) => entries.iter().map(|(_, value)| *value).collect(),
-            Self::Enum { payload, .. } => payload.iter().copied().collect(),
+            Self::Enum { payload, .. } => payload
+                .iter()
+                .filter_map(|payload| match payload {
+                    RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
+                        Some(*reference)
+                    }
+                    _ => None,
+                })
+                .collect(),
             Self::String(_) | Self::I32Array(_) => Vec::new(),
         }
     }
@@ -123,6 +142,61 @@ impl Heap {
             index,
             generation: 0,
         })
+    }
+
+    pub fn allocate_enum(
+        &mut self,
+        type_id: StableId,
+        variant: StableId,
+        tag: u32,
+        payload: Option<RuntimeValue>,
+    ) -> Result<RuntimeValue, HeapError> {
+        let reference = self.allocate(Object::Enum {
+            type_id,
+            variant,
+            tag,
+            payload,
+        })?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub fn enum_tag(&self, value: RuntimeValue) -> Result<u32, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        match self.resolve(reference)? {
+            Object::Enum {
+                type_id: actual,
+                tag,
+                ..
+            } if *actual == type_id => Ok(*tag),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn enum_payload(
+        &self,
+        value: RuntimeValue,
+        expected_variant: StableId,
+    ) -> Result<RuntimeValue, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        match self.resolve(reference)? {
+            Object::Enum {
+                type_id: actual,
+                variant,
+                payload: Some(payload),
+                ..
+            } if *actual == type_id && *variant == expected_variant => Ok(*payload),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
     }
 
     pub fn resolve(&self, reference: GcRef) -> Result<&Object, HeapError> {

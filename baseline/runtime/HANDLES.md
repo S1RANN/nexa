@@ -16,3 +16,12 @@ Resolution order is fixed:
 Reusing a slot increments its generation. A slot is retired before generation wraparound. Stale,
 cross-realm, out-of-range, and terminal-state handles return structured errors and never expose a
 payload reference.
+
+State handles are the exception to module-slot identity. They use:
+
+```text
+{ domain: StatefulDomainId, stable_id: StableId, generation: u32 }
+```
+
+The Stateful Domain survives reload. `STATE_PRESERVE` retains generation, `STATE_REPLACE`
+increments it, and `STATE_DELETE` leaves old handles permanently stale.

@@ -3,8 +3,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    ModuleHandle, PollResult, RealmConfig, RealmRuntime, RuntimeValue, ScopeHandle, StepConfig,
-    TaskHandle, TaskLimits,
+    HostArgs, HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, PollResult, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeValue, ScopeHandle, StepConfig, TaskHandle,
+    TaskLimits,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -46,9 +47,31 @@ pub fn realm_with(
         function.emit(instruction);
     }
     let verified = verified(vec![function.finish().unwrap()]);
-    let mut realm = RealmRuntime::new(RealmConfig::default());
+    let mut realm = RealmRuntime::hosted(
+        RealmConfig::default(),
+        RuntimeHost::new(64),
+        Box::new(NoHost(host)),
+    )
+    .unwrap();
     let module = realm.load_module(verified, host, schema).unwrap();
     (realm, module, host, schema)
+}
+
+struct NoHost(StableId);
+
+impl HostRegistry for NoHost {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
+    fn call(
+        &mut self,
+        id: u32,
+        _: &mut ResourceContext<'_>,
+        _: HostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        Err(HostTrap::UnknownFunction(id))
+    }
 }
 
 #[must_use]

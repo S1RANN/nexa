@@ -11,15 +11,15 @@ carry a monotonic terminal sequence and fixed realm/module/epoch/request identit
 
 Runtime behavior is explicit:
 
-- Success type-checks, writes the destination register, and resumes;
-- Error traps with a typed numeric host error payload and optional owned message;
-- Cancelled terminates the task with `HostCancelled`;
-- Abandoned traps deterministically.
+- typed Success resumes with `Result::Ok`;
+- typed Error resumes with `Result::Err`;
+- Cancelled follows the IDL `ReturnError`/`CancelTask` policy;
+- Abandoned follows the IDL `ReturnError`/`Trap` policy.
 
 ## Zero-allocation release transfer
 
 `RuntimeHost` owns a preallocated `ReleaseNodePool`. Realm and host release queues are intrusive
-lists partitioned by VM, Render, Audio, IO, and Custom domain. Resource creation reserves the node;
+lists partitioned by VM, Render, Audio, and IO. Custom domains are deferred. Resource creation reserves the node;
 terminal cleanup only fills it. Realm flush and Drop splice the lists into RuntimeHost without a
 temporary collection or per-record enqueue.
 
@@ -64,4 +64,5 @@ RetiredEpoch Registry
 Realm Model v3 and explorer-driven differential replay
 ```
 
-Strict Explicit Migration and language-level `Result` remain the next Milestone 3.2 tranche.
+Strict Explicit Migration and the Enum/Option/Result substrate are recorded in
+`reports/milestone3_2_contracts.md`.

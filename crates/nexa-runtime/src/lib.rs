@@ -34,8 +34,8 @@ pub use host::{
     HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestError,
     HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest, ReleaseKind,
     ReleaseQueue, ReleaseQueueError, ReleaseQueueState, RequestTerminalRecord, ResourceContext,
-    ResourceTokenHandle, RuntimeHost, RuntimeHostDomain, RuntimeHostError, RuntimeResourceSnapshot,
-    RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostDomain, RuntimeResourceSnapshot, RuntimeResources,
+    ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
@@ -49,7 +49,9 @@ pub use realm::{
     RootPublicationRecord, RuntimeCapacityReport, TaskTerminalReason, TaskTerminalRecord,
     TickBudget, TickReport,
 };
-pub use reload::{ReloadError, StateHandle, StateObject, StateValue, StatefulError};
+pub use reload::{
+    ReloadError, StateHandle, StateObject, StateValue, StatefulDomainId, StatefulError,
+};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};

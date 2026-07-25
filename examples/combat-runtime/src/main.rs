@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
+use nexa_bytecode::{Instruction, RootMap, ValueType};
 use nexa_core::StableId;
 use nexa_runtime::{
     ActivationEntry, HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime,
@@ -77,11 +78,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = generated::GeneratedHostRegistry::new(EngineHost {
         last_request: Arc::clone(&last_request),
     });
-    let mut realm = RealmRuntime::with_runtime_host(
+    let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
         runtime_host.clone(),
         Box::new(registry),
-    );
+    )?;
     let module = realm.load_module(verified, host_hash, schema_hash)?;
     let enemy_brain = StableId::from_name("EnemyBrain::boss");
     realm.insert_state(
@@ -120,12 +121,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         realm.poll_task(task, 32)?,
         PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
     );
-    let mut pending = last_request
+    let pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
         .expect("animation request was captured by the host");
-    pending.ticket.complete(HostPayload::Opaque(1))?;
+    let mut ticket = generated::AnimationCompletionTicket(pending.ticket);
+    ticket.complete(Ok(1))?;
     realm.tick(TickBudget {
         max_tasks: 1,
         frame_fuel_budget: 32,
@@ -157,6 +159,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_hash,
         schema_hash_v2,
     )?;
+    let mut v2 = v2.into_module();
+    let migration = &mut v2.functions[0];
+    let phase = StableId::from_name("EnemyBrain::phase");
+    let aggression = StableId::from_name("EnemyBrain::aggression");
+    let brain_type = StableId::from_name("EnemyBrain");
+    migration.code = vec![
+        Instruction::StateOldGet {
+            stable_id: enemy_brain,
+            ty: ValueType::Named(brain_type),
+            dst: 1,
+        },
+        Instruction::StateOldFieldGet {
+            object: 1,
+            field_id: phase,
+            ty: ValueType::I32,
+            dst: 2,
+        },
+        Instruction::LoadI32 { dst: 3, value: 0 },
+        Instruction::StateNewCreate {
+            stable_id: enemy_brain,
+            type_id: brain_type,
+            dst: 4,
+        },
+        Instruction::StateNewSet {
+            object: 4,
+            field_id: phase,
+            source: 2,
+        },
+        Instruction::StateNewSet {
+            object: 4,
+            field_id: aggression,
+            source: 3,
+        },
+        Instruction::StateReplace {
+            old_id: enemy_brain,
+            target: 4,
+        },
+        Instruction::StateFinish,
+        Instruction::Return { source: 0 },
+    ];
+    migration.root_bitmap.fill(false);
+    migration.root_bitmap[1] = true;
+    migration.root_bitmap[4] = true;
+    migration.safepoints = vec![0, 8];
+    let mut terminal_roots = vec![false; usize::from(migration.registers)];
+    terminal_roots[1] = true;
+    terminal_roots[4] = true;
+    migration.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: vec![false; usize::from(migration.registers)],
+        },
+        RootMap {
+            pc: 8,
+            bitmap: terminal_roots,
+        },
+    ];
+    let v2 = nexa_verifier::verify(v2, nexa_verifier::VerifierLimits::default())?;
     let v2 = realm.prepare_reload_migrating(module, v2, host_hash)?;
     realm.quiesce_reload()?;
     assert_eq!(
