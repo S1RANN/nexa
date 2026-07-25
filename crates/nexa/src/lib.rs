@@ -5,8 +5,8 @@
 mod error;
 
 pub use error::{
-    ClassifiedError, Diagnostic, ErrorCategory, ErrorCode, ErrorContext, ErrorMetadata,
-    ErrorModuleEpoch, HostError, MigrationError, NexaError,
+    ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, ErrorCodeDefinition,
+    ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, MigrationError, NexaError,
 };
 
 use nexa_bytecode::{DecodeLimits, Module};
@@ -66,8 +66,9 @@ pub mod prelude {
     pub use nexa_verifier::VerifierLimits;
 
     pub use crate::{
-        ClassifiedError, Diagnostic, ErrorCategory, ErrorCode, ErrorContext, ErrorMetadata,
-        ErrorModuleEpoch, HostError, MigrationError, NexaError, compile, compile_file,
-        compile_with_interface, decode_module, verify_module,
+        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
+        ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError,
+        MigrationError, NexaError, compile, compile_file, compile_with_interface, decode_module,
+        verify_module,
     };
 }

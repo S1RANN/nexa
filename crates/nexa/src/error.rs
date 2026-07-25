@@ -14,6 +14,41 @@ use nexa_verifier::{VerifyError, VerifyErrorKind};
 pub struct ErrorCode(&'static str);
 
 impl ErrorCode {
+    pub const NX1001: Self = Self::new("NX1001");
+    pub const NX1002: Self = Self::new("NX1002");
+    pub const NX2001: Self = Self::new("NX2001");
+    pub const NX2002: Self = Self::new("NX2002");
+    pub const NX2101: Self = Self::new("NX2101");
+    pub const NX2201: Self = Self::new("NX2201");
+    pub const NX2202: Self = Self::new("NX2202");
+    pub const NX2210: Self = Self::new("NX2210");
+    pub const NX2220: Self = Self::new("NX2220");
+    pub const NX2221: Self = Self::new("NX2221");
+    pub const NX2301: Self = Self::new("NX2301");
+    pub const NX2302: Self = Self::new("NX2302");
+    pub const NX2401: Self = Self::new("NX2401");
+    pub const NX2501: Self = Self::new("NX2501");
+    pub const NX2601: Self = Self::new("NX2601");
+    pub const NX2602: Self = Self::new("NX2602");
+    pub const NX2603: Self = Self::new("NX2603");
+    pub const NX2604: Self = Self::new("NX2604");
+    pub const NX3001: Self = Self::new("NX3001");
+    pub const NX3002: Self = Self::new("NX3002");
+    pub const NX3003: Self = Self::new("NX3003");
+    pub const NX3004: Self = Self::new("NX3004");
+    pub const NX4001: Self = Self::new("NX4001");
+    pub const NX4002: Self = Self::new("NX4002");
+    pub const NX4003: Self = Self::new("NX4003");
+    pub const NX5001: Self = Self::new("NX5001");
+    pub const NX5002: Self = Self::new("NX5002");
+    pub const NX5003: Self = Self::new("NX5003");
+    pub const NX5004: Self = Self::new("NX5004");
+    pub const NX6001: Self = Self::new("NX6001");
+    pub const NX6002: Self = Self::new("NX6002");
+    pub const NX6003: Self = Self::new("NX6003");
+    pub const NX6004: Self = Self::new("NX6004");
+    pub const NX6005: Self = Self::new("NX6005");
+
     #[must_use]
     pub const fn new(value: &'static str) -> Self {
         Self(value)
@@ -23,6 +58,13 @@ impl ErrorCode {
     pub const fn as_str(self) -> &'static str {
         self.0
     }
+
+    #[must_use]
+    pub fn definition(self) -> Option<&'static ErrorCodeDefinition> {
+        ERROR_CODE_TABLE
+            .iter()
+            .find(|definition| definition.code == self)
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -30,6 +72,57 @@ impl fmt::Display for ErrorCode {
         formatter.write_str(self.0)
     }
 }
+
+/// One immutable entry in Nexa's public diagnostic-code registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErrorCodeDefinition {
+    pub code: ErrorCode,
+    pub summary: &'static str,
+}
+
+impl ErrorCodeDefinition {
+    const fn new(code: ErrorCode, summary: &'static str) -> Self {
+        Self { code, summary }
+    }
+}
+
+/// The complete Milestone 4.0 stable error-code registry, ordered by code.
+pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
+    ErrorCodeDefinition::new(ErrorCode::NX1001, "Unexpected character"),
+    ErrorCodeDefinition::new(ErrorCode::NX1002, "Unexpected token"),
+    ErrorCodeDefinition::new(ErrorCode::NX2001, "Unknown name"),
+    ErrorCodeDefinition::new(ErrorCode::NX2002, "Unknown type"),
+    ErrorCodeDefinition::new(ErrorCode::NX2101, "Type mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX2201, "Non-exhaustive match"),
+    ErrorCodeDefinition::new(ErrorCode::NX2202, "Duplicate match variant"),
+    ErrorCodeDefinition::new(ErrorCode::NX2210, "Cannot infer constructor type"),
+    ErrorCodeDefinition::new(ErrorCode::NX2220, "? requires Result"),
+    ErrorCodeDefinition::new(ErrorCode::NX2221, "? error mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX2301, "Await outside Task"),
+    ErrorCodeDefinition::new(ErrorCode::NX2302, "Missing await"),
+    ErrorCodeDefinition::new(ErrorCode::NX2401, "Invalid numeric conversion"),
+    ErrorCodeDefinition::new(ErrorCode::NX2501, "Invalid field access"),
+    ErrorCodeDefinition::new(ErrorCode::NX2601, "Migration intrinsic outside Migration"),
+    ErrorCodeDefinition::new(ErrorCode::NX2602, "Missing finish_migration"),
+    ErrorCodeDefinition::new(ErrorCode::NX2603, "Missing forwarding"),
+    ErrorCodeDefinition::new(ErrorCode::NX2604, "Duplicate forwarding"),
+    ErrorCodeDefinition::new(ErrorCode::NX3001, "Invalid bytecode section"),
+    ErrorCodeDefinition::new(ErrorCode::NX3002, "Invalid register range"),
+    ErrorCodeDefinition::new(ErrorCode::NX3003, "Invalid root map"),
+    ErrorCodeDefinition::new(ErrorCode::NX3004, "Invalid SourceMap"),
+    ErrorCodeDefinition::new(ErrorCode::NX4001, "Host interface mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX4002, "Host capability unavailable"),
+    ErrorCodeDefinition::new(ErrorCode::NX4003, "Host argument mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX5001, "Host result mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX5002, "Host abandoned"),
+    ErrorCodeDefinition::new(ErrorCode::NX5003, "Unknown host error code"),
+    ErrorCodeDefinition::new(ErrorCode::NX5004, "Runtime resource capacity"),
+    ErrorCodeDefinition::new(ErrorCode::NX6001, "Migration limit"),
+    ErrorCodeDefinition::new(ErrorCode::NX6002, "Migration graph failure"),
+    ErrorCodeDefinition::new(ErrorCode::NX6003, "Activation failure"),
+    ErrorCodeDefinition::new(ErrorCode::NX6004, "Reload completion capacity"),
+    ErrorCodeDefinition::new(ErrorCode::NX6005, "Invalid ReloadMetadata"),
+];
 
 /// The stable top-level class of an error crossing the Nexa facade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -159,7 +252,7 @@ impl ClassifiedError for HostError {
             code: match self {
                 Self::Trap(trap) => host_trap_code(trap),
                 Self::Request(error) => host_request_code(error),
-                Self::Lifecycle(_) => ErrorCode::new("NX5004"),
+                Self::Lifecycle(_) => ErrorCode::NX5004,
                 Self::Realm(error) => realm_error_code(error),
             },
             category: ErrorCategory::Host,
@@ -193,8 +286,8 @@ impl ClassifiedError for MigrationError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
             code: match self {
-                Self::State(_) => ErrorCode::new("NX6002"),
-                Self::Limit(_) => ErrorCode::new("NX6001"),
+                Self::State(_) => ErrorCode::NX6002,
+                Self::Limit(_) => ErrorCode::NX6001,
             },
             category: ErrorCategory::Migration,
             context: ErrorContext::default(),
@@ -351,7 +444,7 @@ impl From<MigrationLimitError> for NexaError {
 impl ClassifiedError for DecodeError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: ErrorCode::new("NX3001"),
+            code: ErrorCode::NX3001,
             category: ErrorCategory::Decode,
             context: ErrorContext::default(),
         }
@@ -364,12 +457,12 @@ impl ClassifiedError for VerifyError {
             VerifyErrorKind::RegisterOutOfRange(_)
             | VerifyErrorKind::FunctionOutOfRange(_)
             | VerifyErrorKind::HostImportOutOfRange(_)
-            | VerifyErrorKind::ExportOutOfRange(_) => ErrorCode::new("NX3002"),
+            | VerifyErrorKind::ExportOutOfRange(_) => ErrorCode::NX3002,
             VerifyErrorKind::RootBitmapLength
             | VerifyErrorKind::ForgedRoot(_)
             | VerifyErrorKind::MissingRoot(_)
-            | VerifyErrorKind::InvalidRootMap(_) => ErrorCode::new("NX3003"),
-            _ => ErrorCode::new("NX3001"),
+            | VerifyErrorKind::InvalidRootMap(_) => ErrorCode::NX3003,
+            _ => ErrorCode::NX3001,
         };
         ErrorMetadata {
             code,
@@ -383,10 +476,8 @@ impl ClassifiedError for RuntimeError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
             code: match self {
-                Self::ResourceLimit(_) => ErrorCode::new("NX5004"),
-                Self::Scope(_) | Self::Task(_) | Self::InjectedFailure(_) => {
-                    ErrorCode::new("NX5001")
-                }
+                Self::ResourceLimit(_) => ErrorCode::NX5004,
+                Self::Scope(_) | Self::Task(_) | Self::InjectedFailure(_) => ErrorCode::NX5001,
             },
             category: ErrorCategory::Runtime,
             context: ErrorContext::default(),
@@ -397,13 +488,13 @@ impl ClassifiedError for RuntimeError {
 impl ClassifiedError for ReloadError {
     fn metadata(&self) -> ErrorMetadata {
         let code = match self {
-            Self::CompletionBufferCapacity => ErrorCode::new("NX6004"),
-            Self::MigrationLimit(_) => ErrorCode::new("NX6001"),
+            Self::CompletionBufferCapacity => ErrorCode::NX6004,
+            Self::MigrationLimit(_) => ErrorCode::NX6001,
             Self::GraphCheck | Self::MissingForwarding | Self::DuplicateForwarding => {
-                ErrorCode::new("NX6002")
+                ErrorCode::NX6002
             }
-            Self::Activation(_) => ErrorCode::new("NX6003"),
-            Self::HostHashMismatch => ErrorCode::new("NX4001"),
+            Self::Activation(_) => ErrorCode::NX6003,
+            Self::HostHashMismatch => ErrorCode::NX4001,
             Self::InvalidState
             | Self::EpochNotNewer
             | Self::StagingCapacity
@@ -411,7 +502,7 @@ impl ClassifiedError for ReloadError {
             | Self::MigrationNotFinished
             | Self::InvalidStateHandle
             | Self::Migration(_)
-            | Self::QuiesceTimeout => ErrorCode::new("NX6005"),
+            | Self::QuiesceTimeout => ErrorCode::NX6005,
         };
         ErrorMetadata {
             code,
@@ -444,7 +535,7 @@ impl ClassifiedError for HostRequestError {
 impl ClassifiedError for RuntimeHostCloseError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: ErrorCode::new("NX5004"),
+            code: ErrorCode::NX5004,
             category: ErrorCategory::Host,
             context: ErrorContext::default(),
         }
@@ -470,7 +561,7 @@ impl ClassifiedError for RealmError {
 impl ClassifiedError for StatefulError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: ErrorCode::new("NX6002"),
+            code: ErrorCode::NX6002,
             category: ErrorCategory::Migration,
             context: ErrorContext::default(),
         }
@@ -480,7 +571,7 @@ impl ClassifiedError for StatefulError {
 impl ClassifiedError for MigrationLimitError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: ErrorCode::new("NX6001"),
+            code: ErrorCode::NX6001,
             category: ErrorCategory::Migration,
             context: ErrorContext::default(),
         }
@@ -505,22 +596,20 @@ fn compile_error_span(error: &CompileError, file: FileId) -> Option<SourceSpan> 
 
 fn compile_error_code(error: &CompileError) -> ErrorCode {
     match error {
-        CompileError::UnexpectedCharacter { .. } => ErrorCode::new("NX1001"),
-        CompileError::UnexpectedToken { .. } | CompileError::UnexpectedEnd => {
-            ErrorCode::new("NX1002")
-        }
-        CompileError::UnknownName(_) | CompileError::DuplicateName(_) => ErrorCode::new("NX2001"),
+        CompileError::UnexpectedCharacter { .. } => ErrorCode::NX1001,
+        CompileError::UnexpectedToken { .. } | CompileError::UnexpectedEnd => ErrorCode::NX1002,
+        CompileError::UnknownName(_) | CompileError::DuplicateName(_) => ErrorCode::NX2001,
         CompileError::UnknownType(_)
         | CompileError::MissingReturn
         | CompileError::SuspendingDefer
         | CompileError::DeferCaptureLimit
         | CompileError::InvalidEffect
         | CompileError::TooManyRegisters
-        | CompileError::Verify(_) => ErrorCode::new("NX2002"),
-        CompileError::TypeMismatch => ErrorCode::new("NX2101"),
-        CompileError::CannotInferType => ErrorCode::new("NX2210"),
-        CompileError::NonExhaustiveMatch => ErrorCode::new("NX2201"),
-        CompileError::DuplicateMatchVariant => ErrorCode::new("NX2202"),
+        | CompileError::Verify(_) => ErrorCode::NX2002,
+        CompileError::TypeMismatch => ErrorCode::NX2101,
+        CompileError::CannotInferType => ErrorCode::NX2210,
+        CompileError::NonExhaustiveMatch => ErrorCode::NX2201,
+        CompileError::DuplicateMatchVariant => ErrorCode::NX2202,
     }
 }
 
@@ -557,40 +646,38 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
 
 fn host_trap_code(error: &HostTrap) -> ErrorCode {
     match error {
-        HostTrap::UnknownFunction(_) => ErrorCode::new("NX4001"),
-        HostTrap::Arity | HostTrap::Type => ErrorCode::new("NX4003"),
-        HostTrap::Panicked | HostTrap::Host(_) => ErrorCode::new("NX5001"),
+        HostTrap::UnknownFunction(_) => ErrorCode::NX4001,
+        HostTrap::Arity | HostTrap::Type => ErrorCode::NX4003,
+        HostTrap::Panicked | HostTrap::Host(_) => ErrorCode::NX5001,
     }
 }
 
 fn host_request_code(error: &HostRequestError) -> ErrorCode {
     match error {
         HostRequestError::CompletionQueueFull | HostRequestError::Allocation(_) => {
-            ErrorCode::new("NX5004")
+            ErrorCode::NX5004
         }
-        HostRequestError::UnknownCustomDomain(_) => ErrorCode::new("NX4002"),
+        HostRequestError::UnknownCustomDomain(_) => ErrorCode::NX4002,
         HostRequestError::Handle(_)
         | HostRequestError::ReleaseQueue(_)
         | HostRequestError::HostClosing
         | HostRequestError::HostClosed
         | HostRequestError::CompletionQueueClosed
         | HostRequestError::AlreadyCompleted
-        | HostRequestError::InvalidState => ErrorCode::new("NX5001"),
+        | HostRequestError::InvalidState => ErrorCode::NX5001,
     }
 }
 
 fn realm_error_code(error: &RealmError) -> ErrorCode {
     match error {
-        RealmError::HostHashMismatch | RealmError::MissingHostInterfaceHash => {
-            ErrorCode::new("NX4001")
-        }
-        RealmError::HostCapabilitiesUnavailable => ErrorCode::new("NX4002"),
+        RealmError::HostHashMismatch | RealmError::MissingHostInterfaceHash => ErrorCode::NX4001,
+        RealmError::HostCapabilitiesUnavailable => ErrorCode::NX4002,
         RealmError::RuntimeHostClosing
         | RealmError::RuntimeHostClosed
         | RealmError::ModuleAllocation(_)
-        | RealmError::EpochExhausted => ErrorCode::new("NX5004"),
+        | RealmError::EpochExhausted => ErrorCode::NX5004,
         RealmError::Reload(error) => error.metadata().code,
-        RealmError::State(_) | RealmError::SchemaHashMismatch => ErrorCode::new("NX6002"),
+        RealmError::State(_) | RealmError::SchemaHashMismatch => ErrorCode::NX6002,
         RealmError::Runtime(_)
         | RealmError::Interpreter(_)
         | RealmError::Host(_)
@@ -599,7 +686,7 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
         | RealmError::MissingModule(_)
         | RealmError::ModuleNotCallable
         | RealmError::TerminalTask
-        | RealmError::TaskWaiting => ErrorCode::new("NX5001"),
+        | RealmError::TaskWaiting => ErrorCode::NX5001,
     }
 }
 
@@ -614,7 +701,66 @@ mod tests {
     };
     use nexa_verifier::{VerifyError, VerifyErrorKind};
 
-    use super::{ClassifiedError, Diagnostic, ErrorCategory, HostError, MigrationError, NexaError};
+    use super::{
+        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, HostError,
+        MigrationError, NexaError,
+    };
+
+    #[test]
+    fn stable_error_code_table_is_complete_ordered_and_unique() {
+        let expected = [
+            ("NX1001", "Unexpected character"),
+            ("NX1002", "Unexpected token"),
+            ("NX2001", "Unknown name"),
+            ("NX2002", "Unknown type"),
+            ("NX2101", "Type mismatch"),
+            ("NX2201", "Non-exhaustive match"),
+            ("NX2202", "Duplicate match variant"),
+            ("NX2210", "Cannot infer constructor type"),
+            ("NX2220", "? requires Result"),
+            ("NX2221", "? error mismatch"),
+            ("NX2301", "Await outside Task"),
+            ("NX2302", "Missing await"),
+            ("NX2401", "Invalid numeric conversion"),
+            ("NX2501", "Invalid field access"),
+            ("NX2601", "Migration intrinsic outside Migration"),
+            ("NX2602", "Missing finish_migration"),
+            ("NX2603", "Missing forwarding"),
+            ("NX2604", "Duplicate forwarding"),
+            ("NX3001", "Invalid bytecode section"),
+            ("NX3002", "Invalid register range"),
+            ("NX3003", "Invalid root map"),
+            ("NX3004", "Invalid SourceMap"),
+            ("NX4001", "Host interface mismatch"),
+            ("NX4002", "Host capability unavailable"),
+            ("NX4003", "Host argument mismatch"),
+            ("NX5001", "Host result mismatch"),
+            ("NX5002", "Host abandoned"),
+            ("NX5003", "Unknown host error code"),
+            ("NX5004", "Runtime resource capacity"),
+            ("NX6001", "Migration limit"),
+            ("NX6002", "Migration graph failure"),
+            ("NX6003", "Activation failure"),
+            ("NX6004", "Reload completion capacity"),
+            ("NX6005", "Invalid ReloadMetadata"),
+        ];
+
+        let actual = ERROR_CODE_TABLE
+            .iter()
+            .map(|definition| (definition.code.as_str(), definition.summary))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert!(
+            ERROR_CODE_TABLE
+                .windows(2)
+                .all(|pair| pair[0].code < pair[1].code)
+        );
+        assert_eq!(
+            ErrorCode::NX6005.definition().map(|entry| entry.summary),
+            Some("Invalid ReloadMetadata")
+        );
+        assert_eq!(ErrorCode::new("NX9999").definition(), None);
+    }
 
     #[test]
     fn every_public_error_class_has_structured_metadata() {
