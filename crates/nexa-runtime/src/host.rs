@@ -500,35 +500,77 @@ impl RuntimeHost {
     #[must_use]
     pub fn drain_releases(&self) -> Vec<ReleaseRecord> {
         let capacity = self.pending_releases();
-        let mut records = Vec::with_capacity(capacity);
-        for domain in RuntimeHostDomain::ALL {
-            records.extend(self.drain(domain, usize::MAX));
-        }
+        let mut records = vec![
+            ReleaseRecord {
+                realm_id: 0,
+                module_id: 0,
+                epoch: 0,
+                kind: ReleaseKind::HostRequest,
+                object_id: 0,
+                domain: RuntimeHostDomain::VmThread,
+            };
+            capacity
+        ];
+        let count = self.drain_into(&mut records);
+        records.truncate(count);
         records
     }
 
+    #[must_use]
     pub fn drain(&self, domain: RuntimeHostDomain, max_items: usize) -> Vec<ReleaseRecord> {
+        let capacity = max_items.min(self.pending_releases());
+        let mut records = vec![
+            ReleaseRecord {
+                realm_id: 0,
+                module_id: 0,
+                epoch: 0,
+                kind: ReleaseKind::HostRequest,
+                object_id: 0,
+                domain,
+            };
+            capacity
+        ];
+        let count = self.drain_domain_into(domain, &mut records);
+        records.truncate(count);
+        records
+    }
+
+    pub fn drain_into(&self, records: &mut [ReleaseRecord]) -> usize {
+        let mut count = 0;
+        for domain in RuntimeHostDomain::ALL {
+            if count == records.len() {
+                break;
+            }
+            count += self.drain_domain_into(domain, &mut records[count..]);
+        }
+        count
+    }
+
+    pub fn drain_domain_into(
+        &self,
+        domain: RuntimeHostDomain,
+        records: &mut [ReleaseRecord],
+    ) -> usize {
         let bucket = domain.bucket();
         let mut state = self
             .releases
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut records = Vec::with_capacity(max_items.min(state.host_lists[bucket].len));
+        let mut count = 0;
         let ReleaseDomainState { pool, host_lists } = &mut *state;
-        for _ in 0..max_items {
+        for record in records {
             let Some(node) = pop_release_node(pool, &mut host_lists[bucket]) else {
                 break;
             };
-            records.push(
-                pool.nodes[node]
-                    .record
-                    .take()
-                    .expect("queued release node owns a record"),
-            );
+            *record = pool.nodes[node]
+                .record
+                .take()
+                .expect("queued release node owns a record");
             pool.release(node);
+            count += 1;
         }
-        records
+        count
     }
 
     #[must_use]
@@ -729,29 +771,47 @@ impl ReleaseQueue {
     }
 
     pub fn drain(&mut self) -> impl Iterator<Item = ReleaseRecord> {
-        let mut records = Vec::with_capacity(self.queued_len());
+        let mut records = vec![
+            ReleaseRecord {
+                realm_id: 0,
+                module_id: 0,
+                epoch: 0,
+                kind: ReleaseKind::HostRequest,
+                object_id: 0,
+                domain: RuntimeHostDomain::VmThread,
+            };
+            self.queued_len()
+        ];
+        let count = self.drain_into(&mut records);
+        records.truncate(count);
+        records.into_iter()
+    }
+
+    pub fn drain_into(&mut self, records: &mut [ReleaseRecord]) -> usize {
+        let mut count = 0;
         let mut state = self
             .domain
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         for list in &mut self.lists {
-            while let Some(node) = pop_release_node(&mut state.pool, list) {
-                records.push(
-                    state.pool.nodes[node]
-                        .record
-                        .take()
-                        .expect("queued release node owns a record"),
-                );
+            while count < records.len()
+                && let Some(node) = pop_release_node(&mut state.pool, list)
+            {
+                records[count] = state.pool.nodes[node]
+                    .record
+                    .take()
+                    .expect("queued release node owns a record");
                 state.pool.release(node);
+                count += 1;
             }
         }
         drop(state);
-        if !records.is_empty() {
+        if count != 0 {
             self.advance_transfer_generation();
         }
         self.refresh_state();
-        records.into_iter()
+        count
     }
 
     pub fn reparent_realm(&mut self, old_realm: u32, new_realm: u32) {

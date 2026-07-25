@@ -44,7 +44,7 @@ pub use host::{
     HostCompletionResult, HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry,
     HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest,
     RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
-    RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
+    ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
     RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
     RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
 };

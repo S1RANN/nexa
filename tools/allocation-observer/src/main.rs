@@ -12,9 +12,9 @@ use nexa_core::StableId;
 use nexa_runtime::{
     CancelReason, HeapError, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
     HostTrap, HostValue, MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult,
-    RealmConfig, RealmError, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
-    RuntimeLimits, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskRuntime,
-    TaskState, TickBudget, set_migration_allocation_observer,
+    RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeHost,
+    RuntimeHostDomain, RuntimeLimits, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
+    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -61,6 +61,17 @@ fn observed(operation: impl FnOnce()) -> u64 {
     operation();
     ENABLED.store(false, Ordering::SeqCst);
     ALLOCATIONS.load(Ordering::SeqCst)
+}
+
+fn release_buffer<const N: usize>() -> [ReleaseRecord; N] {
+    [ReleaseRecord {
+        realm_id: 0,
+        module_id: 0,
+        epoch: 0,
+        kind: ReleaseKind::HostRequest,
+        object_id: 0,
+        domain: RuntimeHostDomain::VmThread,
+    }; N]
 }
 
 fn migration_observer(
@@ -712,6 +723,171 @@ fn main() {
         let _ = host.begin_close();
         host.try_finish_close().unwrap();
 
+        let host = RuntimeHost::new(4);
+        let (mut realm, module) = make_realm_with_host(host.clone());
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(31)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        realm
+            .create_resource_token(task, RuntimeHostDomain::Render)
+            .unwrap();
+        let token_release = observed(|| {
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                PollResult::Completed(_)
+            ));
+        });
+        drop(realm);
+        let mut drain_records = release_buffer::<2>();
+        let runtime_host_drain = observed(|| {
+            assert_eq!(host.drain_into(&mut drain_records), 1);
+        });
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
+        let host = RuntimeHost::new(4);
+        let (mut realm, module) = make_realm_with_host(host.clone());
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(32)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        realm
+            .create_snapshot(task, Arc::from([1_i32, 2, 3]))
+            .unwrap();
+        let snapshot_release = observed(|| {
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                PollResult::Completed(_)
+            ));
+        });
+        drop(realm);
+        let mut drain_records = release_buffer::<2>();
+        assert_eq!(host.drain_into(&mut drain_records), 1);
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
+        let host = RuntimeHost::new(4);
+        let (mut realm, module) = make_realm_with_host(host.clone());
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(33)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let detached = realm.create_host_request(task).unwrap();
+        realm.wait_for_request(task, detached.request).unwrap();
+        let detached_request_release = observed(|| drop(realm));
+        drop(detached);
+        let mut drain_records = release_buffer::<2>();
+        assert_eq!(host.drain_into(&mut drain_records), 1);
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
+        let retired_host_hash = StableId::from_name("allocation-observer-retired-host");
+        let retired_schema = StableId::from_name("allocation-observer-retired-schema");
+        let host = RuntimeHost::new(4);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            host.clone(),
+            Box::new(NoHost(retired_host_hash)),
+        )
+        .unwrap();
+        let old = realm
+            .load_module(
+                build_retired_epoch_module(retired_host_hash, retired_schema),
+                retired_host_hash,
+                retired_schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                old,
+                2,
+                &[RuntimeValue::I32(34)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 64).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        );
+        realm
+            .create_resource_token(task, RuntimeHostDomain::Io)
+            .unwrap();
+        realm
+            .prepare_reload(
+                old,
+                build_retired_epoch_module(retired_host_hash, retired_schema),
+                retired_host_hash,
+                retired_schema,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm
+            .stage_reload(0, &[RuntimeValue::I32(1)])
+            .unwrap();
+        realm
+            .commit_reload(nexa_runtime::ActivationEntry {
+                function_id: 1,
+                arguments: &[],
+                fuel: 32,
+            })
+            .unwrap();
+        let retired_epoch_final_transfer = observed(|| {
+            realm
+                .tick(TickBudget {
+                    max_tasks: 0,
+                    frame_fuel_budget: 0,
+                    collect_garbage: false,
+                })
+                .unwrap();
+        });
+        assert!(realm.resource_invariants_hold());
+        drop(realm);
+        let mut drain_records = release_buffer::<2>();
+        assert_eq!(host.drain_into(&mut drain_records), 1);
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
         for count in &MIGRATION_COUNTS {
             count.store(0, Ordering::SeqCst);
         }
@@ -758,6 +934,11 @@ fn main() {
             cancel_return_error,
             abandon_return_error,
             heap_full_writeback,
+            token_release,
+            snapshot_release,
+            detached_request_release,
+            runtime_host_drain,
+            retired_epoch_final_transfer,
             realm_drop_transfer,
         ));
     }
@@ -788,6 +969,11 @@ fn main() {
                 cancel_return_error,
                 abandon_return_error,
                 heap_full_writeback,
+                token_release,
+                snapshot_release,
+                detached_request_release,
+                runtime_host_drain,
+                retired_epoch_final_transfer,
                 realm_drop_transfer,
             )| {
                 *promotion
@@ -811,6 +997,11 @@ fn main() {
                     + *cancel_return_error
                     + *abandon_return_error
                     + *heap_full_writeback
+                    + *token_release
+                    + *snapshot_release
+                    + *detached_request_release
+                    + *runtime_host_drain
+                    + *retired_epoch_final_transfer
                     + *realm_drop_transfer
                     == 0
             },
@@ -839,6 +1030,11 @@ fn main() {
             cancel_return_error,
             abandon_return_error,
             heap_full_writeback,
+            token_release,
+            snapshot_release,
+            detached_request_release,
+            runtime_host_drain,
+            retired_epoch_final_transfer,
             realm_drop_transfer,
         )| {
             *promotion
@@ -862,6 +1058,11 @@ fn main() {
                 + *cancel_return_error
                 + *abandon_return_error
                 + *heap_full_writeback
+                + *token_release
+                + *snapshot_release
+                + *detached_request_release
+                + *runtime_host_drain
+                + *retired_epoch_final_transfer
                 + *realm_drop_transfer
                 == 0
         },
@@ -896,8 +1097,8 @@ fn main() {
     println!(
         "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
-            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, realm_drop_transfer)| format!(
-                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
+            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, token_release, snapshot_release, detached_request_release, runtime_host_drain, retired_epoch_final_transfer, realm_drop_transfer)| format!(
+                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"token_release\":{token_release},\"snapshot_release\":{snapshot_release},\"detached_request_release\":{detached_request_release},\"runtime_host_drain\":{runtime_host_drain},\"retired_epoch_final_transfer\":{retired_epoch_final_transfer},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
             .join(","),
@@ -1254,6 +1455,48 @@ fn build_module(
     builder
         .metadata(host, schema)
         .function(function.finish().unwrap());
+    verify(builder.finish(), VerifierLimits::default()).unwrap()
+}
+
+fn build_retired_epoch_module(
+    host: StableId,
+    schema: StableId,
+) -> nexa_verifier::VerifiedModule {
+    let mut migration = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::I32],
+            result: Some(ValueType::I32),
+        },
+        1,
+    );
+    migration
+        .effect(FunctionEffect::Migration)
+        .emit(Instruction::Return { source: 0 });
+    let mut activation = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: None,
+        },
+        0,
+    );
+    activation
+        .effect(FunctionEffect::Immediate)
+        .emit(Instruction::ReturnVoid);
+    let mut task = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::I32],
+            result: Some(ValueType::I32),
+        },
+        1,
+    );
+    task.effect(FunctionEffect::Task)
+        .emit(Instruction::Yield)
+        .emit(Instruction::Return { source: 0 });
+    let mut builder = ModuleBuilder::new();
+    builder.metadata(host, schema);
+    builder.function(migration.finish().unwrap());
+    builder.function(activation.finish().unwrap());
+    builder.function(task.finish().unwrap());
     verify(builder.finish(), VerifierLimits::default()).unwrap()
 }
 
