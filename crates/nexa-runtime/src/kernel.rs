@@ -3,7 +3,7 @@ use crate::RuntimeTrace;
 use crate::scope::{ScopeError, ScopeHandle, ScopeManager, ScopeSnapshot};
 use crate::task::TaskExecution;
 use crate::task::{TaskError, TaskEvent, TaskHandle, TaskManager, TaskSnapshot};
-use crate::{FuelState, InterpreterContinuation};
+use crate::{FuelState, InterpreterContinuation, RuntimeFailureInjector, RuntimeFailurePoint};
 use nexa_core::RawHandle;
 use std::fmt;
 
@@ -70,7 +70,7 @@ pub enum RuntimeError {
     Scope(ScopeError),
     Task(TaskError),
     ResourceLimit(&'static str),
-    InjectedFailure(FailurePoint),
+    InjectedFailure(RuntimeFailurePoint),
 }
 
 impl fmt::Display for RuntimeError {
@@ -82,16 +82,6 @@ impl fmt::Display for RuntimeError {
             Self::InjectedFailure(point) => write!(formatter, "injected failure at {point:?}"),
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FailurePoint {
-    TaskSlotReserve,
-    FrameSegmentReserve,
-    SchedulerTokenReserve,
-    TraceCapacityReserve,
-    ScopeMembership,
-    ContinuationReserve,
 }
 
 impl std::error::Error for RuntimeError {}
@@ -118,7 +108,7 @@ pub struct TaskRuntime {
     available_frame_segments: u32,
     available_scheduler_tokens: u32,
     available_trace_records: u32,
-    injected_failure: Option<FailurePoint>,
+    failure_injector: RuntimeFailureInjector,
 }
 
 impl TaskRuntime {
@@ -132,7 +122,7 @@ impl TaskRuntime {
             available_frame_segments: limits.max_frame_segments,
             available_scheduler_tokens: limits.max_scheduler_tokens,
             available_trace_records: limits.max_trace_records,
-            injected_failure: None,
+            failure_injector: RuntimeFailureInjector::default(),
         }
     }
 
@@ -140,6 +130,7 @@ impl TaskRuntime {
         &mut self,
         parent: Option<ScopeHandle>,
     ) -> Result<ScopeHandle, RuntimeError> {
+        self.fail_if_injected(RuntimeFailurePoint::ScopeSlot)?;
         Ok(self.scopes.create(&mut self.trace, parent)?)
     }
 
@@ -149,28 +140,24 @@ impl TaskRuntime {
         module_epoch: u64,
         continuation_reserved: bool,
     ) -> Result<TaskHandle, RuntimeError> {
-        self.fail_if_injected(FailurePoint::TaskSlotReserve)?;
+        self.fail_if_injected(RuntimeFailurePoint::TaskSlot)?;
         self.require_admission_pool(
-            FailurePoint::FrameSegmentReserve,
+            RuntimeFailurePoint::FrameSlot,
             self.available_frame_segments,
             "frame segment pool",
         )?;
         self.require_admission_pool(
-            FailurePoint::SchedulerTokenReserve,
+            RuntimeFailurePoint::SchedulerSlot,
             self.available_scheduler_tokens,
             "scheduler token pool",
         )?;
-        self.require_admission_pool(
-            FailurePoint::TraceCapacityReserve,
-            self.available_trace_records,
-            "trace capacity pool",
-        )?;
+        if self.available_trace_records == 0 {
+            return Err(RuntimeError::ResourceLimit("trace capacity pool"));
+        }
         let scope = self.scopes.snapshot(owner)?;
         if scope.transient_children >= self.limits.max_transient_children_per_scope {
             return Err(RuntimeError::ResourceLimit("transient child limit"));
         }
-        self.fail_if_injected(FailurePoint::ScopeMembership)?;
-        self.fail_if_injected(FailurePoint::ContinuationReserve)?;
         self.available_frame_segments -= 1;
         self.available_scheduler_tokens -= 1;
         self.available_trace_records -= 1;
@@ -355,8 +342,12 @@ impl TaskRuntime {
         (tasks, self.scopes.live_len(), continuations)
     }
 
-    pub fn inject_failure_once(&mut self, point: FailurePoint) {
-        self.injected_failure = Some(point);
+    pub fn failure_injector(&mut self) -> &mut RuntimeFailureInjector {
+        &mut self.failure_injector
+    }
+
+    pub fn inject_failure_once(&mut self, point: RuntimeFailurePoint) {
+        self.failure_injector.arm_once(point);
     }
 
     pub(crate) fn attach_continuation(
@@ -472,7 +463,7 @@ impl TaskRuntime {
 
     fn require_admission_pool(
         &mut self,
-        point: FailurePoint,
+        point: RuntimeFailurePoint,
         available: u32,
         name: &'static str,
     ) -> Result<(), RuntimeError> {
@@ -490,9 +481,8 @@ impl TaskRuntime {
         self.available_trace_records = self.available_trace_records.saturating_add(1);
     }
 
-    fn fail_if_injected(&mut self, point: FailurePoint) -> Result<(), RuntimeError> {
-        if self.injected_failure == Some(point) {
-            self.injected_failure = None;
+    fn fail_if_injected(&mut self, point: RuntimeFailurePoint) -> Result<(), RuntimeError> {
+        if self.failure_injector.trigger(point) {
             Err(RuntimeError::InjectedFailure(point))
         } else {
             Ok(())
@@ -502,7 +492,8 @@ impl TaskRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::{FailurePoint, RuntimeError, RuntimeLimits, TaskRuntime};
+    use super::{RuntimeError, RuntimeLimits, TaskRuntime};
+    use crate::RuntimeFailurePoint;
 
     #[test]
     fn full_task_pool_and_injected_admission_leave_scope_unchanged() {
@@ -523,12 +514,9 @@ mod tests {
         let mut runtime = TaskRuntime::new(2, RuntimeLimits::default());
         let scope = runtime.create_scope(None).unwrap();
         for point in [
-            FailurePoint::TaskSlotReserve,
-            FailurePoint::FrameSegmentReserve,
-            FailurePoint::SchedulerTokenReserve,
-            FailurePoint::TraceCapacityReserve,
-            FailurePoint::ScopeMembership,
-            FailurePoint::ContinuationReserve,
+            RuntimeFailurePoint::TaskSlot,
+            RuntimeFailurePoint::FrameSlot,
+            RuntimeFailurePoint::SchedulerSlot,
         ] {
             runtime.inject_failure_once(point);
             assert_eq!(

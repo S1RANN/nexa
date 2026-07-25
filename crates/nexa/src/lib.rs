@@ -59,6 +59,7 @@ pub mod prelude {
         HostTrap, HostValue, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
         MigrationUsageReport, ModuleEpochKey, ModuleHandle, PendingHostRequest, PendingReason,
         PollResult, RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle,
+        RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint,
         RuntimeHost, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
         RuntimeHostState, RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot,
         ScriptFunction, SnapshotHandle, StateHandle, StateHandleError, StateValue,

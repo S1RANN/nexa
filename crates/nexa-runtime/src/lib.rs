@@ -1,6 +1,7 @@
 //! Model-driven Nexa runtime primitives.
 
 mod allocation;
+mod failure;
 mod frame;
 mod heap;
 mod host;
@@ -28,7 +29,10 @@ pub use allocation::{
     AllocationBoundary, AllocationSnapshot, MigrationAllocationPhase, allocation_snapshot,
     set_migration_allocation_observer,
 };
-pub use kernel::{FailurePoint, RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
+pub use failure::{
+    RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint,
+};
+pub use kernel::{RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
 pub use nexa_core::StableId;

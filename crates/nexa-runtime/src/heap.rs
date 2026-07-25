@@ -3,7 +3,7 @@ use std::fmt;
 
 use nexa_core::StableId;
 
-use crate::RuntimeValue;
+use crate::{RuntimeFailureInjector, RuntimeFailurePoint, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GcRef {
@@ -56,7 +56,7 @@ struct ObjectSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
-    InjectedAllocationFailure,
+    InjectedFailure(RuntimeFailurePoint),
     InvalidReference(GcRef),
 }
 
@@ -107,7 +107,7 @@ pub struct Heap {
     slots: Vec<ObjectSlot>,
     free: Vec<u32>,
     max_objects: u32,
-    fail_next_allocation: bool,
+    failure_injector: RuntimeFailureInjector,
 }
 
 impl Heap {
@@ -117,7 +117,7 @@ impl Heap {
             slots: Vec::with_capacity(max_objects as usize),
             free: Vec::with_capacity(max_objects as usize),
             max_objects,
-            fail_next_allocation: false,
+            failure_injector: RuntimeFailureInjector::default(),
         }
     }
 
@@ -127,9 +127,8 @@ impl Heap {
     }
 
     pub(crate) fn preflight(&mut self, count: usize) -> Result<HeapReservation, HeapError> {
-        if self.fail_next_allocation {
-            self.fail_next_allocation = false;
-            return Err(HeapError::InjectedAllocationFailure);
+        if self.failure_injector.trigger(RuntimeFailurePoint::HeapSlot) {
+            return Err(HeapError::InjectedFailure(RuntimeFailurePoint::HeapSlot));
         }
         let unused = usize::try_from(self.max_objects)
             .unwrap_or(usize::MAX)
@@ -279,8 +278,8 @@ impl Heap {
         })
     }
 
-    pub fn inject_allocation_failure_once(&mut self) {
-        self.fail_next_allocation = true;
+    pub fn failure_injector(&mut self) -> &mut RuntimeFailureInjector {
+        &mut self.failure_injector
     }
 
     #[must_use]
@@ -299,6 +298,7 @@ impl Heap {
 #[cfg(test)]
 mod tests {
     use super::{GcRoots, Heap, HeapError, Object};
+    use crate::RuntimeFailurePoint;
 
     #[test]
     fn cycles_collect_but_suspended_task_roots_survive() {
@@ -330,10 +330,11 @@ mod tests {
     fn allocation_failure_does_not_drop_live_objects() {
         let mut heap = Heap::new(2);
         let live = heap.allocate(Object::I32Array(vec![1, 2])).unwrap();
-        heap.inject_allocation_failure_once();
+        heap.failure_injector()
+            .arm_once(RuntimeFailurePoint::HeapSlot);
         assert_eq!(
             heap.allocate(Object::String("no".into())),
-            Err(HeapError::InjectedAllocationFailure)
+            Err(HeapError::InjectedFailure(RuntimeFailurePoint::HeapSlot))
         );
         assert!(heap.resolve(live).is_ok());
     }
