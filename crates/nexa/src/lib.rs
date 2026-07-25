@@ -47,8 +47,9 @@ pub fn verify_module(module: Module, limits: VerifierLimits) -> Result<VerifiedM
 pub mod prelude {
     pub use nexa_bytecode::{
         AbandonPolicy, AsyncResultType, CancelPolicy, DecodeLimits, EnumType, EnumVariant,
-        FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder,
-        Signature, StateField, StateSchema, StateType, ValueType, option_type, result_type,
+        FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
+        MigrationLimitRequirements, ModuleBuilder, ReloadMetadata, Signature, StateField,
+        StateSchema, StateType, ValueType, option_type, result_type,
     };
     pub use nexa_core::{FileId, FunctionId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_idl::{exact_hash as exact_idl_hash, generate_rust as generate_rust_bindings};

@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
-use nexa_bytecode::{Function, FunctionEffect, HostCallMode, Instruction, Module, ValueType};
+use nexa_bytecode::{
+    Function, FunctionEffect, HostCallMode, Instruction, Module, ValueType,
+    minimum_migration_limits,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifierLimits {
@@ -56,6 +59,7 @@ pub enum VerifyErrorKind {
     InvalidEnumMetadata,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
+    InvalidReloadMetadata,
 }
 
 impl fmt::Display for VerifyError {
@@ -86,6 +90,7 @@ impl VerifiedModule {
 }
 
 pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
+    verify_reload_metadata(&module)?;
     let mut enum_ids = BTreeSet::new();
     for enum_type in &module.enum_types {
         let mut variant_ids = BTreeSet::new();
@@ -177,6 +182,70 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
         }
     }
     Ok(VerifiedModule(module))
+}
+
+pub fn verify_reload_transition(
+    old: &VerifiedModule,
+    candidate: &VerifiedModule,
+) -> Result<(), VerifyError> {
+    let old_hash = old.module().reload_metadata.stateful_schema_hash;
+    let candidate_metadata = candidate.module().reload_metadata;
+    if old_hash != candidate_metadata.stateful_schema_hash
+        && candidate_metadata.migration_entry.is_none()
+    {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidReloadMetadata,
+        });
+    }
+    Ok(())
+}
+
+fn verify_reload_metadata(module: &Module) -> Result<(), VerifyError> {
+    let invalid = |function| VerifyError {
+        function,
+        instruction: None,
+        kind: VerifyErrorKind::InvalidReloadMetadata,
+    };
+    let migration_entries = module
+        .functions
+        .iter()
+        .enumerate()
+        .filter(|(_, function)| function.effect == FunctionEffect::Migration)
+        .map(|(index, _)| u32::try_from(index).expect("module function count exceeds u32"))
+        .collect::<Vec<_>>();
+    if migration_entries.len() > 1
+        || module.reload_metadata.migration_entry != migration_entries.first().copied()
+    {
+        return Err(invalid(
+            usize::try_from(module.reload_metadata.migration_entry.unwrap_or_default())
+                .unwrap_or(usize::MAX),
+        ));
+    }
+    if let Some(entry) = module.reload_metadata.activation_entry {
+        let entry = usize::try_from(entry).unwrap_or(usize::MAX);
+        let function = module.functions.get(entry).ok_or_else(|| invalid(entry))?;
+        if function.effect != FunctionEffect::Immediate {
+            return Err(invalid(entry));
+        }
+    }
+    let expected_schema_hash = module.state_schema.stable_hash();
+    if module.reload_metadata.stateful_schema_hash != expected_schema_hash {
+        return Err(invalid(0));
+    }
+    let required = minimum_migration_limits(module, module.reload_metadata.migration_entry);
+    if !module
+        .reload_metadata
+        .minimum_migration_limits
+        .satisfies(required)
+    {
+        return Err(invalid(
+            usize::try_from(module.reload_metadata.migration_entry.unwrap_or_default())
+                .unwrap_or(usize::MAX),
+        ));
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -903,10 +972,11 @@ fn longest_path(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature, ValueType,
+        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
+        StateSchema, StateType, ValueType,
     };
 
-    use super::{VerifierLimits, VerifyErrorKind, verify};
+    use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
 
     #[test]
     fn rejects_bad_jump_type_and_forged_root_bitmap() {
@@ -1033,6 +1103,98 @@ mod tests {
             VerifyErrorKind::ImmediateCostLimit
         ));
         assert!(verify(immediate_loop(Some(3)), VerifierLimits::default()).is_ok());
+    }
+
+    #[test]
+    fn reload_metadata_is_verified_independently_of_the_compiler() {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+        let migration = migration.finish().unwrap();
+
+        let mut forged = ModuleBuilder::new();
+        forged.function(migration.clone());
+        let mut forged = forged.finish();
+        forged.reload_metadata.migration_entry = None;
+        assert!(matches!(
+            verify(forged, VerifierLimits::default()).unwrap_err().kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        ));
+
+        let mut underreported = ModuleBuilder::new();
+        underreported.function(migration.clone());
+        let mut underreported = underreported.finish();
+        underreported
+            .reload_metadata
+            .minimum_migration_limits
+            .max_fuel = 0;
+        assert!(matches!(
+            verify(underreported, VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        ));
+
+        let mut duplicate = ModuleBuilder::new();
+        duplicate.function(migration.clone());
+        duplicate.function(migration);
+        assert!(matches!(
+            verify(duplicate.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        ));
+
+        let mut ordinary = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        ordinary.emit(Instruction::ReturnVoid);
+        let ordinary = ordinary.finish().unwrap();
+        let mut invalid_activation = ModuleBuilder::new();
+        invalid_activation.function(ordinary.clone());
+        let mut invalid_activation = invalid_activation.finish();
+        invalid_activation.reload_metadata.activation_entry = Some(0);
+        assert!(matches!(
+            verify(invalid_activation, VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        ));
+
+        let old_hash = nexa_bytecode::StateSchema::default().stable_hash();
+        let mut new_hash = old_hash;
+        new_hash.0 ^= 1;
+        let mut old = ModuleBuilder::new();
+        old.metadata(old_hash, old_hash).function(ordinary.clone());
+        let old = verify(old.finish(), VerifierLimits::default()).unwrap();
+        let mut candidate = ModuleBuilder::new();
+        candidate
+            .metadata(new_hash, new_hash)
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: old_hash,
+                    version: 1,
+                    fields: Vec::new(),
+                }],
+            })
+            .function(ordinary);
+        let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
+        assert!(matches!(
+            verify_reload_transition(&old, &candidate).unwrap_err().kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        ));
     }
 
     #[test]

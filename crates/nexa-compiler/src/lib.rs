@@ -18,6 +18,7 @@ pub enum TokenKind {
     Task,
     Immediate,
     Migration,
+    Activation,
     Cleanup,
     Return,
     Let,
@@ -89,6 +90,7 @@ pub enum CompileError {
     SuspendingDefer,
     DeferCaptureLimit,
     InvalidEffect,
+    InvalidReloadMetadata(&'static str),
     TooManyRegisters,
     Verify(String),
 }
@@ -157,6 +159,7 @@ pub enum AstTypeKind {
 pub struct AstFunction {
     pub name: String,
     pub is_task: bool,
+    pub is_activation: bool,
     pub effect: FunctionEffect,
     pub parameters: Vec<(String, AstType)>,
     pub result: AstType,
@@ -308,6 +311,7 @@ struct HostFunction {
 #[derive(Clone, Debug)]
 struct HirFunction {
     name: String,
+    is_activation: bool,
     effect: FunctionEffect,
     signature: Signature,
     body: Vec<AstStatement>,
@@ -388,6 +392,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "task" => TokenKind::Task,
                     "immediate" => TokenKind::Immediate,
                     "migration" => TokenKind::Migration,
+                    "activation" => TokenKind::Activation,
                     "cleanup" => TokenKind::Cleanup,
                     "return" => TokenKind::Return,
                     "let" => TokenKind::Let,
@@ -446,10 +451,19 @@ impl Parser<'_> {
         let mut types = Vec::new();
         let mut functions = Vec::new();
         while self.cursor < self.tokens.len() {
-            if matches!(
-                self.peek_kind(),
-                Some(TokenKind::Struct | TokenKind::Enum | TokenKind::Class | TokenKind::At)
-            ) {
+            let is_stateful_type = matches!(
+                (
+                    self.peek_kind(),
+                    self.tokens.get(self.cursor + 1).map(|token| &token.kind)
+                ),
+                (Some(TokenKind::At), Some(TokenKind::Stateful))
+            );
+            if is_stateful_type
+                || matches!(
+                    self.peek_kind(),
+                    Some(TokenKind::Struct | TokenKind::Enum | TokenKind::Class)
+                )
+            {
                 types.push(self.type_declaration()?);
             } else {
                 functions.push(self.function()?);
@@ -523,7 +537,13 @@ impl Parser<'_> {
     }
 
     fn function(&mut self) -> Result<AstFunction, CompileError> {
-        let effect = if self.take(&TokenKind::Task) {
+        let is_activation = if self.take(&TokenKind::At) {
+            self.expect(&TokenKind::Activation, "activation")?;
+            true
+        } else {
+            false
+        };
+        let mut effect = if self.take(&TokenKind::Task) {
             FunctionEffect::Task
         } else if self.take(&TokenKind::Immediate) {
             FunctionEffect::Immediate
@@ -534,6 +554,9 @@ impl Parser<'_> {
         } else {
             FunctionEffect::Ordinary
         };
+        if is_activation && effect == FunctionEffect::Ordinary {
+            effect = FunctionEffect::Immediate;
+        }
         let is_task = effect == FunctionEffect::Task;
         self.expect(&TokenKind::Fn, "fn")?;
         let name = self.ident()?;
@@ -556,6 +579,7 @@ impl Parser<'_> {
         Ok(AstFunction {
             name,
             is_task,
+            is_activation,
             effect,
             parameters,
             result,
@@ -1142,6 +1166,36 @@ fn resolve_and_typecheck_with_hosts(
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
 ) -> Result<HirModule, CompileError> {
+    if ast
+        .functions
+        .iter()
+        .filter(|function| function.effect == FunctionEffect::Migration)
+        .count()
+        > 1
+    {
+        return Err(CompileError::InvalidReloadMetadata(
+            "multiple migration entries",
+        ));
+    }
+    let activation_count = ast
+        .functions
+        .iter()
+        .filter(|function| function.is_activation)
+        .count();
+    if activation_count > 1 {
+        return Err(CompileError::InvalidReloadMetadata(
+            "multiple activation entries",
+        ));
+    }
+    if ast
+        .functions
+        .iter()
+        .any(|function| function.is_activation && function.effect != FunctionEffect::Immediate)
+    {
+        return Err(CompileError::InvalidReloadMetadata(
+            "activation entry must have Immediate effect",
+        ));
+    }
     let mut enum_types = ast
         .types
         .iter()
@@ -1319,6 +1373,7 @@ fn resolve_and_typecheck_with_hosts(
         }
         functions.push(HirFunction {
             name: function.name,
+            is_activation: function.is_activation,
             effect: function.effect,
             signature,
             body: function.body,
@@ -2197,7 +2252,20 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             code,
         });
     }
-    Ok(module.finish())
+    let mut module = module.finish();
+    module.reload_metadata.migration_entry = hir
+        .functions
+        .iter()
+        .position(|function| function.effect == FunctionEffect::Migration)
+        .map(|entry| u32::try_from(entry).expect("function count is compiler bounded"));
+    module.reload_metadata.activation_entry = hir
+        .functions
+        .iter()
+        .position(|function| function.is_activation)
+        .map(|entry| u32::try_from(entry).expect("function count is compiler bounded"));
+    module.reload_metadata.minimum_migration_limits =
+        nexa_bytecode::minimum_migration_limits(&module, module.reload_metadata.migration_entry);
+    Ok(module)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3598,5 +3666,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn compiler_emits_reload_entries_and_rejects_ambiguous_metadata() {
+        let module = compile(
+            "@stateful class Store { value: i32; }
+             migration fn migrate() -> bool {
+                 finish_migration();
+                 return true;
+             }
+             @activation fn activate() -> i32 {
+                 return 1;
+             }",
+        )
+        .unwrap();
+        let metadata = module.module().reload_metadata;
+        assert_eq!(metadata.migration_entry, Some(0));
+        assert_eq!(metadata.activation_entry, Some(1));
+        assert_eq!(
+            metadata.stateful_schema_hash,
+            module.module().state_schema.stable_hash()
+        );
+        assert_eq!(
+            module.module().functions[0].effect,
+            FunctionEffect::Migration
+        );
+        assert_eq!(
+            module.module().functions[1].effect,
+            FunctionEffect::Immediate
+        );
+        assert!(metadata.minimum_migration_limits.max_fuel > 0);
+        assert_eq!(metadata.minimum_migration_limits.max_call_depth, 1);
+
+        assert_eq!(
+            compile(
+                "migration fn first() -> bool { return true; }
+                 migration fn second() -> bool { return true; }"
+            )
+            .unwrap_err(),
+            CompileError::InvalidReloadMetadata("multiple migration entries")
+        );
+        assert_eq!(
+            compile(
+                "@activation fn first() -> bool { return true; }
+                 @activation fn second() -> bool { return true; }"
+            )
+            .unwrap_err(),
+            CompileError::InvalidReloadMetadata("multiple activation entries")
+        );
+        assert_eq!(
+            compile("@activation task fn invalid() -> bool { return true; }").unwrap_err(),
+            CompileError::InvalidReloadMetadata("activation entry must have Immediate effect")
+        );
     }
 }

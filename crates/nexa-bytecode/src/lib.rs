@@ -183,6 +183,62 @@ pub struct StateSchema {
     pub types: Vec<StateType>,
 }
 
+impl StateSchema {
+    #[must_use]
+    pub fn stable_hash(&self) -> StableId {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        hash_u64(
+            &mut hash,
+            u64::try_from(self.types.len()).unwrap_or(u64::MAX),
+        );
+        for state_type in &self.types {
+            hash_u64(&mut hash, state_type.stable_id.0);
+            hash_u64(&mut hash, u64::from(state_type.version));
+            hash_u64(
+                &mut hash,
+                u64::try_from(state_type.fields.len()).unwrap_or(u64::MAX),
+            );
+            for field in &state_type.fields {
+                hash_u64(&mut hash, field.stable_id.0);
+                hash_value_type(&mut hash, field.ty);
+            }
+        }
+        StableId(hash)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MigrationLimitRequirements {
+    pub max_objects: u32,
+    pub max_fields: u32,
+    pub max_forwarding_entries: u32,
+    pub max_state_bytes: u64,
+    pub max_gc_roots: u32,
+    pub max_fuel: u64,
+    pub max_call_depth: u16,
+}
+
+impl MigrationLimitRequirements {
+    #[must_use]
+    pub const fn satisfies(self, required: Self) -> bool {
+        self.max_objects >= required.max_objects
+            && self.max_fields >= required.max_fields
+            && self.max_forwarding_entries >= required.max_forwarding_entries
+            && self.max_state_bytes >= required.max_state_bytes
+            && self.max_gc_roots >= required.max_gc_roots
+            && self.max_fuel >= required.max_fuel
+            && self.max_call_depth >= required.max_call_depth
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReloadMetadata {
+    pub migration_entry: Option<u32>,
+    pub activation_entry: Option<u32>,
+    pub stateful_schema_hash: StableId,
+    pub minimum_migration_limits: MigrationLimitRequirements,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScriptExport {
     pub stable_id: StableId,
@@ -329,6 +385,129 @@ pub struct Module {
     pub state_schema: StateSchema,
     pub host_interface_hash: Option<StableId>,
     pub schema_hash: Option<StableId>,
+    pub reload_metadata: ReloadMetadata,
+}
+
+#[must_use]
+pub fn minimum_migration_limits(
+    module: &Module,
+    migration_entry: Option<u32>,
+) -> MigrationLimitRequirements {
+    let Some(entry) = migration_entry.and_then(|entry| usize::try_from(entry).ok()) else {
+        return MigrationLimitRequirements::default();
+    };
+    if entry >= module.functions.len() {
+        return MigrationLimitRequirements::default();
+    }
+
+    let mut reachable = vec![false; module.functions.len()];
+    let mut pending = vec![entry];
+    while let Some(function_index) = pending.pop() {
+        if reachable[function_index] {
+            continue;
+        }
+        reachable[function_index] = true;
+        for instruction in &module.functions[function_index].code {
+            if let Instruction::Call { function, .. } = instruction
+                && let Ok(callee) = usize::try_from(*function)
+                && callee < module.functions.len()
+            {
+                pending.push(callee);
+            }
+        }
+    }
+
+    let mut objects = BTreeSet::new();
+    let mut forwarding = BTreeSet::new();
+    let mut max_fields = 0_u32;
+    let mut max_gc_roots = 0_u32;
+    let mut max_fuel = 0_u64;
+    for (function_index, function) in module.functions.iter().enumerate() {
+        if !reachable[function_index] {
+            continue;
+        }
+        max_fuel = max_fuel.saturating_add(u64::try_from(function.code.len()).unwrap_or(u64::MAX));
+        for root_map in &function.root_maps {
+            let roots = root_map.bitmap.iter().filter(|root| **root).count();
+            max_gc_roots = max_gc_roots.max(u32::try_from(roots).unwrap_or(u32::MAX));
+        }
+        for instruction in &function.code {
+            match instruction {
+                Instruction::StateNewCreate { stable_id, .. } => {
+                    objects.insert(*stable_id);
+                }
+                Instruction::StateNewSet { .. } => {
+                    max_fields = max_fields.saturating_add(1);
+                }
+                Instruction::StateReplace { old_id, .. } => {
+                    forwarding.insert(*old_id);
+                }
+                Instruction::StatePreserve { stable_id } => {
+                    objects.insert(*stable_id);
+                    forwarding.insert(*stable_id);
+                }
+                Instruction::StateDelete { stable_id } => {
+                    forwarding.insert(*stable_id);
+                }
+                _ => {}
+            }
+        }
+    }
+    let max_objects = u32::try_from(objects.len()).unwrap_or(u32::MAX);
+    let max_forwarding_entries = u32::try_from(forwarding.len()).unwrap_or(u32::MAX);
+    let max_state_bytes = u64::from(max_objects)
+        .saturating_mul(32)
+        .saturating_add(u64::from(max_fields).saturating_mul(16));
+    MigrationLimitRequirements {
+        max_objects,
+        max_fields,
+        max_forwarding_entries,
+        max_state_bytes,
+        max_gc_roots,
+        max_fuel,
+        max_call_depth: migration_call_depth(module, entry, &mut Vec::new()),
+    }
+}
+
+fn migration_call_depth(module: &Module, function: usize, visiting: &mut Vec<usize>) -> u16 {
+    if visiting.contains(&function) {
+        return u16::MAX;
+    }
+    let Some(body) = module.functions.get(function) else {
+        return 0;
+    };
+    visiting.push(function);
+    let mut depth = 1_u16;
+    for instruction in &body.code {
+        if let Instruction::Call {
+            function: callee, ..
+        } = instruction
+            && let Ok(callee) = usize::try_from(*callee)
+        {
+            depth = depth.max(migration_call_depth(module, callee, visiting).saturating_add(1));
+        }
+    }
+    visiting.pop();
+    depth
+}
+
+fn hash_u64(hash: &mut u64, value: u64) {
+    for byte in value.to_le_bytes() {
+        *hash ^= u64::from(byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+}
+
+fn hash_value_type(hash: &mut u64, value: ValueType) {
+    match value {
+        ValueType::I32 => hash_u64(hash, 0),
+        ValueType::Bool => hash_u64(hash, 1),
+        ValueType::Ref => hash_u64(hash, 2),
+        ValueType::Named(stable_id) => {
+            hash_u64(hash, 3);
+            hash_u64(hash, stable_id.0);
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -394,6 +573,17 @@ impl Module {
         let mut output = Vec::new();
         put_optional_id(&mut output, self.host_interface_hash);
         put_optional_id(&mut output, self.schema_hash);
+        put_optional_u32(&mut output, self.reload_metadata.migration_entry);
+        put_optional_u32(&mut output, self.reload_metadata.activation_entry);
+        put_u64(&mut output, self.reload_metadata.stateful_schema_hash.0);
+        let migration_limits = self.reload_metadata.minimum_migration_limits;
+        put_u32(&mut output, migration_limits.max_objects);
+        put_u32(&mut output, migration_limits.max_fields);
+        put_u32(&mut output, migration_limits.max_forwarding_entries);
+        put_u64(&mut output, migration_limits.max_state_bytes);
+        put_u32(&mut output, migration_limits.max_gc_roots);
+        put_u64(&mut output, migration_limits.max_fuel);
+        put_u16(&mut output, migration_limits.max_call_depth);
         put_u32(
             &mut output,
             u32::try_from(self.host_imports.len()).expect("host import count exceeds wire format"),
@@ -586,6 +776,24 @@ impl Module {
         };
         let host_interface_hash = read_optional_id(&mut reader)?;
         let schema_hash = read_optional_id(&mut reader)?;
+        let migration_entry = read_optional_u32(&mut reader)?;
+        let activation_entry = read_optional_u32(&mut reader)?;
+        let stateful_schema_hash = StableId(reader.u64()?);
+        let minimum_migration_limits = MigrationLimitRequirements {
+            max_objects: reader.u32()?,
+            max_fields: reader.u32()?,
+            max_forwarding_entries: reader.u32()?,
+            max_state_bytes: reader.u64()?,
+            max_gc_roots: reader.u32()?,
+            max_fuel: reader.u64()?,
+            max_call_depth: reader.u16()?,
+        };
+        let reload_metadata = ReloadMetadata {
+            migration_entry,
+            activation_entry,
+            stateful_schema_hash,
+            minimum_migration_limits,
+        };
         let host_import_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
         if host_import_count > limits.max_host_imports {
@@ -869,6 +1077,7 @@ impl Module {
             state_schema: StateSchema { types: state_types },
             host_interface_hash,
             schema_hash,
+            reload_metadata,
         })
     }
 }
@@ -1410,6 +1619,7 @@ pub struct ModuleBuilder {
     state_schema: StateSchema,
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
+    reload_metadata: ReloadMetadata,
 }
 
 impl ModuleBuilder {
@@ -1423,6 +1633,20 @@ impl ModuleBuilder {
             state_schema: StateSchema { types: Vec::new() },
             host_interface_hash: None,
             schema_hash: None,
+            reload_metadata: ReloadMetadata {
+                migration_entry: None,
+                activation_entry: None,
+                stateful_schema_hash: StableId(0),
+                minimum_migration_limits: MigrationLimitRequirements {
+                    max_objects: 0,
+                    max_fields: 0,
+                    max_forwarding_entries: 0,
+                    max_state_bytes: 0,
+                    max_gc_roots: 0,
+                    max_fuel: 0,
+                    max_call_depth: 0,
+                },
+            },
         }
     }
 
@@ -1459,9 +1683,24 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn reload_entries(
+        &mut self,
+        migration_entry: Option<u32>,
+        activation_entry: Option<u32>,
+    ) -> &mut Self {
+        self.reload_metadata.migration_entry = migration_entry;
+        self.reload_metadata.activation_entry = activation_entry;
+        self
+    }
+
+    pub fn reload_metadata(&mut self, metadata: ReloadMetadata) -> &mut Self {
+        self.reload_metadata = metadata;
+        self
+    }
+
     #[must_use]
     pub fn finish(self) -> Module {
-        Module {
+        let mut module = Module {
             functions: self.functions,
             enum_types: self.enum_types,
             host_imports: self.host_imports,
@@ -1469,7 +1708,27 @@ impl ModuleBuilder {
             state_schema: self.state_schema,
             host_interface_hash: self.host_interface_hash,
             schema_hash: self.schema_hash,
+            reload_metadata: self.reload_metadata,
+        };
+        let migration_entries = module
+            .functions
+            .iter()
+            .enumerate()
+            .filter(|(_, function)| function.effect == FunctionEffect::Migration)
+            .map(|(index, _)| u32::try_from(index).expect("function count exceeds u32"))
+            .collect::<Vec<_>>();
+        if module.reload_metadata.migration_entry.is_none() && migration_entries.len() == 1 {
+            module.reload_metadata.migration_entry = migration_entries.first().copied();
         }
+        if module.reload_metadata.stateful_schema_hash == StableId(0) {
+            module.reload_metadata.stateful_schema_hash = module.state_schema.stable_hash();
+        }
+        if module.reload_metadata.minimum_migration_limits == MigrationLimitRequirements::default()
+        {
+            module.reload_metadata.minimum_migration_limits =
+                minimum_migration_limits(&module, module.reload_metadata.migration_entry);
+        }
+        module
     }
 }
 
@@ -1598,7 +1857,8 @@ impl FunctionBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        DecodeError, FunctionBuilder, Instruction, Module, ModuleBuilder, Signature, ValueType,
+        DecodeError, FunctionBuilder, FunctionEffect, Instruction, Module, ModuleBuilder,
+        Signature, ValueType,
     };
 
     #[test]
@@ -1651,5 +1911,34 @@ mod tests {
             Module::decode(&corrupt),
             Err(DecodeError::ChecksumMismatch(2))
         );
+    }
+
+    #[test]
+    fn reload_metadata_round_trips_with_inferred_migration_requirements() {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+        let mut builder = ModuleBuilder::new();
+        builder.function(migration.finish().unwrap());
+        let module = builder.finish();
+
+        assert_eq!(module.reload_metadata.migration_entry, Some(0));
+        assert_eq!(module.reload_metadata.minimum_migration_limits.max_fuel, 2);
+        assert_eq!(
+            module
+                .reload_metadata
+                .minimum_migration_limits
+                .max_call_depth,
+            1
+        );
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 }

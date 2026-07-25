@@ -462,6 +462,7 @@ impl ClassifiedError for VerifyError {
             | VerifyErrorKind::ForgedRoot(_)
             | VerifyErrorKind::MissingRoot(_)
             | VerifyErrorKind::InvalidRootMap(_) => ErrorCode::NX3003,
+            VerifyErrorKind::InvalidReloadMetadata => ErrorCode::NX6005,
             _ => ErrorCode::NX3001,
         };
         ErrorMetadata {
@@ -606,6 +607,7 @@ fn compile_error_code(error: &CompileError) -> ErrorCode {
         | CompileError::InvalidEffect
         | CompileError::TooManyRegisters
         | CompileError::Verify(_) => ErrorCode::NX2002,
+        CompileError::InvalidReloadMetadata(_) => ErrorCode::NX6005,
         CompileError::TypeMismatch => ErrorCode::NX2101,
         CompileError::CannotInferType => ErrorCode::NX2210,
         CompileError::NonExhaustiveMatch => ErrorCode::NX2201,
@@ -639,6 +641,9 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
         CompileError::SuspendingDefer => formatter.write_str("defer body may suspend"),
         CompileError::DeferCaptureLimit => formatter.write_str("defer capture limit exceeded"),
         CompileError::InvalidEffect => formatter.write_str("invalid function effect"),
+        CompileError::InvalidReloadMetadata(message) => {
+            write!(formatter, "invalid reload metadata: {message}")
+        }
         CompileError::TooManyRegisters => formatter.write_str("register limit exceeded"),
         CompileError::Verify(message) => write!(formatter, "verification failed: {message}"),
     }

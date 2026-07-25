@@ -753,23 +753,12 @@ impl RealmRuntime {
         if old.verified.module().host_interface_hash != Some(host_hash) {
             return Err(RealmError::HostHashMismatch);
         }
-        let old_schema = old
-            .verified
-            .module()
-            .schema_hash
-            .ok_or(RealmError::SchemaHashMismatch)?;
         let stateful_domain = old.stateful_domain;
         let candidate_schema = candidate
             .module()
             .schema_hash
             .ok_or(RealmError::SchemaHashMismatch)?;
-        if candidate_schema != old_schema
-            && !candidate
-                .module()
-                .functions
-                .iter()
-                .any(|function| function.effect == nexa_bytecode::FunctionEffect::Migration)
-        {
+        if nexa_verifier::verify_reload_transition(&old.verified, &candidate).is_err() {
             return Err(
                 ReloadError::Migration("schema changes require a migration entry".into()).into(),
             );
