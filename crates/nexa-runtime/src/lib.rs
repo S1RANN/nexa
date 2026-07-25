@@ -7,6 +7,8 @@ mod host;
 mod interpreter;
 mod kernel;
 mod metrics;
+#[cfg(any(test, feature = "model-adapter"))]
+pub mod model_adapter;
 mod realm;
 mod reload;
 mod scheduler;

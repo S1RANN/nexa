@@ -11,7 +11,7 @@ nexa-machine = { path = "../nexa-machine" }
 
 [dev-dependencies]
 nexa-bytecode = { path = "../nexa-bytecode" }
-nexa-runtime = { path = "../nexa-runtime" }
+nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
 nexa-verifier = { path = "../nexa-verifier" }
 
 [lints]

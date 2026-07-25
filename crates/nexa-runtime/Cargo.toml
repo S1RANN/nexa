@@ -12,6 +12,7 @@ nexa-verifier = { path = "../nexa-verifier" }
 
 [features]
 allocation-counting = []
+model-adapter = []
 
 [lints]
 workspace = true

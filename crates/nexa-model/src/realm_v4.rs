@@ -36,7 +36,7 @@ pub enum RealmV4Event {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-enum CancelKind {
+pub enum RealmV4CancelKind {
     #[default]
     None,
     Ordinary,
@@ -49,7 +49,7 @@ pub struct RealmV4World {
     pub scheduler_tokens: u8,
     resources: u8,
     reload_restore: Option<RealmV4TaskState>,
-    cancel: CancelKind,
+    cancel: RealmV4CancelKind,
 }
 
 const CONTINUATION: u8 = 1 << 0;
@@ -64,7 +64,7 @@ impl Default for RealmV4World {
             scheduler_tokens: 1,
             resources: CONTINUATION | USER_DEFER,
             reload_restore: None,
-            cancel: CancelKind::None,
+            cancel: RealmV4CancelKind::None,
         }
     }
 }
@@ -114,7 +114,7 @@ impl RealmV4World {
                 ));
             }
             (state, RealmV4Event::RequestCancel) if is_cancellable(state) => {
-                self.begin_cancel(CancelKind::Ordinary);
+                self.begin_cancel(RealmV4CancelKind::Ordinary);
             }
             (RealmV4TaskState::ReloadPaused, RealmV4Event::ReloadCommitCancel)
                 if self.has_resource(RELOAD) =>
@@ -122,10 +122,10 @@ impl RealmV4World {
                 self.set_resource(RELOAD, false);
                 self.reload_restore = None;
                 self.set_resource(USER_DEFER, false);
-                self.begin_cancel(CancelKind::ReloadCommit);
+                self.begin_cancel(RealmV4CancelKind::ReloadCommit);
             }
             (RealmV4TaskState::Cancelling, RealmV4Event::ReachSafepoint) => {
-                if self.cancel == CancelKind::Ordinary && self.has_resource(USER_DEFER) {
+                if self.cancel == RealmV4CancelKind::Ordinary && self.has_resource(USER_DEFER) {
                     self.task = RealmV4TaskState::Cleanup;
                 } else {
                     self.finish_terminal(RealmV4TaskState::Cancelled);
@@ -150,7 +150,7 @@ impl RealmV4World {
         self.check_invariants()
     }
 
-    fn begin_cancel(&mut self, kind: CancelKind) {
+    fn begin_cancel(&mut self, kind: RealmV4CancelKind) {
         self.task = RealmV4TaskState::Cancelling;
         self.cancel = kind;
         self.set_resource(REQUEST, false);
@@ -159,12 +159,13 @@ impl RealmV4World {
 
     fn finish_terminal(&mut self, state: RealmV4TaskState) {
         self.task = state;
-        self.set_resource(CONTINUATION | REQUEST, false);
+        self.set_resource(CONTINUATION | REQUEST | RELOAD | USER_DEFER, false);
         self.scheduler_tokens = 0;
-        self.cancel = CancelKind::None;
+        self.reload_restore = None;
+        self.cancel = RealmV4CancelKind::None;
     }
 
-    fn has_resource(self, resource: u8) -> bool {
+    const fn has_resource(self, resource: u8) -> bool {
         self.resources & resource != 0
     }
 
@@ -200,16 +201,46 @@ impl RealmV4World {
         if self.task == RealmV4TaskState::ReloadPaused && !self.has_resource(RELOAD) {
             return Err("reload-paused task lacks active transaction");
         }
-        if self.cancel == CancelKind::ReloadCommit && self.has_resource(USER_DEFER) {
+        if self.cancel == RealmV4CancelKind::ReloadCommit && self.has_resource(USER_DEFER) {
             return Err("reload-commit cancellation retained user defer");
         }
-        if self.task == RealmV4TaskState::Cleanup && self.cancel != CancelKind::Ordinary {
+        if self.task == RealmV4TaskState::Cleanup && self.cancel != RealmV4CancelKind::Ordinary {
             return Err("cleanup must belong to an ordinary cancellation");
         }
         if self.scheduler_tokens > 1 {
             return Err("task owns multiple scheduler tokens");
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub const fn has_continuation(self) -> bool {
+        self.has_resource(CONTINUATION)
+    }
+
+    #[must_use]
+    pub const fn has_request(self) -> bool {
+        self.has_resource(REQUEST)
+    }
+
+    #[must_use]
+    pub const fn reload_active(self) -> bool {
+        self.has_resource(RELOAD)
+    }
+
+    #[must_use]
+    pub const fn has_user_defer(self) -> bool {
+        self.has_resource(USER_DEFER)
+    }
+
+    #[must_use]
+    pub const fn cancel_kind(self) -> RealmV4CancelKind {
+        self.cancel
+    }
+
+    #[must_use]
+    pub const fn reload_restore(self) -> Option<RealmV4TaskState> {
+        self.reload_restore
     }
 }
 
@@ -225,7 +256,7 @@ fn is_reload_pausable(state: RealmV4TaskState) -> bool {
 }
 
 fn is_cancellable(state: RealmV4TaskState) -> bool {
-    is_reload_pausable(state) || state == RealmV4TaskState::ReloadPaused
+    is_reload_pausable(state)
 }
 
 fn is_terminal(state: RealmV4TaskState) -> bool {
@@ -246,6 +277,7 @@ pub struct RealmV4Report {
     pub visited_worlds: usize,
     pub rejected_operations: usize,
     pub reached_states: BTreeSet<RealmV4TaskState>,
+    pub shortest_paths: Vec<Vec<RealmV4Event>>,
     pub failures: Vec<(String, Vec<RealmV4Event>)>,
     pub truncated: bool,
 }
@@ -272,6 +304,7 @@ pub fn explore_realm_v4(config: RealmV4Config) -> RealmV4Report {
     ];
     let initial = RealmV4World::default();
     let mut report = RealmV4Report::default();
+    report.shortest_paths.push(Vec::new());
     let mut seen = BTreeSet::from([initial]);
     let mut queue = VecDeque::from([(initial, Vec::new())]);
     while let Some((world, path)) = queue.pop_front() {
@@ -296,6 +329,7 @@ pub fn explore_realm_v4(config: RealmV4Config) -> RealmV4Report {
                         break;
                     }
                     seen.insert(next);
+                    report.shortest_paths.push(next_path.clone());
                     queue.push_back((next, next_path));
                 }
                 Ok(()) => {}
@@ -324,5 +358,177 @@ pub fn explore_realm_v4(config: RealmV4Config) -> RealmV4Report {
                 .push((format!("task state {state:?} is unreachable"), Vec::new()));
         }
     }
+    report
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmV4RoutingEvent {
+    CompleteA,
+    CompleteB,
+    RollbackA,
+    CommitA,
+    ActivationFaultA,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmV4ReloadState {
+    Reloading,
+    RolledBack,
+    Committed,
+    ActivationFaulted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RealmV4CompletionState {
+    Pending,
+    Buffered,
+    Delivered,
+    Replayed,
+    Discarded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RealmV4RoutingWorld {
+    pub reload: RealmV4ReloadState,
+    pub completion_a: RealmV4CompletionState,
+    pub completion_b: RealmV4CompletionState,
+}
+
+impl Default for RealmV4RoutingWorld {
+    fn default() -> Self {
+        Self {
+            reload: RealmV4ReloadState::Reloading,
+            completion_a: RealmV4CompletionState::Pending,
+            completion_b: RealmV4CompletionState::Pending,
+        }
+    }
+}
+
+impl RealmV4RoutingWorld {
+    pub fn apply(&mut self, event: RealmV4RoutingEvent) -> Result<(), &'static str> {
+        match event {
+            RealmV4RoutingEvent::CompleteA
+                if self.completion_a == RealmV4CompletionState::Pending =>
+            {
+                self.completion_a = match self.reload {
+                    RealmV4ReloadState::Reloading => RealmV4CompletionState::Buffered,
+                    RealmV4ReloadState::RolledBack => RealmV4CompletionState::Delivered,
+                    RealmV4ReloadState::Committed | RealmV4ReloadState::ActivationFaulted => {
+                        RealmV4CompletionState::Discarded
+                    }
+                };
+            }
+            RealmV4RoutingEvent::CompleteB
+                if self.completion_b == RealmV4CompletionState::Pending =>
+            {
+                self.completion_b = RealmV4CompletionState::Delivered;
+            }
+            RealmV4RoutingEvent::RollbackA if self.reload == RealmV4ReloadState::Reloading => {
+                self.reload = RealmV4ReloadState::RolledBack;
+                if self.completion_a == RealmV4CompletionState::Buffered {
+                    self.completion_a = RealmV4CompletionState::Replayed;
+                }
+            }
+            RealmV4RoutingEvent::CommitA if self.reload == RealmV4ReloadState::Reloading => {
+                self.reload = RealmV4ReloadState::Committed;
+                if self.completion_a == RealmV4CompletionState::Buffered {
+                    self.completion_a = RealmV4CompletionState::Discarded;
+                }
+            }
+            RealmV4RoutingEvent::ActivationFaultA
+                if self.reload == RealmV4ReloadState::Reloading =>
+            {
+                self.reload = RealmV4ReloadState::ActivationFaulted;
+                if self.completion_a == RealmV4CompletionState::Buffered {
+                    self.completion_a = RealmV4CompletionState::Discarded;
+                }
+            }
+            _ => return Err("operation rejected"),
+        }
+        self.check_invariants()
+    }
+
+    fn check_invariants(self) -> Result<(), &'static str> {
+        if matches!(
+            self.completion_b,
+            RealmV4CompletionState::Buffered
+                | RealmV4CompletionState::Replayed
+                | RealmV4CompletionState::Discarded
+        ) {
+            return Err("module B completion was captured by module A reload");
+        }
+        if self.completion_a == RealmV4CompletionState::Replayed
+            && self.reload != RealmV4ReloadState::RolledBack
+        {
+            return Err("module A completion replayed without rollback");
+        }
+        if self.completion_a == RealmV4CompletionState::Discarded
+            && !matches!(
+                self.reload,
+                RealmV4ReloadState::Committed | RealmV4ReloadState::ActivationFaulted
+            )
+        {
+            return Err("module A completion discarded before publication");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RealmV4RoutingReport {
+    pub visited_worlds: usize,
+    pub rejected_operations: usize,
+    pub shortest_paths: Vec<Vec<RealmV4RoutingEvent>>,
+    pub failures: Vec<(String, Vec<RealmV4RoutingEvent>)>,
+    pub truncated: bool,
+}
+
+#[must_use]
+pub fn explore_realm_v4_routing(config: RealmV4Config) -> RealmV4RoutingReport {
+    const EVENTS: [RealmV4RoutingEvent; 5] = [
+        RealmV4RoutingEvent::CompleteA,
+        RealmV4RoutingEvent::CompleteB,
+        RealmV4RoutingEvent::RollbackA,
+        RealmV4RoutingEvent::CommitA,
+        RealmV4RoutingEvent::ActivationFaultA,
+    ];
+    let initial = RealmV4RoutingWorld::default();
+    let mut report = RealmV4RoutingReport {
+        shortest_paths: vec![Vec::new()],
+        ..RealmV4RoutingReport::default()
+    };
+    let mut seen = BTreeSet::from([initial]);
+    let mut queue = VecDeque::from([(initial, Vec::new())]);
+    while let Some((world, path)) = queue.pop_front() {
+        if path.len() >= config.max_depth {
+            if EVENTS.into_iter().any(|event| {
+                let mut next = world;
+                next.apply(event).is_ok() && !seen.contains(&next)
+            }) {
+                report.truncated = true;
+            }
+            continue;
+        }
+        for event in EVENTS {
+            let mut next = world;
+            let mut next_path = path.clone();
+            next_path.push(event);
+            match next.apply(event) {
+                Ok(()) if !seen.contains(&next) => {
+                    if seen.len() == config.max_worlds {
+                        report.truncated = true;
+                        break;
+                    }
+                    seen.insert(next);
+                    report.shortest_paths.push(next_path.clone());
+                    queue.push_back((next, next_path));
+                }
+                Ok(()) => {}
+                Err("operation rejected") => report.rejected_operations += 1,
+                Err(error) => report.failures.push((error.into(), next_path)),
+            }
+        }
+    }
+    report.visited_worlds = seen.len();
     report
 }

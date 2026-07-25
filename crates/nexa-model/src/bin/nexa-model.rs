@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
 use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
-use nexa_model::realm_v4::{RealmV4Config, explore_realm_v4};
+use nexa_model::realm_v4::{RealmV4Config, explore_realm_v4, explore_realm_v4_routing};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -128,6 +128,20 @@ fn run(path: &Path) -> Result<(), String> {
             realm_v4.visited_worlds,
             realm_v4.reached_states.len(),
             realm_v4.rejected_operations
+        );
+        let realm_v4_routing = explore_realm_v4_routing(RealmV4Config {
+            max_depth: 8,
+            max_worlds: 256,
+        });
+        if !realm_v4_routing.failures.is_empty() || realm_v4_routing.truncated {
+            return Err(format!(
+                "Realm v4 routing model failed: {:?}, truncated={}",
+                realm_v4_routing.failures, realm_v4_routing.truncated
+            ));
+        }
+        println!(
+            "RealmV4 routing: {} worlds, {} rejected operations",
+            realm_v4_routing.visited_worlds, realm_v4_routing.rejected_operations
         );
     }
     Ok(())
