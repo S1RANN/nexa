@@ -54,7 +54,7 @@ pub struct ModuleEpochRoot {
     pub schema_hash: StableId,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
-    state: StatefulRegistry,
+    state: Arc<StatefulRegistry>,
     staging_roots: Vec<GcRef>,
 }
 
@@ -598,12 +598,11 @@ impl RealmRuntime {
         stable_id: StableId,
         value: crate::StateValue,
     ) -> Result<crate::StateHandle, RealmError> {
-        Ok(self
+        let root = self
             .modules
             .resolve_mut(module.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .state
-            .insert(stable_id, value)?)
+            .map_err(RealmError::ModuleHandle)?;
+        Ok(Arc::make_mut(&mut root.state).insert(stable_id, value)?)
     }
 
     pub fn state_handles(
@@ -678,7 +677,7 @@ impl RealmRuntime {
                 schema_hash,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
-                state: StatefulRegistry::new(stateful_domain),
+                state: Arc::new(StatefulRegistry::new(stateful_domain)),
                 staging_roots: Vec::new(),
             })
             .map_err(RealmError::ModuleAllocation)?;
@@ -733,7 +732,7 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?;
         candidate_root.lifecycle = ModuleLifecycle::Staging;
         candidate_root.stateful_domain = stateful_domain;
-        candidate_root.state = StatefulRegistry::new(stateful_domain);
+        candidate_root.state = Arc::new(StatefulRegistry::new(stateful_domain));
         self.reload.begin(ReloadTransaction {
             old_module,
             candidate,
@@ -859,7 +858,10 @@ impl RealmRuntime {
         };
         match execution {
             InterpreterOutcome::Returned { value, .. } => {
-                let migrated = migration.finish()?;
+                let migrated = match migration.finish()? {
+                    crate::stateful::MigrationOutput::Owned(registry) => Arc::new(registry),
+                    crate::stateful::MigrationOutput::Shared(registry) => registry,
+                };
                 self.modules
                     .resolve_mut(candidate_handle.raw())
                     .map_err(RealmError::ModuleHandle)?
@@ -2255,7 +2257,6 @@ impl RealmRuntime {
             {
                 if let Ok(root) = self.modules.resolve_mut(entry.module.raw()) {
                     root.globals.clear();
-                    root.state = StatefulRegistry::new(root.stateful_domain);
                     root.staging_roots.clear();
                 }
                 let _ = self.modules.release(entry.module.raw());

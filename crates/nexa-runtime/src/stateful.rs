@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::sync::Arc;
 
 use nexa_core::StableId;
 
@@ -69,13 +70,17 @@ struct ForwardingSlot {
     target: Option<StableId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct StatefulRegistry {
     domain: StatefulDomainId,
     objects: Vec<MigrationObjectSlot>,
     fields: Vec<MigrationFieldSlot>,
     payload: Vec<u8>,
     gc_roots: Vec<GcRef>,
+    object_capacity: usize,
+    field_capacity: usize,
+    byte_capacity: usize,
+    gc_root_capacity: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +93,7 @@ pub enum StatefulError {
     StaleGeneration,
     GenerationExhausted,
     NestedObject,
+    Capacity(MigrationLimitError),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -167,16 +173,56 @@ impl fmt::Display for StatefulError {
 
 impl std::error::Error for StatefulError {}
 
+impl Clone for StatefulRegistry {
+    fn clone(&self) -> Self {
+        let mut objects = Vec::with_capacity(self.object_capacity);
+        objects.extend_from_slice(&self.objects);
+        let mut fields = Vec::with_capacity(self.field_capacity);
+        fields.extend_from_slice(&self.fields);
+        let mut payload = Vec::with_capacity(self.byte_capacity);
+        payload.extend_from_slice(&self.payload);
+        let mut gc_roots = Vec::with_capacity(self.gc_root_capacity);
+        gc_roots.extend_from_slice(&self.gc_roots);
+        Self {
+            domain: self.domain,
+            objects,
+            fields,
+            payload,
+            gc_roots,
+            object_capacity: self.object_capacity,
+            field_capacity: self.field_capacity,
+            byte_capacity: self.byte_capacity,
+            gc_root_capacity: self.gc_root_capacity,
+        }
+    }
+}
+
 impl StatefulRegistry {
     #[must_use]
-    pub const fn new(domain: StatefulDomainId) -> Self {
-        Self {
+    pub fn new(domain: StatefulDomainId) -> Self {
+        Self::try_new(domain, MigrationLimits::default())
+            .expect("default stateful registry capacity can be reserved")
+    }
+
+    pub(crate) fn try_new(
+        domain: StatefulDomainId,
+        limits: MigrationLimits,
+    ) -> Result<Self, MigrationLimitError> {
+        let report = limits.capacity_report();
+        Ok(Self {
             domain,
-            objects: Vec::new(),
-            fields: Vec::new(),
-            payload: Vec::new(),
-            gc_roots: Vec::new(),
-        }
+            objects: reserve(report.object_capacity, MigrationLimitError::Objects)?,
+            fields: reserve(report.field_capacity, MigrationLimitError::Fields)?,
+            payload: reserve(
+                report.payload_byte_capacity,
+                MigrationLimitError::StateBytes,
+            )?,
+            gc_roots: reserve(limits.max_gc_roots as usize, MigrationLimitError::GcRoots)?,
+            object_capacity: report.object_capacity,
+            field_capacity: report.field_capacity,
+            byte_capacity: report.payload_byte_capacity,
+            gc_root_capacity: limits.max_gc_roots as usize,
+        })
     }
 
     #[must_use]
@@ -193,6 +239,27 @@ impl StatefulRegistry {
         let search = self
             .objects
             .binary_search_by_key(&stable_id, |slot| slot.stable_id);
+        let removed_usage = search
+            .ok()
+            .map(|index| self.slot_usage(&self.objects[index]))
+            .unwrap_or_default();
+        let inserted_usage = value_usage(&value);
+        let usage = registry_usage(&self.objects, &self.fields);
+        self.check_usage(MigrationUsage {
+            objects: usage.objects + usize::from(search.is_err()),
+            fields: usage
+                .fields
+                .saturating_sub(removed_usage.fields)
+                .saturating_add(inserted_usage.fields),
+            payload_bytes: usage
+                .payload_bytes
+                .saturating_sub(removed_usage.payload_bytes)
+                .saturating_add(inserted_usage.payload_bytes),
+            gc_roots: usage
+                .gc_roots
+                .saturating_sub(removed_usage.gc_roots)
+                .saturating_add(inserted_usage.gc_roots),
+        })?;
         let (index, generation) = match search {
             Ok(index) => {
                 let generation = self.objects[index]
@@ -317,7 +384,7 @@ impl StatefulRegistry {
                 .binary_search_by_key(&schema_field.stable_id, |field| field.field_id)
                 .map(|index| &fields[index])
                 .map_err(|_| StatefulError::Missing(schema_field.stable_id))?;
-            if !state_value_matches(field.value.clone(), schema_field.ty) {
+            if !state_value_matches(&field.value, schema_field.ty) {
                 return Err(StatefulError::Missing(schema_field.stable_id));
             }
         }
@@ -361,20 +428,18 @@ impl StatefulRegistry {
             .objects
             .get(index)
             .map_or(self.fields.len(), |slot| slot.field_start as usize);
-        let (type_id, version, scalar, fields) = match value {
-            StateValue::Object(object) => (
-                object.type_id,
-                object.version,
-                None,
-                object.fields.into_iter().collect::<Vec<_>>(),
-            ),
-            scalar => (StableId(0), 0, Some(scalar), Vec::new()),
+        let (type_id, version, scalar, field_len) = match value {
+            StateValue::Object(object) => {
+                let field_len =
+                    u32::try_from(object.fields.len()).expect("state field count fits u32");
+                for (offset, (field_id, value)) in object.fields.into_iter().enumerate() {
+                    self.fields
+                        .insert(field_start + offset, MigrationFieldSlot { field_id, value });
+                }
+                (object.type_id, object.version, None, field_len)
+            }
+            scalar => (StableId(0), 0, Some(scalar), 0),
         };
-        let field_len = u32::try_from(fields.len()).expect("state field count fits u32");
-        for (offset, (field_id, value)) in fields.into_iter().enumerate() {
-            self.fields
-                .insert(field_start + offset, MigrationFieldSlot { field_id, value });
-        }
         for slot in &mut self.objects[index..] {
             slot.field_start += field_len;
         }
@@ -407,6 +472,49 @@ impl StatefulRegistry {
                 }
             }
         }
+    }
+
+    fn slot_usage(&self, slot: &MigrationObjectSlot) -> MigrationUsage {
+        let fields = self.object_fields(slot);
+        MigrationUsage {
+            objects: 1,
+            fields: fields.len(),
+            payload_bytes: object_payload_bytes(slot).saturating_add(
+                fields
+                    .iter()
+                    .map(|field| {
+                        std::mem::size_of::<StableId>()
+                            .saturating_add(state_value_payload_bytes(&field.value))
+                    })
+                    .sum(),
+            ),
+            gc_roots: slot
+                .scalar
+                .as_ref()
+                .map_or(0, state_value_root_count)
+                .saturating_add(
+                    fields
+                        .iter()
+                        .map(|field| state_value_root_count(&field.value))
+                        .sum(),
+                ),
+        }
+    }
+
+    fn check_usage(&self, usage: MigrationUsage) -> Result<(), StatefulError> {
+        if usage.objects > self.object_capacity {
+            return Err(StatefulError::Capacity(MigrationLimitError::Objects));
+        }
+        if usage.fields > self.field_capacity {
+            return Err(StatefulError::Capacity(MigrationLimitError::Fields));
+        }
+        if usage.payload_bytes > self.byte_capacity {
+            return Err(StatefulError::Capacity(MigrationLimitError::StateBytes));
+        }
+        if usage.gc_roots > self.gc_root_capacity {
+            return Err(StatefulError::Capacity(MigrationLimitError::GcRoots));
+        }
+        Ok(())
     }
 }
 
@@ -452,6 +560,34 @@ fn registry_usage(
     }
 }
 
+fn value_usage(value: &StateValue) -> MigrationUsage {
+    match value {
+        StateValue::Object(object) => MigrationUsage {
+            objects: 1,
+            fields: object.fields.len(),
+            payload_bytes: std::mem::size_of::<StableId>()
+                .saturating_add(std::mem::size_of::<u32>())
+                .saturating_add(
+                    object
+                        .fields
+                        .values()
+                        .map(|value| {
+                            std::mem::size_of::<StableId>()
+                                .saturating_add(state_value_payload_bytes(value))
+                        })
+                        .sum(),
+                ),
+            gc_roots: object.fields.values().map(state_value_root_count).sum(),
+        },
+        scalar => MigrationUsage {
+            objects: 1,
+            fields: 0,
+            payload_bytes: state_value_payload_bytes(scalar),
+            gc_roots: state_value_root_count(scalar),
+        },
+    }
+}
+
 fn object_payload_bytes(slot: &MigrationObjectSlot) -> usize {
     if let Some(value) = &slot.scalar {
         state_value_payload_bytes(value)
@@ -492,14 +628,24 @@ fn reject_nested_object(value: &StateValue) -> Result<(), StatefulError> {
     Ok(())
 }
 
-fn state_value_matches(value: StateValue, expected: nexa_bytecode::ValueType) -> bool {
+fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -> bool {
     matches!(
         (value, expected),
-        (StateValue::I32(_), nexa_bytecode::ValueType::I32)
-            | (StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
-            | (StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
-            | (StateValue::Handle(_), nexa_bytecode::ValueType::Named(_))
+        (&StateValue::I32(_), nexa_bytecode::ValueType::I32)
+            | (&StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
+            | (&StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
+            | (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(_))
     )
+}
+
+fn clone_leaf_value(value: &StateValue) -> StateValue {
+    match value {
+        StateValue::I32(value) => StateValue::I32(*value),
+        StateValue::Bool(value) => StateValue::Bool(*value),
+        StateValue::Ref(reference) => StateValue::Ref(*reference),
+        StateValue::Handle(handle) => StateValue::Handle(*handle),
+        StateValue::Object(_) => unreachable!("nested state objects are rejected at admission"),
+    }
 }
 
 struct MigrationArena {
@@ -639,6 +785,10 @@ impl MigrationArena {
             fields: self.fields,
             payload: self.payload,
             gc_roots: self.gc_roots,
+            object_capacity: self.object_capacity,
+            field_capacity: self.field_capacity,
+            byte_capacity: self.byte_capacity,
+            gc_root_capacity: self.gc_root_capacity,
         }
     }
 }
@@ -650,7 +800,7 @@ fn reserve<T>(capacity: usize, error: MigrationLimitError) -> Result<Vec<T>, Mig
 }
 
 pub(crate) struct MigrationContext {
-    old: StatefulRegistry,
+    old: Arc<StatefulRegistry>,
     arena: MigrationArena,
     domain: StatefulDomainId,
     schema: nexa_bytecode::StateSchema,
@@ -665,7 +815,7 @@ const OBSERVED_FIRST_OPCODE: u8 = 1 << 3;
 
 impl MigrationContext {
     pub(crate) fn new(
-        old: StatefulRegistry,
+        old: impl Into<Arc<StatefulRegistry>>,
         domain: StatefulDomainId,
         schema: nexa_bytecode::StateSchema,
         schema_unchanged: bool,
@@ -682,7 +832,7 @@ impl MigrationContext {
         );
         let arena = arena?;
         Ok(Self {
-            old,
+            old: old.into(),
             arena,
             domain,
             schema,
@@ -717,12 +867,12 @@ impl MigrationContext {
         })
     }
 
-    pub(crate) fn finish(self) -> Result<StatefulRegistry, ReloadError> {
+    pub(crate) fn finish(self) -> Result<MigrationOutput, ReloadError> {
         let _observation = MigrationObservation::new(MigrationAllocationPhase::Finish, false);
         self.finish_inner()
     }
 
-    fn finish_inner(mut self) -> Result<StatefulRegistry, ReloadError> {
+    fn finish_inner(mut self) -> Result<MigrationOutput, ReloadError> {
         if !self.has_flag(TOUCHED) {
             if self.has_flag(SCHEMA_UNCHANGED) {
                 self.old
@@ -731,7 +881,7 @@ impl MigrationContext {
                 self.old
                     .validate_handles()
                     .map_err(|_| ReloadError::InvalidStateHandle)?;
-                return Ok(self.old);
+                return Ok(MigrationOutput::Shared(self.old));
             }
             return Err(ReloadError::MigrationNoOutput);
         }
@@ -757,7 +907,7 @@ impl MigrationContext {
         registry
             .validate_handles()
             .map_err(|_| ReloadError::InvalidStateHandle)?;
-        Ok(registry)
+        Ok(MigrationOutput::Owned(registry))
     }
 
     fn observe_opcode(&mut self, phase: MigrationAllocationPhase) -> MigrationObservation {
@@ -776,31 +926,37 @@ impl MigrationContext {
 
     fn remap_handles(&mut self) {
         for index in 0..self.arena.objects.len() {
-            if let Some(mut value) = self.arena.objects[index].scalar.clone() {
-                self.remap_value(&mut value);
-                self.arena.objects[index].scalar = Some(value);
+            let remapped = self.arena.objects[index]
+                .scalar
+                .as_ref()
+                .and_then(|value| self.remapped_handle(value));
+            if let Some(handle) = remapped {
+                self.arena.objects[index].scalar = Some(StateValue::Handle(handle));
             }
         }
         for index in 0..self.arena.fields.len() {
-            let mut value = self.arena.fields[index].value.clone();
-            self.remap_value(&mut value);
-            self.arena.fields[index].value = value;
+            let remapped = self.remapped_handle(&self.arena.fields[index].value);
+            if let Some(handle) = remapped {
+                self.arena.fields[index].value = StateValue::Handle(handle);
+            }
         }
     }
 
-    fn remap_value(&self, value: &mut StateValue) {
+    fn remapped_handle(&self, value: &StateValue) -> Option<StateHandle> {
         let StateValue::Handle(handle) = value else {
-            return;
+            return None;
         };
+        let mut handle = *handle;
         let Ok(index) = self.arena.forwarding_index(handle.stable_id) else {
-            return;
+            return None;
         };
-        let Some(target) = self.arena.forwarding[index].target else {
-            return;
-        };
+        let target = self.arena.forwarding[index].target?;
         if let Ok(target_index) = self.arena.object_index(target) {
             handle.stable_id = target;
             handle.generation = self.arena.objects[target_index].generation;
+            Some(handle)
+        } else {
+            None
         }
     }
 
@@ -809,6 +965,11 @@ impl MigrationContext {
             .object(stable_id)
             .map_err(|_| "old state does not exist".into())
     }
+}
+
+pub(crate) enum MigrationOutput {
+    Owned(StatefulRegistry),
+    Shared(Arc<StatefulRegistry>),
 }
 
 impl InterpreterMigration for MigrationContext {
@@ -934,7 +1095,7 @@ impl InterpreterMigration for MigrationContext {
             .ok_or(RuntimeMessage::Static(
                 "candidate state field does not exist",
             ))?;
-        if !state_value_matches(value.clone(), expected) {
+        if !state_value_matches(&value, expected) {
             return Err("candidate state field type mismatch".into());
         }
         let start = slot.field_start as usize;
@@ -1017,7 +1178,7 @@ impl InterpreterMigration for MigrationContext {
             payload_bytes: usage.payload_bytes.saturating_add(payload_delta),
             gc_roots: usage.gc_roots.saturating_add(root_delta),
         })?;
-        let old_slot = self.old.objects[old_index].clone();
+        let old_slot = &self.old.objects[old_index];
         let old_fields_start = old_slot.field_start as usize;
         let old_fields_len = old_slot.field_len as usize;
         self.arena.insert_object(
@@ -1026,13 +1187,17 @@ impl InterpreterMigration for MigrationContext {
             old_slot.type_id,
             old_slot.version,
             old_slot.generation,
-            old_slot.scalar,
+            old_slot.scalar.as_ref().map(clone_leaf_value),
         );
         for offset in 0..old_fields_len {
+            let old_field = &self.old.fields[old_fields_start + offset];
             self.arena.insert_field(
                 object_index,
                 self.arena.objects[object_index].field_start as usize + offset,
-                self.old.fields[old_fields_start + offset].clone(),
+                MigrationFieldSlot {
+                    field_id: old_field.field_id,
+                    value: clone_leaf_value(&old_field.value),
+                },
             );
         }
         self.arena
@@ -1377,6 +1542,103 @@ mod tests {
     }
 
     #[test]
+    fn stateful_registry_keeps_its_configured_slot_bounds() {
+        let mut registry = StatefulRegistry::try_new(
+            StatefulDomainId::new(1),
+            MigrationLimits {
+                max_objects: 1,
+                max_fields: 1,
+                max_state_bytes: 128,
+                max_gc_roots: 1,
+                ..limits()
+            },
+        )
+        .unwrap();
+        let first = StableId::from_name("RegistryLimit::first");
+        let second = StableId::from_name("RegistryLimit::second");
+        registry.insert(first, StateValue::I32(1)).unwrap();
+        assert_eq!(
+            registry.insert(second, StateValue::I32(2)),
+            Err(StatefulError::Capacity(MigrationLimitError::Objects))
+        );
+        assert_eq!(registry.object_count(), 1);
+        assert_eq!(registry.objects.capacity(), 1);
+    }
+
+    #[test]
+    fn every_migration_opcode_preserves_all_vector_capacities() {
+        let type_id = StableId::from_name("CapacityInvariant");
+        let field_id = StableId::from_name("CapacityInvariant::field");
+        let preserved_id = StableId::from_name("CapacityInvariant::preserved");
+        let replaced_id = StableId::from_name("CapacityInvariant::replaced");
+        let deleted_id = StableId::from_name("CapacityInvariant::deleted");
+        let target_id = StableId::from_name("CapacityInvariant::target");
+        let mut old = StatefulRegistry::new(StatefulDomainId::new(1));
+        old.insert(
+            preserved_id,
+            StateValue::Object(StateObject {
+                type_id,
+                version: 1,
+                fields: BTreeMap::from([(field_id, StateValue::I32(1))]),
+            }),
+        )
+        .unwrap();
+        old.insert(replaced_id, StateValue::I32(2)).unwrap();
+        old.insert(deleted_id, StateValue::I32(3)).unwrap();
+        let mut migration = MigrationContext::new(
+            old,
+            StatefulDomainId::new(1),
+            schema(type_id, &[(field_id, ValueType::I32)]),
+            false,
+            limits(),
+        )
+        .unwrap();
+        let capacities = (
+            migration.arena.objects.capacity(),
+            migration.arena.fields.capacity(),
+            migration.arena.forwarding.capacity(),
+            migration.arena.payload.capacity(),
+            migration.arena.gc_roots.capacity(),
+        );
+        let assert_capacities = |migration: &MigrationContext| {
+            assert_eq!(
+                (
+                    migration.arena.objects.capacity(),
+                    migration.arena.fields.capacity(),
+                    migration.arena.forwarding.capacity(),
+                    migration.arena.payload.capacity(),
+                    migration.arena.gc_roots.capacity(),
+                ),
+                capacities
+            );
+        };
+
+        migration.old_get(replaced_id, ValueType::I32).unwrap();
+        assert_capacities(&migration);
+        let preserved = migration
+            .old_get(preserved_id, ValueType::Named(type_id))
+            .unwrap();
+        migration
+            .old_field_get(preserved, field_id, ValueType::I32)
+            .unwrap();
+        assert_capacities(&migration);
+        let target = migration.new_create(target_id, type_id).unwrap();
+        assert_capacities(&migration);
+        migration
+            .new_set(target, field_id, RuntimeValue::I32(4))
+            .unwrap();
+        assert_capacities(&migration);
+        migration.preserve(preserved_id).unwrap();
+        assert_capacities(&migration);
+        migration.replace(replaced_id, target).unwrap();
+        assert_capacities(&migration);
+        migration.delete(deleted_id).unwrap();
+        assert_capacities(&migration);
+        migration.finish_staging().unwrap();
+        assert_capacities(&migration);
+    }
+
+    #[test]
     fn object_capacity_accepts_limit_minus_one_and_limit_then_rejects_limit_plus_one() {
         let type_id = StableId::from_name("ObjectLimit");
         let ids = [
@@ -1595,7 +1857,9 @@ mod tests {
         let objects_pointer = migration.arena.objects.as_ptr();
         let fields_pointer = migration.arena.fields.as_ptr();
         let payload_pointer = migration.arena.payload.as_ptr();
-        let registry = migration.finish().unwrap();
+        let MigrationOutput::Owned(registry) = migration.finish().unwrap() else {
+            panic!("a touched migration owns its completed registry");
+        };
         assert_eq!(registry.objects.as_ptr(), objects_pointer);
         assert_eq!(registry.fields.as_ptr(), fields_pointer);
         assert_eq!(registry.payload.as_ptr(), payload_pointer);
