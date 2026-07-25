@@ -76,6 +76,8 @@ pub enum RetiredEpochState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetiredEpochSnapshot {
     pub module: ModuleHandle,
+    pub module_generation: u32,
+    pub module_id: u32,
     pub epoch: u64,
     pub state: RetiredEpochState,
     pub task_count: usize,
@@ -85,6 +87,26 @@ pub struct RetiredEpochSnapshot {
     pub gc_root_count: usize,
     pub pending_releases: usize,
     pub pending_completions: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModuleEpochKey {
+    pub module: ModuleHandle,
+    pub module_generation: u32,
+    pub module_id: u32,
+    pub epoch: u64,
+}
+
+impl RetiredEpochSnapshot {
+    #[must_use]
+    pub const fn key(self) -> ModuleEpochKey {
+        ModuleEpochKey {
+            module: self.module,
+            module_generation: self.module_generation,
+            module_id: self.module_id,
+            epoch: self.epoch,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -114,6 +136,10 @@ impl RetiredEpochRegistry {
             self.entries.remove(drained);
         }
         self.entries.push_back(entry);
+    }
+
+    fn get(&self, key: ModuleEpochKey) -> Option<&RetiredEpochSnapshot> {
+        self.entries.iter().find(|entry| entry.key() == key)
     }
 }
 
@@ -615,6 +641,11 @@ impl RealmRuntime {
         &self.retired_epochs.entries
     }
 
+    #[must_use]
+    pub fn retired_epoch(&self, key: ModuleEpochKey) -> Option<&RetiredEpochSnapshot> {
+        self.retired_epochs.get(key)
+    }
+
     pub fn insert_state(
         &mut self,
         module: ModuleHandle,
@@ -808,14 +839,18 @@ impl RealmRuntime {
             .resolve(old_module.raw())
             .map_err(RealmError::ModuleHandle)?
             .module_id;
+        let old_generation = old_module.raw().generation;
+        let old_epoch = self.module_epoch(old_module)?;
         let tasks = self
             .tasks
             .task_handles()
             .into_iter()
             .filter(|task| {
-                self.tasks
-                    .task_snapshot(*task)
-                    .is_ok_and(|snapshot| snapshot.module_id == old_id)
+                self.tasks.task_snapshot(*task).is_ok_and(|snapshot| {
+                    snapshot.module_id == old_id
+                        && snapshot.module_generation == old_generation
+                        && snapshot.module_epoch == old_epoch
+                })
             })
             .collect::<Vec<_>>();
         for task in &tasks {
@@ -1169,7 +1204,7 @@ impl RealmRuntime {
             config.priority,
             FuelState::new(config.fuel_slice, 0, config.cumulative_budget),
             continuation,
-            loaded.module_id,
+            module.raw(),
             config.limits,
         ) {
             self.tasks.finish_task(task)?;
@@ -1258,15 +1293,7 @@ impl RealmRuntime {
                 return Ok(PollResult::Pending(PendingReason::ReloadPause));
             }
         };
-        let module_raw = self
-            .modules
-            .occupied_handles_iter()
-            .find(|raw| raw.index == snapshot.module_id)
-            .ok_or(RealmError::MissingModule(snapshot.module_id))?;
-        let module = self
-            .modules
-            .resolve(module_raw)
-            .map_err(RealmError::ModuleHandle)?;
+        let module = resolve_task_module(&self.modules, self.realm_id, snapshot)?;
         let fuel = FuelState::new(
             fuel_slice,
             snapshot.fuel.cumulative_used,
@@ -1473,7 +1500,7 @@ impl RealmRuntime {
         let mut roots = GcRoots::default();
         for task in self.tasks.task_handles() {
             let snapshot = self.tasks.task_snapshot(task)?;
-            let module = self.module_for_id(snapshot.module_id)?;
+            let module = self.module_for_task(snapshot)?;
             let continuation = self.tasks.execution(task)?.continuation();
             roots
                 .suspended_tasks
@@ -1911,7 +1938,7 @@ impl RealmRuntime {
             ))),
             ValueType::Named(type_id) => {
                 let variant = self
-                    .module_for_id(snapshot.module_id)?
+                    .module_for_task(snapshot)?
                     .verified
                     .module()
                     .enum_types
@@ -2087,12 +2114,11 @@ impl RealmRuntime {
         )
     }
 
-    fn module_for_id(&self, module_id: u32) -> Result<&ModuleEpochRoot, RealmError> {
-        self.modules
-            .occupied_handles_iter()
-            .find(|raw| raw.index == module_id)
-            .and_then(|raw| self.modules.resolve(raw).ok())
-            .ok_or(RealmError::MissingModule(module_id))
+    fn module_for_task(
+        &self,
+        snapshot: crate::TaskSnapshot,
+    ) -> Result<&ModuleEpochRoot, RealmError> {
+        resolve_task_module(&self.modules, self.realm_id, snapshot)
     }
 
     fn trace_cursor(&self) -> usize {
@@ -2182,7 +2208,7 @@ impl RealmRuntime {
             self.tasks.mark_execution_cleanup(task)?;
         }
         let cleanup = if run_user_cleanup {
-            let verified = Arc::clone(&self.module_for_id(snapshot.module_id)?.verified);
+            let verified = Arc::clone(&self.module_for_task(snapshot)?.verified);
             let continuation = self.tasks.take_execution(task)?.into_continuation();
             CheckedInterpreter::run_cleanup(
                 &verified,
@@ -2277,9 +2303,13 @@ impl RealmRuntime {
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?;
         let resources = self.resources.epoch_counts(root.module_id, root.epoch);
-        let task_count = self.tasks.count_for_epoch(root.module_id, root.epoch);
+        let task_count =
+            self.tasks
+                .count_for_epoch(module.raw().generation, root.module_id, root.epoch);
         self.retired_epochs.retire(RetiredEpochSnapshot {
             module,
+            module_generation: module.raw().generation,
+            module_id: root.module_id,
             epoch: root.epoch,
             state: RetiredEpochState::Retired,
             task_count,
@@ -2305,9 +2335,18 @@ impl RealmRuntime {
                 self.retired_epochs.entries[index].state = RetiredEpochState::Drained;
                 continue;
             };
-            let module_id = root.module_id;
-            let epoch = root.epoch;
-            let task_count = self.tasks.count_for_epoch(module_id, epoch);
+            if root.module_id != entry.module_id
+                || root.epoch != entry.epoch
+                || entry.module.raw().generation != entry.module_generation
+            {
+                self.retired_epochs.entries[index].state = RetiredEpochState::Drained;
+                continue;
+            }
+            let module_id = entry.module_id;
+            let epoch = entry.epoch;
+            let task_count = self
+                .tasks
+                .count_for_epoch(entry.module_generation, module_id, epoch);
             let resources = self.resources.epoch_counts(module_id, epoch);
             let root_count =
                 root.globals.len() + root.state.gc_roots().len() + root.staging_roots.len();
@@ -2349,6 +2388,19 @@ impl RealmRuntime {
             }
         }
     }
+}
+
+fn resolve_task_module(
+    modules: &SlotPool<ModuleEpochRoot>,
+    realm_id: u32,
+    snapshot: crate::TaskSnapshot,
+) -> Result<&ModuleEpochRoot, RealmError> {
+    let raw = RawHandle::new(realm_id, snapshot.module_id, snapshot.module_generation);
+    let module = modules.resolve(raw).map_err(RealmError::ModuleHandle)?;
+    if module.module_id != snapshot.module_id || module.epoch != snapshot.module_epoch {
+        return Err(RealmError::MissingModule(snapshot.module_id));
+    }
+    Ok(module)
 }
 
 impl Drop for RealmRuntime {
@@ -3723,6 +3775,202 @@ mod tests {
         assert_eq!(realm.resource_ledger().retired_epochs, 0);
         assert!(realm.resource_invariants_hold());
         assert_eq!(runtime_host.pending_releases(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retired_epoch_registry_tracks_five_generations_and_drains_independently() {
+        let host_hash = StableId::from_name("five-generation-host");
+        let schema = StableId::from_name("five-generation-schema");
+        let request = Arc::new(Mutex::new(None));
+        let runtime_host = RuntimeHost::new(8);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig {
+                max_modules: 5,
+                max_host_resources: 8,
+                release_capacity: 8,
+                ..RealmConfig::default()
+            },
+            runtime_host,
+            Box::new(AsyncRegistry {
+                hash: host_hash,
+                request: Arc::clone(&request),
+            }),
+        )
+        .unwrap();
+        let epoch_a = realm
+            .load_module(
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+                schema,
+            )
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let waiting = realm
+            .call(
+                epoch_a,
+                2,
+                &[],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            realm.poll_task(waiting, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        ));
+        let _late_completion = request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap();
+
+        let epoch_b = realm
+            .prepare_reload(
+                epoch_a,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
+
+        let epoch_c = realm
+            .prepare_reload(
+                epoch_b,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(2)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
+
+        let token_owner = realm
+            .call(
+                epoch_c,
+                3,
+                &[RuntimeValue::I32(7)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 32,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            realm.poll_task(token_owner, 32).unwrap(),
+            PollResult::Pending(PendingReason::ExplicitYield)
+        ));
+        realm
+            .create_resource_token(token_owner, crate::RuntimeHostDomain::Render)
+            .unwrap();
+
+        let epoch_d = realm
+            .prepare_reload(
+                epoch_c,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+            )
+            .unwrap();
+        realm.quiesce_reload().unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(3)]).unwrap();
+        realm.commit_reload(&[], 32).unwrap();
+
+        let epoch_e = realm
+            .prepare_reload(
+                epoch_d,
+                reloadable_async_module(host_hash, schema),
+                host_hash,
+            )
+            .unwrap();
+
+        assert_eq!(realm.active_root(), Some(epoch_d));
+        assert_eq!(
+            realm.module_lifecycle(epoch_d).unwrap(),
+            super::ModuleLifecycle::Active
+        );
+        assert_eq!(
+            realm.module_lifecycle(epoch_e).unwrap(),
+            super::ModuleLifecycle::Staging
+        );
+        assert_eq!(realm.retired_epochs().len(), 3);
+        assert!(
+            realm
+                .retired_epochs()
+                .iter()
+                .all(|entry| entry.state == super::RetiredEpochState::Retired)
+        );
+
+        let key_a = realm.retired_epochs()[0].key();
+        let key_b = realm.retired_epochs()[1].key();
+        let key_c = realm.retired_epochs()[2].key();
+        assert_eq!(key_a.module, epoch_a);
+        assert_eq!(key_b.module, epoch_b);
+        assert_eq!(key_c.module, epoch_c);
+        assert_eq!(key_a.module_generation, key_a.module.raw().generation);
+        assert_eq!(key_b.module_generation, key_b.module.raw().generation);
+        assert_eq!(key_c.module_generation, key_c.module.raw().generation);
+        assert_eq!(realm.retired_epoch(key_a).unwrap().epoch, key_a.epoch);
+        assert_eq!(realm.retired_epoch(key_b).unwrap().epoch, key_b.epoch);
+        assert_eq!(realm.retired_epoch(key_c).unwrap().epoch, key_c.epoch);
+        assert!(
+            realm
+                .retired_epoch(super::ModuleEpochKey {
+                    module_generation: key_b.module_generation.wrapping_add(1),
+                    ..key_b
+                })
+                .is_none()
+        );
+        assert!(
+            realm
+                .retired_epoch(super::ModuleEpochKey {
+                    module_id: key_b.module_id.wrapping_add(1),
+                    ..key_b
+                })
+                .is_none()
+        );
+        assert!(
+            realm
+                .retired_epoch(super::ModuleEpochKey {
+                    epoch: key_b.epoch.wrapping_add(1),
+                    ..key_b
+                })
+                .is_none()
+        );
+
+        assert_eq!(realm.retired_epoch(key_a).unwrap().pending_completions, 1);
+        assert_eq!(realm.retired_epoch(key_b).unwrap().pending_completions, 0);
+        assert_eq!(realm.retired_epoch(key_b).unwrap().pending_releases, 0);
+        assert_eq!(realm.retired_epoch(key_c).unwrap().pending_releases, 1);
+
+        realm.reap_retired_epochs();
+
+        assert_eq!(
+            realm.retired_epoch(key_a).unwrap().state,
+            super::RetiredEpochState::Retired
+        );
+        assert_eq!(
+            realm.retired_epoch(key_b).unwrap().state,
+            super::RetiredEpochState::Drained
+        );
+        assert_eq!(
+            realm.retired_epoch(key_c).unwrap().state,
+            super::RetiredEpochState::Retired
+        );
+        assert_eq!(realm.active_root(), Some(epoch_d));
+        assert_eq!(
+            realm.module_lifecycle(epoch_e).unwrap(),
+            super::ModuleLifecycle::Staging
+        );
     }
 
     #[test]

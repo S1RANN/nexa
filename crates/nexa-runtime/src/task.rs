@@ -46,6 +46,7 @@ struct Task {
     owner: ScopeHandle,
     module_epoch: u64,
     module_id: u32,
+    module_generation: u32,
     child_kind: ChildKind,
     reserved_slots: i64,
     priority: u32,
@@ -108,6 +109,7 @@ pub struct TaskSnapshot {
     pub owner: ScopeHandle,
     pub module_epoch: u64,
     pub module_id: u32,
+    pub module_generation: u32,
     pub persistent: bool,
     pub task_slots: i64,
     pub priority: u32,
@@ -163,7 +165,7 @@ impl From<ScopeError> for TaskError {
 pub(crate) struct TaskManager {
     realm_id: u32,
     tasks: SlotPool<Task>,
-    epoch_counts: BTreeMap<(u32, u64), usize>,
+    epoch_counts: BTreeMap<(u32, u32, u64), usize>,
 }
 
 impl TaskManager {
@@ -199,6 +201,7 @@ impl TaskManager {
             owner,
             module_epoch,
             module_id: 0,
+            module_generation: 0,
             child_kind: ChildKind::Transient,
             reserved_slots: 0,
             priority: 0,
@@ -217,7 +220,7 @@ impl TaskManager {
             let _ = scopes.complete_transient_child(trace, owner);
             return Err(error);
         }
-        *self.epoch_counts.entry((0, module_epoch)).or_default() += 1;
+        *self.epoch_counts.entry((0, 0, module_epoch)).or_default() += 1;
         Ok(handle)
     }
 
@@ -359,7 +362,11 @@ impl TaskManager {
         if terminal {
             let released = self.tasks.release(handle.raw())?;
             debug_assert_eq!(released.reserved_slots, 0);
-            let key = (released.module_id, released.module_epoch);
+            let key = (
+                released.module_generation,
+                released.module_id,
+                released.module_epoch,
+            );
             let count = self
                 .epoch_counts
                 .get_mut(&key)
@@ -381,6 +388,7 @@ impl TaskManager {
             owner: task.owner,
             module_epoch: task.module_epoch,
             module_id: task.module_id,
+            module_generation: task.module_generation,
             persistent: task.child_kind == ChildKind::Persistent,
             task_slots: task.reserved_slots,
             priority: task.priority,
@@ -396,24 +404,31 @@ impl TaskManager {
         priority: u32,
         fuel: FuelState,
         execution: TaskExecution,
-        module_id: u32,
+        module: RawHandle,
         limits: crate::TaskLimits,
     ) -> Result<(), TaskError> {
-        let (old_module_id, module_epoch) = {
+        if module.realm_id != self.realm_id {
+            return Err(TaskError::Invariant("task module belongs to another realm"));
+        }
+        let module_generation = module.generation;
+        let module_id = module.index;
+        let (old_module_generation, old_module_id, module_epoch) = {
             let task = self.tasks.resolve_mut(handle.raw())?;
             if task.execution.is_some() {
                 return Err(TaskError::Invariant("task already owns a continuation"));
             }
             let old_module_id = task.module_id;
+            let old_module_generation = task.module_generation;
             task.priority = priority;
             task.module_id = module_id;
+            task.module_generation = module_generation;
             task.fuel = fuel;
             task.execution = Some(execution);
             task.limits = limits;
-            (old_module_id, task.module_epoch)
+            (old_module_generation, old_module_id, task.module_epoch)
         };
-        if old_module_id != module_id {
-            let old_key = (old_module_id, module_epoch);
+        if old_module_generation != module_generation || old_module_id != module_id {
+            let old_key = (old_module_generation, old_module_id, module_epoch);
             let old_count = self
                 .epoch_counts
                 .get_mut(&old_key)
@@ -426,7 +441,7 @@ impl TaskManager {
             }
             *self
                 .epoch_counts
-                .entry((module_id, module_epoch))
+                .entry((module_generation, module_id, module_epoch))
                 .or_default() += 1;
         }
         Ok(())
@@ -476,6 +491,7 @@ impl TaskManager {
         task.owner = snapshot.owner;
         task.module_epoch = snapshot.module_epoch;
         task.module_id = snapshot.module_id;
+        task.module_generation = snapshot.module_generation;
         task.child_kind = if snapshot.persistent {
             ChildKind::Persistent
         } else {
@@ -520,9 +536,14 @@ impl TaskManager {
         (tasks, continuations)
     }
 
-    pub(crate) fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
+    pub(crate) fn count_for_epoch(
+        &self,
+        module_generation: u32,
+        module_id: u32,
+        epoch: u64,
+    ) -> usize {
         self.epoch_counts
-            .get(&(module_id, epoch))
+            .get(&(module_generation, module_id, epoch))
             .copied()
             .unwrap_or(0)
     }

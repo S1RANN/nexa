@@ -4,6 +4,7 @@ use crate::scope::{ScopeError, ScopeHandle, ScopeManager, ScopeSnapshot};
 use crate::task::TaskExecution;
 use crate::task::{TaskError, TaskEvent, TaskHandle, TaskManager, TaskSnapshot};
 use crate::{FuelState, InterpreterContinuation};
+use nexa_core::RawHandle;
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -364,7 +365,7 @@ impl TaskRuntime {
         priority: u32,
         fuel: FuelState,
         continuation: InterpreterContinuation,
-        module_id: u32,
+        module: RawHandle,
         limits: TaskLimits,
     ) -> Result<(), RuntimeError> {
         Ok(self.tasks.attach_execution(
@@ -372,7 +373,7 @@ impl TaskRuntime {
             priority,
             fuel,
             TaskExecution::Ready(continuation),
-            module_id,
+            module,
             limits,
         )?)
     }
@@ -435,8 +436,14 @@ impl TaskRuntime {
         self.tasks.handles_iter()
     }
 
-    pub(crate) fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
-        self.tasks.count_for_epoch(module_id, epoch)
+    pub(crate) fn count_for_epoch(
+        &self,
+        module_generation: u32,
+        module_id: u32,
+        epoch: u64,
+    ) -> usize {
+        self.tasks
+            .count_for_epoch(module_generation, module_id, epoch)
     }
 
     pub(crate) fn record_charge(

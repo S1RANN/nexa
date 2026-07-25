@@ -141,7 +141,7 @@ impl RealmV4RuntimeAdapter {
                 1,
                 FuelState::new(64, 0, 1_024),
                 continuation,
-                1,
+                nexa_core::RawHandle::new(71, 1, 0),
                 crate::TaskLimits::default(),
             )
             .expect("model continuation attachment succeeds");
