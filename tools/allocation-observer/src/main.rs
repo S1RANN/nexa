@@ -10,8 +10,8 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, HostValue,
-    MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult, RealmConfig,
+    CancelReason, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap,
+    HostValue, MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult, RealmConfig,
     RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StateObject,
     StateValue, StepConfig, TaskLimits, TickBudget, set_migration_allocation_observer,
 };
@@ -200,7 +200,9 @@ fn main() {
 
         let host = RuntimeHost::new(16);
         let pending = Arc::new(Mutex::new(None));
-        let (mut realm, module) = make_async_host_realm(host.clone(), Arc::clone(&pending));
+        let (mut realm, module) =
+            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
+        drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
             .call(
@@ -280,6 +282,92 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
+        let pending = Arc::new(Mutex::new(None));
+        let config = RealmConfig {
+            max_host_resources: 1,
+            ..RealmConfig::default()
+        };
+        let (mut realm, module) =
+            make_async_host_realm(config, host.clone(), Arc::clone(&pending));
+        drop(pending.lock().unwrap());
+        let scope = realm.create_scope(None).unwrap();
+        let first = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(1)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(first, 64).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        let rejected = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(2)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        let async_admission_capacity_failure = observed(|| {
+            assert!(realm.poll_task(rejected, 64).is_err());
+        });
+        drop(realm);
+        drop(pending.lock().unwrap().take());
+        let _ = host.drain_releases();
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
+        let host = RuntimeHost::new(4);
+        let pending = Arc::new(Mutex::new(None));
+        let (mut realm, module) =
+            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
+        drop(pending.lock().unwrap());
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(
+                module,
+                0,
+                &[RuntimeValue::I32(3)],
+                StepConfig {
+                    owner: scope,
+                    priority: 1,
+                    fuel_slice: 16,
+                    cumulative_budget: 128,
+                    limits: TaskLimits::default(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            realm.poll_task(task, 64).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        let async_admission_cancellation = observed(|| {
+            realm
+                .cancel_task(task, CancelReason::ScopeCancelled)
+                .unwrap();
+        });
+        drop(pending.lock().unwrap().take());
+        drop(realm);
+        let _ = host.drain_releases();
+        let _ = host.begin_close();
+        host.try_finish_close().unwrap();
+
+        let host = RuntimeHost::new(4);
         let (mut realm, module) = make_realm_with_host(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
@@ -338,6 +426,8 @@ fn main() {
             trace_off,
             immediate_host_call,
             async_admission,
+            async_admission_capacity_failure,
+            async_admission_cancellation,
             success_result_writeback,
             error_result_writeback,
             realm_drop_transfer,
@@ -353,7 +443,9 @@ fn main() {
                 resume,
                 trace_off,
                 immediate_host_call,
-                _,
+                async_admission,
+                async_admission_capacity_failure,
+                async_admission_cancellation,
                 _,
                 _,
                 realm_drop_transfer,
@@ -362,6 +454,9 @@ fn main() {
                     + *resume
                     + *trace_off
                     + *immediate_host_call
+                    + *async_admission
+                    + *async_admission_capacity_failure
+                    + *async_admission_cancellation
                     + *realm_drop_transfer
                     == 0
             },
@@ -374,6 +469,8 @@ fn main() {
             trace_off,
             immediate_host_call,
             async_admission,
+            async_admission_capacity_failure,
+            async_admission_cancellation,
             success_result_writeback,
             error_result_writeback,
             realm_drop_transfer,
@@ -383,6 +480,8 @@ fn main() {
                 + *trace_off
                 + *immediate_host_call
                 + *async_admission
+                + *async_admission_capacity_failure
+                + *async_admission_cancellation
                 + *success_result_writeback
                 + *error_result_writeback
                 + *realm_drop_transfer
@@ -419,8 +518,8 @@ fn main() {
     println!(
         "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
-            .map(|(repeat, promotion, resume, trace_off, immediate_host_call, async_admission, success_result_writeback, error_result_writeback, realm_drop_transfer)| format!(
-                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"resume\":{resume},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
+            .map(|(repeat, promotion, resume, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, realm_drop_transfer)| format!(
+                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"resume\":{resume},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
             .join(","),
@@ -592,6 +691,7 @@ fn make_migration_realm() -> RealmRuntime {
 }
 
 fn make_async_host_realm(
+    config: RealmConfig,
     host: RuntimeHost,
     pending: Arc<Mutex<Option<PendingHostRequest>>>,
 ) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
@@ -651,12 +751,8 @@ fn make_async_host_realm(
     });
     builder.function(function);
     let verified = verify(builder.finish(), VerifierLimits::default()).unwrap();
-    let mut realm = RealmRuntime::hosted(
-        RealmConfig::default(),
-        host,
-        Box::new(AsyncHost { host_hash, pending }),
-    )
-    .unwrap();
+    let mut realm =
+        RealmRuntime::hosted(config, host, Box::new(AsyncHost { host_hash, pending })).unwrap();
     let module = realm.load_module(verified, host_hash, schema).unwrap();
     (realm, module)
 }
@@ -773,7 +869,7 @@ impl HostRegistry for AsyncHost {
         }
         let pending = context
             .create_request()
-            .map_err(|error| HostTrap::Host(error.to_string()))?;
+            .map_err(|_| HostTrap::Panicked)?;
         let request = pending.request;
         *self.pending.lock().unwrap() = Some(pending);
         Ok(HostCallOutcome::Pending(request))

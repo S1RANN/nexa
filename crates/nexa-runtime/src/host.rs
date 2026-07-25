@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -139,9 +139,75 @@ struct ReleaseDomainState {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct EpochReleaseCount {
+    module_id: u32,
+    epoch: u64,
     generation: u64,
     queued: usize,
     reserved: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EpochCount {
+    module_id: u32,
+    epoch: u64,
+    count: usize,
+}
+
+#[derive(Debug)]
+struct EpochCounts {
+    slots: Vec<EpochCount>,
+    capacity: usize,
+}
+
+impl EpochCounts {
+    fn new(capacity: usize) -> Self {
+        Self {
+            slots: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn increment(&mut self, module_id: u32, epoch: u64) {
+        if let Some(slot) = self
+            .slots
+            .iter_mut()
+            .find(|slot| slot.module_id == module_id && slot.epoch == epoch)
+        {
+            slot.count = slot.count.saturating_add(1);
+            return;
+        }
+        assert!(
+            self.slots.len() < self.capacity,
+            "epoch count slots are preflighted by resource capacity"
+        );
+        self.slots.push(EpochCount {
+            module_id,
+            epoch,
+            count: 1,
+        });
+    }
+
+    fn decrement(&mut self, module_id: u32, epoch: u64) {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| slot.module_id == module_id && slot.epoch == epoch)
+            .expect("epoch ownership count exists");
+        self.slots[index].count = self.slots[index]
+            .count
+            .checked_sub(1)
+            .expect("epoch ownership count is positive");
+        if self.slots[index].count == 0 {
+            self.slots.swap_remove(index);
+        }
+    }
+
+    fn get(&self, module_id: u32, epoch: u64) -> usize {
+        self.slots
+            .iter()
+            .find(|slot| slot.module_id == module_id && slot.epoch == epoch)
+            .map_or(0, |slot| slot.count)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -151,12 +217,16 @@ struct ReleaseDomain {
 
 impl ReleaseDomain {
     fn new(capacity: usize) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(ReleaseDomainState {
-                pool: ReleaseNodePool::new(capacity),
-                host_lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
-            })),
-        }
+        let inner = Arc::new(Mutex::new(ReleaseDomainState {
+            pool: ReleaseNodePool::new(capacity),
+            host_lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
+        }));
+        drop(
+            inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        Self { inner }
     }
 }
 
@@ -165,7 +235,7 @@ pub struct ReleaseQueue {
     domain: ReleaseDomain,
     host_admission: Option<HostAdmissionGate>,
     lists: [IntrusiveReleaseList; RELEASE_DOMAIN_COUNT],
-    epoch_pending: BTreeMap<(u32, u64), EpochReleaseCount>,
+    epoch_pending: Vec<EpochReleaseCount>,
     transfer_generation: u64,
     capacity: usize,
     reserved: usize,
@@ -507,7 +577,7 @@ impl ReleaseQueue {
             domain,
             host_admission,
             lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
-            epoch_pending: BTreeMap::new(),
+            epoch_pending: Vec::with_capacity(capacity),
             transfer_generation: 0,
             capacity,
             reserved: 0,
@@ -532,6 +602,17 @@ impl ReleaseQueue {
             self.transition_to_stalled();
             return Err(ReleaseQueueError::Capacity);
         }
+        self.epoch_pending.retain(|count| {
+            count.reserved > 0 || (count.generation == self.transfer_generation && count.queued > 0)
+        });
+        let epoch_index = self
+            .epoch_pending
+            .iter()
+            .position(|count| count.module_id == module_id && count.epoch == epoch);
+        if epoch_index.is_none() && self.epoch_pending.len() == self.epoch_pending.capacity() {
+            self.transition_to_stalled();
+            return Err(ReleaseQueueError::Capacity);
+        }
         let Some(reservation) = self
             .domain
             .inner
@@ -543,17 +624,17 @@ impl ReleaseQueue {
             self.transition_to_stalled();
             return Err(ReleaseQueueError::Capacity);
         };
-        self.epoch_pending.retain(|_, count| {
-            count.reserved > 0 || (count.generation == self.transfer_generation && count.queued > 0)
-        });
-        let count = self
-            .epoch_pending
-            .entry((module_id, epoch))
-            .or_insert(EpochReleaseCount {
+        let index = epoch_index.unwrap_or_else(|| {
+            self.epoch_pending.push(EpochReleaseCount {
+                module_id,
+                epoch,
                 generation: self.transfer_generation,
                 queued: 0,
                 reserved: 0,
             });
+            self.epoch_pending.len() - 1
+        });
+        let count = &mut self.epoch_pending[index];
         if count.generation != self.transfer_generation {
             count.generation = self.transfer_generation;
             count.queued = 0;
@@ -595,7 +676,8 @@ impl ReleaseQueue {
         drop(state);
         let count = self
             .epoch_pending
-            .get_mut(&(record.module_id, record.epoch))
+            .iter_mut()
+            .find(|count| count.module_id == record.module_id && count.epoch == record.epoch)
             .expect("resource creation prepared the epoch release index");
         if count.generation != self.transfer_generation {
             count.generation = self.transfer_generation;
@@ -624,11 +706,14 @@ impl ReleaseQueue {
         {
             state.pool.release(reservation.node);
             self.reserved -= 1;
-            let key = (reservation.module_id, reservation.epoch);
-            let count = self
+            let index = self
                 .epoch_pending
-                .get_mut(&key)
+                .iter()
+                .position(|count| {
+                    count.module_id == reservation.module_id && count.epoch == reservation.epoch
+                })
                 .expect("release reservation has epoch ownership");
+            let count = &mut self.epoch_pending[index];
             count.reserved = count
                 .reserved
                 .checked_sub(1)
@@ -636,7 +721,7 @@ impl ReleaseQueue {
             if count.reserved == 0
                 && (count.generation != self.transfer_generation || count.queued == 0)
             {
-                self.epoch_pending.remove(&key);
+                self.epoch_pending.swap_remove(index);
             }
         }
         drop(state);
@@ -763,7 +848,8 @@ impl ReleaseQueue {
 
     fn record_count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
         self.epoch_pending
-            .get(&(module_id, epoch))
+            .iter()
+            .find(|count| count.module_id == module_id && count.epoch == epoch)
             .filter(|count| count.generation == self.transfer_generation)
             .map_or(0, |count| count.queued)
     }
@@ -815,19 +901,12 @@ fn append_release_list(
     *source = IntrusiveReleaseList::default();
 }
 
-fn increment_epoch_count(counts: &mut BTreeMap<(u32, u64), usize>, module_id: u32, epoch: u64) {
-    *counts.entry((module_id, epoch)).or_default() += 1;
+fn increment_epoch_count(counts: &mut EpochCounts, module_id: u32, epoch: u64) {
+    counts.increment(module_id, epoch);
 }
 
-fn decrement_epoch_count(counts: &mut BTreeMap<(u32, u64), usize>, module_id: u32, epoch: u64) {
-    let key = (module_id, epoch);
-    let count = counts.get_mut(&key).expect("epoch ownership count exists");
-    *count = count
-        .checked_sub(1)
-        .expect("epoch ownership count is positive");
-    if *count == 0 {
-        counts.remove(&key);
-    }
+fn decrement_epoch_count(counts: &mut EpochCounts, module_id: u32, epoch: u64) {
+    counts.decrement(module_id, epoch);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1079,7 +1158,7 @@ struct CompletionQueue {
     capacity: usize,
     slots: Vec<CompletionSlot>,
     free: Vec<usize>,
-    epoch_counts: BTreeMap<(u32, u64), usize>,
+    epoch_counts: EpochCounts,
     closed: bool,
     next_terminal_sequence: u64,
     global_pending: Option<Arc<AtomicUsize>>,
@@ -1289,7 +1368,7 @@ impl From<ReleaseQueueError> for HostRequestError {
 pub(crate) struct HostRequestManager {
     realm_id: u32,
     requests: SlotPool<HostRequest>,
-    epoch_counts: BTreeMap<(u32, u64), usize>,
+    epoch_counts: EpochCounts,
     completions: Arc<Mutex<CompletionQueue>>,
     discarded_late_results: u64,
     terminal_records: VecDeque<RequestTerminalRecord>,
@@ -1316,22 +1395,28 @@ impl HostRequestManager {
         global_pending: Option<Arc<AtomicUsize>>,
         host_admission: Option<HostAdmissionGate>,
     ) -> Self {
+        let completions = Arc::new(Mutex::new(CompletionQueue {
+            items: VecDeque::with_capacity(capacity as usize),
+            capacity: capacity as usize,
+            slots: vec![CompletionSlot::Free; capacity as usize],
+            free: (0..capacity as usize).rev().collect(),
+            epoch_counts: EpochCounts::new(capacity as usize),
+            closed: false,
+            next_terminal_sequence: 1,
+            global_pending,
+            host_admission,
+            accounting: CompletionAccounting::default(),
+        }));
+        drop(
+            completions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         Self {
             realm_id,
             requests: SlotPool::with_capacity_limit(realm_id, capacity),
-            epoch_counts: BTreeMap::new(),
-            completions: Arc::new(Mutex::new(CompletionQueue {
-                items: VecDeque::with_capacity(capacity as usize),
-                capacity: capacity as usize,
-                slots: vec![CompletionSlot::Free; capacity as usize],
-                free: (0..capacity as usize).rev().collect(),
-                epoch_counts: BTreeMap::new(),
-                closed: false,
-                next_terminal_sequence: 1,
-                global_pending,
-                host_admission,
-                accounting: CompletionAccounting::default(),
-            })),
+            epoch_counts: EpochCounts::new(capacity as usize),
+            completions,
             discarded_late_results: 0,
             terminal_records: VecDeque::with_capacity(capacity as usize),
         }
@@ -1656,18 +1741,11 @@ impl HostRequestManager {
             .completions
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue
-            .epoch_counts
-            .get(&(module_id, epoch))
-            .copied()
-            .unwrap_or(0)
+        queue.epoch_counts.get(module_id, epoch)
     }
 
     fn request_count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
-        self.epoch_counts
-            .get(&(module_id, epoch))
-            .copied()
-            .unwrap_or(0)
+        self.epoch_counts.get(module_id, epoch)
     }
 
     fn reserve_completion(
@@ -1817,7 +1895,7 @@ struct ResourceToken {
 pub(crate) struct ResourceTokenManager {
     realm_id: u32,
     tokens: SlotPool<ResourceToken>,
-    epoch_counts: BTreeMap<(u32, u64), usize>,
+    epoch_counts: EpochCounts,
     terminal: VecDeque<RawHandle>,
     terminal_capacity: usize,
 }
@@ -1828,7 +1906,7 @@ impl ResourceTokenManager {
         Self {
             realm_id,
             tokens: SlotPool::with_capacity_limit(realm_id, capacity),
-            epoch_counts: BTreeMap::new(),
+            epoch_counts: EpochCounts::new(capacity as usize),
             terminal: VecDeque::with_capacity(capacity as usize),
             terminal_capacity: capacity as usize,
         }
@@ -1914,10 +1992,7 @@ impl ResourceTokenManager {
     }
 
     fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
-        self.epoch_counts
-            .get(&(module_id, epoch))
-            .copied()
-            .unwrap_or(0)
+        self.epoch_counts.get(module_id, epoch)
     }
 }
 
@@ -1944,7 +2019,7 @@ struct SnapshotEntry {
 pub(crate) struct SnapshotManager {
     realm_id: u32,
     snapshots: SlotPool<SnapshotEntry>,
-    epoch_counts: BTreeMap<(u32, u64), usize>,
+    epoch_counts: EpochCounts,
 }
 
 impl SnapshotManager {
@@ -1953,7 +2028,7 @@ impl SnapshotManager {
         Self {
             realm_id,
             snapshots: SlotPool::with_capacity_limit(realm_id, capacity),
-            epoch_counts: BTreeMap::new(),
+            epoch_counts: EpochCounts::new(capacity as usize),
         }
     }
 
@@ -2015,10 +2090,7 @@ impl SnapshotManager {
     }
 
     fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
-        self.epoch_counts
-            .get(&(module_id, epoch))
-            .copied()
-            .unwrap_or(0)
+        self.epoch_counts.get(module_id, epoch)
     }
 }
 
@@ -2029,13 +2101,39 @@ pub struct TaskResourceSet {
     pub snapshots: BTreeSet<SnapshotHandle>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnedResource {
+    Request {
+        task: TaskHandle,
+        handle: HostRequestHandle,
+    },
+    Token {
+        task: TaskHandle,
+        handle: ResourceTokenHandle,
+    },
+    Snapshot {
+        task: TaskHandle,
+        handle: SnapshotHandle,
+    },
+}
+
+impl OwnedResource {
+    const fn task(self) -> TaskHandle {
+        match self {
+            Self::Request { task, .. } | Self::Token { task, .. } | Self::Snapshot { task, .. } => {
+                task
+            }
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct RuntimeResources {
     requests: HostRequestManager,
     tokens: ResourceTokenManager,
     snapshots: SnapshotManager,
     releases: ReleaseQueue,
-    ownership: BTreeMap<TaskHandle, TaskResourceSet>,
+    ownership: Vec<OwnedResource>,
     host_admission: Option<HostAdmissionGate>,
 }
 
@@ -2106,7 +2204,11 @@ impl RuntimeResources {
             tokens: ResourceTokenManager::new(realm_id, capacity),
             snapshots: SnapshotManager::new(realm_id, capacity),
             releases,
-            ownership: BTreeMap::new(),
+            ownership: Vec::with_capacity(
+                (capacity as usize)
+                    .checked_mul(3)
+                    .expect("host resource ownership capacity overflow"),
+            ),
             host_admission: resource_admission,
         }
     }
@@ -2125,9 +2227,12 @@ impl RuntimeResources {
             .drain_completions(&mut self.releases)
             .into_iter()
             .inspect(|delivery| {
-                for resources in self.ownership.values_mut() {
-                    resources.requests.remove(&delivery.request);
-                }
+                self.ownership.retain(|owned| {
+                    !matches!(
+                        owned,
+                        OwnedResource::Request { handle, .. } if *handle == delivery.request
+                    )
+                });
             })
             .collect()
     }
@@ -2137,23 +2242,24 @@ impl RuntimeResources {
         task: TaskHandle,
         detach_requests: bool,
     ) -> Result<(), HostRequestError> {
-        let Some(owned) = self.ownership.remove(&task) else {
-            return Ok(());
-        };
-        for request in owned.requests {
-            match self
-                .requests
-                .cancel(request, detach_requests, &mut self.releases)
-            {
-                Ok(()) | Err(HostRequestError::Handle(_)) => {}
-                Err(error) => return Err(error),
+        while let Some(index) = self.ownership.iter().position(|owned| owned.task() == task) {
+            match self.ownership.swap_remove(index) {
+                OwnedResource::Request { handle, .. } => {
+                    match self
+                        .requests
+                        .cancel(handle, detach_requests, &mut self.releases)
+                    {
+                        Ok(()) | Err(HostRequestError::Handle(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                OwnedResource::Token { handle, .. } => {
+                    self.tokens.release(handle, &mut self.releases)?;
+                }
+                OwnedResource::Snapshot { handle, .. } => {
+                    self.snapshots.release(handle, &mut self.releases)?;
+                }
             }
-        }
-        for token in owned.tokens {
-            self.tokens.release(token, &mut self.releases)?;
-        }
-        for snapshot in owned.snapshots {
-            self.snapshots.release(snapshot, &mut self.releases)?;
         }
         Ok(())
     }
@@ -2186,15 +2292,53 @@ impl RuntimeResources {
     }
 
     #[must_use]
-    pub fn ownership(&self, task: TaskHandle) -> Option<&TaskResourceSet> {
-        self.ownership.get(&task)
+    pub fn ownership(&self, task: TaskHandle) -> Option<TaskResourceSet> {
+        let mut snapshot = TaskResourceSet::default();
+        for owned in self
+            .ownership
+            .iter()
+            .copied()
+            .filter(|owned| owned.task() == task)
+        {
+            match owned {
+                OwnedResource::Request { handle, .. } => {
+                    snapshot.requests.insert(handle);
+                }
+                OwnedResource::Token { handle, .. } => {
+                    snapshot.tokens.insert(handle);
+                }
+                OwnedResource::Snapshot { handle, .. } => {
+                    snapshot.snapshots.insert(handle);
+                }
+            }
+        }
+        (!snapshot.requests.is_empty()
+            || !snapshot.tokens.is_empty()
+            || !snapshot.snapshots.is_empty())
+        .then_some(snapshot)
     }
 
     #[must_use]
     pub fn owns_request(&self, task: TaskHandle, request: HostRequestHandle) -> bool {
+        self.ownership.iter().any(|owned| {
+            matches!(
+                owned,
+                OwnedResource::Request {
+                    task: owner,
+                    handle,
+                } if *owner == task && *handle == request
+            )
+        })
+    }
+
+    #[must_use]
+    pub(crate) fn request_count_for_task(&self, task: TaskHandle) -> usize {
         self.ownership
-            .get(&task)
-            .is_some_and(|resources| resources.requests.contains(&request))
+            .iter()
+            .filter(|owned| {
+                matches!(owned, OwnedResource::Request { task: owner, .. } if *owner == task)
+            })
+            .count()
     }
 
     #[must_use]
@@ -2281,12 +2425,11 @@ impl ResourceContext<'_> {
             self.epoch,
             &mut self.resources.releases,
         )?;
-        self.resources
-            .ownership
-            .entry(self.task)
-            .or_default()
-            .requests
-            .insert(pending.request);
+        debug_assert!(self.resources.ownership.len() < self.resources.ownership.capacity());
+        self.resources.ownership.push(OwnedResource::Request {
+            task: self.task,
+            handle: pending.request,
+        });
         Ok(pending)
     }
 
@@ -2302,12 +2445,11 @@ impl ResourceContext<'_> {
             domain,
             &mut self.resources.releases,
         )?;
-        self.resources
-            .ownership
-            .entry(self.task)
-            .or_default()
-            .tokens
-            .insert(token);
+        debug_assert!(self.resources.ownership.len() < self.resources.ownership.capacity());
+        self.resources.ownership.push(OwnedResource::Token {
+            task: self.task,
+            handle: token,
+        });
         Ok(token)
     }
 
@@ -2323,12 +2465,11 @@ impl ResourceContext<'_> {
             data,
             &mut self.resources.releases,
         )?;
-        self.resources
-            .ownership
-            .entry(self.task)
-            .or_default()
-            .snapshots
-            .insert(snapshot);
+        debug_assert!(self.resources.ownership.len() < self.resources.ownership.capacity());
+        self.resources.ownership.push(OwnedResource::Snapshot {
+            task: self.task,
+            handle: snapshot,
+        });
         Ok(snapshot)
     }
 

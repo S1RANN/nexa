@@ -1587,9 +1587,8 @@ impl RealmRuntime {
             let Ok(TaskExecution::Waiting { request, .. }) = self.tasks.execution(task) else {
                 return false;
             };
-            self.resources.ownership(task).is_some_and(|resources| {
-                resources.requests.len() == 1 && resources.requests.contains(request)
-            })
+            self.resources.request_count_for_task(task) == 1
+                && self.resources.owns_request(task, *request)
         });
         let drained_epochs_are_empty = self.retired_epochs.entries.iter().all(|entry| {
             entry.state != RetiredEpochState::Drained
