@@ -33,3 +33,7 @@ The compiler lowers `None`, `Some`, `Ok`, `Err`, exhaustive enum `match`, and ex
 enum instructions. Migration source intrinsics lower to old-state reads, staging writes, explicit
 Preserve/Replace/Delete decisions, and `STATE_FINISH`; examples may not patch migration bytecode in
 Rust.
+
+Compiler register counts are derived from a per-function plan. Local registers and the peak
+expression, call-argument, match, and migration temporary windows are counted independently; no
+fixed `locals + 8` allowance is permitted. The verifier independently checks every argument range.

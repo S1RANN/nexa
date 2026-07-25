@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use nexa_core::StableId;
@@ -7,7 +7,7 @@ use crate::interpreter::InterpreterMigration;
 use crate::machines::reload;
 use crate::scheduler::SchedulerCheckpoint;
 use crate::task::TaskExecution;
-use crate::{GcRef, ModuleHandle, RuntimeValue, TaskHandle, TaskSnapshot};
+use crate::{GcRef, HostCompletionDelivery, ModuleHandle, RuntimeValue, TaskHandle, TaskSnapshot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatefulDomainId(u64);
@@ -68,6 +68,42 @@ pub enum StatefulError {
     Missing(StableId),
     StaleGeneration,
     GenerationExhausted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MigrationLimits {
+    pub max_objects: u32,
+    pub max_fields: u32,
+    pub max_forwarding_entries: u32,
+    pub max_state_bytes: usize,
+    pub max_gc_roots: u32,
+    pub max_fuel: u64,
+    pub max_call_depth: u16,
+}
+
+impl Default for MigrationLimits {
+    fn default() -> Self {
+        Self {
+            max_objects: 4_096,
+            max_fields: 16_384,
+            max_forwarding_entries: 4_096,
+            max_state_bytes: 16 * 1024 * 1024,
+            max_gc_roots: 4_096,
+            max_fuel: 4_096,
+            max_call_depth: 128,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrationLimitError {
+    Objects,
+    Fields,
+    Forwarding,
+    StateBytes,
+    GcRoots,
+    Fuel,
+    CallDepth,
 }
 
 impl fmt::Display for StatefulError {
@@ -163,6 +199,60 @@ impl StatefulRegistry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MigrationUsage {
+    objects: u64,
+    fields: u64,
+    state_bytes: usize,
+    gc_roots: u64,
+}
+
+fn registry_usage(registry: &StatefulRegistry) -> MigrationUsage {
+    let mut usage = MigrationUsage::default();
+    for entry in registry.entries.values() {
+        usage.objects += 1;
+        usage.state_bytes = usage
+            .state_bytes
+            .saturating_add(std::mem::size_of::<StableId>() + std::mem::size_of::<u32>());
+        add_state_value_usage(&entry.value, &mut usage);
+    }
+    usage
+}
+
+fn add_state_value_usage(value: &StateValue, usage: &mut MigrationUsage) {
+    match value {
+        StateValue::I32(_) => {
+            usage.state_bytes = usage.state_bytes.saturating_add(std::mem::size_of::<i32>());
+        }
+        StateValue::Bool(_) => {
+            usage.state_bytes = usage.state_bytes.saturating_add(1);
+        }
+        StateValue::Ref(_) => {
+            usage.state_bytes = usage
+                .state_bytes
+                .saturating_add(std::mem::size_of::<GcRef>());
+            usage.gc_roots += 1;
+        }
+        StateValue::Handle(_) => {
+            usage.state_bytes = usage
+                .state_bytes
+                .saturating_add(std::mem::size_of::<StateHandle>());
+        }
+        StateValue::Object(object) => {
+            usage.state_bytes = usage
+                .state_bytes
+                .saturating_add(std::mem::size_of::<StableId>() + std::mem::size_of::<u32>());
+            for value in object.fields.values() {
+                usage.fields += 1;
+                usage.state_bytes = usage
+                    .state_bytes
+                    .saturating_add(std::mem::size_of::<StableId>());
+                add_state_value_usage(value, usage);
+            }
+        }
+    }
+}
+
 pub(crate) struct MigrationContext {
     old: StatefulRegistry,
     staging: StatefulRegistry,
@@ -172,6 +262,7 @@ pub(crate) struct MigrationContext {
     schema_unchanged: bool,
     touched: bool,
     finalized: bool,
+    limits: MigrationLimits,
     invalid: Option<ReloadError>,
 }
 
@@ -182,6 +273,7 @@ impl MigrationContext {
         domain: StatefulDomainId,
         schema: nexa_bytecode::StateSchema,
         schema_unchanged: bool,
+        limits: MigrationLimits,
     ) -> Self {
         Self {
             old,
@@ -192,8 +284,44 @@ impl MigrationContext {
             schema_unchanged,
             touched: false,
             finalized: false,
+            limits,
             invalid: None,
         }
+    }
+
+    pub(crate) fn limit_error(&self) -> Option<MigrationLimitError> {
+        match self.invalid {
+            Some(ReloadError::MigrationLimit(error)) => Some(error),
+            _ => None,
+        }
+    }
+
+    fn reject_limit<T>(&mut self, error: MigrationLimitError) -> Result<T, String> {
+        self.invalid = Some(ReloadError::MigrationLimit(error));
+        Err(format!("migration limit exceeded: {error:?}"))
+    }
+
+    fn ensure_usage(&mut self, usage: MigrationUsage) -> Result<(), String> {
+        if usage.objects > u64::from(self.limits.max_objects) {
+            return self.reject_limit(MigrationLimitError::Objects);
+        }
+        if usage.fields > u64::from(self.limits.max_fields) {
+            return self.reject_limit(MigrationLimitError::Fields);
+        }
+        if usage.state_bytes > self.limits.max_state_bytes {
+            return self.reject_limit(MigrationLimitError::StateBytes);
+        }
+        if usage.gc_roots > u64::from(self.limits.max_gc_roots) {
+            return self.reject_limit(MigrationLimitError::GcRoots);
+        }
+        Ok(())
+    }
+
+    fn ensure_forwarding_capacity(&mut self) -> Result<(), String> {
+        if self.decisions.len() >= self.limits.max_forwarding_entries as usize {
+            return self.reject_limit(MigrationLimitError::Forwarding);
+        }
+        Ok(())
     }
 
     pub(crate) fn finish(mut self) -> Result<StatefulRegistry, ReloadError> {
@@ -309,26 +437,30 @@ impl InterpreterMigration for MigrationContext {
         if self.finalized {
             return Err("STATE_FINISH already executed".into());
         }
-        let schema = self
+        let version = self
             .schema
             .types
             .iter()
             .find(|state_type| state_type.stable_id == type_id)
+            .map(|state_type| state_type.version)
             .ok_or_else(|| format!("candidate state type {type_id:?} does not exist"))?;
         if self.staging.entries.contains_key(&stable_id) {
             return Err("new state object already exists".into());
         }
-        self.staging.entries.insert(
+        let mut projected = self.staging.clone();
+        projected.entries.insert(
             stable_id,
             StateEntry {
                 generation: 0,
                 value: StateValue::Object(StateObject {
                     type_id,
-                    version: schema.version,
+                    version,
                     fields: BTreeMap::new(),
                 }),
             },
         );
+        self.ensure_usage(registry_usage(&projected))?;
+        self.staging = projected;
         self.touched = true;
         Ok(RuntimeValue::Opaque {
             type_id,
@@ -353,8 +485,8 @@ impl InterpreterMigration for MigrationContext {
             return Err("STATE_NEW_SET requires a staging object".into());
         };
         let value = runtime_to_state_value(value, &self.staging)?;
-        let entry = self
-            .staging
+        let mut projected = self.staging.clone();
+        let entry = projected
             .entries
             .get_mut(&StableId(object_id))
             .ok_or_else(|| "staging object does not exist".to_string())?;
@@ -365,6 +497,8 @@ impl InterpreterMigration for MigrationContext {
             return Err("staging object type mismatch".into());
         }
         object.fields.insert(field_id, value);
+        self.ensure_usage(registry_usage(&projected))?;
+        self.staging = projected;
         self.touched = true;
         Ok(())
     }
@@ -377,16 +511,20 @@ impl InterpreterMigration for MigrationContext {
             self.invalid = Some(ReloadError::DuplicateForwarding);
             return Ok(());
         }
+        self.ensure_forwarding_capacity()?;
         let entry = self
             .old
             .entries
             .get(&stable_id)
             .ok_or_else(|| "STATE_PRESERVE source does not exist".to_string())?
             .clone();
-        if self.staging.entries.insert(stable_id, entry).is_some() {
+        let mut projected = self.staging.clone();
+        if projected.entries.insert(stable_id, entry).is_some() {
             self.invalid = Some(ReloadError::DuplicateForwarding);
             return Ok(());
         }
+        self.ensure_usage(registry_usage(&projected))?;
+        self.staging = projected;
         self.forwarding.insert(stable_id, stable_id);
         self.decisions.insert(stable_id, Some(stable_id));
         self.touched = true;
@@ -411,6 +549,7 @@ impl InterpreterMigration for MigrationContext {
             self.invalid = Some(ReloadError::DuplicateForwarding);
             return Ok(());
         }
+        self.ensure_forwarding_capacity()?;
         let old_generation = self
             .old
             .entries
@@ -420,11 +559,14 @@ impl InterpreterMigration for MigrationContext {
         let replacement_generation = old_generation
             .checked_add(1)
             .ok_or_else(|| "replacement generation exhausted".to_string())?;
-        self.staging
+        let mut projected = self.staging.clone();
+        projected
             .entries
             .get_mut(&target_id)
             .expect("target existence checked")
             .generation = replacement_generation;
+        self.ensure_usage(registry_usage(&projected))?;
+        self.staging = projected;
         self.forwarding.insert(old_id, target_id);
         self.decisions.insert(old_id, Some(target_id));
         self.touched = true;
@@ -438,11 +580,16 @@ impl InterpreterMigration for MigrationContext {
         if !self.old.entries.contains_key(&stable_id) {
             return Err("STATE_DELETE source does not exist".into());
         }
-        if self.decisions.insert(stable_id, None).is_some() {
+        if self.decisions.contains_key(&stable_id) {
             self.invalid = Some(ReloadError::DuplicateForwarding);
             return Ok(());
         }
-        self.staging.entries.remove(&stable_id);
+        self.ensure_forwarding_capacity()?;
+        let mut projected = self.staging.clone();
+        projected.entries.remove(&stable_id);
+        self.ensure_usage(registry_usage(&projected))?;
+        self.staging = projected;
+        self.decisions.insert(stable_id, None);
         self.touched = true;
         Ok(())
     }
@@ -628,6 +775,8 @@ pub enum ReloadError {
     MissingForwarding,
     DuplicateForwarding,
     InvalidStateHandle,
+    MigrationLimit(MigrationLimitError),
+    CompletionBufferCapacity,
     Migration(String),
     GraphCheck,
     QuiesceTimeout,
@@ -639,6 +788,40 @@ pub(crate) struct ReloadTransaction {
     pub(crate) old_module: ModuleHandle,
     pub(crate) candidate: ModuleHandle,
     pub(crate) paused_tasks: Vec<PausedTask>,
+    pub(crate) completions: ReloadCompletionBuffer,
+}
+
+#[derive(Debug)]
+pub(crate) struct ReloadCompletionBuffer {
+    entries: VecDeque<HostCompletionDelivery>,
+    capacity: usize,
+}
+
+impl ReloadCompletionBuffer {
+    #[must_use]
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            entries: VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    pub(crate) fn push(&mut self, delivery: HostCompletionDelivery) -> Result<(), ReloadError> {
+        if self.entries.len() == self.capacity {
+            return Err(ReloadError::CompletionBufferCapacity);
+        }
+        self.entries.push_back(delivery);
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = HostCompletionDelivery> + '_ {
+        self.entries.drain(..)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -764,9 +947,16 @@ impl std::error::Error for ReloadError {}
 
 #[cfg(test)]
 mod tests {
+    use nexa_bytecode::{StateField, StateSchema, StateType, ValueType};
     use nexa_core::StableId;
 
-    use super::{StateValue, StatefulDomainId, StatefulError, StatefulRegistry};
+    use crate::GcRef;
+    use crate::interpreter::InterpreterMigration;
+
+    use super::{
+        MigrationContext, MigrationLimitError, MigrationLimits, StateValue, StatefulDomainId,
+        StatefulError, StatefulRegistry,
+    };
 
     #[test]
     fn state_handles_are_generation_and_domain_checked() {
@@ -777,5 +967,124 @@ mod tests {
         assert_ne!(old, new);
         assert_eq!(registry.resolve(old), Err(StatefulError::StaleGeneration));
         assert_eq!(registry.resolve(new), Ok(&StateValue::I32(2)));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn migration_context_rejects_capacity_before_staging_mutation() {
+        let type_id = StableId::from_name("LimitedState");
+        let object_id = StableId::from_name("LimitedState::one");
+        let field_id = StableId::from_name("LimitedState::value");
+        let schema = StateSchema {
+            types: vec![StateType {
+                stable_id: type_id,
+                version: 1,
+                fields: vec![StateField {
+                    stable_id: field_id,
+                    ty: ValueType::Ref,
+                }],
+            }],
+        };
+
+        let mut objects = MigrationContext::new(
+            StatefulRegistry::new(StatefulDomainId::new(1)),
+            StatefulDomainId::new(1),
+            schema.clone(),
+            false,
+            MigrationLimits {
+                max_objects: 0,
+                ..MigrationLimits::default()
+            },
+        );
+        assert!(objects.new_create(object_id, type_id).is_err());
+        assert_eq!(objects.limit_error(), Some(MigrationLimitError::Objects));
+        assert!(objects.staging.entries.is_empty());
+
+        let mut fields = MigrationContext::new(
+            StatefulRegistry::new(StatefulDomainId::new(1)),
+            StatefulDomainId::new(1),
+            schema.clone(),
+            false,
+            MigrationLimits {
+                max_fields: 0,
+                ..MigrationLimits::default()
+            },
+        );
+        let object = fields.new_create(object_id, type_id).unwrap();
+        assert!(
+            fields
+                .new_set(
+                    object,
+                    field_id,
+                    crate::RuntimeValue::Ref(GcRef {
+                        index: 0,
+                        generation: 0,
+                    })
+                )
+                .is_err()
+        );
+        assert_eq!(fields.limit_error(), Some(MigrationLimitError::Fields));
+        assert!(matches!(
+            fields.staging.entries[&object_id].value,
+            StateValue::Object(ref object) if object.fields.is_empty()
+        ));
+
+        let mut bytes = MigrationContext::new(
+            StatefulRegistry::new(StatefulDomainId::new(1)),
+            StatefulDomainId::new(1),
+            schema.clone(),
+            false,
+            MigrationLimits {
+                max_state_bytes: 0,
+                ..MigrationLimits::default()
+            },
+        );
+        assert!(bytes.new_create(object_id, type_id).is_err());
+        assert_eq!(bytes.limit_error(), Some(MigrationLimitError::StateBytes));
+
+        let mut roots = MigrationContext::new(
+            StatefulRegistry::new(StatefulDomainId::new(1)),
+            StatefulDomainId::new(1),
+            schema,
+            false,
+            MigrationLimits {
+                max_gc_roots: 0,
+                ..MigrationLimits::default()
+            },
+        );
+        let object = roots.new_create(object_id, type_id).unwrap();
+        assert!(
+            roots
+                .new_set(
+                    object,
+                    field_id,
+                    crate::RuntimeValue::Ref(GcRef {
+                        index: 0,
+                        generation: 0,
+                    })
+                )
+                .is_err()
+        );
+        assert_eq!(roots.limit_error(), Some(MigrationLimitError::GcRoots));
+
+        let old_id = StableId::from_name("old");
+        let mut old = StatefulRegistry::new(StatefulDomainId::new(1));
+        old.insert(old_id, StateValue::I32(1)).unwrap();
+        let mut forwarding = MigrationContext::new(
+            old,
+            StatefulDomainId::new(1),
+            StateSchema { types: Vec::new() },
+            false,
+            MigrationLimits {
+                max_forwarding_entries: 0,
+                ..MigrationLimits::default()
+            },
+        );
+        assert!(forwarding.preserve(old_id).is_err());
+        assert_eq!(
+            forwarding.limit_error(),
+            Some(MigrationLimitError::Forwarding)
+        );
+        assert!(forwarding.staging.entries.is_empty());
     }
 }

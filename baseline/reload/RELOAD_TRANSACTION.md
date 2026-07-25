@@ -8,8 +8,10 @@ purity, and reserve staging capacity. The active system continues running.
 ## Quiesce
 
 Stop new task admission for the module. Tasks enter `ReloadPaused` at safepoints. Completion
-delivery is buffered. Tasks, frames, requests, and resources remain intact. Timeout restores
-delivery and resumes old tasks.
+delivery is drained from the global queue into a capacity-bounded, transaction-owned completion
+buffer. Tasks, frames, requests, and resources remain intact. Rollback restores scheduler and task
+checkpoints before replaying buffered deliveries; commit discards old-epoch buffered deliveries
+while cancelling the old tasks.
 
 ## Stage
 
@@ -26,6 +28,10 @@ graph, and execute `STATE_FINISH`. An untouched changed-schema migration returns
 Migration functions use typed source intrinsics: `old.get<T>`, `old.field<T>`, `new.create<T>`,
 `new.set`, `preserve`, `replace`, `delete`, and `finish_migration`. These are available only to
 `migration fn` and lower directly to the restricted migration instruction set.
+
+`RealmConfig::migration_limits` bounds objects, fields, forwarding entries, state bytes, GC roots,
+fuel, and call depth. Every staging mutation is preflighted against those limits. A limit failure
+occurs before root publication and leaves the old root available for rollback.
 
 ## Commit
 

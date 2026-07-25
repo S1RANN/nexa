@@ -958,6 +958,40 @@ mod tests {
                 .kind,
             VerifyErrorKind::MissingRoot(0)
         ));
+
+        let eight_i32 = vec![ValueType::I32; 8];
+        let mut target_function = FunctionBuilder::new(
+            Signature {
+                parameters: eight_i32.clone(),
+                result: Some(ValueType::I32),
+            },
+            8,
+        );
+        target_function.emit(Instruction::Return { source: 0 });
+        let mut out_of_range_call = FunctionBuilder::new(
+            Signature {
+                parameters: eight_i32,
+                result: Some(ValueType::I32),
+            },
+            8,
+        );
+        out_of_range_call
+            .emit(Instruction::Call {
+                function: 0,
+                args_base: 1,
+                args_count: 8,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut module = ModuleBuilder::new();
+        module.function(target_function.finish().unwrap());
+        module.function(out_of_range_call.finish().unwrap());
+        assert!(matches!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::RegisterOutOfRange(8)
+        ));
     }
 
     #[test]

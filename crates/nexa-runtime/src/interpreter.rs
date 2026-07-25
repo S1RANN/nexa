@@ -406,9 +406,9 @@ impl CheckedInterpreter {
         function: u32,
         arguments: &[RuntimeValue],
         fuel: u64,
+        limits: FrameLimits,
         migration: &mut dyn InterpreterMigration,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        let limits = FrameLimits::default();
         let continuation = Self::start(
             module,
             function,

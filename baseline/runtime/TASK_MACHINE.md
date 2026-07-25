@@ -5,11 +5,12 @@
 ```text
 Created → Ready → Running
 Running ⇄ FuelYielded
+Running ⇄ ExplicitYielded
 Running ⇄ Waiting
-Running/Waiting/FuelYielded → ReloadPauseRequested → ReloadPaused
-Running/Waiting/FuelYielded → CancelRequested → Cancelling → Cancelled
+Running/Waiting/FuelYielded/ExplicitYielded → ReloadPauseRequested → ReloadPaused
+Running/Waiting/FuelYielded/ExplicitYielded → CancelRequested → Cancelling → Cleanup → Cancelled
 Running → Completed
-Running/Cancelling → Trapped
+Running/Cancelling/Cleanup → Trapped
 ```
 
 ## Admission invariants
@@ -29,3 +30,7 @@ Detached physical host operations belong to the host-resource domain.
 
 `ReloadCommitCancel` does not run user script `defer`. It releases only VM-managed resources and
 registered host-resource tokens. Ordinary cancellation may run non-suspending user `defer`.
+
+Realm Model v4 independently explores Fuel and Explicit Yield resume paths, waiting-request
+ownership, reload pause/rollback, ordinary bounded cleanup, reload-commit cancellation, and
+terminal scheduler-token cleanup.

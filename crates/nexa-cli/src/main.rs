@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use nexa_machine::{MachineSpec, stable_id_map};
 use nexa_model::explore;
 use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
+use nexa_model::realm_v4::{RealmV4Config, explore_realm_v4};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -449,23 +450,38 @@ fn check_models() -> Result<(), String> {
     if realm_v3.truncated {
         return Err("Realm v3 model exploration was truncated".into());
     }
+    let realm_v4 = explore_realm_v4(RealmV4Config {
+        max_depth: 16,
+        max_worlds: 4_096,
+    });
+    if !realm_v4.failures.is_empty() {
+        let (message, path) = &realm_v4.failures[0];
+        std::fs::write(artifact, format!("{message}\npath={path:?}\n"))
+            .map_err(|error| format!("could not write model artifact: {error}"))?;
+        return Err(format!("Realm v4 model failed: {:?}", realm_v4.failures));
+    }
+    if realm_v4.truncated {
+        return Err("Realm v4 model exploration was truncated".into());
+    }
     std::fs::write(
         artifact,
         format!(
-            "success: {} machine snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds\n",
+            "success: {} machine snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds\n",
             snapshot_count,
             system_report.visited_worlds,
             realm_report.visited_worlds,
             realm_v3.visited_worlds,
+            realm_v4.visited_worlds,
         ),
     )
     .map_err(|error| format!("could not write model artifact: {error}"))?;
     println!(
-        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds",
+        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds",
         specs.len(),
         system_report.visited_worlds,
         realm_report.visited_worlds,
         realm_v3.visited_worlds,
+        realm_v4.visited_worlds,
     );
     Ok(())
 }

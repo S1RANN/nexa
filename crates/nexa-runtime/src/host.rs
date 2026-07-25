@@ -18,6 +18,22 @@ pub enum RuntimeHostDomain {
     Io,
 }
 
+pub const RELEASE_DOMAIN_COUNT: usize = 4;
+
+impl RuntimeHostDomain {
+    const ALL: [Self; RELEASE_DOMAIN_COUNT] = [Self::VmThread, Self::Render, Self::Audio, Self::Io];
+
+    #[must_use]
+    pub const fn bucket(self) -> usize {
+        match self {
+            Self::VmThread => 0,
+            Self::Render => 1,
+            Self::Audio => 2,
+            Self::Io => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReleaseReservation {
     node: usize,
@@ -116,7 +132,7 @@ impl ReleaseNodePool {
 #[derive(Debug)]
 struct ReleaseDomainState {
     pool: ReleaseNodePool,
-    host_lists: [IntrusiveReleaseList; 4],
+    host_lists: [IntrusiveReleaseList; RELEASE_DOMAIN_COUNT],
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -136,7 +152,7 @@ impl ReleaseDomain {
         Self {
             inner: Arc::new(Mutex::new(ReleaseDomainState {
                 pool: ReleaseNodePool::new(capacity),
-                host_lists: [IntrusiveReleaseList::default(); 4],
+                host_lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
             })),
         }
     }
@@ -145,7 +161,7 @@ impl ReleaseDomain {
 #[derive(Debug)]
 pub struct ReleaseQueue {
     domain: ReleaseDomain,
-    lists: [IntrusiveReleaseList; 5],
+    lists: [IntrusiveReleaseList; RELEASE_DOMAIN_COUNT],
     epoch_pending: BTreeMap<(u32, u64), EpochReleaseCount>,
     transfer_generation: u64,
     capacity: usize,
@@ -266,19 +282,14 @@ impl RuntimeHost {
     pub fn drain_releases(&self) -> Vec<ReleaseRecord> {
         let capacity = self.pending_releases();
         let mut records = Vec::with_capacity(capacity);
-        for domain in [
-            RuntimeHostDomain::VmThread,
-            RuntimeHostDomain::Render,
-            RuntimeHostDomain::Audio,
-            RuntimeHostDomain::Io,
-        ] {
+        for domain in RuntimeHostDomain::ALL {
             records.extend(self.drain(domain, usize::MAX));
         }
         records
     }
 
     pub fn drain(&self, domain: RuntimeHostDomain, max_items: usize) -> Vec<ReleaseRecord> {
-        let bucket = release_domain_bucket(domain);
+        let bucket = domain.bucket();
         let mut state = self
             .releases
             .inner
@@ -343,7 +354,7 @@ impl ReleaseQueue {
     fn with_domain(domain: ReleaseDomain, capacity: usize) -> Self {
         Self {
             domain,
-            lists: [IntrusiveReleaseList::default(); 5],
+            lists: [IntrusiveReleaseList::default(); RELEASE_DOMAIN_COUNT],
             epoch_pending: BTreeMap::new(),
             transfer_generation: 0,
             capacity,
@@ -405,7 +416,7 @@ impl ReleaseQueue {
         if reservation.module_id != record.module_id || reservation.epoch != record.epoch {
             return Err(ReleaseQueueError::NotReserved);
         }
-        let bucket = release_domain_bucket(record.domain);
+        let bucket = record.domain.bucket();
         let mut state = self
             .domain
             .inner
@@ -602,15 +613,6 @@ impl ReleaseQueue {
             .transfer_generation
             .checked_add(1)
             .expect("release transfer generation exhausted");
-    }
-}
-
-fn release_domain_bucket(domain: RuntimeHostDomain) -> usize {
-    match domain {
-        RuntimeHostDomain::VmThread => 0,
-        RuntimeHostDomain::Render => 1,
-        RuntimeHostDomain::Audio => 2,
-        RuntimeHostDomain::Io => 3,
     }
 }
 

@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
 use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
+use nexa_model::realm_v4::{RealmV4Config, explore_realm_v4};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -27,6 +28,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn run(path: &Path) -> Result<(), String> {
     let paths = spec_paths(path)?;
     let mut snapshots = 0;
@@ -110,6 +112,22 @@ fn run(path: &Path) -> Result<(), String> {
         println!(
             "RealmV3: {} worlds, {} rejected operations",
             realm_v3.visited_worlds, realm_v3.rejected_operations
+        );
+        let realm_v4 = explore_realm_v4(RealmV4Config {
+            max_depth: 16,
+            max_worlds: 4_096,
+        });
+        if !realm_v4.failures.is_empty() || realm_v4.truncated {
+            return Err(format!(
+                "Realm v4 model failed: {:?}, truncated={}",
+                realm_v4.failures, realm_v4.truncated
+            ));
+        }
+        println!(
+            "RealmV4: {} worlds, {} task states, {} rejected operations",
+            realm_v4.visited_worlds,
+            realm_v4.reached_states.len(),
+            realm_v4.rejected_operations
         );
     }
     Ok(())

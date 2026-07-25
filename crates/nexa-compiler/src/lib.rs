@@ -314,6 +314,16 @@ struct HirFunction {
     locals: BTreeMap<String, (u16, ValueType)>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RegisterPlan {
+    local_count: u16,
+    expression_temporaries: u16,
+    max_call_arguments: u16,
+    match_temporaries: u16,
+    migration_temporaries: u16,
+    total: u16,
+}
+
 pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
@@ -1977,6 +1987,156 @@ fn lower_type(ty: &AstType) -> ValueType {
     }
 }
 
+fn plan_registers(function: &HirFunction) -> Result<RegisterPlan, CompileError> {
+    let local_count = function
+        .locals
+        .values()
+        .map(|(register, _)| register.saturating_add(1))
+        .max()
+        .unwrap_or_else(|| u16::try_from(function.signature.parameters.len()).unwrap_or(u16::MAX));
+    let mut plan = RegisterPlan {
+        local_count,
+        expression_temporaries: 1,
+        ..RegisterPlan::default()
+    };
+    inspect_statement_registers(&function.body, &mut plan)?;
+    let temporary_count = plan
+        .expression_temporaries
+        .max(plan.max_call_arguments)
+        .max(plan.match_temporaries)
+        .max(plan.migration_temporaries)
+        .max(1);
+    plan.total = plan
+        .local_count
+        .checked_add(temporary_count)
+        .ok_or(CompileError::TooManyRegisters)?;
+    Ok(plan)
+}
+
+fn inspect_statement_registers(
+    statements: &[AstStatement],
+    plan: &mut RegisterPlan,
+) -> Result<(), CompileError> {
+    for statement in statements {
+        match statement {
+            AstStatement::Bind { value, .. }
+            | AstStatement::Return(value)
+            | AstStatement::Expression(value)
+            | AstStatement::Defer(value) => inspect_expression_registers(value, plan)?,
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                inspect_expression_registers(condition, plan)?;
+                inspect_statement_registers(then_body, plan)?;
+                inspect_statement_registers(else_body, plan)?;
+            }
+            AstStatement::While { condition, body } => {
+                inspect_expression_registers(condition, plan)?;
+                inspect_statement_registers(body, plan)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_expression_registers(
+    expression: &AstExpression,
+    plan: &mut RegisterPlan,
+) -> Result<(), CompileError> {
+    let requirement = temporary_requirement(expression)?;
+    plan.expression_temporaries = plan.expression_temporaries.max(requirement);
+    match expression {
+        AstExpression::Binary { lhs, rhs, .. } => {
+            inspect_expression_registers(lhs, plan)?;
+            inspect_expression_registers(rhs, plan)?;
+        }
+        AstExpression::Call { arguments, .. } => {
+            let window = u16::try_from(arguments.len())
+                .map_err(|_| CompileError::TooManyRegisters)?
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            plan.max_call_arguments = plan.max_call_arguments.max(window);
+            for argument in arguments {
+                inspect_expression_registers(argument, plan)?;
+            }
+        }
+        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+            inspect_expression_registers(expression, plan)?;
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                inspect_expression_registers(payload, plan)?;
+            }
+        }
+        AstExpression::Match { value, arms } => {
+            plan.match_temporaries = plan.match_temporaries.max(requirement);
+            inspect_expression_registers(value, plan)?;
+            for arm in arms {
+                inspect_expression_registers(&arm.value, plan)?;
+            }
+        }
+        AstExpression::Migration(intrinsic) => {
+            plan.migration_temporaries = plan.migration_temporaries.max(requirement);
+            for expression in migration_expressions(intrinsic) {
+                inspect_expression_registers(expression, plan)?;
+            }
+        }
+        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+    }
+    Ok(())
+}
+
+fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError> {
+    let offset_requirement =
+        |offset: usize, nested: &AstExpression| -> Result<usize, CompileError> {
+            offset
+                .checked_add(usize::from(temporary_requirement(nested)?))
+                .ok_or(CompileError::TooManyRegisters)
+        };
+    let required = match expression {
+        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => 1,
+        AstExpression::Binary { lhs, rhs, .. } => {
+            usize::from(temporary_requirement(lhs)?).max(offset_requirement(1, rhs)?)
+        }
+        AstExpression::Call { arguments, .. } => {
+            let mut required = 1;
+            for (index, argument) in arguments.iter().enumerate() {
+                required = required.max(offset_requirement(index + 1, argument)?);
+            }
+            required
+        }
+        AstExpression::Await(expression) => usize::from(temporary_requirement(expression)?),
+        AstExpression::Constructor { payload, .. } => payload
+            .as_deref()
+            .map_or(Ok(1), |payload| offset_requirement(1, payload))?,
+        AstExpression::Match { value, arms } => {
+            let mut required = usize::from(temporary_requirement(value)?).max(4);
+            for arm in arms {
+                required = required.max(usize::from(temporary_requirement(&arm.value)?));
+            }
+            required
+        }
+        AstExpression::Try(expression) => usize::from(temporary_requirement(expression)?).max(4),
+        AstExpression::Migration(intrinsic) => match intrinsic {
+            MigrationIntrinsic::OldGet { .. }
+            | MigrationIntrinsic::NewCreate { .. }
+            | MigrationIntrinsic::Preserve { .. }
+            | MigrationIntrinsic::Delete { .. }
+            | MigrationIntrinsic::Finish => 1,
+            MigrationIntrinsic::OldFieldGet { object, .. } => offset_requirement(1, object)?.max(1),
+            MigrationIntrinsic::NewSet { object, value, .. } => {
+                usize::from(temporary_requirement(object)?).max(offset_requirement(1, value)?)
+            }
+            MigrationIntrinsic::Replace { target, .. } => {
+                usize::from(temporary_requirement(target)?)
+            }
+        },
+    };
+    u16::try_from(required).map_err(|_| CompileError::TooManyRegisters)
+}
+
 pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     let function_ids = hir
         .functions
@@ -2004,8 +2164,8 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     }
     for function in &hir.functions {
         let mut code = Vec::new();
-        let temporary =
-            u16::try_from(function.locals.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        let register_plan = plan_registers(function)?;
+        let temporary = register_plan.local_count;
         let emit_context = EmitContext {
             functions: &function_ids,
             script_functions: &hir.functions,
@@ -2020,10 +2180,10 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             &emit_context,
             &mut code,
         )?;
-        let registers =
-            u16::try_from(function.locals.len() + 8).map_err(|_| CompileError::TooManyRegisters)?;
+        let registers = register_plan.total;
         let safepoints = collect_safepoints(&code);
-        let (root_bitmap, root_maps) = exact_root_maps(function, &code, &safepoints, hir)?;
+        let (root_bitmap, root_maps) =
+            exact_root_maps(function, &code, &safepoints, hir, registers)?;
         module.function(Function {
             signature: function.signature.clone(),
             registers,
@@ -2046,10 +2206,11 @@ fn exact_root_maps(
     code: &[Instruction],
     safepoints: &[u32],
     module: &HirModule,
+    registers: u16,
 ) -> Result<(Vec<bool>, Vec<RootMap>), CompileError> {
     use std::collections::VecDeque;
 
-    let register_count = function.locals.len() + 8;
+    let register_count = usize::from(registers);
     let mut entry = vec![None; register_count];
     for (index, ty) in function.signature.parameters.iter().copied().enumerate() {
         entry[index] = Some(ty);
@@ -2225,12 +2386,16 @@ fn emit_statements(
             AstStatement::Bind { name, value, .. } => {
                 emit_expression(
                     value,
-                    locals[name].0,
+                    temporary,
                     Some(locals[name].1),
                     locals,
                     context,
                     code,
                 )?;
+                code.push(Instruction::Move {
+                    dst: locals[name].0,
+                    source: temporary,
+                });
             }
             AstStatement::Return(value) => {
                 emit_expression(
@@ -3153,6 +3318,93 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn register_planner_handles_nested_eight_argument_calls_without_fixed_slack() {
+        let module = compile(
+            "fn id(value: i32) -> i32 {
+                return value;
+             }
+             fn sum8(
+                a: i32, b: i32, c: i32, d: i32,
+                e: i32, f: i32, g: i32, h: i32
+             ) -> i32 {
+                return a + b + c + d + e + f + g + h;
+             }
+             fn nested(value: i32) -> i32 {
+                return sum8(
+                    1, 2, 3, 4, 5, 6, 7,
+                    sum8(value, 1, 2, 3, 4, 5, 6, 7)
+                );
+             }",
+        )
+        .unwrap();
+        assert_eq!(module.module().functions[0].registers, 2);
+        assert!(module.module().functions[2].registers >= 18);
+        assert!(matches!(
+            CheckedInterpreter::run(&module, 2, &[RuntimeValue::I32(10)], 1_000).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(66)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn register_planner_covers_eight_argument_host_match_try_and_defer_windows() {
+        for arity in 0..=8 {
+            let parameters = (0..arity)
+                .map(|index| format!("p{index}: i32"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let arguments = (0..arity)
+                .map(|index| index.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let idl = nexa_idl::parse(&format!(
+                "interface Engine {{ sync fn probe({parameters}) -> i32; }}"
+            ))
+            .unwrap();
+            let module = super::compile_with_interface(
+                &format!(
+                    "module game.registers;
+                     import engine;
+                     fn call() -> i32 {{ return engine.probe({arguments}); }}"
+                ),
+                &idl,
+                StableId::from_name("schema"),
+            )
+            .unwrap();
+            assert!(module.module().functions[0].registers > arity);
+        }
+
+        let module = compile(
+            "enum Failure { Rejected }
+             fn sum8(
+                a: i32, b: i32, c: i32, d: i32,
+                e: i32, f: i32, g: i32, h: i32
+             ) -> i32 {
+                return a + b + c + d + e + f + g + h;
+             }
+             fn in_match(value: Option<i32>) -> i32 {
+                return match value {
+                    Some(found) => sum8(found, 1, 2, 3, 4, 5, 6, 7),
+                    None => 0,
+                };
+             }
+             fn in_try(value: Result<i32, Failure>) -> Result<i32, Failure> {
+                return Ok(sum8(value?, 1, 2, 3, 4, 5, 6, 7));
+             }
+             fn in_defer() -> i32 {
+                defer sum8(1, 2, 3, 4, 5, 6, 7, 8);
+                return 0;
+             }",
+        )
+        .unwrap();
+        assert!(module.module().functions[1].registers >= 9);
+        assert!(module.module().functions[2].registers >= 9);
+        assert!(module.module().functions[3].registers >= 9);
     }
 
     #[test]

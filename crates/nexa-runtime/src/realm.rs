@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 
@@ -7,18 +7,21 @@ use nexa_core::{RawHandle, StableId};
 use nexa_verifier::VerifiedModule;
 
 use crate::machines::retired_epoch;
-use crate::reload::{ReloadCoordinator, ReloadTransaction, StatefulDomainId, StatefulRegistry};
+use crate::reload::{
+    MigrationLimitError, MigrationLimits, ReloadCompletionBuffer, ReloadCoordinator,
+    ReloadTransaction, StatefulDomainId, StatefulRegistry,
+};
 use crate::scheduler::Scheduler;
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, ExecutionCharge, FuelState,
-    GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionResult, HostPayload,
-    HostRegistry, HostRequestError, HostRequestHandle, HostTrap, HostValue, InterpreterError,
-    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, Object, OpcodeCostTable,
-    PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost,
-    RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle,
-    SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime,
-    TaskState, Trap, TrapKind,
+    GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionDelivery,
+    HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
+    HostValue, InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
+    Object, OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
+    RuntimeHost, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeTrace, RuntimeValue,
+    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
+    TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -215,6 +218,7 @@ pub struct RealmConfig {
     pub release_capacity: usize,
     pub tombstone_capacity: usize,
     pub cost_table: OpcodeCostTable,
+    pub migration_limits: MigrationLimits,
 }
 
 impl Default for RealmConfig {
@@ -228,6 +232,7 @@ impl Default for RealmConfig {
             release_capacity: 2_048,
             tombstone_capacity: 1_024,
             cost_table: OpcodeCostTable::default(),
+            migration_limits: MigrationLimits::default(),
         }
     }
 }
@@ -396,6 +401,8 @@ pub struct RealmRuntime {
     next_stateful_domain: u64,
     retired_epochs: RetiredEpochRegistry,
     reload: ReloadCoordinator,
+    migration_limits: MigrationLimits,
+    reload_completion_capacity: usize,
     host_registry: Option<Box<dyn HostRegistry>>,
     host_registry_hash: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
@@ -426,6 +433,8 @@ impl RealmRuntime {
             next_stateful_domain: 1,
             retired_epochs: RetiredEpochRegistry::new(config.max_modules as usize),
             reload: ReloadCoordinator::default(),
+            migration_limits: config.migration_limits,
+            reload_completion_capacity: config.max_host_resources as usize,
             host_registry: None,
             host_registry_hash: None,
             runtime_host: None,
@@ -664,6 +673,7 @@ impl RealmRuntime {
             old_module,
             candidate,
             paused_tasks: Vec::new(),
+            completions: ReloadCompletionBuffer::new(self.reload_completion_capacity),
         })?;
         Ok(candidate)
     }
@@ -717,6 +727,7 @@ impl RealmRuntime {
             old_module,
             candidate,
             paused_tasks: Vec::new(),
+            completions: ReloadCompletionBuffer::new(self.reload_completion_capacity),
         })?;
         Ok(candidate)
     }
@@ -775,6 +786,7 @@ impl RealmRuntime {
         migration_function: u32,
         arguments: &[RuntimeValue],
     ) -> Result<Option<RuntimeValue>, RealmError> {
+        self.buffer_reload_completions()?;
         let candidate_handle = self.reload.transaction()?.candidate;
         let candidate = self
             .modules
@@ -806,14 +818,30 @@ impl RealmRuntime {
             candidate_domain,
             candidate_schema,
             schema_unchanged,
+            self.migration_limits,
         );
-        match CheckedInterpreter::run_migration(
+        let execution = CheckedInterpreter::run_migration(
             &candidate.verified,
             migration_function,
             arguments,
-            4_096,
+            self.migration_limits.max_fuel,
+            crate::FrameLimits {
+                max_call_depth: u32::from(self.migration_limits.max_call_depth),
+                ..crate::FrameLimits::default()
+            },
             &mut migration,
-        )? {
+        );
+        if let Some(error) = migration.limit_error() {
+            return Err(ReloadError::MigrationLimit(error).into());
+        }
+        let execution = match execution {
+            Err(InterpreterError::ContinuationLimit(crate::FrameError::CallDepthLimit)) => {
+                return Err(ReloadError::MigrationLimit(MigrationLimitError::CallDepth).into());
+            }
+            Err(error) => return Err(error.into()),
+            Ok(execution) => execution,
+        };
+        match execution {
             InterpreterOutcome::Returned { value, .. } => {
                 let migrated = migration.finish()?;
                 self.modules
@@ -823,8 +851,12 @@ impl RealmRuntime {
                 self.reload.staged()?;
                 Ok(value)
             }
-            InterpreterOutcome::Suspended { .. } => {
-                Err(ReloadError::Migration("migration attempted to suspend".into()).into())
+            InterpreterOutcome::Suspended { reason, .. } => {
+                if reason == SuspendReason::Fuel {
+                    Err(ReloadError::MigrationLimit(MigrationLimitError::Fuel).into())
+                } else {
+                    Err(ReloadError::Migration("migration attempted to suspend".into()).into())
+                }
             }
             InterpreterOutcome::HostPending { .. } => {
                 Err(ReloadError::Migration("migration attempted a host call".into()).into())
@@ -839,6 +871,7 @@ impl RealmRuntime {
         &mut self,
         activation: ActivationEntry<'_>,
     ) -> Result<ModuleHandle, RealmError> {
+        self.buffer_reload_completions()?;
         let candidate = self.reload.transaction()?.candidate;
         let verified = self
             .modules
@@ -895,9 +928,10 @@ impl RealmRuntime {
     }
 
     pub fn rollback_reload(&mut self) -> Result<(), RealmError> {
+        self.buffer_reload_completions()?;
         self.reload.rollback()?;
-        let transaction = self.reload.finish()?;
-        for paused in transaction.paused_tasks {
+        let mut transaction = self.reload.finish()?;
+        for paused in transaction.paused_tasks.drain(..) {
             self.tasks
                 .restore_task_checkpoint(paused.handle, paused.snapshot, paused.execution)?;
             self.scheduler.restore(paused.handle, paused.scheduler);
@@ -905,7 +939,17 @@ impl RealmRuntime {
         self.modules
             .release(transaction.candidate.raw())
             .map_err(RealmError::ModuleHandle)?;
+        for delivery in transaction.completions.drain() {
+            self.deliver_host_completion(delivery)?;
+        }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn reload_buffered_completions(&self) -> usize {
+        self.reload
+            .transaction()
+            .map_or(0, |transaction| transaction.completions.len())
     }
 
     fn publish_reload_root(&mut self) -> Result<(), RealmError> {
@@ -966,6 +1010,13 @@ impl RealmRuntime {
         arguments: &[RuntimeValue],
         config: StepConfig,
     ) -> Result<TaskHandle, RealmError> {
+        if self
+            .reload
+            .transaction()
+            .is_ok_and(|transaction| transaction.old_module == module)
+        {
+            return Err(ReloadError::InvalidState.into());
+        }
         let loaded = self
             .modules
             .resolve(module.raw())
@@ -1303,6 +1354,7 @@ impl RealmRuntime {
         task: TaskHandle,
     ) -> Result<PendingHostRequest, RealmError> {
         self.require_host_capabilities()?;
+        self.require_reload_idle()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1358,6 +1410,7 @@ impl RealmRuntime {
         operation: impl FnOnce(&mut crate::ResourceContext<'_>) -> T,
     ) -> Result<T, RealmError> {
         self.require_host_capabilities()?;
+        self.require_reload_idle()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         let mut context = self
             .resources
@@ -1371,6 +1424,7 @@ impl RealmRuntime {
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, RealmError> {
         self.require_host_capabilities()?;
+        self.require_reload_idle()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1384,6 +1438,7 @@ impl RealmRuntime {
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, RealmError> {
         self.require_host_capabilities()?;
+        self.require_reload_idle()?;
         let snapshot = self.tasks.task_snapshot(task)?;
         Ok(self
             .resources
@@ -1439,21 +1494,42 @@ impl RealmRuntime {
 
     fn drain_host_completions(&mut self) -> Result<usize, RealmError> {
         if self.reload.active() {
-            return Ok(0);
+            return self.buffer_reload_completions();
         }
         let mut count = 0;
         for delivery in self.resources.drain_completions() {
-            let request = delivery.request;
-            if let Some(task) = self.scheduler.wake_request(request) {
-                let snapshot = self.tasks.task_snapshot(task)?;
-                if snapshot.state != TaskState::Waiting {
-                    continue;
-                }
-                self.handle_host_completion(task, request, snapshot, delivery.result)?;
-                count += 1;
-            }
+            count += usize::from(self.deliver_host_completion(delivery)?);
         }
         Ok(count)
+    }
+
+    fn buffer_reload_completions(&mut self) -> Result<usize, RealmError> {
+        if !self.reload.active() {
+            return Ok(0);
+        }
+        let deliveries = self.resources.drain_completions();
+        let count = deliveries.len();
+        let transaction = self.reload.transaction_mut()?;
+        for delivery in deliveries {
+            transaction.completions.push(delivery)?;
+        }
+        Ok(count)
+    }
+
+    fn deliver_host_completion(
+        &mut self,
+        delivery: HostCompletionDelivery,
+    ) -> Result<bool, RealmError> {
+        let request = delivery.request;
+        let Some(task) = self.scheduler.wake_request(request) else {
+            return Ok(false);
+        };
+        let snapshot = self.tasks.task_snapshot(task)?;
+        if snapshot.state != TaskState::Waiting {
+            return Ok(false);
+        }
+        self.handle_host_completion(task, request, snapshot, delivery.result)?;
+        Ok(true)
     }
 
     fn handle_host_completion(
@@ -1867,6 +1943,14 @@ impl RealmRuntime {
             .ok_or(RealmError::HostCapabilitiesUnavailable)
     }
 
+    fn require_reload_idle(&self) -> Result<(), RealmError> {
+        if self.reload.active() {
+            Err(ReloadError::InvalidState.into())
+        } else {
+            Ok(())
+        }
+    }
+
     fn register_retired_epoch(&mut self, module: ModuleHandle) -> Result<(), RealmError> {
         let root = self
             .modules
@@ -1964,35 +2048,81 @@ fn module_requires_host_capabilities(module: &nexa_bytecode::Module) -> bool {
     if !module.host_imports.is_empty() {
         return true;
     }
-    let is_host_type = |ty: ValueType| {
-        matches!(ty, ValueType::Named(id) if [
-            StableId::from_name("HostRequest"),
-            StableId::from_name("ResourceToken"),
-            StableId::from_name("Snapshot"),
-            StableId::from_name("Buffer"),
-        ].contains(&id))
-    };
+    let mut visited = BTreeSet::new();
+    let mut requires = |ty| requires_host_capabilities(module, ty, &mut visited);
     module.functions.iter().any(|function| {
         function
             .signature
             .parameters
             .iter()
             .copied()
-            .any(&is_host_type)
-            || function.signature.result.is_some_and(&is_host_type)
+            .any(&mut requires)
+            || function.signature.result.is_some_and(&mut requires)
     }) || module.exports.iter().any(|export| {
         export
             .signature
             .parameters
             .iter()
             .copied()
-            .any(&is_host_type)
-            || export.signature.result.is_some_and(&is_host_type)
+            .any(&mut requires)
+            || export.signature.result.is_some_and(&mut requires)
+    }) || module.enum_types.iter().any(|enum_type| {
+        enum_type
+            .variants
+            .iter()
+            .filter_map(|variant| variant.payload_type)
+            .any(&mut requires)
     }) || module
         .state_schema
         .types
         .iter()
-        .any(|state_type| state_type.fields.iter().any(|field| is_host_type(field.ty)))
+        .any(|state_type| state_type.fields.iter().any(|field| requires(field.ty)))
+}
+
+fn requires_host_capabilities(
+    module: &nexa_bytecode::Module,
+    ty: ValueType,
+    visited: &mut BTreeSet<StableId>,
+) -> bool {
+    let ValueType::Named(type_id) = ty else {
+        return false;
+    };
+    if [
+        StableId::from_name("HostRequest"),
+        StableId::from_name("ResourceToken"),
+        StableId::from_name("Snapshot"),
+        StableId::from_name("Buffer"),
+    ]
+    .contains(&type_id)
+    {
+        return true;
+    }
+    if !visited.insert(type_id) {
+        return false;
+    }
+    if let Some(enum_type) = module
+        .enum_types
+        .iter()
+        .find(|enum_type| enum_type.type_id == type_id)
+        && enum_type
+            .variants
+            .iter()
+            .filter_map(|variant| variant.payload_type)
+            .any(|payload| requires_host_capabilities(module, payload, visited))
+    {
+        return true;
+    }
+    module
+        .state_schema
+        .types
+        .iter()
+        .find(|state_type| state_type.stable_id == type_id)
+        .is_some_and(|state_type| {
+            state_type
+                .fields
+                .iter()
+                .any(|field| requires_host_capabilities(module, field.ty, visited))
+        })
 }
 
 fn reservation_for_module(
@@ -2649,6 +2779,7 @@ mod tests {
         realm.quiesce_reload().unwrap();
         pending.ticket.complete(HostPayload::I32(99)).unwrap();
         realm.stage_reload(0, &[RuntimeValue::I32(1)]).unwrap();
+        assert_eq!(realm.reload_buffered_completions(), 1);
         realm.rollback_reload().unwrap();
         realm
             .tick(TickBudget {
@@ -2808,6 +2939,28 @@ mod tests {
         let mut isolated = RealmRuntime::isolated(RealmConfig::default());
         assert_eq!(
             isolated.load_module(host_module, host, schema),
+            Err(RealmError::HostCapabilitiesUnavailable)
+        );
+
+        let option =
+            nexa_bytecode::option_type(ValueType::Named(StableId::from_name("HostRequest")));
+        let mut wrapped = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(option.type_id)],
+                result: Some(ValueType::Named(option.type_id)),
+            },
+            1,
+        );
+        wrapped.set_root(0).unwrap();
+        wrapped.emit(Instruction::Return { source: 0 });
+        let mut indirect = ModuleBuilder::new();
+        indirect
+            .metadata(host, schema)
+            .enum_type(option)
+            .function(wrapped.finish().unwrap());
+        let indirect = verify(indirect.finish(), VerifierLimits::default()).unwrap();
+        assert_eq!(
+            isolated.load_module(indirect, host, schema),
             Err(RealmError::HostCapabilitiesUnavailable)
         );
 

@@ -32,10 +32,11 @@ pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, Object};
 pub use host::{
     CopyBuffer, HostArgs, HostCallOutcome, HostCompletionDelivery, HostCompletionResult,
     HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest, ReleaseKind,
-    ReleaseQueue, ReleaseQueueError, ReleaseQueueState, RequestTerminalRecord, ResourceContext,
-    ResourceTokenHandle, RuntimeHost, RuntimeHostCloseError, RuntimeHostDomain,
-    RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
+    HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest,
+    RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
+    RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
+    RuntimeHostCloseError, RuntimeHostDomain, RuntimeResourceSnapshot, RuntimeResources,
+    ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
@@ -50,7 +51,8 @@ pub use realm::{
     TickBudget, TickReport,
 };
 pub use reload::{
-    ReloadError, StateHandle, StateObject, StateValue, StatefulDomainId, StatefulError,
+    MigrationLimitError, MigrationLimits, ReloadError, StateHandle, StateObject, StateValue,
+    StatefulDomainId, StatefulError,
 };
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
