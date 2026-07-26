@@ -751,7 +751,7 @@ fn workspace(context: &Context) -> GateArtifact<Value> {
                 invalid_contracts.push("work-package-count".into());
             }
         }
-        if manifest.milestone != "Milestone 4.0R3" {
+        if manifest.milestone != "4.0R3" {
             invalid_contracts.push("milestone-name".into());
         }
     }

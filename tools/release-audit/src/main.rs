@@ -398,7 +398,7 @@ fn validate_manifest(
     manifest: &ContractManifest,
     implementation_sha: &str,
 ) -> Result<(), String> {
-    if manifest.version != 3 || manifest.milestone != "Milestone 4.0R3" {
+    if manifest.version != 3 || manifest.milestone != "4.0R3" {
         return Err("unsupported contract manifest".into());
     }
     let packages = manifest
