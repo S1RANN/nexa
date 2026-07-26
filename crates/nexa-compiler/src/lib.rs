@@ -5,10 +5,10 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use nexa_bytecode::{
-    AbandonPolicy, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant, Function,
-    FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap,
-    ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
-    StructField as BytecodeStructField, StructType, ValueType,
+    AbandonPolicy, ArrayType, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant,
+    Function, FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder,
+    RootMap, ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema,
+    StateType, StructField as BytecodeStructField, StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -314,6 +314,9 @@ pub enum AstExpression {
         type_name: String,
         fields: Vec<StructFieldValue>,
     },
+    ArrayNew {
+        element_type: AstType,
+    },
     Match {
         value: Box<Self>,
         arms: Vec<MatchArm>,
@@ -465,6 +468,34 @@ enum StringMethod {
     Hash,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArrayMethod {
+    Len,
+    Get,
+    Set,
+    Push,
+    Pop,
+    Insert,
+    Remove,
+    Clear,
+}
+
+fn array_method(function: &str) -> Option<(&str, ArrayMethod)> {
+    let (receiver, method) = function.rsplit_once('.')?;
+    let method = match method {
+        "len" => ArrayMethod::Len,
+        "get" => ArrayMethod::Get,
+        "set" => ArrayMethod::Set,
+        "push" => ArrayMethod::Push,
+        "pop" => ArrayMethod::Pop,
+        "insert" => ArrayMethod::Insert,
+        "remove" => ArrayMethod::Remove,
+        "clear" => ArrayMethod::Clear,
+        _ => return None,
+    };
+    Some((receiver, method))
+}
+
 fn string_method(function: &str) -> Option<(&str, StringMethod)> {
     let (receiver, method) = function.rsplit_once('.')?;
     let method = match method {
@@ -518,6 +549,7 @@ pub struct HirModule {
     class_types: Vec<ClassType>,
     class_fields: BTreeMap<(StableId, String), BytecodeStructField>,
     state_handle_targets: BTreeMap<StableId, ValueType>,
+    array_types: Vec<ArrayType>,
     span: SourceSpan,
 }
 
@@ -1128,8 +1160,13 @@ impl Parser<'_> {
             TokenKind::False => AstExpression::Bool(false),
             TokenKind::Ident(mut name) => {
                 while self.take(&TokenKind::Dot) {
+                    let component = if name == "Array" && self.take(&TokenKind::New) {
+                        "new".to_owned()
+                    } else {
+                        self.ident()?
+                    };
                     name.push('.');
-                    name.push_str(&self.ident()?);
+                    name.push_str(&component);
                 }
                 let type_arguments = if self.take(&TokenKind::Less) {
                     let mut arguments = Vec::new();
@@ -1152,6 +1189,11 @@ impl Parser<'_> {
                         type_name: name,
                         fields: self.struct_field_values()?,
                     }
+                } else if name == "Array.new" {
+                    let element_type = exactly_one_type(type_arguments)?;
+                    self.expect(&TokenKind::LParen, "(")?;
+                    self.expect(&TokenKind::RParen, ")")?;
+                    AstExpression::ArrayNew { element_type }
                 } else if is_migration_intrinsic(&name) {
                     AstExpression::Migration(self.migration_intrinsic(
                         &name,
@@ -1716,6 +1758,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
@@ -1848,6 +1891,141 @@ fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType
     targets
 }
 
+#[allow(clippy::too_many_lines)]
+fn collect_array_types(ast: &AstModule) -> Vec<ArrayType> {
+    fn collect_type(ty: &AstType, arrays: &mut BTreeMap<StableId, ArrayType>) {
+        let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
+            return;
+        };
+        for argument in arguments {
+            collect_type(argument, arrays);
+        }
+        if name == "Array" && arguments.len() == 1 {
+            let array = ArrayType::new(lower_type(&arguments[0]));
+            arrays.insert(array.type_id, array);
+        }
+    }
+    fn collect_expression(expression: &AstExpression, arrays: &mut BTreeMap<StableId, ArrayType>) {
+        match expression.kind() {
+            AstExpression::ArrayNew { element_type } => collect_type(element_type, arrays),
+            AstExpression::Binary { lhs, rhs, .. } => {
+                collect_expression(lhs, arrays);
+                collect_expression(rhs, arrays);
+            }
+            AstExpression::Call { arguments, .. } => {
+                for argument in arguments {
+                    collect_expression(argument, arrays);
+                }
+            }
+            AstExpression::Await(expression) | AstExpression::Try(expression) => {
+                collect_expression(expression, arrays);
+            }
+            AstExpression::Constructor { payload, .. } => {
+                if let Some(payload) = payload {
+                    collect_expression(payload, arrays);
+                }
+            }
+            AstExpression::StructLiteral { fields, .. }
+            | AstExpression::ClassNew { fields, .. } => {
+                for field in fields {
+                    collect_expression(&field.value, arrays);
+                }
+            }
+            AstExpression::FieldGet { value, .. } => collect_expression(value, arrays),
+            AstExpression::StructWith { value, updates } => {
+                collect_expression(value, arrays);
+                for update in updates {
+                    collect_expression(&update.value, arrays);
+                }
+            }
+            AstExpression::Match { value, arms } => {
+                collect_expression(value, arrays);
+                for arm in arms {
+                    collect_expression(&arm.value, arrays);
+                }
+            }
+            AstExpression::Migration(intrinsic) => {
+                match intrinsic.kind() {
+                    MigrationIntrinsic::OldGet { ty, .. }
+                    | MigrationIntrinsic::OldFieldGet { ty, .. }
+                    | MigrationIntrinsic::NewCreate { ty, .. } => collect_type(ty, arrays),
+                    MigrationIntrinsic::NewSet { .. }
+                    | MigrationIntrinsic::Preserve { .. }
+                    | MigrationIntrinsic::Replace { .. }
+                    | MigrationIntrinsic::Delete { .. }
+                    | MigrationIntrinsic::Finish => {}
+                    MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
+                }
+                for expression in migration_expressions(intrinsic) {
+                    collect_expression(expression, arrays);
+                }
+            }
+            AstExpression::Integer(_)
+            | AstExpression::Float(_)
+            | AstExpression::Rune(_)
+            | AstExpression::String(_)
+            | AstExpression::Bool(_)
+            | AstExpression::Name(_) => {}
+            AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
+        }
+    }
+    fn collect_statements(statements: &[AstStatement], arrays: &mut BTreeMap<StableId, ArrayType>) {
+        for statement in statements {
+            match statement.kind() {
+                AstStatement::Bind { ty, value, .. } => {
+                    if let Some(ty) = ty {
+                        collect_type(ty, arrays);
+                    }
+                    collect_expression(value, arrays);
+                }
+                AstStatement::Return(value)
+                | AstStatement::Expression(value)
+                | AstStatement::Defer(value) => collect_expression(value, arrays),
+                AstStatement::FieldSet {
+                    value, replacement, ..
+                } => {
+                    collect_expression(value, arrays);
+                    collect_expression(replacement, arrays);
+                }
+                AstStatement::If {
+                    condition,
+                    then_body,
+                    else_body,
+                } => {
+                    collect_expression(condition, arrays);
+                    collect_statements(then_body, arrays);
+                    collect_statements(else_body, arrays);
+                }
+                AstStatement::While { condition, body } => {
+                    collect_expression(condition, arrays);
+                    collect_statements(body, arrays);
+                }
+                AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
+            }
+        }
+    }
+
+    let mut arrays = BTreeMap::new();
+    for declaration in &ast.types {
+        for field in &declaration.fields {
+            collect_type(&field.ty, &mut arrays);
+        }
+        for variant in &declaration.variants {
+            if let Some(payload) = &variant.payload {
+                collect_type(payload, &mut arrays);
+            }
+        }
+    }
+    for function in &ast.functions {
+        for parameter in &function.parameters {
+            collect_type(&parameter.ty, &mut arrays);
+        }
+        collect_type(&function.result.ty, &mut arrays);
+        collect_statements(&function.body, &mut arrays);
+    }
+    arrays.into_values().collect()
+}
+
 fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
     for statement in statements {
         match statement.kind() {
@@ -1940,6 +2118,7 @@ fn resolve_and_typecheck_with_hosts(
     }
     collect_builtin_enum_types(&ast, &mut enum_types);
     let state_handle_targets = collect_state_handle_targets(&ast);
+    let array_types = collect_array_types(&ast);
     if !state_handle_targets.is_empty() {
         enum_types.push(nexa_bytecode::state_handle_error_type());
         for target in state_handle_targets.values().copied() {
@@ -2196,6 +2375,7 @@ fn resolve_and_typecheck_with_hosts(
             function_result: signature.result.expect("result is required"),
             effect: function.effect,
             state_handle_targets: &state_handle_targets,
+            array_types: &array_types,
         };
         let flow = check_statements(
             &function.body,
@@ -2229,6 +2409,7 @@ fn resolve_and_typecheck_with_hosts(
         class_types,
         class_fields,
         state_handle_targets,
+        array_types,
         span: module_span,
     })
 }
@@ -2349,6 +2530,7 @@ fn validate_await_expression(
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => Ok(()),
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -2478,6 +2660,26 @@ fn resolve_expression(
                         StateHandleMethod::Hash => "hash",
                     }
                 );
+            } else if let Some((receiver, method)) = array_method(function) {
+                let resolved = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(receiver))
+                    .cloned()
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                *function = format!(
+                    "{resolved}.{}",
+                    match method {
+                        ArrayMethod::Len => "len",
+                        ArrayMethod::Get => "get",
+                        ArrayMethod::Set => "set",
+                        ArrayMethod::Push => "push",
+                        ArrayMethod::Pop => "pop",
+                        ArrayMethod::Insert => "insert",
+                        ArrayMethod::Remove => "remove",
+                        ArrayMethod::Clear => "clear",
+                    }
+                );
             } else if let Some((receiver, method)) = string_method(function) {
                 let resolved = scopes
                     .iter()
@@ -2552,7 +2754,8 @@ fn resolve_expression(
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
         | AstExpression::String(_)
-        | AstExpression::Bool(_) => {}
+        | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. } => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
     Ok(())
@@ -2565,7 +2768,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
-                "Option" | "StateHandle" => 1,
+                "Option" | "StateHandle" | "Array" => 1,
                 "Result" => 2,
                 _ => return Err(CompileError::UnknownType(name.clone())),
             };
@@ -2774,6 +2977,7 @@ struct TypeContext<'a> {
     function_result: ValueType,
     effect: FunctionEffect,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
+    array_types: &'a [ArrayType],
 }
 
 fn check_statements(
@@ -2958,6 +3162,7 @@ fn contains_await(expression: &AstExpression) -> bool {
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => false,
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -3068,6 +3273,24 @@ fn expression_type(
                 {
                     return Err(CompileError::TypeMismatch);
                 }
+            }
+            ValueType::Named(type_id)
+        }
+        AstExpression::ArrayNew { element_type } => {
+            if matches!(
+                context.effect,
+                FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+            ) {
+                return Err(CompileError::InvalidEffect);
+            }
+            let element = lower_type(element_type);
+            let type_id = nexa_bytecode::array_type(element);
+            if !context
+                .array_types
+                .iter()
+                .any(|array_type| array_type.type_id == type_id && array_type.element == element)
+            {
+                return Err(CompileError::TypeMismatch);
             }
             ValueType::Named(type_id)
         }
@@ -3251,6 +3474,83 @@ fn expression_type(
                     return Err(CompileError::TypeMismatch);
                 }
                 return Ok(result);
+            }
+            if let Some((receiver, method)) = array_method(function) {
+                let receiver_type = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                let ValueType::Named(array_type) = receiver_type else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let element = context
+                    .array_types
+                    .iter()
+                    .find(|candidate| candidate.type_id == array_type)
+                    .map(|candidate| candidate.element)
+                    .ok_or(CompileError::TypeMismatch)?;
+                if matches!(
+                    context.effect,
+                    FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(CompileError::InvalidEffect);
+                }
+                let actual = match method {
+                    ArrayMethod::Len if arguments.is_empty() => ValueType::I32,
+                    ArrayMethod::Get | ArrayMethod::Remove if arguments.len() == 1 => {
+                        if expression_type(
+                            &arguments[0],
+                            locals,
+                            context,
+                            next_register,
+                            Some(ValueType::I32),
+                        )? != ValueType::I32
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        element
+                    }
+                    ArrayMethod::Set | ArrayMethod::Insert if arguments.len() == 2 => {
+                        if expression_type(
+                            &arguments[0],
+                            locals,
+                            context,
+                            next_register,
+                            Some(ValueType::I32),
+                        )? != ValueType::I32
+                            || expression_type(
+                                &arguments[1],
+                                locals,
+                                context,
+                                next_register,
+                                Some(element),
+                            )? != element
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Bool
+                    }
+                    ArrayMethod::Push if arguments.len() == 1 => {
+                        if expression_type(
+                            &arguments[0],
+                            locals,
+                            context,
+                            next_register,
+                            Some(element),
+                        )? != element
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Bool
+                    }
+                    ArrayMethod::Pop if arguments.is_empty() => element,
+                    ArrayMethod::Clear if arguments.is_empty() => ValueType::Bool,
+                    _ => return Err(CompileError::TypeMismatch),
+                };
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(actual);
             }
             if let Some((receiver, method)) = state_handle_method(function) {
                 if matches!(
@@ -3573,6 +3873,9 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::BuiltinGeneric { name, arguments } if name == "StateHandle" => {
             ValueType::Named(nexa_bytecode::state_handle_type(lower_type(&arguments[0])))
         }
+        AstType::BuiltinGeneric { name, arguments } if name == "Array" => {
+            ValueType::Named(nexa_bytecode::array_type(lower_type(&arguments[0])))
+        }
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -3705,6 +4008,7 @@ fn inspect_expression_registers(
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -3724,6 +4028,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => 1,
         AstExpression::Binary { lhs, rhs, .. } => {
             usize::from(temporary_requirement(lhs)?).max(offset_requirement(1, rhs)?)
@@ -3862,6 +4167,7 @@ fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
         | AstExpression::Bool(_)
+        | AstExpression::ArrayNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -3914,6 +4220,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             state_schema: &hir.state_schema,
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
+            array_types: &hir.array_types,
             string_indices: &string_indices,
         };
         emit_statements(
@@ -3978,6 +4285,9 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
             type_id: *type_id,
             target: *target,
         });
+    }
+    for array_type in &hir.array_types {
+        module.array_type(*array_type);
     }
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
@@ -4082,7 +4392,8 @@ fn exact_root_maps(
             Instruction::StateNewCreate { type_id, dst, .. }
             | Instruction::EnumNew { type_id, dst, .. }
             | Instruction::StructNew { type_id, dst, .. }
-            | Instruction::ClassNew { type_id, dst, .. } => {
+            | Instruction::ClassNew { type_id, dst, .. }
+            | Instruction::ArrayNew { type_id, dst } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
             }
             Instruction::StateHandleResolve {
@@ -4095,6 +4406,7 @@ fn exact_root_maps(
             | Instruction::StateHandleHash { dst, .. }
             | Instruction::StringLen { dst, .. }
             | Instruction::StringByteLen { dst, .. }
+            | Instruction::ArrayLen { dst, .. }
             | Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
@@ -4150,6 +4462,18 @@ fn exact_root_maps(
                     })
                     .map(|field| field.ty);
             }
+            Instruction::ArrayGet { source, dst, .. }
+            | Instruction::ArrayPop { source, dst }
+            | Instruction::ArrayRemove { source, dst, .. } => {
+                let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                state[usize::from(dst)] = module
+                    .array_types
+                    .iter()
+                    .find(|array_type| array_type.type_id == type_id)
+                    .map(|array_type| array_type.element);
+            }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
                 successors.push(target as usize);
@@ -4164,6 +4488,10 @@ fn exact_root_maps(
             | Instruction::StatePreserve { .. }
             | Instruction::StateFinish
             | Instruction::ClassSet { .. }
+            | Instruction::ArraySet { .. }
+            | Instruction::ArrayPush { .. }
+            | Instruction::ArrayInsert { .. }
+            | Instruction::ArrayClear { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -4247,6 +4575,7 @@ struct EmitContext<'a> {
     state_schema: &'a StateSchema,
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
+    array_types: &'a [ArrayType],
     string_indices: &'a BTreeMap<String, u32>,
 }
 
@@ -4511,6 +4840,16 @@ fn emit_expression(
         function,
         arguments,
     } = expression.kind()
+        && array_method(function).is_some()
+    {
+        let result = emit_array_method(function, arguments, destination, locals, context, code);
+        code.replace_span(previous_span);
+        return result;
+    }
+    if let AstExpression::Call {
+        function,
+        arguments,
+    } = expression.kind()
         && state_handle_method(function).is_some()
     {
         let result =
@@ -4662,6 +5001,12 @@ fn emit_expression(
                 fields_base,
                 fields_count: u16::try_from(class_type.fields.len())
                     .map_err(|_| CompileError::TooManyRegisters)?,
+                dst: destination,
+            });
+        }
+        AstExpression::ArrayNew { element_type } => {
+            code.push(Instruction::ArrayNew {
+                type_id: nexa_bytecode::array_type(lower_type(element_type)),
                 dst: destination,
             });
         }
@@ -5123,6 +5468,124 @@ fn emit_string_method(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
+fn emit_array_method(
+    function: &str,
+    arguments: &[AstExpression],
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut TrackedCode,
+) -> Result<(), CompileError> {
+    let (receiver, method) =
+        array_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+    let (source, receiver_type) = *locals
+        .get(receiver)
+        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+    let ValueType::Named(array_type) = receiver_type else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let element = context
+        .array_types
+        .iter()
+        .find(|candidate| candidate.type_id == array_type)
+        .map(|candidate| candidate.element)
+        .ok_or(CompileError::TypeMismatch)?;
+    let temporary = destination
+        .checked_add(1)
+        .ok_or(CompileError::TooManyRegisters)?;
+    match method {
+        ArrayMethod::Len => code.push(Instruction::ArrayLen {
+            source,
+            dst: destination,
+        }),
+        ArrayMethod::Get | ArrayMethod::Remove => {
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(if method == ArrayMethod::Get {
+                Instruction::ArrayGet {
+                    source,
+                    index: temporary,
+                    dst: destination,
+                }
+            } else {
+                Instruction::ArrayRemove {
+                    source,
+                    index: temporary,
+                    dst: destination,
+                }
+            });
+        }
+        ArrayMethod::Set | ArrayMethod::Insert => {
+            let value = temporary
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            emit_expression(&arguments[1], value, Some(element), locals, context, code)?;
+            code.push(if method == ArrayMethod::Set {
+                Instruction::ArraySet {
+                    source,
+                    index: temporary,
+                    value,
+                }
+            } else {
+                Instruction::ArrayInsert {
+                    source,
+                    index: temporary,
+                    value,
+                }
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        ArrayMethod::Push => {
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(element),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::ArrayPush {
+                source,
+                value: temporary,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        ArrayMethod::Pop => code.push(Instruction::ArrayPop {
+            source,
+            dst: destination,
+        }),
+        ArrayMethod::Clear => {
+            code.push(Instruction::ArrayClear { source });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn emit_state_handle_method(
     function: &str,
     arguments: &[AstExpression],
@@ -5281,6 +5744,9 @@ fn emitted_expression_type(
                 .then_some(ValueType::Named(type_id))
                 .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
         }
+        AstExpression::ArrayNew { element_type } => Ok(ValueType::Named(
+            nexa_bytecode::array_type(lower_type(element_type)),
+        )),
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
@@ -5337,6 +5803,28 @@ fn emitted_expression_type(
                     StateHandleMethod::IsAlive | StateHandleMethod::Equality => ValueType::Bool,
                     StateHandleMethod::StableId => nexa_bytecode::stable_id_type(),
                     StateHandleMethod::Generation | StateHandleMethod::Hash => ValueType::I32,
+                })
+            } else if let Some((receiver, method)) = array_method(function) {
+                let ValueType::Named(array_type) = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let element = context
+                    .array_types
+                    .iter()
+                    .find(|candidate| candidate.type_id == array_type)
+                    .map(|candidate| candidate.element)
+                    .ok_or(CompileError::TypeMismatch)?;
+                Ok(match method {
+                    ArrayMethod::Len => ValueType::I32,
+                    ArrayMethod::Get | ArrayMethod::Pop | ArrayMethod::Remove => element,
+                    ArrayMethod::Set
+                    | ArrayMethod::Push
+                    | ArrayMethod::Insert
+                    | ArrayMethod::Clear => ValueType::Bool,
                 })
             } else {
                 context
@@ -5735,6 +6223,15 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::StructNew { .. }
                     | Instruction::StructWith { .. }
                     | Instruction::ClassNew { .. }
+                    | Instruction::ArrayNew { .. }
+                    | Instruction::ArrayLen { .. }
+                    | Instruction::ArrayGet { .. }
+                    | Instruction::ArraySet { .. }
+                    | Instruction::ArrayPush { .. }
+                    | Instruction::ArrayPop { .. }
+                    | Instruction::ArrayInsert { .. }
+                    | Instruction::ArrayRemove { .. }
+                    | Instruction::ArrayClear { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -6703,6 +7200,87 @@ migration fn migrate() -> bool {
             ),
             Err(CompileError::UnknownName(name)) if name == "null"
         ));
+    }
+
+    #[test]
+    fn arrays_compile_verify_execute_and_trap_at_runtime_boundaries() {
+        let module = compile(
+            "fn array_ops() -> i32 {
+                 let values: Array<i32> = Array.new<i32>();
+                 values.push(10);
+                 values.insert(0, 5);
+                 values.set(1, 7);
+                 let first: i32 = values.get(0);
+                 let removed: i32 = values.remove(1);
+                 values.push(9);
+                 let popped: i32 = values.pop();
+                 let length: i32 = values.len();
+                 values.clear();
+                 return first + removed + popped + length;
+             }
+             fn out_of_bounds() -> i32 {
+                 let values: Array<i32> = Array.new<i32>();
+                 return values.get(0);
+             }",
+        )
+        .unwrap();
+        assert_eq!(
+            module.module().array_types,
+            vec![nexa_bytecode::ArrayType::new(nexa_bytecode::ValueType::I32)]
+        );
+        let function = &module.module().functions[0];
+        for (pc, instruction) in function.code.iter().enumerate() {
+            if matches!(
+                instruction,
+                Instruction::ArrayNew { .. }
+                    | Instruction::ArrayLen { .. }
+                    | Instruction::ArrayGet { .. }
+                    | Instruction::ArraySet { .. }
+                    | Instruction::ArrayPush { .. }
+                    | Instruction::ArrayPop { .. }
+                    | Instruction::ArrayInsert { .. }
+                    | Instruction::ArrayRemove { .. }
+                    | Instruction::ArrayClear { .. }
+            ) {
+                let pc = u32::try_from(pc).unwrap();
+                assert!(function.safepoints.contains(&pc));
+                assert!(function.root_maps.iter().any(|root_map| root_map.pc == pc));
+            }
+        }
+
+        let mut heap = nexa_runtime::Heap::new(16);
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[], 500, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(22)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Trapped {
+                trap: nexa_runtime::Trap {
+                    kind: TrapKind::ArrayIndexOutOfBounds,
+                    ..
+                },
+                ..
+            }
+        ));
+
+        let mut exhausted = nexa_runtime::Heap::new(0);
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[], 100, &mut exhausted),
+            Err(nexa_runtime::InterpreterError::Heap(
+                nexa_runtime::HeapError::CapacityExhausted
+            ))
+        ));
+
+        for source in [
+            "immediate fn bad() -> Array<i32> { return Array.new<i32>(); }",
+            "immediate fn bad(values: Array<i32>) -> i32 { return values.len(); }",
+        ] {
+            assert_eq!(compile(source).unwrap_err(), CompileError::InvalidEffect);
+        }
     }
 
     #[test]

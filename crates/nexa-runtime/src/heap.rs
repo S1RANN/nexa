@@ -36,6 +36,11 @@ pub enum Object {
         fields: [RuntimeValue; nexa_bytecode::MAX_CLASS_FIELDS],
         field_count: u8,
     },
+    Array {
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<RuntimeValue>,
+    },
 }
 
 impl Object {
@@ -48,6 +53,16 @@ impl Object {
             } => fields[..usize::from(*field_count)]
                 .iter()
                 .filter_map(|field| match field {
+                    RuntimeValue::String { reference, .. }
+                    | RuntimeValue::Struct { reference, .. }
+                    | RuntimeValue::Ref(reference)
+                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
+                    _ => None,
+                })
+                .collect(),
+            Self::Array { values, .. } => values
+                .iter()
+                .filter_map(|value| match value {
                     RuntimeValue::String { reference, .. }
                     | RuntimeValue::Struct { reference, .. }
                     | RuntimeValue::Ref(reference)
@@ -96,6 +111,8 @@ struct ObjectSlot {
 pub enum HeapError {
     CapacityExhausted,
     StringTooLarge { bytes: usize, max_bytes: usize },
+    CollectionTooLarge { length: usize, max_length: usize },
+    IndexOutOfBounds { index: usize, length: usize },
     InjectedFailure(RuntimeFailurePoint),
     InvalidReference(GcRef),
 }
@@ -155,10 +172,13 @@ pub struct Heap {
     free: Vec<u32>,
     max_objects: u32,
     max_string_bytes: usize,
+    max_collection_length: usize,
     failure_injector: RuntimeFailureInjector,
 }
 
 impl Heap {
+    pub const DEFAULT_MAX_COLLECTION_LENGTH: usize = 1_024;
+
     #[must_use]
     pub fn new(max_objects: u32) -> Self {
         Self::new_with_string_limit(max_objects, usize::MAX)
@@ -166,11 +186,25 @@ impl Heap {
 
     #[must_use]
     pub fn new_with_string_limit(max_objects: u32, max_string_bytes: usize) -> Self {
+        Self::new_with_limits(
+            max_objects,
+            max_string_bytes,
+            Self::DEFAULT_MAX_COLLECTION_LENGTH,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_limits(
+        max_objects: u32,
+        max_string_bytes: usize,
+        max_collection_length: usize,
+    ) -> Self {
         Self {
             slots: Vec::with_capacity(max_objects as usize),
             free: Vec::with_capacity(max_objects as usize),
             max_objects,
             max_string_bytes,
+            max_collection_length: max_collection_length.min(i32::MAX as usize),
             failure_injector: RuntimeFailureInjector::default(),
         }
     }
@@ -584,6 +618,170 @@ impl Heap {
         Ok(lhs == rhs)
     }
 
+    pub fn allocate_array(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::array_type(element_type) {
+            return Err(invalid_value_reference());
+        }
+        let reference = self.allocate(Object::Array {
+            type_id,
+            element_type,
+            values: Vec::new(),
+        })?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub fn array_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        Ok(self.array_values(value)?.len())
+    }
+
+    pub fn array_get(&self, value: RuntimeValue, index: usize) -> Result<RuntimeValue, HeapError> {
+        let values = self.array_values(value)?;
+        values
+            .get(index)
+            .copied()
+            .ok_or(HeapError::IndexOutOfBounds {
+                index,
+                length: values.len(),
+            })
+    }
+
+    pub fn array_set(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        replacement: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let values = self.array_values_mut(value)?;
+        let length = values.len();
+        let slot = values
+            .get_mut(index)
+            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+        *slot = replacement;
+        Ok(())
+    }
+
+    pub fn array_push(
+        &mut self,
+        value: RuntimeValue,
+        element: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let max_length = self.max_collection_length;
+        let values = self.array_values_mut(value)?;
+        let length = values
+            .len()
+            .checked_add(1)
+            .ok_or(HeapError::CollectionTooLarge {
+                length: usize::MAX,
+                max_length,
+            })?;
+        if length > max_length {
+            return Err(HeapError::CollectionTooLarge { length, max_length });
+        }
+        values
+            .try_reserve(1)
+            .map_err(|_| HeapError::CapacityExhausted)?;
+        values.push(element);
+        Ok(())
+    }
+
+    pub fn array_pop(&mut self, value: RuntimeValue) -> Result<RuntimeValue, HeapError> {
+        let values = self.array_values_mut(value)?;
+        let length = values.len();
+        values
+            .pop()
+            .ok_or(HeapError::IndexOutOfBounds { index: 0, length })
+    }
+
+    pub fn array_insert(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        element: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let max_length = self.max_collection_length;
+        let values = self.array_values_mut(value)?;
+        let current = values.len();
+        if index > current {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: current,
+            });
+        }
+        let length = current
+            .checked_add(1)
+            .ok_or(HeapError::CollectionTooLarge {
+                length: usize::MAX,
+                max_length,
+            })?;
+        if length > max_length {
+            return Err(HeapError::CollectionTooLarge { length, max_length });
+        }
+        values
+            .try_reserve(1)
+            .map_err(|_| HeapError::CapacityExhausted)?;
+        values.insert(index, element);
+        Ok(())
+    }
+
+    pub fn array_remove(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let values = self.array_values_mut(value)?;
+        if index >= values.len() {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: values.len(),
+            });
+        }
+        Ok(values.remove(index))
+    }
+
+    pub fn array_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        self.array_values_mut(value)?.clear();
+        Ok(())
+    }
+
+    fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Array {
+                type_id: actual,
+                element_type,
+                values,
+            } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
+                Ok(values)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn array_values_mut(
+        &mut self,
+        value: RuntimeValue,
+    ) -> Result<&mut Vec<RuntimeValue>, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve_mut(reference)? {
+            Object::Array {
+                type_id: actual,
+                element_type,
+                values,
+            } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
+                Ok(values)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
     fn structural_hash(
         &self,
         type_id: StableId,
@@ -628,12 +826,27 @@ impl Heap {
             RuntimeValue::NamedRef { reference, type_id } => {
                 write_hash(&mut hash, &[8]);
                 write_hash(&mut hash, &type_id.0.to_le_bytes());
-                let (_, variant, tag, payload) =
-                    self.enum_parts(RuntimeValue::NamedRef { reference, type_id })?;
-                write_hash(&mut hash, &variant.0.to_le_bytes());
-                write_hash(&mut hash, &tag.to_le_bytes());
-                if let Some(payload) = payload {
-                    write_hash(&mut hash, &self.runtime_value_hash(payload)?.to_le_bytes());
+                match self.resolve(reference)? {
+                    Object::Enum {
+                        variant,
+                        tag,
+                        payload,
+                        ..
+                    } => {
+                        write_hash(&mut hash, &variant.0.to_le_bytes());
+                        write_hash(&mut hash, &tag.to_le_bytes());
+                        if let Some(payload) = payload {
+                            write_hash(
+                                &mut hash,
+                                &self.runtime_value_hash(*payload)?.to_le_bytes(),
+                            );
+                        }
+                    }
+                    Object::Class { .. } | Object::Array { .. } => {
+                        write_hash(&mut hash, &reference.index.to_le_bytes());
+                        write_hash(&mut hash, &reference.generation.to_le_bytes());
+                    }
+                    _ => return Err(HeapError::InvalidReference(reference)),
                 }
             }
             RuntimeValue::Ref(reference) => {
@@ -702,15 +915,37 @@ impl Heap {
                     type_id: rhs_type, ..
                 },
             ) if lhs_type == rhs_type => {
-                let (_, lhs_variant, lhs_tag, lhs_payload) = self.enum_parts(lhs)?;
-                let (_, rhs_variant, rhs_tag, rhs_payload) = self.enum_parts(rhs)?;
-                lhs_variant == rhs_variant
-                    && lhs_tag == rhs_tag
-                    && match (lhs_payload, rhs_payload) {
-                        (Some(lhs), Some(rhs)) => self.runtime_value_equal(lhs, rhs)?,
-                        (None, None) => true,
-                        _ => false,
+                let (
+                    RuntimeValue::NamedRef {
+                        reference: lhs_reference,
+                        ..
+                    },
+                    RuntimeValue::NamedRef {
+                        reference: rhs_reference,
+                        ..
+                    },
+                ) = (lhs, rhs)
+                else {
+                    unreachable!("matched named references")
+                };
+                match (self.resolve(lhs_reference)?, self.resolve(rhs_reference)?) {
+                    (Object::Enum { .. }, Object::Enum { .. }) => {
+                        let (_, lhs_variant, lhs_tag, lhs_payload) = self.enum_parts(lhs)?;
+                        let (_, rhs_variant, rhs_tag, rhs_payload) = self.enum_parts(rhs)?;
+                        lhs_variant == rhs_variant
+                            && lhs_tag == rhs_tag
+                            && match (lhs_payload, rhs_payload) {
+                                (Some(lhs), Some(rhs)) => self.runtime_value_equal(lhs, rhs)?,
+                                (None, None) => true,
+                                _ => false,
+                            }
                     }
+                    (Object::Class { .. }, Object::Class { .. })
+                    | (Object::Array { .. }, Object::Array { .. }) => {
+                        lhs_reference == rhs_reference
+                    }
+                    _ => false,
+                }
             }
             _ => lhs == rhs,
         })
@@ -869,5 +1104,79 @@ mod tests {
             heap.allocate_class(StableId::from_name("Empty"), &[])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn arrays_enforce_bounds_and_max_length_before_mutation() {
+        let mut heap = Heap::new_with_limits(4, usize::MAX, 2);
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+
+        heap.array_push(array, RuntimeValue::I32(10)).unwrap();
+        heap.array_insert(array, 0, RuntimeValue::I32(5)).unwrap();
+        assert_eq!(heap.array_len(array), Ok(2));
+        assert_eq!(heap.array_get(array, 0), Ok(RuntimeValue::I32(5)));
+        assert_eq!(
+            heap.array_push(array, RuntimeValue::I32(99)),
+            Err(HeapError::CollectionTooLarge {
+                length: 3,
+                max_length: 2,
+            })
+        );
+        assert_eq!(
+            heap.array_insert(array, 3, RuntimeValue::I32(99)),
+            Err(HeapError::IndexOutOfBounds {
+                index: 3,
+                length: 2,
+            })
+        );
+        assert_eq!(heap.array_len(array), Ok(2));
+
+        heap.array_set(array, 1, RuntimeValue::I32(7)).unwrap();
+        assert_eq!(heap.array_remove(array, 0), Ok(RuntimeValue::I32(5)));
+        assert_eq!(heap.array_pop(array), Ok(RuntimeValue::I32(7)));
+        assert_eq!(
+            heap.array_pop(array),
+            Err(HeapError::IndexOutOfBounds {
+                index: 0,
+                length: 0,
+            })
+        );
+        heap.array_clear(array).unwrap();
+    }
+
+    #[test]
+    fn array_elements_are_traced_from_the_array_root() {
+        let mut heap = Heap::new_with_limits(4, usize::MAX, 4);
+        let string = heap.allocate_string("kept").unwrap();
+        let string_value = RuntimeValue::String {
+            reference: string,
+            hash: heap.string_hash(string).unwrap(),
+        };
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::String);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::String)
+            .unwrap();
+        heap.array_push(array, string_value).unwrap();
+        let RuntimeValue::NamedRef {
+            reference: array_reference,
+            ..
+        } = array
+        else {
+            unreachable!("array allocations are named references")
+        };
+
+        let roots = GcRoots {
+            running_frames: vec![array_reference],
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().marked, 2);
+        assert_eq!(heap.string(string), Ok("kept"));
+
+        let stats = heap.collect(&GcRoots::default()).unwrap();
+        assert_eq!(stats.reclaimed, 2);
+        assert_eq!(stats.live, 0);
     }
 }

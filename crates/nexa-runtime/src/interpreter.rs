@@ -314,6 +314,7 @@ pub enum TrapKind {
     BytecodeTrap,
     DivideByZero,
     StringIndexOutOfBounds,
+    ArrayIndexOutOfBounds,
     CleanupBudgetExceeded,
     Host,
 }
@@ -362,14 +363,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 68],
+    costs: [u16; 77],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 68],
+            costs: [1; 77],
         }
     }
 }
@@ -740,6 +741,47 @@ impl CheckedInterpreter {
         continuation.cumulative_exhausted = false;
         let mut charge = ExecutionCharge::default();
         let mut pending_cost = std::mem::take(&mut continuation.pending_fuel);
+        macro_rules! array_operation {
+            ($operation:expr) => {
+                match $operation {
+                    Ok(value) => value,
+                    Err(HeapError::IndexOutOfBounds { .. }) => {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::ArrayIndexOutOfBounds,
+                                "array index out of bounds",
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    }
+                    Err(error) => return Err(InterpreterError::Heap(error)),
+                }
+            };
+        }
+        macro_rules! array_index {
+            ($value:expr) => {
+                match usize::try_from($value) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::ArrayIndexOutOfBounds,
+                                "array index out of bounds",
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    }
+                }
+            };
+        }
         if let Some(migration) = migration.as_deref_mut() {
             migration.observe_call_depth(continuation.arena.depth());
         }
@@ -1636,6 +1678,126 @@ impl CheckedInterpreter {
                     )?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::ArrayNew { type_id, dst } => {
+                    let element_type = module
+                        .module()
+                        .array_types
+                        .iter()
+                        .find(|array_type| array_type.type_id == type_id)
+                        .map(|array_type| array_type.element)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let value = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .allocate_array(type_id, element_type)?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayLen { source, dst } => {
+                    let array = register(&continuation.arena, source)?;
+                    let length = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .array_len(array)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(
+                            i32::try_from(length)
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayGet { source, index, dst } => {
+                    let array = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = array_index!(index);
+                    let value = array_operation!(
+                        heap.as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_get(array, index)
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArraySet {
+                    source,
+                    index,
+                    value,
+                } => {
+                    let array = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let replacement = register(&continuation.arena, value)?;
+                    let index = array_index!(index);
+                    array_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_set(array, index, replacement)
+                    );
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayPush { source, value } => {
+                    let array = register(&continuation.arena, source)?;
+                    let value = register(&continuation.arena, value)?;
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .array_push(array, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayPop { source, dst } => {
+                    let array = register(&continuation.arena, source)?;
+                    let value = array_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_pop(array)
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayInsert {
+                    source,
+                    index,
+                    value,
+                } => {
+                    let array = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let value = register(&continuation.arena, value)?;
+                    let index = array_index!(index);
+                    array_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_insert(array, index, value)
+                    );
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayRemove { source, index, dst } => {
+                    let array = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = array_index!(index);
+                    let value = array_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_remove(array, index)
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ArrayClear { source } => {
+                    let array = register(&continuation.arena, source)?;
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .array_clear(array)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StateFinish => {
                     migration
                         .as_deref_mut()
@@ -1968,6 +2130,15 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::StructNew { .. }
         | Instruction::StructWith { .. }
         | Instruction::ClassNew { .. }
+        | Instruction::ArrayNew { .. }
+        | Instruction::ArrayLen { .. }
+        | Instruction::ArrayGet { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayPop { .. }
+        | Instruction::ArrayInsert { .. }
+        | Instruction::ArrayRemove { .. }
+        | Instruction::ArrayClear { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -2050,6 +2221,15 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::ClassGet { .. } => 65,
         Instruction::ClassSet { .. } => 66,
         Instruction::ClassEqual { .. } => 67,
+        Instruction::ArrayNew { .. } => 68,
+        Instruction::ArrayLen { .. } => 69,
+        Instruction::ArrayGet { .. } => 70,
+        Instruction::ArraySet { .. } => 71,
+        Instruction::ArrayPush { .. } => 72,
+        Instruction::ArrayPop { .. } => 73,
+        Instruction::ArrayInsert { .. } => 74,
+        Instruction::ArrayRemove { .. } => 75,
+        Instruction::ArrayClear { .. } => 76,
     }
 }
 

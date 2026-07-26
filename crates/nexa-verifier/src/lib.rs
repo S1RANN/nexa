@@ -60,6 +60,7 @@ pub enum VerifyErrorKind {
     InvalidStructMetadata,
     InvalidClassMetadata,
     InvalidStateMetadata,
+    InvalidArrayMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -67,6 +68,7 @@ pub enum VerifyErrorKind {
     StructFieldOutOfRange(u64),
     ClassTypeOutOfRange(u64),
     ClassFieldOutOfRange(u64),
+    ArrayTypeOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
     StringOutOfRange(u32),
@@ -233,6 +235,22 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
             });
         }
     }
+    for array_type in &module.array_types {
+        if !named_ids.insert(array_type.type_id)
+            || array_type.type_id != nexa_bytecode::array_type(array_type.element)
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidArrayMetadata,
+            });
+        }
+    }
+    verify_state_storage_metadata(module)?;
+    Ok(())
+}
+
+fn verify_state_storage_metadata(module: &Module) -> Result<(), VerifyError> {
     for state_type in &module.state_schema.types {
         if state_type
             .fields
@@ -480,7 +498,36 @@ fn verify_function(
                 Err(error(Some(pc), VerifyErrorKind::TypeMismatch))
             }
         };
+        let array_element = |state: &[Option<ValueType>], source: u16| {
+            let source = register(source)?;
+            let Some(ValueType::Named(type_id)) = state[source] else {
+                return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+            };
+            module
+                .array_types
+                .iter()
+                .find(|array_type| array_type.type_id == type_id)
+                .map(|array_type| array_type.element)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0)))
+        };
         let mut successors = Vec::with_capacity(2);
+        if matches!(
+            instruction,
+            Instruction::ArrayNew { .. }
+                | Instruction::ArrayLen { .. }
+                | Instruction::ArrayGet { .. }
+                | Instruction::ArraySet { .. }
+                | Instruction::ArrayPush { .. }
+                | Instruction::ArrayPop { .. }
+                | Instruction::ArrayInsert { .. }
+                | Instruction::ArrayRemove { .. }
+                | Instruction::ArrayClear { .. }
+        ) && matches!(
+            function.effect,
+            FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+        ) {
+            return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+        }
         match instruction {
             Instruction::LoadI32 { dst, .. } => state[register(dst)?] = Some(ValueType::I32),
             Instruction::LoadI64 { dst, .. } => state[register(dst)?] = Some(ValueType::I64),
@@ -1078,6 +1125,54 @@ fn verify_function(
                 require(&state, rhs, ValueType::Named(type_id))?;
                 state[register(dst)?] = Some(ValueType::Bool);
             }
+            Instruction::ArrayNew { type_id, dst } => {
+                if !module
+                    .array_types
+                    .iter()
+                    .any(|array_type| array_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::ArrayTypeOutOfRange(type_id.0),
+                    ));
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::ArrayLen { source, dst } => {
+                array_element(&state, source)?;
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::ArrayGet { source, index, dst }
+            | Instruction::ArrayRemove { source, index, dst } => {
+                let element = array_element(&state, source)?;
+                require(&state, index, ValueType::I32)?;
+                state[register(dst)?] = Some(element);
+            }
+            Instruction::ArraySet {
+                source,
+                index,
+                value,
+            }
+            | Instruction::ArrayInsert {
+                source,
+                index,
+                value,
+            } => {
+                let element = array_element(&state, source)?;
+                require(&state, index, ValueType::I32)?;
+                require(&state, value, element)?;
+            }
+            Instruction::ArrayPush { source, value } => {
+                let element = array_element(&state, source)?;
+                require(&state, value, element)?;
+            }
+            Instruction::ArrayPop { source, dst } => {
+                let element = array_element(&state, source)?;
+                state[register(dst)?] = Some(element);
+            }
+            Instruction::ArrayClear { source } => {
+                array_element(&state, source)?;
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -1257,6 +1352,15 @@ fn verify_safepoints(
                     | Instruction::StructNew { .. }
                     | Instruction::StructWith { .. }
                     | Instruction::ClassNew { .. }
+                    | Instruction::ArrayNew { .. }
+                    | Instruction::ArrayLen { .. }
+                    | Instruction::ArrayGet { .. }
+                    | Instruction::ArraySet { .. }
+                    | Instruction::ArrayPush { .. }
+                    | Instruction::ArrayPop { .. }
+                    | Instruction::ArrayInsert { .. }
+                    | Instruction::ArrayRemove { .. }
+                    | Instruction::ArrayClear { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }
@@ -1512,9 +1616,9 @@ fn longest_path(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ClassType, FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
-        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
-        StructType, ValueType,
+        ArrayType, ClassType, FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap,
+        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
+        StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1554,6 +1658,79 @@ mod tests {
                 .unwrap_err()
                 .kind,
             VerifyErrorKind::InvalidClassMetadata
+        );
+    }
+
+    #[test]
+    fn array_metadata_and_instruction_types_are_verified_independently() {
+        let array = ArrayType::new(ValueType::I32);
+        let mut valid = ModuleBuilder::new();
+        valid.array_type(array);
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let mut forged = ModuleBuilder::new();
+        forged.array_type(ArrayType {
+            type_id: StableId::from_name("forged-array"),
+            element: ValueType::I32,
+        });
+        assert_eq!(
+            verify(forged.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidArrayMetadata
+        );
+
+        let mut wrong_element = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(array.type_id), ValueType::Bool],
+                result: None,
+            },
+            2,
+        );
+        wrong_element
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::ArrayPush {
+                source: 0,
+                value: 1,
+            })
+            .emit(Instruction::ReturnVoid);
+        let mut module = ModuleBuilder::new();
+        module
+            .array_type(array)
+            .function(wrong_element.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+
+        let mut immediate = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::Named(array.type_id)),
+            },
+            1,
+        );
+        immediate
+            .effect(FunctionEffect::Immediate)
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::ArrayNew {
+                type_id: array.type_id,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut module = ModuleBuilder::new();
+        module
+            .array_type(array)
+            .function(immediate.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEffect
         );
     }
 

@@ -159,6 +159,16 @@ fn render_module_dump(
             )
             .expect("String writes do not fail");
         }
+        let mut arrays = module.array_types.iter().collect::<Vec<_>>();
+        arrays.sort_by_key(|array| array.type_id);
+        for array in arrays {
+            writeln!(
+                output,
+                "array {:016x} element={:?}",
+                array.type_id.0, array.element
+            )
+            .expect("String writes do not fail");
+        }
     }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
@@ -1075,7 +1085,7 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ClassType, FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature,
+        ArrayType, ClassType, FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature,
         SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
         StructType, ValueType,
     };
@@ -1113,6 +1123,7 @@ mod tests {
         });
         let state_target = ValueType::Named(StableId::from_name("Store"));
         builder.state_handle_type(StateHandleType::new(state_target));
+        builder.array_type(ArrayType::new(ValueType::I32));
         builder.state_schema(StateSchema {
             types: vec![StateType {
                 stable_id: StableId::from_name("Store"),
@@ -1154,6 +1165,8 @@ mod tests {
         assert!(full.contains("class "));
         assert!(full.contains("mutable=true"));
         assert!(full.contains("state-handle "));
+        assert!(full.contains("array "));
+        assert!(full.contains("element=I32"));
         assert!(full.contains("stateful-class "));
         assert!(full.contains("persistent=true"));
         assert!(
@@ -1167,6 +1180,7 @@ mod tests {
         let types = render_module_dump(&bytes, &module, Some(SectionKind::Types), false).unwrap();
         assert!(types.contains("section types"));
         assert!(types.contains("state-handle "));
+        assert!(types.contains("array "));
         assert!(!types.contains("code function="));
         let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
         assert!(code.contains("section code"));

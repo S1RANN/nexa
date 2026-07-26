@@ -279,6 +279,27 @@ impl StateHandleType {
 }
 
 #[must_use]
+pub fn array_type(element: ValueType) -> StableId {
+    parameterized_type_id("Array", &[element])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArrayType {
+    pub type_id: StableId,
+    pub element: ValueType,
+}
+
+impl ArrayType {
+    #[must_use]
+    pub fn new(element: ValueType) -> Self {
+        Self {
+            type_id: array_type(element),
+            element,
+        }
+    }
+}
+
+#[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
 }
@@ -660,6 +681,45 @@ pub enum Instruction {
         rhs: u16,
         dst: u16,
     },
+    ArrayNew {
+        type_id: StableId,
+        dst: u16,
+    },
+    ArrayLen {
+        source: u16,
+        dst: u16,
+    },
+    ArrayGet {
+        source: u16,
+        index: u16,
+        dst: u16,
+    },
+    ArraySet {
+        source: u16,
+        index: u16,
+        value: u16,
+    },
+    ArrayPush {
+        source: u16,
+        value: u16,
+    },
+    ArrayPop {
+        source: u16,
+        dst: u16,
+    },
+    ArrayInsert {
+        source: u16,
+        index: u16,
+        value: u16,
+    },
+    ArrayRemove {
+        source: u16,
+        index: u16,
+        dst: u16,
+    },
+    ArrayClear {
+        source: u16,
+    },
     StateFinish,
     StateOldFieldGet {
         object: u16,
@@ -734,6 +794,7 @@ pub struct Module {
     pub strings: Vec<String>,
     pub functions: Vec<Function>,
     pub state_handle_types: Vec<StateHandleType>,
+    pub array_types: Vec<ArrayType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -1317,12 +1378,22 @@ impl Module {
         let mut types = Vec::new();
         put_u32(
             &mut types,
-            u32::try_from(self.state_handle_types.len())
-                .expect("state handle type count exceeds wire format"),
+            u32::try_from(
+                self.state_handle_types
+                    .len()
+                    .saturating_add(self.array_types.len()),
+            )
+            .expect("parameterized type count exceeds wire format"),
         );
         for state_handle in &self.state_handle_types {
+            types.push(1);
             put_u64(&mut types, state_handle.type_id.0);
             encode_type(&mut types, state_handle.target);
+        }
+        for array in &self.array_types {
+            types.push(2);
+            put_u64(&mut types, array.type_id.0);
+            encode_type(&mut types, array.element);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -1429,11 +1500,22 @@ impl Module {
             usize::try_from(types_reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
         enforce_limit(state_handle_type_count, limits.max_types, "types")?;
         let mut state_handle_types = Vec::with_capacity(state_handle_type_count);
+        let mut array_types = Vec::new();
         for _ in 0..state_handle_type_count {
-            state_handle_types.push(StateHandleType {
-                type_id: StableId(types_reader.u64()?),
-                target: decode_type(&mut types_reader)?,
-            });
+            let kind = types_reader.u8()?;
+            let type_id = StableId(types_reader.u64()?);
+            let argument = decode_type(&mut types_reader)?;
+            match kind {
+                1 => state_handle_types.push(StateHandleType {
+                    type_id,
+                    target: argument,
+                }),
+                2 => array_types.push(ArrayType {
+                    type_id,
+                    element: argument,
+                }),
+                _ => return Err(DecodeError::InvalidType(kind)),
+            }
         }
         if types_reader.remaining() != 0 {
             return Err(DecodeError::TrailingBytes);
@@ -1846,6 +1928,7 @@ impl Module {
             strings,
             functions,
             state_handle_types,
+            array_types,
             enum_types,
             struct_types,
             class_types,
@@ -2310,6 +2393,60 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, rhs);
             put_u16(output, dst);
         }
+        Instruction::ArrayNew { type_id, dst } => {
+            output.push(68);
+            put_u64(output, type_id.0);
+            put_u16(output, dst);
+        }
+        Instruction::ArrayLen { source, dst } => {
+            output.push(69);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::ArrayGet { source, index, dst }
+        | Instruction::ArrayRemove { source, index, dst } => {
+            output.push(match instruction {
+                Instruction::ArrayGet { .. } => 70,
+                Instruction::ArrayRemove { .. } => 75,
+                _ => unreachable!(),
+            });
+            put_u16(output, source);
+            put_u16(output, index);
+            put_u16(output, dst);
+        }
+        Instruction::ArraySet {
+            source,
+            index,
+            value,
+        }
+        | Instruction::ArrayInsert {
+            source,
+            index,
+            value,
+        } => {
+            output.push(match instruction {
+                Instruction::ArraySet { .. } => 71,
+                Instruction::ArrayInsert { .. } => 74,
+                _ => unreachable!(),
+            });
+            put_u16(output, source);
+            put_u16(output, index);
+            put_u16(output, value);
+        }
+        Instruction::ArrayPush { source, value } => {
+            output.push(72);
+            put_u16(output, source);
+            put_u16(output, value);
+        }
+        Instruction::ArrayPop { source, dst } => {
+            output.push(73);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::ArrayClear { source } => {
+            output.push(76);
+            put_u16(output, source);
+        }
         Instruction::Jump { target } => {
             output.push(7);
             put_u32(output, target);
@@ -2768,6 +2905,45 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             rhs: reader.u16()?,
             dst: reader.u16()?,
         },
+        68 => Instruction::ArrayNew {
+            type_id: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        69 => Instruction::ArrayLen {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        70 => Instruction::ArrayGet {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        71 => Instruction::ArraySet {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            value: reader.u16()?,
+        },
+        72 => Instruction::ArrayPush {
+            source: reader.u16()?,
+            value: reader.u16()?,
+        },
+        73 => Instruction::ArrayPop {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        74 => Instruction::ArrayInsert {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            value: reader.u16()?,
+        },
+        75 => Instruction::ArrayRemove {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        76 => Instruction::ArrayClear {
+            source: reader.u16()?,
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -2877,6 +3053,7 @@ pub struct ModuleBuilder {
     strings: Vec<String>,
     functions: Vec<Function>,
     state_handle_types: Vec<StateHandleType>,
+    array_types: Vec<ArrayType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -2896,6 +3073,7 @@ impl ModuleBuilder {
             strings: Vec::new(),
             functions: Vec::new(),
             state_handle_types: Vec::new(),
+            array_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -2970,6 +3148,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn array_type(&mut self, array_type: ArrayType) -> &mut Self {
+        self.array_types.push(array_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -3006,6 +3189,7 @@ impl ModuleBuilder {
             strings: self.strings,
             functions: self.functions,
             state_handle_types: self.state_handle_types,
+            array_types: self.array_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
@@ -3125,6 +3309,15 @@ impl FunctionBuilder {
                         | Instruction::Call { .. }
                         | Instruction::HostCall { .. }
                         | Instruction::StateHandleResolve { .. }
+                        | Instruction::ArrayNew { .. }
+                        | Instruction::ArrayLen { .. }
+                        | Instruction::ArrayGet { .. }
+                        | Instruction::ArraySet { .. }
+                        | Instruction::ArrayPush { .. }
+                        | Instruction::ArrayPop { .. }
+                        | Instruction::ArrayInsert { .. }
+                        | Instruction::ArrayRemove { .. }
+                        | Instruction::ArrayClear { .. }
                         | Instruction::Return { .. }
                         | Instruction::ReturnVoid
                         | Instruction::Trap
@@ -3180,7 +3373,7 @@ mod tests {
     use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{
-        ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder,
+        ArrayType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder,
         FunctionEffect, Instruction, Module, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
         StateField, StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
         result_type, state_handle_error_type, state_handle_type,
@@ -3568,6 +3761,62 @@ mod tests {
             module.state_handle_types,
             vec![StateHandleType::new(target)]
         );
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn array_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+        let array = ArrayType::new(ValueType::I32);
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::Named(array.type_id),
+                    ValueType::I32,
+                    ValueType::I32,
+                ],
+                result: Some(ValueType::I32),
+            },
+            6,
+        );
+        function
+            .emit(Instruction::ArrayNew {
+                type_id: array.type_id,
+                dst: 3,
+            })
+            .emit(Instruction::ArrayLen { source: 0, dst: 5 })
+            .emit(Instruction::ArrayGet {
+                source: 0,
+                index: 1,
+                dst: 4,
+            })
+            .emit(Instruction::ArraySet {
+                source: 0,
+                index: 1,
+                value: 2,
+            })
+            .emit(Instruction::ArrayPush {
+                source: 0,
+                value: 2,
+            })
+            .emit(Instruction::ArrayPop { source: 0, dst: 4 })
+            .emit(Instruction::ArrayInsert {
+                source: 0,
+                index: 1,
+                value: 2,
+            })
+            .emit(Instruction::ArrayRemove {
+                source: 0,
+                index: 1,
+                dst: 4,
+            })
+            .emit(Instruction::ArrayClear { source: 0 })
+            .emit(Instruction::Return { source: 5 });
+        let mut builder = ModuleBuilder::new();
+        builder
+            .array_type(array)
+            .function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(module.array_types, vec![array]);
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 
