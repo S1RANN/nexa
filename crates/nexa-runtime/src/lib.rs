@@ -68,6 +68,12 @@ pub use realm::{
     RetiredEpochSnapshot, RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport,
     TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
 };
+#[cfg(any(test, feature = "model-adapter"))]
+pub use realm::{
+    HeapInspection, ModuleInspection, RealmInspectionSnapshot, ReloadInspection,
+    ReloadInspectionState, RootInspection, SchedulerInspection, TaskExecutionInspection,
+    TaskInspection,
+};
 pub use reload::ReloadError;
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};

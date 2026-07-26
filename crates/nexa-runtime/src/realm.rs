@@ -1113,6 +1113,119 @@ pub struct RuntimeCapacityReport {
     pub release_records: usize,
 }
 
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleInspection {
+    pub handle: ModuleHandle,
+    pub generation: u32,
+    pub module_id: u32,
+    pub epoch: u64,
+    pub lifecycle: ModuleLifecycle,
+    pub stateful_domain: StatefulDomainId,
+    pub state_objects: usize,
+    pub module_gc_roots: usize,
+    pub state_gc_roots: usize,
+    pub staging_gc_roots: usize,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskExecutionInspection {
+    Ready,
+    Running,
+    FuelYielded,
+    ExplicitYielded,
+    Waiting {
+        request: HostRequestHandle,
+        destination: u16,
+    },
+    ReloadPaused,
+    Cancelling,
+    Cleanup,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SchedulerInspection {
+    Ready,
+    Waiting(HostRequestHandle),
+    Detached,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaskInspection {
+    pub handle: TaskHandle,
+    pub state: TaskState,
+    pub execution: TaskExecutionInspection,
+    pub scheduler: SchedulerInspection,
+    pub module_id: u32,
+    pub module_generation: u32,
+    pub epoch: u64,
+    pub ownership: crate::TaskResourceSet,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReloadInspectionState {
+    #[default]
+    Idle,
+    Preparing,
+    Quiescing,
+    Staging,
+    Committing,
+    Published,
+    Activating,
+    Completed,
+    RolledBack,
+    ActivationFaulted,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReloadInspection {
+    pub state: ReloadInspectionState,
+    pub old_module: Option<ModuleHandle>,
+    pub candidate_module: Option<ModuleHandle>,
+    pub paused_tasks: Vec<TaskHandle>,
+    pub completion_buffer: usize,
+    pub root_publications: Vec<RootPublicationRecord>,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RootInspection {
+    pub module_globals: usize,
+    pub stateful_registry: usize,
+    pub staging_heap: usize,
+    pub suspended_tasks: usize,
+    pub published_roots: usize,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapInspection {
+    pub live_objects: usize,
+    pub capacity: u32,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealmInspectionSnapshot {
+    pub active_root: Option<ModuleInspection>,
+    pub candidate_root: Option<ModuleInspection>,
+    pub modules: Vec<ModuleInspection>,
+    pub retired_epochs: Vec<RetiredEpochSnapshot>,
+    pub tasks: Vec<TaskInspection>,
+    pub resources: crate::RuntimeResourceLedger,
+    pub completion_accounting: crate::CompletionAccounting,
+    pub reload: ReloadInspection,
+    pub roots: RootInspection,
+    pub heap: HeapInspection,
+    pub runtime_host: Option<RuntimeHostState>,
+    pub terminal_records: Vec<(TaskHandle, TaskTerminalRecord)>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealmError {
     Runtime(RuntimeError),
@@ -2448,6 +2561,162 @@ impl RealmRuntime {
         ledger
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
+    #[must_use]
+    pub fn inspection_snapshot(&self) -> RealmInspectionSnapshot {
+        let modules = self
+            .modules
+            .occupied_handles_iter()
+            .filter_map(|raw| self.module_inspection(ModuleHandle(raw)))
+            .collect::<Vec<_>>();
+        let active_root = self
+            .active_root
+            .and_then(|module| self.module_inspection(module));
+        let transaction = self.reload.transaction().ok();
+        let candidate_root =
+            transaction.and_then(|transaction| self.module_inspection(transaction.candidate));
+        let tasks = self
+            .tasks
+            .task_handles_iter()
+            .filter_map(|task| self.task_inspection(task))
+            .collect::<Vec<_>>();
+        let roots = RootInspection {
+            module_globals: modules.iter().map(|module| module.module_gc_roots).sum(),
+            stateful_registry: modules.iter().map(|module| module.state_gc_roots).sum(),
+            staging_heap: modules.iter().map(|module| module.staging_gc_roots).sum(),
+            suspended_tasks: self.suspended_task_root_count(),
+            published_roots: self.root_publications.len(),
+        };
+        let reload = ReloadInspection {
+            state: self.reload_inspection_state(),
+            old_module: transaction.map(|transaction| transaction.old_module),
+            candidate_module: transaction.map(|transaction| transaction.candidate),
+            paused_tasks: transaction.map_or_else(Vec::new, |transaction| {
+                transaction
+                    .paused_tasks
+                    .iter()
+                    .map(|paused| paused.handle)
+                    .collect()
+            }),
+            completion_buffer: transaction.map_or(0, |transaction| transaction.completions.len()),
+            root_publications: self.root_publications.iter().copied().collect(),
+        };
+        RealmInspectionSnapshot {
+            active_root,
+            candidate_root,
+            modules,
+            retired_epochs: self.retired_epochs.entries.iter().copied().collect(),
+            tasks,
+            resources: self.resource_ledger(),
+            completion_accounting: self.completion_accounting(),
+            reload,
+            roots,
+            heap: HeapInspection {
+                live_objects: self.heap.live_len(),
+                capacity: self.heap.capacity_limit(),
+            },
+            runtime_host: self.runtime_host.as_ref().map(RuntimeHost::state),
+            terminal_records: self.tombstones.iter().cloned().collect(),
+        }
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    fn module_inspection(&self, handle: ModuleHandle) -> Option<ModuleInspection> {
+        let module = self.modules.resolve(handle.raw()).ok()?;
+        Some(ModuleInspection {
+            handle,
+            generation: handle.raw().generation,
+            module_id: module.module_id,
+            epoch: module.epoch,
+            lifecycle: module.lifecycle,
+            stateful_domain: module.stateful_domain,
+            state_objects: module.state.object_count(),
+            module_gc_roots: module.globals.len(),
+            state_gc_roots: module.state.gc_roots().len(),
+            staging_gc_roots: module.staging_roots.len(),
+        })
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    fn task_inspection(&self, handle: TaskHandle) -> Option<TaskInspection> {
+        let task = self.tasks.task_snapshot(handle).ok()?;
+        let execution = match self.tasks.execution(handle).ok()? {
+            TaskExecution::Ready(_) => TaskExecutionInspection::Ready,
+            TaskExecution::Running(_) => TaskExecutionInspection::Running,
+            TaskExecution::FuelYielded(_) => TaskExecutionInspection::FuelYielded,
+            TaskExecution::ExplicitYielded(_) => TaskExecutionInspection::ExplicitYielded,
+            TaskExecution::Waiting {
+                request,
+                destination,
+                ..
+            } => TaskExecutionInspection::Waiting {
+                request: *request,
+                destination: *destination,
+            },
+            TaskExecution::ReloadPaused(_) => TaskExecutionInspection::ReloadPaused,
+            TaskExecution::Cancelling(_) => TaskExecutionInspection::Cancelling,
+            TaskExecution::Cleanup(_) => TaskExecutionInspection::Cleanup,
+        };
+        let scheduler = match self.scheduler.checkpoint(handle) {
+            crate::scheduler::SchedulerCheckpoint::Ready { .. } => SchedulerInspection::Ready,
+            crate::scheduler::SchedulerCheckpoint::Waiting { request } => {
+                SchedulerInspection::Waiting(request)
+            }
+            crate::scheduler::SchedulerCheckpoint::Detached => SchedulerInspection::Detached,
+        };
+        Some(TaskInspection {
+            handle,
+            state: task.state,
+            execution,
+            scheduler,
+            module_id: task.module_id,
+            module_generation: task.module_generation,
+            epoch: task.module_epoch,
+            ownership: self.resources.ownership(handle).unwrap_or_default(),
+        })
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    fn suspended_task_root_count(&self) -> usize {
+        self.tasks
+            .task_handles_iter()
+            .filter_map(|task| {
+                let snapshot = self.tasks.task_snapshot(task).ok()?;
+                let module = self.module_for_task(snapshot).ok()?;
+                let execution = self.tasks.execution(task).ok()?;
+                execution
+                    .continuation()
+                    .checked_gc_roots(&module.verified)
+                    .ok()
+            })
+            .map(|roots| roots.len())
+            .sum()
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    fn reload_inspection_state(&self) -> ReloadInspectionState {
+        use crate::machines::reload::State;
+        match self.reload.inspection_state() {
+            None => self
+                .active_root
+                .and_then(|active| self.modules.resolve(active.raw()).ok())
+                .filter(|module| module.lifecycle == ModuleLifecycle::ActivationFaulted)
+                .map_or(ReloadInspectionState::Idle, |_| {
+                    ReloadInspectionState::ActivationFaulted
+                }),
+            Some(State::Planned) => ReloadInspectionState::Idle,
+            Some(State::Preparing) => ReloadInspectionState::Preparing,
+            Some(State::Quiescing) => ReloadInspectionState::Quiescing,
+            Some(State::Staging) => ReloadInspectionState::Staging,
+            Some(State::Committing) => ReloadInspectionState::Committing,
+            Some(State::Published) => ReloadInspectionState::Published,
+            Some(State::Activating) => ReloadInspectionState::Activating,
+            Some(State::Completed) => ReloadInspectionState::Completed,
+            Some(State::RolledBack) => ReloadInspectionState::RolledBack,
+            Some(State::ActivationFaulted) => ReloadInspectionState::ActivationFaulted,
+        }
+    }
+
     #[must_use]
     pub fn resource_invariants_hold(&self) -> bool {
         let terminal_tasks_have_no_continuation = self
@@ -3437,14 +3706,15 @@ mod tests {
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{
-        CancelReason, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
+        CancelReason, ModuleLifecycle, PendingReason, PollResult, RealmConfig, RealmError,
+        RealmRuntime, ReloadInspectionState, SchedulerInspection, TaskExecutionInspection,
         TaskTerminalReason,
     };
     use crate::task::TaskExecution;
     use crate::{
         CopyBuffer, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
         HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain,
-        RuntimeValue, StepConfig, TaskLimits, TickBudget,
+        RuntimeValue, StepConfig, TaskLimits, TaskState, TickBudget,
     };
 
     #[test]
@@ -6154,5 +6424,46 @@ mod tests {
             realm.stage_reload(&[]),
             Err(RealmError::Reload(ReloadError::MigrationNoOutput))
         );
+    }
+
+    #[test]
+    fn inspection_snapshot_reads_production_state() {
+        let (verified, host, schema) = module(true);
+        let mut realm = RealmRuntime::isolated(RealmConfig {
+            realm_id: 95,
+            max_heap_objects: 8,
+            ..RealmConfig::default()
+        });
+        let module = realm.load_module(verified, host, schema).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(module, 0, &[RuntimeValue::I32(9)], task_config(scope))
+            .unwrap();
+        let root = realm
+            .allocate(Object::String("inspection-root".into()))
+            .unwrap();
+        realm.attach_module_root(module, root).unwrap();
+
+        let snapshot = realm.inspection_snapshot();
+        let active = snapshot.active_root.expect("active root is inspected");
+        assert_eq!(active.handle, module);
+        assert_eq!(active.generation, module.raw().generation);
+        assert_eq!(active.module_id, module.raw().index);
+        assert_eq!(active.lifecycle, ModuleLifecycle::Active);
+        assert_eq!(active.module_gc_roots, 1);
+        assert!(snapshot.candidate_root.is_none());
+        assert_eq!(snapshot.modules.len(), 1);
+        assert_eq!(snapshot.tasks.len(), 1);
+        assert_eq!(snapshot.tasks[0].handle, task);
+        assert_eq!(snapshot.tasks[0].state, TaskState::Ready);
+        assert_eq!(snapshot.tasks[0].execution, TaskExecutionInspection::Ready);
+        assert_eq!(snapshot.tasks[0].scheduler, SchedulerInspection::Ready);
+        assert_eq!(snapshot.resources.tasks, 1);
+        assert_eq!(snapshot.resources.continuations, 1);
+        assert_eq!(snapshot.roots.module_globals, 1);
+        assert_eq!(snapshot.heap.live_objects, 1);
+        assert_eq!(snapshot.heap.capacity, 8);
+        assert_eq!(snapshot.reload.state, ReloadInspectionState::Idle);
+        assert!(snapshot.terminal_records.is_empty());
     }
 }

@@ -1469,6 +1469,12 @@ impl Heap {
             .count()
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
+    #[must_use]
+    pub(crate) const fn capacity_limit(&self) -> u32 {
+        self.max_objects
+    }
+
     fn validate_reference(&self, reference: GcRef) -> Result<(), HeapError> {
         self.resolve(reference).map(|_| ())
     }

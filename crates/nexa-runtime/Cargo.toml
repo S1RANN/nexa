@@ -12,6 +12,10 @@ nexa-core = { path = "../nexa-core" }
 nexa-idl = { path = "../nexa-idl", optional = true }
 nexa-verifier = { path = "../nexa-verifier" }
 
+[dev-dependencies]
+nexa-compiler = { path = "../nexa-compiler" }
+nexa-idl = { path = "../nexa-idl" }
+
 [features]
 allocation-counting = []
 fuzzing = ["model-adapter"]

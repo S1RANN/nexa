@@ -155,6 +155,12 @@ impl ReloadCoordinator {
         self.transaction.is_some()
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
+    #[must_use]
+    pub(crate) const fn inspection_state(&self) -> Option<reload::State> {
+        self.state
+    }
+
     fn apply(&mut self, event: reload::Event) -> Result<(), ReloadError> {
         let outcome = reload::apply(self.state.ok_or(ReloadError::InvalidState)?, event, |_| {
             true
