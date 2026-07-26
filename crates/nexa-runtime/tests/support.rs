@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
 };

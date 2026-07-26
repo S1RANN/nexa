@@ -169,13 +169,13 @@ impl InterpreterHost for RealmHostBridge<'_> {
         &mut self,
         import: u32,
         arguments: &[RuntimeValue],
-        heap: Option<&mut Heap>,
+        mut heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
         let metadata = self
             .imports
             .get(import as usize)
             .ok_or(HostTrap::UnknownFunction(import))?;
-        let values = RuntimeHostArgs::new(arguments, heap.as_deref())?;
+        let values = RuntimeHostArgs::new(arguments, heap.as_deref_mut())?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
@@ -190,6 +190,9 @@ impl InterpreterHost for RealmHostBridge<'_> {
                     self.array_types,
                     self.buffer_types,
                 )?))
+            }
+            HostCallOutcome::RuntimeImmediate(value) => {
+                Ok(InterpreterHostOutcome::Immediate(value))
             }
             HostCallOutcome::Pending(request) => {
                 if !self.resources.owns_request(self.task, request) {
@@ -3800,8 +3803,8 @@ mod tests {
     use crate::task::TaskExecution;
     use crate::{
         CopyBuffer, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
-        HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain,
-        RuntimeValue, StepConfig, TaskLimits, TaskState, TickBudget,
+        HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostArgs,
+        RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskState, TickBudget,
     };
 
     #[test]
@@ -4552,6 +4555,40 @@ mod tests {
         request: Arc<Mutex<Option<crate::PendingHostRequest>>>,
     }
 
+    struct DirectWriterRegistry {
+        hash: StableId,
+    }
+
+    impl HostRegistry for DirectWriterRegistry {
+        fn interface_hash(&self) -> Option<StableId> {
+            Some(self.hash)
+        }
+
+        fn call(
+            &mut self,
+            _: u32,
+            _: &mut ResourceContext<'_>,
+            _: HostArgs<'_>,
+        ) -> Result<HostCallOutcome, HostTrap> {
+            panic!("materializing call must not run")
+        }
+
+        fn call_runtime(
+            &mut self,
+            id: u32,
+            _: &mut ResourceContext<'_>,
+            args: RuntimeHostArgs<'_>,
+        ) -> Result<HostCallOutcome, HostTrap> {
+            if id != 0 || !args.is_empty() {
+                return Err(HostTrap::Arity);
+            }
+            let mut writer = args.return_writer(1)?;
+            let value = writer.write_string("direct-result".to_owned())?;
+            let value = writer.finish(value)?;
+            Ok(HostCallOutcome::RuntimeImmediate(value))
+        }
+    }
+
     impl HostRegistry for AsyncRegistry {
         fn interface_hash(&self) -> Option<StableId> {
             Some(self.hash)
@@ -4576,6 +4613,79 @@ mod tests {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(pending);
             Ok(HostCallOutcome::Pending(request))
         }
+    }
+
+    fn run_direct_writer_registry() -> PollResult<Option<RuntimeValue>> {
+        let host_hash = StableId::from_name("direct-writer-host");
+        let schema = StableId::from_name("direct-writer-schema");
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::String),
+            },
+            1,
+        );
+        function
+            .effect(FunctionEffect::Task)
+            .emit(Instruction::HostCall {
+                import: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut function = function.finish().unwrap();
+        function.root_bitmap[0] = true;
+        function.safepoints = vec![0, 1];
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.metadata(host_hash, schema);
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("Direct::string"),
+            parameters: Vec::new(),
+            result: Some(ValueType::String),
+            mode: HostCallMode::Immediate,
+            fuel_cost: 1,
+            async_result: None,
+        });
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+        let runtime_host = RuntimeHost::new(8);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            runtime_host,
+            Box::new(DirectWriterRegistry { hash: host_hash }),
+        )
+        .unwrap();
+        let module = realm.load_module(module, host_hash, schema).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm.call(module, 0, &[], task_config(scope)).unwrap();
+        realm.poll_task(task, 32).unwrap()
+    }
+
+    #[test]
+    fn complex_host_returns_use_direct_reserved_writer() {
+        assert!(matches!(
+            run_direct_writer_registry(),
+            PollResult::Completed(Some(RuntimeValue::String { .. }))
+        ));
+    }
+
+    #[test]
+    fn production_registry_never_calls_materializing_api() {
+        assert!(matches!(
+            run_direct_writer_registry(),
+            PollResult::Completed(Some(RuntimeValue::String { .. }))
+        ));
     }
 
     struct QueueAsyncRegistry {

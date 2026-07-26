@@ -398,6 +398,61 @@ impl Heap {
         reservation.remaining == 0
     }
 
+    pub(crate) fn commit_owned_string(
+        &mut self,
+        reservation: &mut HeapReservation,
+        value: String,
+    ) -> Result<RuntimeValue, HeapError> {
+        self.validate_string_length(value.len())?;
+        let reference = self.commit(reservation, Object::String(value));
+        let hash = self.string_hash(reference)?;
+        Ok(RuntimeValue::String { reference, hash })
+    }
+
+    pub(crate) fn commit_array_reserved(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::array_type(element_type) {
+            return Err(invalid_value_reference());
+        }
+        self.validate_collection_length(values.len())?;
+        let reference = self.commit(
+            reservation,
+            Object::Array {
+                type_id,
+                element_type,
+                values,
+            },
+        );
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub(crate) fn commit_buffer_reserved(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<RuntimeValue>,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::buffer_type(element_type) {
+            return Err(invalid_value_reference());
+        }
+        self.validate_collection_length(values.len())?;
+        let reference = self.commit(
+            reservation,
+            Object::Buffer {
+                type_id,
+                element_type,
+                values,
+            },
+        );
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
     pub fn allocate_enum(
         &mut self,
         type_id: StableId,

@@ -1,6 +1,7 @@
 //! Public Nexa facade.
 //!
 //! Stable facade over Nexa's model-checked runtime, compiler, bytecode and IDL APIs.
+#![allow(deprecated)]
 
 mod error;
 

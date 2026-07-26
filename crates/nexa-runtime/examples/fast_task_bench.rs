@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

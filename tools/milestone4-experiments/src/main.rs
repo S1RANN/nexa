@@ -1,3 +1,5 @@
+#![allow(deprecated)]
+
 use std::collections::{BTreeMap, VecDeque};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};

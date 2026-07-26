@@ -1,4 +1,5 @@
 //! Model-driven Nexa runtime primitives.
+#![allow(deprecated)]
 
 mod allocation;
 mod failure;
@@ -36,6 +37,7 @@ pub use failure::{
 pub use kernel::{RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
+pub use nexa_bytecode::ValueType;
 pub use nexa_core::StableId;
 
 #[cfg(test)]
@@ -45,15 +47,16 @@ pub use frame::{
 };
 pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object};
 pub use host::{
-    CompletionAccounting, CopyBuffer, HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome,
-    HostCompletionDelivery, HostCompletionResult, HostCompletionTicket, HostEnumRef,
-    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostRequestState, HostResultRef, HostStr, HostStructRef, HostTrap,
-    HostValue, HostValueRef, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
-    ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
-    ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
-    RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
-    RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
+    CompletionAccounting, CopyBuffer, EncodeHostReturn, HostArgs, HostArrayRef, HostBufferRef,
+    HostCallOutcome, HostCompletionDelivery, HostCompletionResult, HostCompletionTicket,
+    HostEnumRef, HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostRequestState, HostResultRef, HostReturnWriter, HostStr, HostStructRef,
+    HostTrap, HostValue, HostValueRef, MAX_HOST_RETURN_FIELDS, PendingHostRequest,
+    RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
+    ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
+    RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
+    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
+    TaskResourceSet,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

@@ -1053,6 +1053,8 @@ impl HostPayload {
     }
 }
 
+/// Legacy materialized host value. Converting runtime values to this form may allocate.
+#[deprecated(note = "use RuntimeHostArgs borrowed views and HostReturnWriter")]
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostValue {
     I32(i32),
@@ -1086,6 +1088,7 @@ impl HostValue {
 }
 
 const MAX_HOST_ARGUMENTS: usize = 8;
+pub const MAX_HOST_RETURN_FIELDS: usize = nexa_bytecode::MAX_STRUCT_FIELDS;
 
 /// A UTF-8 string view borrowed directly from the VM heap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1385,16 +1388,16 @@ pub enum HostResultRef<'a, T, E> {
     __Lifetime(std::marker::PhantomData<&'a ()>),
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 pub struct RuntimeHostArgs<'a> {
     values: &'a [crate::RuntimeValue],
-    heap: Option<&'a crate::Heap>,
+    heap: Option<&'a mut crate::Heap>,
 }
 
 impl<'a> RuntimeHostArgs<'a> {
     pub fn new(
         values: &'a [crate::RuntimeValue],
-        heap: Option<&'a crate::Heap>,
+        heap: Option<&'a mut crate::Heap>,
     ) -> Result<Self, HostTrap> {
         if values.len() > MAX_HOST_ARGUMENTS {
             return Err(HostTrap::Arity);
@@ -1458,6 +1461,7 @@ impl<'a> RuntimeHostArgs<'a> {
         match self.value(index)? {
             crate::RuntimeValue::String { reference, .. } => self
                 .heap
+                .as_deref()
                 .ok_or(HostTrap::Type)?
                 .string(reference)
                 .map(str::to_owned)
@@ -1466,14 +1470,14 @@ impl<'a> RuntimeHostArgs<'a> {
         }
     }
 
-    pub fn value_ref(&self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+    pub fn value_ref(&self, index: usize) -> Result<HostValueRef<'_>, HostTrap> {
         Ok(HostValueRef {
             value: self.value(index)?,
-            heap: self.heap,
+            heap: self.heap.as_deref(),
         })
     }
 
-    pub fn str_ref(&self, index: usize) -> Result<HostStr<'a>, HostTrap> {
+    pub fn str_ref(&self, index: usize) -> Result<HostStr<'_>, HostTrap> {
         self.value_ref(index)?.str_ref()
     }
 
@@ -1481,15 +1485,15 @@ impl<'a> RuntimeHostArgs<'a> {
         &self,
         index: usize,
         type_id: StableId,
-    ) -> Result<HostStructRef<'a>, HostTrap> {
+    ) -> Result<HostStructRef<'_>, HostTrap> {
         self.value_ref(index)?.struct_ref(type_id)
     }
 
-    pub fn enum_ref(&self, index: usize, type_id: StableId) -> Result<HostEnumRef<'a>, HostTrap> {
+    pub fn enum_ref(&self, index: usize, type_id: StableId) -> Result<HostEnumRef<'_>, HostTrap> {
         self.value_ref(index)?.enum_ref(type_id)
     }
 
-    pub fn array_ref(&self, index: usize, type_id: StableId) -> Result<HostArrayRef<'a>, HostTrap> {
+    pub fn array_ref(&self, index: usize, type_id: StableId) -> Result<HostArrayRef<'_>, HostTrap> {
         self.value_ref(index)?.array_ref(type_id)
     }
 
@@ -1497,7 +1501,7 @@ impl<'a> RuntimeHostArgs<'a> {
         &self,
         index: usize,
         type_id: StableId,
-    ) -> Result<HostBufferRef<'a>, HostTrap> {
+    ) -> Result<HostBufferRef<'_>, HostTrap> {
         self.value_ref(index)?.buffer_ref(type_id)
     }
 
@@ -1534,11 +1538,15 @@ impl<'a> RuntimeHostArgs<'a> {
     }
 
     pub fn host_value(&self, index: usize) -> Result<HostValue, HostTrap> {
-        runtime_argument_to_host_value(self.value(index)?, self.heap)
+        runtime_argument_to_host_value(self.value(index)?, self.heap.as_deref())
     }
 
-    fn materialize(self) -> Result<HostArgs<'a>, HostTrap> {
-        HostArgs::from_runtime(self.values, self.heap)
+    pub fn return_writer(self, required_slots: usize) -> Result<HostReturnWriter<'a>, HostTrap> {
+        HostReturnWriter::new(self.heap.ok_or(HostTrap::Type)?, required_slots)
+    }
+
+    fn materialize(&self) -> Result<HostArgs<'static>, HostTrap> {
+        HostArgs::from_runtime(self.values, self.heap.as_deref())
     }
 
     fn value(&self, index: usize) -> Result<crate::RuntimeValue, HostTrap> {
@@ -1546,6 +1554,8 @@ impl<'a> RuntimeHostArgs<'a> {
     }
 }
 
+/// Legacy materialized argument list. Runtime conversion may allocate.
+#[deprecated(note = "use RuntimeHostArgs borrowed views")]
 #[derive(Clone, Debug)]
 pub struct HostArgs<'a> {
     borrowed: Option<&'a [HostValue]>,
@@ -1684,9 +1694,127 @@ fn runtime_argument_to_host_value(
     })
 }
 
+/// A preflighted encoder that writes a host result directly into the VM heap.
+pub struct HostReturnWriter<'a> {
+    heap: &'a mut crate::Heap,
+    reservation: crate::heap::HeapReservation,
+}
+
+impl<'a> HostReturnWriter<'a> {
+    fn new(heap: &'a mut crate::Heap, required_slots: usize) -> Result<Self, HostTrap> {
+        let reservation = heap.preflight(required_slots).map_err(|_| HostTrap::Type)?;
+        Ok(Self { heap, reservation })
+    }
+
+    pub fn write_string(&mut self, value: String) -> Result<crate::RuntimeValue, HostTrap> {
+        self.heap
+            .commit_owned_string(&mut self.reservation, value)
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn write_struct(
+        &mut self,
+        type_id: StableId,
+        fields: &[crate::RuntimeValue],
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        self.heap
+            .commit_struct(&mut self.reservation, type_id, fields)
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn write_enum(
+        &mut self,
+        type_id: StableId,
+        variant: StableId,
+        tag: u32,
+        payload: Option<crate::RuntimeValue>,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        Ok(self
+            .heap
+            .allocate_enum_reserved(&mut self.reservation, type_id, variant, tag, payload))
+    }
+
+    pub fn write_array(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<crate::RuntimeValue>,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        self.heap
+            .commit_array_reserved(&mut self.reservation, type_id, element_type, values)
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn write_buffer(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<crate::RuntimeValue>,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        self.heap
+            .commit_buffer_reserved(&mut self.reservation, type_id, element_type, values)
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn finish(self, value: crate::RuntimeValue) -> Result<crate::RuntimeValue, HostTrap> {
+        if crate::Heap::reservation_complete(&self.reservation) {
+            Ok(value)
+        } else {
+            Err(HostTrap::Type)
+        }
+    }
+}
+
+pub trait EncodeHostReturn {
+    fn required_slots(&self) -> Result<usize, HostTrap>;
+
+    fn encode_into(
+        self,
+        writer: &mut HostReturnWriter<'_>,
+    ) -> Result<crate::RuntimeValue, HostTrap>;
+}
+
+macro_rules! scalar_host_return {
+    ($ty:ty, $variant:ident, $encode:expr) => {
+        impl EncodeHostReturn for $ty {
+            fn required_slots(&self) -> Result<usize, HostTrap> {
+                Ok(0)
+            }
+
+            fn encode_into(
+                self,
+                _: &mut HostReturnWriter<'_>,
+            ) -> Result<crate::RuntimeValue, HostTrap> {
+                Ok(crate::RuntimeValue::$variant(($encode)(self)))
+            }
+        }
+    };
+}
+
+scalar_host_return!(i32, I32, |value| value);
+scalar_host_return!(i64, I64, |value| value);
+scalar_host_return!(f32, F32, f32::to_bits);
+scalar_host_return!(f64, F64, f64::to_bits);
+scalar_host_return!(bool, Bool, |value| value);
+scalar_host_return!(char, Rune, |value| value as u32);
+
+impl EncodeHostReturn for String {
+    fn required_slots(&self) -> Result<usize, HostTrap> {
+        Ok(1)
+    }
+
+    fn encode_into(
+        self,
+        writer: &mut HostReturnWriter<'_>,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        writer.write_string(self)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostCallOutcome {
     Immediate(HostValue),
+    RuntimeImmediate(crate::RuntimeValue),
     Pending(HostRequestHandle),
 }
 
@@ -1704,6 +1832,8 @@ pub trait HostRegistry {
         None
     }
 
+    /// Compatibility dispatch for materialized callers. This path may allocate.
+    #[deprecated(note = "production registries must override call_runtime")]
     fn call(
         &mut self,
         id: u32,
@@ -3496,7 +3626,7 @@ mod tests {
             )
             .unwrap();
         let values = [string, structure, enumeration, array, buffer];
-        let args = RuntimeHostArgs::new(&values, Some(&heap)).unwrap();
+        let args = RuntimeHostArgs::new(&values, Some(&mut heap)).unwrap();
 
         assert_eq!(args.str_ref(0).unwrap().as_str(), "Nexa界");
         let structure = args.struct_ref(1, struct_type).unwrap();
