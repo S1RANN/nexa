@@ -2635,6 +2635,50 @@ impl RuntimeResources {
         Ok(())
     }
 
+    pub(crate) fn release_token(
+        &mut self,
+        task: TaskHandle,
+        handle: ResourceTokenHandle,
+    ) -> Result<(), HostRequestError> {
+        let index = self
+            .ownership
+            .iter()
+            .position(|owned| {
+                matches!(
+                    owned,
+                    OwnedResource::Token {
+                        task: owner,
+                        handle: owned_handle,
+                    } if *owner == task && *owned_handle == handle
+                )
+            })
+            .ok_or(HostRequestError::InvalidState)?;
+        self.ownership.swap_remove(index);
+        self.tokens.release(handle, &mut self.releases).map(|_| ())
+    }
+
+    pub(crate) fn release_snapshot(
+        &mut self,
+        task: TaskHandle,
+        handle: SnapshotHandle,
+    ) -> Result<(), HostRequestError> {
+        let index = self
+            .ownership
+            .iter()
+            .position(|owned| {
+                matches!(
+                    owned,
+                    OwnedResource::Snapshot {
+                        task: owner,
+                        handle: owned_handle,
+                    } if *owner == task && *owned_handle == handle
+                )
+            })
+            .ok_or(HostRequestError::InvalidState)?;
+        self.ownership.swap_remove(index);
+        self.snapshots.release(handle, &mut self.releases)
+    }
+
     pub fn drain_releases(&mut self) -> Vec<ReleaseRecord> {
         self.releases.drain().collect()
     }

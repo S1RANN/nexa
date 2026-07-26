@@ -2,9 +2,10 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
-    GcRef, HostCompletionTicket, HostRegistry, ModuleHandle, PendingHostRequest, RealmConfig,
-    RealmRuntime, ResourceTokenHandle, RuntimeFailureInjector, RuntimeHost, ScopeHandle,
-    SnapshotHandle, StableId, TaskHandle,
+    GcRef, HostCompletionTicket, HostPayload, HostRegistry, ModuleHandle, Object,
+    PendingHostRequest, RealmConfig, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceTokenHandle,
+    RuntimeFailureInjector, RuntimeHost, RuntimeHostDomain, RuntimeValue, ScopeHandle,
+    SnapshotHandle, StableId, StepConfig, TaskHandle, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -109,11 +110,174 @@ impl RealmV5RuntimeAdapter {
     }
 
     pub fn apply(&mut self, event: RealmV5RuntimeEvent) -> Result<(), RealmV5RuntimeApplyError> {
+        self.apply_production(event)
+            .map_err(RealmV5RuntimeApplyError::Invariant)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn apply_production(&mut self, event: RealmV5RuntimeEvent) -> Result<(), String> {
         match event {
-            RealmV5RuntimeEvent::GcCollect => {
+            RealmV5RuntimeEvent::TaskAdmission => self.admit_driver_tasks(),
+            RealmV5RuntimeEvent::PollTask | RealmV5RuntimeEvent::FuelYield => self.poll_tasks(1),
+            RealmV5RuntimeEvent::ExplicitYield
+            | RealmV5RuntimeEvent::ResumeTask
+            | RealmV5RuntimeEvent::HostWait
+            | RealmV5RuntimeEvent::TaskComplete => self.poll_tasks(1_024),
+            RealmV5RuntimeEvent::HostComplete => self.complete_requests(false),
+            RealmV5RuntimeEvent::LateCompletion => self.complete_requests(true),
+            RealmV5RuntimeEvent::Cancel | RealmV5RuntimeEvent::Cleanup => {
+                for task in self.tasks.iter().flatten().copied() {
+                    if self.realm.task_snapshot(task).is_ok() {
+                        self.realm
+                            .cancel_task(task, crate::CancelReason::OwnerDestroyed)
+                            .map_err(debug)?;
+                    }
+                }
+                Ok(())
+            }
+            RealmV5RuntimeEvent::BeginReload => {
+                let active = self
+                    .realm
+                    .active_root()
+                    .ok_or_else(|| "active root is missing".to_owned())?;
+                let index = usize::from(normalize_epoch(
+                    self.realm.module_epoch(active).map_err(debug)?,
+                )?)
+                .checked_add(1)
+                .ok_or_else(|| "candidate index overflow".to_owned())?;
+                let compiled = realm_v5_modules();
+                let candidate_module = compiled
+                    .modules
+                    .get(index)
+                    .ok_or_else(|| "no candidate module remains".to_owned())?
+                    .clone();
+                let candidate = self
+                    .realm
+                    .prepare_reload(active, candidate_module, compiled.host_hash)
+                    .map_err(debug)?;
+                self.modules.epochs[index] = Some(candidate);
+                Ok(())
+            }
+            RealmV5RuntimeEvent::Quiesce => {
+                self.realm.quiesce_reload().map_err(debug)?;
+                Ok(())
+            }
+            RealmV5RuntimeEvent::Migration => {
+                let candidate = self
+                    .candidate_epoch()?
+                    .ok_or_else(|| "candidate is missing".to_owned())?;
+                let arguments = if candidate == 1 {
+                    &[RuntimeValue::Bool(false)][..]
+                } else {
+                    &[]
+                };
+                self.realm.stage_reload(arguments).map_err(debug)?;
+                Ok(())
+            }
+            RealmV5RuntimeEvent::Rollback => {
+                let candidate = self.candidate_epoch()?;
+                self.realm.rollback_reload().map_err(debug)?;
+                if let Some(candidate) = candidate {
+                    self.modules.epochs[usize::from(candidate)] = None;
+                }
+                Ok(())
+            }
+            RealmV5RuntimeEvent::Commit | RealmV5RuntimeEvent::ActivationFault => {
+                let should_trap = event == RealmV5RuntimeEvent::ActivationFault;
+                match self
+                    .realm
+                    .commit_reload(&[RuntimeValue::Bool(should_trap)], 1_024)
+                {
+                    Ok(_) => Ok(()),
+                    Err(crate::RealmError::Reload(crate::ReloadError::Activation(_)))
+                        if should_trap =>
+                    {
+                        Ok(())
+                    }
+                    Err(error) => Err(debug(error)),
+                }
+            }
+            RealmV5RuntimeEvent::TokenAcquire => {
+                let task = self.live_task(0)?;
+                self.fixtures.tokens[0] = Some(
+                    self.realm
+                        .create_resource_token(task, RuntimeHostDomain::VmThread)
+                        .map_err(debug)?,
+                );
+                Ok(())
+            }
+            RealmV5RuntimeEvent::TokenRelease => {
+                let task = self.task(0)?;
+                let token = self.fixtures.tokens[0]
+                    .take()
+                    .ok_or_else(|| "token is missing".to_owned())?;
                 self.realm
-                    .collect_garbage()
-                    .map_err(|error| RealmV5RuntimeApplyError::Invariant(format!("{error:?}")))?;
+                    .release_resource_token(task, token)
+                    .map_err(debug)
+            }
+            RealmV5RuntimeEvent::SnapshotAcquire => {
+                let task = self.live_task(0)?;
+                self.fixtures.snapshots[0] = Some(
+                    self.realm
+                        .create_snapshot(
+                            task,
+                            StableId::from_name("RealmV5Snapshot"),
+                            Arc::from([1, 2, 3]),
+                        )
+                        .map_err(debug)?,
+                );
+                Ok(())
+            }
+            RealmV5RuntimeEvent::SnapshotRelease => {
+                let task = self.task(0)?;
+                let snapshot = self.fixtures.snapshots[0]
+                    .take()
+                    .ok_or_else(|| "snapshot is missing".to_owned())?;
+                self.realm.release_snapshot(task, snapshot).map_err(debug)
+            }
+            RealmV5RuntimeEvent::ReleaseDrain => {
+                self.realm
+                    .tick(TickBudget {
+                        max_tasks: 0,
+                        frame_fuel_budget: 0,
+                        collect_garbage: false,
+                    })
+                    .map_err(debug)?;
+                let mut records = [empty_release_record(); 64];
+                let drained = self.host.drain_into(&mut records);
+                if drained == 0 {
+                    return Err("no release record was available".into());
+                }
+                Ok(())
+            }
+            RealmV5RuntimeEvent::GcRootAttach => {
+                let active = self
+                    .realm
+                    .active_root()
+                    .ok_or_else(|| "active root is missing".to_owned())?;
+                let object = self
+                    .realm
+                    .allocate(Object::String("realm-v5-root".into()))
+                    .map_err(debug)?;
+                self.realm
+                    .attach_module_root(active, object)
+                    .map_err(debug)?;
+                self.fixtures.gc_object = Some(object);
+                Ok(())
+            }
+            RealmV5RuntimeEvent::GcRootDrop => {
+                let active = self
+                    .realm
+                    .active_root()
+                    .ok_or_else(|| "active root is missing".to_owned())?;
+                let object = self
+                    .fixtures
+                    .gc_object
+                    .ok_or_else(|| "GC object is missing".to_owned())?;
+                self.realm.drop_module_root(active, object).map_err(debug)
+            }
+            RealmV5RuntimeEvent::GcCollect => {
+                self.realm.collect_garbage().map_err(debug)?;
                 if self
                     .fixtures
                     .gc_object
@@ -123,10 +287,105 @@ impl RealmV5RuntimeAdapter {
                 }
                 Ok(())
             }
-            _ => Err(RealmV5RuntimeApplyError::Invariant(format!(
-                "{event:?} is not mapped until its production fixture is installed"
-            ))),
+            RealmV5RuntimeEvent::RetiredEpochReap(_) => {
+                self.realm
+                    .tick(TickBudget {
+                        max_tasks: 0,
+                        frame_fuel_budget: 0,
+                        collect_garbage: false,
+                    })
+                    .map_err(debug)?;
+                Ok(())
+            }
+            RealmV5RuntimeEvent::RuntimeHostBeginClose => {
+                let _ = self.host.begin_close();
+                Ok(())
+            }
+            RealmV5RuntimeEvent::RuntimeHostFinishClose => {
+                self.host.try_finish_close().map_err(debug)?;
+                Ok(())
+            }
         }
+    }
+
+    fn admit_driver_tasks(&mut self) -> Result<(), String> {
+        let active = self
+            .realm
+            .active_root()
+            .ok_or_else(|| "active root is missing".to_owned())?;
+        for index in 0..REALM_V5_TASK_COUNT {
+            let task = self
+                .realm
+                .call(
+                    active,
+                    4,
+                    &[RuntimeValue::I32(
+                        i32::try_from(index).expect("task index fits i32"),
+                    )],
+                    StepConfig {
+                        owner: self.fixtures.scope,
+                        priority: u32::try_from(index).expect("task index fits u32"),
+                        fuel_slice: 1,
+                        cumulative_budget: 10_000,
+                        limits: TaskLimits::default(),
+                    },
+                )
+                .map_err(debug)?;
+            self.tasks[index] = Some(task);
+        }
+        Ok(())
+    }
+
+    fn poll_tasks(&mut self, fuel: u64) -> Result<(), String> {
+        for task in self.tasks.iter().flatten().copied() {
+            if self.realm.task_snapshot(task).is_ok() {
+                self.realm.poll_task(task, fuel).map_err(debug)?;
+            }
+        }
+        self.capture_requests();
+        Ok(())
+    }
+
+    fn capture_requests(&mut self) {
+        let mut queue = self
+            .fixtures
+            .request_queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while let Some(pending) = queue.pop_front() {
+            if let Some(index) = self.requests.iter().position(Option::is_none) {
+                self.fixtures.request_handles[index] = Some(pending.request);
+                self.requests[index] = Some(pending.ticket);
+            }
+        }
+    }
+
+    fn complete_requests(&mut self, late: bool) -> Result<(), String> {
+        self.capture_requests();
+        for ticket in &mut self.requests {
+            if let Some(mut ticket) = ticket.take() {
+                ticket.complete(HostPayload::I32(7)).map_err(debug)?;
+            }
+        }
+        self.realm
+            .tick(TickBudget {
+                max_tasks: 0,
+                frame_fuel_budget: 0,
+                collect_garbage: false,
+            })
+            .map_err(debug)?;
+        let _ = late;
+        Ok(())
+    }
+
+    fn task(&self, index: usize) -> Result<TaskHandle, String> {
+        self.tasks[index].ok_or_else(|| "task is missing".to_owned())
+    }
+
+    fn live_task(&self, index: usize) -> Result<TaskHandle, String> {
+        let task = self.task(index)?;
+        self.realm.task_snapshot(task).map_err(debug)?;
+        Ok(task)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -154,11 +413,16 @@ impl RealmV5RuntimeAdapter {
             )
         });
         let requests = std::array::from_fn(|index| RealmV5RuntimeRequestSnapshot {
-            state: if self.fixtures.request_handles[index].is_some() {
-                RealmV5RuntimeRequestState::Pending
-            } else {
-                RealmV5RuntimeRequestState::Vacant
-            },
+            state: self.fixtures.request_handles[index].map_or(
+                RealmV5RuntimeRequestState::Vacant,
+                |request| {
+                    if self.realm.request_terminal_record(request).is_some() {
+                        RealmV5RuntimeRequestState::Completed
+                    } else {
+                        RealmV5RuntimeRequestState::Pending
+                    }
+                },
+            ),
             task: self.fixtures.request_handles[index].and_then(|_| u8::try_from(index).ok()),
             epoch: tasks[index].epoch,
         });
@@ -407,6 +671,17 @@ fn debug(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
 
+const fn empty_release_record() -> ReleaseRecord {
+    ReleaseRecord {
+        realm_id: 0,
+        module_id: 0,
+        epoch: 0,
+        kind: ReleaseKind::HostRequest,
+        object_id: 0,
+        domain: RuntimeHostDomain::VmThread,
+    }
+}
+
 struct RealmV5CompiledModules {
     host_hash: StableId,
     schema_hashes: [StableId; REALM_V5_MODULE_COUNT],
@@ -457,13 +732,18 @@ mod tests {
 
     use crate::StableId;
 
-    use super::{RealmV5RuntimeAdapter, realm_v5_modules};
+    use super::{
+        RealmV5RuntimeAdapter, RealmV5RuntimeEvent, RealmV5RuntimeTaskState, realm_v5_modules,
+    };
 
     #[test]
     fn real_realm_v5_adapter_has_no_shadow_state() {
         let adapter = RealmV5RuntimeAdapter::new();
         assert_eq!(adapter.realm().realm_id(), 83);
-        let source = include_str!("model_adapter_v5.rs");
+        let source = include_str!("model_adapter_v5.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production adapter source precedes tests");
         let declaration = source
             .split("pub struct RealmV5RuntimeAdapter")
             .nth(1)
@@ -565,5 +845,104 @@ mod tests {
             code.iter()
                 .any(|instruction| matches!(instruction, Instruction::StateReplace { .. }))
         );
+    }
+
+    #[test]
+    fn real_realm_v5_events_use_production_apis() {
+        let mut adapter = RealmV5RuntimeAdapter::new();
+        adapter.apply(RealmV5RuntimeEvent::TaskAdmission).unwrap();
+        assert!(
+            adapter
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::Ready)
+        );
+        adapter.apply(RealmV5RuntimeEvent::FuelYield).unwrap();
+        assert!(
+            adapter
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::FuelYielded)
+        );
+        adapter.apply(RealmV5RuntimeEvent::ExplicitYield).unwrap();
+        assert!(
+            adapter
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::ExplicitYielded)
+        );
+        adapter.apply(RealmV5RuntimeEvent::HostWait).unwrap();
+        assert!(
+            adapter
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::Waiting)
+        );
+        adapter.apply(RealmV5RuntimeEvent::HostComplete).unwrap();
+        let completed_snapshot = adapter.snapshot().unwrap();
+        assert!(
+            completed_snapshot
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::Running),
+            "{completed_snapshot:?}"
+        );
+        adapter.apply(RealmV5RuntimeEvent::TaskComplete).unwrap();
+        assert!(
+            adapter
+                .snapshot()
+                .unwrap()
+                .tasks
+                .iter()
+                .all(|task| task.state == RealmV5RuntimeTaskState::Completed)
+        );
+
+        adapter.apply(RealmV5RuntimeEvent::BeginReload).unwrap();
+        adapter.apply(RealmV5RuntimeEvent::Quiesce).unwrap();
+        adapter.apply(RealmV5RuntimeEvent::Migration).unwrap();
+        adapter.apply(RealmV5RuntimeEvent::Commit).unwrap();
+        assert_eq!(adapter.snapshot().unwrap().active_epoch, 1);
+
+        let mut resources = RealmV5RuntimeAdapter::new();
+        resources.apply(RealmV5RuntimeEvent::TaskAdmission).unwrap();
+        resources.apply(RealmV5RuntimeEvent::TokenAcquire).unwrap();
+        resources.apply(RealmV5RuntimeEvent::TokenRelease).unwrap();
+        resources
+            .apply(RealmV5RuntimeEvent::SnapshotAcquire)
+            .unwrap();
+        resources
+            .apply(RealmV5RuntimeEvent::SnapshotRelease)
+            .unwrap();
+        resources.apply(RealmV5RuntimeEvent::GcRootAttach).unwrap();
+        resources.apply(RealmV5RuntimeEvent::GcRootDrop).unwrap();
+        resources.apply(RealmV5RuntimeEvent::GcCollect).unwrap();
+        resources
+            .apply(RealmV5RuntimeEvent::RuntimeHostBeginClose)
+            .unwrap();
+
+        let source = include_str!("model_adapter_v5.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production adapter source precedes tests");
+        for forbidden in [
+            "self.reload =",
+            "self.active_epoch =",
+            "self.retired_epochs.push",
+            "self.state_registry",
+            "self.reload_completion_buffer",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "event adapter directly mutates shadow state: {forbidden}"
+            );
+        }
     }
 }

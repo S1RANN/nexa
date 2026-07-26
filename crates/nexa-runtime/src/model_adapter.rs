@@ -1079,7 +1079,10 @@ impl HostRegistry for RoutingRegistry {
         context: &mut ResourceContext<'_>,
         args: HostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || !args.is_empty() {
+        if id != 0
+            || args.len() > 1
+            || (args.len() == 1 && !matches!(args.get(0)?, crate::HostValue::I32(_)))
+        {
             return Err(HostTrap::Arity);
         }
         let pending = context

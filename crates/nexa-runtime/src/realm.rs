@@ -2328,6 +2328,15 @@ impl RealmRuntime {
             .create_token(domain)?)
     }
 
+    pub fn release_resource_token(
+        &mut self,
+        task: TaskHandle,
+        token: ResourceTokenHandle,
+    ) -> Result<(), RealmError> {
+        self.resources.release_token(task, token)?;
+        Ok(())
+    }
+
     pub fn create_snapshot(
         &mut self,
         task: TaskHandle,
@@ -2343,6 +2352,15 @@ impl RealmRuntime {
             .create_snapshot(content_type, data)?)
     }
 
+    pub fn release_snapshot(
+        &mut self,
+        task: TaskHandle,
+        snapshot: SnapshotHandle,
+    ) -> Result<(), RealmError> {
+        self.resources.release_snapshot(task, snapshot)?;
+        Ok(())
+    }
+
     pub fn snapshot_data(&self, snapshot: SnapshotHandle) -> Result<&[i32], RealmError> {
         Ok(self.resources.snapshot_data(snapshot)?)
     }
@@ -2353,6 +2371,40 @@ impl RealmRuntime {
 
     pub fn snapshot_content_type(&self, snapshot: SnapshotHandle) -> Result<StableId, RealmError> {
         Ok(self.resources.snapshot_content_type(snapshot)?)
+    }
+
+    pub fn attach_module_root(
+        &mut self,
+        module: ModuleHandle,
+        root: GcRef,
+    ) -> Result<(), RealmError> {
+        self.heap.resolve(root)?;
+        let module = self
+            .modules
+            .resolve_mut(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        if !module.globals.contains(&root) {
+            module.globals.push(root);
+        }
+        Ok(())
+    }
+
+    pub fn drop_module_root(
+        &mut self,
+        module: ModuleHandle,
+        root: GcRef,
+    ) -> Result<(), RealmError> {
+        let module = self
+            .modules
+            .resolve_mut(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let index = module
+            .globals
+            .iter()
+            .position(|candidate| *candidate == root)
+            .ok_or(RealmError::Heap(HeapError::InvalidReference(root)))?;
+        module.globals.swap_remove(index);
+        Ok(())
     }
 
     #[must_use]

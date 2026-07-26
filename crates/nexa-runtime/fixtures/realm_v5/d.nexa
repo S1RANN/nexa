@@ -33,11 +33,25 @@ task fn explicit(value: i32) -> i32 {
 
 task fn request(value: i32) -> Result<i32, WaitError> {
     defer finalize(value);
+    for index in 0..8 {
+        value + index;
+    }
+    yield;
     let completed: i32 = await host.wait(value)?;
     return Ok(completed);
 }
 
 migration fn migrate() -> bool {
+    let old_state: ModelState = old.get<ModelState>(seed);
+    let value: i32 = old.field<i32>(old_state, ModelState.value);
+    let replacement: i32 = old.field<i32>(old_state, ModelState.replacement);
+    let generation: i32 = old.field<i32>(old_state, ModelState.generation);
+    let next: ModelState = new.create<ModelState>(seed);
+    new.set(next, ModelState.value, value);
+    new.set(next, ModelState.replacement, replacement);
+    new.set(next, ModelState.generation, generation);
+    new.set(next, ModelState.final_value, 4);
+    replace(seed, next);
     finish_migration();
     return true;
 }
