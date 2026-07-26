@@ -2174,12 +2174,20 @@ impl ResourceTokenManager {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SnapshotHandle(RawHandle);
+pub struct SnapshotHandle {
+    raw: RawHandle,
+    type_id: StableId,
+}
 
 impl SnapshotHandle {
     #[must_use]
     pub const fn raw(self) -> RawHandle {
-        self.0
+        self.raw
+    }
+
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
     }
 }
 
@@ -2187,6 +2195,8 @@ impl SnapshotHandle {
 struct SnapshotEntry {
     module_id: u32,
     epoch: u64,
+    type_id: StableId,
+    content_type: StableId,
     data: Arc<[i32]>,
     external_bytes: usize,
     release: ReleaseReservation,
@@ -2214,21 +2224,25 @@ impl SnapshotManager {
         _owner: TaskHandle,
         module_id: u32,
         epoch: u64,
+        content_type: StableId,
         data: Arc<[i32]>,
         releases: &mut ReleaseQueue,
     ) -> Result<SnapshotHandle, HostRequestError> {
         let release = releases.reserve(module_id, epoch)?;
+        let type_id = nexa_bytecode::snapshot_type(content_type);
         let external_bytes = data.len().saturating_mul(std::mem::size_of::<i32>());
         match self.snapshots.try_allocate(SnapshotEntry {
             module_id,
             epoch,
+            type_id,
+            content_type,
             data,
             external_bytes,
             release,
         }) {
             Ok(raw) => {
                 increment_epoch_count(&mut self.epoch_counts, module_id, epoch);
-                Ok(SnapshotHandle(raw))
+                Ok(SnapshotHandle { raw, type_id })
             }
             Err(error) => {
                 releases.cancel_reservation(release);
@@ -2238,11 +2252,15 @@ impl SnapshotManager {
     }
 
     pub fn data(&self, handle: SnapshotHandle) -> Result<&[i32], HostRequestError> {
-        Ok(&self.snapshots.resolve(handle.raw())?.data)
+        Ok(&self.resolve(handle)?.data)
     }
 
     pub fn external_bytes(&self, handle: SnapshotHandle) -> Result<usize, HostRequestError> {
-        Ok(self.snapshots.resolve(handle.raw())?.external_bytes)
+        Ok(self.resolve(handle)?.external_bytes)
+    }
+
+    pub fn content_type(&self, handle: SnapshotHandle) -> Result<StableId, HostRequestError> {
+        Ok(self.resolve(handle)?.content_type)
     }
 
     fn release(
@@ -2250,6 +2268,7 @@ impl SnapshotManager {
         handle: SnapshotHandle,
         releases: &mut ReleaseQueue,
     ) -> Result<(), HostRequestError> {
+        self.resolve(handle)?;
         let snapshot = self.snapshots.release(handle.raw())?;
         releases.enqueue_reserved(
             snapshot.release,
@@ -2268,6 +2287,14 @@ impl SnapshotManager {
 
     fn count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
         self.epoch_counts.get(module_id, epoch)
+    }
+
+    fn resolve(&self, handle: SnapshotHandle) -> Result<&SnapshotEntry, HostRequestError> {
+        let snapshot = self.snapshots.resolve(handle.raw())?;
+        if handle.type_id != snapshot.type_id {
+            return Err(HostRequestError::InvalidState);
+        }
+        Ok(snapshot)
     }
 }
 
@@ -2533,6 +2560,13 @@ impl RuntimeResources {
         self.snapshots.external_bytes(snapshot)
     }
 
+    pub fn snapshot_content_type(
+        &self,
+        snapshot: SnapshotHandle,
+    ) -> Result<StableId, HostRequestError> {
+        self.snapshots.content_type(snapshot)
+    }
+
     #[must_use]
     pub fn request_terminal_record(
         &self,
@@ -2705,6 +2739,7 @@ impl ResourceContext<'_> {
 
     pub fn create_snapshot(
         &mut self,
+        content_type: StableId,
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, HostRequestError> {
         self.admit(HostAdmissionKind::Snapshot)?;
@@ -2712,6 +2747,7 @@ impl ResourceContext<'_> {
             self.task,
             self.module_id,
             self.epoch,
+            content_type,
             data,
             &mut self.resources.releases,
         )?;
@@ -2937,10 +2973,29 @@ mod tests {
         let mut releases = ReleaseQueue::new(1);
         let mut snapshots = SnapshotManager::new(1, 1);
         let snapshot = snapshots
-            .create(task, 0, 1, Arc::<[i32]>::from([1, 2, 3]), &mut releases)
+            .create(
+                task,
+                0,
+                1,
+                nexa_core::StableId::from_name("EnemyView"),
+                Arc::<[i32]>::from([1, 2, 3]),
+                &mut releases,
+            )
             .unwrap();
+        let content_type = nexa_core::StableId::from_name("EnemyView");
+        assert_eq!(
+            snapshot.type_id(),
+            nexa_bytecode::snapshot_type(content_type)
+        );
+        assert_eq!(snapshots.content_type(snapshot), Ok(content_type));
         assert_eq!(snapshots.data(snapshot).unwrap(), &[1, 2, 3]);
         assert_eq!(snapshots.external_bytes(snapshot).unwrap(), 12);
+        let wrong_content = nexa_core::StableId::from_name("OtherView");
+        let forged = super::SnapshotHandle {
+            raw: snapshot.raw(),
+            type_id: nexa_bytecode::snapshot_type(wrong_content),
+        };
+        assert_eq!(snapshots.data(forged), Err(HostRequestError::InvalidState));
         assert!(releases.reserve(0, 1).is_err());
         assert_eq!(releases.state(), ReleaseQueueState::Stalled);
         snapshots.release(snapshot, &mut releases).unwrap();
@@ -3388,7 +3443,14 @@ mod tests {
         let mut snapshot_releases = host.release_queue(1);
         let mut snapshots = SnapshotManager::new(1, 1);
         assert_eq!(
-            snapshots.create(task, 2, 3, Arc::from([1]), &mut snapshot_releases),
+            snapshots.create(
+                task,
+                2,
+                3,
+                nexa_core::StableId::from_name("EnemyView"),
+                Arc::from([1]),
+                &mut snapshot_releases,
+            ),
             Err(HostRequestError::HostClosing)
         );
         host.try_finish_close().unwrap();

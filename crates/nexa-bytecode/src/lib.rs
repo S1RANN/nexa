@@ -344,6 +344,27 @@ impl BufferType {
 }
 
 #[must_use]
+pub fn snapshot_type(content_type: StableId) -> StableId {
+    parameterized_type_id("Snapshot", &[ValueType::Named(content_type)])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotType {
+    pub type_id: StableId,
+    pub content_type: StableId,
+}
+
+impl SnapshotType {
+    #[must_use]
+    pub fn new(content_type: StableId) -> Self {
+        Self {
+            type_id: snapshot_type(content_type),
+            content_type,
+        }
+    }
+}
+
+#[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
 }
@@ -901,6 +922,7 @@ pub struct Module {
     pub array_types: Vec<ArrayType>,
     pub map_types: Vec<MapType>,
     pub buffer_types: Vec<BufferType>,
+    pub snapshot_types: Vec<SnapshotType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -1489,7 +1511,8 @@ impl Module {
                     .len()
                     .saturating_add(self.array_types.len())
                     .saturating_add(self.map_types.len())
-                    .saturating_add(self.buffer_types.len()),
+                    .saturating_add(self.buffer_types.len())
+                    .saturating_add(self.snapshot_types.len()),
             )
             .expect("parameterized type count exceeds wire format"),
         );
@@ -1513,6 +1536,11 @@ impl Module {
             types.push(4);
             put_u64(&mut types, buffer.type_id.0);
             encode_type(&mut types, buffer.element);
+        }
+        for snapshot in &self.snapshot_types {
+            types.push(5);
+            put_u64(&mut types, snapshot.type_id.0);
+            put_u64(&mut types, snapshot.content_type.0);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -1622,6 +1650,7 @@ impl Module {
         let mut array_types = Vec::new();
         let mut map_types = Vec::new();
         let mut buffer_types = Vec::new();
+        let mut snapshot_types = Vec::new();
         for _ in 0..state_handle_type_count {
             let kind = types_reader.u8()?;
             let type_id = StableId(types_reader.u64()?);
@@ -1642,6 +1671,10 @@ impl Module {
                 4 => buffer_types.push(BufferType {
                     type_id,
                     element: decode_type(&mut types_reader)?,
+                }),
+                5 => snapshot_types.push(SnapshotType {
+                    type_id,
+                    content_type: StableId(types_reader.u64()?),
                 }),
                 _ => return Err(DecodeError::InvalidType(kind)),
             }
@@ -2060,6 +2093,7 @@ impl Module {
             array_types,
             map_types,
             buffer_types,
+            snapshot_types,
             enum_types,
             struct_types,
             class_types,
@@ -3342,6 +3376,7 @@ pub struct ModuleBuilder {
     array_types: Vec<ArrayType>,
     map_types: Vec<MapType>,
     buffer_types: Vec<BufferType>,
+    snapshot_types: Vec<SnapshotType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -3364,6 +3399,7 @@ impl ModuleBuilder {
             array_types: Vec::new(),
             map_types: Vec::new(),
             buffer_types: Vec::new(),
+            snapshot_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -3453,6 +3489,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn snapshot_type(&mut self, snapshot_type: SnapshotType) -> &mut Self {
+        self.snapshot_types.push(snapshot_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -3492,6 +3533,7 @@ impl ModuleBuilder {
             array_types: self.array_types,
             map_types: self.map_types,
             buffer_types: self.buffer_types,
+            snapshot_types: self.snapshot_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
@@ -3689,9 +3731,9 @@ mod tests {
     use super::{
         ArrayType, BufferType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant,
         FunctionBuilder, FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind,
-        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
-        StructField, StructType, ValueType, option_type, result_type, state_handle_error_type,
-        state_handle_type,
+        Signature, SnapshotType, SourceMapEntry, StateField, StateHandleType, StateSchema,
+        StateType, StructField, StructType, ValueType, option_type, result_type,
+        state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -4236,6 +4278,22 @@ mod tests {
             .function(function.finish().unwrap());
         let module = builder.finish();
         assert_eq!(module.buffer_types, vec![buffer]);
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn typed_snapshot_metadata_round_trips_in_bytecode_v4() {
+        let content_type = StableId::from_name("EnemyView");
+        let snapshot = SnapshotType::new(content_type);
+        let mut builder = ModuleBuilder::new();
+        builder
+            .struct_type(StructType {
+                type_id: content_type,
+                fields: Vec::new(),
+            })
+            .snapshot_type(snapshot);
+        let module = builder.finish();
+        assert_eq!(module.snapshot_types, vec![snapshot]);
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 

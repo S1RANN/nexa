@@ -217,7 +217,13 @@ fn main() {
     results.push(bench("nexa_snapshot_read", host_samples, || {
         let (mut realm, module, scope, host) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
-        let snapshot = realm.create_snapshot(task, [1, 2, 3].into()).unwrap();
+        let snapshot = realm
+            .create_snapshot(
+                task,
+                nexa_core::StableId::from_name("BenchSnapshot"),
+                [1, 2, 3].into(),
+            )
+            .unwrap();
         black_box(realm.snapshot_data(snapshot).unwrap());
         drop(realm);
         let _ = host.drain_releases();

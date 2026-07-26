@@ -2319,9 +2319,7 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::ResourceToken(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
             "ResourceToken",
         ))),
-        RuntimeValue::Snapshot(_) => {
-            Some(ValueType::Named(nexa_core::StableId::from_name("Snapshot")))
-        }
+        RuntimeValue::Snapshot(snapshot) => Some(ValueType::Named(snapshot.type_id())),
         RuntimeValue::Unit => None,
     }
 }

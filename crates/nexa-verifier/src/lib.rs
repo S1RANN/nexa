@@ -63,6 +63,7 @@ pub enum VerifyErrorKind {
     InvalidArrayMetadata,
     InvalidMapMetadata,
     InvalidBufferMetadata,
+    InvalidSnapshotMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -252,7 +253,76 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
     }
     verify_map_metadata(module)?;
     verify_buffer_metadata(module)?;
+    verify_snapshot_metadata(module)?;
     verify_state_storage_metadata(module)?;
+    Ok(())
+}
+
+fn verify_snapshot_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut ids = BTreeSet::new();
+    let valid_content = |content_type| {
+        module
+            .enum_types
+            .iter()
+            .any(|ty| ty.type_id == content_type)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == content_type)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == content_type)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == content_type)
+    };
+    if module.snapshot_types.iter().any(|snapshot| {
+        !ids.insert(snapshot.type_id)
+            || snapshot.type_id != nexa_bytecode::snapshot_type(snapshot.content_type)
+            || !valid_content(snapshot.content_type)
+            || module
+                .enum_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == snapshot.type_id)
+            || module
+                .state_handle_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .array_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .map_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+            || module
+                .buffer_types
+                .iter()
+                .any(|ty| ty.type_id == snapshot.type_id)
+    }) {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidSnapshotMetadata,
+        });
+    }
     Ok(())
 }
 
@@ -288,6 +358,10 @@ fn verify_buffer_metadata(module: &Module) -> Result<(), VerifyError> {
                 .any(|ty| ty.type_id == buffer.type_id)
             || module
                 .map_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .snapshot_types
                 .iter()
                 .any(|ty| ty.type_id == buffer.type_id)
     }) {
@@ -329,6 +403,10 @@ fn verify_map_metadata(module: &Module) -> Result<(), VerifyError> {
                 .any(|ty| ty.type_id == map_type.type_id)
             || module
                 .array_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+            || module
+                .snapshot_types
                 .iter()
                 .any(|ty| ty.type_id == map_type.type_id)
     });
@@ -1883,8 +1961,9 @@ fn longest_path(
 mod tests {
     use nexa_bytecode::{
         ArrayType, BufferType, ClassType, FunctionBuilder, FunctionEffect, HostCallMode,
-        HostImport, Instruction, MapType, ModuleBuilder, RootMap, Signature, SourceMapEntry,
-        StateField, StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
+        HostImport, Instruction, MapType, ModuleBuilder, RootMap, Signature, SnapshotType,
+        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+        StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -2072,6 +2151,54 @@ mod tests {
                 .unwrap_err()
                 .kind,
             VerifyErrorKind::InvalidEffect
+        );
+    }
+
+    #[test]
+    fn typed_snapshot_metadata_requires_an_exact_known_content_type() {
+        let content_type = StableId::from_name("EnemyView");
+        let snapshot = SnapshotType::new(content_type);
+        let content = StructType {
+            type_id: content_type,
+            fields: Vec::new(),
+        };
+        let mut identity = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(snapshot.type_id)],
+                result: Some(ValueType::Named(snapshot.type_id)),
+            },
+            1,
+        );
+        identity
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::Return { source: 0 });
+        let mut valid = ModuleBuilder::new();
+        valid
+            .struct_type(content.clone())
+            .snapshot_type(snapshot)
+            .function(identity.finish().unwrap());
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let mut forged = ModuleBuilder::new();
+        forged.struct_type(content).snapshot_type(SnapshotType {
+            type_id: StableId::from_name("forged-snapshot"),
+            content_type,
+        });
+        assert_eq!(
+            verify(forged.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSnapshotMetadata
+        );
+
+        let mut unknown_content = ModuleBuilder::new();
+        unknown_content.snapshot_type(SnapshotType::new(StableId::from_name("UnknownView")));
+        assert_eq!(
+            verify(unknown_content.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSnapshotMetadata
         );
     }
 

@@ -1996,9 +1996,7 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::ResourceToken(_) => {
             nexa_bytecode::ValueType::Named(StableId::from_name("ResourceToken"))
         }
-        RuntimeValue::Snapshot(_) => {
-            nexa_bytecode::ValueType::Named(StableId::from_name("Snapshot"))
-        }
+        RuntimeValue::Snapshot(snapshot) => nexa_bytecode::ValueType::Named(snapshot.type_id()),
         RuntimeValue::Unit => nexa_bytecode::ValueType::Named(StableId::from_name("Unit")),
     }
 }

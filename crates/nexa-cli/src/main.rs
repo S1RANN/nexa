@@ -189,6 +189,16 @@ fn render_module_dump(
             )
             .expect("String writes do not fail");
         }
+        let mut snapshots = module.snapshot_types.iter().collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.type_id);
+        for snapshot in snapshots {
+            writeln!(
+                output,
+                "snapshot {:016x} content-type={:016x} ownership=host immutable=true",
+                snapshot.type_id.0, snapshot.content_type.0
+            )
+            .expect("String writes do not fail");
+        }
     }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
@@ -1106,14 +1116,15 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 mod tests {
     use nexa_bytecode::{
         ArrayType, BufferType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder,
-        SectionKind, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema,
-        StateType, StructField, StructType, ValueType,
+        SectionKind, Signature, SnapshotType, SourceMapEntry, StateField, StateHandleType,
+        StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::render_module_dump;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn bytecode_dump_is_deterministic_and_supports_code_types_and_source_map_views() {
         let mut function = FunctionBuilder::new(
             Signature {
@@ -1127,8 +1138,9 @@ mod tests {
             .emit(Instruction::Return { source: 0 });
         let mut builder = ModuleBuilder::new();
         builder.string("Nexa界\n");
+        let position_type = StableId::from_name("Position");
         builder.struct_type(StructType {
-            type_id: StableId::from_name("Position"),
+            type_id: position_type,
             fields: vec![StructField {
                 stable_id: StableId::from_parts(&["Position", "::x"]),
                 ty: ValueType::I32,
@@ -1146,6 +1158,7 @@ mod tests {
         builder.array_type(ArrayType::new(ValueType::I32));
         builder.map_type(MapType::new(ValueType::String, ValueType::I32));
         builder.buffer_type(BufferType::new(ValueType::I64));
+        builder.snapshot_type(SnapshotType::new(position_type));
         builder.state_schema(StateSchema {
             types: vec![StateType {
                 stable_id: StableId::from_name("Store"),
@@ -1193,6 +1206,8 @@ mod tests {
         assert!(full.contains("key=String value=I32"));
         assert!(full.contains("buffer "));
         assert!(full.contains("element=I64 ownership=vm-copy"));
+        assert!(full.contains("snapshot "));
+        assert!(full.contains("ownership=host immutable=true"));
         assert!(full.contains("stateful-class "));
         assert!(full.contains("persistent=true"));
         assert!(
@@ -1209,6 +1224,7 @@ mod tests {
         assert!(types.contains("array "));
         assert!(types.contains("map "));
         assert!(types.contains("buffer "));
+        assert!(types.contains("snapshot "));
         assert!(!types.contains("code function="));
         let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
         assert!(code.contains("section code"));

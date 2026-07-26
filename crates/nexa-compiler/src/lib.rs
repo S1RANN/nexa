@@ -7,8 +7,9 @@ use std::ops::{Deref, DerefMut};
 use nexa_bytecode::{
     AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
     EnumVariant, Function, FunctionEffect, HostCallMode, HostImport, Instruction, MapType, Module,
-    ModuleBuilder, RootMap, ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType,
-    StateSchema, StateType, StructField as BytecodeStructField, StructType, ValueType,
+    ModuleBuilder, RootMap, ScriptExport, Signature, SnapshotType, SourceMapEntry, StateField,
+    StateHandleType, StateSchema, StateType, StructField as BytecodeStructField, StructType,
+    ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -602,6 +603,7 @@ pub struct HirModule {
     array_types: Vec<ArrayType>,
     map_types: Vec<MapType>,
     buffer_types: Vec<BufferType>,
+    snapshot_types: Vec<SnapshotType>,
     span: SourceSpan,
 }
 
@@ -2154,6 +2156,46 @@ fn collect_buffer_types(ast: &AstModule) -> Vec<BufferType> {
     buffers.into_values().collect()
 }
 
+fn collect_snapshot_types(ast: &AstModule) -> Vec<SnapshotType> {
+    fn collect(ty: &AstType, snapshots: &mut BTreeMap<StableId, SnapshotType>) {
+        let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
+            return;
+        };
+        for argument in arguments {
+            collect(argument, snapshots);
+        }
+        if name == "Snapshot"
+            && arguments.len() == 1
+            && let ValueType::Named(content_type) = lower_type(&arguments[0])
+        {
+            let snapshot = SnapshotType::new(content_type);
+            snapshots.insert(snapshot.type_id, snapshot);
+        }
+    }
+
+    let mut snapshots = BTreeMap::new();
+    for declaration in &ast.types {
+        for field in &declaration.fields {
+            collect(&field.ty, &mut snapshots);
+        }
+        for payload in declaration
+            .variants
+            .iter()
+            .filter_map(|variant| variant.payload.as_ref())
+        {
+            collect(payload, &mut snapshots);
+        }
+    }
+    for function in &ast.functions {
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut snapshots);
+        }
+        collect(&function.result.ty, &mut snapshots);
+        collect_statement_types(&function.body, &mut |ty| collect(ty, &mut snapshots));
+    }
+    snapshots.into_values().collect()
+}
+
 fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
     for statement in statements {
         match statement.kind() {
@@ -2248,6 +2290,7 @@ fn resolve_and_typecheck_with_hosts(
     let state_handle_targets = collect_state_handle_targets(&ast);
     let (array_types, map_types) = collect_collection_types(&ast);
     let buffer_types = collect_buffer_types(&ast);
+    let snapshot_types = collect_snapshot_types(&ast);
     let declared_type_ids = ast
         .types
         .iter()
@@ -2416,7 +2459,6 @@ fn resolve_and_typecheck_with_hosts(
         "Buffer",
         "HostRequest",
         "ResourceToken",
-        "Snapshot",
         "StableId",
         "StateHandle",
         "StateHandleError",
@@ -2568,6 +2610,7 @@ fn resolve_and_typecheck_with_hosts(
         array_types,
         map_types,
         buffer_types,
+        snapshot_types,
         span: module_span,
     })
 }
@@ -2963,11 +3006,14 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
-                "Option" | "StateHandle" | "Array" | "Buffer" => 1,
+                "Option" | "StateHandle" | "Array" | "Buffer" | "Snapshot" => 1,
                 "Result" | "Map" => 2,
                 _ => return Err(CompileError::UnknownType(name.clone())),
             };
             if arguments.len() != expected {
+                return Err(CompileError::TypeMismatch);
+            }
+            if name == "Snapshot" && !matches!(arguments[0].kind(), AstType::Named(_)) {
                 return Err(CompileError::TypeMismatch);
             }
             for argument in arguments {
@@ -4258,6 +4304,12 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::BuiltinGeneric { name, arguments } if name == "Buffer" => {
             ValueType::Named(nexa_bytecode::buffer_type(lower_type(&arguments[0])))
         }
+        AstType::BuiltinGeneric { name, arguments } if name == "Snapshot" => {
+            let ValueType::Named(content_type) = lower_type(&arguments[0]) else {
+                unreachable!("snapshot content types are validated as nominal")
+            };
+            ValueType::Named(nexa_bytecode::snapshot_type(content_type))
+        }
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -4685,6 +4737,9 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
     }
     for buffer_type in &hir.buffer_types {
         module.buffer_type(*buffer_type);
+    }
+    for snapshot_type in &hir.snapshot_types {
+        module.snapshot_type(*snapshot_type);
     }
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
@@ -7076,6 +7131,7 @@ pub fn compile_with_interface(
     interface: &Idl,
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
+    let idl_snapshot_types = collect_idl_snapshot_types(interface)?;
     let tokens = lex(source)?;
     let mut ast = parse(&tokens)?;
     for structure in &interface.structs {
@@ -7229,6 +7285,15 @@ pub fn compile_with_interface(
     let hir =
         resolve_and_typecheck_with_hosts(ast, host_functions, Some(host_hash), Some(schema_hash))?;
     let mut module = emit_bytecode(&hir)?;
+    for snapshot_type in idl_snapshot_types {
+        if !module
+            .snapshot_types
+            .iter()
+            .any(|candidate| candidate.type_id == snapshot_type.type_id)
+        {
+            module.snapshot_types.push(snapshot_type);
+        }
+    }
     for export in &interface.exports {
         let (function, hir_function) = hir
             .functions
@@ -7267,7 +7332,13 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         TypeRef::Rune => ValueType::Rune,
         TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
         TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
-        TypeRef::Snapshot(_) => ValueType::Named(StableId::from_name("Snapshot")),
+        TypeRef::Snapshot(Some(content)) => {
+            let ValueType::Named(content_type) = lower_idl_type(content) else {
+                unreachable!("IDL snapshot content types are validated as nominal")
+            };
+            ValueType::Named(nexa_bytecode::snapshot_type(content_type))
+        }
+        TypeRef::Snapshot(None) => unreachable!("IDL snapshots are validated as typed"),
         TypeRef::Option(inner) => {
             ValueType::Named(nexa_bytecode::option_type(lower_idl_type(inner)).type_id)
         }
@@ -7277,6 +7348,71 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         TypeRef::String => ValueType::String,
         TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
     }
+}
+
+fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, CompileError> {
+    fn collect(
+        ty: &TypeRef,
+        snapshots: &mut BTreeMap<StableId, SnapshotType>,
+    ) -> Result<(), CompileError> {
+        match ty {
+            TypeRef::Snapshot(Some(content)) => {
+                let TypeRef::Named(name) = content.as_ref() else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let snapshot = SnapshotType::new(StableId::from_name(name));
+                snapshots.insert(snapshot.type_id, snapshot);
+            }
+            TypeRef::Snapshot(None) => return Err(CompileError::TypeMismatch),
+            TypeRef::HostRequest(Some(inner))
+            | TypeRef::ResourceToken(Some(inner))
+            | TypeRef::Option(inner) => collect(inner, snapshots)?,
+            TypeRef::Result(success, error) => {
+                collect(success, snapshots)?;
+                collect(error, snapshots)?;
+            }
+            TypeRef::I32
+            | TypeRef::I64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Rune
+            | TypeRef::String
+            | TypeRef::HostRequest(None)
+            | TypeRef::ResourceToken(None)
+            | TypeRef::Named(_) => {}
+        }
+        Ok(())
+    }
+
+    let mut snapshots = BTreeMap::new();
+    for structure in &interface.structs {
+        for field in &structure.fields {
+            collect(&field.ty, &mut snapshots)?;
+        }
+    }
+    for enumeration in &interface.enums {
+        for variant in &enumeration.variants {
+            if let Some(payload) = &variant.payload {
+                collect(payload, &mut snapshots)?;
+            }
+        }
+    }
+    for function in &interface.functions {
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut snapshots)?;
+        }
+        collect(&function.result, &mut snapshots)?;
+    }
+    for export in &interface.exports {
+        for parameter in &export.parameters {
+            collect(&parameter.ty, &mut snapshots)?;
+        }
+        if let Some(result) = &export.result {
+            collect(result, &mut snapshots)?;
+        }
+    }
+    Ok(snapshots.into_values().collect())
 }
 
 fn ast_type_from_idl(ty: &TypeRef) -> AstType {
@@ -7290,7 +7426,11 @@ fn ast_type_from_idl(ty: &TypeRef) -> AstType {
         TypeRef::String => AstType::String,
         TypeRef::HostRequest(_) => AstType::Named("HostRequest".into()),
         TypeRef::ResourceToken(_) => AstType::Named("ResourceToken".into()),
-        TypeRef::Snapshot(_) => AstType::Named("Snapshot".into()),
+        TypeRef::Snapshot(Some(content)) => AstType::BuiltinGeneric {
+            name: "Snapshot".into(),
+            arguments: vec![ast_type_from_idl(content)],
+        },
+        TypeRef::Snapshot(None) => AstType::Named("Snapshot".into()),
         TypeRef::Option(inner) => AstType::BuiltinGeneric {
             name: "Option".into(),
             arguments: vec![ast_type_from_idl(inner)],
@@ -8195,6 +8335,54 @@ migration fn migrate() -> bool {
     }
 
     #[test]
+    fn typed_snapshots_compile_from_source_and_idl_with_exact_content_metadata() {
+        let content_type = StableId::from_name("EnemyView");
+        let metadata = nexa_bytecode::SnapshotType::new(content_type);
+        let module = compile(
+            "struct EnemyView { health: i32; }
+             fn identity(value: Snapshot<EnemyView>) -> Snapshot<EnemyView> {
+                 return value;
+             }",
+        )
+        .unwrap();
+        assert_eq!(module.module().snapshot_types, vec![metadata]);
+        assert_eq!(
+            module.module().functions[0].signature.parameters,
+            vec![nexa_bytecode::ValueType::Named(metadata.type_id)]
+        );
+
+        let idl = nexa_idl::parse(
+            "interface Engine {
+                 struct EnemyView { health: i32; }
+                 sync fn world_snapshot() -> snapshot<EnemyView>;
+             }",
+        )
+        .unwrap();
+        let module = super::compile_with_interface(
+            "module game;
+             import engine;
+             fn view() -> Snapshot<EnemyView> {
+                 return engine.world_snapshot();
+             }",
+            &idl,
+            StableId::from_name("schema"),
+        )
+        .unwrap();
+        assert_eq!(module.module().snapshot_types, vec![metadata]);
+
+        for source in [
+            "struct EnemyView { health: i32; }
+             fn bad(value: Snapshot) -> i32 { return 0; }",
+            "fn bad(value: Snapshot<i32>) -> i32 { return 0; }",
+        ] {
+            assert!(matches!(
+                compile(source),
+                Err(CompileError::UnknownType(_) | CompileError::TypeMismatch)
+            ));
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn maps_compile_verify_execute_and_cover_every_source_operation() {
         let module = compile(
@@ -8876,7 +9064,8 @@ migration fn migrate() -> bool {
              fn forged(handle: StateHandle<Mutable>) -> bool { return true; }",
             "@stateful class Store { request: HostRequest; }",
             "@stateful class Store { token: ResourceToken; }",
-            "@stateful class Store { snapshot: Snapshot; }",
+            "struct View { value: i32; }
+             @stateful class Store { snapshot: Snapshot<View>; }",
             "@stateful class Store { buffer: Buffer; }",
         ] {
             assert_eq!(compile(source).unwrap_err(), CompileError::TypeMismatch);

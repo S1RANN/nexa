@@ -1591,7 +1591,10 @@ impl RealmV5RuntimeAdapter {
                         u32::from(self.active_epoch),
                         u64::from(self.active_epoch),
                     )
-                    .create_snapshot(Arc::from([1_i32, 2_i32]))
+                    .create_snapshot(
+                        nexa_core::StableId::from_name("ModelSnapshot"),
+                        Arc::from([1_i32, 2_i32]),
+                    )
                     .map_err(debug)?;
                 self.snapshot = Some(RealmV5OwnedResource {
                     handle,

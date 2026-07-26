@@ -267,13 +267,15 @@ fn validate_host_value(
         | (HostValue::Bool(_), Some(ValueType::Bool))
         | (HostValue::Rune(_), Some(ValueType::Rune))
         | (
-            HostValue::Request(_)
-            | HostValue::Token(_)
-            | HostValue::Snapshot(_)
-            | HostValue::Opaque(_),
+            HostValue::Request(_) | HostValue::Token(_) | HostValue::Opaque(_),
             Some(ValueType::Named(_)),
         )
         | (HostValue::Unit, None) => Ok(0),
+        (HostValue::Snapshot(snapshot), Some(ValueType::Named(type_id)))
+            if snapshot.type_id() == type_id =>
+        {
+            Ok(0)
+        }
         (HostValue::String(value), Some(ValueType::String)) => {
             heap.ok_or(HostTrap::Type)?
                 .validate_string_length(value.len())
@@ -470,7 +472,9 @@ fn commit_host_value(
         (HostValue::Token(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::ResourceToken(value))
         }
-        (HostValue::Snapshot(value), Some(ValueType::Named(_))) => {
+        (HostValue::Snapshot(value), Some(ValueType::Named(type_id)))
+            if value.type_id() == type_id =>
+        {
             Ok(RuntimeValue::Snapshot(value))
         }
         (HostValue::Opaque(value), Some(ValueType::Named(type_id))) => {
@@ -571,7 +575,9 @@ fn completion_to_runtime(
         (HostPayload::Token(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::ResourceToken(value))
         }
-        (HostPayload::Snapshot(value), Some(ValueType::Named(_))) => {
+        (HostPayload::Snapshot(value), Some(ValueType::Named(type_id)))
+            if value.type_id() == type_id =>
+        {
             Ok(RuntimeValue::Snapshot(value))
         }
         _ => Err(InterpreterError::TypeMismatch),
@@ -2186,6 +2192,7 @@ impl RealmRuntime {
     pub fn create_snapshot(
         &mut self,
         task: TaskHandle,
+        content_type: StableId,
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, RealmError> {
         self.require_host_capabilities()?;
@@ -2194,7 +2201,7 @@ impl RealmRuntime {
         Ok(self
             .resources
             .context(task, snapshot.module_id, snapshot.module_epoch)
-            .create_snapshot(data)?)
+            .create_snapshot(content_type, data)?)
     }
 
     pub fn snapshot_data(&self, snapshot: SnapshotHandle) -> Result<&[i32], RealmError> {
@@ -2203,6 +2210,10 @@ impl RealmRuntime {
 
     pub fn snapshot_external_bytes(&self, snapshot: SnapshotHandle) -> Result<usize, RealmError> {
         Ok(self.resources.snapshot_external_bytes(snapshot)?)
+    }
+
+    pub fn snapshot_content_type(&self, snapshot: SnapshotHandle) -> Result<StableId, RealmError> {
+        Ok(self.resources.snapshot_content_type(snapshot)?)
     }
 
     #[must_use]
@@ -3133,10 +3144,13 @@ fn requires_host_capabilities(
     if [
         StableId::from_name("HostRequest"),
         StableId::from_name("ResourceToken"),
-        StableId::from_name("Snapshot"),
         StableId::from_name("Buffer"),
     ]
     .contains(&type_id)
+        || module
+            .snapshot_types
+            .iter()
+            .any(|snapshot| snapshot.type_id == type_id)
     {
         return true;
     }
@@ -3309,6 +3323,58 @@ mod tests {
                 HostValue::I32(4),
                 HostValue::I32(5),
             ])))
+        );
+    }
+
+    #[test]
+    fn typed_snapshot_host_boundaries_reject_content_type_confusion() {
+        let mut tasks = crate::TaskRuntime::new(1, crate::RuntimeLimits::default());
+        let scope = tasks.create_scope(None).unwrap();
+        let task = tasks.admit_task(scope, 1, true).unwrap();
+        let mut resources = crate::RuntimeResources::new(1, 1, 2);
+        let content_type = StableId::from_name("EnemyView");
+        let snapshot = resources
+            .context(task, 1, 1)
+            .create_snapshot(content_type, Arc::from([1, 2, 3]))
+            .unwrap();
+        let snapshot_type = nexa_bytecode::snapshot_type(content_type);
+        assert_eq!(
+            super::host_to_runtime_value(
+                HostValue::Snapshot(snapshot),
+                Some(ValueType::Named(snapshot_type)),
+                None,
+                &[],
+                &[],
+                &[],
+            ),
+            Ok(RuntimeValue::Snapshot(snapshot))
+        );
+        assert_eq!(
+            super::host_to_runtime_value(
+                HostValue::Snapshot(snapshot),
+                Some(ValueType::Named(nexa_bytecode::snapshot_type(
+                    StableId::from_name("OtherView"),
+                ))),
+                None,
+                &[],
+                &[],
+                &[],
+            ),
+            Err(HostTrap::Type)
+        );
+        assert_eq!(
+            super::completion_to_runtime(
+                HostPayload::Snapshot(snapshot),
+                Some(ValueType::Named(snapshot_type)),
+            ),
+            Ok(RuntimeValue::Snapshot(snapshot))
+        );
+        assert_eq!(
+            super::completion_to_runtime(
+                HostPayload::Snapshot(snapshot),
+                Some(ValueType::Named(StableId::from_name("Snapshot"))),
+            ),
+            Err(crate::InterpreterError::TypeMismatch)
         );
     }
 
@@ -4934,7 +5000,13 @@ mod tests {
         realm
             .create_resource_token(task, RuntimeHostDomain::Render)
             .unwrap();
-        realm.create_snapshot(task, Arc::from([1, 2, 3])).unwrap();
+        realm
+            .create_snapshot(
+                task,
+                StableId::from_name("LedgerSnapshot"),
+                Arc::from([1, 2, 3]),
+            )
+            .unwrap();
         realm.allocate(Object::String("ledger".to_owned())).unwrap();
         realm
             .insert_state(

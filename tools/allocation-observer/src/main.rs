@@ -775,7 +775,11 @@ fn main() {
             )
             .unwrap();
         realm
-            .create_snapshot(task, Arc::from([1_i32, 2, 3]))
+            .create_snapshot(
+                task,
+                StableId::from_name("ObserverSnapshot"),
+                Arc::from([1_i32, 2, 3]),
+            )
             .unwrap();
         let snapshot_release = observed(|| {
             assert!(matches!(

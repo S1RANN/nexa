@@ -133,6 +133,7 @@ impl RuntimeAdapter {
                     self.realm
                         .create_snapshot(
                             self.tasks[task].expect("task was stored"),
+                            nexa_core::StableId::from_name("ModelSnapshot"),
                             Arc::<[i32]>::from([1, 2, 3]),
                         )
                         .map_err(debug)?;

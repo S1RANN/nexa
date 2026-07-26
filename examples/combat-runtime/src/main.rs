@@ -58,7 +58,7 @@ impl generated::GameHost for EngineHost {
         context: &mut ResourceContext<'_>,
     ) -> Result<nexa_runtime::SnapshotHandle, generated::HostError> {
         context
-            .create_snapshot(Arc::from([10, 20, 30]))
+            .create_snapshot(StableId::from_name("EnemyView"), Arc::from([10, 20, 30]))
             .map_err(|error| generated::HostError(error.to_string()))
     }
 }
