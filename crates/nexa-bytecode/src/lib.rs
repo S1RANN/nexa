@@ -8,6 +8,48 @@ use nexa_core::{FileId, SourceSpan, StableId};
 pub const MAGIC: [u8; 4] = *b"NXBC";
 pub const BYTECODE_VERSION: u16 = 4;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum SectionKind {
+    Strings = 1,
+    Types = 2,
+    Constants = 3,
+    Enums = 4,
+    Structs = 5,
+    Classes = 6,
+    HostImports = 7,
+    StateSchemas = 8,
+    Exports = 9,
+    Functions = 10,
+    Code = 11,
+    RootMaps = 12,
+    Safepoints = 13,
+    LoopBounds = 14,
+    SourceMap = 15,
+    ReloadMetadata = 16,
+}
+
+impl SectionKind {
+    pub const ALL: [Self; 16] = [
+        Self::Strings,
+        Self::Types,
+        Self::Constants,
+        Self::Enums,
+        Self::Structs,
+        Self::Classes,
+        Self::HostImports,
+        Self::StateSchemas,
+        Self::Exports,
+        Self::Functions,
+        Self::Code,
+        Self::RootMaps,
+        Self::Safepoints,
+        Self::LoopBounds,
+        Self::SourceMap,
+        Self::ReloadMetadata,
+    ];
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueType {
     I32,
@@ -668,6 +710,8 @@ impl Module {
         put_u32(&mut output, migration_limits.max_gc_roots);
         put_u64(&mut output, migration_limits.max_fuel);
         put_u16(&mut output, migration_limits.max_call_depth);
+        let reload_metadata = output;
+        let mut output = Vec::new();
         put_u32(
             &mut output,
             u32::try_from(self.host_imports.len()).expect("host import count exceeds wire format"),
@@ -708,6 +752,8 @@ impl Module {
                 put_optional_u32(&mut output, async_result.abandon_error);
             }
         }
+        let host_imports = output;
+        let mut output = Vec::new();
         put_u32(
             &mut output,
             u32::try_from(self.enum_types.len()).expect("enum type count exceeds wire format"),
@@ -728,6 +774,8 @@ impl Module {
                 }
             }
         }
+        let enums = output;
+        let mut output = Vec::new();
         put_u32(
             &mut output,
             u32::try_from(self.state_schema.types.len())
@@ -746,6 +794,8 @@ impl Module {
                 encode_type(&mut output, field.ty);
             }
         }
+        let state_schemas = output;
+        let mut output = Vec::new();
         put_u32(
             &mut output,
             u32::try_from(self.exports.len()).expect("export count exceeds wire format"),
@@ -766,7 +816,7 @@ impl Module {
                 encode_type(&mut output, result);
             }
         }
-        let metadata = output;
+        let exports = output;
         let mut output = Vec::new();
         put_u32(
             &mut output,
@@ -833,6 +883,70 @@ impl Module {
             }
         }
         let functions = output;
+        let mut code = Vec::new();
+        put_u32(
+            &mut code,
+            u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
+        );
+        let mut root_maps = Vec::new();
+        put_u32(
+            &mut root_maps,
+            u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
+        );
+        let mut safepoints = Vec::new();
+        put_u32(
+            &mut safepoints,
+            u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
+        );
+        let mut loop_bounds = Vec::new();
+        put_u32(
+            &mut loop_bounds,
+            u32::try_from(self.functions.len()).expect("function count exceeds wire format"),
+        );
+        for function in &self.functions {
+            put_u32(
+                &mut code,
+                u32::try_from(function.code.len()).expect("instruction count exceeds wire format"),
+            );
+            for instruction in &function.code {
+                encode_instruction(&mut code, *instruction);
+            }
+            put_u16(
+                &mut root_maps,
+                u16::try_from(function.root_bitmap.len()).expect("root bitmap exceeds wire format"),
+            );
+            root_maps.extend(function.root_bitmap.iter().map(|root| u8::from(*root)));
+            put_u32(
+                &mut root_maps,
+                u32::try_from(function.root_maps.len())
+                    .expect("root map count exceeds wire format"),
+            );
+            for root_map in &function.root_maps {
+                put_u32(&mut root_maps, root_map.pc);
+                put_u16(
+                    &mut root_maps,
+                    u16::try_from(root_map.bitmap.len()).expect("root bitmap exceeds wire format"),
+                );
+                root_maps.extend(root_map.bitmap.iter().map(|root| u8::from(*root)));
+            }
+            put_u32(
+                &mut safepoints,
+                u32::try_from(function.safepoints.len())
+                    .expect("safepoint count exceeds wire format"),
+            );
+            for safepoint in &function.safepoints {
+                put_u32(&mut safepoints, *safepoint);
+            }
+            put_u32(
+                &mut loop_bounds,
+                u32::try_from(function.loop_bounds.len())
+                    .expect("loop-bound count exceeds wire format"),
+            );
+            for loop_bound in &function.loop_bounds {
+                put_u32(&mut loop_bounds, loop_bound.back_edge);
+                put_u32(&mut loop_bounds, loop_bound.max_iterations);
+            }
+        }
         let mut source_map = Vec::new();
         put_u32(
             &mut source_map,
@@ -846,7 +960,29 @@ impl Module {
             put_u32(&mut source_map, entry.span.start);
             put_u32(&mut source_map, entry.span.end);
         }
-        encode_sections(&[(1, metadata), (2, functions), (3, source_map)])
+        let empty = || {
+            let mut section = Vec::new();
+            put_u32(&mut section, 0);
+            section
+        };
+        encode_sections(&[
+            (SectionKind::Strings as u8, empty()),
+            (SectionKind::Types as u8, empty()),
+            (SectionKind::Constants as u8, empty()),
+            (SectionKind::Enums as u8, enums),
+            (SectionKind::Structs as u8, empty()),
+            (SectionKind::Classes as u8, empty()),
+            (SectionKind::HostImports as u8, host_imports),
+            (SectionKind::StateSchemas as u8, state_schemas),
+            (SectionKind::Exports as u8, exports),
+            (SectionKind::Functions as u8, functions),
+            (SectionKind::Code as u8, code),
+            (SectionKind::RootMaps as u8, root_maps),
+            (SectionKind::Safepoints as u8, safepoints),
+            (SectionKind::LoopBounds as u8, loop_bounds),
+            (SectionKind::SourceMap as u8, source_map),
+            (SectionKind::ReloadMetadata as u8, reload_metadata),
+        ])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -860,20 +996,19 @@ impl Module {
             return Err(DecodeError::ResourceLimit("byte length"));
         }
         let sections = decode_sections(bytes, limits.max_sections)?;
-        let metadata = sections
-            .iter()
-            .find_map(|(kind, bytes)| (*kind == 1).then_some(*bytes))
-            .ok_or(DecodeError::InvalidSectionDirectory)?;
-        let function_bytes = sections
-            .iter()
-            .find_map(|(kind, bytes)| (*kind == 2).then_some(*bytes))
-            .ok_or(DecodeError::InvalidSectionDirectory)?;
-        let source_map_bytes = sections
-            .iter()
-            .find_map(|(kind, bytes)| (*kind == 3).then_some(*bytes))
-            .ok_or(DecodeError::InvalidSectionDirectory)?;
+        for kind in SectionKind::ALL {
+            required_section(&sections, kind)?;
+        }
+        let mut metadata = Vec::new();
+        metadata.extend_from_slice(required_section(&sections, SectionKind::ReloadMetadata)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::HostImports)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::Enums)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::StateSchemas)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::Exports)?);
+        let function_bytes = required_section(&sections, SectionKind::Functions)?;
+        let source_map_bytes = required_section(&sections, SectionKind::SourceMap)?;
         let mut reader = Reader {
-            bytes: metadata,
+            bytes: &metadata,
             cursor: 0,
         };
         let host_interface_hash = read_optional_id(&mut reader)?;
@@ -1297,6 +1432,16 @@ fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u8, &[u8])>
         return Err(DecodeError::TrailingBytes);
     }
     Ok(sections)
+}
+
+fn required_section<'a>(
+    sections: &[(u8, &'a [u8])],
+    kind: SectionKind,
+) -> Result<&'a [u8], DecodeError> {
+    sections
+        .iter()
+        .find_map(|(candidate, bytes)| (*candidate == kind as u8).then_some(*bytes))
+        .ok_or(DecodeError::InvalidSectionDirectory)
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
@@ -2109,7 +2254,7 @@ mod tests {
 
     use super::{
         DecodeError, FunctionBuilder, FunctionEffect, Instruction, Module, ModuleBuilder,
-        Signature, SourceMapEntry, ValueType, result_type, state_handle_error_type,
+        SectionKind, Signature, SourceMapEntry, ValueType, result_type, state_handle_error_type,
         state_handle_type,
     };
 
@@ -2157,6 +2302,16 @@ mod tests {
         }]);
         let module = builder.finish();
         let encoded = module.encode();
+        assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 16);
+        assert_eq!(
+            (0..16)
+                .map(|index| encoded[8 + index * 13])
+                .collect::<Vec<_>>(),
+            SectionKind::ALL
+                .into_iter()
+                .map(|kind| kind as u8)
+                .collect::<Vec<_>>()
+        );
         assert_eq!(
             module.source_span(0, 0),
             Some(SourceSpan::new(FileId(7), 4, 9))
@@ -2171,7 +2326,9 @@ mod tests {
         corrupt[opcode] = u8::MAX;
         assert_eq!(
             Module::decode(&corrupt),
-            Err(DecodeError::ChecksumMismatch(3))
+            Err(DecodeError::ChecksumMismatch(
+                SectionKind::ReloadMetadata as u8
+            ))
         );
     }
 
