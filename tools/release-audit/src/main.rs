@@ -689,6 +689,7 @@ fn render_report(results: &AuditResults, artifacts: &BTreeMap<String, Value>) ->
         );
         report.push_str("\n```\n\n");
     }
+    report.pop();
     report
 }
 
