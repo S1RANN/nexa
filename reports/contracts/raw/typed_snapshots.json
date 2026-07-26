@@ -1,11 +1,10 @@
 {
-  "alignment_validation": true,
-  "combat_payload": "EnemyView",
-  "command": "typed snapshot codec and storage tests",
-  "content_type_validation": true,
-  "failures": [],
-  "implementation_sha": "3bc6a81b8bcb61307698ece3b80f118fdb2c64df",
-  "implementation_tree": "7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4",
+  "schema_version": 1,
+  "gate": "typed-snapshots",
+  "implementation_sha": "011110bc1f4a381b16e614ade2d8c9c23f231636",
+  "implementation_tree": "c55200964bc6a5f630d3a1a3e4e96e4aed9f8e4b",
+  "command": "nexa-contract-gates typed-snapshots",
+  "status": "passed",
   "metrics": {
     "alignment_validation": true,
     "combat_payload": "EnemyView",
@@ -14,9 +13,5 @@
     "storage": "Arc<[u8]>",
     "type_id_validation": true
   },
-  "schema_hash_validation": true,
-  "schema_version": 1,
-  "status": "passed",
-  "storage": "Arc<[u8]>",
-  "type_id_validation": true
+  "failures": []
 }

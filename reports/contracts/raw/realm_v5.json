@@ -1,8 +1,10 @@
 {
-  "command": "nexa_model::realm_v5::explore_realm_v5",
-  "failures": [],
-  "implementation_sha": "3bc6a81b8bcb61307698ece3b80f118fdb2c64df",
-  "implementation_tree": "7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4",
+  "schema_version": 1,
+  "gate": "realm-v5",
+  "implementation_sha": "011110bc1f4a381b16e614ade2d8c9c23f231636",
+  "implementation_tree": "c55200964bc6a5f630d3a1a3e4e96e4aed9f8e4b",
+  "command": "nexa-contract-gates realm-v5",
+  "status": "passed",
   "metrics": {
     "real_realm_runtime_paths": 592,
     "rejected_event_paths": 15745,
@@ -10,11 +12,5 @@
     "truncated": false,
     "worlds": 592
   },
-  "real_realm_runtime_paths": 592,
-  "rejected_event_paths": 15745,
-  "schema_version": 1,
-  "shadow_state_fields": 0,
-  "status": "passed",
-  "truncated": false,
-  "worlds": 592
+  "failures": []
 }

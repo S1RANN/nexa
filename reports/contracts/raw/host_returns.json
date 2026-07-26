@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "gate": "host-returns",
+  "implementation_sha": "011110bc1f4a381b16e614ade2d8c9c23f231636",
+  "implementation_tree": "c55200964bc6a5f630d3a1a3e4e96e4aed9f8e4b",
+  "command": "nexa-contract-gates host-returns",
+  "status": "passed",
+  "metrics": {
+    "cases": [
+      {
+        "host_allocations": 1,
+        "name": "return_string",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_struct",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_enum",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_option",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_result",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_array",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_buffer",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 3,
+        "name": "return_array_struct",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 3
+      },
+      {
+        "host_allocations": 3,
+        "name": "return_buffer_struct",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 3
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_nested_enum",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 2,
+        "name": "return_option_array",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 2
+      },
+      {
+        "host_allocations": 2,
+        "name": "return_result_buffer",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 2
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_large_array",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 1,
+        "name": "return_large_buffer",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 1
+      },
+      {
+        "host_allocations": 5,
+        "name": "return_nested",
+        "passed": true,
+        "thunk_allocations": 0,
+        "total_allocations": 5
+      }
+    ],
+    "non_empty_lengths": [
+      3,
+      31,
+      32,
+      1
+    ],
+    "requirements": {
+      "exact_cases": 15,
+      "overflow_rejected": true
+    },
+    "round_trip": {
+      "case_names": [
+        "return_string",
+        "return_struct",
+        "return_enum",
+        "return_option",
+        "return_result",
+        "return_array",
+        "return_buffer",
+        "return_array_struct",
+        "return_buffer_struct",
+        "return_nested_enum",
+        "return_option_array",
+        "return_result_buffer",
+        "return_large_array",
+        "return_large_buffer",
+        "return_nested"
+      ],
+      "cases": 15,
+      "failures": []
+    }
+  },
+  "failures": []
+}
