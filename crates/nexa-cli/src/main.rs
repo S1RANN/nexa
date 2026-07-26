@@ -1496,6 +1496,8 @@ fn write_exploration_failure(
     let artifact = ModelFailureArtifact {
         format_version: MODEL_FAILURE_ARTIFACT_VERSION,
         commit_sha: current_commit_sha(),
+        runtime_kind: "RealmRuntime".into(),
+        shadow_state_fields: 0,
         model_config: json!({
             "model": model,
             "bounds": model_config
@@ -1514,6 +1516,10 @@ fn write_exploration_failure(
         releases: json!([]),
         heap: json!({}),
         roots: json!([]),
+        root_publications: json!([]),
+        module_handles: json!([]),
+        completion_accounting: json!({}),
+        failure_point_stats: json!({}),
         trace: json!(trace),
         error_code: error_code.into(),
     };
@@ -1645,6 +1651,8 @@ mod tests {
         let artifact = ModelFailureArtifact {
             format_version: MODEL_FAILURE_ARTIFACT_VERSION,
             commit_sha: "test".into(),
+            runtime_kind: "RealmRuntime".into(),
+            shadow_state_fields: 0,
             model_config: json!({"model": "realm-v5"}),
             path: vec!["TaskAdmission".into()],
             failure_event: "TaskAdmission".into(),
@@ -1660,6 +1668,10 @@ mod tests {
             releases: json!([]),
             heap: json!({}),
             roots: json!([]),
+            root_publications: json!([]),
+            module_handles: json!([]),
+            completion_accounting: json!({}),
+            failure_point_stats: json!({}),
             trace: json!([]),
             error_code: "NEXA_MODEL_TEST".into(),
         };

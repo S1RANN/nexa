@@ -365,6 +365,8 @@ fn write_failure(
     let failure = ModelFailureArtifact {
         format_version: MODEL_FAILURE_ARTIFACT_VERSION,
         commit_sha: current_commit_sha(),
+        runtime_kind: "RealmRuntime".into(),
+        shadow_state_fields: 0,
         model_config: json!({
             "model": "realm-v4",
             "max_depth": 16,
@@ -394,6 +396,10 @@ fn write_failure(
         releases: json!([]),
         heap: json!({"objects": 0}),
         roots: json!([]),
+        root_publications: json!([]),
+        module_handles: json!([]),
+        completion_accounting: json!({}),
+        failure_point_stats: json!({}),
         trace: json!(
             path.iter()
                 .map(|event| format!("{event:?}"))
@@ -423,6 +429,8 @@ fn write_routing_failure(
     let failure = ModelFailureArtifact {
         format_version: MODEL_FAILURE_ARTIFACT_VERSION,
         commit_sha: current_commit_sha(),
+        runtime_kind: "RealmRuntime".into(),
+        shadow_state_fields: 0,
         model_config: json!({
             "model": "realm-v4-routing",
             "max_depth": 8,
@@ -458,6 +466,10 @@ fn write_routing_failure(
         releases: json!([]),
         heap: json!({"objects": 0}),
         roots: json!([]),
+        root_publications: json!([]),
+        module_handles: json!([]),
+        completion_accounting: json!({}),
+        failure_point_stats: json!({}),
         trace: json!(
             path.iter()
                 .map(|event| format!("{event:?}"))

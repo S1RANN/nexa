@@ -3,13 +3,15 @@ use std::io::Write;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const MODEL_FAILURE_ARTIFACT_VERSION: u32 = 1;
+pub const MODEL_FAILURE_ARTIFACT_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelFailureArtifact {
     pub format_version: u32,
     pub commit_sha: String,
+    pub runtime_kind: String,
+    pub shadow_state_fields: u32,
     pub model_config: Value,
     pub path: Vec<String>,
     pub failure_event: String,
@@ -25,6 +27,10 @@ pub struct ModelFailureArtifact {
     pub releases: Value,
     pub heap: Value,
     pub roots: Value,
+    pub root_publications: Value,
+    pub module_handles: Value,
+    pub completion_accounting: Value,
+    pub failure_point_stats: Value,
     pub trace: Value,
     pub error_code: String,
 }
@@ -67,6 +73,8 @@ mod tests {
         let artifact = ModelFailureArtifact {
             format_version: MODEL_FAILURE_ARTIFACT_VERSION,
             commit_sha: "0123456789abcdef".into(),
+            runtime_kind: "RealmRuntime".into(),
+            shadow_state_fields: 0,
             model_config: json!({"max_depth": 32, "max_worlds": 32768}),
             path: vec!["TaskAdmission".into(), "event with \"quotes\"".into()],
             failure_event: "Cleanup\nTrap".into(),
@@ -82,6 +90,10 @@ mod tests {
             releases: json!([]),
             heap: json!({"objects": 0}),
             roots: json!([]),
+            root_publications: json!([]),
+            module_handles: json!([]),
+            completion_accounting: json!({}),
+            failure_point_stats: json!({}),
             trace: json!([{"transition": "cleanup.trap"}]),
             error_code: "NEXA_MODEL_DIFFERENTIAL_MISMATCH".into(),
         };
@@ -94,6 +106,8 @@ mod tests {
         assert_eq!(parsed["failure_event"], "Cleanup\nTrap");
         for field in [
             "commit_sha",
+            "runtime_kind",
+            "shadow_state_fields",
             "model_config",
             "model_before",
             "model_after",
@@ -107,6 +121,10 @@ mod tests {
             "releases",
             "heap",
             "roots",
+            "root_publications",
+            "module_handles",
+            "completion_accounting",
+            "failure_point_stats",
             "trace",
             "error_code",
         ] {

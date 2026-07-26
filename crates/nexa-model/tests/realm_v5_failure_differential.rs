@@ -1,3 +1,6 @@
+use nexa_model::artifact::{
+    MODEL_FAILURE_ARTIFACT_VERSION, ModelFailureArtifact, write_model_failure_artifact,
+};
 use nexa_runtime::model_adapter::{
     RealmV5RuntimeAdapter, RealmV5RuntimeApplyError, RealmV5RuntimeEvent,
     RealmV5RuntimeReloadState, RealmV5RuntimeRetiredEpoch, RealmV5RuntimeTaskState,
@@ -6,6 +9,134 @@ use nexa_runtime::{
     FailurePointStats, HeapError, Object, RealmError, RuntimeError, RuntimeFailureMode,
     RuntimeFailurePoint,
 };
+use serde_json::json;
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn failure_artifact_serializes_real_realm_inspection() {
+    let mut runtime = replay(&[
+        RealmV5RuntimeEvent::BeginReload,
+        RealmV5RuntimeEvent::Quiesce,
+        RealmV5RuntimeEvent::Migration,
+        RealmV5RuntimeEvent::Commit,
+    ]);
+    let before = runtime.realm().inspection_snapshot();
+    runtime
+        .failure_injector()
+        .arm_once(RuntimeFailurePoint::HeapSlot);
+    assert!(matches!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("artifact".into())),
+        Err(RealmError::Heap(HeapError::InjectedFailure(
+            RuntimeFailurePoint::HeapSlot
+        )))
+    ));
+    let after = runtime.realm().inspection_snapshot();
+    assert_eq!(after, before);
+
+    let runtime_before = inspection_value(&before);
+    let runtime_after = inspection_value(&after);
+    let failure_point_stats = json!(runtime.failure_injector().all_stats().map(
+        |(point, stats)| json!({
+            "point": format!("{point:?}"),
+            "attempted": stats.attempted,
+            "injected": stats.injected
+        })
+    ));
+    let artifact = ModelFailureArtifact {
+        format_version: MODEL_FAILURE_ARTIFACT_VERSION,
+        commit_sha: "test".into(),
+        runtime_kind: "RealmRuntime".into(),
+        shadow_state_fields: 0,
+        model_config: json!({"model": "realm-v5", "source": "production-inspection"}),
+        path: vec![
+            "BeginReload".into(),
+            "Quiesce".into(),
+            "Migration".into(),
+            "Commit".into(),
+        ],
+        failure_event: "HeapSlot".into(),
+        model_before: runtime_before.clone(),
+        model_after: runtime_after.clone(),
+        runtime_before,
+        runtime_after,
+        ledger: resource_ledger_value(before.resources),
+        epochs: json!({
+            "active": before.active_root.as_ref().map(|module| module.epoch),
+            "retired": before.retired_epochs.iter().map(|epoch| epoch.epoch).collect::<Vec<_>>()
+        }),
+        tasks: json!(
+            before
+                .tasks
+                .iter()
+                .map(|task| format!("{:?}", task.state))
+                .collect::<Vec<_>>()
+        ),
+        requests: json!(before.resources.requests),
+        completions: completion_value(before.completion_accounting),
+        releases: json!(
+            before
+                .runtime_host_releases
+                .iter()
+                .map(|release| release.epoch)
+                .collect::<Vec<_>>()
+        ),
+        heap: json!({"objects": before.heap.live_objects, "capacity": before.heap.capacity}),
+        roots: json!({
+            "module_globals": before.roots.module_globals,
+            "stateful_registry": before.roots.stateful_registry,
+            "staging_heap": before.roots.staging_heap,
+            "suspended_tasks": before.roots.suspended_tasks
+        }),
+        root_publications: json!(
+            before
+                .reload
+                .root_publications
+                .iter()
+                .map(|publication| {
+                    json!({
+                        "publication_id": publication.publication_id,
+                        "candidate_epoch": publication.candidate_epoch
+                    })
+                })
+                .collect::<Vec<_>>()
+        ),
+        module_handles: json!(
+            before
+                .modules
+                .iter()
+                .map(|module| {
+                    json!({
+                        "module_id": module.module_id,
+                        "generation": module.generation,
+                        "epoch": module.epoch,
+                        "lifecycle": format!("{:?}", module.lifecycle)
+                    })
+                })
+                .collect::<Vec<_>>()
+        ),
+        completion_accounting: completion_value(before.completion_accounting),
+        failure_point_stats,
+        trace: json!(["production.heap.preflight"]),
+        error_code: "NEXA_RUNTIME_INJECTED_FAILURE".into(),
+    };
+    let mut encoded = Vec::new();
+    write_model_failure_artifact(&mut encoded, &artifact).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(parsed["runtime_kind"], "RealmRuntime");
+    assert_eq!(parsed["shadow_state_fields"], 0);
+    assert_eq!(parsed["runtime_before"], parsed["runtime_after"]);
+    assert_eq!(parsed["root_publications"].as_array().unwrap().len(), 1);
+    assert!(!parsed["module_handles"].as_array().unwrap().is_empty());
+    let heap_stats = parsed["failure_point_stats"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|stats| stats["point"] == "HeapSlot")
+        .unwrap();
+    assert_eq!(heap_stats["injected"], 1);
+}
 
 #[test]
 fn production_failure_modes_and_stats_are_complete() {
@@ -365,4 +496,52 @@ fn replay(path: &[RealmV5RuntimeEvent]) -> RealmV5RuntimeAdapter {
             .unwrap_or_else(|error| panic!("fixture rejected {event:?}: {error:?}"));
     }
     runtime
+}
+
+fn inspection_value(inspection: &nexa_runtime::RealmInspectionSnapshot) -> serde_json::Value {
+    json!({
+        "active_epoch": inspection.active_root.as_ref().map(|module| module.epoch),
+        "candidate_epoch": inspection.candidate_root.as_ref().map(|module| module.epoch),
+        "module_count": inspection.modules.len(),
+        "retired_count": inspection.retired_epochs.len(),
+        "task_count": inspection.tasks.len(),
+        "resource_ledger": resource_ledger_value(inspection.resources),
+        "completion_accounting": completion_value(inspection.completion_accounting),
+        "reload_state": format!("{:?}", inspection.reload.state),
+        "reload_buffer": inspection.reload.completion_buffer,
+        "root_publications": inspection.reload.root_publications.len(),
+        "heap_objects": inspection.heap.live_objects,
+        "terminal_records": inspection.terminal_records.len(),
+        "runtime_host": format!("{:?}", inspection.runtime_host)
+    })
+}
+
+fn resource_ledger_value(ledger: nexa_runtime::RuntimeResourceLedger) -> serde_json::Value {
+    json!({
+        "tasks": ledger.tasks,
+        "scopes": ledger.scopes,
+        "continuations": ledger.continuations,
+        "scheduler_tokens": ledger.scheduler_tokens,
+        "requests": ledger.requests,
+        "completion_reservations": ledger.completion_reservations,
+        "tokens": ledger.tokens,
+        "snapshots": ledger.snapshots,
+        "release_reservations": ledger.release_reservations,
+        "queued_releases": ledger.queued_releases,
+        "heap_objects": ledger.heap_objects,
+        "state_objects": ledger.state_objects,
+        "retired_epochs": ledger.retired_epochs
+    })
+}
+
+fn completion_value(accounting: nexa_runtime::CompletionAccounting) -> serde_json::Value {
+    json!({
+        "reserved": accounting.reserved,
+        "queued": accounting.queued,
+        "delivered": accounting.delivered,
+        "cancelled": accounting.cancelled,
+        "abandoned": accounting.abandoned,
+        "reload_discarded": accounting.reload_discarded,
+        "late_discarded": accounting.late_discarded
+    })
 }
