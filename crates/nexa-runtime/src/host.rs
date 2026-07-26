@@ -1008,6 +1008,7 @@ pub enum HostPayload {
     Bool(bool),
     Rune(u32),
     String(String),
+    Struct(Vec<HostPayload>),
     Enum {
         type_id: nexa_core::StableId,
         variant: nexa_core::StableId,
@@ -1114,6 +1115,14 @@ fn runtime_argument_to_host_value(
                 .string(reference)
                 .map_err(|_| HostTrap::Type)?
                 .to_owned(),
+        ),
+        value @ crate::RuntimeValue::Struct { .. } => HostValue::Struct(
+            heap.ok_or(HostTrap::Type)?
+                .struct_fields(value)
+                .map_err(|_| HostTrap::Type)?
+                .iter()
+                .map(|field| runtime_argument_to_host_value(*field, heap))
+                .collect::<Result<Vec<_>, _>>()?,
         ),
         value @ crate::RuntimeValue::NamedRef { .. }
             if heap.is_some_and(|heap| heap.enum_parts(value).is_ok()) =>
@@ -2028,6 +2037,13 @@ fn enqueue_request_release(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ResourceTokenHandle(RawHandle);
+
+impl ResourceTokenHandle {
+    #[must_use]
+    pub const fn raw(self) -> RawHandle {
+        self.0
+    }
+}
 
 #[derive(Debug)]
 struct ResourceToken {

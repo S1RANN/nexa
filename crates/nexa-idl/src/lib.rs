@@ -432,6 +432,22 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
                 source,
             )
         }
+        TypeRef::Named(name) if idl.structs.iter().any(|item| item.name == *name) => {
+            let structure = idl
+                .structs
+                .iter()
+                .find(|structure| structure.name == *name)
+                .expect("validated struct exists");
+            let fields = structure
+                .fields
+                .iter()
+                .map(|field| {
+                    encode_completion_payload(idl, &field.ty, &format!("{source}.{}", field.name))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("nexa_runtime::HostPayload::Struct(vec![{fields}])")
+        }
         _ => "nexa_runtime::HostPayload::Unit".into(),
     }
 }
@@ -1190,6 +1206,20 @@ mod tests {
         );
         assert!(enum_payload.contains("HostPayload::Enum"));
         assert!(enum_payload.contains("payload: Some(Box::new"));
+
+        let struct_payload = generate_rust(
+            &parse(
+                "interface Geometry {
+                    struct Position { x: i32; label: string; }
+                    enum GeometryError { Cancelled }
+                    request(return_error, trap) fn position()
+                        -> request<Result<Position, GeometryError>>;
+                }",
+            )
+            .unwrap(),
+        );
+        assert!(struct_payload.contains("HostPayload::Struct"));
+        assert!(struct_payload.contains("HostPayload::String(value.label)"));
     }
 
     #[test]

@@ -61,7 +61,15 @@ pub enum StateValue {
     F64(u64),
     Bool(bool),
     Rune(u32),
-    String { reference: GcRef, hash: u64 },
+    String {
+        reference: GcRef,
+        hash: u64,
+    },
+    Struct {
+        reference: GcRef,
+        type_id: StableId,
+        hash: u64,
+    },
     Ref(GcRef),
     Handle(StateHandle),
     Object(StateObject),
@@ -806,6 +814,11 @@ fn state_value_payload_bytes(value: &StateValue) -> usize {
         StateValue::F32(_) | StateValue::Rune(_) => std::mem::size_of::<u32>(),
         StateValue::Bool(_) => 1,
         StateValue::String { .. } => std::mem::size_of::<GcRef>() + std::mem::size_of::<u64>(),
+        StateValue::Struct { .. } => {
+            std::mem::size_of::<GcRef>()
+                + std::mem::size_of::<StableId>()
+                + std::mem::size_of::<u64>()
+        }
         StateValue::Ref(_) => std::mem::size_of::<GcRef>(),
         StateValue::Handle(_) => std::mem::size_of::<StateHandle>(),
         StateValue::Object(_) => usize::MAX,
@@ -821,6 +834,7 @@ fn state_value_type(value: &StateValue) -> ValueType {
         StateValue::Bool(_) => ValueType::Bool,
         StateValue::Rune(_) => ValueType::Rune,
         StateValue::String { .. } => ValueType::String,
+        StateValue::Struct { type_id, .. } => ValueType::Named(*type_id),
         StateValue::Ref(_) => ValueType::Ref,
         StateValue::Handle(_) => ValueType::Named(nexa_bytecode::state_handle_type(
             ValueType::Named(StableId::from_name("StateValue")),
@@ -832,13 +846,15 @@ fn state_value_type(value: &StateValue) -> ValueType {
 fn state_value_root_count(value: &StateValue) -> usize {
     usize::from(matches!(
         value,
-        StateValue::String { .. } | StateValue::Ref(_)
+        StateValue::String { .. } | StateValue::Struct { .. } | StateValue::Ref(_)
     ))
 }
 
 fn push_root(value: &StateValue, roots: &mut Vec<GcRef>) {
     match value {
-        StateValue::String { reference, .. } | StateValue::Ref(reference) => {
+        StateValue::String { reference, .. }
+        | StateValue::Struct { reference, .. }
+        | StateValue::Ref(reference) => {
             roots.push(*reference);
         }
         _ => {}
@@ -870,6 +886,12 @@ fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -
         | (&StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
         | (&StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
         | (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(_)) => true,
+        (
+            &StateValue::Struct {
+                type_id: actual, ..
+            },
+            nexa_bytecode::ValueType::Named(expected),
+        ) => actual == expected,
         _ => false,
     }
 }
@@ -884,6 +906,15 @@ fn clone_leaf_value(value: &StateValue) -> StateValue {
         StateValue::Rune(value) => StateValue::Rune(*value),
         StateValue::String { reference, hash } => StateValue::String {
             reference: *reference,
+            hash: *hash,
+        },
+        StateValue::Struct {
+            reference,
+            type_id,
+            hash,
+        } => StateValue::Struct {
+            reference: *reference,
+            type_id: *type_id,
             hash: *hash,
         },
         StateValue::Ref(reference) => StateValue::Ref(*reference),
@@ -1154,6 +1185,15 @@ fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue)
         }
         StateValue::String { hash: value, .. } => {
             hash.write_u8(9);
+            hash.write_u64(*value);
+        }
+        StateValue::Struct {
+            type_id,
+            hash: value,
+            ..
+        } => {
+            hash.write_u8(10);
+            hash.write_u64(type_id.0);
             hash.write_u64(*value);
         }
         StateValue::Bool(value) => {
@@ -1783,6 +1823,15 @@ fn state_to_runtime_value(stable_id: StableId, value: &StateValue) -> RuntimeVal
             reference: *reference,
             hash: *hash,
         },
+        StateValue::Struct {
+            reference,
+            type_id,
+            hash,
+        } => RuntimeValue::Struct {
+            reference: *reference,
+            type_id: *type_id,
+            hash: *hash,
+        },
         StateValue::Ref(reference) => RuntimeValue::Ref(*reference),
         StateValue::Handle(handle) => RuntimeValue::Opaque {
             type_id: StableId::from_name("StateHandle"),
@@ -1808,6 +1857,15 @@ fn runtime_to_state_value(
         RuntimeValue::Bool(value) => Ok(StateValue::Bool(value)),
         RuntimeValue::Rune(value) => Ok(StateValue::Rune(value)),
         RuntimeValue::String { reference, hash } => Ok(StateValue::String { reference, hash }),
+        RuntimeValue::Struct {
+            reference,
+            type_id,
+            hash,
+        } => Ok(StateValue::Struct {
+            reference,
+            type_id,
+            hash,
+        }),
         RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
             Ok(StateValue::Ref(reference))
         }
@@ -1849,6 +1907,7 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::Bool(_) => nexa_bytecode::ValueType::Bool,
         RuntimeValue::Rune(_) => nexa_bytecode::ValueType::Rune,
         RuntimeValue::String { .. } => nexa_bytecode::ValueType::String,
+        RuntimeValue::Struct { type_id, .. } => nexa_bytecode::ValueType::Named(type_id),
         RuntimeValue::Ref(_) => nexa_bytecode::ValueType::Ref,
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             nexa_bytecode::ValueType::Named(type_id)
@@ -2051,7 +2110,7 @@ pub fn run_offline_migration(
                                 .map_err(|_| OfflineMigrationError::UnsupportedOutputValue)?
                                 .to_owned(),
                         ),
-                        StateValue::Ref(_) | StateValue::Object(_) => {
+                        StateValue::Struct { .. } | StateValue::Ref(_) | StateValue::Object(_) => {
                             return Err(OfflineMigrationError::UnsupportedOutputValue);
                         }
                     };
@@ -2249,6 +2308,45 @@ mod tests {
             Ok(StateValue::String { reference, hash })
         );
         assert_eq!(registry.gc_roots(), vec![reference]);
+    }
+
+    #[test]
+    fn stateful_struct_fields_preserve_nominal_value_and_nested_gc_roots() {
+        let mut heap = crate::Heap::new_with_string_limit(4, 32);
+        let label = heap.allocate_string("persistent").unwrap();
+        let label_hash = heap.string_hash(label).unwrap();
+        let type_id = StableId::from_name("Position");
+        let value = heap
+            .allocate_struct(
+                type_id,
+                &[
+                    RuntimeValue::I32(7),
+                    RuntimeValue::String {
+                        reference: label,
+                        hash: label_hash,
+                    },
+                ],
+            )
+            .unwrap();
+        let RuntimeValue::Struct {
+            reference, hash, ..
+        } = value
+        else {
+            panic!("struct allocation must produce a struct value");
+        };
+        let mut registry = StatefulRegistry::try_new(StatefulDomainId::new(7), limits()).unwrap();
+        let stable_id = StableId::from_name("persistent-position");
+        let state = StateValue::Struct {
+            reference,
+            type_id,
+            hash,
+        };
+        let handle = registry.insert(stable_id, state.clone()).unwrap();
+        assert_eq!(registry.resolve(handle), Ok(state));
+        assert_eq!(registry.gc_roots(), vec![reference]);
+        assert!(heap.struct_fields(value).unwrap().iter().any(
+            |value| matches!(value, RuntimeValue::String { reference: field, .. } if *field == label)
+        ));
     }
 
     fn context(schema: StateSchema, limits: MigrationLimits) -> MigrationContext {

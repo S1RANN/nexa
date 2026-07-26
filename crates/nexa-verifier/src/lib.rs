@@ -57,9 +57,12 @@ pub enum VerifyErrorKind {
     ImmediateRecursion,
     WcetComplexityLimit,
     InvalidEnumMetadata,
+    InvalidStructMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
+    StructTypeOutOfRange(u64),
+    StructFieldOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
     StringOutOfRange(u32),
@@ -95,54 +98,8 @@ impl VerifiedModule {
 pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
     verify_reload_metadata(&module)?;
     verify_source_map(&module)?;
-    let mut enum_ids = BTreeSet::new();
-    for enum_type in &module.enum_types {
-        let mut variant_ids = BTreeSet::new();
-        let mut tags = BTreeSet::new();
-        if !enum_ids.insert(enum_type.type_id)
-            || enum_type.variants.is_empty()
-            || enum_type
-                .variants
-                .iter()
-                .any(|variant| !variant_ids.insert(variant.stable_id) || !tags.insert(variant.tag))
-        {
-            return Err(VerifyError {
-                function: 0,
-                instruction: None,
-                kind: VerifyErrorKind::InvalidEnumMetadata,
-            });
-        }
-    }
-    for import in &module.host_imports {
-        let valid = match (import.mode, import.async_result) {
-            (HostCallMode::Immediate, None) => true,
-            (HostCallMode::Async, Some(async_result)) => {
-                import.result == Some(ValueType::Named(async_result.result_type))
-                    && matches!(
-                        (async_result.cancel_policy, async_result.cancel_error),
-                        (nexa_bytecode::CancelPolicy::ReturnError, Some(_))
-                            | (nexa_bytecode::CancelPolicy::CancelTask, None)
-                    )
-                    && matches!(
-                        (async_result.abandon_policy, async_result.abandon_error),
-                        (nexa_bytecode::AbandonPolicy::ReturnError, Some(_))
-                            | (nexa_bytecode::AbandonPolicy::Trap, None)
-                    )
-                    && module.enum_types.iter().any(|enum_type| {
-                        enum_type
-                            == &nexa_bytecode::result_type(async_result.success, async_result.error)
-                    })
-            }
-            _ => false,
-        };
-        if !valid {
-            return Err(VerifyError {
-                function: 0,
-                instruction: None,
-                kind: VerifyErrorKind::InvalidEnumMetadata,
-            });
-        }
-    }
+    verify_named_type_metadata(&module)?;
+    verify_host_import_metadata(&module)?;
     let mut export_ids = BTreeSet::new();
     for export in &module.exports {
         if !export_ids.insert(export.stable_id) {
@@ -186,6 +143,79 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
         }
     }
     Ok(VerifiedModule(module))
+}
+
+fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut enum_ids = BTreeSet::new();
+    for enum_type in &module.enum_types {
+        let mut variant_ids = BTreeSet::new();
+        let mut tags = BTreeSet::new();
+        if !enum_ids.insert(enum_type.type_id)
+            || enum_type.variants.is_empty()
+            || enum_type
+                .variants
+                .iter()
+                .any(|variant| !variant_ids.insert(variant.stable_id) || !tags.insert(variant.tag))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidEnumMetadata,
+            });
+        }
+    }
+    let mut named_ids = enum_ids;
+    for struct_type in &module.struct_types {
+        let mut field_ids = BTreeSet::new();
+        if !named_ids.insert(struct_type.type_id)
+            || struct_type.fields.len() > nexa_bytecode::MAX_STRUCT_FIELDS
+            || struct_type
+                .fields
+                .iter()
+                .any(|field| !field_ids.insert(field.stable_id))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidStructMetadata,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
+    for import in &module.host_imports {
+        let valid = match (import.mode, import.async_result) {
+            (HostCallMode::Immediate, None) => true,
+            (HostCallMode::Async, Some(async_result)) => {
+                import.result == Some(ValueType::Named(async_result.result_type))
+                    && matches!(
+                        (async_result.cancel_policy, async_result.cancel_error),
+                        (nexa_bytecode::CancelPolicy::ReturnError, Some(_))
+                            | (nexa_bytecode::CancelPolicy::CancelTask, None)
+                    )
+                    && matches!(
+                        (async_result.abandon_policy, async_result.abandon_error),
+                        (nexa_bytecode::AbandonPolicy::ReturnError, Some(_))
+                            | (nexa_bytecode::AbandonPolicy::Trap, None)
+                    )
+                    && module.enum_types.iter().any(|enum_type| {
+                        enum_type
+                            == &nexa_bytecode::result_type(async_result.success, async_result.error)
+                    })
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidEnumMetadata,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn verify_source_map(module: &Module) -> Result<(), VerifyError> {
@@ -735,6 +765,100 @@ fn verify_function(
                     })?;
                 state[register(dst)?] = Some(payload_type);
             }
+            Instruction::StructNew {
+                type_id,
+                fields_base,
+                fields_count,
+                dst,
+            } => {
+                let struct_type = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::StructTypeOutOfRange(type_id.0))
+                    })?;
+                if usize::from(fields_count) != struct_type.fields.len() {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                for (index, field) in struct_type.fields.iter().enumerate() {
+                    let source = fields_base
+                        .checked_add(u16::try_from(index).map_err(|_| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?)
+                        .ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?;
+                    require(&state, source, field.ty)?;
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::StructGet { source, field, dst } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field_type = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .and_then(|struct_type| {
+                        struct_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
+                    })?;
+                state[register(dst)?] = Some(field_type);
+            }
+            Instruction::StructWith {
+                source,
+                field,
+                value,
+                dst,
+            } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field_type = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .and_then(|struct_type| {
+                        struct_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
+                    })?;
+                require(&state, value, field_type)?;
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::StructEqual { lhs, rhs, dst } => {
+                let lhs = register(lhs)?;
+                let Some(ValueType::Named(type_id)) = state[lhs] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                if !module
+                    .struct_types
+                    .iter()
+                    .any(|struct_type| struct_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::StructTypeOutOfRange(type_id.0),
+                    ));
+                }
+                require(&state, rhs, ValueType::Named(type_id))?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -911,6 +1035,8 @@ fn verify_safepoints(
                     | Instruction::LoadString { .. }
                     | Instruction::StringConcat { .. }
                     | Instruction::EnumNew { .. }
+                    | Instruction::StructNew { .. }
+                    | Instruction::StructWith { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }

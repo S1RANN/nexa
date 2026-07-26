@@ -15,6 +15,11 @@ pub enum RuntimeValue {
         reference: GcRef,
         hash: u64,
     },
+    Struct {
+        reference: GcRef,
+        type_id: nexa_core::StableId,
+        hash: u64,
+    },
     Ref(GcRef),
     NamedRef {
         reference: GcRef,
@@ -329,6 +334,7 @@ impl FrameArena {
             .iter()
             .filter_map(|value| match value {
                 RuntimeValue::String { reference, .. }
+                | RuntimeValue::Struct { reference, .. }
                 | RuntimeValue::Ref(reference)
                 | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
                 RuntimeValue::I32(_)
@@ -362,6 +368,7 @@ impl FrameArena {
                 if is_root {
                     match self.registers[frame.register_start as usize + register] {
                         RuntimeValue::String { reference, .. }
+                        | RuntimeValue::Struct { reference, .. }
                         | RuntimeValue::Ref(reference)
                         | RuntimeValue::NamedRef { reference, .. } => {
                             roots.push(reference);

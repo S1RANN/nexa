@@ -7,7 +7,8 @@ use std::ops::{Deref, DerefMut};
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, Function, FunctionEffect,
     HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap, ScriptExport, Signature,
-    SourceMapEntry, StateField, StateSchema, StateType, ValueType,
+    SourceMapEntry, StateField, StateSchema, StateType, StructField as BytecodeStructField,
+    StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -28,6 +29,7 @@ pub enum TokenKind {
     Else,
     While,
     Match,
+    With,
     Await,
     Defer,
     For,
@@ -290,6 +292,18 @@ pub enum AstExpression {
         variant: String,
         payload: Option<Box<Self>>,
     },
+    StructLiteral {
+        type_name: String,
+        fields: Vec<StructFieldValue>,
+    },
+    FieldGet {
+        value: Box<Self>,
+        field: String,
+    },
+    StructWith {
+        value: Box<Self>,
+        updates: Vec<StructFieldValue>,
+    },
     Match {
         value: Box<Self>,
         arms: Vec<MatchArm>,
@@ -331,6 +345,13 @@ impl AstExpression {
 pub struct MatchArm {
     pub variant: String,
     pub binding: Option<String>,
+    pub value: AstExpression,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructFieldValue {
+    pub name: String,
     pub value: AstExpression,
     pub span: SourceSpan,
 }
@@ -482,6 +503,8 @@ pub struct HirModule {
     state_schema: StateSchema,
     enum_types: Vec<EnumType>,
     enum_variants: BTreeMap<(StableId, String), EnumVariant>,
+    struct_types: Vec<StructType>,
+    struct_fields: BTreeMap<(StableId, String), BytecodeStructField>,
     state_handle_targets: BTreeMap<StableId, ValueType>,
     span: SourceSpan,
 }
@@ -709,6 +732,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "else" => TokenKind::Else,
                     "while" => TokenKind::While,
                     "match" => TokenKind::Match,
+                    "with" => TokenKind::With,
                     "await" => TokenKind::Await,
                     "defer" => TokenKind::Defer,
                     "for" => TokenKind::For,
@@ -1057,7 +1081,15 @@ impl Parser<'_> {
                 } else {
                     Vec::new()
                 };
-                if is_migration_intrinsic(&name) {
+                if type_arguments.is_empty()
+                    && name.chars().next().is_some_and(char::is_uppercase)
+                    && self.take(&TokenKind::LBrace)
+                {
+                    AstExpression::StructLiteral {
+                        type_name: name,
+                        fields: self.struct_field_values()?,
+                    }
+                } else if is_migration_intrinsic(&name) {
                     AstExpression::Migration(self.migration_intrinsic(
                         &name,
                         type_arguments,
@@ -1118,7 +1150,20 @@ impl Parser<'_> {
                     if !type_arguments.is_empty() {
                         return Err(self.unexpected("generic function call"));
                     }
-                    AstExpression::Name(name)
+                    if let Some((receiver, field)) = name.split_once('.')
+                        && !receiver.contains('.')
+                    {
+                        AstExpression::FieldGet {
+                            value: Box::new(self.spanned_expression(
+                                start,
+                                self.previous_end(),
+                                AstExpression::Name(receiver.to_owned()),
+                            )),
+                            field: field.to_owned(),
+                        }
+                    } else {
+                        AstExpression::Name(name)
+                    }
                 }
             }
             TokenKind::LParen => {
@@ -1129,6 +1174,15 @@ impl Parser<'_> {
             _ => return Err(self.unexpected("expression")),
         };
         loop {
+            if self.take(&TokenKind::With) {
+                let inner_end = self.previous_end();
+                self.expect(&TokenKind::LBrace, "{")?;
+                lhs = AstExpression::StructWith {
+                    value: Box::new(self.spanned_expression(start, inner_end, lhs)),
+                    updates: self.struct_field_values()?,
+                };
+                continue;
+            }
             if self.at(&TokenKind::Question) {
                 let inner_end = self.previous_end();
                 self.cursor += 1;
@@ -1195,6 +1249,25 @@ impl Parser<'_> {
             value: Box::new(value),
             arms,
         })
+    }
+
+    fn struct_field_values(&mut self) -> Result<Vec<StructFieldValue>, CompileError> {
+        let mut fields = Vec::new();
+        while !self.take(&TokenKind::RBrace) {
+            let field_start = self.current_start();
+            let name = self.ident()?;
+            self.expect(&TokenKind::Colon, ":")?;
+            let value = self.expression(0)?;
+            fields.push(StructFieldValue {
+                name,
+                value,
+                span: self.span_from(field_start),
+            });
+            if !self.take(&TokenKind::Comma) && !self.at(&TokenKind::RBrace) {
+                return Err(self.unexpected(", or }"));
+            }
+        }
+        Ok(fields)
     }
 
     fn migration_intrinsic(
@@ -1536,6 +1609,23 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
                 substitute_name(payload, name, value);
             }
         }
+        AstExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                substitute_name(&mut field.value, name, value);
+            }
+        }
+        AstExpression::FieldGet {
+            value: field_value, ..
+        } => substitute_name(field_value, name, value),
+        AstExpression::StructWith {
+            value: struct_value,
+            updates,
+        } => {
+            substitute_name(struct_value, name, value);
+            for field in updates {
+                substitute_name(&mut field.value, name, value);
+            }
+        }
         AstExpression::Match {
             value: matched,
             arms,
@@ -1828,6 +1918,37 @@ fn resolve_and_typecheck_with_hosts(
             }
         }
     }
+    let struct_types = ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Struct)
+        .map(|declaration| StructType {
+            type_id: StableId::from_name(&declaration.name),
+            fields: declaration
+                .fields
+                .iter()
+                .map(|field| BytecodeStructField {
+                    stable_id: StableId::from_parts(&[&declaration.name, "::", &field.name]),
+                    ty: lower_type(&field.ty),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let mut struct_fields = BTreeMap::new();
+    for declaration in ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Struct)
+    {
+        let type_id = StableId::from_name(&declaration.name);
+        let metadata = struct_types
+            .iter()
+            .find(|struct_type| struct_type.type_id == type_id)
+            .expect("source struct metadata was built");
+        for (source, field) in declaration.fields.iter().zip(&metadata.fields) {
+            struct_fields.insert((type_id, source.name.clone()), *field);
+        }
+    }
     let state_schema = StateSchema {
         types: ast
             .types
@@ -1876,6 +1997,15 @@ fn resolve_and_typecheck_with_hosts(
             validate_type(&field.ty, &known_types)?;
         }
         let mut variants = BTreeSet::new();
+        let mut fields = BTreeSet::new();
+        for field in &declaration.fields {
+            if !fields.insert(&field.name) {
+                return Err(CompileError::DuplicateName(format!(
+                    "{}.{}",
+                    declaration.name, field.name
+                )));
+            }
+        }
         for variant in &declaration.variants {
             if !variants.insert(&variant.name) {
                 return Err(CompileError::DuplicateName(format!(
@@ -1952,6 +2082,8 @@ fn resolve_and_typecheck_with_hosts(
             signatures: &signatures,
             enum_types: &enum_types,
             enum_variants: &enum_variants,
+            struct_types: &struct_types,
+            struct_fields: &struct_fields,
             function_result: signature.result.expect("result is required"),
             effect: function.effect,
             state_handle_targets: &state_handle_targets,
@@ -1983,6 +2115,8 @@ fn resolve_and_typecheck_with_hosts(
         state_schema,
         enum_types,
         enum_variants,
+        struct_types,
+        struct_fields,
         state_handle_targets,
         span: module_span,
     })
@@ -2058,6 +2192,22 @@ fn validate_await_expression(
         AstExpression::Constructor { payload, .. } => {
             if let Some(payload) = payload {
                 validate_await_expression(payload, suspending_functions, false)?;
+            }
+            Ok(())
+        }
+        AstExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                validate_await_expression(&field.value, suspending_functions, false)?;
+            }
+            Ok(())
+        }
+        AstExpression::FieldGet { value, .. } => {
+            validate_await_expression(value, suspending_functions, false)
+        }
+        AstExpression::StructWith { value, updates } => {
+            validate_await_expression(value, suspending_functions, false)?;
+            for field in updates {
+                validate_await_expression(&field.value, suspending_functions, false)?;
             }
             Ok(())
         }
@@ -2236,6 +2386,20 @@ fn resolve_expression(
                 resolve_expression(payload, scopes, next_local)?;
             }
         }
+        AstExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                resolve_expression(&mut field.value, scopes, next_local)?;
+            }
+        }
+        AstExpression::FieldGet { value, .. } => {
+            resolve_expression(value, scopes, next_local)?;
+        }
+        AstExpression::StructWith { value, updates } => {
+            resolve_expression(value, scopes, next_local)?;
+            for field in updates {
+                resolve_expression(&mut field.value, scopes, next_local)?;
+            }
+        }
         AstExpression::Match { value, arms } => {
             resolve_expression(value, scopes, next_local)?;
             for arm in arms {
@@ -2341,6 +2505,8 @@ struct TypeContext<'a> {
     signatures: &'a BTreeMap<String, Signature>,
     enum_types: &'a [EnumType],
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
+    struct_types: &'a [StructType],
+    struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     function_result: ValueType,
     effect: FunctionEffect,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
@@ -2479,6 +2645,13 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Constructor { payload, .. } => {
             payload.as_deref().is_some_and(contains_await)
         }
+        AstExpression::StructLiteral { fields, .. } => {
+            fields.iter().any(|field| contains_await(&field.value))
+        }
+        AstExpression::FieldGet { value, .. } => contains_await(value),
+        AstExpression::StructWith { value, updates } => {
+            contains_await(value) || updates.iter().any(|field| contains_await(&field.value))
+        }
         AstExpression::Match { value, arms } => {
             contains_await(value) || arms.iter().any(|arm| contains_await(&arm.value))
         }
@@ -2544,11 +2717,92 @@ fn expression_type(
                 return Err(CompileError::UnknownName(name.clone()));
             }
         }
+        AstExpression::StructLiteral { type_name, fields } => {
+            let type_id = StableId::from_name(type_name);
+            let struct_type = context
+                .struct_types
+                .iter()
+                .find(|struct_type| struct_type.type_id == type_id)
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+            if fields.len() != struct_type.fields.len() {
+                return Err(CompileError::TypeMismatch);
+            }
+            let mut supplied = BTreeSet::new();
+            for field in fields {
+                let metadata = context
+                    .struct_fields
+                    .get(&(type_id, field.name.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                if !supplied.insert(metadata.stable_id)
+                    || expression_type(
+                        &field.value,
+                        locals,
+                        context,
+                        next_register,
+                        Some(metadata.ty),
+                    )? != metadata.ty
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+            }
+            ValueType::Named(type_id)
+        }
+        AstExpression::FieldGet { value, field } => {
+            let ValueType::Named(type_id) =
+                expression_type(value, locals, context, next_register, None)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            context
+                .struct_fields
+                .get(&(type_id, field.clone()))
+                .map(|field| field.ty)
+                .ok_or(CompileError::TypeMismatch)?
+        }
+        AstExpression::StructWith { value, updates } => {
+            let ValueType::Named(type_id) =
+                expression_type(value, locals, context, next_register, None)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            if !context
+                .struct_types
+                .iter()
+                .any(|struct_type| struct_type.type_id == type_id)
+                || updates.is_empty()
+            {
+                return Err(CompileError::TypeMismatch);
+            }
+            let mut supplied = BTreeSet::new();
+            for update in updates {
+                let field = context
+                    .struct_fields
+                    .get(&(type_id, update.name.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                if !supplied.insert(field.stable_id)
+                    || expression_type(
+                        &update.value,
+                        locals,
+                        context,
+                        next_register,
+                        Some(field.ty),
+                    )? != field.ty
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+            }
+            ValueType::Named(type_id)
+        }
         AstExpression::Binary { op, lhs, rhs } if op.kind == BinaryOp::Equal => {
             let operand_type = expression_type(lhs, locals, context, next_register, None)?;
-            if operand_type != ValueType::String
-                || expression_type(rhs, locals, context, next_register, Some(ValueType::String))?
-                    != ValueType::String
+            let supported = operand_type == ValueType::String
+                || matches!(operand_type, ValueType::Named(type_id) if context
+                    .struct_types
+                    .iter()
+                    .any(|struct_type| struct_type.type_id == type_id));
+            if !supported
+                || expression_type(rhs, locals, context, next_register, Some(operand_type))?
+                    != operand_type
             {
                 return Err(CompileError::TypeMismatch);
             }
@@ -3059,6 +3313,20 @@ fn inspect_expression_registers(
                 inspect_expression_registers(payload, plan)?;
             }
         }
+        AstExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                inspect_expression_registers(&field.value, plan)?;
+            }
+        }
+        AstExpression::FieldGet { value, .. } => {
+            inspect_expression_registers(value, plan)?;
+        }
+        AstExpression::StructWith { value, updates } => {
+            inspect_expression_registers(value, plan)?;
+            for field in updates {
+                inspect_expression_registers(&field.value, plan)?;
+            }
+        }
         AstExpression::Match { value, arms } => {
             plan.match_temporaries = plan.match_temporaries.max(requirement);
             inspect_expression_registers(value, plan)?;
@@ -3111,6 +3379,21 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         AstExpression::Constructor { payload, .. } => payload
             .as_deref()
             .map_or(Ok(1), |payload| offset_requirement(1, payload))?,
+        AstExpression::StructLiteral { fields, .. } => {
+            let mut required = 1;
+            for (index, field) in fields.iter().enumerate() {
+                required = required.max(offset_requirement(index + 1, &field.value)?);
+            }
+            required
+        }
+        AstExpression::FieldGet { value, .. } => usize::from(temporary_requirement(value)?),
+        AstExpression::StructWith { value, updates } => {
+            let mut required = usize::from(temporary_requirement(value)?);
+            for field in updates {
+                required = required.max(offset_requirement(1, &field.value)?);
+            }
+            required
+        }
         AstExpression::Match { value, arms } => {
             let mut required = usize::from(temporary_requirement(value)?).max(4);
             for arm in arms {
@@ -3186,6 +3469,18 @@ fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet
                 collect_expression_strings(payload, strings);
             }
         }
+        AstExpression::StructLiteral { fields, .. } => {
+            for field in fields {
+                collect_expression_strings(&field.value, strings);
+            }
+        }
+        AstExpression::FieldGet { value, .. } => collect_expression_strings(value, strings),
+        AstExpression::StructWith { value, updates } => {
+            collect_expression_strings(value, strings);
+            for field in updates {
+                collect_expression_strings(&field.value, strings);
+            }
+        }
         AstExpression::Match { value, arms } => {
             collect_expression_strings(value, strings);
             for arm in arms {
@@ -3235,13 +3530,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     for function in host_functions {
         module.host_import(function.metadata.clone());
     }
-    if let (Some(host), Some(schema)) = (hir.host_interface_hash, hir.schema_hash) {
-        module.metadata(host, schema);
-    }
-    module.state_schema(hir.state_schema.clone());
-    for enum_type in &hir.enum_types {
-        module.enum_type(enum_type.clone());
-    }
+    emit_module_metadata(hir, &mut module);
     let mut source_map = Vec::new();
     for (function_index, function) in hir.functions.iter().enumerate() {
         let mut code = TrackedCode::new(function.span);
@@ -3252,6 +3541,8 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             script_functions: &hir.functions,
             host_functions: &hir.host_functions,
             enum_variants: &hir.enum_variants,
+            struct_types: &hir.struct_types,
+            struct_fields: &hir.struct_fields,
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
             string_indices: &string_indices,
@@ -3306,6 +3597,19 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     module.reload_metadata.minimum_migration_limits =
         nexa_bytecode::minimum_migration_limits(&module, module.reload_metadata.migration_entry);
     Ok(module)
+}
+
+fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
+    if let (Some(host), Some(schema)) = (hir.host_interface_hash, hir.schema_hash) {
+        module.metadata(host, schema);
+    }
+    module.state_schema(hir.state_schema.clone());
+    for enum_type in &hir.enum_types {
+        module.enum_type(enum_type.clone());
+    }
+    for struct_type in &hir.struct_types {
+        module.struct_type(struct_type.clone());
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3370,11 +3674,12 @@ fn exact_root_maps(
             Instruction::LoadBool { dst, .. }
             | Instruction::CompareEq { dst, .. }
             | Instruction::StringEqual { dst, .. }
+            | Instruction::StructEqual { dst, .. }
             | Instruction::StateHandleIsAlive { dst, .. }
             | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
             }
-            Instruction::Move { dst, source } => {
+            Instruction::Move { dst, source } | Instruction::StructWith { source, dst, .. } => {
                 state[usize::from(dst)] = state[usize::from(source)];
             }
             Instruction::Call {
@@ -3396,7 +3701,8 @@ fn exact_root_maps(
                 state[usize::from(dst)] = Some(ty);
             }
             Instruction::StateNewCreate { type_id, dst, .. }
-            | Instruction::EnumNew { type_id, dst, .. } => {
+            | Instruction::EnumNew { type_id, dst, .. }
+            | Instruction::StructNew { type_id, dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
             }
             Instruction::StateHandleResolve {
@@ -3431,6 +3737,22 @@ fn exact_root_maps(
                             .find(|candidate| candidate.stable_id == variant)
                     })
                     .and_then(|variant| variant.payload_type);
+            }
+            Instruction::StructGet { source, field, dst } => {
+                let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                state[usize::from(dst)] = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .and_then(|struct_type| {
+                        struct_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty);
             }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
@@ -3521,6 +3843,8 @@ struct EmitContext<'a> {
     script_functions: &'a [HirFunction],
     host_functions: &'a BTreeMap<String, HostFunction>,
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
+    struct_types: &'a [StructType],
+    struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     string_indices: &'a BTreeMap<String, u32>,
@@ -3822,12 +4146,141 @@ fn emit_expression(
                 return Err(CompileError::UnknownName(name.clone()));
             }
         }
+        AstExpression::StructLiteral { type_name, fields } => {
+            let type_id = StableId::from_name(type_name);
+            let struct_type = context
+                .struct_types
+                .iter()
+                .find(|struct_type| struct_type.type_id == type_id)
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+            let fields_base = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            for (index, metadata) in struct_type.fields.iter().enumerate() {
+                let field = fields
+                    .iter()
+                    .find(|field| {
+                        context
+                            .struct_fields
+                            .get(&(type_id, field.name.clone()))
+                            .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
+                    })
+                    .ok_or(CompileError::TypeMismatch)?;
+                let register = fields_base
+                    .checked_add(u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    &field.value,
+                    register,
+                    Some(metadata.ty),
+                    locals,
+                    context,
+                    code,
+                )?;
+            }
+            code.push(Instruction::StructNew {
+                type_id,
+                fields_base,
+                fields_count: u16::try_from(struct_type.fields.len())
+                    .map_err(|_| CompileError::TooManyRegisters)?,
+                dst: destination,
+            });
+        }
+        AstExpression::FieldGet { value, field } => {
+            let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            emit_expression(
+                value,
+                destination,
+                Some(ValueType::Named(type_id)),
+                locals,
+                context,
+                code,
+            )?;
+            let field = context
+                .struct_fields
+                .get(&(type_id, field.clone()))
+                .ok_or(CompileError::TypeMismatch)?;
+            code.push(Instruction::StructGet {
+                source: destination,
+                field: field.stable_id,
+                dst: destination,
+            });
+        }
+        AstExpression::StructWith { value, updates } => {
+            let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            emit_expression(
+                value,
+                destination,
+                Some(ValueType::Named(type_id)),
+                locals,
+                context,
+                code,
+            )?;
+            let replacement = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            for update in updates {
+                let field = context
+                    .struct_fields
+                    .get(&(type_id, update.name.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                emit_expression(
+                    &update.value,
+                    replacement,
+                    Some(field.ty),
+                    locals,
+                    context,
+                    code,
+                )?;
+                code.push(Instruction::StructWith {
+                    source: destination,
+                    field: field.stable_id,
+                    value: replacement,
+                    dst: destination,
+                });
+            }
+        }
         AstExpression::Binary { op, lhs, rhs } => {
+            if op.kind == BinaryOp::Equal {
+                let operand_type = emitted_expression_type(lhs, None, locals, context)?;
+                let lhs_register = destination;
+                let rhs_register = destination
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(lhs, lhs_register, Some(operand_type), locals, context, code)?;
+                emit_expression(rhs, rhs_register, Some(operand_type), locals, context, code)?;
+                code.push(match operand_type {
+                    ValueType::String => Instruction::StringEqual {
+                        dst: destination,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    },
+                    ValueType::Named(type_id)
+                        if context
+                            .struct_types
+                            .iter()
+                            .any(|struct_type| struct_type.type_id == type_id) =>
+                    {
+                        Instruction::StructEqual {
+                            dst: destination,
+                            lhs: lhs_register,
+                            rhs: rhs_register,
+                        }
+                    }
+                    _ => return Err(CompileError::TypeMismatch),
+                });
+                code.replace_span(previous_span);
+                return Ok(());
+            }
             let numeric_type =
                 expected.unwrap_or(emitted_expression_type(lhs, None, locals, context)?);
-            if op.kind == BinaryOp::Equal
-                || (op.kind == BinaryOp::Add && numeric_type == ValueType::String)
-            {
+            if op.kind == BinaryOp::Add && numeric_type == ValueType::String {
                 let lhs_register = destination;
                 let rhs_register = destination
                     .checked_add(1)
@@ -3848,18 +4301,10 @@ fn emit_expression(
                     context,
                     code,
                 )?;
-                code.push(if op.kind == BinaryOp::Equal {
-                    Instruction::StringEqual {
-                        dst: destination,
-                        lhs: lhs_register,
-                        rhs: rhs_register,
-                    }
-                } else {
-                    Instruction::StringConcat {
-                        dst: destination,
-                        lhs: lhs_register,
-                        rhs: rhs_register,
-                    }
+                code.push(Instruction::StringConcat {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
                 });
                 code.replace_span(previous_span);
                 return Ok(());
@@ -4321,6 +4766,29 @@ fn emitted_expression_type(
             },
             |(_, ty)| Ok(*ty),
         ),
+        AstExpression::StructLiteral { type_name, .. } => {
+            let type_id = StableId::from_name(type_name);
+            context
+                .struct_types
+                .iter()
+                .any(|struct_type| struct_type.type_id == type_id)
+                .then_some(ValueType::Named(type_id))
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
+        }
+        AstExpression::FieldGet { value, field } => {
+            let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
+            else {
+                return Err(CompileError::TypeMismatch);
+            };
+            context
+                .struct_fields
+                .get(&(type_id, field.clone()))
+                .map(|field| field.ty)
+                .ok_or(CompileError::TypeMismatch)
+        }
+        AstExpression::StructWith { value, .. } => {
+            emitted_expression_type(value, None, locals, context)
+        }
         AstExpression::Call { function, .. } => {
             if let Some(ValueType::Named(type_id)) = expected
                 && context
@@ -4735,6 +5203,8 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::LoadString { .. }
                     | Instruction::StringConcat { .. }
                     | Instruction::EnumNew { .. }
+                    | Instruction::StructNew { .. }
+                    | Instruction::StructWith { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -4782,6 +5252,30 @@ pub fn compile_with_interface(
 ) -> Result<VerifiedModule, CompileError> {
     let tokens = lex(source)?;
     let mut ast = parse(&tokens)?;
+    for structure in &interface.structs {
+        if !ast
+            .types
+            .iter()
+            .any(|declaration| declaration.name == structure.name)
+        {
+            ast.types.push(AstTypeDeclaration {
+                name: structure.name.clone(),
+                kind: AstTypeKind::Struct,
+                version: 0,
+                fields: structure
+                    .fields
+                    .iter()
+                    .map(|field| AstField {
+                        name: field.name.clone(),
+                        ty: ast_type_from_idl(&field.ty),
+                        span: SourceSpan::new(FileId(0), 0, 0),
+                    })
+                    .collect(),
+                variants: Vec::new(),
+                span: SourceSpan::new(FileId(0), 0, 0),
+            });
+        }
+    }
     for enumeration in &interface.enums {
         if !ast
             .types
@@ -5384,6 +5878,170 @@ migration fn migrate() -> bool {
         assert_eq!(
             event.variants[1].payload_type,
             Some(nexa_bytecode::ValueType::I32)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn structs_are_nominal_immutable_structurally_equal_values() {
+        let source = "struct Position { x: i32; y: i32; label: string; }
+             enum Event { Idle, Move(Position) }
+             fn make(x: i32, y: i32) -> Position {
+                 return Position { label: \"origin\", y: y, x: x };
+             }
+             fn read_x(value: Position) -> i32 {
+                 return value.x;
+             }
+             fn move_x(value: Position) -> Position {
+                 return value with { x: value.x + 1, label: \"moved\" };
+             }
+             fn equal() -> bool {
+                 let lhs: Position = Position { x: 1, y: 2, label: \"same\" };
+                 let rhs: Position = Position { x: 1, y: 2, label: \"same\" };
+                 return lhs == rhs;
+             }
+             fn event() -> Event {
+                 return Move(Position { x: 3, y: 4, label: \"event\" });
+             }
+             fn event_y(value: Event) -> i32 {
+                 return match value {
+                     Idle => 0,
+                     Move(position) => position.y,
+                 };
+             }";
+        let module = compile(source).unwrap();
+        let position = module
+            .module()
+            .struct_types
+            .iter()
+            .find(|struct_type| struct_type.type_id == StableId::from_name("Position"))
+            .unwrap();
+        assert_eq!(
+            position
+                .fields
+                .iter()
+                .map(|field| field.ty)
+                .collect::<Vec<_>>(),
+            [
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::String,
+            ]
+        );
+
+        let mut heap = nexa_runtime::Heap::new_with_string_limit(32, 64);
+        let InterpreterOutcome::Returned {
+            value: Some(original),
+            ..
+        } = CheckedInterpreter::run_with_heap(
+            &module,
+            0,
+            &[RuntimeValue::I32(7), RuntimeValue::I32(8)],
+            200,
+            &mut heap,
+        )
+        .unwrap()
+        else {
+            panic!("struct constructor must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[original], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(7)),
+                ..
+            }
+        ));
+        let InterpreterOutcome::Returned {
+            value: Some(updated),
+            ..
+        } = CheckedInterpreter::run_with_heap(&module, 2, &[original], 200, &mut heap).unwrap()
+        else {
+            panic!("struct with update must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[updated], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(8)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[original], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(7)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 3, &[], 300, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::Bool(true)),
+                ..
+            }
+        ));
+        let InterpreterOutcome::Returned {
+            value: Some(event), ..
+        } = CheckedInterpreter::run_with_heap(&module, 4, &[], 200, &mut heap).unwrap()
+        else {
+            panic!("enum struct payload must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 5, &[event], 200, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(4)),
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            compile(
+                "struct Pair { left: i32; right: i32; }
+                 fn bad() -> Pair { return Pair { left: 1 }; }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+        assert!(matches!(
+            compile(
+                "struct Pair { left: i32; right: i32; }
+                 fn bad(value: Pair) -> i32 { return value.missing; }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+        assert!(matches!(
+            compile(
+                "struct Left { value: i32; }
+                 struct Right { value: i32; }
+                 fn bad(value: Left) -> Right { return value; }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+
+        let idl = nexa_idl::parse(
+            "interface Geometry {
+                 struct Position { x: i32; y: i32; label: string; }
+                 sync fn echo(value: Position) -> Position;
+             }",
+        )
+        .unwrap();
+        let host_module = super::compile_with_interface(
+            "module game;
+             import geometry;
+             fn echo_position(value: Position) -> Position {
+                 return geometry.echo(value with { x: value.x + 1 });
+             }",
+            &idl,
+            StableId::from_name("schema"),
+        )
+        .unwrap();
+        assert_eq!(host_module.module().struct_types.len(), 1);
+        assert!(
+            host_module.module().functions[0]
+                .code
+                .iter()
+                .any(|instruction| matches!(
+                    instruction,
+                    nexa_bytecode::Instruction::HostCall { .. }
+                ))
         );
     }
 

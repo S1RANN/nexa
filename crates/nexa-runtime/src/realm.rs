@@ -151,6 +151,7 @@ struct RealmHostBridge<'a> {
     epoch: u64,
     imports: &'a [HostImport],
     enum_types: &'a [nexa_bytecode::EnumType],
+    struct_types: &'a [nexa_bytecode::StructType],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -169,9 +170,15 @@ impl InterpreterHost for RealmHostBridge<'_> {
             .resources
             .context(self.task, self.module_id, self.epoch);
         match self.registry.call(import, &mut context, values)? {
-            HostCallOutcome::Immediate(value) => Ok(InterpreterHostOutcome::Immediate(
-                host_to_runtime_value(value, metadata.result, heap, self.enum_types)?,
-            )),
+            HostCallOutcome::Immediate(value) => {
+                Ok(InterpreterHostOutcome::Immediate(host_to_runtime_value(
+                    value,
+                    metadata.result,
+                    heap,
+                    self.enum_types,
+                    self.struct_types,
+                )?))
+            }
             HostCallOutcome::Pending(request) => {
                 if !self.resources.owns_request(self.task, request) {
                     return Err(HostTrap::Host(
@@ -207,10 +214,11 @@ fn host_to_runtime_value(
     expected: Option<ValueType>,
     heap: Option<&mut Heap>,
     enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
 ) -> Result<RuntimeValue, HostTrap> {
-    let slots = validate_host_value(&value, expected, heap.as_deref(), enum_types)?;
+    let slots = validate_host_value(&value, expected, heap.as_deref(), enum_types, struct_types)?;
     if slots == 0 {
-        return commit_host_value(value, expected, None, None, enum_types);
+        return commit_host_value(value, expected, None, None, enum_types, struct_types);
     }
     let heap = heap.ok_or(HostTrap::Type)?;
     let mut reservation = heap.preflight(slots).map_err(|_| HostTrap::Type)?;
@@ -220,6 +228,7 @@ fn host_to_runtime_value(
         Some(heap),
         Some(&mut reservation),
         enum_types,
+        struct_types,
     )
 }
 
@@ -228,6 +237,7 @@ fn validate_host_value(
     expected: Option<ValueType>,
     heap: Option<&Heap>,
     enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
 ) -> Result<usize, HostTrap> {
     match (value, expected) {
         (HostValue::I32(_), Some(ValueType::I32))
@@ -270,13 +280,40 @@ fn validate_host_value(
                 })
                 .ok_or(HostTrap::Type)?;
             let payload_slots = match (payload.as_deref(), metadata.payload_type) {
-                (Some(payload), Some(payload_type)) => {
-                    validate_host_value(payload, Some(payload_type), heap, enum_types)?
-                }
+                (Some(payload), Some(payload_type)) => validate_host_value(
+                    payload,
+                    Some(payload_type),
+                    heap,
+                    enum_types,
+                    struct_types,
+                )?,
                 (None, None) => 0,
                 _ => return Err(HostTrap::Type),
             };
             payload_slots.checked_add(1).ok_or(HostTrap::Type)
+        }
+        (HostValue::Struct(fields), Some(ValueType::Named(type_id))) => {
+            let metadata = struct_types
+                .iter()
+                .find(|struct_type| struct_type.type_id == type_id)
+                .ok_or(HostTrap::Type)?;
+            if fields.len() != metadata.fields.len() {
+                return Err(HostTrap::Type);
+            }
+            fields
+                .iter()
+                .zip(&metadata.fields)
+                .try_fold(1_usize, |slots, (value, field)| {
+                    slots
+                        .checked_add(validate_host_value(
+                            value,
+                            Some(field.ty),
+                            heap,
+                            enum_types,
+                            struct_types,
+                        )?)
+                        .ok_or(HostTrap::Type)
+                })
         }
         _ => Err(HostTrap::Type),
     }
@@ -288,6 +325,7 @@ fn commit_host_value(
     mut heap: Option<&mut Heap>,
     mut reservation: Option<&mut HeapReservation>,
     enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
@@ -331,6 +369,7 @@ fn commit_host_value(
                     heap.as_deref_mut(),
                     reservation.as_deref_mut(),
                     enum_types,
+                    struct_types,
                 )?),
                 (None, None) => None,
                 _ => return Err(HostTrap::Type),
@@ -347,6 +386,14 @@ fn commit_host_value(
             );
             Ok(RuntimeValue::NamedRef { reference, type_id })
         }
+        (HostValue::Struct(fields), Some(ValueType::Named(type_id))) => commit_host_struct(
+            fields,
+            type_id,
+            heap.ok_or(HostTrap::Type)?,
+            reservation.ok_or(HostTrap::Type)?,
+            enum_types,
+            struct_types,
+        ),
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
         }
@@ -362,6 +409,36 @@ fn commit_host_value(
         (HostValue::Unit, None) => Ok(RuntimeValue::Unit),
         _ => Err(HostTrap::Type),
     }
+}
+
+fn commit_host_struct(
+    fields: Vec<HostValue>,
+    type_id: StableId,
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
+) -> Result<RuntimeValue, HostTrap> {
+    let metadata = struct_types
+        .iter()
+        .find(|struct_type| struct_type.type_id == type_id)
+        .ok_or(HostTrap::Type)?;
+    if fields.len() != metadata.fields.len() {
+        return Err(HostTrap::Type);
+    }
+    let mut values = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+    for (index, (field, metadata)) in fields.into_iter().zip(&metadata.fields).enumerate() {
+        values[index] = commit_host_value(
+            field,
+            Some(metadata.ty),
+            Some(&mut *heap),
+            Some(&mut *reservation),
+            enum_types,
+            struct_types,
+        )?;
+    }
+    heap.commit_struct(reservation, type_id, &values[..metadata.fields.len()])
+        .map_err(|_| HostTrap::Type)
 }
 
 fn completion_to_runtime(
@@ -443,6 +520,10 @@ pub enum CompletionRoute {
 enum PlannedResultPayload {
     Value(RuntimeValue),
     String(String),
+    Struct {
+        type_id: StableId,
+        fields: Vec<PlannedResultPayload>,
+    },
     Enum {
         type_id: StableId,
         variant: StableId,
@@ -455,6 +536,7 @@ fn plan_host_payload(
     payload: &HostPayload,
     expected: ValueType,
     enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
 ) -> Result<PlannedResultPayload, InterpreterError> {
     if let HostPayload::String(value) = payload
         && expected == ValueType::String
@@ -487,6 +569,7 @@ fn plan_host_payload(
                 payload,
                 payload_type,
                 enum_types,
+                struct_types,
             )?)),
             (None, None) => None,
             _ => return Err(InterpreterError::TypeMismatch),
@@ -498,6 +581,21 @@ fn plan_host_payload(
             payload,
         });
     }
+    if let (HostPayload::Struct(fields), ValueType::Named(type_id)) = (payload, expected) {
+        let metadata = struct_types
+            .iter()
+            .find(|struct_type| struct_type.type_id == type_id)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        if fields.len() != metadata.fields.len() {
+            return Err(InterpreterError::TypeMismatch);
+        }
+        let fields = fields
+            .iter()
+            .zip(&metadata.fields)
+            .map(|(value, field)| plan_host_payload(value, field.ty, enum_types, struct_types))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PlannedResultPayload::Struct { type_id, fields });
+    }
     Ok(PlannedResultPayload::Value(completion_to_runtime(
         payload.clone(),
         Some(expected),
@@ -508,6 +606,13 @@ fn planned_payload_slots(payload: &PlannedResultPayload) -> Result<usize, RealmE
     match payload {
         PlannedResultPayload::Value(_) => Ok(0),
         PlannedResultPayload::String(_) => Ok(1),
+        PlannedResultPayload::Struct { fields, .. } => {
+            fields.iter().try_fold(1_usize, |slots, field| {
+                slots
+                    .checked_add(planned_payload_slots(field)?)
+                    .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
+            })
+        }
         PlannedResultPayload::Enum { payload, .. } => payload.as_deref().map_or(Ok(1), |payload| {
             planned_payload_slots(payload)?
                 .checked_add(1)
@@ -525,6 +630,11 @@ fn validate_planned_payload(heap: &Heap, payload: &PlannedResultPayload) -> Resu
             payload: Some(payload),
             ..
         } => validate_planned_payload(heap, payload)?,
+        PlannedResultPayload::Struct { fields, .. } => {
+            for field in fields {
+                validate_planned_payload(heap, field)?;
+            }
+        }
         PlannedResultPayload::Value(_) | PlannedResultPayload::Enum { payload: None, .. } => {}
     }
     Ok(())
@@ -541,6 +651,15 @@ fn commit_planned_payload(
             let reference = heap.commit(reservation, Object::String(value));
             let hash = heap.string_hash(reference)?;
             Ok(RuntimeValue::String { reference, hash })
+        }
+        PlannedResultPayload::Struct { type_id, fields } => {
+            let field_count = fields.len();
+            let mut values = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+            for (index, field) in fields.into_iter().enumerate() {
+                values[index] = commit_planned_payload(heap, reservation, field)?;
+            }
+            heap.commit_struct(reservation, type_id, &values[..field_count])
+                .map_err(RealmError::Heap)
         }
         PlannedResultPayload::Enum {
             type_id,
@@ -1578,6 +1697,7 @@ impl RealmRuntime {
                 epoch: snapshot.module_epoch,
                 imports: &module.verified.module().host_imports,
                 enum_types: &module.verified.module().enum_types,
+                struct_types: &module.verified.module().struct_types,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
                 &module.verified,
@@ -2172,14 +2292,24 @@ impl RealmRuntime {
                     let payload = {
                         let enum_types =
                             &self.module_for_task(snapshot)?.verified.module().enum_types;
-                        plan_host_payload(payload, result.success, enum_types)?
+                        let struct_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .struct_types;
+                        plan_host_payload(payload, result.success, enum_types, struct_types)?
                     };
                     self.preflight_async_result(result, true, payload)?
                 } else if let Some(expected_type) = expected_type {
                     let payload = {
                         let enum_types =
                             &self.module_for_task(snapshot)?.verified.module().enum_types;
-                        plan_host_payload(payload, expected_type, enum_types)?
+                        let struct_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .struct_types;
+                        plan_host_payload(payload, expected_type, enum_types, struct_types)?
                     };
                     validate_planned_payload(&self.heap, &payload)?;
                     let slots = planned_payload_slots(&payload)?;
@@ -2887,7 +3017,7 @@ mod tests {
     use nexa_bytecode::{
         EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
         Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema,
-        StateType, ValueType,
+        StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -2910,6 +3040,7 @@ mod tests {
             HostValue::String("host-result".into()),
             Some(ValueType::String),
             Some(&mut heap),
+            &[],
             &[],
         )
         .unwrap();
@@ -2945,6 +3076,7 @@ mod tests {
             Some(ValueType::Named(type_id)),
             Some(&mut heap),
             &enum_types,
+            &[],
         )
         .unwrap();
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
@@ -2962,6 +3094,7 @@ mod tests {
                 Some(ValueType::Named(type_id)),
                 Some(&mut heap),
                 &enum_types,
+                &[],
             ),
             Err(HostTrap::Type)
         );
@@ -2973,7 +3106,8 @@ mod tests {
             payload: Some(Box::new(HostPayload::String("async".into()))),
         };
         let planned =
-            super::plan_host_payload(&completion, ValueType::Named(type_id), &enum_types).unwrap();
+            super::plan_host_payload(&completion, ValueType::Named(type_id), &enum_types, &[])
+                .unwrap();
         assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
         super::validate_planned_payload(&heap, &planned).unwrap();
         let mut reservation = heap.preflight(2).unwrap();
@@ -2987,6 +3121,65 @@ mod tests {
                 tag: 0,
                 payload: Some(Box::new(HostValue::String("async".into()))),
             })
+        );
+    }
+
+    #[test]
+    fn host_structs_cross_sync_and_async_gc_boundaries_with_metadata_validation() {
+        let type_id = StableId::from_name("Position");
+        let struct_types = [StructType {
+            type_id,
+            fields: vec![
+                StructField {
+                    stable_id: StableId::from_parts(&["Position", "::x"]),
+                    ty: ValueType::I32,
+                },
+                StructField {
+                    stable_id: StableId::from_parts(&["Position", "::label"]),
+                    ty: ValueType::String,
+                },
+            ],
+        }];
+        let host = HostValue::Struct(vec![HostValue::I32(7), HostValue::String("spawn".into())]);
+        let mut heap = crate::Heap::new_with_string_limit(8, 64);
+        let runtime = super::host_to_runtime_value(
+            host.clone(),
+            Some(ValueType::Named(type_id)),
+            Some(&mut heap),
+            &[],
+            &struct_types,
+        )
+        .unwrap();
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(args.get(0), Ok(&host));
+        assert_eq!(
+            super::host_to_runtime_value(
+                HostValue::Struct(vec![HostValue::I32(7)]),
+                Some(ValueType::Named(type_id)),
+                Some(&mut heap),
+                &[],
+                &struct_types,
+            ),
+            Err(HostTrap::Type)
+        );
+
+        let completion = HostPayload::Struct(vec![
+            HostPayload::I32(8),
+            HostPayload::String("resume".into()),
+        ]);
+        let planned =
+            super::plan_host_payload(&completion, ValueType::Named(type_id), &[], &struct_types)
+                .unwrap();
+        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
+        let mut reservation = heap.preflight(2).unwrap();
+        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(
+            args.get(0),
+            Ok(&HostValue::Struct(vec![
+                HostValue::I32(8),
+                HostValue::String("resume".into()),
+            ]))
         );
     }
 

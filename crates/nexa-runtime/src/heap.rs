@@ -12,6 +12,9 @@ pub struct GcRef {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+// Struct storage stays inline so construction and `with` updates use only the
+// preallocated heap slot pool instead of allocating a system-heap side object.
+#[allow(clippy::large_enum_variant)]
 pub enum Object {
     String(String),
     I32Array(Vec<i32>),
@@ -21,6 +24,12 @@ pub enum Object {
         variant: StableId,
         tag: u32,
         payload: Option<RuntimeValue>,
+    },
+    Struct {
+        type_id: StableId,
+        fields: [RuntimeValue; nexa_bytecode::MAX_STRUCT_FIELDS],
+        field_count: u8,
+        hash: u64,
     },
     Class {
         fields: Vec<GcRef>,
@@ -36,6 +45,21 @@ impl Object {
                 .iter()
                 .filter_map(|payload| match payload {
                     RuntimeValue::String { reference, .. }
+                    | RuntimeValue::Struct { reference, .. }
+                    | RuntimeValue::Ref(reference)
+                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
+                    _ => None,
+                })
+                .collect(),
+            Self::Struct {
+                fields,
+                field_count,
+                ..
+            } => fields[..usize::from(*field_count)]
+                .iter()
+                .filter_map(|field| match field {
+                    RuntimeValue::String { reference, .. }
+                    | RuntimeValue::Struct { reference, .. }
                     | RuntimeValue::Ref(reference)
                     | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
                     _ => None,
@@ -312,6 +336,274 @@ impl Heap {
         }
     }
 
+    pub fn allocate_struct(
+        &mut self,
+        type_id: StableId,
+        fields: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        if fields.len() > nexa_bytecode::MAX_STRUCT_FIELDS {
+            return Err(HeapError::CapacityExhausted);
+        }
+        let mut reservation = self.preflight(1)?;
+        self.commit_struct(&mut reservation, type_id, fields)
+    }
+
+    pub(crate) fn commit_struct(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        fields: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        if fields.len() > nexa_bytecode::MAX_STRUCT_FIELDS {
+            return Err(HeapError::CapacityExhausted);
+        }
+        let hash = self.structural_hash(type_id, fields)?;
+        let mut stored = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+        stored[..fields.len()].copy_from_slice(fields);
+        let reference = self.commit(
+            reservation,
+            Object::Struct {
+                type_id,
+                fields: stored,
+                field_count: u8::try_from(fields.len()).expect("struct field limit fits into u8"),
+                hash,
+            },
+        );
+        Ok(RuntimeValue::Struct {
+            reference,
+            type_id,
+            hash,
+        })
+    }
+
+    pub fn struct_fields(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+        let RuntimeValue::Struct {
+            reference,
+            type_id,
+            hash,
+        } = value
+        else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        match self.resolve(reference)? {
+            Object::Struct {
+                type_id: actual,
+                fields,
+                field_count,
+                hash: actual_hash,
+            } if *actual == type_id && *actual_hash == hash => {
+                Ok(&fields[..usize::from(*field_count)])
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn struct_field(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        self.struct_fields(value)?
+            .get(index)
+            .copied()
+            .ok_or(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }))
+    }
+
+    pub fn struct_with(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        replacement: RuntimeValue,
+    ) -> Result<RuntimeValue, HeapError> {
+        let RuntimeValue::Struct { type_id, .. } = value else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        let fields = self.struct_fields(value)?;
+        if index >= fields.len() {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        }
+        let mut updated = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+        updated[..fields.len()].copy_from_slice(fields);
+        updated[index] = replacement;
+        self.allocate_struct(type_id, &updated[..fields.len()])
+    }
+
+    pub fn struct_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
+        let (
+            RuntimeValue::Struct {
+                type_id: lhs_type,
+                hash: lhs_hash,
+                ..
+            },
+            RuntimeValue::Struct {
+                type_id: rhs_type,
+                hash: rhs_hash,
+                ..
+            },
+        ) = (lhs, rhs)
+        else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        if lhs_type != rhs_type || lhs_hash != rhs_hash {
+            return Ok(false);
+        }
+        let lhs = self.struct_fields(lhs)?;
+        let rhs = self.struct_fields(rhs)?;
+        if lhs.len() != rhs.len() {
+            return Ok(false);
+        }
+        lhs.iter().zip(rhs).try_fold(true, |equal, (lhs, rhs)| {
+            Ok(equal && self.runtime_value_equal(*lhs, *rhs)?)
+        })
+    }
+
+    fn structural_hash(
+        &self,
+        type_id: StableId,
+        fields: &[RuntimeValue],
+    ) -> Result<u64, HeapError> {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        write_hash(&mut hash, &type_id.0.to_le_bytes());
+        for field in fields {
+            write_hash(&mut hash, &self.runtime_value_hash(*field)?.to_le_bytes());
+        }
+        Ok(hash)
+    }
+
+    fn runtime_value_hash(&self, value: RuntimeValue) -> Result<u64, HeapError> {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        match value {
+            RuntimeValue::I32(value) => {
+                write_hash(&mut hash, &[1]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::I64(value) => {
+                write_hash(&mut hash, &[2]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::F32(value) => {
+                write_hash(&mut hash, &[3]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::F64(value) => {
+                write_hash(&mut hash, &[4]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::Bool(value) => write_hash(&mut hash, &[5, u8::from(value)]),
+            RuntimeValue::Rune(value) => {
+                write_hash(&mut hash, &[6]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::String { hash: value, .. } | RuntimeValue::Struct { hash: value, .. } => {
+                write_hash(&mut hash, &[7]);
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::NamedRef { reference, type_id } => {
+                write_hash(&mut hash, &[8]);
+                write_hash(&mut hash, &type_id.0.to_le_bytes());
+                let (_, variant, tag, payload) =
+                    self.enum_parts(RuntimeValue::NamedRef { reference, type_id })?;
+                write_hash(&mut hash, &variant.0.to_le_bytes());
+                write_hash(&mut hash, &tag.to_le_bytes());
+                if let Some(payload) = payload {
+                    write_hash(&mut hash, &self.runtime_value_hash(payload)?.to_le_bytes());
+                }
+            }
+            RuntimeValue::Ref(reference) => {
+                write_hash(&mut hash, &[9]);
+                write_hash(&mut hash, &reference.index.to_le_bytes());
+                write_hash(&mut hash, &reference.generation.to_le_bytes());
+            }
+            RuntimeValue::HostRequest(value) => {
+                write_hash(&mut hash, &[10]);
+                write_hash(&mut hash, &value.raw().index.to_le_bytes());
+                write_hash(&mut hash, &value.raw().generation.to_le_bytes());
+            }
+            RuntimeValue::ResourceToken(value) => {
+                write_hash(&mut hash, &[11]);
+                write_hash(&mut hash, &value.raw().index.to_le_bytes());
+                write_hash(&mut hash, &value.raw().generation.to_le_bytes());
+            }
+            RuntimeValue::Snapshot(value) => {
+                write_hash(&mut hash, &[12]);
+                write_hash(&mut hash, &value.raw().index.to_le_bytes());
+                write_hash(&mut hash, &value.raw().generation.to_le_bytes());
+            }
+            RuntimeValue::Opaque { value, type_id } => {
+                write_hash(&mut hash, &[13]);
+                write_hash(&mut hash, &type_id.0.to_le_bytes());
+                write_hash(&mut hash, &value.to_le_bytes());
+            }
+            RuntimeValue::StateHandle {
+                domain,
+                stable_id,
+                generation,
+                handle_type,
+            } => {
+                write_hash(&mut hash, &[14]);
+                write_hash(&mut hash, &domain.to_le_bytes());
+                write_hash(&mut hash, &stable_id.0.to_le_bytes());
+                write_hash(&mut hash, &generation.to_le_bytes());
+                write_hash(&mut hash, &handle_type.0.to_le_bytes());
+            }
+            RuntimeValue::Unit => write_hash(&mut hash, &[15]),
+        }
+        Ok(hash)
+    }
+
+    #[allow(clippy::float_cmp)]
+    fn runtime_value_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
+        Ok(match (lhs, rhs) {
+            (RuntimeValue::F32(lhs), RuntimeValue::F32(rhs)) => {
+                f32::from_bits(lhs) == f32::from_bits(rhs)
+            }
+            (RuntimeValue::F64(lhs), RuntimeValue::F64(rhs)) => {
+                f64::from_bits(lhs) == f64::from_bits(rhs)
+            }
+            (
+                RuntimeValue::String { reference: lhs, .. },
+                RuntimeValue::String { reference: rhs, .. },
+            ) => self.string(lhs)? == self.string(rhs)?,
+            (lhs @ RuntimeValue::Struct { .. }, rhs @ RuntimeValue::Struct { .. }) => {
+                self.struct_equal(lhs, rhs)?
+            }
+            (
+                lhs @ RuntimeValue::NamedRef {
+                    type_id: lhs_type, ..
+                },
+                rhs @ RuntimeValue::NamedRef {
+                    type_id: rhs_type, ..
+                },
+            ) if lhs_type == rhs_type => {
+                let (_, lhs_variant, lhs_tag, lhs_payload) = self.enum_parts(lhs)?;
+                let (_, rhs_variant, rhs_tag, rhs_payload) = self.enum_parts(rhs)?;
+                lhs_variant == rhs_variant
+                    && lhs_tag == rhs_tag
+                    && match (lhs_payload, rhs_payload) {
+                        (Some(lhs), Some(rhs)) => self.runtime_value_equal(lhs, rhs)?,
+                        (None, None) => true,
+                        _ => false,
+                    }
+            }
+            _ => lhs == rhs,
+        })
+    }
+
     pub fn resolve(&self, reference: GcRef) -> Result<&Object, HeapError> {
         let slot = self
             .slots
@@ -379,6 +671,13 @@ impl Heap {
 
     fn validate_reference(&self, reference: GcRef) -> Result<(), HeapError> {
         self.resolve(reference).map(|_| ())
+    }
+}
+
+fn write_hash(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
     }
 }
 

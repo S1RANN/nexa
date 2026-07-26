@@ -7,6 +7,7 @@ use nexa_core::{FileId, SourceSpan, StableId};
 
 pub const MAGIC: [u8; 4] = *b"NXBC";
 pub const BYTECODE_VERSION: u16 = 4;
+pub const MAX_STRUCT_FIELDS: usize = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -195,6 +196,18 @@ pub struct EnumVariant {
 pub struct EnumType {
     pub type_id: StableId,
     pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StructField {
+    pub stable_id: StableId,
+    pub ty: ValueType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructType {
+    pub type_id: StableId,
+    pub fields: Vec<StructField>,
 }
 
 #[must_use]
@@ -581,6 +594,28 @@ pub enum Instruction {
         variant: StableId,
         dst: u16,
     },
+    StructNew {
+        type_id: StableId,
+        fields_base: u16,
+        fields_count: u16,
+        dst: u16,
+    },
+    StructGet {
+        source: u16,
+        field: StableId,
+        dst: u16,
+    },
+    StructWith {
+        source: u16,
+        field: StableId,
+        value: u16,
+        dst: u16,
+    },
+    StructEqual {
+        lhs: u16,
+        rhs: u16,
+        dst: u16,
+    },
     StateFinish,
     StateOldFieldGet {
         object: u16,
@@ -655,6 +690,7 @@ pub struct Module {
     pub strings: Vec<String>,
     pub functions: Vec<Function>,
     pub enum_types: Vec<EnumType>,
+    pub struct_types: Vec<StructType>,
     pub host_imports: Vec<HostImport>,
     pub exports: Vec<ScriptExport>,
     pub state_schema: StateSchema,
@@ -1002,6 +1038,24 @@ impl Module {
         let mut output = Vec::new();
         put_u32(
             &mut output,
+            u32::try_from(self.struct_types.len()).expect("struct type count exceeds wire format"),
+        );
+        for struct_type in &self.struct_types {
+            put_u64(&mut output, struct_type.type_id.0);
+            put_u16(
+                &mut output,
+                u16::try_from(struct_type.fields.len())
+                    .expect("struct field count exceeds wire format"),
+            );
+            for field in &struct_type.fields {
+                put_u64(&mut output, field.stable_id.0);
+                encode_type(&mut output, field.ty);
+            }
+        }
+        let structs = output;
+        let mut output = Vec::new();
+        put_u32(
+            &mut output,
             u32::try_from(self.state_schema.types.len())
                 .expect("state type count exceeds wire format"),
         );
@@ -1206,7 +1260,7 @@ impl Module {
             (SectionKind::Types, empty()),
             (SectionKind::Constants, empty()),
             (SectionKind::Enums, enums),
-            (SectionKind::Structs, empty()),
+            (SectionKind::Structs, structs),
             (SectionKind::Classes, empty()),
             (SectionKind::HostImports, host_imports),
             (SectionKind::StateSchemas, state_schemas),
@@ -1301,6 +1355,7 @@ impl Module {
         );
         metadata.extend_from_slice(required_section(&sections, SectionKind::HostImports)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Enums)?);
+        metadata.extend_from_slice(required_section(&sections, SectionKind::Structs)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::StateSchemas)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Exports)?);
         let function_bytes = required_section(&sections, SectionKind::Functions)?;
@@ -1433,6 +1488,27 @@ impl Module {
             }
             enum_types.push(EnumType { type_id, variants });
         }
+        let struct_type_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        enforce_limit(struct_type_count, limits.max_structs, "structs")?;
+        let mut struct_types = Vec::with_capacity(struct_type_count);
+        let mut total_fields = 0_usize;
+        for _ in 0..struct_type_count {
+            let type_id = StableId(reader.u64()?);
+            let field_count = usize::from(reader.u16()?);
+            total_fields = total_fields
+                .checked_add(field_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_fields, limits.max_fields, "fields")?;
+            let mut fields = Vec::with_capacity(field_count);
+            for _ in 0..field_count {
+                fields.push(StructField {
+                    stable_id: StableId(reader.u64()?),
+                    ty: decode_type(&mut reader)?,
+                });
+            }
+            struct_types.push(StructType { type_id, fields });
+        }
         let state_type_count =
             usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
         if state_type_count > limits.max_state_types {
@@ -1442,7 +1518,6 @@ impl Module {
             return Err(DecodeError::Truncated);
         }
         let mut state_types = Vec::with_capacity(state_type_count);
-        let mut total_fields = 0_usize;
         for _ in 0..state_type_count {
             let stable_id = StableId(reader.u64()?);
             let version = reader.u32()?;
@@ -1659,6 +1734,7 @@ impl Module {
             strings,
             functions,
             enum_types,
+            struct_types,
             host_imports,
             exports,
             state_schema: StateSchema { types: state_types },
@@ -2049,6 +2125,42 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, dst);
             put_u16(output, lhs);
             put_u16(output, rhs);
+        }
+        Instruction::StructNew {
+            type_id,
+            fields_base,
+            fields_count,
+            dst,
+        } => {
+            output.push(60);
+            put_u64(output, type_id.0);
+            put_u16(output, fields_base);
+            put_u16(output, fields_count);
+            put_u16(output, dst);
+        }
+        Instruction::StructGet { source, field, dst } => {
+            output.push(61);
+            put_u16(output, source);
+            put_u64(output, field.0);
+            put_u16(output, dst);
+        }
+        Instruction::StructWith {
+            source,
+            field,
+            value,
+            dst,
+        } => {
+            output.push(62);
+            put_u16(output, source);
+            put_u64(output, field.0);
+            put_u16(output, value);
+            put_u16(output, dst);
+        }
+        Instruction::StructEqual { lhs, rhs, dst } => {
+            output.push(63);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+            put_u16(output, dst);
         }
         Instruction::Jump { target } => {
             output.push(7);
@@ -2465,6 +2577,28 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 _ => unreachable!(),
             }
         }
+        60 => Instruction::StructNew {
+            type_id: StableId(reader.u64()?),
+            fields_base: reader.u16()?,
+            fields_count: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        61 => Instruction::StructGet {
+            source: reader.u16()?,
+            field: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        62 => Instruction::StructWith {
+            source: reader.u16()?,
+            field: StableId(reader.u64()?),
+            value: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        63 => Instruction::StructEqual {
+            lhs: reader.u16()?,
+            rhs: reader.u16()?,
+            dst: reader.u16()?,
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -2574,6 +2708,7 @@ pub struct ModuleBuilder {
     strings: Vec<String>,
     functions: Vec<Function>,
     enum_types: Vec<EnumType>,
+    struct_types: Vec<StructType>,
     host_imports: Vec<HostImport>,
     exports: Vec<ScriptExport>,
     state_schema: StateSchema,
@@ -2590,6 +2725,7 @@ impl ModuleBuilder {
             strings: Vec::new(),
             functions: Vec::new(),
             enum_types: Vec::new(),
+            struct_types: Vec::new(),
             host_imports: Vec::new(),
             exports: Vec::new(),
             state_schema: StateSchema { types: Vec::new() },
@@ -2646,6 +2782,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn struct_type(&mut self, struct_type: StructType) -> &mut Self {
+        self.struct_types.push(struct_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -2682,6 +2823,7 @@ impl ModuleBuilder {
             strings: self.strings,
             functions: self.functions,
             enum_types: self.enum_types,
+            struct_types: self.struct_types,
             host_imports: self.host_imports,
             exports: self.exports,
             state_schema: self.state_schema,
@@ -2855,7 +2997,8 @@ mod tests {
     use super::{
         DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder, FunctionEffect,
         Instruction, Module, ModuleBuilder, SectionKind, Signature, SourceMapEntry, StateField,
-        StateSchema, StateType, ValueType, result_type, state_handle_error_type, state_handle_type,
+        StateSchema, StateType, StructField, StructType, ValueType, result_type,
+        state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -3404,5 +3547,69 @@ mod tests {
         let checksum = super::checksum(&invalid_utf8[offset..offset + length]);
         invalid_utf8[24..28].copy_from_slice(&checksum.to_le_bytes());
         assert_eq!(Module::decode(&invalid_utf8), Err(DecodeError::InvalidUtf8));
+    }
+
+    #[test]
+    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+        let type_id = nexa_core::StableId::from_name("Position");
+        let x = nexa_core::StableId::from_parts(&["Position", "::x"]);
+        let fields = vec![
+            StructField {
+                stable_id: x,
+                ty: ValueType::I32,
+            },
+            StructField {
+                stable_id: nexa_core::StableId::from_parts(&["Position", "::label"]),
+                ty: ValueType::String,
+            },
+        ];
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::I32, ValueType::String],
+                result: Some(ValueType::Bool),
+            },
+            7,
+        );
+        function
+            .emit(Instruction::StructNew {
+                type_id,
+                fields_base: 0,
+                fields_count: 2,
+                dst: 2,
+            })
+            .emit(Instruction::StructGet {
+                source: 2,
+                field: x,
+                dst: 3,
+            })
+            .emit(Instruction::StructWith {
+                source: 2,
+                field: x,
+                value: 3,
+                dst: 4,
+            })
+            .emit(Instruction::StructEqual {
+                lhs: 2,
+                rhs: 4,
+                dst: 5,
+            })
+            .emit(Instruction::Return { source: 5 });
+        let mut builder = ModuleBuilder::new();
+        builder
+            .struct_type(StructType { type_id, fields })
+            .function(function.finish().unwrap());
+        let module = builder.finish();
+        let encoded = module.encode();
+        assert_eq!(Module::decode(&encoded), Ok(module));
+        assert_eq!(
+            Module::decode_with_limits(
+                &encoded,
+                DecodeLimits {
+                    max_structs: 0,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(DecodeError::ResourceLimit("structs"))
+        );
     }
 }

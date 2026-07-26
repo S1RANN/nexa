@@ -362,14 +362,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 60],
+    costs: [u16; 64],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 60],
+            costs: [1; 64],
         }
     }
 }
@@ -1458,6 +1458,98 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, payload)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::StructNew {
+                    type_id,
+                    fields_base,
+                    fields_count,
+                    dst,
+                } => {
+                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+                    for index in 0..fields_count {
+                        fields[usize::from(index)] = register(
+                            &continuation.arena,
+                            fields_base
+                                .checked_add(index)
+                                .ok_or(InterpreterError::TypeMismatch)?,
+                        )?;
+                    }
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    let value =
+                        heap.allocate_struct(type_id, &fields[..usize::from(fields_count)])?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StructGet { source, field, dst } => {
+                    let value = register(&continuation.arena, source)?;
+                    let RuntimeValue::Struct { type_id, .. } = value else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = module
+                        .module()
+                        .struct_types
+                        .iter()
+                        .find(|struct_type| struct_type.type_id == type_id)
+                        .and_then(|struct_type| {
+                            struct_type
+                                .fields
+                                .iter()
+                                .position(|candidate| candidate.stable_id == field)
+                        })
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        heap.struct_field(value, index)?,
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StructWith {
+                    source,
+                    field,
+                    value,
+                    dst,
+                } => {
+                    let source = register(&continuation.arena, source)?;
+                    let replacement = register(&continuation.arena, value)?;
+                    let RuntimeValue::Struct { type_id, .. } = source else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = module
+                        .module()
+                        .struct_types
+                        .iter()
+                        .find(|struct_type| struct_type.type_id == type_id)
+                        .and_then(|struct_type| {
+                            struct_type
+                                .fields
+                                .iter()
+                                .position(|candidate| candidate.stable_id == field)
+                        })
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        heap.struct_with(source, index, replacement)?,
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StructEqual { lhs, rhs, dst } => {
+                    let lhs = register(&continuation.arena, lhs)?;
+                    let rhs = register(&continuation.arena, rhs)?;
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Bool(heap.struct_equal(lhs, rhs)?),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StateFinish => {
                     migration
                         .as_deref_mut()
@@ -1721,6 +1813,7 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::Bool(_) => Some(ValueType::Bool),
         RuntimeValue::Rune(_) => Some(ValueType::Rune),
         RuntimeValue::String { .. } => Some(ValueType::String),
+        RuntimeValue::Struct { type_id, .. } => Some(ValueType::Named(type_id)),
         RuntimeValue::Ref(_) => Some(ValueType::Ref),
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             Some(ValueType::Named(type_id))
@@ -1786,6 +1879,8 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::LoadString { .. }
         | Instruction::StringConcat { .. }
         | Instruction::EnumNew { .. }
+        | Instruction::StructNew { .. }
+        | Instruction::StructWith { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -1860,6 +1955,10 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::StringConcat { .. } => 57,
         Instruction::StringRuneAt { .. } => 58,
         Instruction::StringHash { .. } => 59,
+        Instruction::StructNew { .. } => 60,
+        Instruction::StructGet { .. } => 61,
+        Instruction::StructWith { .. } => 62,
+        Instruction::StructEqual { .. } => 63,
     }
 }
 

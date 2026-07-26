@@ -184,6 +184,22 @@ fn render_module_dump(
             }
         }
     }
+    if render(nexa_bytecode::SectionKind::Structs) {
+        let mut structs = module.struct_types.iter().collect::<Vec<_>>();
+        structs.sort_by_key(|struct_type| struct_type.type_id);
+        for struct_type in structs {
+            writeln!(output, "struct {:016x}", struct_type.type_id.0)
+                .expect("String writes do not fail");
+            for (index, field) in struct_type.fields.iter().enumerate() {
+                writeln!(
+                    output,
+                    "  field index={index} id={:016x} type={:?}",
+                    field.stable_id.0, field.ty,
+                )
+                .expect("String writes do not fail");
+            }
+        }
+    }
     if render(nexa_bytecode::SectionKind::SourceMap) {
         render_source_map(&mut output, module);
     }
@@ -1010,9 +1026,9 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 mod tests {
     use nexa_bytecode::{
         FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
-        ValueType,
+        StructField, StructType, ValueType,
     };
-    use nexa_core::{FileId, SourceSpan};
+    use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::render_module_dump;
 
@@ -1030,6 +1046,13 @@ mod tests {
             .emit(Instruction::Return { source: 0 });
         let mut builder = ModuleBuilder::new();
         builder.string("Nexa界\n");
+        builder.struct_type(StructType {
+            type_id: StableId::from_name("Position"),
+            fields: vec![StructField {
+                stable_id: StableId::from_parts(&["Position", "::x"]),
+                ty: ValueType::I32,
+            }],
+        });
         builder.function(function.finish().unwrap());
         builder.source_map([
             SourceMapEntry {
@@ -1056,6 +1079,8 @@ mod tests {
         assert!(full.contains("header magic=NXBC version=4 sections=16"));
         assert!(full.contains("000000 LoadI32"));
         assert!(full.contains("string 0 \"Nexa界\\n\""));
+        assert!(full.contains("struct "));
+        assert!(full.contains("field index=0"));
         assert!(
             full.find("pc=0..1")
                 .expect("first source map entry is present")
