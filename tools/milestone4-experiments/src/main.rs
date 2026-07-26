@@ -149,6 +149,11 @@ fn run_h1() -> Result<H1Report, Box<dyn std::error::Error>> {
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn gate1_h1_value() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::to_value(run_h1()?)?)
+}
+
 struct H1StaleRegistry {
     hash: StableId,
 }
@@ -239,6 +244,11 @@ fn run_h2() -> Result<H2Report, Box<dyn std::error::Error>> {
         matrix_size: cases.len(),
         cases,
     })
+}
+
+#[allow(dead_code)]
+pub(crate) fn gate1_h2_value() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::to_value(run_h2()?)?)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -533,6 +543,11 @@ fn run_h3() -> Result<H3Report, Box<dyn std::error::Error>> {
     })
 }
 
+#[allow(dead_code)]
+pub(crate) fn gate1_h3_value() -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    Ok(serde_json::to_value(run_h3()?)?)
+}
+
 fn insert_h3_state(
     realm: &mut RealmRuntime,
     module: nexa_runtime::ModuleHandle,
@@ -650,80 +665,11 @@ impl HostRegistry for H3Registry {
     }
 }
 
-const H3_IDL: &str = r#"
-interface ReloadHost {
-    enum ReloadError { Failed, Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, ReloadError>>;
-}
-"#;
-
-const H3_V1: &str = r#"
-module reload.v1;
-import reload_host;
-@stateful(1) class ReloadState { value: i32; legacy: i32; }
-@stateful(1) class StableState { value: i32; }
-task fn wait(value: i32) -> Result<i32, ReloadError> {
-    return await reload_host.wait(value);
-}
-"#;
-
-const H3_V2: &str = r#"
-module reload.v2;
-import reload_host;
-@stateful(2) class ReloadState { value: i32; total: i32; }
-@stateful(1) class StableState { value: i32; }
-migration fn migrate() -> bool {
-    let old_state: ReloadState = old.get<ReloadState>(primary);
-    let value: i32 = old.field<i32>(old_state, ReloadState.value);
-    let state: ReloadState = new.create<ReloadState>(primary);
-    new.set(state, ReloadState.value, value);
-    new.set(state, ReloadState.total, 1);
-    replace(primary, state);
-    preserve(kept);
-    delete(removed);
-    finish_migration();
-    return true;
-}
-task fn wait(value: i32) -> Result<i32, ReloadError> {
-    return await reload_host.wait(value);
-}
-@activation fn activate() -> bool { return true; }
-"#;
-
-const H3_V3: &str = r#"
-module reload.v3;
-import reload_host;
-@stateful(3) class ReloadState { value: i32; total: i32; active: bool; }
-@stateful(1) class StableState { value: i32; }
-migration fn migrate() -> bool {
-    let old_state: ReloadState = old.get<ReloadState>(primary);
-    let value: i32 = old.field<i32>(old_state, ReloadState.value);
-    let total: i32 = old.field<i32>(old_state, ReloadState.total);
-    let state: ReloadState = new.create<ReloadState>(primary);
-    new.set(state, ReloadState.value, value);
-    new.set(state, ReloadState.total, total);
-    new.set(state, ReloadState.active, true);
-    replace(primary, state);
-    preserve(kept);
-    finish_migration();
-    return true;
-}
-task fn wait(value: i32) -> Result<i32, ReloadError> {
-    return await reload_host.wait(value);
-}
-@activation fn activate() -> bool { return true; }
-"#;
-
-const H3_FAULT: &str = r#"
-module reload.fault;
-import reload_host;
-@stateful(3) class ReloadState { value: i32; total: i32; active: bool; }
-@stateful(1) class StableState { value: i32; }
-task fn wait(value: i32) -> Result<i32, ReloadError> {
-    return await reload_host.wait(value);
-}
-@activation fn activate(value: i32) -> i32 { return value; }
-"#;
+const H3_IDL: &str = include_str!("../../../experiments/gate1/h3/host.idl");
+const H3_V1: &str = include_str!("../../../experiments/gate1/h3/v1.nexa");
+const H3_V2: &str = include_str!("../../../experiments/gate1/h3/v2.nexa");
+const H3_V3: &str = include_str!("../../../experiments/gate1/h3/v3.nexa");
+const H3_FAULT: &str = include_str!("../../../experiments/gate1/h3/faulted.nexa");
 
 fn h3_fixture() -> StateFixture {
     StateFixture {

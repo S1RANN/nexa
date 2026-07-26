@@ -1,0 +1,7 @@
+module reload.v1;
+import reload_host;
+@stateful(1) class ReloadState { value: i32; legacy: i32; }
+@stateful(1) class StableState { value: i32; }
+task fn wait(value: i32) -> Result<i32, ReloadError> {
+    return await reload_host.wait(value);
+}

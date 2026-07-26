@@ -1,0 +1,15 @@
+{
+  "max_modules": 8,
+  "max_tasks": 4096,
+  "max_scopes": 1024,
+  "max_continuations": 4096,
+  "max_scheduler_tokens": 4096,
+  "max_host_requests": 2048,
+  "max_completion_reservations": 2048,
+  "max_host_resources": 4096,
+  "max_snapshots": 1024,
+  "max_release_reservations": 4096,
+  "max_reload_buffered_completions": 2048,
+  "max_retired_epochs": 8,
+  "review_note": "Template only; replace with measured Pilot peak plus documented margin."
+}

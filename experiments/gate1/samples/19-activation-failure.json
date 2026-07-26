@@ -1,0 +1,1 @@
+{"id":"G1-S19","input":{"candidate":"faulted"},"expected":{"state":"ActivationFaulted"},"language":["activation"],"runtime_path":"H3/commit","resource_limit":64,"hash":"bound-by-manifest"}

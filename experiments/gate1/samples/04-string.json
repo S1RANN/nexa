@@ -1,0 +1,1 @@
+{"id":"G1-S04","input":{"text":"nexa"},"expected":{"bytes":4},"language":["string"],"runtime_path":"H2/string_concat","resource_limit":64,"hash":"bound-by-manifest"}

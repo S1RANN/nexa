@@ -1,0 +1,1 @@
+{"id":"G1-S18","input":{"completion":"during-quiesce"},"expected":{"buffered":1,"replayed":1},"language":["async completion"],"runtime_path":"H3/rollback","resource_limit":64,"hash":"bound-by-manifest"}

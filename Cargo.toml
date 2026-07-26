@@ -6,6 +6,8 @@ members = [
     "tools/benchmark-v6",
     "tools/contract-gate-protocol",
     "tools/contract-gates",
+    "tools/gate1-decision",
+    "tools/gate1-experiments",
     "tools/milestone4-experiments",
     "tools/release-audit",
 ]

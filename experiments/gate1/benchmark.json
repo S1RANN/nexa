@@ -1,0 +1,15 @@
+{
+  "warmup_samples": 100,
+  "timed_samples": 1000,
+  "independent_processes": 3,
+  "calls_per_frame": [500, 1000],
+  "first_slice_promotion_percent": [[95, 5], [99, 1]],
+  "trace": [false, true],
+  "host_call": [false, true],
+  "value_shape": ["scalar", "complex"],
+  "outcomes": ["success", "error", "cancel", "abandon"],
+  "yield_modes": ["fuel", "explicit"],
+  "timing_tolerance_percent": 50,
+  "max_coefficient_of_variation": 2.0,
+  "seed": 557074319
+}

@@ -1,0 +1,19 @@
+{
+  "allocator": "System, observed by isolated tools/allocation-observer global wrapper",
+  "architecture": "aarch64",
+  "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "commit_sha": "IMPLEMENTATION_COMMIT",
+  "cpu": "Apple M4 Pro",
+  "feature_flags": [
+    "nexa-runtime/allocation-counting"
+  ],
+  "memory": "24 GB",
+  "os": "macos",
+  "os_version": "Darwin 25.5.0",
+  "power_mode": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=34668643)\t100%; charged; 0:00 remaining present: true",
+  "profile": "release for timed benchmark; debug for semantic matrices",
+  "rust": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "schema_version": 1,
+  "seed": 557074319,
+  "tree_sha": "IMPLEMENTATION_TREE"
+}

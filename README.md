@@ -12,14 +12,20 @@ narrow questions:
 3. Can single-module stateful reload preserve gameplay state with commit-before-activation
    semantics?
 
-The normative specification lives under [`baseline/`](baseline/BASELINE_INDEX.md). Historical
-design discussions are rationale only and have no normative force.
+The normative specification lives under [`baseline/`](baseline/BASELINE_INDEX.md). The single
+global stage map is [`ROADMAP.md`](ROADMAP.md). Historical design discussions are rationale only
+and have no normative force.
 
 The current minimum supported Rust toolchain is **1.97.1**.
 
-## Current milestone
+## Current status
 
-The repository implements **Milestone 2B — Unified Executable Runtime**:
+```text
+Current implementation milestone: 4.0R3 complete
+Current project gate: Gate 1 experiment preparation/execution
+```
+
+The implemented MVR execution path is:
 
 ```text
 Nexa source
@@ -50,6 +56,14 @@ cargo run --release -p nexa-runtime --example fast_task_bench --features allocat
 
 The reproducible real-path benchmark result is recorded in
 [`reports/fast_task_benchmark_v1.md`](reports/fast_task_benchmark_v1.md).
+
+Gate 1 is governed by the
+[`MVR Scope`](baseline/mvr/MVR_SCOPE.md),
+[`Gate 1 acceptance criteria`](baseline/testing/GATE1_ACCEPTANCE.md),
+[`frozen experiment manifest`](experiments/gate1/manifest.json), and
+[`final decision`](reports/gate1_final_decision.md). The
+[`Baseline Index`](baseline/BASELINE_INDEX.md) defines their precedence. `ROADMAP.md` is the only
+roadmap; this README deliberately does not duplicate it.
 
 Run the workspace checks:
 

@@ -1,0 +1,1 @@
+{"id":"G1-S11","input":{"entity":7},"expected":{"released":true},"language":["ResourceToken"],"runtime_path":"H2/action_lock","resource_limit":8,"hash":"bound-by-manifest"}

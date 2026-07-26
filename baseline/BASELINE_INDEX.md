@@ -1,15 +1,30 @@
 # Nexa Architecture Baseline Index
 
-Version: **1.0.2**
+Version: **1.1.0**
 
 This is the only entry point for normative Nexa specifications. Historical design documents are
 non-normative rationale. When texts conflict, precedence is:
 
 ```text
 MVR Scope 1.0
+> Gate 1 Acceptance
 > current Architecture Baseline snapshot
+> Roadmap
 > historical rationale
 ```
+
+## Current gate
+
+Milestone 4.0R3 is complete at receipt
+`reports/contracts/milestone4r3_verification_receipt.json`. The current gate is Gate 1. Its
+normative experiment entry points are:
+
+- `testing/GATE1_ACCEPTANCE.md` — frozen acceptance semantics;
+- `testing/GATE1_MACHINE.md` — experiment lifecycle;
+- `../experiments/gate1/manifest.json` — frozen input binding;
+- `../reports/gate1_final_decision.md` — generated terminal decision.
+
+`../ROADMAP.md` provides navigation only and cannot change normative semantics.
 
 ## Active decisions
 
@@ -31,6 +46,8 @@ MVR Scope 1.0
 | D58 | Active | MVR | `runtime/HOST_REQUEST_MACHINE.md` | sender-wide completion reservation |
 | D59 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | allocating Realm release transfer |
 | D60 | Active | MVR | `runtime/RETIRED_EPOCH.md` | per-frame retired-module scan |
+| D61 | Active | Gate 1 | `testing/GATE1_ACCEPTANCE.md` | post-result threshold selection |
+| D62 | Active | Gate 1 | `testing/GATE1_MACHINE.md` | informal experiment lifecycle |
 
 ## Deferred decisions
 

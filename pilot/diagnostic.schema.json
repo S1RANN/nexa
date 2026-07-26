@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Nexa Pilot Diagnostic",
+  "type": "object",
+  "required": ["code", "phase", "message", "implementation_sha", "module_hash"],
+  "properties": {
+    "code": {"type": "string", "pattern": "^NX[0-9]{4}$"},
+    "phase": {"enum": ["build", "load", "runtime", "migration", "activation"]},
+    "message": {"type": "string"},
+    "implementation_sha": {"type": "string"},
+    "module_hash": {"type": "string"},
+    "task": {"type": ["integer", "null"]},
+    "module": {"type": ["integer", "null"]},
+    "request": {"type": ["integer", "null"]},
+    "script_stack": {"type": "array", "items": {"type": "object"}},
+    "runtime_snapshot": {"type": "object"},
+    "trace": {"type": "array"}
+  }
+}

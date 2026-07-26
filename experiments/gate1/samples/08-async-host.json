@@ -1,0 +1,1 @@
+{"id":"G1-S08","input":{"entity":7},"expected":{"result":"Ok"},"language":["async HostCall","Result"],"runtime_path":"H3/wait","resource_limit":64,"hash":"bound-by-manifest"}

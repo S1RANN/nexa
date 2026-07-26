@@ -1,0 +1,1 @@
+{"id":"G1-S20","input":{"epochs":2},"expected":{"independent_reap":true},"language":["retired epoch"],"runtime_path":"H3/v1-v2-v3","resource_limit":64,"hash":"bound-by-manifest"}

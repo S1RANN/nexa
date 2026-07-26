@@ -1,0 +1,1 @@
+{"id":"G1-S09","input":{"entity":7},"expected":{"option":"Some","result":"Ok"},"language":["Result","Option"],"runtime_path":"H1/generated-bindings","resource_limit":64,"hash":"bound-by-manifest"}

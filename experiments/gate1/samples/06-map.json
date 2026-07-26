@@ -1,0 +1,1 @@
+{"id":"G1-S06","input":{"entries":[["a",1],["b",2]]},"expected":{"value":2},"language":["Map"],"runtime_path":"H2/map_operations","resource_limit":64,"hash":"bound-by-manifest"}

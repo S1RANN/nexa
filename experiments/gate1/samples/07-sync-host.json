@@ -1,0 +1,1 @@
+{"id":"G1-S07","input":{"entity":7,"amount":3},"expected":{"value":10},"language":["sync HostCall"],"runtime_path":"H2/simple_host","resource_limit":64,"hash":"bound-by-manifest"}

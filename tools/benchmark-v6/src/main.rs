@@ -27,7 +27,7 @@ use serde::Serialize;
 
 const DEFAULT_SAMPLES: usize = 1_000;
 const SMOKE_SAMPLES: usize = 20;
-const WARMUP: usize = 25;
+const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
 const SCHEMA_V1: StableId = StableId(0x4245_4e43_4853_4331);
 const SCHEMA_V2: StableId = StableId(0x4245_4e43_4853_4332);
@@ -127,8 +127,14 @@ struct CaseStats {
     throughput_ops_per_second: u64,
     mean_ns: u128,
     p50_ns: u128,
+    p90_ns: u128,
     p95_ns: u128,
     p99_ns: u128,
+    min_ns: u128,
+    max_ns: u128,
+    standard_deviation_ns: f64,
+    coefficient_of_variation: f64,
+    frame_1000_calls_ns: u128,
     system_allocations: u64,
     heap_slots_peak: u64,
     fuel_total: u64,
@@ -365,7 +371,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let migration = migration_inputs()?;
     cases.push(bench(
         "migration",
-        samples.min(200),
+        samples,
         || (),
         |()| {
             let result = run_migrate_check(
@@ -393,7 +399,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let new_module = migration.new_module.clone();
     cases.push(bench(
         "reload_commit",
-        samples.min(200),
+        samples,
         || prepared_reload(&old_module, &new_module),
         |mut prepared| {
             let before = PeakResources::from_ledger(prepared.realm.resource_ledger());
@@ -416,7 +422,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     cases.push(bench(
         "realm_drop",
-        samples.min(200),
+        samples,
         || {
             let mut realm = RealmRuntime::isolated(RealmConfig::default());
             let module = realm
@@ -902,6 +908,16 @@ fn bench<T>(
     durations.sort_unstable();
     let total = durations.iter().sum::<Duration>().as_nanos().max(1);
     let sample_count = u64::try_from(samples).unwrap_or(u64::MAX);
+    let mean_ns = total / samples as u128;
+    let variance = durations
+        .iter()
+        .map(|duration| {
+            let delta = duration.as_nanos() as f64 - mean_ns as f64;
+            delta * delta
+        })
+        .sum::<f64>()
+        / samples as f64;
+    let standard_deviation_ns = variance.sqrt();
     let stats = CaseStats {
         case: name,
         samples,
@@ -909,10 +925,16 @@ fn bench<T>(
             (samples as u128).saturating_mul(1_000_000_000) / total,
         )
         .unwrap_or(u64::MAX),
-        mean_ns: total / samples as u128,
+        mean_ns,
         p50_ns: percentile(&durations, 50),
+        p90_ns: percentile(&durations, 90),
         p95_ns: percentile(&durations, 95),
         p99_ns: percentile(&durations, 99),
+        min_ns: durations.first().map_or(0, Duration::as_nanos),
+        max_ns: durations.last().map_or(0, Duration::as_nanos),
+        standard_deviation_ns,
+        coefficient_of_variation: standard_deviation_ns / mean_ns.max(1) as f64,
+        frame_1000_calls_ns: mean_ns.saturating_mul(1_000),
         system_allocations: allocations,
         heap_slots_peak: heap_slots,
         fuel_total: fuel,

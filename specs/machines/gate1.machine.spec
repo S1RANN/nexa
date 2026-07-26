@@ -1,0 +1,50 @@
+machine Gate1
+
+state Draft initial
+state CriteriaFrozen
+state InputsFrozen
+state Running
+state InitialResult
+state ValidityReview
+state IndependentReplay
+state DecisionReview
+state Passed terminal
+state Failed terminal
+state Invalid terminal
+state Inconclusive terminal
+state UnverifiableWithinMvr terminal
+state Stopped terminal
+
+event FreezeCriteria
+event FreezeInputs
+event Start
+event RecordResult
+event ReviewValidity
+event Replay
+event ReviewDecision
+event Pass
+event Fail
+event Invalidate
+event Inconclusive
+event ExhaustRetest
+event Stop
+event ApproveInvalidAmendment
+event ApproveInconclusiveAmendment
+
+transition GATE1_DRAFT_FREEZE_CRITERIA Draft FreezeCriteria CriteriaFrozen
+transition GATE1_CRITERIA_FREEZE_INPUTS CriteriaFrozen FreezeInputs InputsFrozen
+transition GATE1_INPUTS_START_RUNNING InputsFrozen Start Running
+transition GATE1_RUNNING_RECORD_RESULT Running RecordResult InitialResult
+transition GATE1_RESULT_REVIEW_VALIDITY InitialResult ReviewValidity ValidityReview
+transition GATE1_VALIDITY_REPLAY ValidityReview Replay IndependentReplay
+transition GATE1_REPLAY_DECISION_REVIEW IndependentReplay ReviewDecision DecisionReview
+transition GATE1_DECISION_PASS DecisionReview Pass Passed
+transition GATE1_DECISION_FAIL DecisionReview Fail Failed
+transition GATE1_DECISION_INVALID DecisionReview Invalidate Invalid
+transition GATE1_DECISION_INCONCLUSIVE DecisionReview Inconclusive Inconclusive
+transition GATE1_DECISION_UNVERIFIABLE DecisionReview ExhaustRetest UnverifiableWithinMvr
+transition GATE1_DECISION_STOP DecisionReview Stop Stopped
+transition GATE1_DECISION_INVALID_AMEND DecisionReview ApproveInvalidAmendment InputsFrozen
+transition GATE1_DECISION_INCONCLUSIVE_AMEND DecisionReview ApproveInconclusiveAmendment Running
+
+end
