@@ -60,6 +60,33 @@ impl SectionKind {
         Self::SourceMap,
         Self::ReloadMetadata,
     ];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Strings => "strings",
+            Self::Types => "types",
+            Self::Constants => "constants",
+            Self::Enums => "enums",
+            Self::Structs => "structs",
+            Self::Classes => "classes",
+            Self::HostImports => "host-imports",
+            Self::StateSchemas => "state-schemas",
+            Self::Exports => "exports",
+            Self::Functions => "functions",
+            Self::Code => "code",
+            Self::RootMaps => "root-maps",
+            Self::Safepoints => "safepoints",
+            Self::LoopBounds => "loop-bounds",
+            Self::SourceMap => "source-map",
+            Self::ReloadMetadata => "reload-metadata",
+        }
+    }
+
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|kind| kind.name() == name)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -724,6 +751,33 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 impl Module {
+    pub fn inspect_section_directory(
+        bytes: &[u8],
+        limits: DecodeLimits,
+    ) -> Result<Vec<SectionEntry>, DecodeError> {
+        if bytes.len() > limits.max_bytes {
+            return Err(DecodeError::ResourceLimit("byte length"));
+        }
+        let _ = decode_sections(bytes, limits.max_sections)?;
+        let mut reader = Reader { bytes, cursor: 0 };
+        reader.take(4)?;
+        reader.u16()?;
+        let count = usize::from(reader.u16()?);
+        let mut entries = Vec::with_capacity(count);
+        for _ in 0..count {
+            entries.push(SectionEntry {
+                kind: reader.u16()?,
+                flags: reader.u16()?,
+                offset: reader.u32()?,
+                length: reader.u32()?,
+                count: reader.u32()?,
+                checksum: reader.u32()?,
+            });
+        }
+        entries.sort_by_key(|entry| entry.kind);
+        Ok(entries)
+    }
+
     #[must_use]
     pub fn source_span(&self, function: u32, pc: u32) -> Option<SourceSpan> {
         self.source_map

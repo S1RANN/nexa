@@ -42,6 +42,8 @@ fn main() {
         [area, command] if area == "machine" && command == "check" => check_machines(),
         [area, command] if area == "model" && command == "check" => check_models(),
         [command, arguments @ ..] if command == "migrate-check" => migrate_check(arguments),
+        [command, arguments @ ..] if command == "dump" => dump_module(arguments),
+        [command, path] if command == "verify" => verify_module(Path::new(path)),
         [command, path] if command == "compile" => compile_file(Path::new(path)),
         [area, command, path] if area == "idl" && command == "check" => check_idl(Path::new(path)),
         [area, command, path] if area == "idl" && command == "generate" => {
@@ -50,6 +52,8 @@ fn main() {
         _ => Err(
             "usage: nexa baseline check | nexa machine check | nexa model check | \
              nexa compile <file> | nexa idl check|generate <file> | \
+             nexa dump [--section NAME|--source-map] <module.nxb> | \
+             nexa verify <module.nxb> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
              [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
              [MigrationLimits]"
@@ -59,6 +63,154 @@ fn main() {
     if let Err(error) = result {
         eprintln!("nexa: {error}");
         std::process::exit(1);
+    }
+}
+
+fn verify_module(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let module = nexa_bytecode::Module::decode(&bytes)
+        .map_err(|error| format!("bytecode decode failed: {error}"))?;
+    nexa_verifier::verify(module, nexa_verifier::VerifierLimits::default())
+        .map_err(|error| format!("bytecode verification failed: {error}"))?;
+    println!("verified {}", path.display());
+    Ok(())
+}
+
+fn dump_module(arguments: &[String]) -> Result<(), String> {
+    let (section, source_map_only, path) = match arguments {
+        [path] => (None, false, Path::new(path)),
+        [option, section, path] if option == "--section" => (
+            Some(
+                nexa_bytecode::SectionKind::from_name(section)
+                    .ok_or_else(|| format!("unknown bytecode section `{section}`"))?,
+            ),
+            false,
+            Path::new(path),
+        ),
+        [option, path] if option == "--source-map" => (None, true, Path::new(path)),
+        _ => {
+            return Err("usage: nexa dump [--section NAME|--source-map] <module.nxb>".to_owned());
+        }
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let module = nexa_bytecode::Module::decode(&bytes)
+        .map_err(|error| format!("bytecode decode failed: {error}"))?;
+    let rendered = render_module_dump(&bytes, &module, section, source_map_only)?;
+    print!("{rendered}");
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn render_module_dump(
+    bytes: &[u8],
+    module: &nexa_bytecode::Module,
+    selected: Option<nexa_bytecode::SectionKind>,
+    source_map_only: bool,
+) -> Result<String, String> {
+    use std::fmt::Write as _;
+
+    let directory = nexa_bytecode::Module::inspect_section_directory(
+        bytes,
+        nexa_bytecode::DecodeLimits::default(),
+    )
+    .map_err(|error| format!("bytecode directory inspection failed: {error}"))?;
+    let mut output = String::new();
+    if source_map_only {
+        render_source_map(&mut output, module);
+        return Ok(output);
+    }
+    writeln!(
+        output,
+        "header magic=NXBC version={} sections={}",
+        nexa_bytecode::BYTECODE_VERSION,
+        directory.len()
+    )
+    .expect("String writes do not fail");
+    for entry in &directory {
+        let name = nexa_bytecode::SectionKind::ALL
+            .into_iter()
+            .find(|kind| *kind as u16 == entry.kind)
+            .map_or("unknown", nexa_bytecode::SectionKind::name);
+        if selected.is_none_or(|kind| kind as u16 == entry.kind) {
+            writeln!(
+                output,
+                "section {name} kind={} flags={} offset={} length={} count={} checksum={:08x}",
+                entry.kind, entry.flags, entry.offset, entry.length, entry.count, entry.checksum
+            )
+            .expect("String writes do not fail");
+        }
+    }
+    let render = |kind| selected.is_none_or(|selected| selected == kind);
+    if render(nexa_bytecode::SectionKind::Functions) {
+        for (index, function) in module.functions.iter().enumerate() {
+            writeln!(
+                output,
+                "function {index} effect={:?} registers={} frame_bytes={} signature={:?}",
+                function.effect, function.registers, function.frame_bytes, function.signature
+            )
+            .expect("String writes do not fail");
+        }
+    }
+    if render(nexa_bytecode::SectionKind::Code) {
+        for (function, body) in module.functions.iter().enumerate() {
+            writeln!(output, "code function={function}").expect("String writes do not fail");
+            for (pc, instruction) in body.code.iter().enumerate() {
+                writeln!(output, "  {pc:06} {instruction:?}").expect("String writes do not fail");
+            }
+        }
+    }
+    if render(nexa_bytecode::SectionKind::Enums) {
+        let mut enums = module.enum_types.iter().collect::<Vec<_>>();
+        enums.sort_by_key(|enum_type| enum_type.type_id);
+        for enum_type in enums {
+            writeln!(output, "enum {:016x}", enum_type.type_id.0)
+                .expect("String writes do not fail");
+            let mut variants = enum_type.variants.iter().collect::<Vec<_>>();
+            variants.sort_by_key(|variant| (variant.tag, variant.stable_id));
+            for variant in variants {
+                writeln!(
+                    output,
+                    "  variant tag={} id={:016x} payload={:?}",
+                    variant.tag, variant.stable_id.0, variant.payload_type
+                )
+                .expect("String writes do not fail");
+            }
+        }
+    }
+    if render(nexa_bytecode::SectionKind::SourceMap) {
+        render_source_map(&mut output, module);
+    }
+    Ok(output)
+}
+
+fn render_source_map(output: &mut String, module: &nexa_bytecode::Module) {
+    use std::fmt::Write as _;
+
+    let mut entries = module.source_map.clone();
+    entries.sort_by_key(|entry| {
+        (
+            entry.function,
+            entry.pc_start,
+            entry.pc_end,
+            entry.span.file,
+            entry.span.start,
+            entry.span.end,
+        )
+    });
+    for entry in entries {
+        writeln!(
+            output,
+            "source-map function={} pc={}..{} file={} span={}..{}",
+            entry.function,
+            entry.pc_start,
+            entry.pc_end,
+            entry.span.file.0,
+            entry.span.start,
+            entry.span.end
+        )
+        .expect("String writes do not fail");
     }
 }
 
@@ -847,4 +999,71 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
                 })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use nexa_bytecode::{
+        FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
+        ValueType,
+    };
+    use nexa_core::{FileId, SourceSpan};
+
+    use super::render_module_dump;
+
+    #[test]
+    fn bytecode_dump_is_deterministic_and_supports_code_types_and_source_map_views() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        function
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::Return { source: 0 });
+        let mut builder = ModuleBuilder::new();
+        builder.function(function.finish().unwrap());
+        builder.source_map([
+            SourceMapEntry {
+                function: 0,
+                pc_start: 1,
+                pc_end: 2,
+                span: SourceSpan::new(FileId(1), 20, 26),
+            },
+            SourceMapEntry {
+                function: 0,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(1), 10, 19),
+            },
+        ]);
+        let module = builder.finish();
+        let bytes = module.encode();
+
+        let full = render_module_dump(&bytes, &module, None, false).unwrap();
+        assert_eq!(
+            full,
+            render_module_dump(&bytes, &module, None, false).unwrap()
+        );
+        assert!(full.contains("header magic=NXBC version=4 sections=16"));
+        assert!(full.contains("000000 LoadI32"));
+        assert!(
+            full.find("pc=0..1")
+                .expect("first source map entry is present")
+                < full
+                    .find("pc=1..2")
+                    .expect("second source map entry is present")
+        );
+
+        let types = render_module_dump(&bytes, &module, Some(SectionKind::Types), false).unwrap();
+        assert!(types.contains("section types"));
+        assert!(!types.contains("code function="));
+        let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
+        assert!(code.contains("section code"));
+        assert!(code.contains("000001 Return"));
+        let source_map = render_module_dump(&bytes, &module, None, true).unwrap();
+        assert!(source_map.starts_with("source-map function=0 pc=0..1"));
+    }
 }
