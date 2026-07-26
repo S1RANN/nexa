@@ -1,6 +1,7 @@
 #![allow(deprecated)]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,25 +13,50 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HeapError, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
-    HostTrap, HostValue, MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult,
-    RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeHost,
-    RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeValue, StateObject, StateValue,
-    StepConfig, TaskLimits, TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
+    CancelReason, CopyBuffer, Heap, HeapError, HostArgs, HostCallOutcome, HostErrorPayload,
+    HostPayload, HostRegistry, HostTrap, HostValue, MigrationAllocationPhase, Object,
+    PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
+    ReleaseKind, ReleaseRecord, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
+    RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
+    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
 struct CountingAllocator;
 
-static ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static HOST_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static FIRST_OPCODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MIGRATION_COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+thread_local! {
+    static ALLOCATION_OBSERVATION_ENABLED: Cell<bool> = const { Cell::new(false) };
+    static HOST_ALLOCATION_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+fn allocation_observation_enabled() -> bool {
+    ALLOCATION_OBSERVATION_ENABLED.get()
+}
+
+fn set_allocation_observation(enabled: bool) {
+    ALLOCATION_OBSERVATION_ENABLED.set(enabled);
+}
+
+fn host_allocation_active() -> bool {
+    HOST_ALLOCATION_ACTIVE.get()
+}
+
+fn set_host_allocation_active(active: bool) {
+    HOST_ALLOCATION_ACTIVE.set(active);
+}
+
 unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ENABLED.load(Ordering::Relaxed) {
+        if allocation_observation_enabled() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            if host_allocation_active() {
+                HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         unsafe { System.alloc(layout) }
     }
@@ -40,15 +66,21 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        if ENABLED.load(Ordering::Relaxed) {
+        if allocation_observation_enabled() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            if host_allocation_active() {
+                HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         unsafe { System.alloc_zeroed(layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-        if ENABLED.load(Ordering::Relaxed) {
+        if allocation_observation_enabled() {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            if host_allocation_active() {
+                HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            }
         }
         unsafe { System.realloc(pointer, layout, size) }
     }
@@ -59,10 +91,46 @@ static ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn observed(operation: impl FnOnce()) -> u64 {
     ALLOCATIONS.store(0, Ordering::SeqCst);
-    ENABLED.store(true, Ordering::SeqCst);
+    set_allocation_observation(true);
     operation();
-    ENABLED.store(false, Ordering::SeqCst);
+    set_allocation_observation(false);
     ALLOCATIONS.load(Ordering::SeqCst)
+}
+
+fn observed_host_split<T>(operation: impl FnOnce() -> T) -> (T, u64, u64) {
+    ALLOCATIONS.store(0, Ordering::SeqCst);
+    HOST_ALLOCATIONS.store(0, Ordering::SeqCst);
+    set_allocation_observation(true);
+    let result = operation();
+    set_allocation_observation(false);
+    let total = ALLOCATIONS.load(Ordering::SeqCst);
+    let host = HOST_ALLOCATIONS.load(Ordering::SeqCst);
+    (result, total.saturating_sub(host), host)
+}
+
+fn host_owned<T>(operation: impl FnOnce() -> T) -> T {
+    struct HostAllocationGuard;
+    impl Drop for HostAllocationGuard {
+        fn drop(&mut self) {
+            set_host_allocation_active(false);
+        }
+    }
+    set_host_allocation_active(true);
+    let guard = HostAllocationGuard;
+    let result = operation();
+    drop(guard);
+    result
+}
+
+#[allow(
+    dead_code,
+    clippy::extra_unused_lifetimes,
+    clippy::identity_op,
+    clippy::needless_question_mark,
+    clippy::too_many_arguments
+)]
+mod host_matrix {
+    include!(concat!(env!("OUT_DIR"), "/host_matrix.rs"));
 }
 
 fn release_buffer<const N: usize>() -> [ReleaseRecord; N] {
@@ -86,19 +154,19 @@ fn migration_observer(
             if phase == MigrationAllocationPhase::FirstOpcode {
                 FIRST_OPCODE_ACTIVE.store(true, Ordering::SeqCst);
                 ALLOCATIONS.store(0, Ordering::SeqCst);
-                ENABLED.store(true, Ordering::SeqCst);
+                set_allocation_observation(true);
             } else if !FIRST_OPCODE_ACTIVE.load(Ordering::SeqCst) {
                 ALLOCATIONS.store(0, Ordering::SeqCst);
-                ENABLED.store(true, Ordering::SeqCst);
+                set_allocation_observation(true);
             }
         }
         nexa_runtime::AllocationBoundary::End => {
             MIGRATION_COUNTS[index].store(ALLOCATIONS.load(Ordering::SeqCst), Ordering::SeqCst);
             if phase == MigrationAllocationPhase::FirstOpcode {
-                ENABLED.store(false, Ordering::SeqCst);
+                set_allocation_observation(false);
                 FIRST_OPCODE_ACTIVE.store(false, Ordering::SeqCst);
             } else if !FIRST_OPCODE_ACTIVE.load(Ordering::SeqCst) {
-                ENABLED.store(false, Ordering::SeqCst);
+                set_allocation_observation(false);
             }
         }
     }
@@ -287,7 +355,495 @@ fn observe_cleanup(cleanup_traps: bool) -> u64 {
     allocations
 }
 
+struct MatrixHost;
+
+impl host_matrix::AllocationMatrixHost for MatrixHost {
+    fn inspect<'a>(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+        name: &'a str,
+        record: host_matrix::RecordRef<'a>,
+        event: host_matrix::EventRef<'a>,
+        option: Option<host_matrix::RecordRef<'a>>,
+        result: Result<host_matrix::RecordRef<'a>, host_matrix::EventRef<'a>>,
+        array: nexa_runtime::HostArrayRef<'a>,
+        buffer: nexa_runtime::HostBufferRef<'a>,
+        nested: host_matrix::EventRef<'a>,
+    ) -> Result<i32, host_matrix::HostError> {
+        Ok(host_owned(|| {
+            let _ = (name, record, event, option, result, array, buffer, nested);
+            1
+        }))
+    }
+
+    fn inspect_scalar_collections<'a>(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+        array: nexa_runtime::HostArrayRef<'a>,
+        buffer: nexa_runtime::HostBufferRef<'a>,
+    ) -> Result<i32, host_matrix::HostError> {
+        let mut total = 0;
+        for value in array.iter().chain(buffer.iter()) {
+            total += value.i32().map_err(|_| host_matrix::HostError(String::new()))?;
+        }
+        Ok(total)
+    }
+
+    fn return_string(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<String, host_matrix::HostError> {
+        Ok(String::new())
+    }
+
+    fn return_struct(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<host_matrix::Record, host_matrix::HostError> {
+        Ok(host_matrix::Record {
+            label: host_owned(|| "record".to_owned()),
+            value: 7,
+        })
+    }
+
+    fn return_enum(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<host_matrix::Event, host_matrix::HostError> {
+        Ok(host_matrix::Event::Record(host_matrix::Record {
+            label: host_owned(|| "event".to_owned()),
+            value: 11,
+        }))
+    }
+
+    fn return_option(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Option<host_matrix::Record>, host_matrix::HostError> {
+        Ok(Some(host_matrix::Record {
+            label: host_owned(|| "option".to_owned()),
+            value: 13,
+        }))
+    }
+
+    fn return_result(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Result<host_matrix::Record, host_matrix::Event>, host_matrix::HostError> {
+        Ok(Ok(host_matrix::Record {
+            label: host_owned(|| "result".to_owned()),
+            value: 17,
+        }))
+    }
+
+    fn return_array(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Vec<i32>, host_matrix::HostError> {
+        Ok(Vec::new())
+    }
+
+    fn return_buffer(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<CopyBuffer<i32>, host_matrix::HostError> {
+        Ok(CopyBuffer::new(Vec::new()))
+    }
+
+    fn return_scalar(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<i32, host_matrix::HostError> {
+        Ok(1)
+    }
+
+    fn baseline8(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+        a: i32,
+        b: i32,
+        c: i32,
+        d: i32,
+        e: i32,
+        f: i32,
+        g: i32,
+        h: i32,
+    ) -> Result<i32, host_matrix::HostError> {
+        Ok(a + b + c + d + e + f + g + h)
+    }
+
+    fn panic_host(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<i32, host_matrix::HostError> {
+        host_owned(|| panic!("matrix host panic"))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn complex_host_allocation_matrix() {
+    let mut tasks = TaskRuntime::new(1, RuntimeLimits::default());
+    let scope = tasks.create_scope(None).unwrap();
+    let task = tasks.admit_task(scope, 1, true).unwrap();
+    let mut resources = RuntimeResources::new(1, 4, 4);
+    let mut context = resources.context(task, 0, 1);
+    let mut registry = host_matrix::GeneratedHostRegistry::new(MatrixHost);
+    let mut heap = Heap::new(64);
+    let string_reference = heap.allocate_string("nested").unwrap();
+    let string = RuntimeValue::String {
+        reference: string_reference,
+        hash: heap.string_hash(string_reference).unwrap(),
+    };
+    let record_type = StableId::from_name("Record");
+    let record = heap
+        .allocate_struct(record_type, &[string, RuntimeValue::I32(5)])
+        .unwrap();
+    let event_type = StableId::from_name("Event");
+    let event = heap
+        .allocate_enum(
+            event_type,
+            StableId::from_parts(&["Event", "::", "Record"]),
+            1,
+            Some(record),
+        )
+        .unwrap();
+    let option = nexa_bytecode::option_type(ValueType::Named(record_type));
+    let option_value = heap
+        .allocate_enum(
+            option.type_id,
+            option.variants[1].stable_id,
+            option.variants[1].tag,
+            Some(record),
+        )
+        .unwrap();
+    let result = nexa_bytecode::result_type(ValueType::Named(record_type), ValueType::Named(event_type));
+    let result_value = heap
+        .allocate_enum(
+            result.type_id,
+            result.variants[0].stable_id,
+            result.variants[0].tag,
+            Some(record),
+        )
+        .unwrap();
+    let array_type = nexa_bytecode::array_type(ValueType::Named(record_type));
+    let array_reference = heap
+        .allocate(Object::Array {
+            type_id: array_type,
+            element_type: ValueType::Named(record_type),
+            values: vec![record],
+        })
+        .unwrap();
+    let array = RuntimeValue::NamedRef {
+        reference: array_reference,
+        type_id: array_type,
+    };
+    let buffer_type = nexa_bytecode::buffer_type(ValueType::Named(record_type));
+    let buffer = heap
+        .allocate_buffer(buffer_type, ValueType::Named(record_type), &[record])
+        .unwrap();
+    let arguments = [
+        string,
+        record,
+        event,
+        option_value,
+        result_value,
+        array,
+        buffer,
+        event,
+    ];
+    let manual_decode_allocations = [
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.str_ref(0).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(1).unwrap().struct_ref(record_type).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(2).unwrap().enum_ref(event_type).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(3).unwrap().enum_ref(option.type_id).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(4).unwrap().enum_ref(result.type_id).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(5).unwrap().array_ref(array_type).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(6).unwrap().buffer_ref(buffer_type).unwrap();
+        })
+        .1,
+        observed_host_split(|| {
+            let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
+            let _ = args.value_ref(7).unwrap().enum_ref(event_type).unwrap();
+        })
+        .1,
+    ];
+    assert_eq!(manual_decode_allocations, [0; 8]);
+    registry
+        .call_runtime(
+            host_matrix::THUNK_RETURN_SCALAR,
+            &mut context,
+            RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
+        )
+        .unwrap();
+    let (_, baseline_allocations, baseline_host_allocations) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_RETURN_SCALAR,
+            &mut context,
+            RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
+        )
+    });
+    assert_eq!(baseline_host_allocations, 0);
+    let scalar_arguments = [
+        RuntimeValue::I32(1),
+        RuntimeValue::I32(2),
+        RuntimeValue::I32(3),
+        RuntimeValue::I32(4),
+        RuntimeValue::I32(5),
+        RuntimeValue::I32(6),
+        RuntimeValue::I32(7),
+        RuntimeValue::I32(8),
+    ];
+    registry
+        .call_runtime(
+            host_matrix::THUNK_BASELINE8,
+            &mut context,
+            RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
+        )
+        .unwrap();
+    let (_, eight_argument_baseline, _) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_BASELINE8,
+            &mut context,
+            RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
+        )
+    });
+    registry
+        .call_runtime(
+            host_matrix::THUNK_INSPECT,
+            &mut context,
+            RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
+        )
+        .unwrap();
+    let (outcome, thunk_allocations, host_allocations) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_INSPECT,
+            &mut context,
+            RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
+        )
+    });
+    assert!(matches!(
+        outcome,
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(_)))
+    ));
+    assert_eq!(
+        thunk_allocations.saturating_sub(eight_argument_baseline),
+        0,
+        "complex borrowed input decode"
+    );
+    assert_eq!(host_allocations, 0, "input-only host implementation");
+
+    let scalar_array_type = nexa_bytecode::array_type(ValueType::I32);
+    let scalar_array_reference = heap
+        .allocate(Object::Array {
+            type_id: scalar_array_type,
+            element_type: ValueType::I32,
+            values: vec![RuntimeValue::I32(2), RuntimeValue::I32(3)],
+        })
+        .unwrap();
+    let scalar_buffer_type = nexa_bytecode::buffer_type(ValueType::I32);
+    let scalar_buffer = heap
+        .allocate_buffer(
+            scalar_buffer_type,
+            ValueType::I32,
+            &[RuntimeValue::I32(5), RuntimeValue::I32(7)],
+        )
+        .unwrap();
+    let scalar_collections = [
+        RuntimeValue::NamedRef {
+            reference: scalar_array_reference,
+            type_id: scalar_array_type,
+        },
+        scalar_buffer,
+    ];
+    registry
+        .call_runtime(
+            host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
+            &mut context,
+            RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
+        )
+        .unwrap();
+    let (outcome, allocations, _) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
+            &mut context,
+            RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
+        )
+    });
+    assert_eq!(
+        outcome,
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(17)))
+    );
+    assert_eq!(allocations, 0, "scalar array and buffer inputs");
+
+    let return_cases = [
+        host_matrix::THUNK_RETURN_STRING,
+        host_matrix::THUNK_RETURN_STRUCT,
+        host_matrix::THUNK_RETURN_ENUM,
+        host_matrix::THUNK_RETURN_OPTION,
+        host_matrix::THUNK_RETURN_RESULT,
+        host_matrix::THUNK_RETURN_ARRAY,
+        host_matrix::THUNK_RETURN_BUFFER,
+    ];
+    let mut separated_host_allocations = 0;
+    for id in return_cases {
+        registry
+            .call_runtime(
+                id,
+                &mut context,
+                RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
+            )
+            .unwrap();
+        let (outcome, thunk_allocations, host_allocations) = observed_host_split(|| {
+            registry.call_runtime(
+                id,
+                &mut context,
+                RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
+            )
+        });
+        assert!(outcome.is_ok(), "return case {id}");
+        assert_eq!(
+            thunk_allocations.saturating_sub(baseline_allocations),
+            0,
+            "return case {id}"
+        );
+        separated_host_allocations += host_allocations;
+    }
+    assert!(separated_host_allocations > 0);
+
+    let wrong_record = heap
+        .allocate_struct(StableId::from_name("WrongRecord"), &[string, RuntimeValue::I32(5)])
+        .unwrap();
+    let mut wrong_arguments = arguments;
+    wrong_arguments[1] = wrong_record;
+    let (outcome, allocations, _) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_INSPECT,
+            &mut context,
+            RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
+        )
+    });
+    assert_eq!(outcome, Err(HostTrap::Type));
+    assert_eq!(allocations, 0, "wrong struct type id");
+
+    let wrong_event = heap
+        .allocate_enum(
+            event_type,
+            StableId::from_parts(&["Event", "::", "Record"]),
+            99,
+            Some(record),
+        )
+        .unwrap();
+    wrong_arguments = arguments;
+    wrong_arguments[2] = wrong_event;
+    let (outcome, allocations, _) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_INSPECT,
+            &mut context,
+            RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
+        )
+    });
+    assert_eq!(outcome, Err(HostTrap::Type));
+    assert_eq!(allocations, 0, "wrong enum tag");
+
+    let bad_fields = heap
+        .allocate_struct(record_type, &[string, RuntimeValue::Bool(true)])
+        .unwrap();
+    let bad_field_arguments = [bad_fields];
+    let (outcome, allocations, _) = observed_host_split(|| {
+        RuntimeHostArgs::new(&bad_field_arguments, Some(&mut heap))?
+            .value_ref(0)?
+            .struct_ref(record_type)?
+            .field(1)?
+            .i32()
+    });
+    assert_eq!(outcome, Err(HostTrap::Type));
+    assert_eq!(allocations, 0, "wrong struct field type");
+
+    let mut full_heap = Heap::new(0);
+    let _ = RuntimeHostArgs::new(&[], Some(&mut full_heap))
+        .unwrap()
+        .return_writer(1);
+    let (outcome, allocations, _) = observed_host_split(|| {
+        RuntimeHostArgs::new(&[], Some(&mut full_heap))
+            .unwrap()
+            .return_writer(1)
+    });
+    assert!(outcome.is_err());
+    assert_eq!(allocations, 0, "heap full");
+
+    let mut limited_heap = Heap::new_with_limits(4, usize::MAX, 0);
+    let _ = RuntimeHostArgs::new(&[], Some(&mut limited_heap))
+        .unwrap()
+        .return_writer(1);
+    let array_values = vec![RuntimeValue::I32(1)];
+    let (outcome, allocations, _) = observed_host_split(|| {
+        let args = RuntimeHostArgs::new(&[], Some(&mut limited_heap)).unwrap();
+        let mut writer = args.return_writer(1).unwrap();
+        writer.write_array(
+            nexa_bytecode::array_type(ValueType::I32),
+            ValueType::I32,
+            array_values,
+        )
+    });
+    assert_eq!(outcome, Err(HostTrap::Type));
+    assert_eq!(allocations, 0, "array length limit");
+    let buffer_values = vec![RuntimeValue::I32(1)];
+    let (outcome, allocations, _) = observed_host_split(|| {
+        let args = RuntimeHostArgs::new(&[], Some(&mut limited_heap)).unwrap();
+        let mut writer = args.return_writer(1).unwrap();
+        writer.write_buffer(
+            nexa_bytecode::buffer_type(ValueType::I32),
+            ValueType::I32,
+            buffer_values,
+        )
+    });
+    assert_eq!(outcome, Err(HostTrap::Type));
+    assert_eq!(allocations, 0, "buffer length limit");
+
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let (outcome, allocations, _) = observed_host_split(|| {
+        registry.call_runtime(
+            host_matrix::THUNK_PANIC_HOST,
+            &mut context,
+            RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
+        )
+    });
+    std::panic::set_hook(previous_hook);
+    assert_eq!(outcome, Err(HostTrap::Panicked));
+    assert_eq!(allocations, 0, "host panic");
+
+    println!("complex_host_allocation_matrix=ok thunk_allocations=0");
+}
+
 fn main() {
+    complex_host_allocation_matrix();
     let mut runs = Vec::new();
     let mut migration_runs = Vec::new();
     for repeat in 1..=3 {

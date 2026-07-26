@@ -1,0 +1,40 @@
+interface AllocationMatrixHost {
+    struct Record {
+        label: string;
+        value: i32;
+    }
+
+    enum Event {
+        Empty,
+        Record(Record)
+    }
+
+    sync fn inspect(
+        name: string,
+        record: Record,
+        event: Event,
+        option: Option<Record>,
+        result: Result<Record, Event>,
+        array: array<Record>,
+        buffer: buffer<Record>,
+        nested: Event
+    ) -> i32;
+    sync fn inspect_scalar_collections(
+        array: array<i32>,
+        buffer: buffer<i32>
+    ) -> i32;
+
+    sync fn return_string() -> string;
+    sync fn return_struct() -> Record;
+    sync fn return_enum() -> Event;
+    sync fn return_option() -> Option<Record>;
+    sync fn return_result() -> Result<Record, Event>;
+    sync fn return_array() -> array<i32>;
+    sync fn return_buffer() -> buffer<i32>;
+    sync fn return_scalar() -> i32;
+    sync fn baseline8(
+        a: i32, b: i32, c: i32, d: i32,
+        e: i32, f: i32, g: i32, h: i32
+    ) -> i32;
+    sync fn panic_host() -> i32;
+}

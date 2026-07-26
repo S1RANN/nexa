@@ -392,29 +392,49 @@ pub fn state_handle_error_type() -> EnumType {
 
 #[must_use]
 pub fn parameterized_type_id(name: &str, arguments: &[ValueType]) -> StableId {
-    let mut canonical = String::from(name);
-    canonical.push('<');
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    fn append(hash: &mut u64, bytes: impl IntoIterator<Item = u8>) {
+        for byte in bytes {
+            *hash ^= u64::from(byte);
+            *hash = hash.wrapping_mul(PRIME);
+        }
+    }
+
+    let mut hash = OFFSET;
+    append(&mut hash, name.bytes());
+    append(&mut hash, *b"<");
     for (index, argument) in arguments.iter().enumerate() {
         if index != 0 {
-            canonical.push(',');
+            append(&mut hash, *b",");
         }
         match argument {
-            ValueType::I32 => canonical.push_str("i32"),
-            ValueType::I64 => canonical.push_str("i64"),
-            ValueType::F32 => canonical.push_str("f32"),
-            ValueType::F64 => canonical.push_str("f64"),
-            ValueType::Bool => canonical.push_str("bool"),
-            ValueType::Rune => canonical.push_str("rune"),
-            ValueType::String => canonical.push_str("string"),
-            ValueType::Ref => canonical.push_str("ref"),
+            ValueType::I32 => append(&mut hash, b"i32".iter().copied()),
+            ValueType::I64 => append(&mut hash, b"i64".iter().copied()),
+            ValueType::F32 => append(&mut hash, b"f32".iter().copied()),
+            ValueType::F64 => append(&mut hash, b"f64".iter().copied()),
+            ValueType::Bool => append(&mut hash, b"bool".iter().copied()),
+            ValueType::Rune => append(&mut hash, b"rune".iter().copied()),
+            ValueType::String => append(&mut hash, b"string".iter().copied()),
+            ValueType::Ref => append(&mut hash, b"ref".iter().copied()),
             ValueType::Named(id) => {
-                use std::fmt::Write;
-                write!(canonical, "named:{:016x}", id.0).expect("String writes do not fail");
+                append(&mut hash, b"named:".iter().copied());
+                for shift in (0..16).rev().map(|index| index * 4) {
+                    let nibble = ((id.0 >> shift) & 0xf) as u8;
+                    append(
+                        &mut hash,
+                        [if nibble < 10 {
+                            b'0' + nibble
+                        } else {
+                            b'a' + nibble - 10
+                        }],
+                    );
+                }
             }
         }
     }
-    canonical.push('>');
-    StableId::from_name(&canonical)
+    append(&mut hash, *b">");
+    StableId(hash)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

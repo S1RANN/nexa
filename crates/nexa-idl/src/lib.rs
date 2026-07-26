@@ -412,7 +412,8 @@ pub fn generate_rust(idl: &Idl) -> String {
                 decode_runtime_ref_value(idl, &field.ty, &format!("self.0.field({index})?"));
             writeln!(
                 output,
-                "pub fn {}(self) -> Result<{}, nexa_runtime::HostTrap> {{ Ok({decoded}) }}",
+                "#[allow(clippy::needless_question_mark)] pub fn {}(self) -> Result<{}, \
+                 nexa_runtime::HostTrap> {{ Ok({decoded}) }}",
                 field.name,
                 input_rust_type(idl, &field.ty, "'a")
             )
@@ -436,7 +437,7 @@ pub fn generate_rust(idl: &Idl) -> String {
         };
         writeln!(
             output,
-            "impl nexa_runtime::EncodeHostReturn for {} {{ \
+            "#[allow(clippy::identity_op)] impl nexa_runtime::EncodeHostReturn for {} {{ \
              fn required_slots(&self) -> Result<usize, nexa_runtime::HostTrap> {{ \
              Ok({required}) }} fn encode_into(self, writer: &mut \
              nexa_runtime::HostReturnWriter<'_>) -> Result<nexa_runtime::RuntimeValue, \
@@ -489,10 +490,20 @@ pub fn generate_rust(idl: &Idl) -> String {
     }
     writeln!(output, "pub trait {} {{", idl.interface).expect("String writes do not fail");
     for function in &idl.functions {
+        let lifetime = if function
+            .parameters
+            .iter()
+            .any(|parameter| input_type_borrows(idl, &parameter.ty))
+        {
+            "<'a>"
+        } else {
+            ""
+        };
         write!(
             output,
-            "    fn {}<'a>(&mut self, context: &mut nexa_runtime::ResourceContext<'_>",
-            function.name
+            "    #[allow(clippy::too_many_arguments)] fn {}{lifetime}(&mut self, context: &mut \
+             nexa_runtime::ResourceContext<'_>",
+            function.name,
         )
         .expect("String writes do not fail");
         for parameter in &function.parameters {
@@ -855,11 +866,19 @@ fn required_slots_value_expr(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::String => "1usize".into(),
         TypeRef::Array(inner) => {
             let inner = required_slots_value_expr(idl, inner, "value");
-            format!("1usize + ({source}).iter().map(|value| {inner}).sum::<usize>()")
+            if inner == "0usize" {
+                "1usize".into()
+            } else {
+                format!("1usize + ({source}).iter().map(|value| {inner}).sum::<usize>()")
+            }
         }
         TypeRef::Buffer(inner) => {
             let inner = required_slots_value_expr(idl, inner, "value");
-            format!("1usize + ({source}).as_slice().iter().map(|value| {inner}).sum::<usize>()")
+            if inner == "0usize" {
+                "1usize".into()
+            } else {
+                format!("1usize + ({source}).as_slice().iter().map(|value| {inner}).sum::<usize>()")
+            }
         }
         TypeRef::Option(inner) => {
             let inner = required_slots_value_expr(idl, inner, "value");
@@ -1434,6 +1453,26 @@ fn input_rust_type(idl: &Idl, ty: &TypeRef, lifetime: &str) -> String {
         ),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => name.clone(),
         TypeRef::Named(name) => format!("{name}Ref<{lifetime}>"),
+    }
+}
+
+fn input_type_borrows(idl: &Idl, ty: &TypeRef) -> bool {
+    match ty {
+        TypeRef::String | TypeRef::Array(_) | TypeRef::Buffer(_) => true,
+        TypeRef::Option(inner) => input_type_borrows(idl, inner),
+        TypeRef::Result(success, error) => {
+            input_type_borrows(idl, success) || input_type_borrows(idl, error)
+        }
+        TypeRef::Named(name) => !idl.opaque_handles.contains(name),
+        TypeRef::I32
+        | TypeRef::I64
+        | TypeRef::F32
+        | TypeRef::F64
+        | TypeRef::Bool
+        | TypeRef::Rune
+        | TypeRef::HostRequest(_)
+        | TypeRef::ResourceToken(_)
+        | TypeRef::Snapshot(_) => false,
     }
 }
 

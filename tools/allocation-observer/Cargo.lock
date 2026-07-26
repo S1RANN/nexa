@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
  "nexa-core",
+ "nexa-idl",
  "nexa-runtime",
  "nexa-verifier",
 ]
@@ -22,6 +23,14 @@ dependencies = [
 [[package]]
 name = "nexa-core"
 version = "0.1.0"
+
+[[package]]
+name = "nexa-idl"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
+ "nexa-core",
+]
 
 [[package]]
 name = "nexa-runtime"
