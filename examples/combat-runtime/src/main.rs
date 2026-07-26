@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime, ResourceContext,
+    HostPayload, ModuleLifecycle, Object, PollResult, RealmConfig, RealmRuntime, ResourceContext,
     RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
     TickBudget,
 };
@@ -77,6 +77,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let schema_hash_v2 = StableId::from_name("combat-state-v2");
     let verified =
         nexa_compiler::compile_with_interface(include_str!("../gameplay.nexa"), &idl, schema_hash)?;
+    let combat_buffer = verified
+        .module()
+        .buffer_types
+        .iter()
+        .find(|buffer| buffer.element == nexa_bytecode::ValueType::I32)
+        .copied()
+        .ok_or(HostFailure("combat buffer metadata was not emitted"))?;
+    let state_handle_type = nexa_bytecode::state_handle_type(nexa_bytecode::ValueType::Named(
+        StableId::from_name("EnemyBrain"),
+    ));
     let last_request = Arc::new(Mutex::new(None));
     let runtime_host = RuntimeHost::new(4_096);
     let registry = generated::GeneratedHostRegistry::new(EngineHost {
@@ -140,6 +150,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )?;
     let scope = realm.create_scope(None)?;
+    let buffer_reference = realm.allocate(Object::Buffer {
+        type_id: combat_buffer.type_id,
+        element_type: combat_buffer.element,
+        values: vec![
+            RuntimeValue::I32(4),
+            RuntimeValue::I32(5),
+            RuntimeValue::I32(6),
+        ],
+    })?;
+    let feature_task = realm.call(
+        module,
+        5,
+        &[RuntimeValue::NamedRef {
+            reference: buffer_reference,
+            type_id: combat_buffer.type_id,
+        }],
+        StepConfig {
+            owner: scope,
+            priority: 10,
+            fuel_slice: 1_024,
+            cumulative_budget: 4_096,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert!(matches!(
+        realm.poll_task(feature_task, 1_024)?,
+        PollResult::Completed(Some(RuntimeValue::I32(9)))
+    ));
+    let state_task = realm.call(
+        module,
+        6,
+        &[RuntimeValue::StateHandle {
+            handle_type: state_handle_type,
+            domain: replaced_handle.domain.get(),
+            stable_id: replaced_handle.stable_id,
+            generation: replaced_handle.generation,
+        }],
+        StepConfig {
+            owner: scope,
+            priority: 10,
+            fuel_slice: 256,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert!(matches!(
+        realm.poll_task(state_task, 256)?,
+        PollResult::Completed(Some(RuntimeValue::I32(_)))
+    ));
     let checked = realm.call(
         module,
         3,
@@ -323,14 +382,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     );
 
-    late_pending.ticket.complete(HostPayload::I32(99))?;
-    realm.tick(TickBudget {
-        max_tasks: 0,
-        frame_fuel_budget: 0,
-        collect_garbage: false,
-    })?;
-    assert_eq!(realm.discarded_late_host_results(), 1);
-
     let cancelled_scope = realm.create_scope(None)?;
     let cancelled_task = realm.call(
         v2,
@@ -406,6 +457,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             nexa_runtime::CancelReason::ReloadCommit
         ))
     ));
+    assert!(
+        realm.retired_epochs().len() >= 2,
+        "the combat reload must retain multiple retired epochs"
+    );
+    late_pending.ticket.complete(HostPayload::I32(99))?;
+    realm.tick(TickBudget {
+        max_tasks: 0,
+        frame_fuel_budget: 0,
+        collect_garbage: false,
+    })?;
+    assert_eq!(realm.discarded_late_host_results(), 1);
     drop(realm);
     let _releases = runtime_host.drain_releases();
     let _ = runtime_host.begin_close();

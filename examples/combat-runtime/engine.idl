@@ -1,6 +1,6 @@
 interface GameHost {
     opaque ActionLock;
-    opaque EnemyView;
+    struct EnemyView { health: i32; }
     enum AnimationError { MissingClip, EntityGone, Interrupted, Internal, Cancelled }
     sync fn update(entity: i32, delta: i32) -> i32;
     request(return_error, trap) fn animation(entity: i32) -> request<Result<i32, AnimationError>>;

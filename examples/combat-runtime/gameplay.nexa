@@ -10,6 +10,21 @@ import engine;
     phase: i32;
 }
 
+struct CombatStats {
+    damage: i64;
+    label: string;
+}
+
+enum CombatEvent {
+    Idle,
+    Damage(CombatStats),
+}
+
+class CombatFrame {
+    hits: i32;
+    next: Option<CombatFrame>;
+}
+
 fn identity(value: i32) -> i32 {
     return value;
 }
@@ -40,4 +55,55 @@ task fn update(value: i32) -> i32 {
         Err(error) => 0,
     };
     return engine.update(value, 1);
+}
+
+fn feature_probe(input: Buffer<i32>) -> i32 {
+    let wide: i64 = 9223372036854775806 + 1;
+    let ratio: f32 = 7.5 / 2.5;
+    let glyph: rune = '界';
+    let label: string = "combat" + "-runtime";
+    let stats: CombatStats = CombatStats { damage: wide, label: label };
+    let event: CombatEvent = Damage(stats);
+    let decoded: i64 = match event {
+        Idle => 0,
+        Damage(payload) => payload.damage,
+    };
+
+    let frame: CombatFrame = new CombatFrame { hits: 1, next: None };
+    frame.hits = frame.hits + 1;
+
+    let values: Array<i32> = Array.new<i32>();
+    values.push(frame.hits);
+    values.push(3);
+
+    let lookup: Map<i32, string> = Map.new<i32, string>();
+    lookup.set(1, "ready");
+    let mapped: Option<string> = lookup.get(1);
+    let mapped_length: i32 = match mapped {
+        Some(value) => value.byte_len(),
+        None => 0,
+    };
+
+    input.set(0, values.get(0));
+    let copied: Buffer<i32> = input.slice(0, 2);
+    input.copy(copied, 0, 1, 1);
+
+    let optional: Option<i32> = Some(input.get(1));
+    let result: Result<i32, AnimationError> = match optional {
+        Some(value) => Ok(value),
+        None => Err(MissingClip),
+    };
+    let amount: i32 = match result {
+        Ok(value) => value,
+        Err(error) => 0,
+    };
+    return amount + mapped_length + values.len();
+}
+
+fn state_probe(handle: StateHandle<EnemyBrain>) -> i32 {
+    let resolved: Result<EnemyBrain, StateHandleError> = handle.resolve();
+    let alive: bool = handle.is_alive();
+    let stable: StableId = handle.stable_id();
+    let generation: i32 = handle.generation();
+    return handle.hash();
 }
