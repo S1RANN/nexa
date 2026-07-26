@@ -13,7 +13,7 @@
         {"pointer": "/metrics/milestone/gaps", "operator": "set_equals", "expected": ["M4R3-RUNTIME-DIAGNOSTIC", "M4R3-GATE-PROVENANCE", "M4R3-AUDIT-DERIVATION", "M4R3-EVIDENCE-RECEIPT"]},
         {"pointer": "/metrics/milestone/r2_superseded", "operator": "eq", "expected": true}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "7f04726a10c1245a9a4fbd80d577886c878cc599",
       "affected_paths": ["reports/milestone4_0_full_mvr.md", "reports/contracts/milestone4r2_results.json"],
       "forbidden_calls": [],
       "status": "pending"
@@ -29,7 +29,7 @@
         {"pointer": "/metrics/contracts/work_packages", "operator": "eq", "expected": 24},
         {"pointer": "/metrics/contracts/invalid_contracts", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "7f04726a10c1245a9a4fbd80d577886c878cc599",
       "affected_paths": ["reports/contracts/milestone4r3_contracts.json"],
       "forbidden_calls": [],
       "status": "pending"
@@ -45,7 +45,7 @@
         {"pointer": "/metrics/static/direct_nexa_error_construction", "operator": "eq", "expected": 0},
         {"pointer": "/metrics/static/direct_error_variant_construction", "operator": "eq", "expected": 0}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/diagnostic_corpus.rs", "crates/nexa/src/runtime_diagnostics.rs"],
       "forbidden_calls": ["NexaError::Host(", "NexaError::Reload(", "NexaError::Migration(", "invoke_host_boundary(", "validate_host_completion(", "invoke_reload_activation(", "validate_reload_completion_capacity(", "MigrationLimits::validate_requirements("],
       "status": "pending"
@@ -60,7 +60,7 @@
         {"pointer": "/metrics/harness/independent_cases", "operator": "eq", "expected": 11},
         {"pointer": "/metrics/harness/facade_classification_helpers", "operator": "eq", "expected": 0}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
       "forbidden_calls": ["emit_error", "classify", "make_nexa_error"],
       "status": "pending"
@@ -76,7 +76,7 @@
         {"pointer": "/metrics/cases/NX4001/observed", "operator": "eq", "expected": "NX4001"},
         {"pointer": "/metrics/cases/NX4001/real_realm_runtime", "operator": "eq", "expected": true}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["classify"],
       "status": "pending"
@@ -92,7 +92,7 @@
         {"pointer": "/metrics/cases/NX4002/subcases", "operator": "eq", "expected": 5},
         {"pointer": "/metrics/cases/NX4002/observed", "operator": "eq", "expected": "NX4002"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["classify"],
       "status": "pending"
@@ -109,7 +109,7 @@
         {"pointer": "/metrics/cases/NX4003/script_stack", "operator": "not_empty", "expected": null},
         {"pointer": "/metrics/cases/NX4003/request_leaks", "operator": "eq", "expected": 0}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/interpreter.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["RuntimeHostArgs::new"],
       "status": "pending"
@@ -125,7 +125,7 @@
         {"pointer": "/metrics/cases/NX5001/subcases", "operator": "eq", "expected": 2},
         {"pointer": "/metrics/cases/NX5001/task_terminal_state", "operator": "eq", "expected": "Trapped"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs", "crates/nexa-runtime/src/interpreter.rs"],
       "forbidden_calls": ["invoke_host_boundary"],
       "status": "pending"
@@ -141,7 +141,7 @@
         {"pointer": "/metrics/cases/NX5002/completion_exactly_once", "operator": "eq", "expected": true},
         {"pointer": "/metrics/cases/NX5002/observed", "operator": "eq", "expected": "NX5002"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/host.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["validate_host_completion"],
       "status": "pending"
@@ -157,7 +157,7 @@
         {"pointer": "/metrics/cases/NX5003/unknown_error_code", "operator": "eq", "expected": 77},
         {"pointer": "/metrics/cases/NX5003/observed", "operator": "eq", "expected": "NX5003"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["validate_host_completion"],
       "status": "pending"
@@ -173,7 +173,7 @@
         {"pointer": "/metrics/cases/NX5004/subcases", "operator": "eq", "expected": 3},
         {"pointer": "/metrics/cases/NX5004/partial_mutation", "operator": "eq", "expected": false}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["classify"],
       "status": "pending"
@@ -189,7 +189,7 @@
         {"pointer": "/metrics/cases/NX6001/migration_limit_subcases", "operator": "eq", "expected": 7},
         {"pointer": "/metrics/cases/NX6001/observed", "operator": "eq", "expected": "NX6001"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/stateful.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["MigrationLimits::validate_requirements"],
       "status": "pending"
@@ -205,7 +205,7 @@
         {"pointer": "/metrics/cases/NX6002/graph_subcases", "operator": "eq", "expected": 5},
         {"pointer": "/metrics/cases/NX6002/observed", "operator": "eq", "expected": "NX6002"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/stateful.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["StatefulRegistry::insert"],
       "status": "pending"
@@ -221,7 +221,7 @@
         {"pointer": "/metrics/cases/NX6003/candidate_lifecycle", "operator": "eq", "expected": "ActivationFaulted"},
         {"pointer": "/metrics/cases/NX6003/root_publications", "operator": "eq", "expected": 1}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["invoke_reload_activation"],
       "status": "pending"
@@ -237,7 +237,7 @@
         {"pointer": "/metrics/cases/NX6004/real_reload_buffer", "operator": "eq", "expected": true},
         {"pointer": "/metrics/cases/NX6004/partial_buffer_write", "operator": "eq", "expected": false}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/reload.rs", "crates/nexa-runtime/src/realm.rs"],
       "forbidden_calls": ["validate_reload_completion_capacity"],
       "status": "pending"
@@ -252,7 +252,7 @@
         {"pointer": "/metrics/snapshots/cases", "operator": "eq", "expected": 11},
         {"pointer": "/metrics/snapshots/unexpected_mutations", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -267,7 +267,7 @@
         {"pointer": "/metrics/deterministic_cases", "operator": "eq", "expected": 11},
         {"pointer": "/metrics/nondeterministic_cases", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "246c7e01231ef9bcf8cff2cdede4e4a1d8c42138",
       "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -283,7 +283,7 @@
         {"pointer": "/metrics/observed_codes", "operator": "eq", "expected": 11},
         {"pointer": "/failures", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/contract-gates/src/main.rs", "crates/nexa/src/runtime_diagnostics.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -298,7 +298,7 @@
         {"pointer": "/metrics/gate_protocol/schema_version", "operator": "eq", "expected": 1},
         {"pointer": "/metrics/gate_protocol/self_deciding_gates", "operator": "eq", "expected": 9}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/contract-gate-protocol/src/lib.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -314,7 +314,7 @@
         {"pointer": "/metrics/artifacts/missing", "operator": "empty", "expected": null},
         {"pointer": "/metrics/artifacts/provenance_mismatches", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/contract-gates/src/main.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -329,7 +329,7 @@
         {"pointer": "/metrics/audit/domain_fill_values", "operator": "empty", "expected": null},
         {"pointer": "/metrics/audit/forbidden_domain_counts", "operator": "empty", "expected": null}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/release-audit/src/main.rs"],
       "forbidden_calls": ["592", "15", "6", "18", "34", "38"],
       "status": "pending"
@@ -345,7 +345,7 @@
         {"pointer": "/metrics/audit/negative_failures", "operator": "empty", "expected": null},
         {"pointer": "/metrics/audit/gap_derivation", "operator": "eq", "expected": true}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/release-audit/src/main.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -360,7 +360,7 @@
         {"pointer": "/metrics/evidence/protocol", "operator": "eq", "expected": "implementation-evidence-receipt"},
         {"pointer": "/metrics/evidence/premature_receipt", "operator": "eq", "expected": false}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/release-audit/src/main.rs"],
       "forbidden_calls": [],
       "status": "pending"
@@ -375,7 +375,7 @@
         {"pointer": "/metrics/evidence/commands", "operator": "set_equals", "expected": ["generate", "verify-evidence", "generate-receipt", "verify-final"]},
         {"pointer": "/metrics/local_gates/status", "operator": "eq", "expected": "passed"}
       ],
-      "implementation_commit": null,
+      "implementation_commit": "f180db90f0fd342c21fd2e7c714313e910864b2a",
       "affected_paths": ["tools/release-audit/src/main.rs", "scripts/milestone4-local-gates.sh"],
       "forbidden_calls": [],
       "status": "pending"
