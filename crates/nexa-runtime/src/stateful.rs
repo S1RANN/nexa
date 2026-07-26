@@ -183,6 +183,56 @@ pub struct MigrationUsageReport {
     pub max_call_depth_used: u16,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfflineStateObject {
+    pub stable_id: StableId,
+    pub type_id: StableId,
+    pub generation: u32,
+    pub fields: Vec<OfflineStateField>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfflineStateField {
+    pub stable_id: StableId,
+    pub value: OfflineStateValue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfflineStateValue {
+    I32(i32),
+    Bool(bool),
+    Handle(StateHandle),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OfflineMigrationResult {
+    pub objects: Vec<OfflineStateObject>,
+    pub migration_hash: StableId,
+    pub usage: MigrationUsageReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OfflineMigrationError {
+    MissingMigrationEntry,
+    DuplicateObject(StableId),
+    DuplicateField { object: StableId, field: StableId },
+    UnknownType { object: StableId, type_id: StableId },
+    Capacity(MigrationLimitError),
+    InvalidOldState,
+    InvalidHandle,
+    Interpreter(String),
+    Migration(ReloadError),
+    UnsupportedOutputValue,
+}
+
+impl fmt::Display for OfflineMigrationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for OfflineMigrationError {}
+
 impl MigrationLimits {
     #[must_use]
     pub fn capacity_report(self) -> MigrationCapacityReport {
@@ -1677,6 +1727,169 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         }
         RuntimeValue::Unit => nexa_bytecode::ValueType::Named(StableId::from_name("Unit")),
     }
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn run_offline_migration(
+    domain: StatefulDomainId,
+    old_objects: Vec<OfflineStateObject>,
+    old_module: &nexa_verifier::VerifiedModule,
+    new_module: &nexa_verifier::VerifiedModule,
+    limits: MigrationLimits,
+) -> Result<OfflineMigrationResult, OfflineMigrationError> {
+    let migration_entry = new_module
+        .module()
+        .reload_metadata
+        .migration_entry
+        .ok_or(OfflineMigrationError::MissingMigrationEntry)?;
+    let mut old =
+        StatefulRegistry::try_new(domain, limits).map_err(OfflineMigrationError::Capacity)?;
+    let mut sorted = old_objects;
+    sorted.sort_by_key(|object| object.stable_id);
+    for pair in sorted.windows(2) {
+        if pair[0].stable_id == pair[1].stable_id {
+            return Err(OfflineMigrationError::DuplicateObject(pair[0].stable_id));
+        }
+    }
+    for object in sorted {
+        let version = old_module
+            .module()
+            .state_schema
+            .types
+            .iter()
+            .find(|ty| ty.stable_id == object.type_id)
+            .map(|ty| ty.version)
+            .ok_or(OfflineMigrationError::UnknownType {
+                object: object.stable_id,
+                type_id: object.type_id,
+            })?;
+        if old.objects.len() == old.object_capacity {
+            return Err(OfflineMigrationError::Capacity(
+                MigrationLimitError::Objects,
+            ));
+        }
+        let field_start = u32::try_from(old.fields.len())
+            .map_err(|_| OfflineMigrationError::Capacity(MigrationLimitError::Fields))?;
+        let mut fields = object.fields;
+        fields.sort_by_key(|field| field.stable_id);
+        for pair in fields.windows(2) {
+            if pair[0].stable_id == pair[1].stable_id {
+                return Err(OfflineMigrationError::DuplicateField {
+                    object: object.stable_id,
+                    field: pair[0].stable_id,
+                });
+            }
+        }
+        if old.fields.len().saturating_add(fields.len()) > old.field_capacity {
+            return Err(OfflineMigrationError::Capacity(MigrationLimitError::Fields));
+        }
+        let field_len = u32::try_from(fields.len())
+            .map_err(|_| OfflineMigrationError::Capacity(MigrationLimitError::Fields))?;
+        old.objects.push(MigrationObjectSlot {
+            stable_id: object.stable_id,
+            type_id: object.type_id,
+            version,
+            generation: object.generation,
+            field_start,
+            field_len,
+            scalar: None,
+        });
+        old.fields
+            .extend(fields.into_iter().map(|field| MigrationFieldSlot {
+                field_id: field.stable_id,
+                value: match field.value {
+                    OfflineStateValue::I32(value) => StateValue::I32(value),
+                    OfflineStateValue::Bool(value) => StateValue::Bool(value),
+                    OfflineStateValue::Handle(handle) => StateValue::Handle(handle),
+                },
+            }));
+    }
+    old.rebuild_caches();
+    if old.payload.len() > old.byte_capacity || old.gc_roots.len() > old.gc_root_capacity {
+        return Err(OfflineMigrationError::Capacity(
+            MigrationLimitError::StateBytes,
+        ));
+    }
+    old.validate_schema(&old_module.module().state_schema)
+        .map_err(|_| OfflineMigrationError::InvalidOldState)?;
+    old.validate_handles()
+        .map_err(|_| OfflineMigrationError::InvalidHandle)?;
+
+    let mut migration = MigrationContext::new(
+        old,
+        domain,
+        new_module.module().state_schema.clone(),
+        old_module.module().state_schema.stable_hash()
+            == new_module.module().state_schema.stable_hash(),
+        limits,
+    )
+    .map_err(OfflineMigrationError::Migration)?;
+    let outcome = crate::CheckedInterpreter::run_migration(
+        new_module,
+        migration_entry,
+        &[],
+        limits.max_fuel,
+        crate::FrameLimits {
+            max_call_depth: u32::from(limits.max_call_depth),
+            ..crate::FrameLimits::default()
+        },
+        &mut migration,
+    )
+    .map_err(|error| OfflineMigrationError::Interpreter(error.to_string()))?;
+    if !matches!(outcome, crate::InterpreterOutcome::Returned { .. }) {
+        return Err(OfflineMigrationError::Interpreter(format!(
+            "migration did not return: {outcome:?}"
+        )));
+    }
+    let usage = migration.usage_report();
+    let (registry, migration_hash) = match migration
+        .finish()
+        .map_err(OfflineMigrationError::Migration)?
+    {
+        MigrationOutput::Owned { registry, hash } => (registry, hash),
+        MigrationOutput::Shared { registry, hash } => (
+            Arc::try_unwrap(registry).map_err(|_| OfflineMigrationError::InvalidOldState)?,
+            hash,
+        ),
+    };
+    let objects = registry
+        .objects
+        .iter()
+        .map(|slot| {
+            if slot.scalar.is_some() {
+                return Err(OfflineMigrationError::UnsupportedOutputValue);
+            }
+            let fields = registry
+                .object_fields(slot)
+                .iter()
+                .map(|field| {
+                    let value = match field.value {
+                        StateValue::I32(value) => OfflineStateValue::I32(value),
+                        StateValue::Bool(value) => OfflineStateValue::Bool(value),
+                        StateValue::Handle(handle) => OfflineStateValue::Handle(handle),
+                        StateValue::Ref(_) | StateValue::Object(_) => {
+                            return Err(OfflineMigrationError::UnsupportedOutputValue);
+                        }
+                    };
+                    Ok(OfflineStateField {
+                        stable_id: field.field_id,
+                        value,
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(OfflineStateObject {
+                stable_id: slot.stable_id,
+                type_id: slot.type_id,
+                generation: slot.generation,
+                fields,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(OfflineMigrationResult {
+        objects,
+        migration_hash,
+        usage,
+    })
 }
 
 #[cfg(feature = "fuzzing")]

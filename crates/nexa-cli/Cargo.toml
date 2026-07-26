@@ -9,6 +9,7 @@ publish.workspace = true
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-idl = { path = "../nexa-idl" }
 nexa-machine = { path = "../nexa-machine" }
+nexa-migrate = { path = "../nexa-migrate" }
 nexa-model = { path = "../nexa-model" }
 serde_json.workspace = true
 

@@ -71,7 +71,9 @@ pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use stateful::{
     MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
-    StateHandle, StateHandleError, StateObject, StateValue, StatefulDomainId, StatefulError,
+    OfflineMigrationError, OfflineMigrationResult, OfflineStateField, OfflineStateObject,
+    OfflineStateValue, StateHandle, StateHandleError, StateObject, StateValue, StatefulDomainId,
+    StatefulError, run_offline_migration,
 };
 #[cfg(feature = "fuzzing")]
 pub use stateful::{fuzz_migration_arena, fuzz_stateful_registry};

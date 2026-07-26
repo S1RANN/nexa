@@ -41,6 +41,7 @@ fn main() {
         [area, command] if area == "baseline" && command == "check" => check_baseline(),
         [area, command] if area == "machine" && command == "check" => check_machines(),
         [area, command] if area == "model" && command == "check" => check_models(),
+        [command, arguments @ ..] if command == "migrate-check" => migrate_check(arguments),
         [command, path] if command == "compile" => compile_file(Path::new(path)),
         [area, command, path] if area == "idl" && command == "check" => check_idl(Path::new(path)),
         [area, command, path] if area == "idl" && command == "generate" => {
@@ -48,7 +49,9 @@ fn main() {
         }
         _ => Err(
             "usage: nexa baseline check | nexa machine check | nexa model check | \
-             nexa compile <file> | nexa idl check|generate <file>"
+             nexa compile <file> | nexa idl check|generate <file> | \
+             nexa migrate-check --old-module OLD --new-module NEW --state STATE \
+             [--format human|json] [--output PATH] [MigrationLimits]"
                 .to_owned(),
         ),
     };
@@ -56,6 +59,116 @@ fn main() {
         eprintln!("nexa: {error}");
         std::process::exit(1);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MigrateOutputFormat {
+    Human,
+    Json,
+}
+
+fn migrate_check(arguments: &[String]) -> Result<(), String> {
+    let mut old_module = None;
+    let mut new_module = None;
+    let mut state = None;
+    let mut output = None;
+    let mut format = MigrateOutputFormat::Human;
+    let mut config = nexa_migrate::MigrateCheckConfig::default();
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].as_str();
+        let value = arguments
+            .get(index + 1)
+            .ok_or_else(|| format!("missing value for `{option}`"))?;
+        match option {
+            "--old-module" => old_module = Some(PathBuf::from(value)),
+            "--new-module" => new_module = Some(PathBuf::from(value)),
+            "--state" => state = Some(PathBuf::from(value)),
+            "--output" => output = Some(PathBuf::from(value)),
+            "--format" => {
+                format = match value.as_str() {
+                    "human" => MigrateOutputFormat::Human,
+                    "json" => MigrateOutputFormat::Json,
+                    _ => return Err("`--format` must be `human` or `json`".into()),
+                };
+            }
+            "--max-objects" => {
+                config.migration_limits.max_objects = parse_limit(option, value)?;
+            }
+            "--max-fields" => {
+                config.migration_limits.max_fields = parse_limit(option, value)?;
+            }
+            "--max-forwarding-entries" => {
+                config.migration_limits.max_forwarding_entries = parse_limit(option, value)?;
+            }
+            "--max-state-bytes" => {
+                config.migration_limits.max_state_bytes = parse_limit(option, value)?;
+            }
+            "--max-gc-roots" => {
+                config.migration_limits.max_gc_roots = parse_limit(option, value)?;
+            }
+            "--max-fuel" => {
+                config.migration_limits.max_fuel = parse_limit(option, value)?;
+            }
+            "--max-call-depth" => {
+                config.migration_limits.max_call_depth = parse_limit(option, value)?;
+            }
+            _ => return Err(format!("unknown migrate-check option `{option}`")),
+        }
+        index += 2;
+    }
+    let old_module = old_module.ok_or("missing `--old-module`")?;
+    let new_module = new_module.ok_or("missing `--new-module`")?;
+    let state = state.ok_or("missing `--state`")?;
+    let old_bytes = std::fs::read(&old_module)
+        .map_err(|error| format!("could not read {}: {error}", old_module.display()))?;
+    let new_bytes = std::fs::read(&new_module)
+        .map_err(|error| format!("could not read {}: {error}", new_module.display()))?;
+    let state_bytes = std::fs::read(&state)
+        .map_err(|error| format!("could not read {}: {error}", state.display()))?;
+    let result = nexa_migrate::run_migrate_check(&old_bytes, &new_bytes, &state_bytes, config)
+        .map_err(|error| format!("migration check failed: {error}"))?;
+    let rendered = match format {
+        MigrateOutputFormat::Human => format!(
+            "migration check passed\n\
+             old schema: {:016x}\n\
+             new schema: {:016x}\n\
+             migration entry: {}\n\
+             migration hash: {:016x}\n\
+             objects: {}\n\
+             peak objects/fields/forwarding: {}/{}/{}\n\
+             fuel: {}\n\
+             call depth: {}\n",
+            result.old_schema_hash,
+            result.new_schema_hash,
+            result.migration_entry,
+            result.migration_hash,
+            result.output_state.objects.len(),
+            result.usage.object_peak,
+            result.usage.field_peak,
+            result.usage.forwarding_peak,
+            result.usage.fuel_used,
+            result.usage.max_call_depth_used,
+        ),
+        MigrateOutputFormat::Json => serde_json::to_string_pretty(&result)
+            .map_err(|error| format!("could not serialize migration result: {error}"))?,
+    };
+    if let Some(output) = output {
+        std::fs::write(&output, rendered)
+            .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    } else {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+fn parse_limit<T>(option: &str, value: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    value
+        .parse()
+        .map_err(|_| format!("invalid numeric value for `{option}`: `{value}`"))
 }
 
 fn compile_file(path: &Path) -> Result<(), String> {

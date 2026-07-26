@@ -2360,7 +2360,7 @@ impl RuntimeResources {
         Ok(())
     }
 
-    #[cfg(feature = "model-adapter")]
+    #[cfg(any(test, feature = "model-adapter"))]
     pub(crate) fn detach_request_for_model(
         &mut self,
         task: TaskHandle,
@@ -2383,7 +2383,7 @@ impl RuntimeResources {
         self.requests.cancel(handle, true, &mut self.releases)
     }
 
-    #[cfg(feature = "model-adapter")]
+    #[cfg(any(test, feature = "model-adapter"))]
     pub(crate) fn release_token_for_model(
         &mut self,
         task: TaskHandle,
@@ -2406,7 +2406,7 @@ impl RuntimeResources {
         self.tokens.release(handle, &mut self.releases).map(|_| ())
     }
 
-    #[cfg(feature = "model-adapter")]
+    #[cfg(any(test, feature = "model-adapter"))]
     pub(crate) fn release_snapshot_for_model(
         &mut self,
         task: TaskHandle,

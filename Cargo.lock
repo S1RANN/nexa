@@ -50,6 +50,7 @@ dependencies = [
  "nexa-compiler",
  "nexa-idl",
  "nexa-machine",
+ "nexa-migrate",
  "nexa-model",
  "serde_json",
 ]
@@ -87,6 +88,11 @@ dependencies = [
 name = "nexa-migrate"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-runtime",
+ "nexa-verifier",
  "serde",
  "serde_json",
 ]
