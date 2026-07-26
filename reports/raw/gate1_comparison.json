@@ -1,0 +1,12 @@
+{
+  "allocation_counts_match": true,
+  "attribution_signals": [],
+  "code_metrics_match": true,
+  "critical_booleans_match": true,
+  "performance_within_tolerance": true,
+  "result_classification_match": true,
+  "run_a": "reports/raw/gate1_run_1",
+  "run_b": "reports/raw/gate1_run_2",
+  "state_hash_match": true,
+  "status": "PASS"
+}

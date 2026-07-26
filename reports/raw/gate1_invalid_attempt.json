@@ -1,0 +1,13 @@
+{
+  "affected_cases": [
+    "migration",
+    "reload_commit",
+    "realm_drop"
+  ],
+  "implementation_sha": "c6ac195ae72dbd3ea7750120a14f0d667425ae72",
+  "reason": "three inherited benchmark cases reported 200 instead of 1000 timed samples",
+  "resolved_by_retest": true,
+  "result_used_for_decision": false,
+  "review": "Amendment 1 approved; full formal run restarted from frozen inputs",
+  "status": "INVALID"
+}

@@ -1,0 +1,256 @@
+{
+  "attribution_review": {
+    "classification_counts": {
+      "A": 0,
+      "B": 0,
+      "C": 0,
+      "D": 0
+    },
+    "review": "No unresolved failure or inconsistency signal remains.",
+    "signals": [],
+    "unresolved_invalid": 0
+  },
+  "contracts": [
+    {
+      "evidence": "governance, baseline, machine, and contract manifest",
+      "id": "M5-WP-01",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 1
+    },
+    {
+      "evidence": "governance, baseline, machine, and contract manifest",
+      "id": "M5-WP-02",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 2
+    },
+    {
+      "evidence": "governance, baseline, machine, and contract manifest",
+      "id": "M5-WP-03",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 3
+    },
+    {
+      "evidence": "governance, baseline, machine, and contract manifest",
+      "id": "M5-WP-04",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 4
+    },
+    {
+      "evidence": "governance, baseline, machine, and contract manifest",
+      "id": "M5-WP-05",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 5
+    },
+    {
+      "evidence": "frozen acceptance, environment, samples, manifest, and runner",
+      "id": "M5-WP-06",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 6
+    },
+    {
+      "evidence": "frozen acceptance, environment, samples, manifest, and runner",
+      "id": "M5-WP-07",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 7
+    },
+    {
+      "evidence": "frozen acceptance, environment, samples, manifest, and runner",
+      "id": "M5-WP-08",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 8
+    },
+    {
+      "evidence": "frozen acceptance, environment, samples, manifest, and runner",
+      "id": "M5-WP-09",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 9
+    },
+    {
+      "evidence": "frozen acceptance, environment, samples, manifest, and runner",
+      "id": "M5-WP-10",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 10
+    },
+    {
+      "evidence": "H1 formal JSON and generated report",
+      "id": "M5-WP-11",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 11
+    },
+    {
+      "evidence": "H1 formal JSON and generated report",
+      "id": "M5-WP-12",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 12
+    },
+    {
+      "evidence": "H1 formal JSON and generated report",
+      "id": "M5-WP-13",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 13
+    },
+    {
+      "evidence": "H1 formal JSON and generated report",
+      "id": "M5-WP-14",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 14
+    },
+    {
+      "evidence": "H2 formal JSON, allocator observer, and generated report",
+      "id": "M5-WP-15",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 15
+    },
+    {
+      "evidence": "H2 formal JSON, allocator observer, and generated report",
+      "id": "M5-WP-16",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 16
+    },
+    {
+      "evidence": "H2 formal JSON, allocator observer, and generated report",
+      "id": "M5-WP-17",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 17
+    },
+    {
+      "evidence": "H2 formal JSON, allocator observer, and generated report",
+      "id": "M5-WP-18",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 18
+    },
+    {
+      "evidence": "H2 formal JSON, allocator observer, and generated report",
+      "id": "M5-WP-19",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 19
+    },
+    {
+      "evidence": "H3 formal JSON and generated report",
+      "id": "M5-WP-20",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 20
+    },
+    {
+      "evidence": "H3 formal JSON and generated report",
+      "id": "M5-WP-21",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 21
+    },
+    {
+      "evidence": "H3 formal JSON and generated report",
+      "id": "M5-WP-22",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 22
+    },
+    {
+      "evidence": "H3 formal JSON and generated report",
+      "id": "M5-WP-23",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 23
+    },
+    {
+      "evidence": "H3 formal JSON and generated report",
+      "id": "M5-WP-24",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 24
+    },
+    {
+      "evidence": "validity, mutation detection, comparison, and independent replay",
+      "id": "M5-WP-25",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 25
+    },
+    {
+      "evidence": "validity, mutation detection, comparison, and independent replay",
+      "id": "M5-WP-26",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 26
+    },
+    {
+      "evidence": "validity, mutation detection, comparison, and independent replay",
+      "id": "M5-WP-27",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 27
+    },
+    {
+      "evidence": "validity, mutation detection, comparison, and independent replay",
+      "id": "M5-WP-28",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 28
+    },
+    {
+      "evidence": "Pilot integration, operations, and commitment record",
+      "id": "M5-WP-29",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 29
+    },
+    {
+      "evidence": "Pilot integration, operations, and commitment record",
+      "id": "M5-WP-30",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 30
+    },
+    {
+      "evidence": "Pilot integration, operations, and commitment record",
+      "id": "M5-WP-31",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 31
+    },
+    {
+      "evidence": "decision results, final report, and receipt",
+      "id": "M5-WP-32",
+      "implementation_commit": "e397beecc24a406873235d872a4249df538cbe23",
+      "status": "passed",
+      "work_package": 32
+    }
+  ],
+  "decision": "HOLD",
+  "evidence_sha": "SELF",
+  "formal_run_comparison": "PASS",
+  "gate1_status": "DECIDED",
+  "gate2_budget": "NOT_APPROVED",
+  "hypotheses": {
+    "H1a": "PASS",
+    "H2a": "PASS",
+    "H3a": "PASS"
+  },
+  "implementation_sha": "e397beecc24a406873235d872a4249df538cbe23",
+  "independent_replay": "PASS",
+  "milestone": "5.0",
+  "milestone_status": "COMPLETE",
+  "pilot_commitment": "NO_PILOT_TEAM",
+  "schema_version": 1,
+  "validity": "PASS"
+}
