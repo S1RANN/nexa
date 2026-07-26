@@ -406,58 +406,18 @@ pub fn generate_rust(idl: &Idl) -> String {
     .expect("String writes do not fail");
     output.push_str(
         "fn call(&mut self, id: u32, context: &mut nexa_runtime::ResourceContext<'_>, \
-         args: nexa_runtime::HostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n\
-         match id {\n",
+         args: nexa_runtime::HostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, \
+         nexa_runtime::HostTrap> {\n",
     );
-    for (index, function) in idl.functions.iter().enumerate() {
-        if function.parameters.is_empty() {
-            writeln!(
-                output,
-                "{index} => {{ if !args.is_empty() {{ return Err(nexa_runtime::HostTrap::Arity); }}"
-            )
-            .expect("String writes do not fail");
-        } else {
-            writeln!(
-                output,
-                "{index} => {{ if args.len() != {} {{ return Err(nexa_runtime::HostTrap::Arity); }}",
-                function.parameters.len()
-            )
-            .expect("String writes do not fail");
-        }
-        for (argument, parameter) in function.parameters.iter().enumerate() {
-            writeln!(
-                output,
-                "let {} = {};",
-                parameter.name,
-                decode_host_value(idl, &parameter.ty, argument)
-            )
-            .expect("String writes do not fail");
-        }
-        write!(
-            output,
-            "let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.host.{}(context",
-            function.name
-        )
-        .expect("String writes do not fail");
-        for parameter in &function.parameters {
-            write!(output, ", {}", parameter.name).expect("String writes do not fail");
-        }
-        output.push_str(
-            "))).map_err(|_| nexa_runtime::HostTrap::Panicked)?\
-             .map_err(|error| nexa_runtime::HostTrap::Host(\
-                 nexa_runtime::RuntimeMessage::inline(&error.0)))?;\n",
-        );
-        writeln!(
-            output,
-            "Ok({}) }}",
-            encode_host_result(idl, &function.result)
-        )
-        .expect("String writes do not fail");
-    }
+    emit_host_dispatch(&mut output, idl, false);
+    output.push_str("}\n");
     output.push_str(
-        "_ => Err(nexa_runtime::HostTrap::UnknownFunction(id)),\n\
-         }\n}\n}\n",
+        "fn call_runtime(&mut self, id: u32, context: &mut \
+         nexa_runtime::ResourceContext<'_>, args: nexa_runtime::RuntimeHostArgs<'_>) -> \
+         Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n",
     );
+    emit_host_dispatch(&mut output, idl, true);
+    output.push_str("}\n}\n");
     for (index, export) in idl.exports.iter().enumerate() {
         let args = if export.parameters.is_empty() {
             format!(
@@ -493,6 +453,106 @@ pub fn generate_rust(idl: &Idl) -> String {
         .expect("String writes do not fail");
     }
     output
+}
+
+fn emit_host_dispatch(output: &mut String, idl: &Idl, runtime: bool) {
+    output.push_str("match id {\n");
+    for (index, function) in idl.functions.iter().enumerate() {
+        if function.parameters.is_empty() {
+            writeln!(
+                output,
+                "{index} => {{ if !args.is_empty() {{ return \
+                 Err(nexa_runtime::HostTrap::Arity); }}"
+            )
+            .expect("String writes do not fail");
+        } else {
+            writeln!(
+                output,
+                "{index} => {{ if args.len() != {} {{ return \
+                 Err(nexa_runtime::HostTrap::Arity); }}",
+                function.parameters.len()
+            )
+            .expect("String writes do not fail");
+        }
+        for (argument, parameter) in function.parameters.iter().enumerate() {
+            let (prelude, decoded) = if runtime {
+                decode_runtime_host_value(idl, &parameter.ty, argument)
+            } else {
+                (
+                    String::new(),
+                    decode_host_value(idl, &parameter.ty, argument),
+                )
+            };
+            output.push_str(&prelude);
+            writeln!(output, "let {} = {decoded};", parameter.name)
+                .expect("String writes do not fail");
+        }
+        write!(
+            output,
+            "let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| \
+             self.host.{}(context",
+            function.name
+        )
+        .expect("String writes do not fail");
+        for parameter in &function.parameters {
+            write!(output, ", {}", parameter.name).expect("String writes do not fail");
+        }
+        output.push_str(
+            "))).map_err(|_| nexa_runtime::HostTrap::Panicked)?\
+             .map_err(|error| nexa_runtime::HostTrap::Host(\
+             nexa_runtime::RuntimeMessage::inline(&error.0)))?;\n",
+        );
+        writeln!(
+            output,
+            "Ok({}) }}",
+            encode_host_result(idl, &function.result)
+        )
+        .expect("String writes do not fail");
+    }
+    output.push_str("_ => Err(nexa_runtime::HostTrap::UnknownFunction(id)),\n}\n");
+}
+
+fn decode_runtime_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> (String, String) {
+    let direct = match ty {
+        TypeRef::I32 => Some(format!("args.i32({index})?")),
+        TypeRef::I64 => Some(format!("args.i64({index})?")),
+        TypeRef::F32 => Some(format!("args.f32({index})?")),
+        TypeRef::F64 => Some(format!("args.f64({index})?")),
+        TypeRef::Bool => Some(format!("args.bool({index})?")),
+        TypeRef::Rune => Some(format!("args.rune({index})?")),
+        TypeRef::String => Some(format!("args.string({index})?")),
+        TypeRef::HostRequest(_) => Some(format!("args.request({index})?")),
+        TypeRef::ResourceToken(Some(inner)) => Some(format!(
+            "{}::from_raw(args.token({index})?)",
+            typed_handle_name(inner, "Token")
+        )),
+        TypeRef::Snapshot(Some(inner)) => Some(format!(
+            "{}::try_from(args.snapshot({index})?).map_err(|_| \
+             nexa_runtime::HostTrap::Type)?",
+            typed_handle_name(inner, "Snapshot")
+        )),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
+            Some(format!("{name}(args.opaque({index})?)"))
+        }
+        TypeRef::ResourceToken(None) | TypeRef::Snapshot(None) => {
+            unreachable!("validated host handles are typed")
+        }
+        TypeRef::Array(_)
+        | TypeRef::Buffer(_)
+        | TypeRef::Option(_)
+        | TypeRef::Result(_, _)
+        | TypeRef::Named(_) => None,
+    };
+    direct.map_or_else(
+        || {
+            let binding = format!("__nexa_arg_{index}");
+            (
+                format!("let {binding} = args.host_value({index})?;\n"),
+                decode_value(idl, ty, &format!("&{binding}")),
+            )
+        },
+        |decoded| (String::new(), decoded),
+    )
 }
 
 fn collect_typed_handles(idl: &Idl) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -642,7 +702,7 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("nexa_runtime::HostPayload::Struct(vec![{fields}])")
+            format!("nexa_runtime::HostPayload::structure([{fields}])")
         }
         _ => "nexa_runtime::HostPayload::Unit".into(),
     }
@@ -858,7 +918,7 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
                 .map(|field| encode_value(idl, &field.ty, &format!("{source}.{}", field.name)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("nexa_runtime::HostValue::Struct(vec![{fields}])")
+            format!("nexa_runtime::HostValue::structure([{fields}])")
         }
     }
 }
@@ -1824,7 +1884,7 @@ mod tests {
             )
             .unwrap(),
         );
-        assert!(struct_payload.contains("HostPayload::Struct"));
+        assert!(struct_payload.contains("HostPayload::structure"));
         assert!(struct_payload.contains("HostPayload::String(value.label)"));
     }
 
@@ -1844,6 +1904,8 @@ mod tests {
                 sync fn echo_event(value: Event) -> Event;
                 sync fn collections(values: array<Option<i32>>, copy: buffer<i64>)
                     -> array<Result<i32, i32>>;
+                sync fn sum8(a: i32, b: i32, c: i32, d: i32, e: i32, f: i32, g: i32, h: i32)
+                    -> i32;
                 sync fn explode() -> i32;
                 request(return_error, trap) fn next()
                     -> request<Result<Event, EventError>>;
@@ -1870,7 +1932,12 @@ mod tests {
             ),
         )
         .unwrap();
-        fs::write(directory.join("src/bindings.rs"), generate_rust(&idl)).unwrap();
+        let generated = generate_rust(&idl);
+        assert!(generated.contains("fn call_runtime"));
+        assert!(generated.contains("args.i32(7)?"));
+        assert!(!generated.contains("Vec<HostValue>"));
+        assert!(!generated.contains("HostValue::Struct(vec!"));
+        fs::write(directory.join("src/bindings.rs"), generated).unwrap();
         fs::write(
             directory.join("src/main.rs"),
             r#"mod bindings;
@@ -1944,6 +2011,21 @@ impl GameHost for Mock {
         panic!("host panic")
     }
 
+    fn sum8(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        a: i32,
+        b: i32,
+        c: i32,
+        d: i32,
+        e: i32,
+        f: i32,
+        g: i32,
+        h: i32,
+    ) -> Result<i32, HostError> {
+        Ok(a + b + c + d + e + f + g + h)
+    }
+
     fn next(
         &mut self,
         context: &mut nexa_runtime::ResourceContext<'_>,
@@ -2013,7 +2095,30 @@ fn main() {
         HostCallOutcome::Immediate(event)
     );
     assert_eq!(
-        registry.call(6, &mut context, HostArgs::new(&[])),
+        registry
+            .call_runtime(
+                6,
+                &mut context,
+                nexa_runtime::RuntimeHostArgs::new(
+                    &[
+                        nexa_runtime::RuntimeValue::I32(1),
+                        nexa_runtime::RuntimeValue::I32(2),
+                        nexa_runtime::RuntimeValue::I32(3),
+                        nexa_runtime::RuntimeValue::I32(4),
+                        nexa_runtime::RuntimeValue::I32(5),
+                        nexa_runtime::RuntimeValue::I32(6),
+                        nexa_runtime::RuntimeValue::I32(7),
+                        nexa_runtime::RuntimeValue::I32(8),
+                    ],
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        HostCallOutcome::Immediate(HostValue::I32(36))
+    );
+    assert_eq!(
+        registry.call(7, &mut context, HostArgs::new(&[])),
         Err(nexa_runtime::HostTrap::Panicked)
     );
 }

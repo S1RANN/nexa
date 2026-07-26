@@ -16,14 +16,14 @@ use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, St
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, CopyBuffer, DiagnosticCode,
-    ExecutionCharge, FuelState, GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome,
+    ExecutionCharge, FuelState, GcRef, GcRoots, Heap, HeapError, HostCallOutcome,
     HostCompletionDelivery, HostCompletionResult, HostPayload, HostRegistry, HostRequestError,
     HostRequestHandle, HostTrap, HostValue, InterpreterError, InterpreterHost,
     InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object, OpcodeCostTable,
     PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost,
-    RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources,
-    RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig,
-    SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
+    RuntimeHostArgs, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage,
+    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
+    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -175,11 +175,11 @@ impl InterpreterHost for RealmHostBridge<'_> {
             .imports
             .get(import as usize)
             .ok_or(HostTrap::UnknownFunction(import))?;
-        let values = HostArgs::from_runtime(arguments, heap.as_deref())?;
+        let values = RuntimeHostArgs::new(arguments, heap.as_deref())?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
-        match self.registry.call(import, &mut context, values)? {
+        match self.registry.call_runtime(import, &mut context, values)? {
             HostCallOutcome::Immediate(value) => {
                 Ok(InterpreterHostOutcome::Immediate(host_to_runtime_value(
                     value,

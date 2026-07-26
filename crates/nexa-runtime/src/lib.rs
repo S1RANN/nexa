@@ -49,8 +49,9 @@ pub use host::{
     HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest,
     RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
     ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
-    RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
-    RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
+    RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
+    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
+    TaskResourceSet,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

@@ -13,8 +13,8 @@ use nexa_runtime::{
     CancelReason, HeapError, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
     HostTrap, HostValue, MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult,
     RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeHost,
-    RuntimeHostDomain, RuntimeLimits, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
+    RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeValue, StateObject, StateValue,
+    StepConfig, TaskLimits, TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -467,7 +467,16 @@ fn main() {
             .call(
                 module,
                 0,
-                &[RuntimeValue::I32(7)],
+                &[
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3),
+                    RuntimeValue::I32(4),
+                    RuntimeValue::I32(5),
+                    RuntimeValue::I32(6),
+                    RuntimeValue::I32(7),
+                    RuntimeValue::I32(8),
+                ],
                 StepConfig {
                     owner: scope,
                     priority: 1,
@@ -480,7 +489,7 @@ fn main() {
         let immediate_host_call = observed(|| {
             assert!(matches!(
                 realm.poll_task(task, 64).unwrap(),
-                PollResult::Completed(Some(RuntimeValue::I32(8)))
+                PollResult::Completed(Some(RuntimeValue::I32(36)))
             ));
         });
         drop(realm);
@@ -1375,25 +1384,25 @@ fn make_immediate_host_realm(
     let schema = StableId::from_name("allocation-observer-immediate-schema");
     let mut function = FunctionBuilder::new(
         Signature {
-            parameters: vec![ValueType::I32],
+            parameters: vec![ValueType::I32; 8],
             result: Some(ValueType::I32),
         },
-        2,
+        9,
     );
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
             import: 0,
             args_base: 0,
-            args_count: 1,
-            dst: 1,
+            args_count: 8,
+            dst: 8,
         })
-        .emit(Instruction::Return { source: 1 });
+        .emit(Instruction::Return { source: 8 });
     let mut builder = ModuleBuilder::new();
     builder.metadata(host_hash, schema);
     builder.host_import(HostImport {
         stable_id: StableId::from_name("Observer::increment"),
-        parameters: vec![ValueType::I32],
+        parameters: vec![ValueType::I32; 8],
         result: Some(ValueType::I32),
         mode: HostCallMode::Immediate,
         fuel_cost: 1,
@@ -1540,13 +1549,38 @@ impl HostRegistry for ImmediateHost {
         _: &mut ResourceContext<'_>,
         args: HostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 1 {
+        if id != 0 || args.len() != 8 {
             return Err(HostTrap::Arity);
         }
-        let HostValue::I32(value) = args.get(0)? else {
-            return Err(HostTrap::Type);
-        };
-        Ok(HostCallOutcome::Immediate(HostValue::I32(value + 1)))
+        let mut sum = 0;
+        for index in 0..8 {
+            let HostValue::I32(value) = args.get(index)? else {
+                return Err(HostTrap::Type);
+            };
+            sum += value;
+        }
+        Ok(HostCallOutcome::Immediate(HostValue::I32(sum)))
+    }
+
+    fn call_runtime(
+        &mut self,
+        id: u32,
+        _: &mut ResourceContext<'_>,
+        args: RuntimeHostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        if id != 0 || args.len() != 8 {
+            return Err(HostTrap::Arity);
+        }
+        Ok(HostCallOutcome::Immediate(HostValue::I32(
+            args.i32(0)?
+                + args.i32(1)?
+                + args.i32(2)?
+                + args.i32(3)?
+                + args.i32(4)?
+                + args.i32(5)?
+                + args.i32(6)?
+                + args.i32(7)?,
+        )))
     }
 }
 

@@ -1023,6 +1023,13 @@ pub enum HostPayload {
     Unit,
 }
 
+impl HostPayload {
+    #[must_use]
+    pub fn structure<const N: usize>(fields: [Self; N]) -> Self {
+        Self::Struct(Vec::from(fields))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostValue {
     I32(i32),
@@ -1048,7 +1055,140 @@ pub enum HostValue {
     Unit,
 }
 
+impl HostValue {
+    #[must_use]
+    pub fn structure<const N: usize>(fields: [Self; N]) -> Self {
+        Self::Struct(Vec::from(fields))
+    }
+}
+
 const MAX_HOST_ARGUMENTS: usize = 8;
+
+#[derive(Clone, Copy, Debug)]
+pub struct RuntimeHostArgs<'a> {
+    values: &'a [crate::RuntimeValue],
+    heap: Option<&'a crate::Heap>,
+}
+
+impl<'a> RuntimeHostArgs<'a> {
+    pub fn new(
+        values: &'a [crate::RuntimeValue],
+        heap: Option<&'a crate::Heap>,
+    ) -> Result<Self, HostTrap> {
+        if values.len() > MAX_HOST_ARGUMENTS {
+            return Err(HostTrap::Arity);
+        }
+        Ok(Self { values, heap })
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.values.is_empty()
+    }
+
+    pub fn i32(&self, index: usize) -> Result<i32, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::I32(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn i64(&self, index: usize) -> Result<i64, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::I64(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn f32(&self, index: usize) -> Result<f32, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::F32(bits) => Ok(f32::from_bits(bits)),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn f64(&self, index: usize) -> Result<f64, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::F64(bits) => Ok(f64::from_bits(bits)),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn bool(&self, index: usize) -> Result<bool, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::Bool(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn rune(&self, index: usize) -> Result<char, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::Rune(value) => char::from_u32(value).ok_or(HostTrap::Type),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn string(&self, index: usize) -> Result<String, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::String { reference, .. } => self
+                .heap
+                .ok_or(HostTrap::Type)?
+                .string(reference)
+                .map(str::to_owned)
+                .map_err(|_| HostTrap::Type),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn request(&self, index: usize) -> Result<HostRequestHandle, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::HostRequest(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn token(&self, index: usize) -> Result<ResourceTokenHandle, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::ResourceToken(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn snapshot(&self, index: usize) -> Result<SnapshotHandle, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::Snapshot(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn opaque(&self, index: usize) -> Result<u64, HostTrap> {
+        match self.value(index)? {
+            crate::RuntimeValue::Opaque { value, .. } => Ok(value),
+            crate::RuntimeValue::Ref(reference)
+            | crate::RuntimeValue::NamedRef { reference, .. } => {
+                Ok(u64::from(reference.generation) << 32 | u64::from(reference.index))
+            }
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn host_value(&self, index: usize) -> Result<HostValue, HostTrap> {
+        runtime_argument_to_host_value(self.value(index)?, self.heap)
+    }
+
+    fn materialize(self) -> Result<HostArgs<'a>, HostTrap> {
+        HostArgs::from_runtime(self.values, self.heap)
+    }
+
+    fn value(&self, index: usize) -> Result<crate::RuntimeValue, HostTrap> {
+        self.values.get(index).copied().ok_or(HostTrap::Arity)
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct HostArgs<'a> {
@@ -1214,6 +1354,15 @@ pub trait HostRegistry {
         context: &mut ResourceContext<'_>,
         args: HostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap>;
+
+    fn call_runtime(
+        &mut self,
+        id: u32,
+        context: &mut ResourceContext<'_>,
+        args: RuntimeHostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        self.call(id, context, args.materialize()?)
+    }
 }
 
 pub trait ScriptFunction {
