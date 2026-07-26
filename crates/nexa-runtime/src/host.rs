@@ -1054,7 +1054,7 @@ impl HostPayload {
 }
 
 /// Legacy materialized host value. Converting runtime values to this form may allocate.
-#[deprecated(note = "use RuntimeHostArgs borrowed views and HostReturnWriter")]
+#[deprecated(note = "use RuntimeHostArgs borrowed views and HostReturnTransaction")]
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostValue {
     I32(i32),
@@ -1541,8 +1541,11 @@ impl<'a> RuntimeHostArgs<'a> {
         runtime_argument_to_host_value(self.value(index)?, self.heap.as_deref())
     }
 
-    pub fn return_writer(self, required_slots: usize) -> Result<HostReturnWriter<'a>, HostTrap> {
-        HostReturnWriter::new(self.heap.ok_or(HostTrap::Type)?, required_slots)
+    pub fn return_transaction(
+        self,
+        requirements: HostReturnRequirements,
+    ) -> Result<HostReturnTransaction<'a>, HostTrap> {
+        HostReturnTransaction::new(self.heap.ok_or(HostTrap::Type)?, requirements)
     }
 
     fn materialize(&self) -> Result<HostArgs<'static>, HostTrap> {
@@ -1694,21 +1697,124 @@ fn runtime_argument_to_host_value(
     })
 }
 
-/// A preflighted encoder that writes a host result directly into the VM heap.
-pub struct HostReturnWriter<'a> {
-    heap: &'a mut crate::Heap,
-    reservation: crate::heap::HeapReservation,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostReturnRequirements {
+    pub object_slots: usize,
+    pub collection_elements: usize,
+    pub string_bytes: usize,
+    pub struct_fields: usize,
 }
 
-impl<'a> HostReturnWriter<'a> {
-    fn new(heap: &'a mut crate::Heap, required_slots: usize) -> Result<Self, HostTrap> {
-        let reservation = heap.preflight(required_slots).map_err(|_| HostTrap::Type)?;
-        Ok(Self { heap, reservation })
+impl HostReturnRequirements {
+    pub const ZERO: Self = Self {
+        object_slots: 0,
+        collection_elements: 0,
+        string_bytes: 0,
+        struct_fields: 0,
+    };
+
+    pub fn checked_add(self, other: Self) -> Result<Self, HostTrap> {
+        Ok(Self {
+            object_slots: self
+                .object_slots
+                .checked_add(other.object_slots)
+                .ok_or(HostTrap::Type)?,
+            collection_elements: self
+                .collection_elements
+                .checked_add(other.collection_elements)
+                .ok_or(HostTrap::Type)?,
+            string_bytes: self
+                .string_bytes
+                .checked_add(other.string_bytes)
+                .ok_or(HostTrap::Type)?,
+            struct_fields: self
+                .struct_fields
+                .checked_add(other.struct_fields)
+                .ok_or(HostTrap::Type)?,
+        })
+    }
+
+    pub fn with_object(self) -> Result<Self, HostTrap> {
+        self.checked_add(Self {
+            object_slots: 1,
+            ..Self::ZERO
+        })
+    }
+
+    pub fn with_collection(self, elements: usize) -> Result<Self, HostTrap> {
+        self.checked_add(Self {
+            collection_elements: elements,
+            ..Self::ZERO
+        })
+    }
+
+    pub fn with_struct_fields(self, fields: usize) -> Result<Self, HostTrap> {
+        self.checked_add(Self {
+            struct_fields: fields,
+            ..Self::ZERO
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCollectionBuilder {
+    range: crate::heap::CollectionRange,
+    written: usize,
+    type_id: StableId,
+    element_type: nexa_bytecode::ValueType,
+    buffer: bool,
+}
+
+/// An all-or-nothing encoder over pre-reserved object and collection storage.
+pub struct HostReturnTransaction<'a> {
+    heap: &'a mut crate::Heap,
+    heap_reservation: crate::heap::HeapReservation,
+    collection_reservation: crate::heap::CollectionReservation,
+    remaining_string_bytes: usize,
+    remaining_struct_fields: usize,
+    committed: bool,
+}
+
+impl<'a> HostReturnTransaction<'a> {
+    fn new(
+        heap: &'a mut crate::Heap,
+        requirements: HostReturnRequirements,
+    ) -> Result<Self, HostTrap> {
+        heap.preflight_host_string_bytes(requirements.string_bytes)
+            .map_err(|_| HostTrap::Type)?;
+        if heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnObjectReservation) {
+            return Err(HostTrap::Type);
+        }
+        let heap_reservation = heap
+            .preflight(requirements.object_slots)
+            .map_err(|_| HostTrap::Type)?;
+        if heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionReservation) {
+            return Err(HostTrap::Type);
+        }
+        let mut collection_reservation = heap
+            .preflight_collection(requirements.collection_elements)
+            .map_err(|_| HostTrap::Type)?;
+        if heap.begin_host_transaction().is_err() {
+            heap.release_collection_reservation(&mut collection_reservation);
+            return Err(HostTrap::Type);
+        }
+        Ok(Self {
+            heap,
+            heap_reservation,
+            collection_reservation,
+            remaining_string_bytes: requirements.string_bytes,
+            remaining_struct_fields: requirements.struct_fields,
+            committed: false,
+        })
     }
 
     pub fn write_string(&mut self, value: String) -> Result<crate::RuntimeValue, HostTrap> {
+        self.remaining_string_bytes = self
+            .remaining_string_bytes
+            .checked_sub(value.len())
+            .ok_or(HostTrap::Type)?;
         self.heap
-            .commit_owned_string(&mut self.reservation, value)
+            .commit_owned_string(&mut self.heap_reservation, value)
             .map_err(|_| HostTrap::Type)
     }
 
@@ -1717,8 +1823,18 @@ impl<'a> HostReturnWriter<'a> {
         type_id: StableId,
         fields: &[crate::RuntimeValue],
     ) -> Result<crate::RuntimeValue, HostTrap> {
+        if self
+            .heap
+            .failure_trigger(crate::RuntimeFailurePoint::HostReturnStructWrite)
+        {
+            return Err(HostTrap::Type);
+        }
+        self.remaining_struct_fields = self
+            .remaining_struct_fields
+            .checked_sub(fields.len())
+            .ok_or(HostTrap::Type)?;
         self.heap
-            .commit_struct(&mut self.reservation, type_id, fields)
+            .commit_struct(&mut self.heap_reservation, type_id, fields)
             .map_err(|_| HostTrap::Type)
     }
 
@@ -1729,61 +1845,162 @@ impl<'a> HostReturnWriter<'a> {
         tag: u32,
         payload: Option<crate::RuntimeValue>,
     ) -> Result<crate::RuntimeValue, HostTrap> {
-        Ok(self
+        Ok(self.heap.allocate_enum_reserved(
+            &mut self.heap_reservation,
+            type_id,
+            variant,
+            tag,
+            payload,
+        ))
+    }
+
+    pub fn begin_array(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        length: usize,
+    ) -> Result<HostCollectionBuilder, HostTrap> {
+        self.heap
+            .validate_collection_length(length)
+            .map_err(|_| HostTrap::Type)?;
+        let range =
+            crate::Heap::reserve_collection_segment(&mut self.collection_reservation, length)
+                .map_err(|_| HostTrap::Type)?;
+        Ok(HostCollectionBuilder {
+            range,
+            written: 0,
+            type_id,
+            element_type,
+            buffer: false,
+        })
+    }
+
+    pub fn push_array_value(
+        &mut self,
+        builder: &mut HostCollectionBuilder,
+        value: crate::RuntimeValue,
+    ) -> Result<(), HostTrap> {
+        self.push_collection_value(builder, value)
+    }
+
+    pub fn finish_array(
+        &mut self,
+        builder: HostCollectionBuilder,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        if builder.buffer || builder.written != builder.range.length {
+            return Err(HostTrap::Type);
+        }
+        self.heap
+            .commit_array_reserved(
+                &mut self.heap_reservation,
+                builder.type_id,
+                builder.element_type,
+                builder.range,
+            )
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn begin_buffer(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        length: usize,
+    ) -> Result<HostCollectionBuilder, HostTrap> {
+        let mut builder = self.begin_array(type_id, element_type, length)?;
+        builder.buffer = true;
+        Ok(builder)
+    }
+
+    pub fn push_buffer_value(
+        &mut self,
+        builder: &mut HostCollectionBuilder,
+        value: crate::RuntimeValue,
+    ) -> Result<(), HostTrap> {
+        self.push_collection_value(builder, value)
+    }
+
+    pub fn finish_buffer(
+        &mut self,
+        builder: HostCollectionBuilder,
+    ) -> Result<crate::RuntimeValue, HostTrap> {
+        if !builder.buffer || builder.written != builder.range.length {
+            return Err(HostTrap::Type);
+        }
+        self.heap
+            .commit_buffer_reserved(
+                &mut self.heap_reservation,
+                builder.type_id,
+                builder.element_type,
+                builder.range,
+            )
+            .map_err(|_| HostTrap::Type)
+    }
+
+    fn push_collection_value(
+        &mut self,
+        builder: &mut HostCollectionBuilder,
+        value: crate::RuntimeValue,
+    ) -> Result<(), HostTrap> {
+        if self
             .heap
-            .allocate_enum_reserved(&mut self.reservation, type_id, variant, tag, payload))
-    }
-
-    pub fn write_array(
-        &mut self,
-        type_id: StableId,
-        element_type: nexa_bytecode::ValueType,
-        values: Vec<crate::RuntimeValue>,
-    ) -> Result<crate::RuntimeValue, HostTrap> {
+            .failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionWrite)
+        {
+            return Err(HostTrap::Type);
+        }
         self.heap
-            .commit_array_reserved(&mut self.reservation, type_id, element_type, values)
-            .map_err(|_| HostTrap::Type)
+            .write_collection_at(builder.range, builder.written, value)
+            .map_err(|_| HostTrap::Type)?;
+        builder.written += 1;
+        Ok(())
     }
 
-    pub fn write_buffer(
-        &mut self,
-        type_id: StableId,
-        element_type: nexa_bytecode::ValueType,
-        values: Vec<crate::RuntimeValue>,
-    ) -> Result<crate::RuntimeValue, HostTrap> {
-        self.heap
-            .commit_buffer_reserved(&mut self.reservation, type_id, element_type, values)
-            .map_err(|_| HostTrap::Type)
+    pub fn commit(mut self, value: crate::RuntimeValue) -> Result<crate::RuntimeValue, HostTrap> {
+        if self
+            .heap
+            .failure_trigger(crate::RuntimeFailurePoint::HostReturnCommit)
+            || !crate::Heap::reservation_complete(&self.heap_reservation)
+            || self.remaining_string_bytes != 0
+            || self.remaining_struct_fields != 0
+            || crate::Heap::complete_collection_reservation(&mut self.collection_reservation)
+                .is_err()
+        {
+            return Err(HostTrap::Type);
+        }
+        self.heap.commit_host_transaction();
+        self.committed = true;
+        Ok(value)
     }
+}
 
-    pub fn finish(self, value: crate::RuntimeValue) -> Result<crate::RuntimeValue, HostTrap> {
-        if crate::Heap::reservation_complete(&self.reservation) {
-            Ok(value)
-        } else {
-            Err(HostTrap::Type)
+impl Drop for HostReturnTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.heap.rollback_host_transaction();
+            self.heap
+                .release_collection_reservation(&mut self.collection_reservation);
         }
     }
 }
 
 pub trait EncodeHostReturn {
-    fn required_slots(&self) -> Result<usize, HostTrap>;
+    fn requirements(&self) -> Result<HostReturnRequirements, HostTrap>;
 
     fn encode_into(
         self,
-        writer: &mut HostReturnWriter<'_>,
+        transaction: &mut HostReturnTransaction<'_>,
     ) -> Result<crate::RuntimeValue, HostTrap>;
 }
 
 macro_rules! scalar_host_return {
     ($ty:ty, $variant:ident, $encode:expr) => {
         impl EncodeHostReturn for $ty {
-            fn required_slots(&self) -> Result<usize, HostTrap> {
-                Ok(0)
+            fn requirements(&self) -> Result<HostReturnRequirements, HostTrap> {
+                Ok(HostReturnRequirements::ZERO)
             }
 
             fn encode_into(
                 self,
-                _: &mut HostReturnWriter<'_>,
+                _: &mut HostReturnTransaction<'_>,
             ) -> Result<crate::RuntimeValue, HostTrap> {
                 Ok(crate::RuntimeValue::$variant(($encode)(self)))
             }
@@ -1799,15 +2016,19 @@ scalar_host_return!(bool, Bool, |value| value);
 scalar_host_return!(char, Rune, |value| value as u32);
 
 impl EncodeHostReturn for String {
-    fn required_slots(&self) -> Result<usize, HostTrap> {
-        Ok(1)
+    fn requirements(&self) -> Result<HostReturnRequirements, HostTrap> {
+        Ok(HostReturnRequirements {
+            object_slots: 1,
+            string_bytes: self.len(),
+            ..HostReturnRequirements::ZERO
+        })
     }
 
     fn encode_into(
         self,
-        writer: &mut HostReturnWriter<'_>,
+        transaction: &mut HostReturnTransaction<'_>,
     ) -> Result<crate::RuntimeValue, HostTrap> {
-        writer.write_string(self)
+        transaction.write_string(self)
     }
 }
 
@@ -3549,6 +3770,15 @@ impl<T> CopyBuffer<T> {
     }
 }
 
+impl<T> IntoIterator for CopyBuffer<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.data.into_iter()
+    }
+}
+
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_completion_ticket_terminal_race(data: &[u8]) {
     if data.len() > 64 {
@@ -3678,12 +3908,98 @@ mod tests {
 
     use super::{
         EncodedSnapshot, HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload,
-        HostRequestError, HostRequestHandle, HostRequestManager, ReleaseKind, ReleaseQueue,
-        ReleaseQueueError, ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostArgs,
-        RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotLayout,
-        SnapshotManager,
+        HostRequestError, HostRequestHandle, HostRequestManager, HostReturnRequirements,
+        ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceTokenManager,
+        RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState,
+        SnapshotLayout, SnapshotManager,
     };
-    use crate::{Heap, Object, RuntimeLimits, RuntimeValue, StableId, TaskRuntime};
+    use crate::{
+        GcRoots, Heap, RuntimeFailurePoint, RuntimeLimits, RuntimeValue, StableId, TaskRuntime,
+        ValueType,
+    };
+
+    fn encode_three_i32(heap: &mut Heap) -> Result<RuntimeValue, super::HostTrap> {
+        let requirements = HostReturnRequirements {
+            object_slots: 1,
+            collection_elements: 3,
+            ..HostReturnRequirements::ZERO
+        };
+        let mut transaction =
+            RuntimeHostArgs::new(&[], Some(heap))?.return_transaction(requirements)?;
+        let type_id = nexa_bytecode::array_type(ValueType::I32);
+        let mut array = transaction.begin_array(type_id, ValueType::I32, 3)?;
+        for value in [1, 2, 3] {
+            transaction.push_array_value(&mut array, RuntimeValue::I32(value))?;
+        }
+        let value = transaction.finish_array(array)?;
+        transaction.commit(value)
+    }
+
+    #[test]
+    fn host_return_transaction_is_atomic_and_reuses_collection_arena() {
+        let mut heap = Heap::new_with_arena_limits(4, 64, 8, 8, 5);
+        let initial = heap.collection_inspection();
+        heap.failure_injector()
+            .arm_once(RuntimeFailurePoint::HostReturnCollectionWrite);
+        assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
+        assert_eq!(heap.live_len(), 0);
+        assert_eq!(heap.collection_inspection(), initial);
+
+        heap.failure_injector()
+            .arm_once(RuntimeFailurePoint::HostReturnCommit);
+        assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
+        assert_eq!(heap.live_len(), 0);
+        assert_eq!(heap.collection_inspection(), initial);
+
+        let array = encode_three_i32(&mut heap).unwrap();
+        assert_eq!(
+            heap.array_values(array).unwrap(),
+            [
+                RuntimeValue::I32(1),
+                RuntimeValue::I32(2),
+                RuntimeValue::I32(3)
+            ]
+        );
+        let RuntimeValue::NamedRef { reference, .. } = array else {
+            unreachable!()
+        };
+        let stats = heap.collect(&GcRoots::default()).unwrap();
+        assert_eq!(stats.reclaimed, 1);
+        assert_eq!(heap.collection_inspection(), initial);
+        assert!(heap.resolve(reference).is_err());
+        assert!(encode_three_i32(&mut heap).is_ok());
+    }
+
+    #[test]
+    fn host_return_requirements_use_checked_arithmetic() {
+        let string = HostReturnRequirements {
+            object_slots: 1,
+            string_bytes: 5,
+            ..HostReturnRequirements::ZERO
+        };
+        let array = HostReturnRequirements {
+            object_slots: 1,
+            collection_elements: 3,
+            ..HostReturnRequirements::ZERO
+        };
+        assert_eq!(
+            string.checked_add(array).unwrap(),
+            HostReturnRequirements {
+                object_slots: 2,
+                collection_elements: 3,
+                string_bytes: 5,
+                struct_fields: 0,
+            }
+        );
+        assert_eq!(
+            HostReturnRequirements {
+                object_slots: usize::MAX,
+                ..HostReturnRequirements::ZERO
+            }
+            .with_object(),
+            Err(super::HostTrap::Type)
+        );
+    }
 
     #[test]
     fn complex_host_views_borrow_runtime_storage() {
@@ -3703,17 +4019,11 @@ mod tests {
             .allocate_enum(enum_type, variant, 1, Some(structure))
             .unwrap();
         let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
-        let array_reference = heap
-            .allocate(Object::Array {
-                type_id: array_type,
-                element_type: nexa_bytecode::ValueType::I32,
-                values: vec![RuntimeValue::I32(3), RuntimeValue::I32(5)],
-            })
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
             .unwrap();
-        let array = RuntimeValue::NamedRef {
-            reference: array_reference,
-            type_id: array_type,
-        };
+        heap.array_push(array, RuntimeValue::I32(3)).unwrap();
+        heap.array_push(array, RuntimeValue::I32(5)).unwrap();
         let buffer_type = nexa_bytecode::buffer_type(nexa_bytecode::ValueType::I32);
         let buffer = heap
             .allocate_buffer(

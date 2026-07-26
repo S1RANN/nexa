@@ -45,13 +45,17 @@ mod micro;
 pub use frame::{
     ContinuationReservation, DeferAction, Frame, FrameArena, FrameError, FrameLimits, RuntimeValue,
 };
-pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object};
+pub use heap::{
+    CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
+    CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object,
+};
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
-    HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome, HostCompletionDelivery,
-    HostCompletionResult, HostCompletionTicket, HostEnumRef, HostErrorPayload, HostOptionRef,
-    HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostRequestState,
-    HostResultRef, HostReturnWriter, HostStr, HostStructRef, HostTrap, HostValue, HostValueRef,
+    HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome, HostCollectionBuilder,
+    HostCompletionDelivery, HostCompletionResult, HostCompletionTicket, HostEnumRef,
+    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
+    HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValue, HostValueRef,
     MAX_HOST_RETURN_FIELDS, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
     ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
     ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,

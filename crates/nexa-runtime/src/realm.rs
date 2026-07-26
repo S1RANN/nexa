@@ -559,15 +559,8 @@ fn commit_host_array(
             types,
         )?);
     }
-    let reference = heap.commit(
-        reservation,
-        Object::Array {
-            type_id,
-            element_type: metadata.element,
-            values,
-        },
-    );
-    Ok(RuntimeValue::NamedRef { reference, type_id })
+    heap.commit_array_values_reserved(reservation, type_id, metadata.element, &values)
+        .map_err(|_| HostTrap::Type)
 }
 
 fn commit_host_buffer(
@@ -592,15 +585,8 @@ fn commit_host_buffer(
             types,
         )?);
     }
-    let reference = heap.commit(
-        reservation,
-        Object::Buffer {
-            type_id,
-            element_type: metadata.element,
-            values,
-        },
-    );
-    Ok(RuntimeValue::NamedRef { reference, type_id })
+    heap.commit_buffer_values_reserved(reservation, type_id, metadata.element, &values)
+        .map_err(|_| HostTrap::Type)
 }
 
 fn commit_host_struct(
@@ -670,6 +656,8 @@ pub struct RealmConfig {
     pub max_modules: u32,
     pub max_heap_objects: u32,
     pub max_string_bytes: usize,
+    pub max_collection_elements: usize,
+    pub max_collection_ranges: usize,
     pub max_host_resources: u32,
     pub release_capacity: usize,
     pub tombstone_capacity: usize,
@@ -685,6 +673,8 @@ impl Default for RealmConfig {
             max_modules: 16,
             max_heap_objects: 4_096,
             max_string_bytes: 1024 * 1024,
+            max_collection_elements: 65_536,
+            max_collection_ranges: 4_097,
             max_host_resources: 1_024,
             release_capacity: 2_048,
             tombstone_capacity: 1_024,
@@ -972,15 +962,8 @@ fn commit_planned_payload(
                 .into_iter()
                 .map(|value| commit_planned_payload(heap, reservation, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            let reference = heap.commit(
-                reservation,
-                Object::Array {
-                    type_id,
-                    element_type,
-                    values,
-                },
-            );
-            Ok(RuntimeValue::NamedRef { reference, type_id })
+            heap.commit_array_values_reserved(reservation, type_id, element_type, &values)
+                .map_err(RealmError::Heap)
         }
         PlannedResultPayload::Buffer {
             type_id,
@@ -991,15 +974,8 @@ fn commit_planned_payload(
                 .into_iter()
                 .map(|value| commit_planned_payload(heap, reservation, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            let reference = heap.commit(
-                reservation,
-                Object::Buffer {
-                    type_id,
-                    element_type,
-                    values,
-                },
-            );
-            Ok(RuntimeValue::NamedRef { reference, type_id })
+            heap.commit_buffer_values_reserved(reservation, type_id, element_type, &values)
+                .map_err(RealmError::Heap)
         }
     }
 }
@@ -1337,8 +1313,13 @@ impl RealmRuntime {
             config.release_capacity,
         );
         resources.set_failure_injector(failure_injector.clone());
-        let mut heap =
-            Heap::new_with_string_limit(config.max_heap_objects, config.max_string_bytes);
+        let mut heap = Heap::new_with_arena_limits(
+            config.max_heap_objects,
+            config.max_string_bytes,
+            Heap::DEFAULT_MAX_COLLECTION_LENGTH,
+            config.max_collection_elements,
+            config.max_collection_ranges,
+        );
         heap.set_failure_injector(failure_injector.clone());
         Self {
             realm_id: config.realm_id,
@@ -2415,6 +2396,15 @@ impl RealmRuntime {
 
     pub fn allocate(&mut self, object: Object) -> Result<GcRef, RealmError> {
         Ok(self.heap.allocate(object)?)
+    }
+
+    pub fn allocate_buffer(
+        &mut self,
+        type_id: StableId,
+        element_type: ValueType,
+        values: &[RuntimeValue],
+    ) -> Result<RuntimeValue, RealmError> {
+        Ok(self.heap.allocate_buffer(type_id, element_type, values)?)
     }
 
     pub fn resolve_heap_object(&self, reference: GcRef) -> Result<&Object, RealmError> {
@@ -4741,9 +4731,14 @@ mod tests {
             if id != 0 || !args.is_empty() {
                 return Err(HostTrap::Arity);
             }
-            let mut writer = args.return_writer(1)?;
-            let value = writer.write_string("direct-result".to_owned())?;
-            let value = writer.finish(value)?;
+            let requirements = crate::HostReturnRequirements {
+                object_slots: 1,
+                string_bytes: "direct-result".len(),
+                ..crate::HostReturnRequirements::ZERO
+            };
+            let mut transaction = args.return_transaction(requirements)?;
+            let value = transaction.write_string("direct-result".to_owned())?;
+            let value = transaction.commit(value)?;
             Ok(HostCallOutcome::RuntimeImmediate(value))
         }
     }

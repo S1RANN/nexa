@@ -18,10 +18,16 @@ pub enum RuntimeFailurePoint {
     ReloadCompletionSlot,
     ActivationTrap,
     CleanupTrap,
+    HostReturnObjectReservation,
+    HostReturnCollectionReservation,
+    HostReturnStringReservation,
+    HostReturnStructWrite,
+    HostReturnCollectionWrite,
+    HostReturnCommit,
 }
 
 impl RuntimeFailurePoint {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 21] = [
         Self::TaskSlot,
         Self::ScopeSlot,
         Self::SchedulerSlot,
@@ -37,6 +43,12 @@ impl RuntimeFailurePoint {
         Self::ReloadCompletionSlot,
         Self::ActivationTrap,
         Self::CleanupTrap,
+        Self::HostReturnObjectReservation,
+        Self::HostReturnCollectionReservation,
+        Self::HostReturnStringReservation,
+        Self::HostReturnStructWrite,
+        Self::HostReturnCollectionWrite,
+        Self::HostReturnCommit,
     ];
 
     const fn index(self) -> usize {
@@ -134,7 +146,7 @@ impl RuntimeFailureInjector {
     }
 
     #[must_use]
-    pub fn all_stats(&self) -> [(RuntimeFailurePoint, FailurePointStats); 15] {
+    pub fn all_stats(&self) -> [(RuntimeFailurePoint, FailurePointStats); 21] {
         std::array::from_fn(|index| {
             let point = RuntimeFailurePoint::ALL[index];
             (point, self.stats(point))

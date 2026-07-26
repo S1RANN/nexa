@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostPayload, ModuleLifecycle, Object, PollResult, RealmConfig, RealmRuntime, ResourceContext,
+    HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime, ResourceContext,
     RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
     TickBudget,
 };
@@ -152,22 +152,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     )?;
     let scope = realm.create_scope(None)?;
-    let buffer_reference = realm.allocate(Object::Buffer {
-        type_id: combat_buffer.type_id,
-        element_type: combat_buffer.element,
-        values: vec![
+    let buffer = realm.allocate_buffer(
+        combat_buffer.type_id,
+        combat_buffer.element,
+        &[
             RuntimeValue::I32(4),
             RuntimeValue::I32(5),
             RuntimeValue::I32(6),
         ],
-    })?;
+    )?;
     let feature_task = realm.call(
         module,
         5,
-        &[RuntimeValue::NamedRef {
-            reference: buffer_reference,
-            type_id: combat_buffer.type_id,
-        }],
+        &[buffer],
         StepConfig {
             owner: scope,
             priority: 10,

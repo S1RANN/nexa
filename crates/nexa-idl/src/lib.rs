@@ -492,25 +492,26 @@ pub fn generate_rust(idl: &Idl) -> String {
         output.push_str("}\n");
     }
     for structure in &idl.structs {
-        let required = structure
+        let nested_requirements = structure
             .fields
             .iter()
-            .map(|field| {
-                required_slots_value_expr(idl, &field.ty, &format!("&self.{}", field.name))
-            })
+            .map(|field| requirements_value_expr(idl, &field.ty, &format!("&self.{}", field.name)))
             .collect::<Vec<_>>()
-            .join(" + ");
-        let required = if required.is_empty() {
-            "1usize".to_owned()
-        } else {
-            format!("1usize + {required}")
-        };
+            .into_iter()
+            .map(|item| format!("__nexa_requirements = __nexa_requirements.checked_add({item})?;"))
+            .collect::<String>();
+        let requirements = format!(
+            "{{ let mut __nexa_requirements = nexa_runtime::HostReturnRequirements {{ \
+             object_slots: 1, struct_fields: {}, ..nexa_runtime::HostReturnRequirements::ZERO }}; \
+             {nested_requirements} __nexa_requirements }}",
+            structure.fields.len()
+        );
         writeln!(
             output,
             "#[allow(clippy::identity_op)] impl nexa_runtime::EncodeHostReturn for {} {{ \
-             fn required_slots(&self) -> Result<usize, nexa_runtime::HostTrap> {{ \
-             Ok({required}) }} fn encode_into(self, writer: &mut \
-             nexa_runtime::HostReturnWriter<'_>) -> Result<nexa_runtime::RuntimeValue, \
+             fn requirements(&self) -> Result<nexa_runtime::HostReturnRequirements, \
+             nexa_runtime::HostTrap> {{ Ok({requirements}) }} fn encode_into(self, transaction: \
+             &mut nexa_runtime::HostReturnTransaction<'_>) -> Result<nexa_runtime::RuntimeValue, \
              nexa_runtime::HostTrap> {{",
             structure.name
         )
@@ -524,14 +525,14 @@ pub fn generate_rust(idl: &Idl) -> String {
                 idl,
                 &field.ty,
                 &format!("self.{}", field.name),
-                "writer",
+                "transaction",
             );
             writeln!(output, "__nexa_fields[{index}] = {encoded};")
                 .expect("String writes do not fail");
         }
         writeln!(
             output,
-            "writer.write_struct(nexa_runtime::StableId({}), \
+            "transaction.write_struct(nexa_runtime::StableId({}), \
              &__nexa_fields[..{}]) }} }}",
             StableId::from_name(&structure.name).0,
             structure.fields.len()
@@ -539,20 +540,20 @@ pub fn generate_rust(idl: &Idl) -> String {
         .expect("String writes do not fail");
     }
     for enumeration in &idl.enums {
-        let required =
-            required_slots_value_expr(idl, &TypeRef::Named(enumeration.name.clone()), "self");
+        let requirements =
+            requirements_value_expr(idl, &TypeRef::Named(enumeration.name.clone()), "self");
         let encoded = encode_runtime_return_value(
             idl,
             &TypeRef::Named(enumeration.name.clone()),
             "self",
-            "writer",
+            "transaction",
         );
         writeln!(
             output,
             "impl nexa_runtime::EncodeHostReturn for {} {{ \
-             fn required_slots(&self) -> Result<usize, nexa_runtime::HostTrap> {{ \
-             Ok({required}) }} fn encode_into(self, writer: &mut \
-             nexa_runtime::HostReturnWriter<'_>) -> Result<nexa_runtime::RuntimeValue, \
+             fn requirements(&self) -> Result<nexa_runtime::HostReturnRequirements, \
+             nexa_runtime::HostTrap> {{ Ok({requirements}) }} fn encode_into(self, transaction: \
+             &mut nexa_runtime::HostReturnTransaction<'_>) -> Result<nexa_runtime::RuntimeValue, \
              nexa_runtime::HostTrap> {{ Ok({encoded}) }} }}",
             enumeration.name
         )
@@ -737,15 +738,15 @@ fn emit_host_dispatch(output: &mut String, idl: &Idl) {
         if matches!(function.result, TypeRef::HostRequest(_)) {
             output.push_str("Ok(nexa_runtime::HostCallOutcome::Pending(result)) }\n");
         } else if return_requires_writer(&function.result) {
-            let required = required_slots_value_expr(idl, &function.result, "&result");
+            let requirements = requirements_value_expr(idl, &function.result, "&result");
             let encoded =
-                encode_runtime_return_value(idl, &function.result, "result", "__nexa_writer_ref");
+                encode_runtime_return_value(idl, &function.result, "result", "__nexa_transaction");
             writeln!(
                 output,
-                "let __nexa_required_slots = {required}; let mut __nexa_writer = \
-                 args.return_writer(__nexa_required_slots)?; let __nexa_value = {{ let \
-                 __nexa_writer_ref = &mut __nexa_writer; {encoded} }}; \
-                 let __nexa_value = __nexa_writer.finish(__nexa_value)?; \
+                "let __nexa_requirements = {requirements}; let mut __nexa_return = \
+                 args.return_transaction(__nexa_requirements)?; let __nexa_value = {{ let \
+                 __nexa_transaction = &mut __nexa_return; {encoded} }}; \
+                 let __nexa_value = __nexa_return.commit(__nexa_value)?; \
                  Ok(nexa_runtime::HostCallOutcome::RuntimeImmediate(__nexa_value)) }}"
             )
             .expect("String writes do not fail");
@@ -922,7 +923,7 @@ fn return_requires_writer(ty: &TypeRef) -> bool {
 }
 
 #[allow(clippy::too_many_lines)]
-fn required_slots_value_expr(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+fn requirements_value_expr(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
         TypeRef::I32
         | TypeRef::I64
@@ -932,55 +933,80 @@ fn required_slots_value_expr(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         | TypeRef::Rune
         | TypeRef::HostRequest(_)
         | TypeRef::ResourceToken(_)
-        | TypeRef::Snapshot(_) => "0usize".into(),
-        TypeRef::String => "1usize".into(),
+        | TypeRef::Snapshot(_) => "nexa_runtime::HostReturnRequirements::ZERO".into(),
+        TypeRef::String => format!(
+            "nexa_runtime::HostReturnRequirements {{ object_slots: 1, string_bytes: \
+             ({source}).len(), ..nexa_runtime::HostReturnRequirements::ZERO }}"
+        ),
         TypeRef::Array(inner) => {
-            let inner = required_slots_value_expr(idl, inner, "value");
-            if inner == "0usize" {
-                "1usize".into()
-            } else {
-                format!("1usize + ({source}).iter().map(|value| {inner}).sum::<usize>()")
-            }
+            let inner = requirements_value_expr(idl, inner, "value");
+            format!(
+                "{{ let mut __nexa_requirements = nexa_runtime::HostReturnRequirements {{ \
+                 object_slots: 1, collection_elements: ({source}).len(), \
+                 ..nexa_runtime::HostReturnRequirements::ZERO }}; for value in ({source}).iter() {{ \
+                 let _ = value; \
+                 __nexa_requirements = __nexa_requirements.checked_add({inner})?; }} \
+                 __nexa_requirements }}"
+            )
         }
         TypeRef::Buffer(inner) => {
-            let inner = required_slots_value_expr(idl, inner, "value");
-            if inner == "0usize" {
-                "1usize".into()
-            } else {
-                format!("1usize + ({source}).as_slice().iter().map(|value| {inner}).sum::<usize>()")
-            }
+            let inner = requirements_value_expr(idl, inner, "value");
+            format!(
+                "{{ let mut __nexa_requirements = nexa_runtime::HostReturnRequirements {{ \
+                 object_slots: 1, collection_elements: ({source}).len(), \
+                 ..nexa_runtime::HostReturnRequirements::ZERO }}; for value in \
+                 ({source}).as_slice().iter() {{ let _ = value; __nexa_requirements = \
+                 __nexa_requirements.checked_add({inner})?; }} __nexa_requirements }}"
+            )
         }
         TypeRef::Option(inner) => {
-            let inner = required_slots_value_expr(idl, inner, "value");
-            format!("1usize + match {source} {{ Some(value) => {inner}, None => 0usize }}")
+            let inner = requirements_value_expr(idl, inner, "value");
+            format!(
+                "nexa_runtime::HostReturnRequirements {{ object_slots: 1, \
+                 ..nexa_runtime::HostReturnRequirements::ZERO }}.checked_add(match {source} {{ \
+                 Some(value) => {inner}, None => nexa_runtime::HostReturnRequirements::ZERO }})?"
+            )
         }
         TypeRef::Result(success, error) => {
-            let success = required_slots_value_expr(idl, success, "value");
-            let error = required_slots_value_expr(idl, error, "error");
-            format!("1usize + match {source} {{ Ok(value) => {success}, Err(error) => {error} }}")
+            let success = requirements_value_expr(idl, success, "value");
+            let error = requirements_value_expr(idl, error, "error");
+            format!(
+                "nexa_runtime::HostReturnRequirements {{ object_slots: 1, \
+                 ..nexa_runtime::HostReturnRequirements::ZERO }}.checked_add(match {source} {{ \
+                 Ok(value) => {success}, Err(error) => {error} }})?"
+            )
         }
-        TypeRef::Named(name) if idl.opaque_handles.contains(name) => "0usize".into(),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
+            "nexa_runtime::HostReturnRequirements::ZERO".into()
+        }
         TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
             let enumeration = idl
                 .enums
                 .iter()
                 .find(|item| item.name == *name)
                 .expect("validated enum exists");
-            let mut expression = format!("1usize + match {source} {{");
+            let mut expression = format!(
+                "nexa_runtime::HostReturnRequirements {{ object_slots: 1, \
+                 ..nexa_runtime::HostReturnRequirements::ZERO }}.checked_add(match {source} {{"
+            );
             for variant in &enumeration.variants {
                 if let Some(payload) = &variant.payload {
-                    let nested = required_slots_value_expr(idl, payload, "value");
+                    let nested = requirements_value_expr(idl, payload, "value");
                     write!(expression, "{name}::{}(value) => {nested},", variant.name)
                         .expect("String writes do not fail");
                 } else {
-                    write!(expression, "{name}::{} => 0usize,", variant.name)
-                        .expect("String writes do not fail");
+                    write!(
+                        expression,
+                        "{name}::{} => nexa_runtime::HostReturnRequirements::ZERO,",
+                        variant.name
+                    )
+                    .expect("String writes do not fail");
                 }
             }
-            expression.push('}');
+            expression.push_str("})?");
             expression
         }
-        TypeRef::Named(_) => format!("nexa_runtime::EncodeHostReturn::required_slots({source})?"),
+        TypeRef::Named(_) => format!("nexa_runtime::EncodeHostReturn::requirements({source})?"),
     }
 }
 
@@ -1025,9 +1051,10 @@ fn encode_runtime_return_value(idl: &Idl, ty: &TypeRef, source: &str, writer: &s
             let type_id = nexa_bytecode::array_type(value_type(idl, inner)).0;
             let element_type = runtime_value_type_expr(idl, inner);
             format!(
-                "{{ let mut __nexa_values = Vec::with_capacity({source}.len()); for value in \
-                 {source} {{ __nexa_values.push({encoded}); }} {writer}.write_array(\
-                 nexa_runtime::StableId({type_id}), {element_type}, __nexa_values)? }}"
+                "{{ let mut __nexa_array = {writer}.begin_array(nexa_runtime::StableId({type_id}), \
+                 {element_type}, {source}.len())?; for value in {source} {{ let __nexa_encoded = \
+                 {encoded}; {writer}.push_array_value(&mut __nexa_array, __nexa_encoded)?; }} \
+                 {writer}.finish_array(__nexa_array)? }}"
             )
         }
         TypeRef::Buffer(inner) => {
@@ -1035,10 +1062,10 @@ fn encode_runtime_return_value(idl: &Idl, ty: &TypeRef, source: &str, writer: &s
             let type_id = nexa_bytecode::buffer_type(value_type(idl, inner)).0;
             let element_type = runtime_value_type_expr(idl, inner);
             format!(
-                "{{ let __nexa_source = {source}.into_vec(); let mut __nexa_values = \
-                 Vec::with_capacity(__nexa_source.len()); for value in __nexa_source {{ \
-                 __nexa_values.push({encoded}); }} {writer}.write_buffer(\
-                 nexa_runtime::StableId({type_id}), {element_type}, __nexa_values)? }}"
+                "{{ let mut __nexa_buffer = {writer}.begin_buffer(\
+                 nexa_runtime::StableId({type_id}), {element_type}, {source}.len())?; for value in \
+                 {source} {{ let __nexa_encoded = {encoded}; {writer}.push_buffer_value(\
+                 &mut __nexa_buffer, __nexa_encoded)?; }} {writer}.finish_buffer(__nexa_buffer)? }}"
             )
         }
         TypeRef::Option(inner) => {
@@ -2388,6 +2415,59 @@ mod tests {
             assert!(
                 !runtime_dispatch.contains(forbidden),
                 "{forbidden}\n{runtime_dispatch}"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_return_encoders_stream_non_empty_nested_collections() {
+        let generated = generate_rust(
+            &parse(
+                "interface Returns {
+                    struct Record { label: string; value: i32; }
+                    enum Event { Empty, Record(Record) }
+                    sync fn array_struct() -> array<Record>;
+                    sync fn buffer_struct() -> buffer<Record>;
+                    sync fn nested() -> Option<array<Event>>;
+                    sync fn result() -> Result<buffer<Record>, Event>;
+                }",
+            )
+            .unwrap(),
+        );
+        let return_start = generated
+            .find("impl nexa_runtime::EncodeHostReturn")
+            .unwrap();
+        let runtime_start = generated.find("fn call_runtime").unwrap();
+        let return_paths = &generated[return_start..];
+        let runtime_paths = &generated[runtime_start..];
+        for required in [
+            "HostReturnRequirements",
+            ".checked_add(",
+            ".begin_array(",
+            ".push_array_value(",
+            ".finish_array(",
+            ".begin_buffer(",
+            ".push_buffer_value(",
+            ".finish_buffer(",
+            ".return_transaction(",
+            ".commit(",
+        ] {
+            assert!(
+                return_paths.contains(required) || runtime_paths.contains(required),
+                "{required}\n{generated}"
+            );
+        }
+        for forbidden in [
+            "Vec::with_capacity",
+            "collect::<Vec",
+            "into_vec()",
+            "HostValue::Array",
+            "HostValue::Buffer",
+            "args.host_value",
+        ] {
+            assert!(
+                !runtime_paths.contains(forbidden),
+                "{forbidden}\n{runtime_paths}"
             );
         }
     }

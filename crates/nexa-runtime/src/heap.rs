@@ -67,6 +67,149 @@ pub struct GcRef {
     pub generation: u32,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionRange {
+    pub start: usize,
+    pub length: usize,
+}
+
+impl CollectionRange {
+    const fn end(self) -> usize {
+        self.start + self.length
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollectionArena {
+    values: Vec<RuntimeValue>,
+    free_ranges: Vec<CollectionRange>,
+    capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CollectionArenaInspection {
+    pub capacity: usize,
+    pub free_elements: usize,
+    pub free_ranges: usize,
+}
+
+impl CollectionArena {
+    fn new(capacity: usize, max_ranges: usize) -> Self {
+        let mut free_ranges = Vec::with_capacity(max_ranges.max(1));
+        if capacity != 0 {
+            free_ranges.push(CollectionRange {
+                start: 0,
+                length: capacity,
+            });
+        }
+        Self {
+            values: vec![RuntimeValue::Unit; capacity],
+            free_ranges,
+            capacity,
+        }
+    }
+
+    fn find_free(&self, count: usize) -> Option<CollectionRange> {
+        if count == 0 {
+            return Some(CollectionRange::default());
+        }
+        self.free_ranges
+            .iter()
+            .copied()
+            .find(|range| range.length >= count)
+            .map(|range| CollectionRange {
+                start: range.start,
+                length: count,
+            })
+    }
+
+    fn claim(&mut self, range: CollectionRange) -> Result<(), HeapError> {
+        if range.length == 0 {
+            return Ok(());
+        }
+        let index = self
+            .free_ranges
+            .iter()
+            .position(|free| {
+                range.start >= free.start
+                    && range.end() <= free.end()
+                    && range.end() <= self.capacity
+            })
+            .ok_or(HeapError::CapacityExhausted)?;
+        let free = self.free_ranges[index];
+        let prefix = range.start - free.start;
+        let suffix = free.end() - range.end();
+        match (prefix, suffix) {
+            (0, 0) => {
+                self.free_ranges.remove(index);
+            }
+            (0, _) => {
+                self.free_ranges[index] = CollectionRange {
+                    start: range.end(),
+                    length: suffix,
+                };
+            }
+            (_, 0) => self.free_ranges[index].length = prefix,
+            (_, _) => {
+                if self.free_ranges.len() == self.free_ranges.capacity() {
+                    return Err(HeapError::CapacityExhausted);
+                }
+                self.free_ranges[index].length = prefix;
+                self.free_ranges.insert(
+                    index + 1,
+                    CollectionRange {
+                        start: range.end(),
+                        length: suffix,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, range: CollectionRange) {
+        if range.length == 0 {
+            return;
+        }
+        self.values[range.start..range.end()].fill(RuntimeValue::Unit);
+        let insertion = self
+            .free_ranges
+            .partition_point(|candidate| candidate.start < range.start);
+        debug_assert!(self.free_ranges.len() < self.free_ranges.capacity());
+        self.free_ranges.insert(insertion, range);
+        let mut index = insertion.saturating_sub(1);
+        while index + 1 < self.free_ranges.len() {
+            let left = self.free_ranges[index];
+            let right = self.free_ranges[index + 1];
+            if left.end() < right.start {
+                index += 1;
+                continue;
+            }
+            debug_assert!(left.end() <= right.start, "collection ranges overlap");
+            self.free_ranges[index].length = right.end() - left.start;
+            self.free_ranges.remove(index + 1);
+        }
+    }
+
+    fn values(&self, range: CollectionRange) -> Result<&[RuntimeValue], HeapError> {
+        self.values
+            .get(range.start..range.end())
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: range.end(),
+                length: self.capacity,
+            })
+    }
+
+    fn values_mut(&mut self, range: CollectionRange) -> Result<&mut [RuntimeValue], HeapError> {
+        self.values
+            .get_mut(range.start..range.end())
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: range.end(),
+                length: self.capacity,
+            })
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 // Struct storage stays inline so construction and `with` updates use only the
 // preallocated heap slot pool instead of allocating a system-heap side object.
@@ -95,12 +238,12 @@ pub enum Object {
     Array {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
-        values: Vec<RuntimeValue>,
+        range: CollectionRange,
     },
     Buffer {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
-        values: Vec<RuntimeValue>,
+        range: CollectionRange,
     },
 }
 
@@ -121,16 +264,7 @@ impl Object {
                     _ => None,
                 })
                 .collect(),
-            Self::Array { values, .. } | Self::Buffer { values, .. } => values
-                .iter()
-                .filter_map(|value| match value {
-                    RuntimeValue::String { reference, .. }
-                    | RuntimeValue::Struct { reference, .. }
-                    | RuntimeValue::Ref(reference)
-                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
-                    _ => None,
-                })
-                .collect(),
+            Self::Array { .. } | Self::Buffer { .. } => Vec::new(),
             Self::Map(map) => map.references(),
             Self::Enum { payload, .. } => payload
                 .iter()
@@ -208,6 +342,13 @@ pub(crate) struct HeapReservation {
     remaining: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollectionReservation {
+    range: CollectionRange,
+    written: usize,
+    claimed: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcRoots {
     pub running_frames: Vec<GcRef>,
@@ -244,6 +385,9 @@ pub struct Heap {
     max_objects: u32,
     max_string_bytes: usize,
     max_collection_length: usize,
+    collections: CollectionArena,
+    host_staging: Vec<GcRef>,
+    host_transaction_active: bool,
     failure_injector: RuntimeFailureInjector,
 }
 
@@ -270,12 +414,38 @@ impl Heap {
         max_string_bytes: usize,
         max_collection_length: usize,
     ) -> Self {
+        let arena_elements = max_collection_length
+            .saturating_mul((max_objects as usize).min(64))
+            .max(max_collection_length);
+        Self::new_with_arena_limits(
+            max_objects,
+            max_string_bytes,
+            max_collection_length,
+            arena_elements,
+            max_objects as usize + 1,
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_arena_limits(
+        max_objects: u32,
+        max_string_bytes: usize,
+        max_collection_length: usize,
+        max_collection_elements: usize,
+        max_collection_ranges: usize,
+    ) -> Self {
         Self {
             slots: Vec::with_capacity(max_objects as usize),
             free: Vec::with_capacity(max_objects as usize),
             max_objects,
             max_string_bytes,
             max_collection_length: max_collection_length.min(i32::MAX as usize),
+            collections: CollectionArena::new(
+                max_collection_elements,
+                max_collection_ranges.max(max_objects as usize + 1),
+            ),
+            host_staging: Vec::with_capacity(max_objects as usize),
+            host_transaction_active: false,
             failure_injector: RuntimeFailureInjector::default(),
         }
     }
@@ -338,6 +508,15 @@ impl Heap {
         }
     }
 
+    pub(crate) fn preflight_host_string_bytes(&self, bytes: usize) -> Result<(), HeapError> {
+        if self.failure_trigger(RuntimeFailurePoint::HostReturnStringReservation) {
+            return Err(HeapError::InjectedFailure(
+                RuntimeFailurePoint::HostReturnStringReservation,
+            ));
+        }
+        self.validate_string_length(bytes)
+    }
+
     pub(crate) fn validate_collection_length(&self, length: usize) -> Result<(), HeapError> {
         if length > self.max_collection_length {
             Err(HeapError::CollectionTooLarge {
@@ -376,10 +555,14 @@ impl Heap {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.object.is_none());
             slot.object = Some(object);
-            return GcRef {
+            let reference = GcRef {
                 index,
                 generation: slot.generation,
             };
+            if self.host_transaction_active {
+                self.host_staging.push(reference);
+            }
+            return reference;
         }
         let index = u32::try_from(self.slots.len()).expect("heap capacity was preflighted");
         debug_assert!(index < self.max_objects);
@@ -388,10 +571,14 @@ impl Heap {
             marked: false,
             object: Some(object),
         });
-        GcRef {
+        let reference = GcRef {
             index,
             generation: 0,
+        };
+        if self.host_transaction_active {
+            self.host_staging.push(reference);
         }
+        reference
     }
 
     pub(crate) const fn reservation_complete(reservation: &HeapReservation) -> bool {
@@ -409,23 +596,141 @@ impl Heap {
         Ok(RuntimeValue::String { reference, hash })
     }
 
+    pub fn preflight_collection(
+        &mut self,
+        element_count: usize,
+    ) -> Result<CollectionReservation, HeapError> {
+        let range = self
+            .collections
+            .find_free(element_count)
+            .ok_or(HeapError::CapacityExhausted)?;
+        self.collections.claim(range)?;
+        Ok(CollectionReservation {
+            range,
+            written: 0,
+            claimed: true,
+        })
+    }
+
+    pub fn commit_collection_value(
+        &mut self,
+        reservation: &mut CollectionReservation,
+        value: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        if !reservation.claimed || reservation.written >= reservation.range.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index: reservation.written,
+                length: reservation.range.length,
+            });
+        }
+        let index = reservation.range.start + reservation.written;
+        self.collections.values[index] = value;
+        reservation.written += 1;
+        Ok(())
+    }
+
+    pub(crate) fn reserve_collection_segment(
+        reservation: &mut CollectionReservation,
+        length: usize,
+    ) -> Result<CollectionRange, HeapError> {
+        let start = reservation.written;
+        let end = start
+            .checked_add(length)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if end > reservation.range.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index: end,
+                length: reservation.range.length,
+            });
+        }
+        reservation.written = end;
+        Ok(CollectionRange {
+            start: reservation.range.start + start,
+            length,
+        })
+    }
+
+    pub(crate) fn write_collection_at(
+        &mut self,
+        range: CollectionRange,
+        index: usize,
+        value: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let values = self.collections.values_mut(range)?;
+        let length = values.len();
+        let slot = values
+            .get_mut(index)
+            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+        *slot = value;
+        Ok(())
+    }
+
+    pub(crate) fn release_collection_reservation(
+        &mut self,
+        reservation: &mut CollectionReservation,
+    ) {
+        if reservation.claimed {
+            self.collections.release(reservation.range);
+            reservation.claimed = false;
+            reservation.written = 0;
+        }
+    }
+
+    pub(crate) fn complete_collection_reservation(
+        reservation: &mut CollectionReservation,
+    ) -> Result<(), HeapError> {
+        if reservation.written != reservation.range.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index: reservation.written,
+                length: reservation.range.length,
+            });
+        }
+        reservation.claimed = false;
+        Ok(())
+    }
+
+    pub(crate) fn begin_host_transaction(&mut self) -> Result<(), HeapError> {
+        if self.host_transaction_active {
+            return Err(HeapError::CapacityExhausted);
+        }
+        self.host_staging.clear();
+        self.host_transaction_active = true;
+        Ok(())
+    }
+
+    pub(crate) fn commit_host_transaction(&mut self) {
+        self.host_transaction_active = false;
+        self.host_staging.clear();
+    }
+
+    pub(crate) fn rollback_host_transaction(&mut self) {
+        self.host_transaction_active = false;
+        while let Some(reference) = self.host_staging.pop() {
+            if let Some(slot) = self.slots.get_mut(reference.index as usize) {
+                if slot.generation == reference.generation && slot.object.take().is_some() {
+                    self.free.push(reference.index);
+                }
+            }
+        }
+    }
+
     pub(crate) fn commit_array_reserved(
         &mut self,
         reservation: &mut HeapReservation,
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
-        values: Vec<RuntimeValue>,
+        range: CollectionRange,
     ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::array_type(element_type) {
             return Err(invalid_value_reference());
         }
-        self.validate_collection_length(values.len())?;
+        self.validate_collection_length(range.length)?;
         let reference = self.commit(
             reservation,
             Object::Array {
                 type_id,
                 element_type,
-                values,
+                range,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -436,21 +741,59 @@ impl Heap {
         reservation: &mut HeapReservation,
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
-        values: Vec<RuntimeValue>,
+        range: CollectionRange,
     ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::buffer_type(element_type) {
             return Err(invalid_value_reference());
         }
-        self.validate_collection_length(values.len())?;
+        self.validate_collection_length(range.length)?;
         let reference = self.commit(
             reservation,
             Object::Buffer {
                 type_id,
                 element_type,
-                values,
+                range,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub(crate) fn commit_array_values_reserved(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        let mut collection = self.preflight_collection(values.len())?;
+        for value in values {
+            if let Err(error) = self.commit_collection_value(&mut collection, *value) {
+                self.release_collection_reservation(&mut collection);
+                return Err(error);
+            }
+        }
+        let range = collection.range;
+        Self::complete_collection_reservation(&mut collection)?;
+        self.commit_array_reserved(reservation, type_id, element_type, range)
+    }
+
+    pub(crate) fn commit_buffer_values_reserved(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        let mut collection = self.preflight_collection(values.len())?;
+        for value in values {
+            if let Err(error) = self.commit_collection_value(&mut collection, *value) {
+                self.release_collection_reservation(&mut collection);
+                return Err(error);
+            }
+        }
+        let range = collection.range;
+        Self::complete_collection_reservation(&mut collection)?;
+        self.commit_buffer_reserved(reservation, type_id, element_type, range)
     }
 
     pub fn allocate_enum(
@@ -781,7 +1124,7 @@ impl Heap {
         let reference = self.allocate(Object::Array {
             type_id,
             element_type,
-            values: Vec::new(),
+            range: CollectionRange::default(),
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
@@ -807,7 +1150,8 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let values = self.array_values_mut(value)?;
+        let (_, range) = self.array_range(value)?;
+        let values = self.collections.values_mut(range)?;
         let length = values.len();
         let slot = values
             .get_mut(index)
@@ -821,31 +1165,31 @@ impl Heap {
         value: RuntimeValue,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let max_length = self.max_collection_length;
-        let values = self.array_values_mut(value)?;
-        let length = values
-            .len()
+        let current = self.array_values(value)?.len();
+        let length = current
             .checked_add(1)
             .ok_or(HeapError::CollectionTooLarge {
                 length: usize::MAX,
-                max_length,
+                max_length: self.max_collection_length,
             })?;
-        if length > max_length {
-            return Err(HeapError::CollectionTooLarge { length, max_length });
-        }
-        values
-            .try_reserve(1)
-            .map_err(|_| HeapError::CapacityExhausted)?;
-        values.push(element);
-        Ok(())
+        self.validate_collection_length(length)?;
+        self.replace_array_range(value, length, |destination, source| {
+            destination[..current].copy_from_slice(source);
+            destination[current] = element;
+        })
     }
 
     pub fn array_pop(&mut self, value: RuntimeValue) -> Result<RuntimeValue, HeapError> {
-        let values = self.array_values_mut(value)?;
-        let length = values.len();
-        values
-            .pop()
-            .ok_or(HeapError::IndexOutOfBounds { index: 0, length })
+        let length = self.array_values(value)?.len();
+        let result = self
+            .array_values(value)?
+            .last()
+            .copied()
+            .ok_or(HeapError::IndexOutOfBounds { index: 0, length })?;
+        self.replace_array_range(value, length - 1, |destination, source| {
+            destination.copy_from_slice(&source[..length - 1]);
+        })?;
+        Ok(result)
     }
 
     pub fn array_insert(
@@ -854,9 +1198,7 @@ impl Heap {
         index: usize,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let max_length = self.max_collection_length;
-        let values = self.array_values_mut(value)?;
-        let current = values.len();
+        let current = self.array_values(value)?.len();
         if index > current {
             return Err(HeapError::IndexOutOfBounds {
                 index,
@@ -867,16 +1209,14 @@ impl Heap {
             .checked_add(1)
             .ok_or(HeapError::CollectionTooLarge {
                 length: usize::MAX,
-                max_length,
+                max_length: self.max_collection_length,
             })?;
-        if length > max_length {
-            return Err(HeapError::CollectionTooLarge { length, max_length });
-        }
-        values
-            .try_reserve(1)
-            .map_err(|_| HeapError::CapacityExhausted)?;
-        values.insert(index, element);
-        Ok(())
+        self.validate_collection_length(length)?;
+        self.replace_array_range(value, length, |destination, source| {
+            destination[..index].copy_from_slice(&source[..index]);
+            destination[index] = element;
+            destination[index + 1..].copy_from_slice(&source[index..]);
+        })
     }
 
     pub fn array_remove(
@@ -884,19 +1224,20 @@ impl Heap {
         value: RuntimeValue,
         index: usize,
     ) -> Result<RuntimeValue, HeapError> {
-        let values = self.array_values_mut(value)?;
-        if index >= values.len() {
-            return Err(HeapError::IndexOutOfBounds {
-                index,
-                length: values.len(),
-            });
+        let length = self.array_values(value)?.len();
+        if index >= length {
+            return Err(HeapError::IndexOutOfBounds { index, length });
         }
-        Ok(values.remove(index))
+        let removed = self.array_values(value)?[index];
+        self.replace_array_range(value, length - 1, |destination, source| {
+            destination[..index].copy_from_slice(&source[..index]);
+            destination[index..].copy_from_slice(&source[index + 1..]);
+        })?;
+        Ok(removed)
     }
 
     pub fn array_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
-        self.array_values_mut(value)?.clear();
-        Ok(())
+        self.replace_array_range(value, 0, |_, _| {})
     }
 
     pub fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
@@ -907,31 +1248,68 @@ impl Heap {
             Object::Array {
                 type_id: actual,
                 element_type,
-                values,
+                range,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                Ok(values)
+                self.collections.values(*range)
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
 
-    fn array_values_mut(
-        &mut self,
-        value: RuntimeValue,
-    ) -> Result<&mut Vec<RuntimeValue>, HeapError> {
+    fn array_range(&self, value: RuntimeValue) -> Result<(GcRef, CollectionRange), HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
-        match self.resolve_mut(reference)? {
+        match self.resolve(reference)? {
             Object::Array {
                 type_id: actual,
                 element_type,
-                values,
+                range,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                Ok(values)
+                Ok((reference, *range))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
+    }
+
+    fn replace_array_range(
+        &mut self,
+        value: RuntimeValue,
+        new_length: usize,
+        copy: impl FnOnce(&mut [RuntimeValue], &[RuntimeValue]),
+    ) -> Result<(), HeapError> {
+        let (reference, old_range) = self.array_range(value)?;
+        let mut reservation = self.preflight_collection(new_length)?;
+        let new_range = reservation.range;
+        let old_start = old_range.start;
+        let old_end = old_range.end();
+        let new_start = new_range.start;
+        let new_end = new_range.end();
+        if new_length != 0 {
+            if old_range.length == 0 {
+                copy(&mut self.collections.values[new_start..new_end], &[]);
+            } else if new_end <= old_start || old_end <= new_start {
+                let (destination, source) = if new_end <= old_start {
+                    let (left, right) = self.collections.values.split_at_mut(old_start);
+                    (&mut left[new_start..new_end], &right[..old_range.length])
+                } else {
+                    let (left, right) = self.collections.values.split_at_mut(new_start);
+                    (&mut right[..new_length], &left[old_start..old_end])
+                };
+                copy(destination, source);
+            } else {
+                self.release_collection_reservation(&mut reservation);
+                return Err(HeapError::CapacityExhausted);
+            }
+        }
+        reservation.written = new_length;
+        Self::complete_collection_reservation(&mut reservation)?;
+        match self.resolve_mut(reference)? {
+            Object::Array { range, .. } => *range = new_range,
+            _ => return Err(HeapError::InvalidReference(reference)),
+        }
+        self.collections.release(old_range);
+        Ok(())
     }
 
     pub fn allocate_buffer(
@@ -949,17 +1327,14 @@ impl Heap {
                 max_length: self.max_collection_length,
             });
         }
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(source.len())
-            .map_err(|_| HeapError::CapacityExhausted)?;
-        values.extend_from_slice(source);
-        let reference = self.allocate(Object::Buffer {
-            type_id,
-            element_type,
-            values,
-        })?;
-        Ok(RuntimeValue::NamedRef { reference, type_id })
+        let mut heap = self.preflight(1)?;
+        let mut collection = self.preflight_collection(source.len())?;
+        for value in source {
+            self.commit_collection_value(&mut collection, *value)?;
+        }
+        let range = collection.range;
+        Self::complete_collection_reservation(&mut collection)?;
+        self.commit_buffer_reserved(&mut heap, type_id, element_type, range)
     }
 
     pub fn buffer_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
@@ -970,9 +1345,9 @@ impl Heap {
             Object::Buffer {
                 type_id: actual,
                 element_type,
-                values,
+                range,
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                Ok(values)
+                self.collections.values(*range)
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -1017,11 +1392,15 @@ impl Heap {
         let (type_id, element_type) = self.buffer_metadata(value)?;
         let values = self.buffer_values(value)?;
         let end = checked_collection_end(start, length, values.len())?;
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(length)
-            .map_err(|_| HeapError::CapacityExhausted)?;
-        copy.extend_from_slice(&values[start..end]);
-        self.allocate_buffer(type_id, element_type, &copy)
+        let mut collection = self.preflight_collection(length)?;
+        for index in start..end {
+            let item = self.buffer_values(value)?[index];
+            self.commit_collection_value(&mut collection, item)?;
+        }
+        let range = collection.range;
+        Self::complete_collection_reservation(&mut collection)?;
+        let mut heap = self.preflight(1)?;
+        self.commit_buffer_reserved(&mut heap, type_id, element_type, range)
     }
 
     pub fn buffer_copy(
@@ -1036,19 +1415,22 @@ impl Heap {
         if self.buffer_metadata(source)? != destination_metadata {
             return Err(invalid_value_reference());
         }
-        let source_values = self.buffer_values(source)?;
-        let source_end = checked_collection_end(source_start, length, source_values.len())?;
+        let source_end =
+            checked_collection_end(source_start, length, self.buffer_values(source)?.len())?;
         let destination_end = checked_collection_end(
             destination_start,
             length,
             self.buffer_values(destination)?.len(),
         )?;
-        let mut copy = Vec::new();
-        copy.try_reserve_exact(length)
-            .map_err(|_| HeapError::CapacityExhausted)?;
-        copy.extend_from_slice(&source_values[source_start..source_end]);
-        self.buffer_values_mut(destination)?[destination_start..destination_end]
-            .copy_from_slice(&copy);
+        let (_, source_range) = self.buffer_range(source)?;
+        let (_, destination_range) = self.buffer_range(destination)?;
+        let source_absolute = source_range.start + source_start;
+        let destination_absolute = destination_range.start + destination_start;
+        self.collections.values.copy_within(
+            source_absolute..source_absolute + (source_end - source_start),
+            destination_absolute,
+        );
+        debug_assert_eq!(destination_end - destination_start, length);
         Ok(())
     }
 
@@ -1074,23 +1456,25 @@ impl Heap {
         }
     }
 
-    fn buffer_values_mut(
-        &mut self,
-        value: RuntimeValue,
-    ) -> Result<&mut Vec<RuntimeValue>, HeapError> {
+    fn buffer_range(&self, value: RuntimeValue) -> Result<(GcRef, CollectionRange), HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
-        match self.resolve_mut(reference)? {
+        match self.resolve(reference)? {
             Object::Buffer {
                 type_id: actual,
                 element_type,
-                values,
+                range,
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                Ok(values)
+                Ok((reference, *range))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
+    }
+
+    fn buffer_values_mut(&mut self, value: RuntimeValue) -> Result<&mut [RuntimeValue], HeapError> {
+        let (_, range) = self.buffer_range(value)?;
+        self.collections.values_mut(range)
     }
 
     pub fn allocate_map(
@@ -1487,7 +1871,15 @@ impl Heap {
             slot.marked = true;
             marked += 1;
             let object = slot.object.as_ref().expect("validated live object");
-            let references = object.references();
+            let references = match object {
+                Object::Array { range, .. } | Object::Buffer { range, .. } => self
+                    .collections
+                    .values(*range)?
+                    .iter()
+                    .filter_map(|value| value_reference(*value))
+                    .collect(),
+                _ => object.references(),
+            };
             for child in references {
                 self.validate_reference(child)?;
                 queue.push_back(child);
@@ -1496,7 +1888,11 @@ impl Heap {
         let mut reclaimed = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.object.is_some() && !slot.marked {
-                slot.object = None;
+                if let Some(Object::Array { range, .. } | Object::Buffer { range, .. }) =
+                    slot.object.take()
+                {
+                    self.collections.release(range);
+                }
                 if let Some(generation) = slot.generation.checked_add(1) {
                     slot.generation = generation;
                     self.free
@@ -1514,6 +1910,24 @@ impl Heap {
 
     pub fn failure_injector(&mut self) -> &mut RuntimeFailureInjector {
         &mut self.failure_injector
+    }
+
+    #[must_use]
+    pub fn collection_inspection(&self) -> CollectionArenaInspection {
+        CollectionArenaInspection {
+            capacity: self.collections.capacity,
+            free_elements: self
+                .collections
+                .free_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum(),
+            free_ranges: self.collections.free_ranges.len(),
+        }
+    }
+
+    pub(crate) fn failure_trigger(&self, point: RuntimeFailurePoint) -> bool {
+        self.failure_injector.trigger(point)
     }
 
     pub(crate) fn set_failure_injector(&mut self, injector: RuntimeFailureInjector) {

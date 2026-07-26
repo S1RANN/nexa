@@ -9,6 +9,12 @@ interface AllocationMatrixHost {
         Record(Record)
     }
 
+    struct Nested {
+        records: array<Record>;
+        samples: buffer<i32>;
+        label: string;
+    }
+
     sync fn inspect(
         name: string,
         record: Record,
@@ -31,6 +37,14 @@ interface AllocationMatrixHost {
     sync fn return_result() -> Result<Record, Event>;
     sync fn return_array() -> array<i32>;
     sync fn return_buffer() -> buffer<i32>;
+    sync fn return_array_struct() -> array<Record>;
+    sync fn return_buffer_struct() -> buffer<Record>;
+    sync fn return_nested_enum() -> Event;
+    sync fn return_option_array() -> Option<array<Record>>;
+    sync fn return_result_buffer() -> Result<buffer<Record>, Event>;
+    sync fn return_large_array() -> array<i32>;
+    sync fn return_large_buffer() -> buffer<i32>;
+    sync fn return_nested() -> Nested;
     sync fn return_scalar() -> i32;
     sync fn baseline8(
         a: i32, b: i32, c: i32, d: i32,

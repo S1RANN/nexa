@@ -3,8 +3,8 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, Function, FunctionBuilder,
@@ -14,11 +14,12 @@ use nexa_bytecode::{
 use nexa_core::StableId;
 use nexa_runtime::{
     CancelReason, CopyBuffer, Heap, HeapError, HostArgs, HostCallOutcome, HostErrorPayload,
-    HostPayload, HostRegistry, HostTrap, HostValue, MigrationAllocationPhase, Object,
-    PendingHostRequest, PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime,
-    ReleaseKind, ReleaseRecord, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
+    HostPayload, HostRegistry, HostReturnRequirements, HostTrap, HostValue,
+    MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult, RealmConfig,
+    RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint,
+    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeValue,
+    StateObject, StateValue, StepConfig, TaskLimits, TaskRuntime, TaskState, TickBudget,
+    set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -26,6 +27,7 @@ struct CountingAllocator;
 
 static ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static HOST_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
+static THUNK_ALLOCATIONS: AtomicU64 = AtomicU64::new(0);
 static FIRST_OPCODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MIGRATION_COUNTS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
@@ -56,6 +58,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             if host_allocation_active() {
                 HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                THUNK_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             }
         }
         unsafe { System.alloc(layout) }
@@ -70,6 +74,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             if host_allocation_active() {
                 HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                THUNK_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             }
         }
         unsafe { System.alloc_zeroed(layout) }
@@ -80,6 +86,8 @@ unsafe impl GlobalAlloc for CountingAllocator {
             ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             if host_allocation_active() {
                 HOST_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
+            } else {
+                THUNK_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             }
         }
         unsafe { System.realloc(pointer, layout, size) }
@@ -97,15 +105,33 @@ fn observed(operation: impl FnOnce()) -> u64 {
     ALLOCATIONS.load(Ordering::SeqCst)
 }
 
-fn observed_host_split<T>(operation: impl FnOnce() -> T) -> (T, u64, u64) {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct AllocationCounts {
+    total: u64,
+    host: u64,
+    thunk: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HostAllocationCase {
+    name: &'static str,
+    counts: AllocationCounts,
+}
+
+fn observed_host_split<T>(operation: impl FnOnce() -> T) -> (T, AllocationCounts) {
     ALLOCATIONS.store(0, Ordering::SeqCst);
     HOST_ALLOCATIONS.store(0, Ordering::SeqCst);
+    THUNK_ALLOCATIONS.store(0, Ordering::SeqCst);
     set_allocation_observation(true);
     let result = operation();
     set_allocation_observation(false);
-    let total = ALLOCATIONS.load(Ordering::SeqCst);
-    let host = HOST_ALLOCATIONS.load(Ordering::SeqCst);
-    (result, total.saturating_sub(host), host)
+    let counts = AllocationCounts {
+        total: ALLOCATIONS.load(Ordering::SeqCst),
+        host: HOST_ALLOCATIONS.load(Ordering::SeqCst),
+        thunk: THUNK_ALLOCATIONS.load(Ordering::SeqCst),
+    };
+    assert_eq!(counts.total, counts.host + counts.thunk);
+    (result, counts)
 }
 
 fn host_owned<T>(operation: impl FnOnce() -> T) -> T {
@@ -144,10 +170,7 @@ fn release_buffer<const N: usize>() -> [ReleaseRecord; N] {
     }; N]
 }
 
-fn migration_observer(
-    phase: MigrationAllocationPhase,
-    boundary: nexa_runtime::AllocationBoundary,
-) {
+fn migration_observer(phase: MigrationAllocationPhase, boundary: nexa_runtime::AllocationBoundary) {
     let index = migration_phase_index(phase);
     match boundary {
         nexa_runtime::AllocationBoundary::Begin => {
@@ -384,7 +407,9 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
     ) -> Result<i32, host_matrix::HostError> {
         let mut total = 0;
         for value in array.iter().chain(buffer.iter()) {
-            total += value.i32().map_err(|_| host_matrix::HostError(String::new()))?;
+            total += value
+                .i32()
+                .map_err(|_| host_matrix::HostError(String::new()))?;
         }
         Ok(total)
     }
@@ -393,7 +418,7 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
         &mut self,
         _: &mut ResourceContext<'_>,
     ) -> Result<String, host_matrix::HostError> {
-        Ok(String::new())
+        Ok(host_owned(|| "non-empty".to_owned()))
     }
 
     fn return_struct(
@@ -440,14 +465,121 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
         &mut self,
         _: &mut ResourceContext<'_>,
     ) -> Result<Vec<i32>, host_matrix::HostError> {
-        Ok(Vec::new())
+        Ok(host_owned(|| vec![1, 2, 3]))
     }
 
     fn return_buffer(
         &mut self,
         _: &mut ResourceContext<'_>,
     ) -> Result<CopyBuffer<i32>, host_matrix::HostError> {
-        Ok(CopyBuffer::new(Vec::new()))
+        Ok(host_owned(|| CopyBuffer::new(vec![4, 5, 6])))
+    }
+
+    fn return_array_struct(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Vec<host_matrix::Record>, host_matrix::HostError> {
+        Ok(host_owned(|| {
+            vec![
+                host_matrix::Record {
+                    label: "array-a".to_owned(),
+                    value: 21,
+                },
+                host_matrix::Record {
+                    label: "array-b".to_owned(),
+                    value: 22,
+                },
+            ]
+        }))
+    }
+
+    fn return_buffer_struct(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<CopyBuffer<host_matrix::Record>, host_matrix::HostError> {
+        Ok(host_owned(|| {
+            CopyBuffer::new(vec![
+                host_matrix::Record {
+                    label: "buffer-a".to_owned(),
+                    value: 31,
+                },
+                host_matrix::Record {
+                    label: "buffer-b".to_owned(),
+                    value: 32,
+                },
+            ])
+        }))
+    }
+
+    fn return_nested_enum(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<host_matrix::Event, host_matrix::HostError> {
+        Ok(host_owned(|| {
+            host_matrix::Event::Record(host_matrix::Record {
+                label: "nested-enum".to_owned(),
+                value: 41,
+            })
+        }))
+    }
+
+    fn return_option_array(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Option<Vec<host_matrix::Record>>, host_matrix::HostError> {
+        Ok(host_owned(|| {
+            Some(vec![host_matrix::Record {
+                label: "option-array".to_owned(),
+                value: 51,
+            }])
+        }))
+    }
+
+    fn return_result_buffer(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Result<CopyBuffer<host_matrix::Record>, host_matrix::Event>, host_matrix::HostError>
+    {
+        Ok(host_owned(|| {
+            Ok(CopyBuffer::new(vec![host_matrix::Record {
+                label: "result-buffer".to_owned(),
+                value: 61,
+            }]))
+        }))
+    }
+
+    fn return_large_array(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<Vec<i32>, host_matrix::HostError> {
+        Ok(host_owned(|| (0..128).collect()))
+    }
+
+    fn return_large_buffer(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<CopyBuffer<i32>, host_matrix::HostError> {
+        Ok(host_owned(|| CopyBuffer::new((0..128).collect())))
+    }
+
+    fn return_nested(
+        &mut self,
+        _: &mut ResourceContext<'_>,
+    ) -> Result<host_matrix::Nested, host_matrix::HostError> {
+        Ok(host_owned(|| host_matrix::Nested {
+            records: vec![
+                host_matrix::Record {
+                    label: "nested-a".to_owned(),
+                    value: 71,
+                },
+                host_matrix::Record {
+                    label: "nested-b".to_owned(),
+                    value: 72,
+                },
+            ],
+            samples: CopyBuffer::new(vec![8, 9, 10]),
+            label: "nested-root".to_owned(),
+        }))
     }
 
     fn return_scalar(
@@ -472,23 +604,125 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
         Ok(a + b + c + d + e + f + g + h)
     }
 
-    fn panic_host(
-        &mut self,
-        _: &mut ResourceContext<'_>,
-    ) -> Result<i32, host_matrix::HostError> {
+    fn panic_host(&mut self, _: &mut ResourceContext<'_>) -> Result<i32, host_matrix::HostError> {
         host_owned(|| panic!("matrix host panic"))
+    }
+}
+
+fn runtime_string(heap: &Heap, value: RuntimeValue) -> &str {
+    let RuntimeValue::String { reference, .. } = value else {
+        panic!("expected runtime string")
+    };
+    heap.string(reference).unwrap()
+}
+
+fn validate_record(heap: &Heap, value: RuntimeValue, label: &str, number: i32) {
+    let fields = heap.struct_fields(value).unwrap();
+    assert_eq!(runtime_string(heap, fields[0]), label);
+    assert_eq!(fields[1], RuntimeValue::I32(number));
+}
+
+fn validate_return(name: &str, outcome: &Result<HostCallOutcome, HostTrap>, heap: &Heap) {
+    let HostCallOutcome::RuntimeImmediate(value) = outcome.as_ref().unwrap() else {
+        panic!("{name} did not return a runtime value")
+    };
+    match name {
+        "return_string" => assert_eq!(runtime_string(heap, *value), "non-empty"),
+        "return_struct" => validate_record(heap, *value, "record", 7),
+        "return_enum" => {
+            let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
+            assert_eq!(tag, 1);
+            validate_record(heap, payload.unwrap(), "event", 11);
+        }
+        "return_option" => {
+            let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
+            assert_eq!(tag, 1);
+            validate_record(heap, payload.unwrap(), "option", 13);
+        }
+        "return_result" => {
+            let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
+            assert_eq!(tag, 0);
+            validate_record(heap, payload.unwrap(), "result", 17);
+        }
+        "return_array" => assert_eq!(
+            heap.array_values(*value).unwrap(),
+            [
+                RuntimeValue::I32(1),
+                RuntimeValue::I32(2),
+                RuntimeValue::I32(3)
+            ]
+        ),
+        "return_buffer" => assert_eq!(
+            heap.buffer_values(*value).unwrap(),
+            [
+                RuntimeValue::I32(4),
+                RuntimeValue::I32(5),
+                RuntimeValue::I32(6)
+            ]
+        ),
+        "return_array_struct" => {
+            let values = heap.array_values(*value).unwrap();
+            validate_record(heap, values[0], "array-a", 21);
+            validate_record(heap, values[1], "array-b", 22);
+        }
+        "return_buffer_struct" => {
+            let values = heap.buffer_values(*value).unwrap();
+            validate_record(heap, values[0], "buffer-a", 31);
+            validate_record(heap, values[1], "buffer-b", 32);
+        }
+        "return_nested_enum" => {
+            let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
+            validate_record(heap, payload.unwrap(), "nested-enum", 41);
+        }
+        "return_option_array" => {
+            let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
+            let records = heap.array_values(payload.unwrap()).unwrap();
+            validate_record(heap, records[0], "option-array", 51);
+        }
+        "return_result_buffer" => {
+            let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
+            let records = heap.buffer_values(payload.unwrap()).unwrap();
+            validate_record(heap, records[0], "result-buffer", 61);
+        }
+        "return_large_array" => {
+            let values = heap.array_values(*value).unwrap();
+            assert_eq!(values.len(), 128);
+            assert_eq!(values[127], RuntimeValue::I32(127));
+        }
+        "return_large_buffer" => {
+            let values = heap.buffer_values(*value).unwrap();
+            assert_eq!(values.len(), 128);
+            assert_eq!(values[127], RuntimeValue::I32(127));
+        }
+        "return_nested" => {
+            let fields = heap.struct_fields(*value).unwrap();
+            let records = heap.array_values(fields[0]).unwrap();
+            validate_record(heap, records[0], "nested-a", 71);
+            validate_record(heap, records[1], "nested-b", 72);
+            assert_eq!(
+                heap.buffer_values(fields[1]).unwrap(),
+                [
+                    RuntimeValue::I32(8),
+                    RuntimeValue::I32(9),
+                    RuntimeValue::I32(10)
+                ]
+            );
+            assert_eq!(runtime_string(heap, fields[2]), "nested-root");
+        }
+        _ => panic!("unknown return case {name}"),
     }
 }
 
 #[allow(clippy::too_many_lines)]
 fn complex_host_allocation_matrix() {
+    let mut formal_cases = Vec::with_capacity(48);
     let mut tasks = TaskRuntime::new(1, RuntimeLimits::default());
     let scope = tasks.create_scope(None).unwrap();
     let task = tasks.admit_task(scope, 1, true).unwrap();
     let mut resources = RuntimeResources::new(1, 4, 4);
     let mut context = resources.context(task, 0, 1);
     let mut registry = host_matrix::GeneratedHostRegistry::new(MatrixHost);
-    let mut heap = Heap::new(64);
+    let mut heap = Heap::new_with_arena_limits(512, 16_384, 1_024, 16_384, 513);
     let string_reference = heap.allocate_string("nested").unwrap();
     let string = RuntimeValue::String {
         reference: string_reference,
@@ -516,7 +750,8 @@ fn complex_host_allocation_matrix() {
             Some(record),
         )
         .unwrap();
-    let result = nexa_bytecode::result_type(ValueType::Named(record_type), ValueType::Named(event_type));
+    let result =
+        nexa_bytecode::result_type(ValueType::Named(record_type), ValueType::Named(event_type));
     let result_value = heap
         .allocate_enum(
             result.type_id,
@@ -526,17 +761,10 @@ fn complex_host_allocation_matrix() {
         )
         .unwrap();
     let array_type = nexa_bytecode::array_type(ValueType::Named(record_type));
-    let array_reference = heap
-        .allocate(Object::Array {
-            type_id: array_type,
-            element_type: ValueType::Named(record_type),
-            values: vec![record],
-        })
+    let array = heap
+        .allocate_array(array_type, ValueType::Named(record_type))
         .unwrap();
-    let array = RuntimeValue::NamedRef {
-        reference: array_reference,
-        type_id: array_type,
-    };
+    heap.array_push(array, record).unwrap();
     let buffer_type = nexa_bytecode::buffer_type(ValueType::Named(record_type));
     let buffer = heap
         .allocate_buffer(buffer_type, ValueType::Named(record_type), &[record])
@@ -556,44 +784,67 @@ fn complex_host_allocation_matrix() {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.str_ref(0).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(1).unwrap().struct_ref(record_type).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(2).unwrap().enum_ref(event_type).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(3).unwrap().enum_ref(option.type_id).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(4).unwrap().enum_ref(result.type_id).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(5).unwrap().array_ref(array_type).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(6).unwrap().buffer_ref(buffer_type).unwrap();
         })
-        .1,
+        .1
+        .thunk,
         observed_host_split(|| {
             let args = RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap();
             let _ = args.value_ref(7).unwrap().enum_ref(event_type).unwrap();
         })
-        .1,
+        .1
+        .thunk,
     ];
     assert_eq!(manual_decode_allocations, [0; 8]);
+    for name in [
+        "input_string",
+        "input_struct",
+        "input_enum",
+        "input_option",
+        "input_result",
+        "input_array_struct",
+        "input_buffer_struct",
+        "input_nested",
+    ] {
+        formal_cases.push(HostAllocationCase {
+            name,
+            counts: AllocationCounts::default(),
+        });
+    }
     registry
         .call_runtime(
             host_matrix::THUNK_RETURN_SCALAR,
@@ -601,14 +852,14 @@ fn complex_host_allocation_matrix() {
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
         .unwrap();
-    let (_, baseline_allocations, baseline_host_allocations) = observed_host_split(|| {
+    let (_, scalar_counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_RETURN_SCALAR,
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
     });
-    assert_eq!(baseline_host_allocations, 0);
+    assert_eq!(scalar_counts, AllocationCounts::default());
     let scalar_arguments = [
         RuntimeValue::I32(1),
         RuntimeValue::I32(2),
@@ -626,13 +877,14 @@ fn complex_host_allocation_matrix() {
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
-    let (_, eight_argument_baseline, _) = observed_host_split(|| {
+    let (_, eight_argument_counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_BASELINE8,
             &mut context,
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
     });
+    assert_eq!(eight_argument_counts, AllocationCounts::default());
     registry
         .call_runtime(
             host_matrix::THUNK_INSPECT,
@@ -640,7 +892,7 @@ fn complex_host_allocation_matrix() {
             RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
-    let (outcome, thunk_allocations, host_allocations) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_INSPECT,
             &mut context,
@@ -651,21 +903,19 @@ fn complex_host_allocation_matrix() {
         outcome,
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(_)))
     ));
-    assert_eq!(
-        thunk_allocations.saturating_sub(eight_argument_baseline),
-        0,
-        "complex borrowed input decode"
-    );
-    assert_eq!(host_allocations, 0, "input-only host implementation");
+    assert_eq!(counts.thunk, 0, "complex borrowed input decode");
+    assert_eq!(counts.host, 0, "input-only host implementation");
+    formal_cases.push(HostAllocationCase {
+        name: "input_mixed_eight",
+        counts,
+    });
 
     let scalar_array_type = nexa_bytecode::array_type(ValueType::I32);
-    let scalar_array_reference = heap
-        .allocate(Object::Array {
-            type_id: scalar_array_type,
-            element_type: ValueType::I32,
-            values: vec![RuntimeValue::I32(2), RuntimeValue::I32(3)],
-        })
+    let scalar_array = heap
+        .allocate_array(scalar_array_type, ValueType::I32)
         .unwrap();
+    heap.array_push(scalar_array, RuntimeValue::I32(2)).unwrap();
+    heap.array_push(scalar_array, RuntimeValue::I32(3)).unwrap();
     let scalar_buffer_type = nexa_bytecode::buffer_type(ValueType::I32);
     let scalar_buffer = heap
         .allocate_buffer(
@@ -674,13 +924,7 @@ fn complex_host_allocation_matrix() {
             &[RuntimeValue::I32(5), RuntimeValue::I32(7)],
         )
         .unwrap();
-    let scalar_collections = [
-        RuntimeValue::NamedRef {
-            reference: scalar_array_reference,
-            type_id: scalar_array_type,
-        },
-        scalar_buffer,
-    ];
+    let scalar_collections = [scalar_array, scalar_buffer];
     registry
         .call_runtime(
             host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
@@ -688,7 +932,7 @@ fn complex_host_allocation_matrix() {
             RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
         )
         .unwrap();
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
             &mut context,
@@ -699,19 +943,46 @@ fn complex_host_allocation_matrix() {
         outcome,
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(17)))
     );
-    assert_eq!(allocations, 0, "scalar array and buffer inputs");
+    assert_eq!(counts.thunk, 0, "scalar array and buffer inputs");
+    formal_cases.push(HostAllocationCase {
+        name: "input_scalar_collections",
+        counts,
+    });
 
     let return_cases = [
-        host_matrix::THUNK_RETURN_STRING,
-        host_matrix::THUNK_RETURN_STRUCT,
-        host_matrix::THUNK_RETURN_ENUM,
-        host_matrix::THUNK_RETURN_OPTION,
-        host_matrix::THUNK_RETURN_RESULT,
-        host_matrix::THUNK_RETURN_ARRAY,
-        host_matrix::THUNK_RETURN_BUFFER,
+        ("return_string", host_matrix::THUNK_RETURN_STRING),
+        ("return_struct", host_matrix::THUNK_RETURN_STRUCT),
+        ("return_enum", host_matrix::THUNK_RETURN_ENUM),
+        ("return_option", host_matrix::THUNK_RETURN_OPTION),
+        ("return_result", host_matrix::THUNK_RETURN_RESULT),
+        ("return_array", host_matrix::THUNK_RETURN_ARRAY),
+        ("return_buffer", host_matrix::THUNK_RETURN_BUFFER),
+        (
+            "return_array_struct",
+            host_matrix::THUNK_RETURN_ARRAY_STRUCT,
+        ),
+        (
+            "return_buffer_struct",
+            host_matrix::THUNK_RETURN_BUFFER_STRUCT,
+        ),
+        ("return_nested_enum", host_matrix::THUNK_RETURN_NESTED_ENUM),
+        (
+            "return_option_array",
+            host_matrix::THUNK_RETURN_OPTION_ARRAY,
+        ),
+        (
+            "return_result_buffer",
+            host_matrix::THUNK_RETURN_RESULT_BUFFER,
+        ),
+        ("return_large_array", host_matrix::THUNK_RETURN_LARGE_ARRAY),
+        (
+            "return_large_buffer",
+            host_matrix::THUNK_RETURN_LARGE_BUFFER,
+        ),
+        ("return_nested", host_matrix::THUNK_RETURN_NESTED),
     ];
     let mut separated_host_allocations = 0;
-    for id in return_cases {
+    for (name, id) in return_cases {
         registry
             .call_runtime(
                 id,
@@ -719,29 +990,30 @@ fn complex_host_allocation_matrix() {
                 RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
             )
             .unwrap();
-        let (outcome, thunk_allocations, host_allocations) = observed_host_split(|| {
+        let (outcome, counts) = observed_host_split(|| {
             registry.call_runtime(
                 id,
                 &mut context,
                 RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
             )
         });
-        assert!(outcome.is_ok(), "return case {id}");
-        assert_eq!(
-            thunk_allocations.saturating_sub(baseline_allocations),
-            0,
-            "return case {id}"
-        );
-        separated_host_allocations += host_allocations;
+        assert!(outcome.is_ok(), "return case {name}");
+        assert_eq!(counts.thunk, 0, "return case {name}");
+        validate_return(name, &outcome, &heap);
+        formal_cases.push(HostAllocationCase { name, counts });
+        separated_host_allocations += counts.host;
     }
     assert!(separated_host_allocations > 0);
 
     let wrong_record = heap
-        .allocate_struct(StableId::from_name("WrongRecord"), &[string, RuntimeValue::I32(5)])
+        .allocate_struct(
+            StableId::from_name("WrongRecord"),
+            &[string, RuntimeValue::I32(5)],
+        )
         .unwrap();
     let mut wrong_arguments = arguments;
     wrong_arguments[1] = wrong_record;
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_INSPECT,
             &mut context,
@@ -749,7 +1021,11 @@ fn complex_host_allocation_matrix() {
         )
     });
     assert_eq!(outcome, Err(HostTrap::Type));
-    assert_eq!(allocations, 0, "wrong struct type id");
+    assert_eq!(counts.thunk, 0, "wrong struct type id");
+    formal_cases.push(HostAllocationCase {
+        name: "error_wrong_struct_type",
+        counts,
+    });
 
     let wrong_event = heap
         .allocate_enum(
@@ -761,7 +1037,7 @@ fn complex_host_allocation_matrix() {
         .unwrap();
     wrong_arguments = arguments;
     wrong_arguments[2] = wrong_event;
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_INSPECT,
             &mut context,
@@ -769,13 +1045,17 @@ fn complex_host_allocation_matrix() {
         )
     });
     assert_eq!(outcome, Err(HostTrap::Type));
-    assert_eq!(allocations, 0, "wrong enum tag");
+    assert_eq!(counts.thunk, 0, "wrong enum tag");
+    formal_cases.push(HostAllocationCase {
+        name: "error_wrong_enum_tag",
+        counts,
+    });
 
     let bad_fields = heap
         .allocate_struct(record_type, &[string, RuntimeValue::Bool(true)])
         .unwrap();
     let bad_field_arguments = [bad_fields];
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         RuntimeHostArgs::new(&bad_field_arguments, Some(&mut heap))?
             .value_ref(0)?
             .struct_ref(record_type)?
@@ -783,52 +1063,77 @@ fn complex_host_allocation_matrix() {
             .i32()
     });
     assert_eq!(outcome, Err(HostTrap::Type));
-    assert_eq!(allocations, 0, "wrong struct field type");
+    assert_eq!(counts.thunk, 0, "wrong struct field type");
+    formal_cases.push(HostAllocationCase {
+        name: "error_wrong_payload_type",
+        counts,
+    });
 
     let mut full_heap = Heap::new(0);
-    let _ = RuntimeHostArgs::new(&[], Some(&mut full_heap))
-        .unwrap()
-        .return_writer(1);
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let _ = full_heap
+        .failure_injector()
+        .stats(RuntimeFailurePoint::HeapSlot);
+    let requirements = HostReturnRequirements {
+        object_slots: 1,
+        ..HostReturnRequirements::ZERO
+    };
+    let (outcome, counts) = observed_host_split(|| {
         RuntimeHostArgs::new(&[], Some(&mut full_heap))
             .unwrap()
-            .return_writer(1)
+            .return_transaction(requirements)
     });
     assert!(outcome.is_err());
-    assert_eq!(allocations, 0, "heap full");
+    assert_eq!(counts.thunk, 0, "heap full");
+    formal_cases.push(HostAllocationCase {
+        name: "error_heap_object_capacity",
+        counts,
+    });
 
     let mut limited_heap = Heap::new_with_limits(4, usize::MAX, 0);
-    let _ = RuntimeHostArgs::new(&[], Some(&mut limited_heap))
-        .unwrap()
-        .return_writer(1);
-    let array_values = vec![RuntimeValue::I32(1)];
-    let (outcome, allocations, _) = observed_host_split(|| {
-        let args = RuntimeHostArgs::new(&[], Some(&mut limited_heap)).unwrap();
-        let mut writer = args.return_writer(1).unwrap();
-        writer.write_array(
-            nexa_bytecode::array_type(ValueType::I32),
-            ValueType::I32,
-            array_values,
-        )
+    let _ = limited_heap
+        .failure_injector()
+        .stats(RuntimeFailurePoint::HeapSlot);
+    let collection_requirements = HostReturnRequirements {
+        object_slots: 1,
+        collection_elements: 1,
+        ..HostReturnRequirements::ZERO
+    };
+    let (outcome, counts) = observed_host_split(|| {
+        RuntimeHostArgs::new(&[], Some(&mut limited_heap))
+            .unwrap()
+            .return_transaction(collection_requirements)
     });
-    assert_eq!(outcome, Err(HostTrap::Type));
-    assert_eq!(allocations, 0, "array length limit");
-    let buffer_values = vec![RuntimeValue::I32(1)];
-    let (outcome, allocations, _) = observed_host_split(|| {
-        let args = RuntimeHostArgs::new(&[], Some(&mut limited_heap)).unwrap();
-        let mut writer = args.return_writer(1).unwrap();
-        writer.write_buffer(
-            nexa_bytecode::buffer_type(ValueType::I32),
-            ValueType::I32,
-            buffer_values,
-        )
+    assert!(outcome.is_err());
+    assert_eq!(counts.thunk, 0, "collection element capacity");
+    formal_cases.push(HostAllocationCase {
+        name: "error_collection_capacity",
+        counts,
     });
-    assert_eq!(outcome, Err(HostTrap::Type));
-    assert_eq!(allocations, 0, "buffer length limit");
+
+    let mut string_limited_heap = Heap::new_with_arena_limits(4, 2, 4, 4, 5);
+    let _ = string_limited_heap
+        .failure_injector()
+        .stats(RuntimeFailurePoint::HostReturnStringReservation);
+    let string_requirements = HostReturnRequirements {
+        object_slots: 1,
+        string_bytes: 3,
+        ..HostReturnRequirements::ZERO
+    };
+    let (outcome, counts) = observed_host_split(|| {
+        RuntimeHostArgs::new(&[], Some(&mut string_limited_heap))
+            .unwrap()
+            .return_transaction(string_requirements)
+    });
+    assert!(outcome.is_err());
+    assert_eq!(counts.thunk, 0, "string byte capacity");
+    formal_cases.push(HostAllocationCase {
+        name: "error_string_capacity",
+        counts,
+    });
 
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let (outcome, allocations, _) = observed_host_split(|| {
+    let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
             host_matrix::THUNK_PANIC_HOST,
             &mut context,
@@ -837,11 +1142,99 @@ fn complex_host_allocation_matrix() {
     });
     std::panic::set_hook(previous_hook);
     assert_eq!(outcome, Err(HostTrap::Panicked));
-    assert_eq!(allocations, 0, "host panic");
+    assert_eq!(counts.thunk, 0, "host panic");
+    formal_cases.push(HostAllocationCase {
+        name: "error_host_panic",
+        counts,
+    });
+
+    let injected_cases = [
+        (
+            RuntimeFailurePoint::HostReturnObjectReservation,
+            host_matrix::THUNK_RETURN_ARRAY,
+        ),
+        (
+            RuntimeFailurePoint::HostReturnCollectionReservation,
+            host_matrix::THUNK_RETURN_ARRAY,
+        ),
+        (
+            RuntimeFailurePoint::HostReturnStringReservation,
+            host_matrix::THUNK_RETURN_STRUCT,
+        ),
+        (
+            RuntimeFailurePoint::HostReturnStructWrite,
+            host_matrix::THUNK_RETURN_STRUCT,
+        ),
+        (
+            RuntimeFailurePoint::HostReturnCollectionWrite,
+            host_matrix::THUNK_RETURN_ARRAY,
+        ),
+        (
+            RuntimeFailurePoint::HostReturnCommit,
+            host_matrix::THUNK_RETURN_ARRAY,
+        ),
+    ];
+    for (point, id) in injected_cases {
+        let mut injected_heap = Heap::new_with_arena_limits(32, 256, 16, 64, 33);
+        let before = injected_heap.collection_inspection();
+        injected_heap.failure_injector().arm_once(point);
+        let (outcome, counts) = observed_host_split(|| {
+            registry.call_runtime(
+                id,
+                &mut context,
+                RuntimeHostArgs::new(&[], Some(&mut injected_heap)).unwrap(),
+            )
+        });
+        assert_eq!(outcome, Err(HostTrap::Type), "{point:?}");
+        assert_eq!(counts.thunk, 0, "{point:?}");
+        assert_eq!(injected_heap.live_len(), 0, "{point:?}");
+        assert_eq!(injected_heap.collection_inspection(), before, "{point:?}");
+        let name = match point {
+            RuntimeFailurePoint::HostReturnObjectReservation => "injected_object_reservation",
+            RuntimeFailurePoint::HostReturnCollectionReservation => {
+                "injected_collection_reservation"
+            }
+            RuntimeFailurePoint::HostReturnStringReservation => "injected_string_reservation",
+            RuntimeFailurePoint::HostReturnStructWrite => "injected_struct_write",
+            RuntimeFailurePoint::HostReturnCollectionWrite => "injected_collection_write",
+            RuntimeFailurePoint::HostReturnCommit => "injected_commit",
+            _ => unreachable!(),
+        };
+        formal_cases.push(HostAllocationCase { name, counts });
+        assert!(
+            registry
+                .call_runtime(
+                    id,
+                    &mut context,
+                    RuntimeHostArgs::new(&[], Some(&mut injected_heap)).unwrap(),
+                )
+                .is_ok(),
+            "{point:?} retry"
+        );
+    }
+    assert!(formal_cases.len() >= 32);
+    assert!(formal_cases.iter().all(|case| case.counts.thunk == 0));
+    print!(
+        "{{\"host_return_matrix\":{{\"case_count\":{},\"all_thunk_zero\":true,\
+         \"cases\":[",
+        formal_cases.len()
+    );
+    for (index, case) in formal_cases.iter().enumerate() {
+        if index != 0 {
+            print!(",");
+        }
+        print!(
+            "{{\"name\":\"{}\",\"total_allocations\":{},\"host_allocations\":{},\
+             \"thunk_allocations\":{},\"passed\":true}}",
+            case.name, case.counts.total, case.counts.host, case.counts.thunk
+        );
+    }
+    println!("]}}}}");
 
     println!(
-        "complex_host_allocation_matrix=ok complex_cases=25 thunk_allocations=0 \
-         complex_host_thunks_zero=true complex_host_returns_zero=true"
+        "complex_host_allocation_matrix=ok complex_cases={} thunk_allocations=0 \
+         complex_host_thunks_zero=true complex_host_returns_zero=true",
+        formal_cases.len()
     );
 }
 
@@ -956,10 +1349,8 @@ fn main() {
             ));
         });
 
-        let (mut realm, module) = make_realm(vec![
-            Instruction::Yield,
-            Instruction::Return { source: 0 },
-        ]);
+        let (mut realm, module) =
+            make_realm(vec![Instruction::Yield, Instruction::Return { source: 0 }]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
             .call(
@@ -988,9 +1379,7 @@ fn main() {
         let cleanup_trap = observe_cleanup(true);
         let mut task_runtime = TaskRuntime::new(91, RuntimeLimits::default());
         let reload_scope = task_runtime.create_scope(None).unwrap();
-        let reload_task = task_runtime
-            .admit_task(reload_scope, 1, true)
-            .unwrap();
+        let reload_task = task_runtime.admit_task(reload_scope, 1, true).unwrap();
         task_runtime.poll_task(reload_task).unwrap();
         task_runtime.pause_task_for_reload(reload_task).unwrap();
         let reload_commit_cancel = observed(|| {
@@ -1184,8 +1573,7 @@ fn main() {
             max_host_resources: 1,
             ..RealmConfig::default()
         };
-        let (mut realm, module) =
-            make_async_host_realm(config, host.clone(), Arc::clone(&pending));
+        let (mut realm, module) = make_async_host_realm(config, host.clone(), Arc::clone(&pending));
         drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let first = realm
@@ -1439,9 +1827,7 @@ fn main() {
             )
             .unwrap();
         realm.quiesce_reload().unwrap();
-        realm
-            .stage_reload(&[RuntimeValue::I32(1)])
-            .unwrap();
+        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
         realm.commit_reload(&[], 32).unwrap();
         let retired_epoch_final_transfer = observed(|| {
             realm
@@ -1514,69 +1900,67 @@ fn main() {
         ));
     }
 
-    let required_paths_zero = runs
-        .iter()
-        .all(
-            |(
-                _,
-                promotion,
-                explicit_resume,
-                fuel_resume,
-                host_resume,
-                cleanup_success,
-                cleanup_trap,
-                task_completed,
-                task_cancelled,
-                task_trapped,
-                reload_commit_cancel,
-                trace_off,
-                immediate_host_call,
-                async_admission,
-                async_admission_capacity_failure,
-                async_admission_cancellation,
-                success_result_writeback,
-                error_result_writeback,
-                error_enum_writeback,
-                cancel_return_error,
-                abandon_return_error,
-                heap_full_writeback,
-                token_release,
-                snapshot_release,
-                detached_request_release,
-                runtime_host_drain,
-                retired_epoch_final_transfer,
-                realm_drop_transfer,
-            )| {
-                *promotion
-                    + *explicit_resume
-                    + *fuel_resume
-                    + *host_resume
-                    + *cleanup_success
-                    + *cleanup_trap
-                    + *task_completed
-                    + *task_cancelled
-                    + *task_trapped
-                    + *reload_commit_cancel
-                    + *trace_off
-                    + *immediate_host_call
-                    + *async_admission
-                    + *async_admission_capacity_failure
-                    + *async_admission_cancellation
-                    + *success_result_writeback
-                    + *error_result_writeback
-                    + *error_enum_writeback
-                    + *cancel_return_error
-                    + *abandon_return_error
-                    + *heap_full_writeback
-                    + *token_release
-                    + *snapshot_release
-                    + *detached_request_release
-                    + *runtime_host_drain
-                    + *retired_epoch_final_transfer
-                    + *realm_drop_transfer
-                    == 0
-            },
-        );
+    let required_paths_zero = runs.iter().all(
+        |(
+            _,
+            promotion,
+            explicit_resume,
+            fuel_resume,
+            host_resume,
+            cleanup_success,
+            cleanup_trap,
+            task_completed,
+            task_cancelled,
+            task_trapped,
+            reload_commit_cancel,
+            trace_off,
+            immediate_host_call,
+            async_admission,
+            async_admission_capacity_failure,
+            async_admission_cancellation,
+            success_result_writeback,
+            error_result_writeback,
+            error_enum_writeback,
+            cancel_return_error,
+            abandon_return_error,
+            heap_full_writeback,
+            token_release,
+            snapshot_release,
+            detached_request_release,
+            runtime_host_drain,
+            retired_epoch_final_transfer,
+            realm_drop_transfer,
+        )| {
+            *promotion
+                + *explicit_resume
+                + *fuel_resume
+                + *host_resume
+                + *cleanup_success
+                + *cleanup_trap
+                + *task_completed
+                + *task_cancelled
+                + *task_trapped
+                + *reload_commit_cancel
+                + *trace_off
+                + *immediate_host_call
+                + *async_admission
+                + *async_admission_capacity_failure
+                + *async_admission_cancellation
+                + *success_result_writeback
+                + *error_result_writeback
+                + *error_enum_writeback
+                + *cancel_return_error
+                + *abandon_return_error
+                + *heap_full_writeback
+                + *token_release
+                + *snapshot_release
+                + *detached_request_release
+                + *runtime_host_drain
+                + *retired_epoch_final_transfer
+                + *realm_drop_transfer
+                == 0
+        },
+    );
     let all_measured_paths_zero = runs.iter().all(
         |(
             _,
@@ -1833,9 +2217,7 @@ fn make_migration_realm() -> RealmRuntime {
     realm
         .insert_state(old, deleted_id, StateValue::I32(9))
         .unwrap();
-    realm
-        .prepare_reload(old, candidate, host)
-        .unwrap();
+    realm.prepare_reload(old, candidate, host).unwrap();
     realm.quiesce_reload().unwrap();
     realm
 }
@@ -1942,9 +2324,7 @@ fn make_async_host_realm_with_spec(
     (realm, module)
 }
 
-fn make_immediate_host_realm(
-    host: RuntimeHost,
-) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+fn make_immediate_host_realm(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host_hash = StableId::from_name("allocation-observer-immediate-host");
     let schema = StableId::from_name("allocation-observer-immediate-schema");
     let mut function = FunctionBuilder::new(
@@ -1985,9 +2365,7 @@ fn make_immediate_host_realm(
     (realm, module)
 }
 
-fn make_realm_with_host(
-    host: RuntimeHost,
-) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+fn make_realm_with_host(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host_hash = StableId::from_name("allocation-observer-host");
     let schema = StableId::from_name("allocation-observer-schema");
     let verified = build_module(host_hash, schema, vec![Instruction::Return { source: 0 }]);
@@ -2029,10 +2407,7 @@ fn build_module(
     verify(builder.finish(), VerifierLimits::default()).unwrap()
 }
 
-fn build_retired_epoch_module(
-    host: StableId,
-    schema: StableId,
-) -> nexa_verifier::VerifiedModule {
+fn build_retired_epoch_module(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
     let mut migration = FunctionBuilder::new(
         Signature {
             parameters: vec![ValueType::I32],
@@ -2094,9 +2469,7 @@ impl HostRegistry for AsyncHost {
         if id != 0 || args.len() != 1 || !matches!(args.get(0)?, HostValue::I32(_)) {
             return Err(HostTrap::Type);
         }
-        let pending = context
-            .create_request()
-            .map_err(|_| HostTrap::Panicked)?;
+        let pending = context.create_request().map_err(|_| HostTrap::Panicked)?;
         let request = pending.request;
         *self.pending.lock().unwrap() = Some(pending);
         Ok(HostCallOutcome::Pending(request))
