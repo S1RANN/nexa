@@ -5,13 +5,16 @@ use nexa_compiler::CompileError;
 use nexa_core::{FileId, ModuleId, RawHandle, SourceSpan};
 use nexa_runtime::{
     HostRequestError, HostTrap, MigrationLimitError, RealmError, ReloadError, RuntimeError,
-    RuntimeHostCloseError, StatefulError,
+    RuntimeHostCloseError, RuntimeMessage, StatefulError,
 };
 use nexa_verifier::{VerifyError, VerifyErrorKind};
+use serde::Serialize;
 
 /// A stable, machine-readable public error code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ErrorCode(&'static str);
+
+pub type DiagnosticCode = ErrorCode;
 
 impl ErrorCode {
     pub const NX1001: Self = Self::new("NX1001");
@@ -179,35 +182,100 @@ pub trait ClassifiedError {
     fn metadata(&self) -> ErrorMetadata;
 }
 
-/// A compiler diagnostic with a source location and stable classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    Error,
+    Warning,
+    Note,
+    Help,
+}
+
+impl Severity {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warning => "warning",
+            Self::Note => "note",
+            Self::Help => "help",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Label {
+    pub span: SourceSpan,
+    pub message: RuntimeMessage,
+}
+
+/// One source-backed diagnostic representation shared by human and JSON renderers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
-    error: CompileError,
-    context: ErrorContext,
+    pub code: DiagnosticCode,
+    pub severity: Severity,
+    pub message: RuntimeMessage,
+    pub primary: Label,
+    pub secondary: Vec<Label>,
+    pub notes: Vec<RuntimeMessage>,
 }
 
 impl Diagnostic {
     #[must_use]
-    pub fn new(error: CompileError, file: FileId) -> Self {
-        let span = compile_error_span(&error, file);
+    pub fn new(error: &CompileError, file: FileId) -> Self {
+        let span = compile_error_span(error, file).unwrap_or_else(|| SourceSpan::new(file, 0, 0));
+        let message = RuntimeMessage::inline(&CompileErrorMessage(error).to_string());
         Self {
-            error,
-            context: ErrorContext {
+            code: compile_error_code(error),
+            severity: Severity::Error,
+            message,
+            primary: Label {
                 span,
-                ..ErrorContext::default()
+                message: RuntimeMessage::Static("primary source location"),
             },
+            secondary: Vec::new(),
+            notes: Vec::new(),
         }
     }
 
     #[must_use]
-    pub const fn error(&self) -> &CompileError {
-        &self.error
+    pub fn from_parts(
+        code: DiagnosticCode,
+        severity: Severity,
+        message: RuntimeMessage,
+        primary: Label,
+    ) -> Self {
+        Self {
+            code,
+            severity,
+            message,
+            primary,
+            secondary: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&DiagnosticOutput::from(self))
     }
 }
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write_compile_error(&self.error, formatter)
+        writeln!(
+            formatter,
+            "{}[{}]: {}",
+            self.severity.as_str(),
+            self.code,
+            self.message
+        )?;
+        write_label(formatter, "primary", &self.primary)?;
+        for label in &self.secondary {
+            write_label(formatter, "secondary", label)?;
+        }
+        for note in &self.notes {
+            write!(formatter, "\nnote: {note}")?;
+        }
+        Ok(())
     }
 }
 
@@ -216,10 +284,71 @@ impl std::error::Error for Diagnostic {}
 impl ClassifiedError for Diagnostic {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: compile_error_code(&self.error),
+            code: self.code,
             category: ErrorCategory::Diagnostic,
-            context: self.context,
+            context: ErrorContext {
+                span: Some(self.primary.span),
+                ..ErrorContext::default()
+            },
         }
+    }
+}
+
+#[derive(Serialize)]
+struct DiagnosticOutput {
+    code: &'static str,
+    severity: &'static str,
+    message: String,
+    primary: LabelOutput,
+    secondary: Vec<LabelOutput>,
+    notes: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct LabelOutput {
+    file: u32,
+    start: u32,
+    end: u32,
+    message: String,
+}
+
+impl From<&Diagnostic> for DiagnosticOutput {
+    fn from(diagnostic: &Diagnostic) -> Self {
+        Self {
+            code: diagnostic.code.as_str(),
+            severity: diagnostic.severity.as_str(),
+            message: diagnostic.message.to_string(),
+            primary: LabelOutput::from(&diagnostic.primary),
+            secondary: diagnostic.secondary.iter().map(LabelOutput::from).collect(),
+            notes: diagnostic.notes.iter().map(ToString::to_string).collect(),
+        }
+    }
+}
+
+impl From<&Label> for LabelOutput {
+    fn from(label: &Label) -> Self {
+        Self {
+            file: label.span.file.0,
+            start: label.span.start,
+            end: label.span.end,
+            message: label.message.to_string(),
+        }
+    }
+}
+
+fn write_label(formatter: &mut fmt::Formatter<'_>, kind: &str, label: &Label) -> fmt::Result {
+    write!(
+        formatter,
+        "\n  {kind} {}:{}..{}: {}",
+        label.span.file.0, label.span.start, label.span.end, label.message
+    )
+}
+
+struct CompileErrorMessage<'a>(&'a CompileError);
+
+impl fmt::Display for CompileErrorMessage<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_compile_error(self.0, formatter)
     }
 }
 
@@ -298,7 +427,7 @@ impl ClassifiedError for MigrationError {
 /// The only error boundary exposed by high-level Nexa facade operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum NexaError {
-    Diagnostic(Diagnostic),
+    Diagnostic(Box<Diagnostic>),
     Decode(DecodeError),
     Verify(VerifyError),
     Runtime(RuntimeError),
@@ -359,13 +488,13 @@ impl std::error::Error for NexaError {}
 
 impl From<CompileError> for NexaError {
     fn from(error: CompileError) -> Self {
-        Self::Diagnostic(Diagnostic::new(error, FileId::default()))
+        Self::Diagnostic(Box::new(Diagnostic::new(&error, FileId::default())))
     }
 }
 
 impl From<Diagnostic> for NexaError {
     fn from(error: Diagnostic) -> Self {
-        Self::Diagnostic(error)
+        Self::Diagnostic(Box::new(error))
     }
 }
 
@@ -702,13 +831,13 @@ mod tests {
     use nexa_core::{FileId, SourceSpan};
     use nexa_runtime::{
         HostRequestError, HostTrap, MigrationLimitError, ReloadError, RuntimeError,
-        RuntimeHostCloseError,
+        RuntimeHostCloseError, RuntimeMessage,
     };
     use nexa_verifier::{VerifyError, VerifyErrorKind};
 
     use super::{
-        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, HostError,
-        MigrationError, NexaError,
+        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, HostError, Label,
+        MigrationError, NexaError, Severity,
     };
 
     #[test]
@@ -770,13 +899,13 @@ mod tests {
     #[test]
     fn every_public_error_class_has_structured_metadata() {
         let errors = [
-            NexaError::Diagnostic(Diagnostic::new(
-                CompileError::UnexpectedCharacter {
+            NexaError::Diagnostic(Box::new(Diagnostic::new(
+                &CompileError::UnexpectedCharacter {
                     offset: 4,
                     character: '#',
                 },
                 FileId(7),
-            )),
+            ))),
             NexaError::Decode(DecodeError::InvalidMagic),
             NexaError::Verify(VerifyError {
                 function: 0,
@@ -809,14 +938,45 @@ mod tests {
     #[test]
     fn diagnostic_carries_source_span_without_parsing_display_output() {
         let error = NexaError::from(Diagnostic::new(
-            CompileError::UnexpectedCharacter {
+            &CompileError::UnexpectedCharacter {
                 offset: 4,
                 character: '界',
             },
             FileId(9),
         ));
         assert_eq!(error.context().span, Some(SourceSpan::new(FileId(9), 4, 7)));
-        assert_eq!(error.to_string(), "unexpected character `界` at byte 4");
+        assert!(error.to_string().contains("error[NX1001]"));
+        assert!(error.to_string().contains("unexpected character `界`"));
+        assert!(error.to_string().contains("primary 9:4..7"));
+    }
+
+    #[test]
+    fn every_stable_code_renders_from_one_structure_in_human_and_json_formats() {
+        for definition in ERROR_CODE_TABLE {
+            let diagnostic = Diagnostic::from_parts(
+                definition.code,
+                Severity::Error,
+                RuntimeMessage::Static(definition.summary),
+                Label {
+                    span: SourceSpan::new(FileId(3), 5, 8),
+                    message: RuntimeMessage::Static("selected source"),
+                },
+            );
+            let human = diagnostic.to_string();
+            let json: serde_json::Value =
+                serde_json::from_str(&diagnostic.to_json().unwrap()).unwrap();
+
+            assert!(human.contains(definition.code.as_str()));
+            assert!(human.contains(definition.summary));
+            assert_eq!(json["code"], definition.code.as_str());
+            assert_eq!(json["severity"], "error");
+            assert_eq!(json["message"], definition.summary);
+            assert_eq!(json["primary"]["file"], 3);
+            assert_eq!(json["primary"]["start"], 5);
+            assert_eq!(json["primary"]["end"], 8);
+            assert_eq!(json["secondary"], serde_json::json!([]));
+            assert_eq!(json["notes"], serde_json::json!([]));
+        }
     }
 
     #[test]

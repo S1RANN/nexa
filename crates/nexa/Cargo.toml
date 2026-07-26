@@ -12,6 +12,8 @@ nexa-core = { path = "../nexa-core" }
 nexa-idl = { path = "../nexa-idl" }
 nexa-runtime = { path = "../nexa-runtime" }
 nexa-verifier = { path = "../nexa-verifier" }
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

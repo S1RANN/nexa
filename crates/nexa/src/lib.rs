@@ -5,8 +5,9 @@
 mod error;
 
 pub use error::{
-    ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, ErrorCodeDefinition,
-    ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, MigrationError, NexaError,
+    ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
+    ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, Label,
+    MigrationError, NexaError, Severity,
 };
 
 use nexa_bytecode::{DecodeLimits, Module};
@@ -22,7 +23,7 @@ pub fn compile(source: &str) -> Result<VerifiedModule, NexaError> {
 /// Compiles source and attaches `file` to diagnostics that have a source location.
 pub fn compile_file(source: &str, file: FileId) -> Result<VerifiedModule, NexaError> {
     nexa_compiler::compile(source)
-        .map_err(|error| NexaError::Diagnostic(Diagnostic::new(error, file)))
+        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
 }
 
 /// Compiles source against an exact IDL interface through the stable facade error boundary.
@@ -69,9 +70,9 @@ pub mod prelude {
     pub use nexa_verifier::VerifierLimits;
 
     pub use crate::{
-        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
-        ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError,
-        MigrationError, NexaError, compile, compile_file, compile_with_interface, decode_module,
-        verify_module,
+        ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
+        ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, Label,
+        MigrationError, NexaError, Severity, compile, compile_file, compile_with_interface,
+        decode_module, verify_module,
     };
 }

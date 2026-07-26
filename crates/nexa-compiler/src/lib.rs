@@ -105,33 +105,6 @@ impl fmt::Display for CompileError {
 impl std::error::Error for CompileError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CompileDiagnostic {
-    pub message: String,
-    pub span: SourceSpan,
-}
-
-impl CompileError {
-    #[must_use]
-    pub fn diagnostic(&self, file: FileId) -> CompileDiagnostic {
-        let (start, end) = match self {
-            Self::UnexpectedCharacter { offset, character } => {
-                (*offset, offset.saturating_add(character.len_utf8()))
-            }
-            Self::UnexpectedToken { offset, .. } => (*offset, offset.saturating_add(1)),
-            _ => (0, 0),
-        };
-        CompileDiagnostic {
-            message: self.to_string(),
-            span: SourceSpan::new(
-                file,
-                u32::try_from(start).unwrap_or(u32::MAX),
-                u32::try_from(end).unwrap_or(u32::MAX),
-            ),
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstModule {
     pub name: Option<String>,
     pub imports: Vec<AstImport>,
