@@ -20,6 +20,8 @@ pub struct MigrateCheckConfig {
     pub verifier_limits: nexa_verifier::VerifierLimits,
     pub fixture_limits: StateFixtureLimits,
     pub migration_limits: MigrationLimits,
+    pub dump_state: bool,
+    pub diff_state: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -28,12 +30,25 @@ pub struct MigrateCheckResult {
     pub new_schema_hash: u64,
     pub migration_entry: u32,
     pub migration_hash: u64,
+    pub final_state_hash: u64,
+    pub final_object_count: usize,
     pub usage: MigrateCheckUsage,
-    pub output_state: StateFixture,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_state: Option<StateFixture>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_diff: Option<MigrateStateDiff>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct MigrateCheckUsage {
+    pub objects_read: usize,
+    pub objects_created: usize,
+    pub fields_written: usize,
+    pub preserved: usize,
+    pub replaced: usize,
+    pub deleted: usize,
+    pub generation_changes: usize,
+    pub handle_remaps: usize,
     pub object_peak: usize,
     pub field_peak: usize,
     pub forwarding_peak: usize,
@@ -41,6 +56,23 @@ pub struct MigrateCheckUsage {
     pub gc_root_peak: usize,
     pub fuel_used: u64,
     pub max_call_depth_used: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MigrateStateDiff {
+    pub added_objects: Vec<u64>,
+    pub removed_objects: Vec<u64>,
+    pub changed_objects: Vec<MigrateObjectDiff>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct MigrateObjectDiff {
+    pub stable_id: u64,
+    pub old_generation: u64,
+    pub new_generation: u64,
+    pub added_fields: Vec<u64>,
+    pub removed_fields: Vec<u64>,
+    pub changed_fields: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,12 +136,27 @@ pub fn run_migrate_check(
         .reload_metadata
         .migration_entry
         .ok_or_else(|| MigrateCheckError::Runtime("missing migration entry".into()))?;
+    let output_state = output_fixture(fixture.stateful_domain, output.objects);
+    let state_diff = config
+        .diff_state
+        .then(|| diff_state(&fixture, &output_state));
+    let final_object_count = output_state.objects.len();
     Ok(MigrateCheckResult {
         old_schema_hash: old_module.module().state_schema.stable_hash().0,
         new_schema_hash: new_module.module().state_schema.stable_hash().0,
         migration_entry,
         migration_hash: output.migration_hash.0,
+        final_state_hash: output.final_state_hash.0,
+        final_object_count,
         usage: MigrateCheckUsage {
+            objects_read: output.usage.objects_read,
+            objects_created: output.usage.objects_created,
+            fields_written: output.usage.fields_written,
+            preserved: output.usage.preserved,
+            replaced: output.usage.replaced,
+            deleted: output.usage.deleted,
+            generation_changes: output.usage.generation_changes,
+            handle_remaps: output.usage.handle_remaps,
             object_peak: output.usage.object_peak,
             field_peak: output.usage.field_peak,
             forwarding_peak: output.usage.forwarding_peak,
@@ -118,7 +165,8 @@ pub fn run_migrate_check(
             fuel_used: output.usage.fuel_used,
             max_call_depth_used: output.usage.max_call_depth_used,
         },
-        output_state: output_fixture(fixture.stateful_domain, output.objects),
+        output_state: config.dump_state.then_some(output_state),
+        state_diff,
     })
 }
 
@@ -237,12 +285,90 @@ fn output_fixture(domain: u64, objects: Vec<OfflineStateObject>) -> StateFixture
     }
 }
 
+fn diff_state(old: &StateFixture, new: &StateFixture) -> MigrateStateDiff {
+    let old_objects = old
+        .objects
+        .iter()
+        .map(|object| (object.stable_id, object))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let new_objects = new
+        .objects
+        .iter()
+        .map(|object| (object.stable_id, object))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let added_objects = new_objects
+        .keys()
+        .filter(|id| !old_objects.contains_key(id))
+        .copied()
+        .collect();
+    let removed_objects = old_objects
+        .keys()
+        .filter(|id| !new_objects.contains_key(id))
+        .copied()
+        .collect();
+    let mut changed_objects = Vec::new();
+    for (stable_id, old_object) in &old_objects {
+        let Some(new_object) = new_objects.get(stable_id) else {
+            continue;
+        };
+        let old_fields = old_object
+            .fields
+            .iter()
+            .map(|field| (field.stable_id, &field.value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let new_fields = new_object
+            .fields
+            .iter()
+            .map(|field| (field.stable_id, &field.value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let added_fields = new_fields
+            .keys()
+            .filter(|id| !old_fields.contains_key(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let removed_fields = old_fields
+            .keys()
+            .filter(|id| !new_fields.contains_key(id))
+            .copied()
+            .collect::<Vec<_>>();
+        let changed_fields = old_fields
+            .iter()
+            .filter_map(|(id, value)| {
+                new_fields
+                    .get(id)
+                    .filter(|new_value| *new_value != value)
+                    .map(|_| *id)
+            })
+            .collect::<Vec<_>>();
+        if old_object.generation != new_object.generation
+            || !added_fields.is_empty()
+            || !removed_fields.is_empty()
+            || !changed_fields.is_empty()
+        {
+            changed_objects.push(MigrateObjectDiff {
+                stable_id: *stable_id,
+                old_generation: old_object.generation,
+                new_generation: new_object.generation,
+                added_fields,
+                removed_fields,
+                changed_fields,
+            });
+        }
+    }
+    MigrateStateDiff {
+        added_objects,
+        removed_objects,
+        changed_objects,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nexa_core::StableId;
     use serde_json::json;
 
-    use super::{MigrateCheckConfig, run_migrate_check};
+    use super::{MigrateCheckConfig, diff_state, run_migrate_check};
+    use crate::{StateFixtureLimits, parse_state_fixture};
 
     #[test]
     fn migrate_check_uses_decoder_verifier_interpreter_context_and_registry() {
@@ -277,15 +403,90 @@ mod tests {
             &old.module().encode(),
             &new.module().encode(),
             &fixture,
-            MigrateCheckConfig::default(),
+            MigrateCheckConfig {
+                dump_state: true,
+                diff_state: true,
+                ..MigrateCheckConfig::default()
+            },
         )
         .unwrap();
 
         assert_eq!(result.old_schema_hash, result.new_schema_hash);
         assert_eq!(result.migration_entry, 0);
-        assert_eq!(result.output_state.objects.len(), 1);
+        assert_eq!(result.output_state.as_ref().unwrap().objects.len(), 1);
+        assert_eq!(
+            result.state_diff,
+            Some(super::MigrateStateDiff {
+                added_objects: Vec::new(),
+                removed_objects: Vec::new(),
+                changed_objects: Vec::new(),
+            })
+        );
         assert_ne!(result.migration_hash, 0);
+        assert_ne!(result.final_state_hash, 0);
         assert!(result.usage.fuel_used > 0);
         assert!(result.usage.max_call_depth_used > 0);
+    }
+
+    #[test]
+    fn state_diff_is_sorted_and_reports_every_change_class() {
+        let old = serde_json::to_vec(&json!({
+            "format_version": 1,
+            "stateful_domain": 7,
+            "objects": [
+                {
+                    "stable_id": 30,
+                    "type_id": 1,
+                    "generation": 0,
+                    "fields": [{"stable_id": 4, "value": {"type": "i32", "value": 1}}]
+                },
+                {
+                    "stable_id": 10,
+                    "type_id": 1,
+                    "generation": 1,
+                    "fields": [
+                        {"stable_id": 7, "value": {"type": "bool", "value": true}},
+                        {"stable_id": 3, "value": {"type": "i32", "value": 1}}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let new = serde_json::to_vec(&json!({
+            "format_version": 1,
+            "stateful_domain": 7,
+            "objects": [
+                {
+                    "stable_id": 20,
+                    "type_id": 1,
+                    "generation": 0,
+                    "fields": []
+                },
+                {
+                    "stable_id": 10,
+                    "type_id": 1,
+                    "generation": 2,
+                    "fields": [
+                        {"stable_id": 9, "value": {"type": "i32", "value": 9}},
+                        {"stable_id": 3, "value": {"type": "i32", "value": 2}}
+                    ]
+                }
+            ]
+        }))
+        .unwrap();
+        let old = parse_state_fixture(&old, StateFixtureLimits::default()).unwrap();
+        let new = parse_state_fixture(&new, StateFixtureLimits::default()).unwrap();
+
+        let diff = diff_state(&old, &new);
+
+        assert_eq!(diff.added_objects, vec![20]);
+        assert_eq!(diff.removed_objects, vec![30]);
+        assert_eq!(diff.changed_objects.len(), 1);
+        assert_eq!(diff.changed_objects[0].stable_id, 10);
+        assert_eq!(diff.changed_objects[0].old_generation, 1);
+        assert_eq!(diff.changed_objects[0].new_generation, 2);
+        assert_eq!(diff.changed_objects[0].added_fields, vec![9]);
+        assert_eq!(diff.changed_objects[0].removed_fields, vec![7]);
+        assert_eq!(diff.changed_objects[0].changed_fields, vec![3]);
     }
 }

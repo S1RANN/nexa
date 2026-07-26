@@ -51,7 +51,8 @@ fn main() {
             "usage: nexa baseline check | nexa machine check | nexa model check | \
              nexa compile <file> | nexa idl check|generate <file> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
-             [--format human|json] [--output PATH] [MigrationLimits]"
+             [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
+             [MigrationLimits]"
                 .to_owned(),
         ),
     };
@@ -67,7 +68,16 @@ enum MigrateOutputFormat {
     Json,
 }
 
-fn migrate_check(arguments: &[String]) -> Result<(), String> {
+struct MigrateCommand {
+    old_module: PathBuf,
+    new_module: PathBuf,
+    state: PathBuf,
+    output: Option<PathBuf>,
+    format: MigrateOutputFormat,
+    config: nexa_migrate::MigrateCheckConfig,
+}
+
+fn parse_migrate_command(arguments: &[String]) -> Result<MigrateCommand, String> {
     let mut old_module = None;
     let mut new_module = None;
     let mut state = None;
@@ -77,6 +87,19 @@ fn migrate_check(arguments: &[String]) -> Result<(), String> {
     let mut index = 0;
     while index < arguments.len() {
         let option = arguments[index].as_str();
+        match option {
+            "--dump-state" => {
+                config.dump_state = true;
+                index += 1;
+                continue;
+            }
+            "--diff-state" => {
+                config.diff_state = true;
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
         let value = arguments
             .get(index + 1)
             .ok_or_else(|| format!("missing value for `{option}`"))?;
@@ -117,43 +140,100 @@ fn migrate_check(arguments: &[String]) -> Result<(), String> {
         }
         index += 2;
     }
-    let old_module = old_module.ok_or("missing `--old-module`")?;
-    let new_module = new_module.ok_or("missing `--new-module`")?;
-    let state = state.ok_or("missing `--state`")?;
-    let old_bytes = std::fs::read(&old_module)
-        .map_err(|error| format!("could not read {}: {error}", old_module.display()))?;
-    let new_bytes = std::fs::read(&new_module)
-        .map_err(|error| format!("could not read {}: {error}", new_module.display()))?;
-    let state_bytes = std::fs::read(&state)
-        .map_err(|error| format!("could not read {}: {error}", state.display()))?;
-    let result = nexa_migrate::run_migrate_check(&old_bytes, &new_bytes, &state_bytes, config)
-        .map_err(|error| format!("migration check failed: {error}"))?;
-    let rendered = match format {
-        MigrateOutputFormat::Human => format!(
-            "migration check passed\n\
+    Ok(MigrateCommand {
+        old_module: old_module.ok_or("missing `--old-module`")?,
+        new_module: new_module.ok_or("missing `--new-module`")?,
+        state: state.ok_or("missing `--state`")?,
+        output,
+        format,
+        config,
+    })
+}
+
+fn render_migrate_result(
+    result: &nexa_migrate::MigrateCheckResult,
+    format: MigrateOutputFormat,
+) -> Result<String, String> {
+    match format {
+        MigrateOutputFormat::Human => {
+            let mut rendered = format!(
+                "migration check passed\n\
              old schema: {:016x}\n\
              new schema: {:016x}\n\
              migration entry: {}\n\
              migration hash: {:016x}\n\
+             final state hash: {:016x}\n\
              objects: {}\n\
+             objects read/created: {}/{}\n\
+             fields written: {}\n\
+             preserve/replace/delete: {}/{}/{}\n\
+             generation changes: {}\n\
+             handle remaps: {}\n\
              peak objects/fields/forwarding: {}/{}/{}\n\
+             peak state bytes/GC roots: {}/{}\n\
              fuel: {}\n\
              call depth: {}\n",
-            result.old_schema_hash,
-            result.new_schema_hash,
-            result.migration_entry,
-            result.migration_hash,
-            result.output_state.objects.len(),
-            result.usage.object_peak,
-            result.usage.field_peak,
-            result.usage.forwarding_peak,
-            result.usage.fuel_used,
-            result.usage.max_call_depth_used,
-        ),
-        MigrateOutputFormat::Json => serde_json::to_string_pretty(&result)
-            .map_err(|error| format!("could not serialize migration result: {error}"))?,
-    };
-    if let Some(output) = output {
+                result.old_schema_hash,
+                result.new_schema_hash,
+                result.migration_entry,
+                result.migration_hash,
+                result.final_state_hash,
+                result.final_object_count,
+                result.usage.objects_read,
+                result.usage.objects_created,
+                result.usage.fields_written,
+                result.usage.preserved,
+                result.usage.replaced,
+                result.usage.deleted,
+                result.usage.generation_changes,
+                result.usage.handle_remaps,
+                result.usage.object_peak,
+                result.usage.field_peak,
+                result.usage.forwarding_peak,
+                result.usage.payload_byte_peak,
+                result.usage.gc_root_peak,
+                result.usage.fuel_used,
+                result.usage.max_call_depth_used,
+            );
+            if let Some(diff) = &result.state_diff {
+                use std::fmt::Write as _;
+                writeln!(
+                    rendered,
+                    "diff added/removed/changed: {}/{}/{}",
+                    diff.added_objects.len(),
+                    diff.removed_objects.len(),
+                    diff.changed_objects.len()
+                )
+                .expect("String writes do not fail");
+            }
+            if let Some(state) = &result.output_state {
+                rendered.push_str("state:\n");
+                rendered.push_str(
+                    &serde_json::to_string_pretty(state)
+                        .map_err(|error| format!("could not serialize output state: {error}"))?,
+                );
+                rendered.push('\n');
+            }
+            Ok(rendered)
+        }
+        MigrateOutputFormat::Json => serde_json::to_string_pretty(result)
+            .map_err(|error| format!("could not serialize migration result: {error}")),
+    }
+}
+
+fn migrate_check(arguments: &[String]) -> Result<(), String> {
+    let command = parse_migrate_command(arguments)?;
+    let old_bytes = std::fs::read(&command.old_module)
+        .map_err(|error| format!("could not read {}: {error}", command.old_module.display()))?;
+    let new_bytes = std::fs::read(&command.new_module)
+        .map_err(|error| format!("could not read {}: {error}", command.new_module.display()))?;
+    let state_bytes = std::fs::read(&command.state)
+        .map_err(|error| format!("could not read {}: {error}", command.state.display()))?;
+    let result =
+        nexa_migrate::run_migrate_check(&old_bytes, &new_bytes, &state_bytes, command.config)
+            .map_err(|error| format!("migration check failed: {error}"))?;
+    let rendered = render_migrate_result(&result, command.format)?;
+    if let Some(output) = command.output {
         std::fs::write(&output, rendered)
             .map_err(|error| format!("could not write {}: {error}", output.display()))?;
     } else {

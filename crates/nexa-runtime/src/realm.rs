@@ -956,12 +956,8 @@ impl RealmRuntime {
         };
         match execution {
             InterpreterOutcome::Returned { value, .. } => {
-                let (migrated, hash) = match migration.finish()? {
-                    crate::stateful::MigrationOutput::Owned { registry, hash } => {
-                        (Arc::new(registry), hash)
-                    }
-                    crate::stateful::MigrationOutput::Shared { registry, hash } => (registry, hash),
-                };
+                let (migrated, hash, usage) = migration.finish()?.into_shared();
+                self.last_migration_usage_report = Some(usage);
                 self.last_migration_hash = Some(hash);
                 self.modules
                     .resolve_mut(candidate_handle.raw())
@@ -4327,6 +4323,11 @@ mod tests {
         assert_eq!(
             realm.last_migration_usage_report(),
             Some(crate::MigrationUsageReport {
+                objects_read: 1,
+                objects_created: 1,
+                fields_written: 1,
+                replaced: 1,
+                generation_changes: 1,
                 object_peak: 1,
                 field_peak: 1,
                 forwarding_peak: 1,
@@ -4337,6 +4338,7 @@ mod tests {
                 gc_root_peak: 0,
                 fuel_used: 6,
                 max_call_depth_used: 1,
+                ..crate::MigrationUsageReport::default()
             })
         );
         assert!(realm.last_migration_hash().is_some());

@@ -8,7 +8,8 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 pub use check::{
-    MigrateCheckConfig, MigrateCheckError, MigrateCheckResult, MigrateCheckUsage, run_migrate_check,
+    MigrateCheckConfig, MigrateCheckError, MigrateCheckResult, MigrateCheckUsage,
+    MigrateObjectDiff, MigrateStateDiff, run_migrate_check,
 };
 
 pub const STATE_FIXTURE_FORMAT_VERSION: u32 = 1;

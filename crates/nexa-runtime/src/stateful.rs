@@ -174,6 +174,14 @@ pub struct MigrationCapacityReport {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MigrationUsageReport {
+    pub objects_read: usize,
+    pub objects_created: usize,
+    pub fields_written: usize,
+    pub preserved: usize,
+    pub replaced: usize,
+    pub deleted: usize,
+    pub generation_changes: usize,
+    pub handle_remaps: usize,
     pub object_peak: usize,
     pub field_peak: usize,
     pub forwarding_peak: usize,
@@ -208,6 +216,7 @@ pub enum OfflineStateValue {
 pub struct OfflineMigrationResult {
     pub objects: Vec<OfflineStateObject>,
     pub migration_hash: StableId,
+    pub final_state_hash: StableId,
     pub usage: MigrationUsageReport,
 }
 
@@ -1048,6 +1057,18 @@ fn migration_registry_hash(
     registry: &StatefulRegistry,
 ) -> StableId {
     hash.write_u8(0x53);
+    write_registry_hash(&mut hash, registry);
+    StableId(hash.value)
+}
+
+fn final_registry_hash(registry: &StatefulRegistry) -> StableId {
+    let mut hash = DeterministicMigrationHasher::new();
+    hash.write_u8(0x46);
+    write_registry_hash(&mut hash, registry);
+    StableId(hash.value)
+}
+
+fn write_registry_hash(hash: &mut DeterministicMigrationHasher, registry: &StatefulRegistry) {
     hash.write_u64(registry.domain.get());
     hash.write_u64(u64::try_from(registry.objects.len()).unwrap_or(u64::MAX));
     for slot in &registry.objects {
@@ -1057,18 +1078,17 @@ fn migration_registry_hash(
         hash.write_u32(slot.generation);
         if let Some(value) = &slot.scalar {
             hash.write_u8(1);
-            hash_state_value(&mut hash, value);
+            hash_state_value(hash, value);
         } else {
             hash.write_u8(0);
             let fields = registry.object_fields(slot);
             hash.write_u64(u64::try_from(fields.len()).unwrap_or(u64::MAX));
             for field in fields {
                 hash.write_u64(field.field_id.0);
-                hash_state_value(&mut hash, &field.value);
+                hash_state_value(hash, &field.value);
             }
         }
     }
-    StableId(hash.value)
 }
 
 fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue) {
@@ -1191,6 +1211,7 @@ impl MigrationContext {
                 return Ok(MigrationOutput::Shared {
                     registry: self.old,
                     hash,
+                    usage: self.arena.usage_report,
                 });
             }
             return Err(ReloadError::MigrationNoOutput);
@@ -1210,6 +1231,7 @@ impl MigrationContext {
             return Err(ReloadError::MissingForwarding);
         }
         self.remap_handles();
+        let usage = self.arena.usage_report;
         let registry = self.arena.into_registry(self.domain);
         registry
             .validate_schema(&self.schema)
@@ -1218,7 +1240,11 @@ impl MigrationContext {
             .validate_handles()
             .map_err(|_| ReloadError::InvalidStateHandle)?;
         let hash = migration_registry_hash(self.operation_hash, &registry);
-        Ok(MigrationOutput::Owned { registry, hash })
+        Ok(MigrationOutput::Owned {
+            registry,
+            hash,
+            usage,
+        })
     }
 
     fn observe_opcode(&mut self, phase: MigrationAllocationPhase) -> MigrationObservation {
@@ -1236,6 +1262,7 @@ impl MigrationContext {
     }
 
     fn remap_handles(&mut self) {
+        let mut remaps = 0_usize;
         for index in 0..self.arena.objects.len() {
             let remapped = self.arena.objects[index]
                 .scalar
@@ -1243,14 +1270,18 @@ impl MigrationContext {
                 .and_then(|value| self.remapped_handle(value));
             if let Some(handle) = remapped {
                 self.arena.objects[index].scalar = Some(StateValue::Handle(handle));
+                remaps = remaps.saturating_add(1);
             }
         }
         for index in 0..self.arena.fields.len() {
             let remapped = self.remapped_handle(&self.arena.fields[index].value);
             if let Some(handle) = remapped {
                 self.arena.fields[index].value = StateValue::Handle(handle);
+                remaps = remaps.saturating_add(1);
             }
         }
+        self.arena.usage_report.handle_remaps =
+            self.arena.usage_report.handle_remaps.saturating_add(remaps);
     }
 
     fn remapped_handle(&self, value: &StateValue) -> Option<StateHandle> {
@@ -1282,11 +1313,30 @@ pub(crate) enum MigrationOutput {
     Owned {
         registry: StatefulRegistry,
         hash: StableId,
+        usage: MigrationUsageReport,
     },
     Shared {
         registry: Arc<StatefulRegistry>,
         hash: StableId,
+        usage: MigrationUsageReport,
     },
+}
+
+impl MigrationOutput {
+    pub(crate) fn into_shared(self) -> (Arc<StatefulRegistry>, StableId, MigrationUsageReport) {
+        match self {
+            Self::Owned {
+                registry,
+                hash,
+                usage,
+            } => (Arc::new(registry), hash, usage),
+            Self::Shared {
+                registry,
+                hash,
+                usage,
+            } => (registry, hash, usage),
+        }
+    }
 }
 
 impl InterpreterMigration for MigrationContext {
@@ -1314,6 +1364,8 @@ impl InterpreterMigration for MigrationContext {
         if runtime_state_type(value) != expected {
             return Err("old state type does not match migration opcode".into());
         }
+        self.arena.usage_report.objects_read =
+            self.arena.usage_report.objects_read.saturating_add(1);
         Ok(value)
     }
 
@@ -1345,6 +1397,8 @@ impl InterpreterMigration for MigrationContext {
         if runtime_state_type(value) != expected {
             return Err("old state field type mismatch".into());
         }
+        self.arena.usage_report.objects_read =
+            self.arena.usage_report.objects_read.saturating_add(1);
         Ok(value)
     }
 
@@ -1379,6 +1433,8 @@ impl InterpreterMigration for MigrationContext {
             .insert_object(index, stable_id, type_id, version, 0, None);
         self.arena.rebuild_caches();
         self.set_flag(TOUCHED);
+        self.arena.usage_report.objects_created =
+            self.arena.usage_report.objects_created.saturating_add(1);
         Ok(RuntimeValue::Opaque {
             type_id,
             value: stable_id.0,
@@ -1459,6 +1515,8 @@ impl InterpreterMigration for MigrationContext {
         }
         self.arena.rebuild_caches();
         self.set_flag(TOUCHED);
+        self.arena.usage_report.fields_written =
+            self.arena.usage_report.fields_written.saturating_add(1);
         Ok(())
     }
 
@@ -1535,6 +1593,7 @@ impl InterpreterMigration for MigrationContext {
         self.operation_hash.write_u64(stable_id.0);
         self.arena.rebuild_caches();
         self.set_flag(TOUCHED);
+        self.arena.usage_report.preserved = self.arena.usage_report.preserved.saturating_add(1);
         Ok(())
     }
 
@@ -1571,6 +1630,9 @@ impl InterpreterMigration for MigrationContext {
         self.operation_hash.write_u64(old_id.0);
         self.operation_hash.write_u64(target_id.0);
         self.set_flag(TOUCHED);
+        self.arena.usage_report.replaced = self.arena.usage_report.replaced.saturating_add(1);
+        self.arena.usage_report.generation_changes =
+            self.arena.usage_report.generation_changes.saturating_add(1);
         Ok(())
     }
 
@@ -1588,6 +1650,7 @@ impl InterpreterMigration for MigrationContext {
         self.operation_hash.write_u8(3);
         self.operation_hash.write_u64(stable_id.0);
         self.set_flag(TOUCHED);
+        self.arena.usage_report.deleted = self.arena.usage_report.deleted.saturating_add(1);
         Ok(())
     }
 
@@ -1841,17 +1904,26 @@ pub fn run_offline_migration(
             "migration did not return: {outcome:?}"
         )));
     }
-    let usage = migration.usage_report();
-    let (registry, migration_hash) = match migration
+    let (registry, migration_hash, usage) = match migration
         .finish()
         .map_err(OfflineMigrationError::Migration)?
     {
-        MigrationOutput::Owned { registry, hash } => (registry, hash),
-        MigrationOutput::Shared { registry, hash } => (
+        MigrationOutput::Owned {
+            registry,
+            hash,
+            usage,
+        } => (registry, hash, usage),
+        MigrationOutput::Shared {
+            registry,
+            hash,
+            usage,
+        } => (
             Arc::try_unwrap(registry).map_err(|_| OfflineMigrationError::InvalidOldState)?,
             hash,
+            usage,
         ),
     };
+    let final_state_hash = final_registry_hash(&registry);
     let objects = registry
         .objects
         .iter()
@@ -1888,6 +1960,7 @@ pub fn run_offline_migration(
     Ok(OfflineMigrationResult {
         objects,
         migration_hash,
+        final_state_hash,
         usage,
     })
 }
@@ -2342,6 +2415,7 @@ mod tests {
         assert_eq!(
             capacity_migration.usage_report(),
             MigrationUsageReport {
+                objects_created: 1,
                 object_peak: 1,
                 payload_byte_peak: std::mem::size_of::<StableId>() + std::mem::size_of::<u32>(),
                 ..MigrationUsageReport::default()
