@@ -96,7 +96,7 @@ fn main() {
 }
 
 fn audit(root: &Path, run_gates: bool) -> Result<(), String> {
-    let status = git(root, &["status", "--porcelain"])?;
+    let status = git_status(root)?;
     if !status.is_empty() {
         return Err(format!(
             "implementation workspace must be clean before audit:\n{status}"
@@ -284,6 +284,20 @@ fn git(root: &Path, arguments: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
 }
 
+fn git_status(root: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["status", "--porcelain"])
+        .current_dir(root)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .trim_end()
+        .to_owned())
+}
+
 fn work_package_commits() -> BTreeMap<u32, String> {
     [
         (1, "33cfb54"),
@@ -421,7 +435,7 @@ fn validate_report(result: &AuditResult, report: &str) -> Result<(), String> {
 }
 
 fn verify_generated_paths(root: &Path) -> Result<(), String> {
-    let status = git(root, &["status", "--porcelain"])?;
+    let status = git_status(root)?;
     for line in status.lines() {
         let path = line.get(3..).unwrap_or_default();
         if !path.starts_with("reports/") {

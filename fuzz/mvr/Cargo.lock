@@ -139,7 +139,9 @@ name = "nexa-runtime"
 version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
+ "nexa-compiler",
  "nexa-core",
+ "nexa-idl",
  "nexa-verifier",
 ]
 
