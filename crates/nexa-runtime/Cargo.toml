@@ -7,13 +7,15 @@ publish.workspace = true
 
 [dependencies]
 nexa-bytecode = { path = "../nexa-bytecode" }
+nexa-compiler = { path = "../nexa-compiler", optional = true }
 nexa-core = { path = "../nexa-core" }
+nexa-idl = { path = "../nexa-idl", optional = true }
 nexa-verifier = { path = "../nexa-verifier" }
 
 [features]
 allocation-counting = []
 fuzzing = ["model-adapter"]
-model-adapter = []
+model-adapter = ["dep:nexa-compiler", "dep:nexa-idl"]
 
 [lints]
 workspace = true

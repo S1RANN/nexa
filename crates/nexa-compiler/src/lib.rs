@@ -33,6 +33,7 @@ pub enum TokenKind {
     With,
     New,
     Await,
+    Yield,
     Defer,
     For,
     Struct,
@@ -239,6 +240,7 @@ pub enum AstStatement {
         condition: AstExpression,
         body: Vec<Self>,
     },
+    Yield,
     Defer(AstExpression),
     FieldSet {
         value: AstExpression,
@@ -833,6 +835,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "with" => TokenKind::With,
                     "new" => TokenKind::New,
                     "await" => TokenKind::Await,
+                    "yield" => TokenKind::Yield,
                     "defer" => TokenKind::Defer,
                     "for" => TokenKind::For,
                     "struct" => TokenKind::Struct,
@@ -1066,6 +1069,7 @@ impl Parser<'_> {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn statement(&mut self) -> Result<AstStatement, CompileError> {
         let start = self.current_start();
         if self.take(&TokenKind::Return) {
@@ -1139,6 +1143,10 @@ impl Parser<'_> {
             let condition = self.expression(0)?;
             let body = self.block()?;
             return Ok(self.spanned_statement(start, AstStatement::While { condition, body }));
+        }
+        if self.take(&TokenKind::Yield) {
+            self.expect(&TokenKind::Semicolon, ";")?;
+            return Ok(self.spanned_statement(start, AstStatement::Yield));
         }
         if self.take(&TokenKind::Defer) {
             let expression = self.expression(0)?;
@@ -1761,6 +1769,7 @@ fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, va
                 substitute_name(condition, name, value);
                 substitute_name_in_statements(body, name, value);
             }
+            AstStatement::Yield => {}
             AstStatement::Spanned { .. } => unreachable!("kind_mut strips spans"),
         }
     }
@@ -1891,6 +1900,7 @@ fn collect_statement_builtin_types(
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
+            | AstStatement::Yield
             | AstStatement::Defer(_)
             | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
@@ -2092,6 +2102,7 @@ fn collect_collection_types(ast: &AstModule) -> (Vec<ArrayType>, Vec<MapType>) {
                     collect_expression(condition, arrays, maps);
                     collect_statements(body, arrays, maps);
                 }
+                AstStatement::Yield => {}
                 AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
             }
         }
@@ -2212,6 +2223,7 @@ fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
+            | AstStatement::Yield
             | AstStatement::Defer(_)
             | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
@@ -2646,6 +2658,7 @@ fn validate_awaits(
                 validate_await_expression(condition, suspending_functions, false)?;
                 validate_awaits(body, suspending_functions)?;
             }
+            AstStatement::Yield => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -2810,6 +2823,7 @@ fn resolve_statements(
                 resolve_statements(body, scopes, next_local)?;
                 scopes.pop();
             }
+            AstStatement::Yield => {}
             AstStatement::Spanned { .. } => unreachable!("kind_mut strips spans"),
         }
     }
@@ -3191,6 +3205,7 @@ fn validate_statement_types(
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
+            | AstStatement::Yield
             | AstStatement::Defer(_)
             | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
@@ -3223,6 +3238,7 @@ struct TypeContext<'a> {
     buffer_types: &'a [BufferType],
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_statements(
     statements: &[AstStatement],
     locals: &mut BTreeMap<String, (u16, ValueType)>,
@@ -3261,6 +3277,11 @@ fn check_statements(
             }
             AstStatement::Expression(expression) => {
                 expression_type(expression, locals, context, next_register, None)?;
+            }
+            AstStatement::Yield => {
+                if context.effect != FunctionEffect::Task {
+                    return Err(CompileError::InvalidEffect);
+                }
             }
             AstStatement::If {
                 condition,
@@ -3374,6 +3395,7 @@ fn statements_contain_await(statements: &[AstStatement]) -> bool {
         AstStatement::While { condition, body } => {
             contains_await(condition) || statements_contain_await(body)
         }
+        AstStatement::Yield => false,
         AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
     })
 }
@@ -4375,6 +4397,7 @@ fn inspect_statement_registers(
                 inspect_expression_registers(condition, plan)?;
                 inspect_statement_registers(body, plan)?;
             }
+            AstStatement::Yield => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -4549,6 +4572,7 @@ fn collect_string_literals(statements: &[AstStatement], strings: &mut BTreeSet<S
                 collect_expression_strings(condition, strings);
                 collect_string_literals(body, strings);
             }
+            AstStatement::Yield => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -5153,6 +5177,7 @@ fn emit_statements(
             AstStatement::Expression(expression) => {
                 emit_expression(expression, temporary, None, locals, context, code)?;
             }
+            AstStatement::Yield => code.push(Instruction::Yield),
             AstStatement::Defer(expression) => {
                 let AstExpression::Call {
                     function,

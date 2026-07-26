@@ -1,0 +1,4 @@
+interface RealmV5Host {
+    enum WaitError { Cancelled, Failed }
+    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, WaitError>>;
+}

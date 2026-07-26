@@ -1,19 +1,22 @@
 use std::collections::VecDeque;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::{
     GcRef, HostCompletionTicket, HostRegistry, ModuleHandle, PendingHostRequest, RealmConfig,
     RealmRuntime, ResourceTokenHandle, RuntimeFailureInjector, RuntimeHost, ScopeHandle,
     SnapshotHandle, StableId, TaskHandle,
 };
+use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use super::{
     REALM_V5_EPOCH_COUNT, REALM_V5_REQUEST_COUNT, REALM_V5_RETIRED_COUNT, REALM_V5_TASK_COUNT,
     RealmV5RuntimeApplyError, RealmV5RuntimeEvent, RealmV5RuntimeExecution,
     RealmV5RuntimeLedgerSnapshot, RealmV5RuntimeReloadState, RealmV5RuntimeRequestSnapshot,
     RealmV5RuntimeRequestState, RealmV5RuntimeRetiredEpoch, RealmV5RuntimeSnapshot,
-    RealmV5RuntimeTaskSnapshot, RealmV5RuntimeTaskState, RoutingRegistry, routing_old_module,
+    RealmV5RuntimeTaskSnapshot, RealmV5RuntimeTaskState, RoutingRegistry,
 };
+
+const REALM_V5_MODULE_COUNT: usize = 4;
 
 #[derive(Clone, Copy)]
 struct RealmV5ModuleHandles {
@@ -54,8 +57,9 @@ pub struct RealmV5RuntimeAdapter {
 impl RealmV5RuntimeAdapter {
     #[must_use]
     pub fn new() -> Self {
-        let host_hash = StableId::from_name("realm-v5-production-host");
-        let schema_hash = StableId::from_name("realm-v5-production-schema-a");
+        let compiled = realm_v5_modules();
+        let host_hash = compiled.host_hash;
+        let schema_hash = compiled.schema_hashes[0];
         let request_queue = Arc::new(Mutex::new(VecDeque::new()));
         let host = RuntimeHost::new(32);
         let mut realm = RealmRuntime::hosted(
@@ -77,11 +81,7 @@ impl RealmV5RuntimeAdapter {
         )
         .expect("Realm v5 production RealmRuntime starts");
         let active = realm
-            .load_module(
-                routing_old_module(host_hash, schema_hash),
-                host_hash,
-                schema_hash,
-            )
+            .load_module(compiled.modules[0].clone(), host_hash, schema_hash)
             .expect("Realm v5 production module A loads");
         let scope = realm
             .create_scope(None)
@@ -407,9 +407,57 @@ fn debug(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
 
+struct RealmV5CompiledModules {
+    host_hash: StableId,
+    schema_hashes: [StableId; REALM_V5_MODULE_COUNT],
+    modules: [VerifiedModule; REALM_V5_MODULE_COUNT],
+}
+
+fn realm_v5_modules() -> &'static RealmV5CompiledModules {
+    static MODULES: OnceLock<RealmV5CompiledModules> = OnceLock::new();
+    MODULES.get_or_init(|| {
+        let idl = nexa_idl::parse(include_str!("../fixtures/realm_v5/host.idl"))
+            .expect("Realm v5 fixture IDL parses");
+        let host_hash = nexa_idl::exact_hash(&idl);
+        let schema_hashes = [
+            StableId::from_name("realm-v5-schema-a"),
+            StableId::from_name("realm-v5-schema-b"),
+            StableId::from_name("realm-v5-schema-c"),
+            StableId::from_name("realm-v5-schema-d"),
+        ];
+        let sources = [
+            include_str!("../fixtures/realm_v5/a.nexa"),
+            include_str!("../fixtures/realm_v5/b.nexa"),
+            include_str!("../fixtures/realm_v5/c.nexa"),
+            include_str!("../fixtures/realm_v5/d.nexa"),
+        ];
+        let modules = std::array::from_fn(|index| {
+            let compiled =
+                nexa_compiler::compile_with_interface(sources[index], &idl, schema_hashes[index])
+                    .unwrap_or_else(|error| {
+                        panic!("Realm v5 module {index} compiles from source: {error:?}")
+                    });
+            let encoded = compiled.module().encode();
+            let decoded = nexa_bytecode::Module::decode(&encoded)
+                .unwrap_or_else(|error| panic!("Realm v5 module {index} decodes: {error:?}"));
+            verify(decoded, VerifierLimits::default())
+                .unwrap_or_else(|error| panic!("Realm v5 module {index} verifies: {error:?}"))
+        });
+        RealmV5CompiledModules {
+            host_hash,
+            schema_hashes,
+            modules,
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::RealmV5RuntimeAdapter;
+    use nexa_bytecode::{FunctionEffect, Instruction};
+
+    use crate::StableId;
+
+    use super::{RealmV5RuntimeAdapter, realm_v5_modules};
 
     #[test]
     fn real_realm_v5_adapter_has_no_shadow_state() {
@@ -447,5 +495,75 @@ mod tests {
                 "adapter declaration is missing {required}"
             );
         }
+    }
+
+    #[test]
+    fn real_realm_v5_modules_compile_round_trip_and_verify() {
+        let fixtures = realm_v5_modules();
+        assert_eq!(fixtures.modules.len(), 4);
+        for module in &fixtures.modules {
+            let module = module.module();
+            assert!(module.reload_metadata.migration_entry.is_some());
+            assert!(module.reload_metadata.activation_entry.is_some());
+            assert!(!module.state_schema.types.is_empty());
+            assert!(module.functions.iter().any(|function| {
+                function.effect == FunctionEffect::Task
+                    && function
+                        .code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Yield))
+            }));
+            assert!(module.functions.iter().any(|function| {
+                function.effect == FunctionEffect::Task
+                    && function
+                        .code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::HostCall { .. }))
+            }));
+            assert!(
+                module
+                    .functions
+                    .iter()
+                    .any(|function| function.effect == FunctionEffect::Cleanup)
+            );
+            assert!(
+                module
+                    .functions
+                    .iter()
+                    .any(|function| function.effect == FunctionEffect::Migration)
+            );
+            assert!(
+                module
+                    .functions
+                    .iter()
+                    .any(|function| function.effect == FunctionEffect::Immediate)
+            );
+        }
+        let migration = fixtures.modules[1]
+            .module()
+            .reload_metadata
+            .migration_entry
+            .expect("module B has migration");
+        let code = &fixtures.modules[1].module().functions[migration as usize].code;
+        for required in [
+            Instruction::StatePreserve {
+                stable_id: StableId::from_name("preserved"),
+            },
+            Instruction::StateDelete {
+                stable_id: StableId::from_name("deleted"),
+            },
+            Instruction::StateFinish,
+        ] {
+            assert!(
+                code.iter()
+                    .any(|instruction| std::mem::discriminant(instruction)
+                        == std::mem::discriminant(&required)),
+                "module B migration is missing {required:?}"
+            );
+        }
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateReplace { .. }))
+        );
     }
 }
