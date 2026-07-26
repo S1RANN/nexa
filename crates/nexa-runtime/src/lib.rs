@@ -45,14 +45,15 @@ pub use frame::{
 };
 pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object};
 pub use host::{
-    CompletionAccounting, CopyBuffer, HostArgs, HostCallOutcome, HostCompletionDelivery,
-    HostCompletionResult, HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry,
-    HostRequestError, HostRequestHandle, HostRequestState, HostTrap, HostValue, PendingHostRequest,
-    RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
-    ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
-    RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
-    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
-    TaskResourceSet,
+    CompletionAccounting, CopyBuffer, HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome,
+    HostCompletionDelivery, HostCompletionResult, HostCompletionTicket, HostEnumRef,
+    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostRequestState, HostResultRef, HostStr, HostStructRef, HostTrap,
+    HostValue, HostValueRef, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
+    ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
+    RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
+    RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

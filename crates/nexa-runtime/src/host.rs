@@ -1087,6 +1087,304 @@ impl HostValue {
 
 const MAX_HOST_ARGUMENTS: usize = 8;
 
+/// A UTF-8 string view borrowed directly from the VM heap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostStr<'a>(&'a str);
+
+impl<'a> HostStr<'a> {
+    #[must_use]
+    pub const fn as_str(self) -> &'a str {
+        self.0
+    }
+}
+
+impl std::ops::Deref for HostStr<'_> {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+/// A single runtime value plus the heap storage it may borrow.
+#[derive(Clone, Copy, Debug)]
+pub struct HostValueRef<'a> {
+    value: crate::RuntimeValue,
+    heap: Option<&'a crate::Heap>,
+}
+
+impl<'a> HostValueRef<'a> {
+    #[must_use]
+    pub const fn runtime_value(self) -> crate::RuntimeValue {
+        self.value
+    }
+
+    pub fn i32(self) -> Result<i32, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::I32(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn i64(self) -> Result<i64, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::I64(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn f32(self) -> Result<f32, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::F32(value) => Ok(f32::from_bits(value)),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn f64(self) -> Result<f64, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::F64(value) => Ok(f64::from_bits(value)),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn bool(self) -> Result<bool, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::Bool(value) => Ok(value),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn rune(self) -> Result<char, HostTrap> {
+        match self.value {
+            crate::RuntimeValue::Rune(value) => char::from_u32(value).ok_or(HostTrap::Type),
+            _ => Err(HostTrap::Type),
+        }
+    }
+
+    pub fn str_ref(self) -> Result<HostStr<'a>, HostTrap> {
+        let crate::RuntimeValue::String { reference, .. } = self.value else {
+            return Err(HostTrap::Type);
+        };
+        self.heap()?
+            .string(reference)
+            .map(HostStr)
+            .map_err(|_| HostTrap::Type)
+    }
+
+    pub fn struct_ref(self, type_id: StableId) -> Result<HostStructRef<'a>, HostTrap> {
+        let crate::RuntimeValue::Struct {
+            type_id: actual, ..
+        } = self.value
+        else {
+            return Err(HostTrap::Type);
+        };
+        if actual != type_id {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let fields = heap.struct_fields(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostStructRef {
+            type_id,
+            fields,
+            heap,
+        })
+    }
+
+    pub fn enum_ref(self, type_id: StableId) -> Result<HostEnumRef<'a>, HostTrap> {
+        let heap = self.heap()?;
+        let (actual, variant, tag, payload) =
+            heap.enum_parts(self.value).map_err(|_| HostTrap::Type)?;
+        if actual != type_id {
+            return Err(HostTrap::Type);
+        }
+        Ok(HostEnumRef {
+            type_id,
+            variant,
+            tag,
+            payload,
+            heap,
+        })
+    }
+
+    pub fn array_ref(self, type_id: StableId) -> Result<HostArrayRef<'a>, HostTrap> {
+        if !matches!(
+            self.value,
+            crate::RuntimeValue::NamedRef {
+                type_id: actual,
+                ..
+            } if actual == type_id
+        ) {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let values = heap.array_values(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostArrayRef {
+            type_id,
+            values,
+            heap,
+        })
+    }
+
+    pub fn buffer_ref(self, type_id: StableId) -> Result<HostBufferRef<'a>, HostTrap> {
+        if !matches!(
+            self.value,
+            crate::RuntimeValue::NamedRef {
+                type_id: actual,
+                ..
+            } if actual == type_id
+        ) {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let values = heap.buffer_values(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostBufferRef {
+            type_id,
+            values,
+            heap,
+        })
+    }
+
+    fn heap(self) -> Result<&'a crate::Heap, HostTrap> {
+        self.heap.ok_or(HostTrap::Type)
+    }
+}
+
+/// A named struct whose fields remain in the VM heap.
+#[derive(Clone, Copy, Debug)]
+pub struct HostStructRef<'a> {
+    type_id: StableId,
+    fields: &'a [crate::RuntimeValue],
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostStructRef<'a> {
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.fields.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.fields.is_empty()
+    }
+
+    pub fn field(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+        self.fields
+            .get(index)
+            .copied()
+            .map(|value| HostValueRef {
+                value,
+                heap: Some(self.heap),
+            })
+            .ok_or(HostTrap::Type)
+    }
+}
+
+/// A named enum whose optional payload remains in the VM heap.
+#[derive(Clone, Copy, Debug)]
+pub struct HostEnumRef<'a> {
+    type_id: StableId,
+    variant: StableId,
+    tag: u32,
+    payload: Option<crate::RuntimeValue>,
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostEnumRef<'a> {
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
+    }
+
+    #[must_use]
+    pub const fn variant(self) -> StableId {
+        self.variant
+    }
+
+    #[must_use]
+    pub const fn tag(self) -> u32 {
+        self.tag
+    }
+
+    #[must_use]
+    pub fn payload(self) -> Option<HostValueRef<'a>> {
+        self.payload.map(|value| HostValueRef {
+            value,
+            heap: Some(self.heap),
+        })
+    }
+}
+
+macro_rules! host_collection_ref {
+    ($name:ident) => {
+        #[derive(Clone, Copy, Debug)]
+        pub struct $name<'a> {
+            type_id: StableId,
+            values: &'a [crate::RuntimeValue],
+            heap: &'a crate::Heap,
+        }
+
+        impl<'a> $name<'a> {
+            #[must_use]
+            pub const fn type_id(self) -> StableId {
+                self.type_id
+            }
+
+            #[must_use]
+            pub const fn len(self) -> usize {
+                self.values.len()
+            }
+
+            #[must_use]
+            pub const fn is_empty(self) -> bool {
+                self.values.is_empty()
+            }
+
+            pub fn get(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+                self.values
+                    .get(index)
+                    .copied()
+                    .map(|value| HostValueRef {
+                        value,
+                        heap: Some(self.heap),
+                    })
+                    .ok_or(HostTrap::Type)
+            }
+
+            pub fn iter(self) -> impl ExactSizeIterator<Item = HostValueRef<'a>> + 'a {
+                self.values.iter().copied().map(|value| HostValueRef {
+                    value,
+                    heap: Some(self.heap),
+                })
+            }
+        }
+    };
+}
+
+host_collection_ref!(HostArrayRef);
+host_collection_ref!(HostBufferRef);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostOptionRef<'a, T> {
+    None,
+    Some(T),
+    #[doc(hidden)]
+    __Lifetime(std::marker::PhantomData<&'a ()>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostResultRef<'a, T, E> {
+    Ok(T),
+    Err(E),
+    #[doc(hidden)]
+    __Lifetime(std::marker::PhantomData<&'a ()>),
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RuntimeHostArgs<'a> {
     values: &'a [crate::RuntimeValue],
@@ -1166,6 +1464,41 @@ impl<'a> RuntimeHostArgs<'a> {
                 .map_err(|_| HostTrap::Type),
             _ => Err(HostTrap::Type),
         }
+    }
+
+    pub fn value_ref(&self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+        Ok(HostValueRef {
+            value: self.value(index)?,
+            heap: self.heap,
+        })
+    }
+
+    pub fn str_ref(&self, index: usize) -> Result<HostStr<'a>, HostTrap> {
+        self.value_ref(index)?.str_ref()
+    }
+
+    pub fn struct_ref(
+        &self,
+        index: usize,
+        type_id: StableId,
+    ) -> Result<HostStructRef<'a>, HostTrap> {
+        self.value_ref(index)?.struct_ref(type_id)
+    }
+
+    pub fn enum_ref(&self, index: usize, type_id: StableId) -> Result<HostEnumRef<'a>, HostTrap> {
+        self.value_ref(index)?.enum_ref(type_id)
+    }
+
+    pub fn array_ref(&self, index: usize, type_id: StableId) -> Result<HostArrayRef<'a>, HostTrap> {
+        self.value_ref(index)?.array_ref(type_id)
+    }
+
+    pub fn buffer_ref(
+        &self,
+        index: usize,
+        type_id: StableId,
+    ) -> Result<HostBufferRef<'a>, HostTrap> {
+        self.value_ref(index)?.buffer_ref(type_id)
     }
 
     pub fn request(&self, index: usize) -> Result<HostRequestHandle, HostTrap> {
@@ -3120,10 +3453,86 @@ mod tests {
     use super::{
         HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload, HostRequestError,
         HostRequestHandle, HostRequestManager, ReleaseKind, ReleaseQueue, ReleaseQueueError,
-        ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostCloseError,
-        RuntimeHostDomain, RuntimeHostState, SnapshotManager,
+        ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostArgs,
+        RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotManager,
     };
-    use crate::{RuntimeLimits, TaskRuntime};
+    use crate::{Heap, Object, RuntimeLimits, RuntimeValue, StableId, TaskRuntime};
+
+    #[test]
+    fn complex_host_views_borrow_runtime_storage() {
+        let mut heap = Heap::new(16);
+        let string_reference = heap.allocate_string("Nexa界").unwrap();
+        let string = RuntimeValue::String {
+            reference: string_reference,
+            hash: heap.string_hash(string_reference).unwrap(),
+        };
+        let struct_type = StableId::from_name("HostViewStruct");
+        let structure = heap
+            .allocate_struct(struct_type, &[RuntimeValue::I32(7), string])
+            .unwrap();
+        let enum_type = StableId::from_name("HostViewEnum");
+        let variant = StableId::from_name("HostViewEnum::Some");
+        let enumeration = heap
+            .allocate_enum(enum_type, variant, 1, Some(structure))
+            .unwrap();
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array_reference = heap
+            .allocate(Object::Array {
+                type_id: array_type,
+                element_type: nexa_bytecode::ValueType::I32,
+                values: vec![RuntimeValue::I32(3), RuntimeValue::I32(5)],
+            })
+            .unwrap();
+        let array = RuntimeValue::NamedRef {
+            reference: array_reference,
+            type_id: array_type,
+        };
+        let buffer_type = nexa_bytecode::buffer_type(nexa_bytecode::ValueType::I32);
+        let buffer = heap
+            .allocate_buffer(
+                buffer_type,
+                nexa_bytecode::ValueType::I32,
+                &[RuntimeValue::I32(11), RuntimeValue::I32(13)],
+            )
+            .unwrap();
+        let values = [string, structure, enumeration, array, buffer];
+        let args = RuntimeHostArgs::new(&values, Some(&heap)).unwrap();
+
+        assert_eq!(args.str_ref(0).unwrap().as_str(), "Nexa界");
+        let structure = args.struct_ref(1, struct_type).unwrap();
+        assert_eq!(structure.field(0).unwrap().i32().unwrap(), 7);
+        assert_eq!(
+            structure.field(1).unwrap().str_ref().unwrap().as_str(),
+            "Nexa界"
+        );
+        let enumeration = args.enum_ref(2, enum_type).unwrap();
+        assert_eq!(enumeration.variant(), variant);
+        assert_eq!(enumeration.tag(), 1);
+        assert_eq!(
+            enumeration
+                .payload()
+                .unwrap()
+                .struct_ref(struct_type)
+                .unwrap()
+                .field(0)
+                .unwrap()
+                .i32()
+                .unwrap(),
+            7
+        );
+        assert_eq!(
+            args.array_ref(3, array_type).unwrap().get(1).unwrap().i32(),
+            Ok(5)
+        );
+        assert_eq!(
+            args.buffer_ref(4, buffer_type)
+                .unwrap()
+                .get(0)
+                .unwrap()
+                .i32(),
+            Ok(11)
+        );
+    }
 
     #[test]
     fn late_completion_is_discarded_and_release_is_pre_reserved() {
