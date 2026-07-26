@@ -8,5 +8,13 @@ fuzz_target!(|bytes: &[u8]| {
     if bytes.len() > MAX_INPUT {
         return;
     }
-    let _ = serde_json::from_slice::<serde_json::Value>(bytes);
+    let _ = nexa_migrate::parse_state_fixture(
+        bytes,
+        nexa_migrate::StateFixtureLimits {
+            max_bytes: MAX_INPUT,
+            max_objects: 1_024,
+            max_fields: 4_096,
+            max_string_bytes: MAX_INPUT,
+        },
+    );
 });

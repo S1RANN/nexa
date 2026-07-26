@@ -84,6 +84,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-migrate"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-model"
 version = "0.1.0"
 dependencies = [

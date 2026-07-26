@@ -11,9 +11,9 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 nexa-bytecode = { path = "../../crates/nexa-bytecode" }
 nexa-compiler = { path = "../../crates/nexa-compiler" }
+nexa-migrate = { path = "../../crates/nexa-migrate" }
 nexa-runtime = { path = "../../crates/nexa-runtime", features = ["fuzzing"] }
 nexa-verifier = { path = "../../crates/nexa-verifier" }
-serde_json = "1"
 
 [[bin]]
 name = "bytecode_decode"
