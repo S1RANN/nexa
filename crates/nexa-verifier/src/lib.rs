@@ -59,6 +59,7 @@ pub enum VerifyErrorKind {
     InvalidEnumMetadata,
     InvalidStructMetadata,
     InvalidClassMetadata,
+    InvalidStateMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -200,7 +201,110 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
             });
         }
     }
+    for state_type in &module.state_schema.types {
+        let mut field_ids = BTreeSet::new();
+        if !named_ids.insert(state_type.stable_id)
+            || state_type.version == 0
+            || state_type
+                .fields
+                .iter()
+                .any(|field| !field_ids.insert(field.stable_id))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidStateMetadata,
+            });
+        }
+    }
+    for handle_type in &module.state_handle_types {
+        if !named_ids.insert(handle_type.type_id)
+            || handle_type.type_id != nexa_bytecode::state_handle_type(handle_type.target)
+            || !matches!(handle_type.target, ValueType::Named(target) if module
+                .state_schema
+                .types
+                .iter()
+                .any(|state_type| state_type.stable_id == target))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidStateMetadata,
+            });
+        }
+    }
+    for state_type in &module.state_schema.types {
+        if state_type
+            .fields
+            .iter()
+            .any(|field| !valid_state_storage_type(module, field.ty, &mut BTreeSet::new()))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidStateMetadata,
+            });
+        }
+    }
     Ok(())
+}
+
+fn valid_state_storage_type(module: &Module, ty: ValueType, visiting: &mut BTreeSet<u64>) -> bool {
+    let ValueType::Named(type_id) = ty else {
+        return matches!(
+            ty,
+            ValueType::I32
+                | ValueType::I64
+                | ValueType::F32
+                | ValueType::F64
+                | ValueType::Bool
+                | ValueType::Rune
+                | ValueType::String
+                | ValueType::Ref
+        );
+    };
+    if module
+        .state_handle_types
+        .iter()
+        .any(|handle_type| handle_type.type_id == type_id)
+    {
+        return true;
+    }
+    if !visiting.insert(type_id.0) {
+        return true;
+    }
+    let valid = if let Some(struct_type) = module
+        .struct_types
+        .iter()
+        .find(|struct_type| struct_type.type_id == type_id)
+    {
+        struct_type
+            .fields
+            .iter()
+            .all(|field| valid_state_storage_type(module, field.ty, visiting))
+    } else if let Some(enum_type) = module
+        .enum_types
+        .iter()
+        .find(|enum_type| enum_type.type_id == type_id)
+    {
+        enum_type.variants.iter().all(|variant| {
+            variant
+                .payload_type
+                .is_none_or(|payload| valid_state_storage_type(module, payload, visiting))
+        })
+    } else {
+        false
+    };
+    visiting.remove(&type_id.0);
+    valid
+}
+
+fn has_state_handle_type(module: &Module, target: ValueType) -> bool {
+    let type_id = nexa_bytecode::state_handle_type(target);
+    module
+        .state_handle_types
+        .iter()
+        .any(|handle_type| handle_type.type_id == type_id && handle_type.target == target)
 }
 
 fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
@@ -568,7 +672,8 @@ fn verify_function(
                 if matches!(
                     function.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) {
+                ) || !has_state_handle_type(module, target)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -608,7 +713,8 @@ fn verify_function(
                 if matches!(
                     function.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) {
+                ) || !has_state_handle_type(module, target)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -632,7 +738,8 @@ fn verify_function(
                 if matches!(
                     function.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) {
+                ) || !has_state_handle_type(module, target)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -651,7 +758,8 @@ fn verify_function(
                 if matches!(
                     function.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) {
+                ) || !has_state_handle_type(module, target)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 let handle_type = ValueType::Named(nexa_bytecode::state_handle_type(target));
@@ -1405,7 +1513,8 @@ fn longest_path(
 mod tests {
     use nexa_bytecode::{
         ClassType, FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
-        SourceMapEntry, StateSchema, StateType, StructField, ValueType,
+        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+        StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1445,6 +1554,91 @@ mod tests {
                 .unwrap_err()
                 .kind,
             VerifyErrorKind::InvalidClassMetadata
+        );
+    }
+
+    #[test]
+    fn state_metadata_allows_only_verified_persistent_value_closures() {
+        let store = StableId::from_name("Store");
+        let wrapper = StableId::from_name("Wrapper");
+        let node = StableId::from_name("Node");
+        let handle = StateHandleType::new(ValueType::Named(store));
+        let mut valid = ModuleBuilder::new();
+        valid
+            .struct_type(StructType {
+                type_id: wrapper,
+                fields: vec![StructField {
+                    stable_id: StableId::from_parts(&["Wrapper", "::value"]),
+                    ty: ValueType::String,
+                }],
+            })
+            .state_handle_type(handle)
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: store,
+                    version: 1,
+                    fields: vec![
+                        StateField {
+                            stable_id: StableId::from_parts(&["Store", "::wrapper"]),
+                            ty: ValueType::Named(wrapper),
+                        },
+                        StateField {
+                            stable_id: StableId::from_parts(&["Store", "::next"]),
+                            ty: ValueType::Named(handle.type_id),
+                        },
+                    ],
+                }],
+            });
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let mut nested_class = ModuleBuilder::new();
+        nested_class
+            .class_type(ClassType {
+                type_id: node,
+                fields: Vec::new(),
+            })
+            .struct_type(StructType {
+                type_id: wrapper,
+                fields: vec![StructField {
+                    stable_id: StableId::from_parts(&["Wrapper", "::node"]),
+                    ty: ValueType::Named(node),
+                }],
+            })
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: store,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: StableId::from_parts(&["Store", "::wrapper"]),
+                        ty: ValueType::Named(wrapper),
+                    }],
+                }],
+            });
+        assert_eq!(
+            verify(nested_class.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidStateMetadata
+        );
+
+        let mut forged_handle = ModuleBuilder::new();
+        forged_handle
+            .state_handle_type(StateHandleType {
+                type_id: StableId::from_name("forged"),
+                target: ValueType::Named(store),
+            })
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: store,
+                    version: 1,
+                    fields: Vec::new(),
+                }],
+            });
+        assert_eq!(
+            verify(forged_handle.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidStateMetadata
         );
     }
 

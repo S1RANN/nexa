@@ -262,6 +262,22 @@ pub fn state_handle_type(target: ValueType) -> StableId {
     parameterized_type_id("StateHandle", &[target])
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StateHandleType {
+    pub type_id: StableId,
+    pub target: ValueType,
+}
+
+impl StateHandleType {
+    #[must_use]
+    pub fn new(target: ValueType) -> Self {
+        Self {
+            type_id: state_handle_type(target),
+            target,
+        }
+    }
+}
+
 #[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
@@ -717,6 +733,7 @@ pub struct Function {
 pub struct Module {
     pub strings: Vec<String>,
     pub functions: Vec<Function>,
+    pub state_handle_types: Vec<StateHandleType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -1297,6 +1314,16 @@ impl Module {
             );
             strings.extend_from_slice(string.as_bytes());
         }
+        let mut types = Vec::new();
+        put_u32(
+            &mut types,
+            u32::try_from(self.state_handle_types.len())
+                .expect("state handle type count exceeds wire format"),
+        );
+        for state_handle in &self.state_handle_types {
+            put_u64(&mut types, state_handle.type_id.0);
+            encode_type(&mut types, state_handle.target);
+        }
         let empty = || {
             let mut section = Vec::new();
             put_u32(&mut section, 0);
@@ -1304,7 +1331,7 @@ impl Module {
         };
         encode_sections(&[
             (SectionKind::Strings, strings),
-            (SectionKind::Types, empty()),
+            (SectionKind::Types, types),
             (SectionKind::Constants, empty()),
             (SectionKind::Enums, enums),
             (SectionKind::Structs, structs),
@@ -1392,6 +1419,23 @@ impl Module {
             strings.push(value.to_owned());
         }
         if string_reader.remaining() != 0 {
+            return Err(DecodeError::TrailingBytes);
+        }
+        let mut types_reader = Reader {
+            bytes: required_section(&sections, SectionKind::Types)?,
+            cursor: 0,
+        };
+        let state_handle_type_count =
+            usize::try_from(types_reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        enforce_limit(state_handle_type_count, limits.max_types, "types")?;
+        let mut state_handle_types = Vec::with_capacity(state_handle_type_count);
+        for _ in 0..state_handle_type_count {
+            state_handle_types.push(StateHandleType {
+                type_id: StableId(types_reader.u64()?),
+                target: decode_type(&mut types_reader)?,
+            });
+        }
+        if types_reader.remaining() != 0 {
             return Err(DecodeError::TrailingBytes);
         }
         let mut metadata = Vec::new();
@@ -1801,6 +1845,7 @@ impl Module {
         Ok(Self {
             strings,
             functions,
+            state_handle_types,
             enum_types,
             struct_types,
             class_types,
@@ -2831,6 +2876,7 @@ impl std::error::Error for BuildError {}
 pub struct ModuleBuilder {
     strings: Vec<String>,
     functions: Vec<Function>,
+    state_handle_types: Vec<StateHandleType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -2849,6 +2895,7 @@ impl ModuleBuilder {
         Self {
             strings: Vec::new(),
             functions: Vec::new(),
+            state_handle_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -2918,6 +2965,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn state_handle_type(&mut self, state_handle_type: StateHandleType) -> &mut Self {
+        self.state_handle_types.push(state_handle_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -2953,6 +3005,7 @@ impl ModuleBuilder {
         let mut module = Module {
             strings: self.strings,
             functions: self.functions,
+            state_handle_types: self.state_handle_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
@@ -3129,8 +3182,8 @@ mod tests {
     use super::{
         ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder,
         FunctionEffect, Instruction, Module, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
-        StateField, StateSchema, StateType, StructField, StructType, ValueType, result_type,
-        state_handle_error_type, state_handle_type,
+        StateField, StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
+        result_type, state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -3506,10 +3559,15 @@ mod tests {
             .emit(Instruction::Return { source: 7 });
         let mut builder = ModuleBuilder::new();
         builder
+            .state_handle_type(StateHandleType::new(target))
             .enum_type(state_handle_error_type())
             .enum_type(result)
             .function(function.finish().unwrap());
         let module = builder.finish();
+        assert_eq!(
+            module.state_handle_types,
+            vec![StateHandleType::new(target)]
+        );
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 

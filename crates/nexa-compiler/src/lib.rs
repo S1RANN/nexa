@@ -7,7 +7,7 @@ use std::ops::{Deref, DerefMut};
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant, Function,
     FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap,
-    ScriptExport, Signature, SourceMapEntry, StateField, StateSchema, StateType,
+    ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
     StructField as BytecodeStructField, StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
@@ -1088,11 +1088,36 @@ impl Parser<'_> {
             TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
             TokenKind::Match => self.match_expression()?,
             TokenKind::New => {
-                let type_name = self.ident()?;
-                self.expect(&TokenKind::LBrace, "{")?;
-                AstExpression::ClassNew {
-                    type_name,
-                    fields: self.struct_field_values()?,
+                if self.take(&TokenKind::Dot) {
+                    let name = format!("new.{}", self.ident()?);
+                    let type_arguments = if self.take(&TokenKind::Less) {
+                        let mut arguments = Vec::new();
+                        loop {
+                            arguments.push(self.ty()?);
+                            if !self.take(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                        self.expect(&TokenKind::Greater, ">")?;
+                        arguments
+                    } else {
+                        Vec::new()
+                    };
+                    if !is_migration_intrinsic(&name) {
+                        return Err(self.unexpected("migration intrinsic"));
+                    }
+                    AstExpression::Migration(self.migration_intrinsic(
+                        &name,
+                        type_arguments,
+                        start,
+                    )?)
+                } else {
+                    let type_name = self.ident()?;
+                    self.expect(&TokenKind::LBrace, "{")?;
+                    AstExpression::ClassNew {
+                        type_name,
+                        fields: self.struct_field_values()?,
+                    }
                 }
             }
             TokenKind::Integer(value) => AstExpression::Integer(value),
@@ -2097,6 +2122,8 @@ fn resolve_and_typecheck_with_hosts(
             }
         }
     }
+    validate_state_handle_targets(&ast)?;
+    validate_stateful_fields(&ast)?;
     let mut signatures = host_functions
         .iter()
         .map(|(name, function)| (name.clone(), function.signature.clone()))
@@ -2165,6 +2192,7 @@ fn resolve_and_typecheck_with_hosts(
             struct_fields: &struct_fields,
             class_types: &class_types,
             class_fields: &class_fields,
+            state_schema: &state_schema,
             function_result: signature.result.expect("result is required"),
             effect: function.effect,
             state_handle_targets: &state_handle_targets,
@@ -2561,6 +2589,143 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
     }
 }
 
+fn validate_stateful_fields(ast: &AstModule) -> Result<(), CompileError> {
+    let declarations = ast
+        .types
+        .iter()
+        .map(|declaration| (declaration.name.as_str(), declaration))
+        .collect::<BTreeMap<_, _>>();
+    for declaration in ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
+    {
+        for field in &declaration.fields {
+            validate_state_storage_type(&field.ty, &declarations, &mut BTreeSet::new())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_handle_targets(ast: &AstModule) -> Result<(), CompileError> {
+    let stateful_types = ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
+        .map(|declaration| declaration.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let validate = |ty: &AstType| validate_state_handle_target(ty, &stateful_types);
+    for declaration in &ast.types {
+        for field in &declaration.fields {
+            validate(&field.ty)?;
+        }
+        for variant in &declaration.variants {
+            if let Some(payload) = &variant.payload {
+                validate(payload)?;
+            }
+        }
+    }
+    for function in &ast.functions {
+        for parameter in &function.parameters {
+            validate(&parameter.ty)?;
+        }
+        validate(&function.result.ty)?;
+        let mut error = None;
+        collect_statement_types(&function.body, &mut |ty| {
+            if error.is_none() {
+                error = validate(ty).err();
+            }
+        });
+        if let Some(error) = error {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_handle_target(
+    ty: &AstType,
+    stateful_types: &BTreeSet<&str>,
+) -> Result<(), CompileError> {
+    let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
+        return Ok(());
+    };
+    for argument in arguments {
+        validate_state_handle_target(argument, stateful_types)?;
+    }
+    if name == "StateHandle" {
+        let [target] = arguments.as_slice() else {
+            return Err(CompileError::TypeMismatch);
+        };
+        let AstType::Named(target) = target.kind() else {
+            return Err(CompileError::TypeMismatch);
+        };
+        if !stateful_types.contains(target.as_str()) {
+            return Err(CompileError::TypeMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_state_storage_type<'a>(
+    ty: &AstType,
+    declarations: &BTreeMap<&'a str, &'a AstTypeDeclaration>,
+    visiting: &mut BTreeSet<&'a str>,
+) -> Result<(), CompileError> {
+    match ty.kind() {
+        AstType::I32
+        | AstType::I64
+        | AstType::F32
+        | AstType::F64
+        | AstType::Bool
+        | AstType::Rune
+        | AstType::String => Ok(()),
+        AstType::Named(name) => {
+            let declaration = declarations
+                .get(name.as_str())
+                .ok_or(CompileError::TypeMismatch)?;
+            if !matches!(declaration.kind, AstTypeKind::Struct | AstTypeKind::Enum) {
+                return Err(CompileError::TypeMismatch);
+            }
+            if !visiting.insert(declaration.name.as_str()) {
+                return Ok(());
+            }
+            for field in &declaration.fields {
+                validate_state_storage_type(&field.ty, declarations, visiting)?;
+            }
+            for variant in &declaration.variants {
+                if let Some(payload) = &variant.payload {
+                    validate_state_storage_type(payload, declarations, visiting)?;
+                }
+            }
+            visiting.remove(declaration.name.as_str());
+            Ok(())
+        }
+        AstType::BuiltinGeneric { name, arguments }
+            if matches!(name.as_str(), "Option" | "Result") =>
+        {
+            for argument in arguments {
+                validate_state_storage_type(argument, declarations, visiting)?;
+            }
+            Ok(())
+        }
+        AstType::BuiltinGeneric { name, arguments }
+            if name == "StateHandle" && arguments.len() == 1 =>
+        {
+            let AstType::Named(target) = arguments[0].kind() else {
+                return Err(CompileError::TypeMismatch);
+            };
+            declarations
+                .get(target.as_str())
+                .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
+                .map(|_| ())
+                .ok_or(CompileError::TypeMismatch)
+        }
+        AstType::BuiltinGeneric { .. } => Err(CompileError::TypeMismatch),
+        AstType::Spanned { .. } => unreachable!("kind strips spans"),
+    }
+}
+
 fn validate_statement_types(
     statements: &[AstStatement],
     known_types: &BTreeSet<String>,
@@ -2605,6 +2770,7 @@ struct TypeContext<'a> {
     struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     class_types: &'a [ClassType],
     class_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
+    state_schema: &'a StateSchema,
     function_result: ValueType,
     effect: FunctionEffect,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
@@ -3340,17 +3506,37 @@ fn migration_intrinsic_type(
         MigrationIntrinsic::NewSet {
             object,
             owner,
+            field,
             value,
-            ..
         } => {
-            expression_type(
+            let owner_type = StableId::from_name(owner);
+            if expression_type(
                 object,
                 locals,
                 context,
                 next_register,
-                Some(ValueType::Named(StableId::from_name(owner))),
-            )?;
-            expression_type(value, locals, context, next_register, None)?;
+                Some(ValueType::Named(owner_type)),
+            )? != ValueType::Named(owner_type)
+            {
+                return Err(CompileError::TypeMismatch);
+            }
+            let field_id = StableId::from_parts(&[owner, "::", field]);
+            let expected = context
+                .state_schema
+                .types
+                .iter()
+                .find(|state_type| state_type.stable_id == owner_type)
+                .and_then(|state_type| {
+                    state_type
+                        .fields
+                        .iter()
+                        .find(|candidate| candidate.stable_id == field_id)
+                })
+                .map(|field| field.ty)
+                .ok_or(CompileError::TypeMismatch)?;
+            if expression_type(value, locals, context, next_register, Some(expected))? != expected {
+                return Err(CompileError::TypeMismatch);
+            }
             Ok(ValueType::Bool)
         }
         MigrationIntrinsic::Replace { target, .. } => {
@@ -3725,6 +3911,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             struct_fields: &hir.struct_fields,
             class_types: &hir.class_types,
             class_fields: &hir.class_fields,
+            state_schema: &hir.state_schema,
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
             string_indices: &string_indices,
@@ -3786,6 +3973,12 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
         module.metadata(host, schema);
     }
     module.state_schema(hir.state_schema.clone());
+    for (type_id, target) in &hir.state_handle_targets {
+        module.state_handle_type(StateHandleType {
+            type_id: *type_id,
+            target: *target,
+        });
+    }
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
     }
@@ -4051,6 +4244,7 @@ struct EmitContext<'a> {
     struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     class_types: &'a [ClassType],
     class_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
+    state_schema: &'a StateSchema,
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     string_indices: &'a BTreeMap<String, u32>,
@@ -5441,10 +5635,25 @@ fn emit_migration_intrinsic(
             field,
             value,
         } => {
+            let owner_type = StableId::from_name(owner);
+            let field_id = StableId::from_parts(&[owner, "::", field]);
+            let field_type = context
+                .state_schema
+                .types
+                .iter()
+                .find(|state_type| state_type.stable_id == owner_type)
+                .and_then(|state_type| {
+                    state_type
+                        .fields
+                        .iter()
+                        .find(|candidate| candidate.stable_id == field_id)
+                })
+                .map(|field| field.ty)
+                .ok_or(CompileError::TypeMismatch)?;
             emit_expression(
                 object,
                 destination,
-                Some(ValueType::Named(StableId::from_name(owner))),
+                Some(ValueType::Named(owner_type)),
                 locals,
                 context,
                 code,
@@ -5452,10 +5661,17 @@ fn emit_migration_intrinsic(
             let value_register = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
-            emit_expression(value, value_register, None, locals, context, code)?;
+            emit_expression(
+                value,
+                value_register,
+                Some(field_type),
+                locals,
+                context,
+                code,
+            )?;
             code.push(Instruction::StateNewSet {
                 object: destination,
-                field_id: StableId::from_parts(&[owner, "::", field]),
+                field_id,
                 source: value_register,
             });
             code.push(Instruction::LoadBool {
@@ -6942,6 +7158,101 @@ migration fn migrate() -> bool {
         assert!(
             code.iter()
                 .any(|instruction| matches!(instruction, Instruction::StateHandleHash { .. }))
+        );
+    }
+
+    #[test]
+    fn stateful_classes_enforce_persistent_field_closure_and_typed_migration() {
+        let module = compile(
+            "struct Stats { score: i64; label: string; }
+             enum Phase { Idle, Active(i32) }
+             @stateful class Entity {
+                 stats: Stats;
+                 phase: Phase;
+                 next: StateHandle<Entity>;
+                 optional_next: Option<StateHandle<Entity>>;
+             }
+             migration fn migrate() -> bool {
+                 let entity: Entity = new.create<Entity>(entity);
+                 new.set(entity, Entity.phase, Idle);
+                 preserve(kept);
+                 replace(replaced, entity);
+                 delete(removed);
+                 finish_migration();
+                 return true;
+             }",
+        )
+        .unwrap();
+        let entity = StableId::from_name("Entity");
+        assert_eq!(module.module().state_schema.types.len(), 1);
+        assert!(
+            module
+                .module()
+                .state_handle_types
+                .iter()
+                .any(|handle| handle.target == nexa_bytecode::ValueType::Named(entity))
+        );
+        let code = &module.module().functions[0].code;
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateNewCreate { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateNewSet { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StatePreserve { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateReplace { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateDelete { .. }))
+        );
+        assert!(
+            code.iter()
+                .any(|instruction| matches!(instruction, Instruction::StateFinish))
+        );
+
+        for source in [
+            "class Mutable { value: i32; }
+             @stateful class Store { forbidden: Mutable; }",
+            "class Mutable { value: i32; }
+             struct Wrapper { forbidden: Mutable; }
+             @stateful class Store { nested: Wrapper; }",
+            "class Mutable { value: i32; }
+             enum Wrapper { Empty, Forbidden(Mutable) }
+             @stateful class Store { nested: Wrapper; }",
+            "class Mutable { value: i32; }
+             @stateful class Store { nested: Option<Mutable>; }",
+            "class Mutable { value: i32; }
+             @stateful class Store { forged: StateHandle<Mutable>; }",
+            "class Mutable { value: i32; }
+             fn forged(handle: StateHandle<Mutable>) -> bool { return true; }",
+            "@stateful class Store { request: HostRequest; }",
+            "@stateful class Store { token: ResourceToken; }",
+            "@stateful class Store { snapshot: Snapshot; }",
+            "@stateful class Store { buffer: Buffer; }",
+        ] {
+            assert_eq!(compile(source).unwrap_err(), CompileError::TypeMismatch);
+        }
+
+        assert_eq!(
+            compile(
+                "@stateful class Store { value: i32; }
+                 migration fn migrate() -> bool {
+                     let store: Store = new.create<Store>(store);
+                     new.set(store, Store.value, true);
+                     finish_migration();
+                     return true;
+                 }"
+            )
+            .unwrap_err(),
+            CompileError::TypeMismatch
         );
     }
 }

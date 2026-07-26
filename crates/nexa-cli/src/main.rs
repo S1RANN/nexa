@@ -148,6 +148,18 @@ fn render_module_dump(
             writeln!(output, "string {index} {string:?}").expect("String writes do not fail");
         }
     }
+    if render(nexa_bytecode::SectionKind::Types) {
+        let mut handles = module.state_handle_types.iter().collect::<Vec<_>>();
+        handles.sort_by_key(|handle| handle.type_id);
+        for handle in handles {
+            writeln!(
+                output,
+                "state-handle {:016x} target={:?}",
+                handle.type_id.0, handle.target
+            )
+            .expect("String writes do not fail");
+        }
+    }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
             writeln!(
@@ -211,6 +223,28 @@ fn render_module_dump(
                     output,
                     "  field index={index} id={:016x} type={:?} mutable=true",
                     field.stable_id.0, field.ty,
+                )
+                .expect("String writes do not fail");
+            }
+        }
+    }
+    if render(nexa_bytecode::SectionKind::StateSchemas) {
+        let mut state_types = module.state_schema.types.iter().collect::<Vec<_>>();
+        state_types.sort_by_key(|state_type| state_type.stable_id);
+        for state_type in state_types {
+            writeln!(
+                output,
+                "stateful-class {:016x} version={}",
+                state_type.stable_id.0, state_type.version
+            )
+            .expect("String writes do not fail");
+            let mut fields = state_type.fields.iter().collect::<Vec<_>>();
+            fields.sort_by_key(|field| field.stable_id);
+            for field in fields {
+                writeln!(
+                    output,
+                    "  field id={:016x} type={:?} persistent=true",
+                    field.stable_id.0, field.ty
                 )
                 .expect("String writes do not fail");
             }
@@ -1042,7 +1076,8 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 mod tests {
     use nexa_bytecode::{
         ClassType, FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature,
-        SourceMapEntry, StructField, StructType, ValueType,
+        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+        StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1076,6 +1111,18 @@ mod tests {
                 ty: ValueType::I32,
             }],
         });
+        let state_target = ValueType::Named(StableId::from_name("Store"));
+        builder.state_handle_type(StateHandleType::new(state_target));
+        builder.state_schema(StateSchema {
+            types: vec![StateType {
+                stable_id: StableId::from_name("Store"),
+                version: 1,
+                fields: vec![StateField {
+                    stable_id: StableId::from_parts(&["Store", "::value"]),
+                    ty: ValueType::I32,
+                }],
+            }],
+        });
         builder.function(function.finish().unwrap());
         builder.source_map([
             SourceMapEntry {
@@ -1106,6 +1153,9 @@ mod tests {
         assert!(full.contains("field index=0"));
         assert!(full.contains("class "));
         assert!(full.contains("mutable=true"));
+        assert!(full.contains("state-handle "));
+        assert!(full.contains("stateful-class "));
+        assert!(full.contains("persistent=true"));
         assert!(
             full.find("pc=0..1")
                 .expect("first source map entry is present")
@@ -1116,6 +1166,7 @@ mod tests {
 
         let types = render_module_dump(&bytes, &module, Some(SectionKind::Types), false).unwrap();
         assert!(types.contains("section types"));
+        assert!(types.contains("state-handle "));
         assert!(!types.contains("code function="));
         let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
         assert!(code.contains("section code"));

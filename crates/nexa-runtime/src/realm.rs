@@ -5137,6 +5137,7 @@ mod tests {
         let mut builder = ModuleBuilder::new();
         builder
             .metadata(host, schema_hash)
+            .state_handle_type(nexa_bytecode::StateHandleType::new(target))
             .state_schema(StateSchema {
                 types: vec![StateType {
                     stable_id: type_id,

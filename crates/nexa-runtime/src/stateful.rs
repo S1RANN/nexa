@@ -70,7 +70,10 @@ pub enum StateValue {
         type_id: StableId,
         hash: u64,
     },
-    Ref(GcRef),
+    Ref {
+        reference: GcRef,
+        type_id: Option<StableId>,
+    },
     Handle(StateHandle),
     Object(StateObject),
 }
@@ -595,7 +598,14 @@ impl StatefulRegistry {
                 .binary_search_by_key(&schema_field.stable_id, |field| field.field_id)
                 .map(|index| &fields[index])
                 .map_err(|_| StatefulError::Missing(schema_field.stable_id))?;
-            if !state_value_matches(&field.value, schema_field.ty) {
+            let handle_target = match &field.value {
+                StateValue::Handle(handle) => self
+                    .checked_handle_slot(*handle)
+                    .ok()
+                    .map(|target| ValueType::Named(target.type_id)),
+                _ => None,
+            };
+            if !state_value_matches(&field.value, schema_field.ty, handle_target) {
                 return Err(StatefulError::Missing(schema_field.stable_id));
             }
         }
@@ -819,7 +829,9 @@ fn state_value_payload_bytes(value: &StateValue) -> usize {
                 + std::mem::size_of::<StableId>()
                 + std::mem::size_of::<u64>()
         }
-        StateValue::Ref(_) => std::mem::size_of::<GcRef>(),
+        StateValue::Ref { .. } => {
+            std::mem::size_of::<GcRef>() + std::mem::size_of::<Option<StableId>>()
+        }
         StateValue::Handle(_) => std::mem::size_of::<StateHandle>(),
         StateValue::Object(_) => usize::MAX,
     }
@@ -834,8 +846,12 @@ fn state_value_type(value: &StateValue) -> ValueType {
         StateValue::Bool(_) => ValueType::Bool,
         StateValue::Rune(_) => ValueType::Rune,
         StateValue::String { .. } => ValueType::String,
-        StateValue::Struct { type_id, .. } => ValueType::Named(*type_id),
-        StateValue::Ref(_) => ValueType::Ref,
+        StateValue::Struct { type_id, .. }
+        | StateValue::Ref {
+            type_id: Some(type_id),
+            ..
+        } => ValueType::Named(*type_id),
+        StateValue::Ref { type_id: None, .. } => ValueType::Ref,
         StateValue::Handle(_) => ValueType::Named(nexa_bytecode::state_handle_type(
             ValueType::Named(StableId::from_name("StateValue")),
         )),
@@ -846,7 +862,7 @@ fn state_value_type(value: &StateValue) -> ValueType {
 fn state_value_root_count(value: &StateValue) -> usize {
     usize::from(matches!(
         value,
-        StateValue::String { .. } | StateValue::Struct { .. } | StateValue::Ref(_)
+        StateValue::String { .. } | StateValue::Struct { .. } | StateValue::Ref { .. }
     ))
 }
 
@@ -854,7 +870,7 @@ fn push_root(value: &StateValue, roots: &mut Vec<GcRef>) {
     match value {
         StateValue::String { reference, .. }
         | StateValue::Struct { reference, .. }
-        | StateValue::Ref(reference) => {
+        | StateValue::Ref { reference, .. } => {
             roots.push(*reference);
         }
         _ => {}
@@ -873,7 +889,11 @@ fn reject_nested_object(value: &StateValue) -> Result<(), StatefulError> {
     Ok(())
 }
 
-fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -> bool {
+fn state_value_matches(
+    value: &StateValue,
+    expected: nexa_bytecode::ValueType,
+    handle_target: Option<ValueType>,
+) -> bool {
     match (value, expected) {
         (&StateValue::Rune(value), nexa_bytecode::ValueType::Rune) => {
             char::from_u32(value).is_some()
@@ -884,8 +904,16 @@ fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -
         | (&StateValue::F32(_), nexa_bytecode::ValueType::F32)
         | (&StateValue::F64(_), nexa_bytecode::ValueType::F64)
         | (&StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
-        | (&StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
-        | (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(_)) => true,
+        | (&StateValue::Ref { type_id: None, .. }, nexa_bytecode::ValueType::Ref) => true,
+        (
+            &StateValue::Ref {
+                type_id: actual, ..
+            },
+            nexa_bytecode::ValueType::Named(expected),
+        ) => actual == Some(expected),
+        (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(expected)) => {
+            handle_target.is_some_and(|target| nexa_bytecode::state_handle_type(target) == expected)
+        }
         (
             &StateValue::Struct {
                 type_id: actual, ..
@@ -917,7 +945,10 @@ fn clone_leaf_value(value: &StateValue) -> StateValue {
             type_id: *type_id,
             hash: *hash,
         },
-        StateValue::Ref(reference) => StateValue::Ref(*reference),
+        StateValue::Ref { reference, type_id } => StateValue::Ref {
+            reference: *reference,
+            type_id: *type_id,
+        },
         StateValue::Handle(handle) => StateValue::Handle(*handle),
         StateValue::Object(_) => unreachable!("nested state objects are rejected at admission"),
     }
@@ -1200,9 +1231,10 @@ fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue)
             hash.write_u8(2);
             hash.write_u8(u8::from(*value));
         }
-        StateValue::Ref(_) => {
+        StateValue::Ref { type_id, .. } => {
             // GC slot coordinates are deliberately excluded from the stable migration identity.
             hash.write_u8(3);
+            hash.write_u64(type_id.unwrap_or(StableId(0)).0);
         }
         StateValue::Handle(handle) => {
             hash.write_u8(4);
@@ -1492,7 +1524,7 @@ impl InterpreterMigration for MigrationContext {
             .binary_search_by_key(&field_id, |field| field.field_id)
             .map(|index| &fields[index])
             .map_err(|_| RuntimeMessage::Static("old state field does not exist"))?;
-        let value = state_to_runtime_value(field_id, &field.value);
+        let value = state_field_to_runtime_value(field_id, &field.value, expected)?;
         if runtime_state_type(value) != expected {
             return Err("old state field type mismatch".into());
         }
@@ -1579,7 +1611,16 @@ impl InterpreterMigration for MigrationContext {
             .ok_or(RuntimeMessage::Static(
                 "candidate state field does not exist",
             ))?;
-        if !state_value_matches(&value, expected) {
+        let handle_target = match &value {
+            StateValue::Handle(handle) if handle.domain == self.domain => self
+                .arena
+                .object_index(handle.stable_id)
+                .ok()
+                .filter(|index| self.arena.objects[*index].generation == handle.generation)
+                .map(|index| ValueType::Named(self.arena.objects[index].type_id)),
+            _ => None,
+        };
+        if !state_value_matches(&value, expected, handle_target) {
             return Err("candidate state field type mismatch".into());
         }
         let start = slot.field_start as usize;
@@ -1811,6 +1852,25 @@ fn slot_to_runtime_value(slot: &MigrationObjectSlot) -> RuntimeValue {
     )
 }
 
+fn state_field_to_runtime_value(
+    stable_id: StableId,
+    value: &StateValue,
+    expected: ValueType,
+) -> Result<RuntimeValue, RuntimeMessage> {
+    if let StateValue::Handle(handle) = value {
+        let ValueType::Named(handle_type) = expected else {
+            return Err("state handle field has non-handle schema type".into());
+        };
+        return Ok(RuntimeValue::StateHandle {
+            handle_type,
+            domain: handle.domain.get(),
+            stable_id: handle.stable_id,
+            generation: handle.generation,
+        });
+    }
+    Ok(state_to_runtime_value(stable_id, value))
+}
+
 fn state_to_runtime_value(stable_id: StableId, value: &StateValue) -> RuntimeValue {
     match value {
         StateValue::I32(value) => RuntimeValue::I32(*value),
@@ -1832,7 +1892,17 @@ fn state_to_runtime_value(stable_id: StableId, value: &StateValue) -> RuntimeVal
             type_id: *type_id,
             hash: *hash,
         },
-        StateValue::Ref(reference) => RuntimeValue::Ref(*reference),
+        StateValue::Ref {
+            reference,
+            type_id: Some(type_id),
+        } => RuntimeValue::NamedRef {
+            reference: *reference,
+            type_id: *type_id,
+        },
+        StateValue::Ref {
+            reference,
+            type_id: None,
+        } => RuntimeValue::Ref(*reference),
         StateValue::Handle(handle) => RuntimeValue::Opaque {
             type_id: StableId::from_name("StateHandle"),
             value: handle.stable_id.0,
@@ -1866,9 +1936,14 @@ fn runtime_to_state_value(
             type_id,
             hash,
         }),
-        RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
-            Ok(StateValue::Ref(reference))
-        }
+        RuntimeValue::Ref(reference) => Ok(StateValue::Ref {
+            reference,
+            type_id: None,
+        }),
+        RuntimeValue::NamedRef { reference, type_id } => Ok(StateValue::Ref {
+            reference,
+            type_id: Some(type_id),
+        }),
         RuntimeValue::Opaque { value, .. } => {
             let stable_id = StableId(value);
             let generation = arena
@@ -2110,7 +2185,9 @@ pub fn run_offline_migration(
                                 .map_err(|_| OfflineMigrationError::UnsupportedOutputValue)?
                                 .to_owned(),
                         ),
-                        StateValue::Struct { .. } | StateValue::Ref(_) | StateValue::Object(_) => {
+                        StateValue::Struct { .. }
+                        | StateValue::Ref { .. }
+                        | StateValue::Object(_) => {
                             return Err(OfflineMigrationError::UnsupportedOutputValue);
                         }
                     };
@@ -2347,6 +2424,89 @@ mod tests {
         assert!(heap.struct_fields(value).unwrap().iter().any(
             |value| matches!(value, RuntimeValue::String { reference: field, .. } if *field == label)
         ));
+    }
+
+    #[test]
+    fn stateful_handle_fields_preserve_parameterized_target_types() {
+        let domain = StatefulDomainId::new(7);
+        let target_type = StableId::from_name("Entity");
+        let link_type = StableId::from_name("Link");
+        let next_field = StableId::from_parts(&["Link", "::next"]);
+        let target_id = StableId::from_name("entity");
+        let link_id = StableId::from_name("link");
+        let mut registry = StatefulRegistry::try_new(domain, limits()).unwrap();
+        let target = registry
+            .insert(
+                target_id,
+                StateValue::Object(StateObject {
+                    type_id: target_type,
+                    version: 1,
+                    fields: BTreeMap::new(),
+                }),
+            )
+            .unwrap();
+        registry
+            .insert(
+                link_id,
+                StateValue::Object(StateObject {
+                    type_id: link_type,
+                    version: 1,
+                    fields: BTreeMap::from([(next_field, StateValue::Handle(target))]),
+                }),
+            )
+            .unwrap();
+        let handle_type = nexa_bytecode::state_handle_type(ValueType::Named(target_type));
+        let state_schema = StateSchema {
+            types: vec![
+                StateType {
+                    stable_id: target_type,
+                    version: 1,
+                    fields: Vec::new(),
+                },
+                StateType {
+                    stable_id: link_type,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: next_field,
+                        ty: ValueType::Named(handle_type),
+                    }],
+                },
+            ],
+        };
+        registry.validate_schema(&state_schema).unwrap();
+
+        let mut wrong_schema = state_schema.clone();
+        wrong_schema.types[1].fields[0].ty = ValueType::Named(nexa_bytecode::state_handle_type(
+            ValueType::Named(link_type),
+        ));
+        assert!(registry.validate_schema(&wrong_schema).is_err());
+
+        let mut migration =
+            MigrationContext::new(registry, domain, state_schema, false, limits()).unwrap();
+        let old_value = migration
+            .old_field_get(
+                RuntimeValue::Opaque {
+                    type_id: link_type,
+                    value: link_id.0,
+                },
+                next_field,
+                ValueType::Named(handle_type),
+            )
+            .unwrap();
+        assert!(matches!(
+            old_value,
+            RuntimeValue::StateHandle {
+                handle_type: actual,
+                ..
+            } if actual == handle_type
+        ));
+        migration.preserve(target_id).unwrap();
+        let replacement = migration
+            .new_create(StableId::from_name("replacement"), link_type)
+            .unwrap();
+        migration
+            .new_set(replacement, next_field, old_value)
+            .unwrap();
     }
 
     fn context(schema: StateSchema, limits: MigrationLimits) -> MigrationContext {
