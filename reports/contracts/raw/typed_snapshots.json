@@ -1,0 +1,22 @@
+{
+  "alignment_validation": true,
+  "combat_payload": "EnemyView",
+  "command": "typed snapshot codec and storage tests",
+  "content_type_validation": true,
+  "failures": [],
+  "implementation_sha": "3bc6a81b8bcb61307698ece3b80f118fdb2c64df",
+  "implementation_tree": "7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4",
+  "metrics": {
+    "alignment_validation": true,
+    "combat_payload": "EnemyView",
+    "content_type_validation": true,
+    "schema_hash_validation": true,
+    "storage": "Arc<[u8]>",
+    "type_id_validation": true
+  },
+  "schema_hash_validation": true,
+  "schema_version": 1,
+  "status": "passed",
+  "storage": "Arc<[u8]>",
+  "type_id_validation": true
+}

@@ -1,0 +1,112 @@
+{
+  "artifact_hashes_match": true,
+  "artifacts": {
+    "missing": [],
+    "required": 7,
+    "sha_mismatches": []
+  },
+  "audit": {
+    "assertion_operators": [
+      "eq",
+      "ne",
+      "gt",
+      "gte",
+      "lt",
+      "lte",
+      "contains",
+      "set_equals",
+      "all_equal",
+      "empty",
+      "not_empty",
+      "sha_is_ancestor",
+      "diff_paths_allowed"
+    ],
+    "failed_contract_gap_generation": true,
+    "hard_coded_completion_metrics": 0
+  },
+  "changed_paths": [
+    "reports/contracts/raw/workspace_gates.json",
+    "reports/contracts/milestone4r2_results.json",
+    "reports/milestone4_0_full_mvr.md"
+  ],
+  "command": "sh scripts/milestone4-local-gates.sh",
+  "contracts": {
+    "missing_assertions": [],
+    "version": 2,
+    "work_packages": 24
+  },
+  "failures": [],
+  "implementation_sha": "3bc6a81b8bcb61307698ece3b80f118fdb2c64df",
+  "implementation_tree": "7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4",
+  "local_gates": {
+    "output_lines": 972,
+    "status": "passed"
+  },
+  "markdown_regenerated_equal": true,
+  "metrics": {
+    "artifact_hashes_match": true,
+    "artifacts": {
+      "missing": [],
+      "required": 7,
+      "sha_mismatches": []
+    },
+    "audit": {
+      "assertion_operators": [
+        "eq",
+        "ne",
+        "gt",
+        "gte",
+        "lt",
+        "lte",
+        "contains",
+        "set_equals",
+        "all_equal",
+        "empty",
+        "not_empty",
+        "sha_is_ancestor",
+        "diff_paths_allowed"
+      ],
+      "failed_contract_gap_generation": true,
+      "hard_coded_completion_metrics": 0
+    },
+    "changed_paths": [
+      "reports/contracts/raw/workspace_gates.json",
+      "reports/contracts/milestone4r2_results.json",
+      "reports/milestone4_0_full_mvr.md"
+    ],
+    "contracts": {
+      "missing_assertions": [],
+      "version": 2,
+      "work_packages": 24
+    },
+    "local_gates": {
+      "output_lines": 972,
+      "status": "passed"
+    },
+    "markdown_regenerated_equal": true,
+    "milestone": {
+      "initial_gaps": [
+        "M4R2-HOST-RETURN",
+        "M4R2-SOURCE-SPAN",
+        "M4R2-DIAGNOSTIC-CORPUS",
+        "M4R2-RELEASE-AUDIT"
+      ],
+      "missing_initial_gaps": [],
+      "reopened": true
+    },
+    "parent_matches_implementation": true
+  },
+  "milestone": {
+    "initial_gaps": [
+      "M4R2-HOST-RETURN",
+      "M4R2-SOURCE-SPAN",
+      "M4R2-DIAGNOSTIC-CORPUS",
+      "M4R2-RELEASE-AUDIT"
+    ],
+    "missing_initial_gaps": [],
+    "reopened": true
+  },
+  "parent_matches_implementation": true,
+  "schema_version": 1,
+  "status": "passed"
+}

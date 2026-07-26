@@ -1,0 +1,604 @@
+{
+  "command": "compiler static audit + real diagnostic source matrix",
+  "failures": [],
+  "groups": {
+    "effect_migration": {
+      "exact_cases": 9,
+      "inexact_cases": 0
+    },
+    "lowering": {
+      "exact_cases": 70,
+      "inexact_cases": 0
+    },
+    "resolver": {
+      "exact_cases": 3,
+      "inexact_cases": 0
+    },
+    "type_checker": {
+      "exact_cases": 8,
+      "inexact_cases": 0
+    }
+  },
+  "implementation_sha": "3bc6a81b8bcb61307698ece3b80f118fdb2c64df",
+  "implementation_tree": "7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4",
+  "metrics": {
+    "groups": {
+      "effect_migration": {
+        "exact_cases": 9,
+        "inexact_cases": 0
+      },
+      "lowering": {
+        "exact_cases": 70,
+        "inexact_cases": 0
+      },
+      "resolver": {
+        "exact_cases": 3,
+        "inexact_cases": 0
+      },
+      "type_checker": {
+        "exact_cases": 8,
+        "inexact_cases": 0
+      }
+    },
+    "source_backed": {
+      "case_count": 18,
+      "cases": [
+        {
+          "category": "diagnostic",
+          "code": "NX1001",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX1001",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 1,
+          "primary_start": 0,
+          "primary_text": "#",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX1002",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX1002",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 8,
+          "primary_start": 7,
+          "primary_text": ")",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2001",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2001",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 33,
+          "primary_start": 26,
+          "primary_text": "missing",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2002",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2002",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 22,
+          "primary_start": 15,
+          "primary_text": "Missing",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2101",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2101",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 30,
+          "primary_start": 26,
+          "primary_text": "true",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2201",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2201",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 82,
+          "primary_start": 60,
+          "primary_text": "match value { A => 1 }",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2202",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2202",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 85,
+          "primary_start": 79,
+          "primary_text": "A => 2",
+          "secondary_count": 1
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2210",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2210",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 35,
+          "primary_start": 31,
+          "primary_text": "None",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2220",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2220",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 28,
+          "primary_start": 27,
+          "primary_text": "?",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2221",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2221",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 84,
+          "primary_start": 83,
+          "primary_text": "?",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2301",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2301",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 62,
+          "primary_start": 57,
+          "primary_text": "await",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2302",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2302",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 73,
+          "primary_start": 67,
+          "primary_text": "work()",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2401",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2401",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 51,
+          "primary_start": 46,
+          "primary_text": "value",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2501",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2501",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 84,
+          "primary_start": 70,
+          "primary_text": "record.missing",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2601",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2601",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 46,
+          "primary_start": 26,
+          "primary_text": "old.get<i32>(legacy)",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2602",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2602",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 47,
+          "primary_start": 31,
+          "primary_text": "{ return true; }",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2603",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2603",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 89,
+          "primary_start": 31,
+          "primary_text": "{ old.get<i32>(legacy); finish_migration(); return true; }",
+          "secondary_count": 0
+        },
+        {
+          "category": "diagnostic",
+          "code": "NX2604",
+          "human_output": true,
+          "json_output": true,
+          "observed": "NX2604",
+          "passed": true,
+          "pipeline": "compiler",
+          "primary_end": 67,
+          "primary_start": 51,
+          "primary_text": "preserve(legacy)",
+          "secondary_count": 0
+        }
+      ],
+      "codes": [
+        "NX1001",
+        "NX1002",
+        "NX2001",
+        "NX2002",
+        "NX2101",
+        "NX2201",
+        "NX2202",
+        "NX2210",
+        "NX2220",
+        "NX2221",
+        "NX2301",
+        "NX2302",
+        "NX2401",
+        "NX2501",
+        "NX2601",
+        "NX2602",
+        "NX2603",
+        "NX2604"
+      ],
+      "inexact_spans": 0
+    },
+    "static": {
+      "fabricated_zero_one_occurrences": 0,
+      "fallback_span_occurrences": 0,
+      "no_arg_error_constructors": 0
+    },
+    "supplemental": [
+      {
+        "exact": true,
+        "name": "suspending_defer"
+      },
+      {
+        "exact": true,
+        "name": "invalid_effect"
+      },
+      {
+        "exact": true,
+        "name": "invalid_reload_metadata"
+      }
+    ]
+  },
+  "schema_version": 1,
+  "source_backed": {
+    "case_count": 18,
+    "cases": [
+      {
+        "category": "diagnostic",
+        "code": "NX1001",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX1001",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 1,
+        "primary_start": 0,
+        "primary_text": "#",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX1002",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX1002",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 8,
+        "primary_start": 7,
+        "primary_text": ")",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2001",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2001",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 33,
+        "primary_start": 26,
+        "primary_text": "missing",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2002",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2002",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 22,
+        "primary_start": 15,
+        "primary_text": "Missing",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2101",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2101",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 30,
+        "primary_start": 26,
+        "primary_text": "true",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2201",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2201",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 82,
+        "primary_start": 60,
+        "primary_text": "match value { A => 1 }",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2202",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2202",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 85,
+        "primary_start": 79,
+        "primary_text": "A => 2",
+        "secondary_count": 1
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2210",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2210",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 35,
+        "primary_start": 31,
+        "primary_text": "None",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2220",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2220",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 28,
+        "primary_start": 27,
+        "primary_text": "?",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2221",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2221",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 84,
+        "primary_start": 83,
+        "primary_text": "?",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2301",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2301",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 62,
+        "primary_start": 57,
+        "primary_text": "await",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2302",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2302",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 73,
+        "primary_start": 67,
+        "primary_text": "work()",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2401",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2401",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 51,
+        "primary_start": 46,
+        "primary_text": "value",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2501",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2501",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 84,
+        "primary_start": 70,
+        "primary_text": "record.missing",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2601",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2601",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 46,
+        "primary_start": 26,
+        "primary_text": "old.get<i32>(legacy)",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2602",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2602",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 47,
+        "primary_start": 31,
+        "primary_text": "{ return true; }",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2603",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2603",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 89,
+        "primary_start": 31,
+        "primary_text": "{ old.get<i32>(legacy); finish_migration(); return true; }",
+        "secondary_count": 0
+      },
+      {
+        "category": "diagnostic",
+        "code": "NX2604",
+        "human_output": true,
+        "json_output": true,
+        "observed": "NX2604",
+        "passed": true,
+        "pipeline": "compiler",
+        "primary_end": 67,
+        "primary_start": 51,
+        "primary_text": "preserve(legacy)",
+        "secondary_count": 0
+      }
+    ],
+    "codes": [
+      "NX1001",
+      "NX1002",
+      "NX2001",
+      "NX2002",
+      "NX2101",
+      "NX2201",
+      "NX2202",
+      "NX2210",
+      "NX2220",
+      "NX2221",
+      "NX2301",
+      "NX2302",
+      "NX2401",
+      "NX2501",
+      "NX2601",
+      "NX2602",
+      "NX2603",
+      "NX2604"
+    ],
+    "inexact_spans": 0
+  },
+  "static": {
+    "fabricated_zero_one_occurrences": 0,
+    "fallback_span_occurrences": 0,
+    "no_arg_error_constructors": 0
+  },
+  "status": "passed",
+  "supplemental": [
+    {
+      "exact": true,
+      "name": "suspending_defer"
+    },
+    {
+      "exact": true,
+      "name": "invalid_effect"
+    },
+    {
+      "exact": true,
+      "name": "invalid_reload_metadata"
+    }
+  ]
+}
