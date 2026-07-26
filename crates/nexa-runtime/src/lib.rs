@@ -30,7 +30,8 @@ pub use allocation::{
     set_migration_allocation_observer,
 };
 pub use failure::{
-    RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint,
+    FailurePointStats, RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode,
+    RuntimeFailurePoint,
 };
 pub use kernel::{RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;

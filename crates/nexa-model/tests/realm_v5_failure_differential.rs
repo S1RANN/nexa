@@ -2,7 +2,103 @@ use nexa_runtime::model_adapter::{
     RealmV5RuntimeAdapter, RealmV5RuntimeApplyError, RealmV5RuntimeEvent,
     RealmV5RuntimeReloadState, RealmV5RuntimeRetiredEpoch, RealmV5RuntimeTaskState,
 };
-use nexa_runtime::{RealmError, RuntimeError, RuntimeFailurePoint};
+use nexa_runtime::{
+    FailurePointStats, HeapError, Object, RealmError, RuntimeError, RuntimeFailureMode,
+    RuntimeFailurePoint,
+};
+
+#[test]
+fn production_failure_modes_and_stats_are_complete() {
+    let mut runtime = RealmV5RuntimeAdapter::new();
+    let injector = runtime.failure_injector().clone();
+
+    injector.arm_once(RuntimeFailurePoint::HeapSlot);
+    assert_eq!(
+        runtime.realm_mut().allocate(Object::String("once".into())),
+        Err(RealmError::Heap(HeapError::InjectedFailure(
+            RuntimeFailurePoint::HeapSlot
+        )))
+    );
+    assert!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("once-recovered".into()))
+            .is_ok()
+    );
+    assert_eq!(
+        injector.stats(RuntimeFailurePoint::HeapSlot),
+        FailurePointStats {
+            attempted: 2,
+            injected: 1,
+        }
+    );
+
+    injector.arm_at(RuntimeFailurePoint::HeapSlot, 2).unwrap();
+    assert!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("at-first".into()))
+            .is_ok()
+    );
+    assert_eq!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("at-second".into())),
+        Err(RealmError::Heap(HeapError::InjectedFailure(
+            RuntimeFailurePoint::HeapSlot
+        )))
+    );
+
+    injector.arm_always(RuntimeFailurePoint::HeapSlot);
+    for value in ["always-first", "always-second"] {
+        assert_eq!(
+            runtime.realm_mut().allocate(Object::String(value.into())),
+            Err(RealmError::Heap(HeapError::InjectedFailure(
+                RuntimeFailurePoint::HeapSlot
+            )))
+        );
+    }
+    injector.disarm(RuntimeFailurePoint::HeapSlot);
+    assert_eq!(
+        injector.mode(RuntimeFailurePoint::HeapSlot),
+        RuntimeFailureMode::Off
+    );
+    assert!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("disarmed".into()))
+            .is_ok()
+    );
+    assert_eq!(
+        injector.stats(RuntimeFailurePoint::HeapSlot),
+        FailurePointStats {
+            attempted: 3,
+            injected: 2,
+        }
+    );
+
+    injector.arm_once(RuntimeFailurePoint::ScopeSlot);
+    injector.arm_once(RuntimeFailurePoint::HeapSlot);
+    assert!(matches!(
+        runtime.realm_mut().create_scope(None),
+        Err(RealmError::Runtime(RuntimeError::InjectedFailure(
+            RuntimeFailurePoint::ScopeSlot
+        )))
+    ));
+    assert!(matches!(
+        runtime
+            .realm_mut()
+            .allocate(Object::String("ordered".into())),
+        Err(RealmError::Heap(HeapError::InjectedFailure(
+            RuntimeFailurePoint::HeapSlot
+        )))
+    ));
+    injector.clear();
+    for point in RuntimeFailurePoint::ALL {
+        assert_eq!(injector.mode(point), RuntimeFailureMode::Off);
+        assert_eq!(injector.stats(point), FailurePointStats::default());
+    }
+}
 
 #[test]
 #[allow(clippy::too_many_lines)]
