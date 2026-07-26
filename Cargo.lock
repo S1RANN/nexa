@@ -40,6 +40,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-benchmark-v6"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-migrate",
+ "nexa-runtime",
+ "nexa-verifier",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-bytecode"
 version = "0.1.0"
 dependencies = [

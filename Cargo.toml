@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*", "examples/combat-runtime"]
+members = ["crates/*", "examples/combat-runtime", "tools/benchmark-v6"]
 exclude = [
     "tools/allocation-observer",
     "fuzz/bytecode",
