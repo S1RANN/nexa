@@ -319,6 +319,67 @@ pub fn generate_rust(idl: &Idl) -> String {
             writeln!(output, "{pattern} => {tag},").expect("String writes do not fail");
         }
         output.push_str("} } }\n");
+        writeln!(
+            output,
+            "#[derive(Clone, Copy, Debug)] pub enum {}Ref<'a> {{",
+            enumeration.name
+        )
+        .expect("String writes do not fail");
+        for variant in &enumeration.variants {
+            if let Some(payload) = &variant.payload {
+                writeln!(
+                    output,
+                    "    {}({}),",
+                    variant.name,
+                    input_rust_type(idl, payload, "'a")
+                )
+                .expect("String writes do not fail");
+            } else {
+                writeln!(output, "    {},", variant.name).expect("String writes do not fail");
+            }
+        }
+        output.push_str("    #[doc(hidden)] __Lifetime(std::marker::PhantomData<&'a ()>),\n");
+        output.push_str("}\n");
+        writeln!(
+            output,
+            "impl<'a> {}Ref<'a> {{ fn from_runtime(value: \
+             nexa_runtime::HostEnumRef<'a>) -> Result<Self, nexa_runtime::HostTrap> {{",
+            enumeration.name
+        )
+        .expect("String writes do not fail");
+        writeln!(
+            output,
+            "if value.type_id() != nexa_runtime::StableId({}) {{ return \
+             Err(nexa_runtime::HostTrap::Type); }} match (value.variant(), value.tag()) {{",
+            StableId::from_name(&enumeration.name).0
+        )
+        .expect("String writes do not fail");
+        for (tag, variant) in enumeration.variants.iter().enumerate() {
+            let variant_id = StableId::from_parts(&[&enumeration.name, "::", &variant.name]).0;
+            if let Some(payload) = &variant.payload {
+                let decoded = decode_runtime_ref_value(
+                    idl,
+                    payload,
+                    "value.payload().ok_or(nexa_runtime::HostTrap::Type)?",
+                );
+                writeln!(
+                    output,
+                    "(nexa_runtime::StableId({variant_id}), {tag}) => \
+                     Ok(Self::{}({decoded})),",
+                    variant.name
+                )
+                .expect("String writes do not fail");
+            } else {
+                writeln!(
+                    output,
+                    "(nexa_runtime::StableId({variant_id}), {tag}) if value.payload().is_none() \
+                     => Ok(Self::{}),",
+                    variant.name
+                )
+                .expect("String writes do not fail");
+            }
+        }
+        output.push_str("_ => Err(nexa_runtime::HostTrap::Type), } } }\n");
     }
     for structure in &idl.structs {
         writeln!(
@@ -332,18 +393,49 @@ pub fn generate_rust(idl: &Idl) -> String {
                 .expect("String writes do not fail");
         }
         output.push_str("}\n");
+        writeln!(
+            output,
+            "#[derive(Clone, Copy, Debug)] pub struct {}Ref<'a>(\
+             nexa_runtime::HostStructRef<'a>);",
+            structure.name
+        )
+        .expect("String writes do not fail");
+        writeln!(output, "impl<'a> {}Ref<'a> {{", structure.name)
+            .expect("String writes do not fail");
+        writeln!(
+            output,
+            "fn from_runtime(value: nexa_runtime::HostStructRef<'a>) -> Self {{ Self(value) }}"
+        )
+        .expect("String writes do not fail");
+        for (index, field) in structure.fields.iter().enumerate() {
+            let decoded =
+                decode_runtime_ref_value(idl, &field.ty, &format!("self.0.field({index})?"));
+            writeln!(
+                output,
+                "pub fn {}(self) -> Result<{}, nexa_runtime::HostTrap> {{ Ok({decoded}) }}",
+                field.name,
+                input_rust_type(idl, &field.ty, "'a")
+            )
+            .expect("String writes do not fail");
+        }
+        output.push_str("}\n");
     }
     writeln!(output, "pub trait {} {{", idl.interface).expect("String writes do not fail");
     for function in &idl.functions {
         write!(
             output,
-            "    fn {}(&mut self, context: &mut nexa_runtime::ResourceContext<'_>",
+            "    fn {}<'a>(&mut self, context: &mut nexa_runtime::ResourceContext<'_>",
             function.name
         )
         .expect("String writes do not fail");
         for parameter in &function.parameters {
-            write!(output, ", {}: {}", parameter.name, rust_type(&parameter.ty))
-                .expect("String writes do not fail");
+            write!(
+                output,
+                ", {}: {}",
+                parameter.name,
+                input_rust_type(idl, &parameter.ty, "'a")
+            )
+            .expect("String writes do not fail");
         }
         writeln!(
             output,
@@ -405,18 +497,17 @@ pub fn generate_rust(idl: &Idl) -> String {
     )
     .expect("String writes do not fail");
     output.push_str(
-        "fn call(&mut self, id: u32, context: &mut nexa_runtime::ResourceContext<'_>, \
-         args: nexa_runtime::HostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, \
-         nexa_runtime::HostTrap> {\n",
+        "#[allow(deprecated)] fn call(&mut self, _: u32, _: &mut \
+         nexa_runtime::ResourceContext<'_>, _: nexa_runtime::HostArgs<'_>) -> \
+         Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> { \
+         panic!(\"materializing GeneratedHostRegistry::call is disabled\") }\n",
     );
-    emit_host_dispatch(&mut output, idl, false);
-    output.push_str("}\n");
     output.push_str(
         "fn call_runtime(&mut self, id: u32, context: &mut \
          nexa_runtime::ResourceContext<'_>, args: nexa_runtime::RuntimeHostArgs<'_>) -> \
          Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n",
     );
-    emit_host_dispatch(&mut output, idl, true);
+    emit_host_dispatch(&mut output, idl);
     output.push_str("}\n}\n");
     for (index, export) in idl.exports.iter().enumerate() {
         let args = if export.parameters.is_empty() {
@@ -455,7 +546,7 @@ pub fn generate_rust(idl: &Idl) -> String {
     output
 }
 
-fn emit_host_dispatch(output: &mut String, idl: &Idl, runtime: bool) {
+fn emit_host_dispatch(output: &mut String, idl: &Idl) {
     output.push_str("match id {\n");
     for (index, function) in idl.functions.iter().enumerate() {
         if function.parameters.is_empty() {
@@ -475,14 +566,7 @@ fn emit_host_dispatch(output: &mut String, idl: &Idl, runtime: bool) {
             .expect("String writes do not fail");
         }
         for (argument, parameter) in function.parameters.iter().enumerate() {
-            let (prelude, decoded) = if runtime {
-                decode_runtime_host_value(idl, &parameter.ty, argument)
-            } else {
-                (
-                    String::new(),
-                    decode_host_value(idl, &parameter.ty, argument),
-                )
-            };
+            let (prelude, decoded) = decode_runtime_host_value(idl, &parameter.ty, argument);
             output.push_str(&prelude);
             writeln!(output, "let {} = {decoded};", parameter.name)
                 .expect("String writes do not fail");
@@ -520,7 +604,7 @@ fn decode_runtime_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> (String, 
         TypeRef::F64 => Some(format!("args.f64({index})?")),
         TypeRef::Bool => Some(format!("args.bool({index})?")),
         TypeRef::Rune => Some(format!("args.rune({index})?")),
-        TypeRef::String => Some(format!("args.string({index})?")),
+        TypeRef::String => Some(format!("args.str_ref({index})?.as_str()")),
         TypeRef::HostRequest(_) => Some(format!("args.request({index})?")),
         TypeRef::ResourceToken(Some(inner)) => Some(format!(
             "{}::from_raw(args.token({index})?)",
@@ -545,14 +629,118 @@ fn decode_runtime_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> (String, 
     };
     direct.map_or_else(
         || {
-            let binding = format!("__nexa_arg_{index}");
-            (
-                format!("let {binding} = args.host_value({index})?;\n"),
-                decode_value(idl, ty, &format!("&{binding}")),
-            )
+            let source = format!("args.value_ref({index})?");
+            (String::new(), decode_runtime_ref_value(idl, ty, &source))
         },
         |decoded| (String::new(), decoded),
     )
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_runtime_ref_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("{source}.i32()?"),
+        TypeRef::I64 => format!("{source}.i64()?"),
+        TypeRef::F32 => format!("{source}.f32()?"),
+        TypeRef::F64 => format!("{source}.f64()?"),
+        TypeRef::Bool => format!("{source}.bool()?"),
+        TypeRef::Rune => format!("{source}.rune()?"),
+        TypeRef::String => format!("{source}.str_ref()?.as_str()"),
+        TypeRef::HostRequest(_) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::HostRequest(value) \
+             => value, _ => return Err(nexa_runtime::HostTrap::Type) }}"
+        ),
+        TypeRef::ResourceToken(Some(inner)) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::ResourceToken(value) \
+             => {}::from_raw(value), _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            typed_handle_name(inner, "Token")
+        ),
+        TypeRef::Snapshot(Some(inner)) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::Snapshot(value) => \
+             {}::try_from(value).map_err(|_| nexa_runtime::HostTrap::Type)?, _ => return \
+             Err(nexa_runtime::HostTrap::Type) }}",
+            typed_handle_name(inner, "Snapshot")
+        ),
+        TypeRef::ResourceToken(None) | TypeRef::Snapshot(None) => {
+            unreachable!("validated handles are typed")
+        }
+        TypeRef::Array(inner) => format!(
+            "{source}.array_ref(nexa_runtime::StableId({}))?",
+            nexa_bytecode::array_type(value_type(idl, inner)).0
+        ),
+        TypeRef::Buffer(inner) => format!(
+            "{source}.buffer_ref(nexa_runtime::StableId({}))?",
+            nexa_bytecode::buffer_type(value_type(idl, inner)).0
+        ),
+        TypeRef::Option(inner) => {
+            let metadata = nexa_bytecode::option_type(value_type(idl, inner));
+            let none = &metadata.variants[0];
+            let some = &metadata.variants[1];
+            let payload = decode_runtime_ref_value(
+                idl,
+                inner,
+                "__nexa_enum.payload().ok_or(nexa_runtime::HostTrap::Type)?",
+            );
+            format!(
+                "{{ let __nexa_enum = {source}.enum_ref(nexa_runtime::StableId({type_id}))?; \
+                 match (__nexa_enum.variant(), __nexa_enum.tag()) {{ \
+                 (nexa_runtime::StableId({none_id}), {none_tag}) if \
+                 __nexa_enum.payload().is_none() => None, \
+                 (nexa_runtime::StableId({some_id}), {some_tag}) => Some({payload}), \
+                 _ => return Err(nexa_runtime::HostTrap::Type), }} }}",
+                type_id = metadata.type_id.0,
+                none_id = none.stable_id.0,
+                none_tag = none.tag,
+                some_id = some.stable_id.0,
+                some_tag = some.tag,
+            )
+        }
+        TypeRef::Result(success, error) => {
+            let metadata =
+                nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error));
+            let ok = &metadata.variants[0];
+            let err = &metadata.variants[1];
+            let success = decode_runtime_ref_value(
+                idl,
+                success,
+                "__nexa_enum.payload().ok_or(nexa_runtime::HostTrap::Type)?",
+            );
+            let error = decode_runtime_ref_value(
+                idl,
+                error,
+                "__nexa_enum.payload().ok_or(nexa_runtime::HostTrap::Type)?",
+            );
+            format!(
+                "{{ let __nexa_enum = {source}.enum_ref(nexa_runtime::StableId({type_id}))?; \
+                 match (__nexa_enum.variant(), __nexa_enum.tag()) {{ \
+                 (nexa_runtime::StableId({ok_id}), {ok_tag}) => Ok({success}), \
+                 (nexa_runtime::StableId({err_id}), {err_tag}) => Err({error}), \
+                 _ => return Err(nexa_runtime::HostTrap::Type), }} }}",
+                type_id = metadata.type_id.0,
+                ok_id = ok.stable_id.0,
+                ok_tag = ok.tag,
+                err_id = err.stable_id.0,
+                err_tag = err.tag,
+            )
+        }
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::Opaque {{ value, \
+             type_id }} if type_id == nexa_runtime::StableId({}) => {name}(value), \
+             nexa_runtime::RuntimeValue::Ref(reference) | \
+             nexa_runtime::RuntimeValue::NamedRef {{ reference, .. }} => \
+             {name}(u64::from(reference.generation) << 32 | u64::from(reference.index)), \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            StableId::from_name(name).0
+        ),
+        TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => format!(
+            "{name}Ref::from_runtime({source}.enum_ref(nexa_runtime::StableId({}))?)?",
+            StableId::from_name(name).0
+        ),
+        TypeRef::Named(name) => format!(
+            "{name}Ref::from_runtime({source}.struct_ref(nexa_runtime::StableId({}))?)",
+            StableId::from_name(name).0
+        ),
+    }
 }
 
 fn collect_typed_handles(idl: &Idl) -> (BTreeSet<String>, BTreeSet<String>) {
@@ -755,91 +943,6 @@ fn encode_completion_error(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     }
 }
 
-fn decode_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> String {
-    decode_value(idl, ty, &format!("args.get({index})?"))
-}
-
-fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
-    match ty {
-        TypeRef::I32 => decode_match(source, "I32", "*value"),
-        TypeRef::I64 => decode_match(source, "I64", "*value"),
-        TypeRef::F32 => decode_match(source, "F32", "*value"),
-        TypeRef::F64 => decode_match(source, "F64", "*value"),
-        TypeRef::Bool => decode_match(source, "Bool", "*value"),
-        TypeRef::Rune => decode_match(source, "Rune", "*value"),
-        TypeRef::String => decode_match(source, "String", "value.clone()"),
-        TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
-        TypeRef::ResourceToken(Some(inner)) => format!(
-            "match {source} {{ nexa_runtime::HostValue::Token(value) => \
-             {}::from_raw(*value), _ => return Err(nexa_runtime::HostTrap::Type) }}",
-            typed_handle_name(inner, "Token")
-        ),
-        TypeRef::ResourceToken(None) => unreachable!("validated tokens are typed"),
-        TypeRef::Snapshot(Some(inner)) => format!(
-            "match {source} {{ nexa_runtime::HostValue::Snapshot(value) => \
-             {}::try_from(*value).map_err(|_| nexa_runtime::HostTrap::Type)?, \
-             _ => return Err(nexa_runtime::HostTrap::Type) }}",
-            typed_handle_name(inner, "Snapshot")
-        ),
-        TypeRef::Snapshot(None) => unreachable!("validated snapshots are typed"),
-        TypeRef::Array(inner) => decode_collection(idl, inner, source, "Array", false),
-        TypeRef::Buffer(inner) => decode_collection(idl, inner, source, "Buffer", true),
-        TypeRef::Option(inner) => decode_option(idl, inner, source),
-        TypeRef::Result(success, error) => decode_result(idl, success, error, source),
-        TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
-            "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
-             _ => return Err(nexa_runtime::HostTrap::Type) }}"
-        ),
-        TypeRef::Named(name)
-            if idl
-                .enums
-                .iter()
-                .any(|enumeration| enumeration.name == *name) =>
-        {
-            decode_enum_value(
-                idl,
-                idl.enums
-                    .iter()
-                    .find(|enumeration| enumeration.name == *name)
-                    .expect("validated enum exists"),
-                source,
-            )
-        }
-        TypeRef::Named(name) => {
-            let structure = idl
-                .structs
-                .iter()
-                .find(|structure| structure.name == *name)
-                .expect("validated named type exists");
-            let fields = structure
-                .fields
-                .iter()
-                .enumerate()
-                .map(|(index, field)| {
-                    format!(
-                        "{}: {}",
-                        field.name,
-                        decode_value(idl, &field.ty, &format!("&values[{index}]"))
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!(
-                "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == {} \
-                 => {name} {{ {fields} }}, _ => return Err(nexa_runtime::HostTrap::Type) }}",
-                structure.fields.len()
-            )
-        }
-    }
-}
-
-fn decode_match(source: &str, variant: &str, value: &str) -> String {
-    format!(
-        "match {source} {{ nexa_runtime::HostValue::{variant}(value) => {value}, \
-         _ => return Err(nexa_runtime::HostTrap::Type) }}"
-    )
-}
-
 fn encode_host_result(idl: &Idl, ty: &TypeRef) -> String {
     if matches!(ty, TypeRef::HostRequest(_)) {
         "nexa_runtime::HostCallOutcome::Pending(result)".into()
@@ -974,116 +1077,6 @@ fn encode_result(
         err_id = err.stable_id.0,
         err_tag = err.tag,
     )
-}
-
-fn decode_option(idl: &Idl, inner: &TypeRef, source: &str) -> String {
-    let metadata = nexa_bytecode::option_type(value_type(idl, inner));
-    let none = &metadata.variants[0];
-    let some = &metadata.variants[1];
-    let payload = decode_value(idl, inner, "value");
-    format!(
-        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} \
-         if *type_id == nexa_runtime::StableId({type_id}) && *variant == \
-         nexa_runtime::StableId({none_id}) && *tag == {none_tag} && payload.is_none() => None, \
-         nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if *type_id == \
-         nexa_runtime::StableId({type_id}) && *variant == nexa_runtime::StableId({some_id}) && \
-         *tag == {some_tag} => {{ let value = match payload.as_deref() {{ Some(value) => value, \
-         None => return Err(nexa_runtime::HostTrap::Type) }}; Some({payload}) }}, _ => return \
-         Err(nexa_runtime::HostTrap::Type) }}",
-        type_id = metadata.type_id.0,
-        none_id = none.stable_id.0,
-        none_tag = none.tag,
-        some_id = some.stable_id.0,
-        some_tag = some.tag,
-    )
-}
-
-fn decode_result(idl: &Idl, success: &TypeRef, error: &TypeRef, source: &str) -> String {
-    let metadata = nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error));
-    let ok = &metadata.variants[0];
-    let err = &metadata.variants[1];
-    let success_payload = decode_value(idl, success, "value");
-    let error_payload = decode_value(idl, error, "value");
-    format!(
-        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if \
-         *type_id == nexa_runtime::StableId({type_id}) && *variant == \
-         nexa_runtime::StableId({ok_id}) && *tag == {ok_tag} => {{ let value = match \
-         payload.as_deref() {{ Some(value) => value, None => return \
-         Err(nexa_runtime::HostTrap::Type) }}; Ok({success_payload}) }}, \
-         nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if *type_id == \
-         nexa_runtime::StableId({type_id}) && *variant == nexa_runtime::StableId({err_id}) && \
-         *tag == {err_tag} => {{ let value = match payload.as_deref() {{ Some(value) => value, \
-         None => return Err(nexa_runtime::HostTrap::Type) }}; Err({error_payload}) }}, _ => return \
-         Err(nexa_runtime::HostTrap::Type) }}",
-        type_id = metadata.type_id.0,
-        ok_id = ok.stable_id.0,
-        ok_tag = ok.tag,
-        err_id = err.stable_id.0,
-        err_tag = err.tag,
-    )
-}
-
-fn decode_collection(
-    idl: &Idl,
-    inner: &TypeRef,
-    source: &str,
-    variant: &str,
-    copy_buffer: bool,
-) -> String {
-    let decoded = decode_value(idl, inner, "value");
-    let finish = if copy_buffer {
-        "nexa_runtime::CopyBuffer::new(decoded)"
-    } else {
-        "decoded"
-    };
-    format!(
-        "{{ let values = match {source} {{ nexa_runtime::HostValue::{variant}(values) => values, \
-         _ => return Err(nexa_runtime::HostTrap::Type) }}; let mut decoded = \
-         Vec::with_capacity(values.len()); for value in values.as_slice() {{ \
-         decoded.push({decoded}); }} {finish} }}"
-    )
-}
-
-fn decode_enum_value(idl: &Idl, enumeration: &Enum, source: &str) -> String {
-    let mut output = format!(
-        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, payload, .. }} \
-         if *type_id == nexa_runtime::StableId::from_name(\"{}\") => {{",
-        enumeration.name
-    );
-    for (index, variant) in enumeration.variants.iter().enumerate() {
-        if index != 0 {
-            output.push_str(" else ");
-        }
-        write!(
-            output,
-            "if *variant == nexa_runtime::StableId::from_parts(&[\"{}\", \"::\", \"{}\"]) {{",
-            enumeration.name, variant.name
-        )
-        .expect("String writes do not fail");
-        if let Some(payload_type) = &variant.payload {
-            let decoded = decode_value(idl, payload_type, "value");
-            write!(
-                output,
-                "let value = match payload.as_deref() {{ Some(value) => value, None => return \
-                 Err(nexa_runtime::HostTrap::Type) }}; {}::{}({decoded})",
-                enumeration.name, variant.name
-            )
-            .expect("String writes do not fail");
-        } else {
-            write!(
-                output,
-                "if payload.is_some() {{ return Err(nexa_runtime::HostTrap::Type); }} {}::{}",
-                enumeration.name, variant.name
-            )
-            .expect("String writes do not fail");
-        }
-        output.push('}');
-    }
-    output.push_str(
-        " else { return Err(nexa_runtime::HostTrap::Type) } }, \
-         _ => return Err(nexa_runtime::HostTrap::Type) }",
-    );
-    output
 }
 
 fn encode_enum_value(idl: &Idl, enumeration: &Enum, source: &str) -> String {
@@ -1235,6 +1228,35 @@ fn rust_type(ty: &TypeRef) -> String {
             format!("Result<{}, {}>", rust_type(success), rust_type(error))
         }
         TypeRef::Named(name) => name.clone(),
+    }
+}
+
+fn input_rust_type(idl: &Idl, ty: &TypeRef, lifetime: &str) -> String {
+    match ty {
+        TypeRef::I32 => "i32".into(),
+        TypeRef::I64 => "i64".into(),
+        TypeRef::F32 => "f32".into(),
+        TypeRef::F64 => "f64".into(),
+        TypeRef::Bool => "bool".into(),
+        TypeRef::Rune => "char".into(),
+        TypeRef::String => format!("&{lifetime} str"),
+        TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle".into(),
+        TypeRef::ResourceToken(Some(inner)) => typed_handle_name(inner, "Token"),
+        TypeRef::ResourceToken(None) => unreachable!("validated tokens are typed"),
+        TypeRef::Snapshot(Some(inner)) => typed_handle_name(inner, "Snapshot"),
+        TypeRef::Snapshot(None) => unreachable!("validated snapshots are typed"),
+        TypeRef::Array(_) => format!("nexa_runtime::HostArrayRef<{lifetime}>"),
+        TypeRef::Buffer(_) => format!("nexa_runtime::HostBufferRef<{lifetime}>"),
+        TypeRef::Option(inner) => {
+            format!("Option<{}>", input_rust_type(idl, inner, lifetime))
+        }
+        TypeRef::Result(success, error) => format!(
+            "Result<{}, {}>",
+            input_rust_type(idl, success, lifetime),
+            input_rust_type(idl, error, lifetime)
+        ),
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => name.clone(),
+        TypeRef::Named(name) => format!("{name}Ref<{lifetime}>"),
     }
 }
 
@@ -1738,6 +1760,104 @@ mod tests {
     }
 
     #[test]
+    fn generated_runtime_thunks_use_borrowed_inputs() {
+        let generated = generate_rust(
+            &parse(
+                "interface GameHost {
+                    struct CombatStats { label: string; health: i32; }
+                    enum CombatEvent { Idle, Changed(CombatStats) }
+                    sync fn process(
+                        name: string,
+                        stats: CombatStats,
+                        event: CombatEvent,
+                        values: array<i32>,
+                        data: buffer<i32>,
+                        option: Option<CombatStats>
+                    ) -> i32;
+                }",
+            )
+            .unwrap(),
+        );
+        let trait_start = generated.find("pub trait GameHost").unwrap();
+        let trait_end = generated[trait_start..].find("}\n").unwrap() + trait_start;
+        let host_trait = &generated[trait_start..=trait_end];
+        for borrowed in [
+            "name: &'a str",
+            "stats: CombatStatsRef<'a>",
+            "event: CombatEventRef<'a>",
+            "values: nexa_runtime::HostArrayRef<'a>",
+            "data: nexa_runtime::HostBufferRef<'a>",
+            "option: Option<CombatStatsRef<'a>>",
+        ] {
+            assert!(host_trait.contains(borrowed), "{borrowed}\n{host_trait}");
+        }
+        for owning in [
+            "name: String",
+            "stats: CombatStats,",
+            "event: CombatEvent,",
+            "values: Vec<",
+            "data: nexa_runtime::CopyBuffer",
+            "option: Option<CombatStats>",
+        ] {
+            assert!(!host_trait.contains(owning), "{owning}\n{host_trait}");
+        }
+    }
+
+    #[test]
+    fn generated_runtime_thunks_decode_complex_inputs_directly() {
+        let generated = generate_rust(
+            &parse(
+                "interface Direct {
+                    struct Record { name: string; value: i32; }
+                    enum Event { Empty, Record(Record) }
+                    sync fn decode(
+                        name: string,
+                        record: Record,
+                        event: Event,
+                        option: Option<Record>,
+                        result: Result<Record, Event>,
+                        array: array<Record>,
+                        buffer: buffer<Record>,
+                        nested: Option<Result<Event, Record>>
+                    ) -> i32;
+                }",
+            )
+            .unwrap(),
+        );
+        let runtime_start = generated.find("fn call_runtime").unwrap();
+        let runtime_dispatch = &generated[runtime_start..];
+        for direct in [
+            "args.str_ref(0)?.as_str()",
+            "args.value_ref(1)?",
+            ".struct_ref(",
+            ".enum_ref(",
+            ".array_ref(",
+            ".buffer_ref(",
+        ] {
+            assert!(
+                runtime_dispatch.contains(direct),
+                "{direct}\n{runtime_dispatch}"
+            );
+        }
+        for forbidden in [
+            "args.host_value(",
+            "HostArgs::from_runtime",
+            "runtime_argument_to_host_value",
+            "to_owned",
+            "collect::<Vec",
+            "Box::new",
+            "CopyBuffer::new",
+            "HostValue::Struct",
+            "HostValue::Enum",
+        ] {
+            assert!(
+                !runtime_dispatch.contains(forbidden),
+                "{forbidden}\n{runtime_dispatch}"
+            );
+        }
+    }
+
+    #[test]
     fn generated_types_are_deterministic_and_cover_typed_host_handles() {
         let idl = parse(
             "interface Typed {
@@ -1941,7 +2061,7 @@ mod tests {
         fs::write(
             directory.join("src/main.rs"),
             r#"mod bindings;
-use bindings::{Entity, Event, GameHost, GeneratedHostRegistry, HostError, Vec3};
+use bindings::{Entity, Event, EventRef, GameHost, GeneratedHostRegistry, HostError, Vec3, Vec3Ref};
 use nexa_runtime::{HostArgs, HostCallOutcome, HostRegistry, HostValue, RuntimeLimits, RuntimeResources, TaskRuntime};
 
 struct Mock;
@@ -1955,14 +2075,17 @@ impl GameHost for Mock {
         Ok(lhs + rhs)
     }
 
-    fn position(
+    fn position<'a>(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
         entity: Entity,
-        mut value: Vec3,
+        value: Vec3Ref<'a>,
     ) -> Result<Vec3, HostError> {
-        value.x += entity.0 as f32;
-        Ok(value)
+        Ok(Vec3 {
+            x: value.x().map_err(|error| HostError(format!("{error:?}")))? + entity.0 as f32,
+            y: value.y().map_err(|error| HostError(format!("{error:?}")))?,
+            z: value.z().map_err(|error| HostError(format!("{error:?}")))?,
+        })
     }
 
     fn scalar_mix(
@@ -1975,33 +2098,40 @@ impl GameHost for Mock {
         Ok(wide as f64 + ratio + f64::from(glyph as u32))
     }
 
-    fn echo(
+    fn echo<'a>(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
-        value: String,
+        value: &'a str,
     ) -> Result<String, HostError> {
-        Ok(value)
+        Ok(value.to_owned())
     }
 
-    fn echo_event(
+    fn echo_event<'a>(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
-        value: Event,
+        value: EventRef<'a>,
     ) -> Result<Event, HostError> {
-        Ok(value)
+        Ok(match value {
+            EventRef::Idle => Event::Idle,
+            EventRef::Damage(value) => Event::Damage(value),
+            EventRef::Label(value) => Event::Label(value.to_owned()),
+            EventRef::__Lifetime(_) => unreachable!(),
+        })
     }
 
-    fn collections(
+    fn collections<'a>(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
-        values: Vec<Option<i32>>,
-        copy: nexa_runtime::CopyBuffer<i64>,
+        values: nexa_runtime::HostArrayRef<'a>,
+        copy: nexa_runtime::HostBufferRef<'a>,
     ) -> Result<Vec<Result<i32, i32>>, HostError> {
-        let offset = copy.as_slice().first().copied().unwrap_or_default() as i32;
-        Ok(values
-            .into_iter()
-            .map(|value| value.map_or(Err(offset), |value| Ok(value + offset)))
-            .collect())
+        let offset = if copy.is_empty() {
+            0
+        } else {
+            copy.get(0).map_err(|error| HostError(format!("{error:?}")))?
+                .i64().map_err(|error| HostError(format!("{error:?}")))? as i32
+        };
+        Ok((0..values.len()).map(|_| Err(offset)).collect())
     }
 
     fn explode(
@@ -2043,57 +2173,7 @@ fn main() {
     let task = tasks.admit_task(scope, 1, true).unwrap();
     let mut resources = RuntimeResources::new(1, 4, 8);
     let mut context = resources.context(task, 0, 1);
-    let values = [HostValue::I32(20), HostValue::I32(22)];
     let mut registry = GeneratedHostRegistry::new(Mock);
-    let outcome = registry
-        .call(0, &mut context, HostArgs::new(&values))
-        .unwrap();
-    assert_eq!(outcome, HostCallOutcome::Immediate(HostValue::I32(42)));
-    let composite = [
-        HostValue::Opaque(2),
-        HostValue::Struct(vec![
-            HostValue::F32(1.0),
-            HostValue::F32(2.0),
-            HostValue::F32(3.0),
-        ]),
-    ];
-    assert_eq!(
-        registry
-            .call(1, &mut context, HostArgs::new(&composite))
-            .unwrap(),
-        HostCallOutcome::Immediate(HostValue::Struct(vec![
-            HostValue::F32(3.0),
-            HostValue::F32(2.0),
-            HostValue::F32(3.0),
-        ]))
-    );
-    let scalars = [HostValue::I64(4), HostValue::F64(0.5), HostValue::Rune('A')];
-    assert_eq!(
-        registry.call(2, &mut context, HostArgs::new(&scalars)).unwrap(),
-        HostCallOutcome::Immediate(HostValue::F64(69.5))
-    );
-    assert_eq!(
-        registry
-            .call(
-                3,
-                &mut context,
-                HostArgs::new(&[HostValue::String("Nexa界".into())]),
-            )
-            .unwrap(),
-        HostCallOutcome::Immediate(HostValue::String("Nexa界".into()))
-    );
-    let event = HostValue::Enum {
-        type_id: nexa_runtime::StableId::from_name("Event"),
-        variant: nexa_runtime::StableId::from_parts(&["Event", "::", "Damage"]),
-        tag: 1,
-        payload: Some(Box::new(HostValue::I32(7))),
-    };
-    assert_eq!(
-        registry
-            .call(4, &mut context, HostArgs::new(std::slice::from_ref(&event)))
-            .unwrap(),
-        HostCallOutcome::Immediate(event)
-    );
     assert_eq!(
         registry
             .call_runtime(
@@ -2117,10 +2197,9 @@ fn main() {
             .unwrap(),
         HostCallOutcome::Immediate(HostValue::I32(36))
     );
-    assert_eq!(
-        registry.call(7, &mut context, HostArgs::new(&[])),
-        Err(nexa_runtime::HostTrap::Panicked)
-    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = registry.call(0, &mut context, HostArgs::new(&[]));
+    })).is_err());
 }
 "#,
         )
