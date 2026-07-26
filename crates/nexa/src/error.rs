@@ -720,6 +720,7 @@ fn compile_error_span(error: &CompileError, file: FileId) -> Option<SourceSpan> 
         }
         CompileError::UnexpectedToken { offset, .. } => (*offset, offset.saturating_add(1)),
         CompileError::UnexpectedEnd => return Some(SourceSpan::new(file, 0, 0)),
+        CompileError::InvalidNumericConversion { span } => return Some(*span),
         _ => return None,
     };
     Some(SourceSpan::new(
@@ -743,6 +744,7 @@ fn compile_error_code(error: &CompileError) -> ErrorCode {
         | CompileError::Verify(_) => ErrorCode::NX2002,
         CompileError::InvalidReloadMetadata(_) => ErrorCode::NX6005,
         CompileError::TypeMismatch => ErrorCode::NX2101,
+        CompileError::InvalidNumericConversion { .. } => ErrorCode::NX2401,
         CompileError::CannotInferType => ErrorCode::NX2210,
         CompileError::NonExhaustiveMatch => ErrorCode::NX2201,
         CompileError::DuplicateMatchVariant => ErrorCode::NX2202,
@@ -768,6 +770,9 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
         CompileError::UnknownName(name) => write!(formatter, "unknown name `{name}`"),
         CompileError::UnknownType(name) => write!(formatter, "unknown type `{name}`"),
         CompileError::TypeMismatch => formatter.write_str("type mismatch"),
+        CompileError::InvalidNumericConversion { .. } => {
+            formatter.write_str("invalid implicit numeric conversion")
+        }
         CompileError::CannotInferType => formatter.write_str("cannot infer type"),
         CompileError::NonExhaustiveMatch => formatter.write_str("non-exhaustive match"),
         CompileError::DuplicateMatchVariant => formatter.write_str("duplicate match variant"),
@@ -953,6 +958,18 @@ mod tests {
         assert!(error.to_string().contains("error[NX1001]"));
         assert!(error.to_string().contains("unexpected character `界`"));
         assert!(error.to_string().contains("primary 9:4..7"));
+
+        let numeric = NexaError::from(Diagnostic::new(
+            &CompileError::InvalidNumericConversion {
+                span: SourceSpan::new(FileId(9), 12, 17),
+            },
+            FileId(9),
+        ));
+        assert_eq!(numeric.code(), ErrorCode::NX2401);
+        assert_eq!(
+            numeric.context().span,
+            Some(SourceSpan::new(FileId(9), 12, 17))
+        );
     }
 
     #[test]

@@ -6,7 +6,11 @@ use crate::GcRef;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RuntimeValue {
     I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
     Bool(bool),
+    Rune(u32),
     Ref(GcRef),
     NamedRef {
         reference: GcRef,
@@ -324,7 +328,11 @@ impl FrameArena {
                     Some(*reference)
                 }
                 RuntimeValue::I32(_)
+                | RuntimeValue::I64(_)
+                | RuntimeValue::F32(_)
+                | RuntimeValue::F64(_)
                 | RuntimeValue::Bool(_)
+                | RuntimeValue::Rune(_)
                 | RuntimeValue::HostRequest(_)
                 | RuntimeValue::ResourceToken(_)
                 | RuntimeValue::Snapshot(_)
@@ -353,7 +361,11 @@ impl FrameArena {
                             roots.push(reference);
                         }
                         RuntimeValue::I32(_)
+                        | RuntimeValue::I64(_)
+                        | RuntimeValue::F32(_)
+                        | RuntimeValue::F64(_)
                         | RuntimeValue::Bool(_)
+                        | RuntimeValue::Rune(_)
                         | RuntimeValue::HostRequest(_)
                         | RuntimeValue::ResourceToken(_)
                         | RuntimeValue::Snapshot(_)

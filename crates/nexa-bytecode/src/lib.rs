@@ -92,7 +92,11 @@ impl SectionKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ValueType {
     I32,
+    I64,
+    F32,
+    F64,
     Bool,
+    Rune,
     Ref,
     Named(StableId),
 }
@@ -273,7 +277,11 @@ pub fn parameterized_type_id(name: &str, arguments: &[ValueType]) -> StableId {
         }
         match argument {
             ValueType::I32 => canonical.push_str("i32"),
+            ValueType::I64 => canonical.push_str("i64"),
+            ValueType::F32 => canonical.push_str("f32"),
+            ValueType::F64 => canonical.push_str("f64"),
             ValueType::Bool => canonical.push_str("bool"),
+            ValueType::Rune => canonical.push_str("rune"),
             ValueType::Ref => canonical.push_str("ref"),
             ValueType::Named(id) => {
                 use std::fmt::Write;
@@ -376,6 +384,22 @@ pub enum Instruction {
         dst: u16,
         value: bool,
     },
+    LoadI64 {
+        dst: u16,
+        value: i64,
+    },
+    LoadF32 {
+        dst: u16,
+        bits: u32,
+    },
+    LoadF64 {
+        dst: u16,
+        bits: u64,
+    },
+    LoadRune {
+        dst: u16,
+        value: u32,
+    },
     Move {
         dst: u16,
         source: u16,
@@ -391,6 +415,71 @@ pub enum Instruction {
         rhs: u16,
     },
     Mul {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    Div {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    AddI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    SubI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    MulI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    DivI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    AddF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    SubF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    MulF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    DivF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    AddF64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    SubF64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    MulF64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    DivF64 {
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -654,10 +743,14 @@ fn hash_u64(hash: &mut u64, value: u64) {
 fn hash_value_type(hash: &mut u64, value: ValueType) {
     match value {
         ValueType::I32 => hash_u64(hash, 0),
-        ValueType::Bool => hash_u64(hash, 1),
-        ValueType::Ref => hash_u64(hash, 2),
+        ValueType::I64 => hash_u64(hash, 1),
+        ValueType::F32 => hash_u64(hash, 2),
+        ValueType::F64 => hash_u64(hash, 3),
+        ValueType::Bool => hash_u64(hash, 4),
+        ValueType::Rune => hash_u64(hash, 5),
+        ValueType::Ref => hash_u64(hash, 6),
         ValueType::Named(stable_id) => {
-            hash_u64(hash, 3);
+            hash_u64(hash, 7);
             hash_u64(hash, stable_id.0);
         }
     }
@@ -1743,6 +1836,10 @@ fn encode_type(output: &mut Vec<u8>, ty: ValueType) {
             output.push(3);
             put_u64(output, id.0);
         }
+        ValueType::I64 => output.push(4),
+        ValueType::F32 => output.push(5),
+        ValueType::F64 => output.push(6),
+        ValueType::Rune => output.push(7),
     }
 }
 
@@ -1752,6 +1849,10 @@ fn decode_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
         1 => Ok(ValueType::Bool),
         2 => Ok(ValueType::Ref),
         3 => Ok(ValueType::Named(StableId(reader.u64()?))),
+        4 => Ok(ValueType::I64),
+        5 => Ok(ValueType::F32),
+        6 => Ok(ValueType::F64),
+        7 => Ok(ValueType::Rune),
         value => Err(DecodeError::InvalidType(value)),
     }
 }
@@ -1769,6 +1870,26 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, dst);
             output.push(u8::from(value));
         }
+        Instruction::LoadI64 { dst, value } => {
+            output.push(36);
+            put_u16(output, dst);
+            output.extend_from_slice(&value.to_le_bytes());
+        }
+        Instruction::LoadF32 { dst, bits } => {
+            output.push(37);
+            put_u16(output, dst);
+            put_u32(output, bits);
+        }
+        Instruction::LoadF64 { dst, bits } => {
+            output.push(38);
+            put_u16(output, dst);
+            put_u64(output, bits);
+        }
+        Instruction::LoadRune { dst, value } => {
+            output.push(39);
+            put_u16(output, dst);
+            put_u32(output, value);
+        }
         Instruction::Move { dst, source } => {
             output.push(2);
             put_u16(output, dst);
@@ -1783,6 +1904,43 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
                 Instruction::Sub { .. } => 4,
                 Instruction::Mul { .. } => 5,
                 Instruction::CompareEq { .. } => 6,
+                _ => unreachable!(),
+            });
+            put_u16(output, dst);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+        }
+        Instruction::Div { dst, lhs, rhs } => {
+            output.push(44);
+            put_u16(output, dst);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+        }
+        Instruction::AddI64 { dst, lhs, rhs }
+        | Instruction::SubI64 { dst, lhs, rhs }
+        | Instruction::MulI64 { dst, lhs, rhs }
+        | Instruction::DivI64 { dst, lhs, rhs }
+        | Instruction::AddF32 { dst, lhs, rhs }
+        | Instruction::SubF32 { dst, lhs, rhs }
+        | Instruction::MulF32 { dst, lhs, rhs }
+        | Instruction::DivF32 { dst, lhs, rhs }
+        | Instruction::AddF64 { dst, lhs, rhs }
+        | Instruction::SubF64 { dst, lhs, rhs }
+        | Instruction::MulF64 { dst, lhs, rhs }
+        | Instruction::DivF64 { dst, lhs, rhs } => {
+            output.push(match instruction {
+                Instruction::AddI64 { .. } => 40,
+                Instruction::SubI64 { .. } => 41,
+                Instruction::MulI64 { .. } => 42,
+                Instruction::DivI64 { .. } => 43,
+                Instruction::AddF32 { .. } => 45,
+                Instruction::SubF32 { .. } => 46,
+                Instruction::MulF32 { .. } => 47,
+                Instruction::DivF32 { .. } => 48,
+                Instruction::AddF64 { .. } => 49,
+                Instruction::SubF64 { .. } => 50,
+                Instruction::MulF64 { .. } => 51,
+                Instruction::DivF64 { .. } => 52,
                 _ => unreachable!(),
             });
             put_u16(output, dst);
@@ -2138,6 +2296,43 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             target: decode_type(reader)?,
             dst: reader.u16()?,
         },
+        36 => Instruction::LoadI64 {
+            dst: reader.u16()?,
+            value: i64::from_le_bytes(reader.array()?),
+        },
+        37 => Instruction::LoadF32 {
+            dst: reader.u16()?,
+            bits: reader.u32()?,
+        },
+        38 => Instruction::LoadF64 {
+            dst: reader.u16()?,
+            bits: reader.u64()?,
+        },
+        39 => Instruction::LoadRune {
+            dst: reader.u16()?,
+            value: reader.u32()?,
+        },
+        opcode @ 40..=52 => {
+            let dst = reader.u16()?;
+            let lhs = reader.u16()?;
+            let rhs = reader.u16()?;
+            match opcode {
+                40 => Instruction::AddI64 { dst, lhs, rhs },
+                41 => Instruction::SubI64 { dst, lhs, rhs },
+                42 => Instruction::MulI64 { dst, lhs, rhs },
+                43 => Instruction::DivI64 { dst, lhs, rhs },
+                44 => Instruction::Div { dst, lhs, rhs },
+                45 => Instruction::AddF32 { dst, lhs, rhs },
+                46 => Instruction::SubF32 { dst, lhs, rhs },
+                47 => Instruction::MulF32 { dst, lhs, rhs },
+                48 => Instruction::DivF32 { dst, lhs, rhs },
+                49 => Instruction::AddF64 { dst, lhs, rhs },
+                50 => Instruction::SubF64 { dst, lhs, rhs },
+                51 => Instruction::MulF64 { dst, lhs, rhs },
+                52 => Instruction::DivF64 { dst, lhs, rhs },
+                _ => unreachable!(),
+            }
+        }
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -2894,6 +3089,110 @@ mod tests {
             .enum_type(state_handle_error_type())
             .enum_type(result)
             .function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn scalar_types_and_opcodes_round_trip_in_bytecode_v4() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::I32,
+                    ValueType::I64,
+                    ValueType::F32,
+                    ValueType::F64,
+                    ValueType::Rune,
+                ],
+                result: Some(ValueType::F64),
+            },
+            10,
+        );
+        function
+            .emit(Instruction::LoadI64 {
+                dst: 5,
+                value: i64::MIN,
+            })
+            .emit(Instruction::LoadF32 {
+                dst: 6,
+                bits: f32::NAN.to_bits(),
+            })
+            .emit(Instruction::LoadF64 {
+                dst: 7,
+                bits: f64::INFINITY.to_bits(),
+            })
+            .emit(Instruction::LoadRune {
+                dst: 8,
+                value: '界' as u32,
+            })
+            .emit(Instruction::Div {
+                dst: 0,
+                lhs: 0,
+                rhs: 0,
+            })
+            .emit(Instruction::AddI64 {
+                dst: 1,
+                lhs: 1,
+                rhs: 5,
+            })
+            .emit(Instruction::SubI64 {
+                dst: 1,
+                lhs: 1,
+                rhs: 5,
+            })
+            .emit(Instruction::MulI64 {
+                dst: 1,
+                lhs: 1,
+                rhs: 5,
+            })
+            .emit(Instruction::DivI64 {
+                dst: 1,
+                lhs: 1,
+                rhs: 5,
+            })
+            .emit(Instruction::AddF32 {
+                dst: 2,
+                lhs: 2,
+                rhs: 6,
+            })
+            .emit(Instruction::SubF32 {
+                dst: 2,
+                lhs: 2,
+                rhs: 6,
+            })
+            .emit(Instruction::MulF32 {
+                dst: 2,
+                lhs: 2,
+                rhs: 6,
+            })
+            .emit(Instruction::DivF32 {
+                dst: 2,
+                lhs: 2,
+                rhs: 6,
+            })
+            .emit(Instruction::AddF64 {
+                dst: 3,
+                lhs: 3,
+                rhs: 7,
+            })
+            .emit(Instruction::SubF64 {
+                dst: 3,
+                lhs: 3,
+                rhs: 7,
+            })
+            .emit(Instruction::MulF64 {
+                dst: 3,
+                lhs: 3,
+                rhs: 7,
+            })
+            .emit(Instruction::DivF64 {
+                dst: 9,
+                lhs: 3,
+                rhs: 7,
+            })
+            .emit(Instruction::Return { source: 9 });
+        let mut builder = ModuleBuilder::new();
+        builder.function(function.finish().unwrap());
         let module = builder.finish();
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }

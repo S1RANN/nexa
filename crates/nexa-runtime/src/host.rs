@@ -1002,7 +1002,11 @@ struct HostRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostPayload {
     I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
     Bool(bool),
+    Rune(u32),
     Opaque(u64),
     Token(ResourceTokenHandle),
     Snapshot(SnapshotHandle),
@@ -1012,8 +1016,11 @@ pub enum HostPayload {
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostValue {
     I32(i32),
+    I64(i64),
     F32(f32),
+    F64(f64),
     Bool(bool),
+    Rune(char),
     String(String),
     Opaque(u64),
     Struct(Vec<HostValue>),
@@ -1076,7 +1083,13 @@ impl<'a> HostArgs<'a> {
 fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
     match value {
         crate::RuntimeValue::I32(value) => HostValue::I32(value),
+        crate::RuntimeValue::I64(value) => HostValue::I64(value),
+        crate::RuntimeValue::F32(bits) => HostValue::F32(f32::from_bits(bits)),
+        crate::RuntimeValue::F64(bits) => HostValue::F64(f64::from_bits(bits)),
         crate::RuntimeValue::Bool(value) => HostValue::Bool(value),
+        crate::RuntimeValue::Rune(value) => {
+            HostValue::Rune(char::from_u32(value).expect("verified rune is a Unicode scalar value"))
+        }
         crate::RuntimeValue::Ref(reference) | crate::RuntimeValue::NamedRef { reference, .. } => {
             HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
         }

@@ -41,7 +41,9 @@ pub enum TokenKind {
     True,
     False,
     Ident(String),
-    Integer(i32),
+    Integer(i64),
+    Float(u64),
+    Rune(u32),
     LParen,
     RParen,
     LBrace,
@@ -53,6 +55,7 @@ pub enum TokenKind {
     Plus,
     Minus,
     Star,
+    Slash,
     Equal,
     FatArrow,
     Less,
@@ -85,6 +88,9 @@ pub enum CompileError {
     UnknownName(String),
     UnknownType(String),
     TypeMismatch,
+    InvalidNumericConversion {
+        span: SourceSpan,
+    },
     CannotInferType,
     NonExhaustiveMatch,
     DuplicateMatchVariant,
@@ -179,7 +185,11 @@ pub struct AstReturnType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstType {
     I32,
+    I64,
+    F32,
+    F64,
     Bool,
+    Rune,
     Named(String),
     BuiltinGeneric { name: String, arguments: Vec<Self> },
     Spanned { ty: Box<Self>, span: SourceSpan },
@@ -255,7 +265,9 @@ impl AstStatement {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AstExpression {
-    Integer(i32),
+    Integer(i64),
+    Float(u64),
+    Rune(u32),
     Bool(bool),
     Name(String),
     Binary {
@@ -405,6 +417,7 @@ pub enum BinaryOp {
     Add,
     Subtract,
     Multiply,
+    Divide,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -490,6 +503,7 @@ struct RegisterPlan {
     total: u16,
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
@@ -508,6 +522,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             ';' => TokenKind::Semicolon,
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
+            '/' => TokenKind::Slash,
             '=' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
                 let (next_offset, next) = chars.next().expect("peeked token exists");
                 end = next_offset.saturating_add(next.len_utf8());
@@ -530,6 +545,37 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 TokenKind::Arrow
             }
             '-' => TokenKind::Minus,
+            '\'' => {
+                let (_, value) = chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                let value = if value == '\\' {
+                    let (escape_offset, escape) =
+                        chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                    match escape {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        '\\' => '\\',
+                        '\'' => '\'',
+                        character => {
+                            return Err(CompileError::UnexpectedCharacter {
+                                offset: escape_offset,
+                                character,
+                            });
+                        }
+                    }
+                } else {
+                    value
+                };
+                let (close_offset, close) = chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                if close != '\'' {
+                    return Err(CompileError::UnexpectedToken {
+                        offset: close_offset,
+                        expected: "closing rune quote",
+                    });
+                }
+                end = close_offset + 1;
+                TokenKind::Rune(value.into())
+            }
             digit if digit.is_ascii_digit() => {
                 let mut text = digit.to_string();
                 while let Some((next_offset, next)) = chars.peek() {
@@ -540,10 +586,45 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     end = next_offset.saturating_add(next.len_utf8());
                     chars.next();
                 }
-                TokenKind::Integer(text.parse().map_err(|_| CompileError::UnexpectedToken {
-                    offset,
-                    expected: "i32 integer",
-                })?)
+                let decimal = chars.peek().is_some_and(|(_, next)| *next == '.') && {
+                    let mut lookahead = chars.clone();
+                    lookahead.next();
+                    lookahead.peek().is_none_or(|(_, next)| *next != '.')
+                };
+                if decimal {
+                    let (dot_offset, _) = chars.next().expect("peeked decimal point exists");
+                    text.push('.');
+                    end = dot_offset + 1;
+                    let mut digits = 0_usize;
+                    while let Some((next_offset, next)) = chars.peek() {
+                        if !next.is_ascii_digit() {
+                            break;
+                        }
+                        text.push(*next);
+                        end = next_offset.saturating_add(next.len_utf8());
+                        chars.next();
+                        digits += 1;
+                    }
+                    if digits == 0 {
+                        return Err(CompileError::UnexpectedToken {
+                            offset,
+                            expected: "floating-point digits",
+                        });
+                    }
+                    TokenKind::Float(
+                        text.parse::<f64>()
+                            .map_err(|_| CompileError::UnexpectedToken {
+                                offset,
+                                expected: "floating-point number",
+                            })?
+                            .to_bits(),
+                    )
+                } else {
+                    TokenKind::Integer(text.parse().map_err(|_| CompileError::UnexpectedToken {
+                        offset,
+                        expected: "integer",
+                    })?)
+                }
             }
             first if first == '_' || first.is_ascii_alphabetic() => {
                 let mut text = first.to_string();
@@ -886,6 +967,8 @@ impl Parser<'_> {
             TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
             TokenKind::Match => self.match_expression()?,
             TokenKind::Integer(value) => AstExpression::Integer(value),
+            TokenKind::Float(bits) => AstExpression::Float(bits),
+            TokenKind::Rune(value) => AstExpression::Rune(value),
             TokenKind::True => AstExpression::Bool(true),
             TokenKind::False => AstExpression::Bool(false),
             TokenKind::Ident(mut name) => {
@@ -975,6 +1058,7 @@ impl Parser<'_> {
                 Some(TokenKind::Plus) => (1, BinaryOp::Add),
                 Some(TokenKind::Minus) => (1, BinaryOp::Subtract),
                 Some(TokenKind::Star) => (2, BinaryOp::Multiply),
+                Some(TokenKind::Slash) => (2, BinaryOp::Divide),
                 _ => break,
             };
             if precedence < minimum_precedence {
@@ -1117,7 +1201,11 @@ impl Parser<'_> {
         let name = self.ident()?;
         let base = match name.as_str() {
             "i32" => AstType::I32,
+            "i64" => AstType::I64,
+            "f32" => AstType::F32,
+            "f64" => AstType::F64,
             "bool" => AstType::Bool,
+            "rune" => AstType::Rune,
             named => AstType::Named(named.to_owned()),
         };
         if self.take(&TokenKind::Less) {
@@ -1315,7 +1403,7 @@ fn migration_expressions_mut(intrinsic: &mut MigrationIntrinsic) -> Vec<&mut Ast
     }
 }
 
-fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, value: i32) {
+fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, value: i64) {
     for statement in statements {
         match statement.kind_mut() {
             AstStatement::Bind {
@@ -1342,7 +1430,7 @@ fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, va
     }
 }
 
-fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
+fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
     let kind = expression.kind_mut();
     match kind {
         AstExpression::Name(current) if current == name => {
@@ -1379,7 +1467,11 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
                 substitute_name(expression, name, value);
             }
         }
-        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
 }
@@ -1879,7 +1971,11 @@ fn validate_await_expression(
             }
             Ok(())
         }
-        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => Ok(()),
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => Ok(()),
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
@@ -2035,7 +2131,10 @@ fn resolve_expression(
                 resolve_expression(expression, scopes, next_local)?;
             }
         }
-        AstExpression::Integer(_) | AstExpression::Bool(_) => {}
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
     Ok(())
@@ -2060,7 +2159,13 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
             }
             Ok(())
         }
-        AstType::I32 | AstType::Bool | AstType::Named(_) => Ok(()),
+        AstType::I32
+        | AstType::I64
+        | AstType::F32
+        | AstType::F64
+        | AstType::Bool
+        | AstType::Rune
+        | AstType::Named(_) => Ok(()),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
@@ -2249,7 +2354,11 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Migration(intrinsic) => migration_expressions(intrinsic)
             .into_iter()
             .any(contains_await),
-        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => false,
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => false,
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
@@ -2263,21 +2372,58 @@ fn expression_type(
     expected: Option<ValueType>,
 ) -> Result<ValueType, CompileError> {
     let actual = match expression.kind() {
-        AstExpression::Integer(_) => ValueType::I32,
+        AstExpression::Integer(value) => match expected {
+            Some(ValueType::I32) => {
+                i32::try_from(*value).map_err(|_| CompileError::InvalidNumericConversion {
+                    span: expression.span(),
+                })?;
+                ValueType::I32
+            }
+            Some(ValueType::I64) => ValueType::I64,
+            Some(_) => return Err(CompileError::TypeMismatch),
+            None if i32::try_from(*value).is_ok() => ValueType::I32,
+            None => ValueType::I64,
+        },
+        AstExpression::Float(_) => match expected {
+            Some(ValueType::F32) => ValueType::F32,
+            Some(ValueType::F64) | None => ValueType::F64,
+            Some(_) => return Err(CompileError::TypeMismatch),
+        },
+        AstExpression::Rune(value) => {
+            if char::from_u32(*value).is_none() {
+                return Err(CompileError::TypeMismatch);
+            }
+            ValueType::Rune
+        }
         AstExpression::Bool(_) => ValueType::Bool,
         AstExpression::Name(name) => locals
             .get(name)
             .map(|(_, ty)| *ty)
             .ok_or_else(|| CompileError::UnknownName(name.clone()))?,
         AstExpression::Binary { lhs, rhs, .. } => {
-            if expression_type(lhs, locals, context, next_register, Some(ValueType::I32))?
-                != ValueType::I32
-                || expression_type(rhs, locals, context, next_register, Some(ValueType::I32))?
-                    != ValueType::I32
+            let numeric_type = if let Some(expected) = expected {
+                expected
+            } else {
+                expression_type(lhs, locals, context, next_register, None)?
+            };
+            if !matches!(
+                numeric_type,
+                ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
+            ) {
+                return Err(CompileError::TypeMismatch);
+            }
+            if expected.is_some()
+                && expression_type(lhs, locals, context, next_register, Some(numeric_type))?
+                    != numeric_type
             {
                 return Err(CompileError::TypeMismatch);
             }
-            ValueType::I32
+            if expression_type(rhs, locals, context, next_register, Some(numeric_type))?
+                != numeric_type
+            {
+                return Err(CompileError::TypeMismatch);
+            }
+            numeric_type
         }
         AstExpression::Call {
             function,
@@ -2481,7 +2627,17 @@ fn expression_type(
         }
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     };
-    if expected.is_some_and(|expected| actual != expected) {
+    if let Some(expected) = expected
+        && actual != expected
+    {
+        if matches!(
+            (actual, expected),
+            (ValueType::I64, ValueType::I32) | (ValueType::F64, ValueType::F32)
+        ) {
+            return Err(CompileError::InvalidNumericConversion {
+                span: expression.span(),
+            });
+        }
         return Err(CompileError::TypeMismatch);
     }
     Ok(actual)
@@ -2543,7 +2699,11 @@ fn migration_intrinsic_type(
 fn lower_type(ty: &AstType) -> ValueType {
     match ty.kind() {
         AstType::I32 => ValueType::I32,
+        AstType::I64 => ValueType::I64,
+        AstType::F32 => ValueType::F32,
+        AstType::F64 => ValueType::F64,
         AstType::Bool => ValueType::Bool,
+        AstType::Rune => ValueType::Rune,
         AstType::Named(name) => ValueType::Named(StableId::from_name(name)),
         AstType::BuiltinGeneric { name, arguments } if name == "Option" => {
             ValueType::Named(nexa_bytecode::option_type(lower_type(&arguments[0])).type_id)
@@ -2657,7 +2817,11 @@ fn inspect_expression_registers(
                 inspect_expression_registers(expression, plan)?;
             }
         }
-        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
     Ok(())
@@ -2671,7 +2835,11 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
                 .ok_or(CompileError::TooManyRegisters)
         };
     let required = match expression.kind() {
-        AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => 1,
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => 1,
         AstExpression::Binary { lhs, rhs, .. } => {
             usize::from(temporary_requirement(lhs)?).max(offset_requirement(1, rhs)?)
         }
@@ -2833,7 +3001,32 @@ fn exact_root_maps(
             Instruction::LoadI32 { dst, .. }
             | Instruction::Add { dst, .. }
             | Instruction::Sub { dst, .. }
-            | Instruction::Mul { dst, .. } => state[usize::from(dst)] = Some(ValueType::I32),
+            | Instruction::Mul { dst, .. }
+            | Instruction::Div { dst, .. } => state[usize::from(dst)] = Some(ValueType::I32),
+            Instruction::LoadI64 { dst, .. }
+            | Instruction::AddI64 { dst, .. }
+            | Instruction::SubI64 { dst, .. }
+            | Instruction::MulI64 { dst, .. }
+            | Instruction::DivI64 { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::I64);
+            }
+            Instruction::LoadF32 { dst, .. }
+            | Instruction::AddF32 { dst, .. }
+            | Instruction::SubF32 { dst, .. }
+            | Instruction::MulF32 { dst, .. }
+            | Instruction::DivF32 { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::F32);
+            }
+            Instruction::LoadF64 { dst, .. }
+            | Instruction::AddF64 { dst, .. }
+            | Instruction::SubF64 { dst, .. }
+            | Instruction::MulF64 { dst, .. }
+            | Instruction::DivF64 { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::F64);
+            }
+            Instruction::LoadRune { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::Rune);
+            }
             Instruction::LoadBool { dst, .. }
             | Instruction::CompareEq { dst, .. }
             | Instruction::StateHandleIsAlive { dst, .. }
@@ -3184,7 +3377,7 @@ fn emit_statements(
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 fn emit_expression(
     expression: &AstExpression,
     destination: u16,
@@ -3207,10 +3400,41 @@ fn emit_expression(
         return result;
     }
     match expression.kind() {
-        AstExpression::Integer(value) => code.push(Instruction::LoadI32 {
-            dst: destination,
-            value: *value,
-        }),
+        AstExpression::Integer(value) => match expected {
+            Some(ValueType::I64) => code.push(Instruction::LoadI64 {
+                dst: destination,
+                value: *value,
+            }),
+            Some(ValueType::I32) | None => code.push(Instruction::LoadI32 {
+                dst: destination,
+                value: i32::try_from(*value).map_err(|_| {
+                    CompileError::InvalidNumericConversion {
+                        span: expression.span(),
+                    }
+                })?,
+            }),
+            Some(_) => return Err(CompileError::TypeMismatch),
+        },
+        AstExpression::Float(bits) => match expected {
+            Some(ValueType::F32) => code.push(Instruction::LoadF32 {
+                dst: destination,
+                bits: (f64::from_bits(*bits) as f32).to_bits(),
+            }),
+            Some(ValueType::F64) | None => code.push(Instruction::LoadF64 {
+                dst: destination,
+                bits: *bits,
+            }),
+            Some(_) => return Err(CompileError::TypeMismatch),
+        },
+        AstExpression::Rune(value) => {
+            if char::from_u32(*value).is_none() {
+                return Err(CompileError::TypeMismatch);
+            }
+            code.push(Instruction::LoadRune {
+                dst: destination,
+                value: *value,
+            });
+        }
         AstExpression::Bool(value) => code.push(Instruction::LoadBool {
             dst: destination,
             value: *value,
@@ -3226,42 +3450,102 @@ fn emit_expression(
             });
         }
         AstExpression::Binary { op, lhs, rhs } => {
+            let numeric_type =
+                expected.unwrap_or(emitted_expression_type(lhs, None, locals, context)?);
+            if !matches!(
+                numeric_type,
+                ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
+            ) {
+                return Err(CompileError::TypeMismatch);
+            }
             let lhs_register = destination;
             let rhs_register = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
-            emit_expression(
-                lhs,
-                lhs_register,
-                Some(ValueType::I32),
-                locals,
-                context,
-                code,
-            )?;
-            emit_expression(
-                rhs,
-                rhs_register,
-                Some(ValueType::I32),
-                locals,
-                context,
-                code,
-            )?;
-            code.push(match op.kind {
-                BinaryOp::Add => Instruction::Add {
+            emit_expression(lhs, lhs_register, Some(numeric_type), locals, context, code)?;
+            emit_expression(rhs, rhs_register, Some(numeric_type), locals, context, code)?;
+            code.push(match (numeric_type, op.kind) {
+                (ValueType::I32, BinaryOp::Add) => Instruction::Add {
                     dst: destination,
                     lhs: lhs_register,
                     rhs: rhs_register,
                 },
-                BinaryOp::Subtract => Instruction::Sub {
+                (ValueType::I32, BinaryOp::Subtract) => Instruction::Sub {
                     dst: destination,
                     lhs: lhs_register,
                     rhs: rhs_register,
                 },
-                BinaryOp::Multiply => Instruction::Mul {
+                (ValueType::I32, BinaryOp::Multiply) => Instruction::Mul {
                     dst: destination,
                     lhs: lhs_register,
                     rhs: rhs_register,
                 },
+                (ValueType::I32, BinaryOp::Divide) => Instruction::Div {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::I64, BinaryOp::Add) => Instruction::AddI64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::I64, BinaryOp::Subtract) => Instruction::SubI64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::I64, BinaryOp::Multiply) => Instruction::MulI64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::I64, BinaryOp::Divide) => Instruction::DivI64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F32, BinaryOp::Add) => Instruction::AddF32 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F32, BinaryOp::Subtract) => Instruction::SubF32 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F32, BinaryOp::Multiply) => Instruction::MulF32 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F32, BinaryOp::Divide) => Instruction::DivF32 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F64, BinaryOp::Add) => Instruction::AddF64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F64, BinaryOp::Subtract) => Instruction::SubF64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F64, BinaryOp::Multiply) => Instruction::MulF64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                (ValueType::F64, BinaryOp::Divide) => Instruction::DivF64 {
+                    dst: destination,
+                    lhs: lhs_register,
+                    rhs: rhs_register,
+                },
+                _ => return Err(CompileError::TypeMismatch),
             });
         }
         AstExpression::Call {
@@ -3451,6 +3735,7 @@ fn context_function_signature<'a>(
         .map(|function| &function.signature)
 }
 
+#[allow(clippy::too_many_lines)]
 fn emitted_expression_type(
     expression: &AstExpression,
     expected: Option<ValueType>,
@@ -3458,7 +3743,34 @@ fn emitted_expression_type(
     context: &EmitContext<'_>,
 ) -> Result<ValueType, CompileError> {
     match expression.kind() {
-        AstExpression::Integer(_) | AstExpression::Binary { .. } => Ok(ValueType::I32),
+        AstExpression::Integer(value) => match expected {
+            Some(ValueType::I32) | None if i32::try_from(*value).is_ok() => Ok(ValueType::I32),
+            Some(ValueType::I64) | None => Ok(ValueType::I64),
+            Some(_) => Err(CompileError::TypeMismatch),
+        },
+        AstExpression::Float(_) => match expected {
+            Some(ValueType::F32) => Ok(ValueType::F32),
+            Some(ValueType::F64) | None => Ok(ValueType::F64),
+            Some(_) => Err(CompileError::TypeMismatch),
+        },
+        AstExpression::Rune(value) => char::from_u32(*value)
+            .map(|_| ValueType::Rune)
+            .ok_or(CompileError::TypeMismatch),
+        AstExpression::Binary { lhs, .. } => {
+            let ty = if let Some(expected) = expected {
+                expected
+            } else {
+                emitted_expression_type(lhs, None, locals, context)?
+            };
+            if matches!(
+                ty,
+                ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
+            ) {
+                Ok(ty)
+            } else {
+                Err(CompileError::TypeMismatch)
+            }
+        }
         AstExpression::Bool(_) => Ok(ValueType::Bool),
         AstExpression::Name(name) => locals
             .get(name)
@@ -4061,7 +4373,11 @@ pub fn compile_with_interface(
 fn lower_idl_type(ty: &TypeRef) -> ValueType {
     match ty {
         TypeRef::I32 => ValueType::I32,
+        TypeRef::I64 => ValueType::I64,
+        TypeRef::F32 => ValueType::F32,
+        TypeRef::F64 => ValueType::F64,
         TypeRef::Bool => ValueType::Bool,
+        TypeRef::Rune => ValueType::Rune,
         TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
         TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
         TypeRef::Snapshot(_) => ValueType::Named(StableId::from_name("Snapshot")),
@@ -4071,7 +4387,6 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         TypeRef::Result(success, error) => ValueType::Named(
             nexa_bytecode::result_type(lower_idl_type(success), lower_idl_type(error)).type_id,
         ),
-        TypeRef::F32 => ValueType::Named(StableId::from_name("f32")),
         TypeRef::String => ValueType::Named(StableId::from_name("string")),
         TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
     }
@@ -4097,7 +4412,7 @@ fn compile_module(
 mod tests {
     use nexa_bytecode::{FunctionEffect, Instruction};
     use nexa_core::{FileId, StableId};
-    use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue};
+    use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue, TrapKind};
 
     use super::{
         AstExpression, AstStatement, AstType, CompileError, compile, lex, parse_with_file,
@@ -4222,6 +4537,45 @@ migration fn migrate() -> bool {
                 value: Some(RuntimeValue::I32(42)),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn every_scalar_type_compiles_verifies_and_executes_with_defined_arithmetic() {
+        let module = compile(
+            "fn wrap32() -> i32 { return 2147483647 + 1; }
+             fn wrap64() -> i64 { return 9223372036854775807 + 1; }
+             fn ratio32() -> f32 { return 7.5 / 2.5; }
+             fn ratio64() -> f64 { return 7.0 / 2.0; }
+             fn glyph() -> rune { return '界'; }
+             fn divide_zero() -> i64 { return 9 / 0; }",
+        )
+        .unwrap();
+
+        let returned = |function| {
+            let InterpreterOutcome::Returned { value, .. } =
+                CheckedInterpreter::run(&module, function, &[], 100).unwrap()
+            else {
+                panic!("scalar function must return");
+            };
+            value
+        };
+        assert_eq!(returned(0), Some(RuntimeValue::I32(i32::MIN)));
+        assert_eq!(returned(1), Some(RuntimeValue::I64(i64::MIN)));
+        assert_eq!(returned(2), Some(RuntimeValue::F32(3.0_f32.to_bits())));
+        assert_eq!(returned(3), Some(RuntimeValue::F64(3.5_f64.to_bits())));
+        assert_eq!(returned(4), Some(RuntimeValue::Rune('界' as u32)));
+
+        let InterpreterOutcome::Trapped { trap, .. } =
+            CheckedInterpreter::run(&module, 5, &[], 100).unwrap()
+        else {
+            panic!("integer division by zero must trap");
+        };
+        assert_eq!(trap.kind, TrapKind::DivideByZero);
+
+        assert!(matches!(
+            compile("fn narrow(value: i64) -> i32 { return value; }"),
+            Err(CompileError::InvalidNumericConversion { .. })
         ));
     }
 

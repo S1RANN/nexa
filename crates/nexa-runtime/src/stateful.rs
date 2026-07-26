@@ -56,7 +56,11 @@ impl StateHandle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StateValue {
     I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
     Bool(bool),
+    Rune(u32),
     Ref(GcRef),
     Handle(StateHandle),
     Object(StateObject),
@@ -208,7 +212,11 @@ pub struct OfflineStateField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OfflineStateValue {
     I32(i32),
+    I64(i64),
+    F32(u32),
+    F64(u64),
     Bool(bool),
+    Rune(u32),
     Handle(StateHandle),
 }
 
@@ -792,6 +800,8 @@ fn object_payload_bytes(slot: &MigrationObjectSlot) -> usize {
 fn state_value_payload_bytes(value: &StateValue) -> usize {
     match value {
         StateValue::I32(_) => std::mem::size_of::<i32>(),
+        StateValue::I64(_) | StateValue::F64(_) => std::mem::size_of::<u64>(),
+        StateValue::F32(_) | StateValue::Rune(_) => std::mem::size_of::<u32>(),
         StateValue::Bool(_) => 1,
         StateValue::Ref(_) => std::mem::size_of::<GcRef>(),
         StateValue::Handle(_) => std::mem::size_of::<StateHandle>(),
@@ -802,7 +812,11 @@ fn state_value_payload_bytes(value: &StateValue) -> usize {
 fn state_value_type(value: &StateValue) -> ValueType {
     match value {
         StateValue::I32(_) => ValueType::I32,
+        StateValue::I64(_) => ValueType::I64,
+        StateValue::F32(_) => ValueType::F32,
+        StateValue::F64(_) => ValueType::F64,
         StateValue::Bool(_) => ValueType::Bool,
+        StateValue::Rune(_) => ValueType::Rune,
         StateValue::Ref(_) => ValueType::Ref,
         StateValue::Handle(_) => ValueType::Named(nexa_bytecode::state_handle_type(
             ValueType::Named(StableId::from_name("StateValue")),
@@ -834,19 +848,29 @@ fn reject_nested_object(value: &StateValue) -> Result<(), StatefulError> {
 }
 
 fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -> bool {
-    matches!(
-        (value, expected),
+    match (value, expected) {
+        (&StateValue::Rune(value), nexa_bytecode::ValueType::Rune) => {
+            char::from_u32(value).is_some()
+        }
         (&StateValue::I32(_), nexa_bytecode::ValueType::I32)
-            | (&StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
-            | (&StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
-            | (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(_))
-    )
+        | (&StateValue::I64(_), nexa_bytecode::ValueType::I64)
+        | (&StateValue::F32(_), nexa_bytecode::ValueType::F32)
+        | (&StateValue::F64(_), nexa_bytecode::ValueType::F64)
+        | (&StateValue::Bool(_), nexa_bytecode::ValueType::Bool)
+        | (&StateValue::Ref(_), nexa_bytecode::ValueType::Ref)
+        | (&StateValue::Handle(_), nexa_bytecode::ValueType::Named(_)) => true,
+        _ => false,
+    }
 }
 
 fn clone_leaf_value(value: &StateValue) -> StateValue {
     match value {
         StateValue::I32(value) => StateValue::I32(*value),
+        StateValue::I64(value) => StateValue::I64(*value),
+        StateValue::F32(value) => StateValue::F32(*value),
+        StateValue::F64(value) => StateValue::F64(*value),
         StateValue::Bool(value) => StateValue::Bool(*value),
+        StateValue::Rune(value) => StateValue::Rune(*value),
         StateValue::Ref(reference) => StateValue::Ref(*reference),
         StateValue::Handle(handle) => StateValue::Handle(*handle),
         StateValue::Object(_) => unreachable!("nested state objects are rejected at admission"),
@@ -1096,6 +1120,22 @@ fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue)
         StateValue::I32(value) => {
             hash.write_u8(1);
             hash.write(&value.to_le_bytes());
+        }
+        StateValue::I64(value) => {
+            hash.write_u8(5);
+            hash.write(&value.to_le_bytes());
+        }
+        StateValue::F32(bits) => {
+            hash.write_u8(6);
+            hash.write_u32(*bits);
+        }
+        StateValue::F64(bits) => {
+            hash.write_u8(7);
+            hash.write_u64(*bits);
+        }
+        StateValue::Rune(value) => {
+            hash.write_u8(8);
+            hash.write_u32(*value);
         }
         StateValue::Bool(value) => {
             hash.write_u8(2);
@@ -1715,7 +1755,11 @@ fn slot_to_runtime_value(slot: &MigrationObjectSlot) -> RuntimeValue {
 fn state_to_runtime_value(stable_id: StableId, value: &StateValue) -> RuntimeValue {
     match value {
         StateValue::I32(value) => RuntimeValue::I32(*value),
+        StateValue::I64(value) => RuntimeValue::I64(*value),
+        StateValue::F32(bits) => RuntimeValue::F32(*bits),
+        StateValue::F64(bits) => RuntimeValue::F64(*bits),
         StateValue::Bool(value) => RuntimeValue::Bool(*value),
+        StateValue::Rune(value) => RuntimeValue::Rune(*value),
         StateValue::Ref(reference) => RuntimeValue::Ref(*reference),
         StateValue::Handle(handle) => RuntimeValue::Opaque {
             type_id: StableId::from_name("StateHandle"),
@@ -1735,7 +1779,11 @@ fn runtime_to_state_value(
 ) -> Result<StateValue, RuntimeMessage> {
     match value {
         RuntimeValue::I32(value) => Ok(StateValue::I32(value)),
+        RuntimeValue::I64(value) => Ok(StateValue::I64(value)),
+        RuntimeValue::F32(bits) => Ok(StateValue::F32(bits)),
+        RuntimeValue::F64(bits) => Ok(StateValue::F64(bits)),
         RuntimeValue::Bool(value) => Ok(StateValue::Bool(value)),
+        RuntimeValue::Rune(value) => Ok(StateValue::Rune(value)),
         RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
             Ok(StateValue::Ref(reference))
         }
@@ -1771,7 +1819,11 @@ fn runtime_to_state_value(
 fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
     match value {
         RuntimeValue::I32(_) => nexa_bytecode::ValueType::I32,
+        RuntimeValue::I64(_) => nexa_bytecode::ValueType::I64,
+        RuntimeValue::F32(_) => nexa_bytecode::ValueType::F32,
+        RuntimeValue::F64(_) => nexa_bytecode::ValueType::F64,
         RuntimeValue::Bool(_) => nexa_bytecode::ValueType::Bool,
+        RuntimeValue::Rune(_) => nexa_bytecode::ValueType::Rune,
         RuntimeValue::Ref(_) => nexa_bytecode::ValueType::Ref,
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             nexa_bytecode::ValueType::Named(type_id)
@@ -1862,7 +1914,11 @@ pub fn run_offline_migration(
                 field_id: field.stable_id,
                 value: match field.value {
                     OfflineStateValue::I32(value) => StateValue::I32(value),
+                    OfflineStateValue::I64(value) => StateValue::I64(value),
+                    OfflineStateValue::F32(value) => StateValue::F32(value),
+                    OfflineStateValue::F64(value) => StateValue::F64(value),
                     OfflineStateValue::Bool(value) => StateValue::Bool(value),
+                    OfflineStateValue::Rune(value) => StateValue::Rune(value),
                     OfflineStateValue::Handle(handle) => StateValue::Handle(handle),
                 },
             }));
@@ -1937,7 +1993,11 @@ pub fn run_offline_migration(
                 .map(|field| {
                     let value = match field.value {
                         StateValue::I32(value) => OfflineStateValue::I32(value),
+                        StateValue::I64(value) => OfflineStateValue::I64(value),
+                        StateValue::F32(value) => OfflineStateValue::F32(value),
+                        StateValue::F64(value) => OfflineStateValue::F64(value),
                         StateValue::Bool(value) => OfflineStateValue::Bool(value),
+                        StateValue::Rune(value) => OfflineStateValue::Rune(value),
                         StateValue::Handle(handle) => OfflineStateValue::Handle(handle),
                         StateValue::Ref(_) | StateValue::Object(_) => {
                             return Err(OfflineMigrationError::UnsupportedOutputValue);

@@ -61,6 +61,7 @@ pub enum VerifyErrorKind {
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
     InvalidReloadMetadata,
+    InvalidRune(u32),
 }
 
 impl fmt::Display for VerifyError {
@@ -328,6 +329,15 @@ fn verify_function(
         let mut successors = Vec::with_capacity(2);
         match instruction {
             Instruction::LoadI32 { dst, .. } => state[register(dst)?] = Some(ValueType::I32),
+            Instruction::LoadI64 { dst, .. } => state[register(dst)?] = Some(ValueType::I64),
+            Instruction::LoadF32 { dst, .. } => state[register(dst)?] = Some(ValueType::F32),
+            Instruction::LoadF64 { dst, .. } => state[register(dst)?] = Some(ValueType::F64),
+            Instruction::LoadRune { dst, value } => {
+                if char::from_u32(value).is_none() {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidRune(value)));
+                }
+                state[register(dst)?] = Some(ValueType::Rune);
+            }
             Instruction::LoadBool { dst, .. } => state[register(dst)?] = Some(ValueType::Bool),
             Instruction::Move { dst, source } => {
                 let source = register(source)?;
@@ -337,10 +347,35 @@ fn verify_function(
             }
             Instruction::Add { dst, lhs, rhs }
             | Instruction::Sub { dst, lhs, rhs }
-            | Instruction::Mul { dst, lhs, rhs } => {
+            | Instruction::Mul { dst, lhs, rhs }
+            | Instruction::Div { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::I32)?;
                 require(&state, rhs, ValueType::I32)?;
                 state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::AddI64 { dst, lhs, rhs }
+            | Instruction::SubI64 { dst, lhs, rhs }
+            | Instruction::MulI64 { dst, lhs, rhs }
+            | Instruction::DivI64 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::I64)?;
+                require(&state, rhs, ValueType::I64)?;
+                state[register(dst)?] = Some(ValueType::I64);
+            }
+            Instruction::AddF32 { dst, lhs, rhs }
+            | Instruction::SubF32 { dst, lhs, rhs }
+            | Instruction::MulF32 { dst, lhs, rhs }
+            | Instruction::DivF32 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::F32)?;
+                require(&state, rhs, ValueType::F32)?;
+                state[register(dst)?] = Some(ValueType::F32);
+            }
+            Instruction::AddF64 { dst, lhs, rhs }
+            | Instruction::SubF64 { dst, lhs, rhs }
+            | Instruction::MulF64 { dst, lhs, rhs }
+            | Instruction::DivF64 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::F64)?;
+                require(&state, rhs, ValueType::F64)?;
+                state[register(dst)?] = Some(ValueType::F64);
             }
             Instruction::CompareEq { dst, lhs, rhs } => {
                 let lhs = register(lhs)?;
@@ -1129,6 +1164,31 @@ mod tests {
                 .unwrap_err()
                 .kind,
             VerifyErrorKind::InvalidSourceMap
+        );
+    }
+
+    #[test]
+    fn rejects_non_scalar_rune_constants() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::Rune),
+            },
+            1,
+        );
+        function
+            .emit(Instruction::LoadRune {
+                dst: 0,
+                value: 0xD800,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut module = ModuleBuilder::new();
+        module.function(function.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidRune(0xD800)
         );
     }
 

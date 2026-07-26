@@ -184,7 +184,11 @@ fn fixture_schema(schema: &nexa_bytecode::StateSchema) -> StateFixtureSchema {
                         stable_id: field.stable_id.0,
                         kind: match field.ty {
                             ValueType::I32 => StateFixtureValueKind::I32,
+                            ValueType::I64 => StateFixtureValueKind::I64,
+                            ValueType::F32 => StateFixtureValueKind::F32,
+                            ValueType::F64 => StateFixtureValueKind::F64,
                             ValueType::Bool => StateFixtureValueKind::Bool,
+                            ValueType::Rune => StateFixtureValueKind::Rune,
                             ValueType::Ref => StateFixtureValueKind::ObjectReference,
                             ValueType::Named(_) => StateFixtureValueKind::StateHandle,
                         },
@@ -222,7 +226,11 @@ fn offline_field(
 ) -> Result<OfflineStateField, MigrateCheckError> {
     let value = match &field.value {
         StateFixtureValue::I32 { value } => OfflineStateValue::I32(*value),
+        StateFixtureValue::I64 { value } => OfflineStateValue::I64(*value),
+        StateFixtureValue::F32 { value } => OfflineStateValue::F32(value.to_bits()),
+        StateFixtureValue::F64 { value } => OfflineStateValue::F64(value.to_bits()),
         StateFixtureValue::Bool { value } => OfflineStateValue::Bool(*value),
+        StateFixtureValue::Rune { value } => OfflineStateValue::Rune((*value).into()),
         StateFixtureValue::StateHandle {
             domain,
             stable_id,
@@ -245,7 +253,12 @@ fn offline_field(
         fixture.stateful_domain,
         match value {
             OfflineStateValue::Handle(handle) => handle.domain.get(),
-            OfflineStateValue::I32(_) | OfflineStateValue::Bool(_) => fixture.stateful_domain,
+            OfflineStateValue::I32(_)
+            | OfflineStateValue::I64(_)
+            | OfflineStateValue::F32(_)
+            | OfflineStateValue::F64(_)
+            | OfflineStateValue::Bool(_)
+            | OfflineStateValue::Rune(_) => fixture.stateful_domain,
         }
     );
     Ok(OfflineStateField {
@@ -271,7 +284,18 @@ fn output_fixture(domain: u64, objects: Vec<OfflineStateObject>) -> StateFixture
                         stable_id: field.stable_id.0,
                         value: match field.value {
                             OfflineStateValue::I32(value) => StateFixtureValue::I32 { value },
+                            OfflineStateValue::I64(value) => StateFixtureValue::I64 { value },
+                            OfflineStateValue::F32(bits) => StateFixtureValue::F32 {
+                                value: f32::from_bits(bits),
+                            },
+                            OfflineStateValue::F64(bits) => StateFixtureValue::F64 {
+                                value: f64::from_bits(bits),
+                            },
                             OfflineStateValue::Bool(value) => StateFixtureValue::Bool { value },
+                            OfflineStateValue::Rune(value) => StateFixtureValue::Rune {
+                                value: char::from_u32(value)
+                                    .expect("verified rune is a Unicode scalar value"),
+                            },
                             OfflineStateValue::Handle(handle) => StateFixtureValue::StateHandle {
                                 domain: handle.domain.get(),
                                 stable_id: handle.stable_id.0,

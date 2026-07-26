@@ -65,8 +65,11 @@ pub struct Export {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeRef {
     I32,
+    I64,
     F32,
+    F64,
     Bool,
+    Rune,
     String,
     HostRequest(Option<Box<TypeRef>>),
     ResourceToken(Option<Box<TypeRef>>),
@@ -378,7 +381,11 @@ fn pascal_case(name: &str) -> String {
 fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
         TypeRef::I32 => format!("nexa_runtime::HostPayload::I32({source})"),
+        TypeRef::I64 => format!("nexa_runtime::HostPayload::I64({source})"),
+        TypeRef::F32 => format!("nexa_runtime::HostPayload::F32({source}.to_bits())"),
+        TypeRef::F64 => format!("nexa_runtime::HostPayload::F64({source}.to_bits())"),
         TypeRef::Bool => format!("nexa_runtime::HostPayload::Bool({source})"),
+        TypeRef::Rune => format!("nexa_runtime::HostPayload::Rune({source} as u32)"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostPayload::Token({source})"),
         TypeRef::Snapshot(_) => format!("nexa_runtime::HostPayload::Snapshot({source})"),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
@@ -411,8 +418,11 @@ fn decode_host_value(idl: &Idl, ty: &TypeRef, index: usize) -> String {
 fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
         TypeRef::I32 => decode_match(source, "I32", "*value"),
+        TypeRef::I64 => decode_match(source, "I64", "*value"),
         TypeRef::F32 => decode_match(source, "F32", "*value"),
+        TypeRef::F64 => decode_match(source, "F64", "*value"),
         TypeRef::Bool => decode_match(source, "Bool", "*value"),
+        TypeRef::Rune => decode_match(source, "Rune", "*value"),
         TypeRef::String => decode_match(source, "String", "value.clone()"),
         TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
         TypeRef::ResourceToken(_) => decode_match(source, "Token", "*value"),
@@ -485,8 +495,11 @@ fn encode_host_result(idl: &Idl, ty: &TypeRef) -> String {
 fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
         TypeRef::I32 => format!("nexa_runtime::HostValue::I32({source})"),
+        TypeRef::I64 => format!("nexa_runtime::HostValue::I64({source})"),
         TypeRef::F32 => format!("nexa_runtime::HostValue::F32({source})"),
+        TypeRef::F64 => format!("nexa_runtime::HostValue::F64({source})"),
         TypeRef::Bool => format!("nexa_runtime::HostValue::Bool({source})"),
+        TypeRef::Rune => format!("nexa_runtime::HostValue::Rune({source})"),
         TypeRef::String => format!("nexa_runtime::HostValue::String({source})"),
         TypeRef::HostRequest(_) => format!("nexa_runtime::HostValue::Request({source})"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostValue::Token({source})"),
@@ -526,8 +539,11 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
 fn type_name(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 => "i32".into(),
+        TypeRef::I64 => "i64".into(),
         TypeRef::F32 => "f32".into(),
+        TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
+        TypeRef::Rune => "rune".into(),
         TypeRef::String => "string".into(),
         TypeRef::HostRequest(inner) => parameterized_type_name("request", inner.as_deref()),
         TypeRef::ResourceToken(inner) => parameterized_type_name("token", inner.as_deref()),
@@ -550,8 +566,11 @@ fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
 fn rust_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 => "i32".into(),
+        TypeRef::I64 => "i64".into(),
         TypeRef::F32 => "f32".into(),
+        TypeRef::F64 => "f64".into(),
         TypeRef::Bool => "bool".into(),
+        TypeRef::Rune => "char".into(),
         TypeRef::String => "String".into(),
         TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle".into(),
         TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle".into(),
@@ -748,8 +767,11 @@ impl Parser {
         let name = self.word()?;
         Ok(match name.as_str() {
             "i32" => TypeRef::I32,
+            "i64" => TypeRef::I64,
             "f32" => TypeRef::F32,
+            "f64" => TypeRef::F64,
             "bool" => TypeRef::Bool,
+            "rune" => TypeRef::Rune,
             "string" => TypeRef::String,
             "host_request" | "request" => TypeRef::HostRequest(self.optional_type_argument()?),
             "resource_token" | "token" => TypeRef::ResourceToken(self.optional_type_argument()?),
@@ -943,6 +965,17 @@ mod tests {
         )
         .unwrap();
         assert_ne!(exact_hash(&typed), exact_hash(&cancel_task));
+
+        let scalar = generate_rust(
+            &parse(
+                "interface Scalars {
+                    request(return_error, trap) fn sample()
+                        -> request<Result<f64, i32>>;
+                }",
+            )
+            .unwrap(),
+        );
+        assert!(scalar.contains("HostPayload::F64(value.to_bits())"));
     }
 
     #[test]
@@ -954,6 +987,7 @@ mod tests {
                 struct Vec3 { x: f32; y: f32; z: f32; }
                 sync fn add(lhs: i32, rhs: i32) -> i32;
                 sync fn position(entity: Entity, value: Vec3) -> Vec3;
+                sync fn scalar_mix(wide: i64, ratio: f64, glyph: rune) -> f64;
                 sync fn explode() -> i32;
                 export Update(value: i32) -> i32;
             }",
@@ -1006,6 +1040,16 @@ impl GameHost for Mock {
         Ok(value)
     }
 
+    fn scalar_mix(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        wide: i64,
+        ratio: f64,
+        glyph: char,
+    ) -> Result<f64, HostError> {
+        Ok(wide as f64 + ratio + f64::from(glyph as u32))
+    }
+
     fn explode(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
@@ -1044,8 +1088,13 @@ fn main() {
             HostValue::F32(3.0),
         ]))
     );
+    let scalars = [HostValue::I64(4), HostValue::F64(0.5), HostValue::Rune('A')];
     assert_eq!(
-        registry.call(2, &mut context, HostArgs::new(&[])),
+        registry.call(2, &mut context, HostArgs::new(&scalars)).unwrap(),
+        HostCallOutcome::Immediate(HostValue::F64(69.5))
+    );
+    assert_eq!(
+        registry.call(3, &mut context, HostArgs::new(&[])),
         Err(nexa_runtime::HostTrap::Panicked)
     );
 }

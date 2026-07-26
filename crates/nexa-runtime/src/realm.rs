@@ -206,7 +206,11 @@ fn host_to_runtime_value(
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
+        (HostValue::I64(value), Some(ValueType::I64)) => Ok(RuntimeValue::I64(value)),
+        (HostValue::F32(value), Some(ValueType::F32)) => Ok(RuntimeValue::F32(value.to_bits())),
+        (HostValue::F64(value), Some(ValueType::F64)) => Ok(RuntimeValue::F64(value.to_bits())),
         (HostValue::Bool(value), Some(ValueType::Bool)) => Ok(RuntimeValue::Bool(value)),
+        (HostValue::Rune(value), Some(ValueType::Rune)) => Ok(RuntimeValue::Rune(value.into())),
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
         }
@@ -233,7 +237,13 @@ fn completion_to_runtime(
     }
     match (payload, expected) {
         (HostPayload::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
+        (HostPayload::I64(value), Some(ValueType::I64)) => Ok(RuntimeValue::I64(value)),
+        (HostPayload::F32(bits), Some(ValueType::F32)) => Ok(RuntimeValue::F32(bits)),
+        (HostPayload::F64(bits), Some(ValueType::F64)) => Ok(RuntimeValue::F64(bits)),
         (HostPayload::Bool(value), Some(ValueType::Bool)) => Ok(RuntimeValue::Bool(value)),
+        (HostPayload::Rune(value), Some(ValueType::Rune)) if char::from_u32(value).is_some() => {
+            Ok(RuntimeValue::Rune(value))
+        }
         (HostPayload::Opaque(value), Some(ValueType::Named(type_id))) => {
             Ok(RuntimeValue::Opaque { value, type_id })
         }
@@ -1935,6 +1945,7 @@ impl RealmRuntime {
         Ok(ResultWritebackPreflight { action })
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn preflight_async_error(
         &mut self,
         snapshot: crate::TaskSnapshot,
@@ -1945,6 +1956,21 @@ impl RealmRuntime {
             ValueType::I32 => PlannedResultPayload::Value(RuntimeValue::I32(i32::from_ne_bytes(
                 code.to_ne_bytes(),
             ))),
+            ValueType::I64 => PlannedResultPayload::Value(RuntimeValue::I64(i64::from(code))),
+            ValueType::F32 => {
+                PlannedResultPayload::Value(RuntimeValue::F32((code as f32).to_bits()))
+            }
+            ValueType::F64 => {
+                PlannedResultPayload::Value(RuntimeValue::F64(f64::from(code).to_bits()))
+            }
+            ValueType::Rune if char::from_u32(code).is_some() => {
+                PlannedResultPayload::Value(RuntimeValue::Rune(code))
+            }
+            ValueType::Rune => {
+                return Ok(ResultWritebackAction::TrapMessage(
+                    "host error rune is not a Unicode scalar value",
+                ));
+            }
             ValueType::Named(type_id) => {
                 let variant = self
                     .module_for_task(snapshot)?

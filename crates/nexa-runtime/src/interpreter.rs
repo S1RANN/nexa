@@ -312,6 +312,7 @@ impl Trap {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrapKind {
     BytecodeTrap,
+    DivideByZero,
     CleanupBudgetExceeded,
     Host,
 }
@@ -358,14 +359,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 36],
+    costs: [u16; 53],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 36],
+            costs: [1; 53],
         }
     }
 }
@@ -777,6 +778,22 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, RuntimeValue::Bool(value))?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::LoadI64 { dst, value } => {
+                    set_register(&mut continuation.arena, dst, RuntimeValue::I64(value))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::LoadF32 { dst, bits } => {
+                    set_register(&mut continuation.arena, dst, RuntimeValue::F32(bits))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::LoadF64 { dst, bits } => {
+                    set_register(&mut continuation.arena, dst, RuntimeValue::F64(bits))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::LoadRune { dst, value } => {
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Rune(value))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::Move { dst, source } => {
                     let value = register(&continuation.arena, source)?;
                     set_register(&mut continuation.arena, dst, value)?;
@@ -784,7 +801,8 @@ impl CheckedInterpreter {
                 }
                 Instruction::Add { dst, lhs, rhs }
                 | Instruction::Sub { dst, lhs, rhs }
-                | Instruction::Mul { dst, lhs, rhs } => {
+                | Instruction::Mul { dst, lhs, rhs }
+                | Instruction::Div { dst, lhs, rhs } => {
                     let RuntimeValue::I32(lhs) = register(&continuation.arena, lhs)? else {
                         return Err(InterpreterError::TypeMismatch);
                     };
@@ -795,9 +813,108 @@ impl CheckedInterpreter {
                         Instruction::Add { .. } => lhs.wrapping_add(rhs),
                         Instruction::Sub { .. } => lhs.wrapping_sub(rhs),
                         Instruction::Mul { .. } => lhs.wrapping_mul(rhs),
+                        Instruction::Div { .. } if rhs != 0 => lhs.wrapping_div(rhs),
+                        Instruction::Div { .. } => {
+                            settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                            return Ok(InterpreterOutcome::Trapped {
+                                trap: Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::DivideByZero,
+                                    "integer division by zero",
+                                ),
+                                charge,
+                                fuel,
+                            });
+                        }
                         _ => unreachable!(),
                     };
                     set_register(&mut continuation.arena, dst, RuntimeValue::I32(value))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::AddI64 { dst, lhs, rhs }
+                | Instruction::SubI64 { dst, lhs, rhs }
+                | Instruction::MulI64 { dst, lhs, rhs }
+                | Instruction::DivI64 { dst, lhs, rhs } => {
+                    let RuntimeValue::I64(lhs) = register(&continuation.arena, lhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::I64(rhs) = register(&continuation.arena, rhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let value = match instruction {
+                        Instruction::AddI64 { .. } => lhs.wrapping_add(rhs),
+                        Instruction::SubI64 { .. } => lhs.wrapping_sub(rhs),
+                        Instruction::MulI64 { .. } => lhs.wrapping_mul(rhs),
+                        Instruction::DivI64 { .. } if rhs != 0 => lhs.wrapping_div(rhs),
+                        Instruction::DivI64 { .. } => {
+                            settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                            return Ok(InterpreterOutcome::Trapped {
+                                trap: Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::DivideByZero,
+                                    "integer division by zero",
+                                ),
+                                charge,
+                                fuel,
+                            });
+                        }
+                        _ => unreachable!(),
+                    };
+                    set_register(&mut continuation.arena, dst, RuntimeValue::I64(value))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::AddF32 { dst, lhs, rhs }
+                | Instruction::SubF32 { dst, lhs, rhs }
+                | Instruction::MulF32 { dst, lhs, rhs }
+                | Instruction::DivF32 { dst, lhs, rhs } => {
+                    let RuntimeValue::F32(lhs) = register(&continuation.arena, lhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::F32(rhs) = register(&continuation.arena, rhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let lhs = f32::from_bits(lhs);
+                    let rhs = f32::from_bits(rhs);
+                    let value = match instruction {
+                        Instruction::AddF32 { .. } => lhs + rhs,
+                        Instruction::SubF32 { .. } => lhs - rhs,
+                        Instruction::MulF32 { .. } => lhs * rhs,
+                        Instruction::DivF32 { .. } => lhs / rhs,
+                        _ => unreachable!(),
+                    };
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::F32(value.to_bits()),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::AddF64 { dst, lhs, rhs }
+                | Instruction::SubF64 { dst, lhs, rhs }
+                | Instruction::MulF64 { dst, lhs, rhs }
+                | Instruction::DivF64 { dst, lhs, rhs } => {
+                    let RuntimeValue::F64(lhs) = register(&continuation.arena, lhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::F64(rhs) = register(&continuation.arena, rhs)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let lhs = f64::from_bits(lhs);
+                    let rhs = f64::from_bits(rhs);
+                    let value = match instruction {
+                        Instruction::AddF64 { .. } => lhs + rhs,
+                        Instruction::SubF64 { .. } => lhs - rhs,
+                        Instruction::MulF64 { .. } => lhs * rhs,
+                        Instruction::DivF64 { .. } => lhs / rhs,
+                        _ => unreachable!(),
+                    };
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::F64(value.to_bits()),
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::CompareEq { dst, lhs, rhs } => {
@@ -1439,7 +1556,11 @@ fn increment_pc(arena: &mut FrameArena) -> Result<(), InterpreterError> {
 fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
     match value {
         RuntimeValue::I32(_) => Some(ValueType::I32),
+        RuntimeValue::I64(_) => Some(ValueType::I64),
+        RuntimeValue::F32(_) => Some(ValueType::F32),
+        RuntimeValue::F64(_) => Some(ValueType::F64),
         RuntimeValue::Bool(_) => Some(ValueType::Bool),
+        RuntimeValue::Rune(_) => Some(ValueType::Rune),
         RuntimeValue::Ref(_) => Some(ValueType::Ref),
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             Some(ValueType::Named(type_id))
@@ -1552,6 +1673,23 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::StateHandleGeneration { .. } => 33,
         Instruction::StateHandleEqual { .. } => 34,
         Instruction::StateHandleHash { .. } => 35,
+        Instruction::LoadI64 { .. } => 36,
+        Instruction::LoadF32 { .. } => 37,
+        Instruction::LoadF64 { .. } => 38,
+        Instruction::LoadRune { .. } => 39,
+        Instruction::AddI64 { .. } => 40,
+        Instruction::SubI64 { .. } => 41,
+        Instruction::MulI64 { .. } => 42,
+        Instruction::DivI64 { .. } => 43,
+        Instruction::Div { .. } => 44,
+        Instruction::AddF32 { .. } => 45,
+        Instruction::SubF32 { .. } => 46,
+        Instruction::MulF32 { .. } => 47,
+        Instruction::DivF32 { .. } => 48,
+        Instruction::AddF64 { .. } => 49,
+        Instruction::SubF64 { .. } => 50,
+        Instruction::MulF64 { .. } => 51,
+        Instruction::DivF64 { .. } => 52,
     }
 }
 
