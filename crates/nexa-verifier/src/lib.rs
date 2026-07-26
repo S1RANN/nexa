@@ -58,11 +58,14 @@ pub enum VerifyErrorKind {
     WcetComplexityLimit,
     InvalidEnumMetadata,
     InvalidStructMetadata,
+    InvalidClassMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
     StructTypeOutOfRange(u64),
     StructFieldOutOfRange(u64),
+    ClassTypeOutOfRange(u64),
+    ClassFieldOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
     StringOutOfRange(u32),
@@ -178,6 +181,22 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
                 function: 0,
                 instruction: None,
                 kind: VerifyErrorKind::InvalidStructMetadata,
+            });
+        }
+    }
+    for class_type in &module.class_types {
+        let mut field_ids = BTreeSet::new();
+        if !named_ids.insert(class_type.type_id)
+            || class_type.fields.len() > nexa_bytecode::MAX_CLASS_FIELDS
+            || class_type
+                .fields
+                .iter()
+                .any(|field| !field_ids.insert(field.stable_id))
+        {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidClassMetadata,
             });
         }
     }
@@ -859,6 +878,98 @@ fn verify_function(
                 require(&state, rhs, ValueType::Named(type_id))?;
                 state[register(dst)?] = Some(ValueType::Bool);
             }
+            Instruction::ClassNew {
+                type_id,
+                fields_base,
+                fields_count,
+                dst,
+            } => {
+                let class_type = module
+                    .class_types
+                    .iter()
+                    .find(|class_type| class_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ClassTypeOutOfRange(type_id.0))
+                    })?;
+                if usize::from(fields_count) != class_type.fields.len() {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                for (index, field) in class_type.fields.iter().enumerate() {
+                    let source = fields_base
+                        .checked_add(u16::try_from(index).map_err(|_| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?)
+                        .ok_or_else(|| {
+                            error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                        })?;
+                    require(&state, source, field.ty)?;
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::ClassGet { source, field, dst } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field_type = module
+                    .class_types
+                    .iter()
+                    .find(|class_type| class_type.type_id == type_id)
+                    .and_then(|class_type| {
+                        class_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
+                    })?;
+                state[register(dst)?] = Some(field_type);
+            }
+            Instruction::ClassSet {
+                source,
+                field,
+                value,
+            } => {
+                let source = register(source)?;
+                let Some(ValueType::Named(type_id)) = state[source] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field_type = module
+                    .class_types
+                    .iter()
+                    .find(|class_type| class_type.type_id == type_id)
+                    .and_then(|class_type| {
+                        class_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
+                    })?;
+                require(&state, value, field_type)?;
+            }
+            Instruction::ClassEqual { lhs, rhs, dst } => {
+                let lhs = register(lhs)?;
+                let Some(ValueType::Named(type_id)) = state[lhs] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                if !module
+                    .class_types
+                    .iter()
+                    .any(|class_type| class_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::ClassTypeOutOfRange(type_id.0),
+                    ));
+                }
+                require(&state, rhs, ValueType::Named(type_id))?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -1037,6 +1148,7 @@ fn verify_safepoints(
                     | Instruction::EnumNew { .. }
                     | Instruction::StructNew { .. }
                     | Instruction::StructWith { .. }
+                    | Instruction::ClassNew { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }
@@ -1292,12 +1404,49 @@ fn longest_path(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
-        SourceMapEntry, StateSchema, StateType, ValueType,
+        ClassType, FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
+        SourceMapEntry, StateSchema, StateType, StructField, ValueType,
     };
-    use nexa_core::{FileId, SourceSpan};
+    use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
+
+    #[test]
+    fn class_metadata_rejects_duplicate_fields_and_named_type_collisions() {
+        let type_id = StableId::from_name("Node");
+        let field = StructField {
+            stable_id: StableId::from_parts(&["Node", "::value"]),
+            ty: ValueType::I32,
+        };
+        let mut duplicate = ModuleBuilder::new();
+        duplicate.class_type(ClassType {
+            type_id,
+            fields: vec![field, field],
+        });
+        assert_eq!(
+            verify(duplicate.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidClassMetadata
+        );
+
+        let mut collision = ModuleBuilder::new();
+        collision
+            .struct_type(nexa_bytecode::StructType {
+                type_id,
+                fields: vec![field],
+            })
+            .class_type(ClassType {
+                type_id,
+                fields: vec![field],
+            });
+        assert_eq!(
+            verify(collision.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidClassMetadata
+        );
+    }
 
     #[test]
     fn rejects_source_map_ranges_outside_their_function() {

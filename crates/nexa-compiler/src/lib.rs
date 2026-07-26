@@ -5,10 +5,10 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use nexa_bytecode::{
-    AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, Function, FunctionEffect,
-    HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap, ScriptExport, Signature,
-    SourceMapEntry, StateField, StateSchema, StateType, StructField as BytecodeStructField,
-    StructType, ValueType,
+    AbandonPolicy, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant, Function,
+    FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap,
+    ScriptExport, Signature, SourceMapEntry, StateField, StateSchema, StateType,
+    StructField as BytecodeStructField, StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -30,6 +30,7 @@ pub enum TokenKind {
     While,
     Match,
     With,
+    New,
     Await,
     Defer,
     For,
@@ -238,6 +239,11 @@ pub enum AstStatement {
         body: Vec<Self>,
     },
     Defer(AstExpression),
+    FieldSet {
+        value: AstExpression,
+        field: String,
+        replacement: AstExpression,
+    },
     Spanned {
         statement: Box<Self>,
         span: SourceSpan,
@@ -303,6 +309,10 @@ pub enum AstExpression {
     StructWith {
         value: Box<Self>,
         updates: Vec<StructFieldValue>,
+    },
+    ClassNew {
+        type_name: String,
+        fields: Vec<StructFieldValue>,
     },
     Match {
         value: Box<Self>,
@@ -505,6 +515,8 @@ pub struct HirModule {
     enum_variants: BTreeMap<(StableId, String), EnumVariant>,
     struct_types: Vec<StructType>,
     struct_fields: BTreeMap<(StableId, String), BytecodeStructField>,
+    class_types: Vec<ClassType>,
+    class_fields: BTreeMap<(StableId, String), BytecodeStructField>,
     state_handle_targets: BTreeMap<StableId, ValueType>,
     span: SourceSpan,
 }
@@ -733,6 +745,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                     "while" => TokenKind::While,
                     "match" => TokenKind::Match,
                     "with" => TokenKind::With,
+                    "new" => TokenKind::New,
                     "await" => TokenKind::Await,
                     "defer" => TokenKind::Defer,
                     "for" => TokenKind::For,
@@ -1047,6 +1060,23 @@ impl Parser<'_> {
             return Ok(self.spanned_statement(start, AstStatement::Defer(expression)));
         }
         let expression = self.expression(0)?;
+        if self.take(&TokenKind::Equal) {
+            let AstExpression::FieldGet { value, field } = expression.kind() else {
+                return Err(self.unexpected("class field assignment"));
+            };
+            let value = (**value).clone();
+            let field = field.clone();
+            let replacement = self.expression(0)?;
+            self.expect(&TokenKind::Semicolon, ";")?;
+            return Ok(self.spanned_statement(
+                start,
+                AstStatement::FieldSet {
+                    value,
+                    field,
+                    replacement,
+                },
+            ));
+        }
         self.expect(&TokenKind::Semicolon, ";")?;
         Ok(self.spanned_statement(start, AstStatement::Expression(expression)))
     }
@@ -1057,6 +1087,14 @@ impl Parser<'_> {
         let mut lhs = match self.next_kind()? {
             TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
             TokenKind::Match => self.match_expression()?,
+            TokenKind::New => {
+                let type_name = self.ident()?;
+                self.expect(&TokenKind::LBrace, "{")?;
+                AstExpression::ClassNew {
+                    type_name,
+                    fields: self.struct_field_values()?,
+                }
+            }
             TokenKind::Integer(value) => AstExpression::Integer(value),
             TokenKind::Float(bits) => AstExpression::Float(bits),
             TokenKind::Rune(value) => AstExpression::Rune(value),
@@ -1568,6 +1606,14 @@ fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, va
             | AstStatement::Return(expression)
             | AstStatement::Expression(expression)
             | AstStatement::Defer(expression) => substitute_name(expression, name, value),
+            AstStatement::FieldSet {
+                value: object,
+                replacement,
+                ..
+            } => {
+                substitute_name(object, name, value);
+                substitute_name(replacement, name, value);
+            }
             AstStatement::If {
                 condition,
                 then_body,
@@ -1609,7 +1655,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
                 substitute_name(payload, name, value);
             }
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             for field in fields {
                 substitute_name(&mut field.value, name, value);
             }
@@ -1709,7 +1755,8 @@ fn collect_statement_builtin_types(
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
-            | AstStatement::Defer(_) => {}
+            | AstStatement::Defer(_)
+            | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -1792,7 +1839,8 @@ fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
-            | AstStatement::Defer(_) => {}
+            | AstStatement::Defer(_)
+            | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -1949,6 +1997,37 @@ fn resolve_and_typecheck_with_hosts(
             struct_fields.insert((type_id, source.name.clone()), *field);
         }
     }
+    let class_types = ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Class)
+        .map(|declaration| ClassType {
+            type_id: StableId::from_name(&declaration.name),
+            fields: declaration
+                .fields
+                .iter()
+                .map(|field| BytecodeStructField {
+                    stable_id: StableId::from_parts(&[&declaration.name, "::", &field.name]),
+                    ty: lower_type(&field.ty),
+                })
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    let mut class_fields = BTreeMap::new();
+    for declaration in ast
+        .types
+        .iter()
+        .filter(|declaration| declaration.kind == AstTypeKind::Class)
+    {
+        let type_id = StableId::from_name(&declaration.name);
+        let metadata = class_types
+            .iter()
+            .find(|class_type| class_type.type_id == type_id)
+            .expect("source class metadata was built");
+        for (source, field) in declaration.fields.iter().zip(&metadata.fields) {
+            class_fields.insert((type_id, source.name.clone()), *field);
+        }
+    }
     let state_schema = StateSchema {
         types: ast
             .types
@@ -2084,6 +2163,8 @@ fn resolve_and_typecheck_with_hosts(
             enum_variants: &enum_variants,
             struct_types: &struct_types,
             struct_fields: &struct_fields,
+            class_types: &class_types,
+            class_fields: &class_fields,
             function_result: signature.result.expect("result is required"),
             effect: function.effect,
             state_handle_targets: &state_handle_targets,
@@ -2117,6 +2198,8 @@ fn resolve_and_typecheck_with_hosts(
         enum_variants,
         struct_types,
         struct_fields,
+        class_types,
+        class_fields,
         state_handle_targets,
         span: module_span,
     })
@@ -2133,6 +2216,12 @@ fn validate_awaits(
             | AstStatement::Expression(value)
             | AstStatement::Defer(value) => {
                 validate_await_expression(value, suspending_functions, false)?;
+            }
+            AstStatement::FieldSet {
+                value, replacement, ..
+            } => {
+                validate_await_expression(value, suspending_functions, false)?;
+                validate_await_expression(replacement, suspending_functions, false)?;
             }
             AstStatement::If {
                 condition,
@@ -2195,7 +2284,7 @@ fn validate_await_expression(
             }
             Ok(())
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             for field in fields {
                 validate_await_expression(&field.value, suspending_functions, false)?;
             }
@@ -2283,6 +2372,12 @@ fn resolve_statements(
             | AstStatement::Expression(expression)
             | AstStatement::Defer(expression) => {
                 resolve_expression(expression, scopes, next_local)?;
+            }
+            AstStatement::FieldSet {
+                value, replacement, ..
+            } => {
+                resolve_expression(value, scopes, next_local)?;
+                resolve_expression(replacement, scopes, next_local)?;
             }
             AstStatement::If {
                 condition,
@@ -2386,7 +2481,7 @@ fn resolve_expression(
                 resolve_expression(payload, scopes, next_local)?;
             }
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             for field in fields {
                 resolve_expression(&mut field.value, scopes, next_local)?;
             }
@@ -2487,7 +2582,8 @@ fn validate_statement_types(
             AstStatement::Bind { ty: None, .. }
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
-            | AstStatement::Defer(_) => {}
+            | AstStatement::Defer(_)
+            | AstStatement::FieldSet { .. } => {}
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
@@ -2507,6 +2603,8 @@ struct TypeContext<'a> {
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
     struct_types: &'a [StructType],
     struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
+    class_types: &'a [ClassType],
+    class_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     function_result: ValueType,
     effect: FunctionEffect,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
@@ -2609,10 +2707,37 @@ fn check_statements(
                 }
                 expression_type(expression, locals, context, next_register, None)?;
             }
+            AstStatement::FieldSet {
+                value,
+                field,
+                replacement,
+            } => check_field_set(value, field, replacement, locals, context, next_register)?,
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(flow)
+}
+
+fn check_field_set(
+    value: &AstExpression,
+    field: &str,
+    replacement: &AstExpression,
+    locals: &mut BTreeMap<String, (u16, ValueType)>,
+    context: &TypeContext<'_>,
+    next_register: &mut u16,
+) -> Result<(), CompileError> {
+    let ValueType::Named(type_id) = expression_type(value, locals, context, next_register, None)?
+    else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let field = context
+        .class_fields
+        .get(&(type_id, field.to_owned()))
+        .ok_or(CompileError::TypeMismatch)?;
+    if expression_type(replacement, locals, context, next_register, Some(field.ty))? != field.ty {
+        return Err(CompileError::TypeMismatch);
+    }
+    Ok(())
 }
 
 fn statements_contain_await(statements: &[AstStatement]) -> bool {
@@ -2621,6 +2746,9 @@ fn statements_contain_await(statements: &[AstStatement]) -> bool {
         | AstStatement::Return(value)
         | AstStatement::Expression(value)
         | AstStatement::Defer(value) => contains_await(value),
+        AstStatement::FieldSet {
+            value, replacement, ..
+        } => contains_await(value) || contains_await(replacement),
         AstStatement::If {
             condition,
             then_body,
@@ -2645,7 +2773,7 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Constructor { payload, .. } => {
             payload.as_deref().is_some_and(contains_await)
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             fields.iter().any(|field| contains_await(&field.value))
         }
         AstExpression::FieldGet { value, .. } => contains_await(value),
@@ -2747,6 +2875,36 @@ fn expression_type(
             }
             ValueType::Named(type_id)
         }
+        AstExpression::ClassNew { type_name, fields } => {
+            let type_id = StableId::from_name(type_name);
+            let class_type = context
+                .class_types
+                .iter()
+                .find(|class_type| class_type.type_id == type_id)
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+            if fields.len() != class_type.fields.len() {
+                return Err(CompileError::TypeMismatch);
+            }
+            let mut supplied = BTreeSet::new();
+            for field in fields {
+                let metadata = context
+                    .class_fields
+                    .get(&(type_id, field.name.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                if !supplied.insert(metadata.stable_id)
+                    || expression_type(
+                        &field.value,
+                        locals,
+                        context,
+                        next_register,
+                        Some(metadata.ty),
+                    )? != metadata.ty
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+            }
+            ValueType::Named(type_id)
+        }
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
@@ -2756,6 +2914,7 @@ fn expression_type(
             context
                 .struct_fields
                 .get(&(type_id, field.clone()))
+                .or_else(|| context.class_fields.get(&(type_id, field.clone())))
                 .map(|field| field.ty)
                 .ok_or(CompileError::TypeMismatch)?
         }
@@ -2799,7 +2958,11 @@ fn expression_type(
                 || matches!(operand_type, ValueType::Named(type_id) if context
                     .struct_types
                     .iter()
-                    .any(|struct_type| struct_type.type_id == type_id));
+                    .any(|struct_type| struct_type.type_id == type_id)
+                    || context
+                        .class_types
+                        .iter()
+                        .any(|class_type| class_type.type_id == type_id));
             if !supported
                 || expression_type(rhs, locals, context, next_register, Some(operand_type))?
                     != operand_type
@@ -3265,6 +3428,17 @@ fn inspect_statement_registers(
             | AstStatement::Return(value)
             | AstStatement::Expression(value)
             | AstStatement::Defer(value) => inspect_expression_registers(value, plan)?,
+            AstStatement::FieldSet {
+                value, replacement, ..
+            } => {
+                inspect_expression_registers(value, plan)?;
+                inspect_expression_registers(replacement, plan)?;
+                plan.expression_temporaries = plan.expression_temporaries.max(
+                    temporary_requirement(replacement)?
+                        .checked_add(1)
+                        .ok_or(CompileError::TooManyRegisters)?,
+                );
+            }
             AstStatement::If {
                 condition,
                 then_body,
@@ -3313,7 +3487,7 @@ fn inspect_expression_registers(
                 inspect_expression_registers(payload, plan)?;
             }
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             for field in fields {
                 inspect_expression_registers(&field.value, plan)?;
             }
@@ -3379,7 +3553,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         AstExpression::Constructor { payload, .. } => payload
             .as_deref()
             .map_or(Ok(1), |payload| offset_requirement(1, payload))?,
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             let mut required = 1;
             for (index, field) in fields.iter().enumerate() {
                 required = required.max(offset_requirement(index + 1, &field.value)?);
@@ -3429,6 +3603,12 @@ fn collect_string_literals(statements: &[AstStatement], strings: &mut BTreeSet<S
             | AstStatement::Return(value)
             | AstStatement::Expression(value)
             | AstStatement::Defer(value) => collect_expression_strings(value, strings),
+            AstStatement::FieldSet {
+                value, replacement, ..
+            } => {
+                collect_expression_strings(value, strings);
+                collect_expression_strings(replacement, strings);
+            }
             AstStatement::If {
                 condition,
                 then_body,
@@ -3469,7 +3649,7 @@ fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet
                 collect_expression_strings(payload, strings);
             }
         }
-        AstExpression::StructLiteral { fields, .. } => {
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
             for field in fields {
                 collect_expression_strings(&field.value, strings);
             }
@@ -3543,6 +3723,8 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             enum_variants: &hir.enum_variants,
             struct_types: &hir.struct_types,
             struct_fields: &hir.struct_fields,
+            class_types: &hir.class_types,
+            class_fields: &hir.class_fields,
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
             string_indices: &string_indices,
@@ -3610,6 +3792,9 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
     for struct_type in &hir.struct_types {
         module.struct_type(struct_type.clone());
     }
+    for class_type in &hir.class_types {
+        module.class_type(class_type.clone());
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3675,6 +3860,7 @@ fn exact_root_maps(
             | Instruction::CompareEq { dst, .. }
             | Instruction::StringEqual { dst, .. }
             | Instruction::StructEqual { dst, .. }
+            | Instruction::ClassEqual { dst, .. }
             | Instruction::StateHandleIsAlive { dst, .. }
             | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
@@ -3702,7 +3888,8 @@ fn exact_root_maps(
             }
             Instruction::StateNewCreate { type_id, dst, .. }
             | Instruction::EnumNew { type_id, dst, .. }
-            | Instruction::StructNew { type_id, dst, .. } => {
+            | Instruction::StructNew { type_id, dst, .. }
+            | Instruction::ClassNew { type_id, dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
             }
             Instruction::StateHandleResolve {
@@ -3754,6 +3941,22 @@ fn exact_root_maps(
                     })
                     .map(|field| field.ty);
             }
+            Instruction::ClassGet { source, field, dst } => {
+                let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                state[usize::from(dst)] = module
+                    .class_types
+                    .iter()
+                    .find(|class_type| class_type.type_id == type_id)
+                    .and_then(|class_type| {
+                        class_type
+                            .fields
+                            .iter()
+                            .find(|candidate| candidate.stable_id == field)
+                    })
+                    .map(|field| field.ty);
+            }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
                 successors.push(target as usize);
@@ -3767,6 +3970,7 @@ fn exact_root_maps(
             | Instruction::StateDelete { .. }
             | Instruction::StatePreserve { .. }
             | Instruction::StateFinish
+            | Instruction::ClassSet { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -3845,6 +4049,8 @@ struct EmitContext<'a> {
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
     struct_types: &'a [StructType],
     struct_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
+    class_types: &'a [ClassType],
+    class_fields: &'a BTreeMap<(StableId, String), BytecodeStructField>,
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     string_indices: &'a BTreeMap<String, u32>,
@@ -4038,6 +4244,45 @@ fn emit_statements(
                     target: end,
                 };
             }
+            AstStatement::FieldSet {
+                value,
+                field,
+                replacement,
+            } => {
+                let ValueType::Named(type_id) =
+                    emitted_expression_type(value, None, locals, context)?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let metadata = context
+                    .class_fields
+                    .get(&(type_id, field.clone()))
+                    .ok_or(CompileError::TypeMismatch)?;
+                emit_expression(
+                    value,
+                    temporary,
+                    Some(ValueType::Named(type_id)),
+                    locals,
+                    context,
+                    code,
+                )?;
+                let replacement_register = temporary
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    replacement,
+                    replacement_register,
+                    Some(metadata.ty),
+                    locals,
+                    context,
+                    code,
+                )?;
+                code.push(Instruction::ClassSet {
+                    source: temporary,
+                    field: metadata.stable_id,
+                    value: replacement_register,
+                });
+            }
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
         code.replace_span(previous_span);
@@ -4186,6 +4431,46 @@ fn emit_expression(
                 dst: destination,
             });
         }
+        AstExpression::ClassNew { type_name, fields } => {
+            let type_id = StableId::from_name(type_name);
+            let class_type = context
+                .class_types
+                .iter()
+                .find(|class_type| class_type.type_id == type_id)
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+            let fields_base = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            for (index, metadata) in class_type.fields.iter().enumerate() {
+                let field = fields
+                    .iter()
+                    .find(|field| {
+                        context
+                            .class_fields
+                            .get(&(type_id, field.name.clone()))
+                            .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
+                    })
+                    .ok_or(CompileError::TypeMismatch)?;
+                let register = fields_base
+                    .checked_add(u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    &field.value,
+                    register,
+                    Some(metadata.ty),
+                    locals,
+                    context,
+                    code,
+                )?;
+            }
+            code.push(Instruction::ClassNew {
+                type_id,
+                fields_base,
+                fields_count: u16::try_from(class_type.fields.len())
+                    .map_err(|_| CompileError::TooManyRegisters)?,
+                dst: destination,
+            });
+        }
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
@@ -4199,15 +4484,21 @@ fn emit_expression(
                 context,
                 code,
             )?;
-            let field = context
-                .struct_fields
-                .get(&(type_id, field.clone()))
-                .ok_or(CompileError::TypeMismatch)?;
-            code.push(Instruction::StructGet {
-                source: destination,
-                field: field.stable_id,
-                dst: destination,
-            });
+            if let Some(field) = context.struct_fields.get(&(type_id, field.clone())) {
+                code.push(Instruction::StructGet {
+                    source: destination,
+                    field: field.stable_id,
+                    dst: destination,
+                });
+            } else if let Some(field) = context.class_fields.get(&(type_id, field.clone())) {
+                code.push(Instruction::ClassGet {
+                    source: destination,
+                    field: field.stable_id,
+                    dst: destination,
+                });
+            } else {
+                return Err(CompileError::TypeMismatch);
+            }
         }
         AstExpression::StructWith { value, updates } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
@@ -4268,6 +4559,18 @@ fn emit_expression(
                             .any(|struct_type| struct_type.type_id == type_id) =>
                     {
                         Instruction::StructEqual {
+                            dst: destination,
+                            lhs: lhs_register,
+                            rhs: rhs_register,
+                        }
+                    }
+                    ValueType::Named(type_id)
+                        if context
+                            .class_types
+                            .iter()
+                            .any(|class_type| class_type.type_id == type_id) =>
+                    {
+                        Instruction::ClassEqual {
                             dst: destination,
                             lhs: lhs_register,
                             rhs: rhs_register,
@@ -4775,6 +5078,15 @@ fn emitted_expression_type(
                 .then_some(ValueType::Named(type_id))
                 .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
         }
+        AstExpression::ClassNew { type_name, .. } => {
+            let type_id = StableId::from_name(type_name);
+            context
+                .class_types
+                .iter()
+                .any(|class_type| class_type.type_id == type_id)
+                .then_some(ValueType::Named(type_id))
+                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
+        }
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
@@ -4783,6 +5095,7 @@ fn emitted_expression_type(
             context
                 .struct_fields
                 .get(&(type_id, field.clone()))
+                .or_else(|| context.class_fields.get(&(type_id, field.clone())))
                 .map(|field| field.ty)
                 .ok_or(CompileError::TypeMismatch)
         }
@@ -5205,6 +5518,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::EnumNew { .. }
                     | Instruction::StructNew { .. }
                     | Instruction::StructWith { .. }
+                    | Instruction::ClassNew { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -6043,6 +6357,136 @@ migration fn migrate() -> bool {
                     nexa_bytecode::Instruction::HostCall { .. }
                 ))
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn classes_are_mutable_identity_values_and_cycles_are_gc_managed() {
+        let source = "class Node { value: i32; next: Option<Node>; }
+             fn make(value: i32) -> Node {
+                 return new Node { next: None, value: value };
+             }
+             fn mutate(node: Node, value: i32) -> i32 {
+                 node.value = value;
+                 return node.value;
+             }
+             fn same(lhs: Node, rhs: Node) -> bool {
+                 return lhs == rhs;
+             }
+             fn cycle() -> Node {
+                 let a: Node = new Node { value: 1, next: None };
+                 let b: Node = new Node { value: 2, next: None };
+                 a.next = Some(b);
+                 b.next = Some(a);
+                 return a;
+             }
+             fn next_value(node: Node) -> i32 {
+                 return match node.next {
+                     None => 0,
+                     Some(next) => next.value,
+                 };
+             }";
+        let module = compile(source).unwrap();
+        let node_type = StableId::from_name("Node");
+        assert_eq!(module.module().class_types.len(), 1);
+        assert_eq!(module.module().class_types[0].type_id, node_type);
+
+        let mut heap = nexa_runtime::Heap::new(32);
+        let InterpreterOutcome::Returned {
+            value: Some(first), ..
+        } = CheckedInterpreter::run_with_heap(&module, 0, &[RuntimeValue::I32(3)], 200, &mut heap)
+            .unwrap()
+        else {
+            panic!("class constructor must return");
+        };
+        let InterpreterOutcome::Returned {
+            value: Some(second),
+            ..
+        } = CheckedInterpreter::run_with_heap(&module, 0, &[RuntimeValue::I32(3)], 200, &mut heap)
+            .unwrap()
+        else {
+            panic!("second class constructor must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(
+                &module,
+                1,
+                &[first, RuntimeValue::I32(9)],
+                200,
+                &mut heap
+            )
+            .unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(9)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 2, &[first, first], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::Bool(true)),
+                ..
+            }
+        ));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 2, &[first, second], 100, &mut heap)
+                .unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::Bool(false)),
+                ..
+            }
+        ));
+
+        let InterpreterOutcome::Returned {
+            value: Some(cycle), ..
+        } = CheckedInterpreter::run_with_heap(&module, 3, &[], 500, &mut heap).unwrap()
+        else {
+            panic!("cyclic class graph must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 4, &[cycle], 200, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(2)),
+                ..
+            }
+        ));
+        let RuntimeValue::NamedRef { reference, .. } = cycle else {
+            panic!("class values are nominal references");
+        };
+        let roots = nexa_runtime::GcRoots {
+            running_frames: vec![reference],
+            ..nexa_runtime::GcRoots::default()
+        };
+        let kept = heap.collect(&roots).unwrap();
+        assert!(kept.live >= 4);
+        let reclaimed = heap.collect(&nexa_runtime::GcRoots::default()).unwrap();
+        assert!(reclaimed.reclaimed >= 4);
+
+        assert!(matches!(
+            compile(
+                "class Left { value: i32; }
+                 class Right { value: i32; }
+                 fn bad(value: Left) -> Right { return value; }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+        assert!(matches!(
+            compile(
+                "class Node { value: i32; }
+                 fn bad(node: Node) -> i32 {
+                     node.value = true;
+                     return node.value;
+                 }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+        assert!(matches!(
+            compile(
+                "class Node { value: i32; }
+                 fn bad() -> Node { return null; }"
+            ),
+            Err(CompileError::UnknownName(name)) if name == "null"
+        ));
     }
 
     #[test]

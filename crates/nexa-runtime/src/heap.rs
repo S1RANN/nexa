@@ -32,14 +32,29 @@ pub enum Object {
         hash: u64,
     },
     Class {
-        fields: Vec<GcRef>,
+        type_id: StableId,
+        fields: [RuntimeValue; nexa_bytecode::MAX_CLASS_FIELDS],
+        field_count: u8,
     },
 }
 
 impl Object {
     fn references(&self) -> Vec<GcRef> {
         match self {
-            Self::Class { fields } => fields.clone(),
+            Self::Class {
+                fields,
+                field_count,
+                ..
+            } => fields[..usize::from(*field_count)]
+                .iter()
+                .filter_map(|field| match field {
+                    RuntimeValue::String { reference, .. }
+                    | RuntimeValue::Struct { reference, .. }
+                    | RuntimeValue::Ref(reference)
+                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
+                    _ => None,
+                })
+                .collect(),
             Self::Map(entries) => entries.iter().map(|(_, value)| *value).collect(),
             Self::Enum { payload, .. } => payload
                 .iter()
@@ -92,6 +107,13 @@ impl fmt::Display for HeapError {
 }
 
 impl std::error::Error for HeapError {}
+
+const fn invalid_value_reference() -> HeapError {
+    HeapError::InvalidReference(GcRef {
+        index: u32::MAX,
+        generation: u32::MAX,
+    })
+}
 
 #[derive(Debug)]
 pub(crate) struct HeapReservation {
@@ -472,6 +494,96 @@ impl Heap {
         })
     }
 
+    pub fn allocate_class(
+        &mut self,
+        type_id: StableId,
+        fields: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        if fields.len() > nexa_bytecode::MAX_CLASS_FIELDS {
+            return Err(HeapError::CapacityExhausted);
+        }
+        let mut stored = [RuntimeValue::Unit; nexa_bytecode::MAX_CLASS_FIELDS];
+        stored[..fields.len()].copy_from_slice(fields);
+        let reference = self.allocate(Object::Class {
+            type_id,
+            fields: stored,
+            field_count: u8::try_from(fields.len()).expect("class field limit fits into u8"),
+        })?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub fn class_field(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Class {
+                type_id: actual,
+                fields,
+                field_count,
+            } if *actual == type_id => fields[..usize::from(*field_count)]
+                .get(index)
+                .copied()
+                .ok_or(HeapError::InvalidReference(reference)),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn set_class_field(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        replacement: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve_mut(reference)? {
+            Object::Class {
+                type_id: actual,
+                fields,
+                field_count,
+            } if *actual == type_id && index < usize::from(*field_count) => {
+                fields[index] = replacement;
+                Ok(())
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn class_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
+        let (
+            RuntimeValue::NamedRef {
+                reference: lhs,
+                type_id: lhs_type,
+            },
+            RuntimeValue::NamedRef {
+                reference: rhs,
+                type_id: rhs_type,
+            },
+        ) = (lhs, rhs)
+        else {
+            return Err(invalid_value_reference());
+        };
+        if lhs_type != rhs_type {
+            return Ok(false);
+        }
+        if !matches!(
+            (self.resolve(lhs)?, self.resolve(rhs)?),
+            (
+                Object::Class { type_id: left, .. },
+                Object::Class { type_id: right, .. }
+            ) if *left == lhs_type && *right == rhs_type
+        ) {
+            return Err(HeapError::InvalidReference(lhs));
+        }
+        Ok(lhs == rhs)
+    }
+
     fn structural_hash(
         &self,
         type_id: StableId,
@@ -614,6 +726,14 @@ impl Heap {
         Ok(slot)
     }
 
+    fn resolve_mut(&mut self, reference: GcRef) -> Result<&mut Object, HeapError> {
+        self.slots
+            .get_mut(reference.index as usize)
+            .filter(|slot| slot.generation == reference.generation)
+            .and_then(|slot| slot.object.as_mut())
+            .ok_or(HeapError::InvalidReference(reference))
+    }
+
     pub fn collect(&mut self, roots: &GcRoots) -> Result<CollectionStats, HeapError> {
         for slot in &mut self.slots {
             slot.marked = false;
@@ -683,23 +803,18 @@ fn write_hash(hash: &mut u64, bytes: &[u8]) {
 
 #[cfg(test)]
 mod tests {
+    use nexa_core::StableId;
+
     use super::{GcRoots, Heap, HeapError, Object};
-    use crate::RuntimeFailurePoint;
+    use crate::{RuntimeFailurePoint, RuntimeValue};
 
     #[test]
     fn cycles_collect_but_suspended_task_roots_survive() {
         let mut heap = Heap::new(4);
-        let first = heap.allocate(Object::Class { fields: Vec::new() }).unwrap();
-        let second = heap
-            .allocate(Object::Class {
-                fields: vec![first],
-            })
-            .unwrap();
-        let Object::Class { fields } = heap.slots[first.index as usize].object.as_mut().unwrap()
-        else {
-            unreachable!()
-        };
-        fields.push(second);
+        let type_id = StableId::from_name("Node");
+        let first = heap.allocate_class(type_id, &[RuntimeValue::Unit]).unwrap();
+        let second = heap.allocate_class(type_id, &[first]).unwrap();
+        heap.set_class_field(first, 0, second).unwrap();
         let stats = heap.collect(&GcRoots::default()).unwrap();
         assert_eq!(stats.reclaimed, 2);
 
@@ -750,6 +865,9 @@ mod tests {
             Err(HeapError::CapacityExhausted)
         ));
         assert_eq!(heap.live_len(), 0);
-        assert!(heap.allocate(Object::Class { fields: Vec::new() }).is_ok());
+        assert!(
+            heap.allocate_class(StableId::from_name("Empty"), &[])
+                .is_ok()
+        );
     }
 }

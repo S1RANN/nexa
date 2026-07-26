@@ -362,14 +362,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 64],
+    costs: [u16; 68],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 64],
+            costs: [1; 68],
         }
     }
 }
@@ -1550,6 +1550,92 @@ impl CheckedInterpreter {
                     )?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::ClassNew {
+                    type_id,
+                    fields_base,
+                    fields_count,
+                    dst,
+                } => {
+                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_CLASS_FIELDS];
+                    for index in 0..fields_count {
+                        fields[usize::from(index)] = register(
+                            &continuation.arena,
+                            fields_base
+                                .checked_add(index)
+                                .ok_or(InterpreterError::TypeMismatch)?,
+                        )?;
+                    }
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    let value =
+                        heap.allocate_class(type_id, &fields[..usize::from(fields_count)])?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ClassGet { source, field, dst } => {
+                    let value = register(&continuation.arena, source)?;
+                    let RuntimeValue::NamedRef { type_id, .. } = value else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = module
+                        .module()
+                        .class_types
+                        .iter()
+                        .find(|class_type| class_type.type_id == type_id)
+                        .and_then(|class_type| {
+                            class_type
+                                .fields
+                                .iter()
+                                .position(|candidate| candidate.stable_id == field)
+                        })
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        heap.class_field(value, index)?,
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ClassSet {
+                    source,
+                    field,
+                    value,
+                } => {
+                    let object = register(&continuation.arena, source)?;
+                    let replacement = register(&continuation.arena, value)?;
+                    let RuntimeValue::NamedRef { type_id, .. } = object else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = module
+                        .module()
+                        .class_types
+                        .iter()
+                        .find(|class_type| class_type.type_id == type_id)
+                        .and_then(|class_type| {
+                            class_type
+                                .fields
+                                .iter()
+                                .position(|candidate| candidate.stable_id == field)
+                        })
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .set_class_field(object, index, replacement)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::ClassEqual { lhs, rhs, dst } => {
+                    let lhs = register(&continuation.arena, lhs)?;
+                    let rhs = register(&continuation.arena, rhs)?;
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Bool(heap.class_equal(lhs, rhs)?),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StateFinish => {
                     migration
                         .as_deref_mut()
@@ -1881,6 +1967,7 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::EnumNew { .. }
         | Instruction::StructNew { .. }
         | Instruction::StructWith { .. }
+        | Instruction::ClassNew { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -1959,6 +2046,10 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::StructGet { .. } => 61,
         Instruction::StructWith { .. } => 62,
         Instruction::StructEqual { .. } => 63,
+        Instruction::ClassNew { .. } => 64,
+        Instruction::ClassGet { .. } => 65,
+        Instruction::ClassSet { .. } => 66,
+        Instruction::ClassEqual { .. } => 67,
     }
 }
 

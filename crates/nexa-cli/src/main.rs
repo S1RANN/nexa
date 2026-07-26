@@ -200,6 +200,22 @@ fn render_module_dump(
             }
         }
     }
+    if render(nexa_bytecode::SectionKind::Classes) {
+        let mut classes = module.class_types.iter().collect::<Vec<_>>();
+        classes.sort_by_key(|class_type| class_type.type_id);
+        for class_type in classes {
+            writeln!(output, "class {:016x}", class_type.type_id.0)
+                .expect("String writes do not fail");
+            for (index, field) in class_type.fields.iter().enumerate() {
+                writeln!(
+                    output,
+                    "  field index={index} id={:016x} type={:?} mutable=true",
+                    field.stable_id.0, field.ty,
+                )
+                .expect("String writes do not fail");
+            }
+        }
+    }
     if render(nexa_bytecode::SectionKind::SourceMap) {
         render_source_map(&mut output, module);
     }
@@ -1025,8 +1041,8 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
-        StructField, StructType, ValueType,
+        ClassType, FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature,
+        SourceMapEntry, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1050,6 +1066,13 @@ mod tests {
             type_id: StableId::from_name("Position"),
             fields: vec![StructField {
                 stable_id: StableId::from_parts(&["Position", "::x"]),
+                ty: ValueType::I32,
+            }],
+        });
+        builder.class_type(ClassType {
+            type_id: StableId::from_name("Node"),
+            fields: vec![StructField {
+                stable_id: StableId::from_parts(&["Node", "::value"]),
                 ty: ValueType::I32,
             }],
         });
@@ -1081,6 +1104,8 @@ mod tests {
         assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(full.contains("struct "));
         assert!(full.contains("field index=0"));
+        assert!(full.contains("class "));
+        assert!(full.contains("mutable=true"));
         assert!(
             full.find("pc=0..1")
                 .expect("first source map entry is present")
