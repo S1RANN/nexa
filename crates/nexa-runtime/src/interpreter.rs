@@ -6,7 +6,7 @@ use nexa_verifier::VerifiedModule;
 
 use crate::{
     ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, Heap, HeapError,
-    RuntimeValue,
+    MapSetOutcome, RuntimeValue,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -363,14 +363,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 77],
+    costs: [u16; 84],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 77],
+            costs: [1; 84],
         }
     }
 }
@@ -1798,6 +1798,104 @@ impl CheckedInterpreter {
                         .array_clear(array)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::MapNew { type_id, dst } => {
+                    let map_type = module
+                        .module()
+                        .map_types
+                        .iter()
+                        .find(|map_type| map_type.type_id == type_id)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let value = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .allocate_map(type_id, map_type.key, map_type.value)?;
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::MapLen { source, dst } => {
+                    let map = register(&continuation.arena, source)?;
+                    let length = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .map_len(map)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(
+                            i32::try_from(length)
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::MapGet {
+                    source,
+                    key,
+                    result_type,
+                    dst,
+                }
+                | Instruction::MapRemove {
+                    source,
+                    key,
+                    result_type,
+                    dst,
+                } => {
+                    let map = register(&continuation.arena, source)?;
+                    let key = register(&continuation.arena, key)?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    let mut reservation = heap.preflight(1)?;
+                    let value = if matches!(instruction, Instruction::MapGet { .. }) {
+                        heap.map_get(map, key)?
+                    } else {
+                        heap.map_remove(map, key)?
+                    };
+                    let (variant, tag, payload) = if let Some(value) = value {
+                        (StableId::from_parts(&["Option", "::Some"]), 1, Some(value))
+                    } else {
+                        (StableId::from_parts(&["Option", "::None"]), 0, None)
+                    };
+                    let value = heap.allocate_enum_reserved(
+                        &mut reservation,
+                        result_type,
+                        variant,
+                        tag,
+                        payload,
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::MapSet { source, key, value } => {
+                    let map = register(&continuation.arena, source)?;
+                    let key = register(&continuation.arena, key)?;
+                    let value = register(&continuation.arena, value)?;
+                    if heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .map_set(map, key, value)?
+                        == MapSetOutcome::Complete
+                    {
+                        increment_pc(&mut continuation.arena)?;
+                    }
+                }
+                Instruction::MapContains { source, key, dst } => {
+                    let map = register(&continuation.arena, source)?;
+                    let key = register(&continuation.arena, key)?;
+                    let contains = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .map_contains(map, key)?;
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(contains))?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::MapClear { source } => {
+                    let map = register(&continuation.arena, source)?;
+                    heap.as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .map_clear(map)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StateFinish => {
                     migration
                         .as_deref_mut()
@@ -2139,6 +2237,13 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::ArrayInsert { .. }
         | Instruction::ArrayRemove { .. }
         | Instruction::ArrayClear { .. }
+        | Instruction::MapNew { .. }
+        | Instruction::MapLen { .. }
+        | Instruction::MapGet { .. }
+        | Instruction::MapSet { .. }
+        | Instruction::MapRemove { .. }
+        | Instruction::MapContains { .. }
+        | Instruction::MapClear { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -2230,6 +2335,13 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::ArrayInsert { .. } => 74,
         Instruction::ArrayRemove { .. } => 75,
         Instruction::ArrayClear { .. } => 76,
+        Instruction::MapNew { .. } => 77,
+        Instruction::MapLen { .. } => 78,
+        Instruction::MapGet { .. } => 79,
+        Instruction::MapSet { .. } => 80,
+        Instruction::MapRemove { .. } => 81,
+        Instruction::MapContains { .. } => 82,
+        Instruction::MapClear { .. } => 83,
     }
 }
 

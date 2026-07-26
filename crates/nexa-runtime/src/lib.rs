@@ -42,7 +42,7 @@ mod micro;
 pub use frame::{
     ContinuationReservation, DeferAction, Frame, FrameArena, FrameError, FrameLimits, RuntimeValue,
 };
-pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, Object};
+pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object};
 pub use host::{
     CompletionAccounting, CopyBuffer, HostArgs, HostCallOutcome, HostCompletionDelivery,
     HostCompletionResult, HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry,

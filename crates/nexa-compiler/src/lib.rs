@@ -6,9 +6,9 @@ use std::ops::{Deref, DerefMut};
 
 use nexa_bytecode::{
     AbandonPolicy, ArrayType, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant,
-    Function, FunctionEffect, HostCallMode, HostImport, Instruction, Module, ModuleBuilder,
-    RootMap, ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema,
-    StateType, StructField as BytecodeStructField, StructType, ValueType,
+    Function, FunctionEffect, HostCallMode, HostImport, Instruction, MapType, Module,
+    ModuleBuilder, RootMap, ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType,
+    StateSchema, StateType, StructField as BytecodeStructField, StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -317,6 +317,10 @@ pub enum AstExpression {
     ArrayNew {
         element_type: AstType,
     },
+    MapNew {
+        key_type: AstType,
+        value_type: AstType,
+    },
     Match {
         value: Box<Self>,
         arms: Vec<MatchArm>,
@@ -480,6 +484,30 @@ enum ArrayMethod {
     Clear,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapMethod {
+    Len,
+    Get,
+    Set,
+    Remove,
+    Contains,
+    Clear,
+}
+
+fn map_method(function: &str) -> Option<(&str, MapMethod)> {
+    let (receiver, method) = function.rsplit_once('.')?;
+    let method = match method {
+        "len" => MapMethod::Len,
+        "get" => MapMethod::Get,
+        "set" => MapMethod::Set,
+        "remove" => MapMethod::Remove,
+        "contains" => MapMethod::Contains,
+        "clear" => MapMethod::Clear,
+        _ => return None,
+    };
+    Some((receiver, method))
+}
+
 fn array_method(function: &str) -> Option<(&str, ArrayMethod)> {
     let (receiver, method) = function.rsplit_once('.')?;
     let method = match method {
@@ -550,6 +578,7 @@ pub struct HirModule {
     class_fields: BTreeMap<(StableId, String), BytecodeStructField>,
     state_handle_targets: BTreeMap<StableId, ValueType>,
     array_types: Vec<ArrayType>,
+    map_types: Vec<MapType>,
     span: SourceSpan,
 }
 
@@ -1160,11 +1189,12 @@ impl Parser<'_> {
             TokenKind::False => AstExpression::Bool(false),
             TokenKind::Ident(mut name) => {
                 while self.take(&TokenKind::Dot) {
-                    let component = if name == "Array" && self.take(&TokenKind::New) {
-                        "new".to_owned()
-                    } else {
-                        self.ident()?
-                    };
+                    let component =
+                        if matches!(name.as_str(), "Array" | "Map") && self.take(&TokenKind::New) {
+                            "new".to_owned()
+                        } else {
+                            self.ident()?
+                        };
                     name.push('.');
                     name.push_str(&component);
                 }
@@ -1194,6 +1224,14 @@ impl Parser<'_> {
                     self.expect(&TokenKind::LParen, "(")?;
                     self.expect(&TokenKind::RParen, ")")?;
                     AstExpression::ArrayNew { element_type }
+                } else if name == "Map.new" {
+                    let [key_type, value_type] = exactly_two_types(type_arguments)?;
+                    self.expect(&TokenKind::LParen, "(")?;
+                    self.expect(&TokenKind::RParen, ")")?;
+                    AstExpression::MapNew {
+                        key_type,
+                        value_type,
+                    }
                 } else if is_migration_intrinsic(&name) {
                     AstExpression::Migration(self.migration_intrinsic(
                         &name,
@@ -1630,6 +1668,10 @@ fn exactly_one_type(mut arguments: Vec<AstType>) -> Result<AstType, CompileError
     Ok(arguments.pop().expect("length was checked"))
 }
 
+fn exactly_two_types(arguments: Vec<AstType>) -> Result<[AstType; 2], CompileError> {
+    arguments.try_into().map_err(|_| CompileError::TypeMismatch)
+}
+
 fn split_field_name(name: &str) -> Result<(String, String), CompileError> {
     name.rsplit_once('.')
         .map(|(owner, field)| (owner.to_owned(), field.to_owned()))
@@ -1759,6 +1801,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
         | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
@@ -1892,63 +1935,83 @@ fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType
 }
 
 #[allow(clippy::too_many_lines)]
-fn collect_array_types(ast: &AstModule) -> Vec<ArrayType> {
-    fn collect_type(ty: &AstType, arrays: &mut BTreeMap<StableId, ArrayType>) {
+fn collect_collection_types(ast: &AstModule) -> (Vec<ArrayType>, Vec<MapType>) {
+    fn collect_type(
+        ty: &AstType,
+        arrays: &mut BTreeMap<StableId, ArrayType>,
+        maps: &mut BTreeMap<StableId, MapType>,
+    ) {
         let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
             return;
         };
         for argument in arguments {
-            collect_type(argument, arrays);
+            collect_type(argument, arrays, maps);
         }
         if name == "Array" && arguments.len() == 1 {
             let array = ArrayType::new(lower_type(&arguments[0]));
             arrays.insert(array.type_id, array);
+        } else if name == "Map" && arguments.len() == 2 {
+            let map = MapType::new(lower_type(&arguments[0]), lower_type(&arguments[1]));
+            maps.insert(map.type_id, map);
         }
     }
-    fn collect_expression(expression: &AstExpression, arrays: &mut BTreeMap<StableId, ArrayType>) {
+    fn collect_expression(
+        expression: &AstExpression,
+        arrays: &mut BTreeMap<StableId, ArrayType>,
+        maps: &mut BTreeMap<StableId, MapType>,
+    ) {
         match expression.kind() {
-            AstExpression::ArrayNew { element_type } => collect_type(element_type, arrays),
+            AstExpression::ArrayNew { element_type } => collect_type(element_type, arrays, maps),
+            AstExpression::MapNew {
+                key_type,
+                value_type,
+            } => {
+                collect_type(key_type, arrays, maps);
+                collect_type(value_type, arrays, maps);
+                let map = MapType::new(lower_type(key_type), lower_type(value_type));
+                maps.insert(map.type_id, map);
+            }
             AstExpression::Binary { lhs, rhs, .. } => {
-                collect_expression(lhs, arrays);
-                collect_expression(rhs, arrays);
+                collect_expression(lhs, arrays, maps);
+                collect_expression(rhs, arrays, maps);
             }
             AstExpression::Call { arguments, .. } => {
                 for argument in arguments {
-                    collect_expression(argument, arrays);
+                    collect_expression(argument, arrays, maps);
                 }
             }
             AstExpression::Await(expression) | AstExpression::Try(expression) => {
-                collect_expression(expression, arrays);
+                collect_expression(expression, arrays, maps);
             }
             AstExpression::Constructor { payload, .. } => {
                 if let Some(payload) = payload {
-                    collect_expression(payload, arrays);
+                    collect_expression(payload, arrays, maps);
                 }
             }
             AstExpression::StructLiteral { fields, .. }
             | AstExpression::ClassNew { fields, .. } => {
                 for field in fields {
-                    collect_expression(&field.value, arrays);
+                    collect_expression(&field.value, arrays, maps);
                 }
             }
-            AstExpression::FieldGet { value, .. } => collect_expression(value, arrays),
+            AstExpression::FieldGet { value, .. } => collect_expression(value, arrays, maps),
             AstExpression::StructWith { value, updates } => {
-                collect_expression(value, arrays);
+                collect_expression(value, arrays, maps);
                 for update in updates {
-                    collect_expression(&update.value, arrays);
+                    collect_expression(&update.value, arrays, maps);
                 }
             }
             AstExpression::Match { value, arms } => {
-                collect_expression(value, arrays);
+                collect_expression(value, arrays, maps);
                 for arm in arms {
-                    collect_expression(&arm.value, arrays);
+                    collect_expression(&arm.value, arrays, maps);
                 }
             }
             AstExpression::Migration(intrinsic) => {
                 match intrinsic.kind() {
                     MigrationIntrinsic::OldGet { ty, .. }
                     | MigrationIntrinsic::OldFieldGet { ty, .. }
-                    | MigrationIntrinsic::NewCreate { ty, .. } => collect_type(ty, arrays),
+                    | MigrationIntrinsic::NewCreate { ty, .. } => collect_type(ty, arrays, maps),
                     MigrationIntrinsic::NewSet { .. }
                     | MigrationIntrinsic::Preserve { .. }
                     | MigrationIntrinsic::Replace { .. }
@@ -1957,7 +2020,7 @@ fn collect_array_types(ast: &AstModule) -> Vec<ArrayType> {
                     MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
                 }
                 for expression in migration_expressions(intrinsic) {
-                    collect_expression(expression, arrays);
+                    collect_expression(expression, arrays, maps);
                 }
             }
             AstExpression::Integer(_)
@@ -1969,36 +2032,40 @@ fn collect_array_types(ast: &AstModule) -> Vec<ArrayType> {
             AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
-    fn collect_statements(statements: &[AstStatement], arrays: &mut BTreeMap<StableId, ArrayType>) {
+    fn collect_statements(
+        statements: &[AstStatement],
+        arrays: &mut BTreeMap<StableId, ArrayType>,
+        maps: &mut BTreeMap<StableId, MapType>,
+    ) {
         for statement in statements {
             match statement.kind() {
                 AstStatement::Bind { ty, value, .. } => {
                     if let Some(ty) = ty {
-                        collect_type(ty, arrays);
+                        collect_type(ty, arrays, maps);
                     }
-                    collect_expression(value, arrays);
+                    collect_expression(value, arrays, maps);
                 }
                 AstStatement::Return(value)
                 | AstStatement::Expression(value)
-                | AstStatement::Defer(value) => collect_expression(value, arrays),
+                | AstStatement::Defer(value) => collect_expression(value, arrays, maps),
                 AstStatement::FieldSet {
                     value, replacement, ..
                 } => {
-                    collect_expression(value, arrays);
-                    collect_expression(replacement, arrays);
+                    collect_expression(value, arrays, maps);
+                    collect_expression(replacement, arrays, maps);
                 }
                 AstStatement::If {
                     condition,
                     then_body,
                     else_body,
                 } => {
-                    collect_expression(condition, arrays);
-                    collect_statements(then_body, arrays);
-                    collect_statements(else_body, arrays);
+                    collect_expression(condition, arrays, maps);
+                    collect_statements(then_body, arrays, maps);
+                    collect_statements(else_body, arrays, maps);
                 }
                 AstStatement::While { condition, body } => {
-                    collect_expression(condition, arrays);
-                    collect_statements(body, arrays);
+                    collect_expression(condition, arrays, maps);
+                    collect_statements(body, arrays, maps);
                 }
                 AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
             }
@@ -2006,24 +2073,25 @@ fn collect_array_types(ast: &AstModule) -> Vec<ArrayType> {
     }
 
     let mut arrays = BTreeMap::new();
+    let mut maps = BTreeMap::new();
     for declaration in &ast.types {
         for field in &declaration.fields {
-            collect_type(&field.ty, &mut arrays);
+            collect_type(&field.ty, &mut arrays, &mut maps);
         }
         for variant in &declaration.variants {
             if let Some(payload) = &variant.payload {
-                collect_type(payload, &mut arrays);
+                collect_type(payload, &mut arrays, &mut maps);
             }
         }
     }
     for function in &ast.functions {
         for parameter in &function.parameters {
-            collect_type(&parameter.ty, &mut arrays);
+            collect_type(&parameter.ty, &mut arrays, &mut maps);
         }
-        collect_type(&function.result.ty, &mut arrays);
-        collect_statements(&function.body, &mut arrays);
+        collect_type(&function.result.ty, &mut arrays, &mut maps);
+        collect_statements(&function.body, &mut arrays, &mut maps);
     }
-    arrays.into_values().collect()
+    (arrays.into_values().collect(), maps.into_values().collect())
 }
 
 fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
@@ -2118,7 +2186,32 @@ fn resolve_and_typecheck_with_hosts(
     }
     collect_builtin_enum_types(&ast, &mut enum_types);
     let state_handle_targets = collect_state_handle_targets(&ast);
-    let array_types = collect_array_types(&ast);
+    let (array_types, map_types) = collect_collection_types(&ast);
+    let declared_type_ids = ast
+        .types
+        .iter()
+        .map(|declaration| StableId::from_name(&declaration.name))
+        .collect::<BTreeSet<_>>();
+    if map_types.iter().any(|map_type| {
+        !matches!(
+            map_type.key,
+            ValueType::I32 | ValueType::I64 | ValueType::Rune | ValueType::String
+        ) && !matches!(map_type.key, ValueType::Named(type_id) if
+            state_handle_targets.contains_key(&type_id)
+                || map_type.key == nexa_bytecode::stable_id_type()
+                || !declared_type_ids.contains(&type_id))
+    }) {
+        return Err(CompileError::TypeMismatch);
+    }
+    for map_type in &map_types {
+        let option = nexa_bytecode::option_type(map_type.value);
+        if !enum_types
+            .iter()
+            .any(|candidate| candidate.type_id == option.type_id)
+        {
+            enum_types.push(option);
+        }
+    }
     if !state_handle_targets.is_empty() {
         enum_types.push(nexa_bytecode::state_handle_error_type());
         for target in state_handle_targets.values().copied() {
@@ -2376,6 +2469,7 @@ fn resolve_and_typecheck_with_hosts(
             effect: function.effect,
             state_handle_targets: &state_handle_targets,
             array_types: &array_types,
+            map_types: &map_types,
         };
         let flow = check_statements(
             &function.body,
@@ -2410,6 +2504,7 @@ fn resolve_and_typecheck_with_hosts(
         class_fields,
         state_handle_targets,
         array_types,
+        map_types,
         span: module_span,
     })
 }
@@ -2531,6 +2626,7 @@ fn validate_await_expression(
         | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => Ok(()),
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -2660,6 +2756,24 @@ fn resolve_expression(
                         StateHandleMethod::Hash => "hash",
                     }
                 );
+            } else if let Some((receiver, method)) = map_method(function) {
+                let resolved = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(receiver))
+                    .cloned()
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                *function = format!(
+                    "{resolved}.{}",
+                    match method {
+                        MapMethod::Len => "len",
+                        MapMethod::Get => "get",
+                        MapMethod::Set => "set",
+                        MapMethod::Remove => "remove",
+                        MapMethod::Contains => "contains",
+                        MapMethod::Clear => "clear",
+                    }
+                );
             } else if let Some((receiver, method)) = array_method(function) {
                 let resolved = scopes
                     .iter()
@@ -2755,7 +2869,8 @@ fn resolve_expression(
         | AstExpression::Rune(_)
         | AstExpression::String(_)
         | AstExpression::Bool(_)
-        | AstExpression::ArrayNew { .. } => {}
+        | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. } => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
     Ok(())
@@ -2769,7 +2884,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
                 "Option" | "StateHandle" | "Array" => 1,
-                "Result" => 2,
+                "Result" | "Map" => 2,
                 _ => return Err(CompileError::UnknownType(name.clone())),
             };
             if arguments.len() != expected {
@@ -2978,6 +3093,7 @@ struct TypeContext<'a> {
     effect: FunctionEffect,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     array_types: &'a [ArrayType],
+    map_types: &'a [MapType],
 }
 
 fn check_statements(
@@ -3163,6 +3279,7 @@ fn contains_await(expression: &AstExpression) -> bool {
         | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => false,
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -3290,6 +3407,26 @@ fn expression_type(
                 .iter()
                 .any(|array_type| array_type.type_id == type_id && array_type.element == element)
             {
+                return Err(CompileError::TypeMismatch);
+            }
+            ValueType::Named(type_id)
+        }
+        AstExpression::MapNew {
+            key_type,
+            value_type,
+        } => {
+            if matches!(
+                context.effect,
+                FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+            ) {
+                return Err(CompileError::InvalidEffect);
+            }
+            let key = lower_type(key_type);
+            let value = lower_type(value_type);
+            let type_id = nexa_bytecode::map_type(key, value);
+            if !context.map_types.iter().any(|map_type| {
+                map_type.type_id == type_id && map_type.key == key && map_type.value == value
+            }) {
                 return Err(CompileError::TypeMismatch);
             }
             ValueType::Named(type_id)
@@ -3474,6 +3611,71 @@ fn expression_type(
                     return Err(CompileError::TypeMismatch);
                 }
                 return Ok(result);
+            }
+            if let Some((receiver, method)) = map_method(function)
+                && locals.get(receiver).is_some_and(|(_, ty)| {
+                    matches!(ty, ValueType::Named(type_id) if context
+                        .map_types
+                        .iter()
+                        .any(|map_type| map_type.type_id == *type_id))
+                })
+            {
+                let receiver_type = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                let ValueType::Named(map_type) = receiver_type else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let map_type = context
+                    .map_types
+                    .iter()
+                    .find(|candidate| candidate.type_id == map_type)
+                    .ok_or(CompileError::TypeMismatch)?;
+                if matches!(
+                    context.effect,
+                    FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(CompileError::InvalidEffect);
+                }
+                let mut check_key = |argument: &AstExpression| {
+                    expression_type(argument, locals, context, next_register, Some(map_type.key))
+                };
+                let actual = match method {
+                    MapMethod::Len if arguments.is_empty() => ValueType::I32,
+                    MapMethod::Get | MapMethod::Remove if arguments.len() == 1 => {
+                        if check_key(&arguments[0])? != map_type.key {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Named(nexa_bytecode::option_type(map_type.value).type_id)
+                    }
+                    MapMethod::Set if arguments.len() == 2 => {
+                        if check_key(&arguments[0])? != map_type.key
+                            || expression_type(
+                                &arguments[1],
+                                locals,
+                                context,
+                                next_register,
+                                Some(map_type.value),
+                            )? != map_type.value
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Bool
+                    }
+                    MapMethod::Contains if arguments.len() == 1 => {
+                        if check_key(&arguments[0])? != map_type.key {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Bool
+                    }
+                    MapMethod::Clear if arguments.is_empty() => ValueType::Bool,
+                    _ => return Err(CompileError::TypeMismatch),
+                };
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(actual);
             }
             if let Some((receiver, method)) = array_method(function) {
                 let receiver_type = locals
@@ -3876,6 +4078,9 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::BuiltinGeneric { name, arguments } if name == "Array" => {
             ValueType::Named(nexa_bytecode::array_type(lower_type(&arguments[0])))
         }
+        AstType::BuiltinGeneric { name, arguments } if name == "Map" => ValueType::Named(
+            nexa_bytecode::map_type(lower_type(&arguments[0]), lower_type(&arguments[1])),
+        ),
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -4009,6 +4214,7 @@ fn inspect_expression_registers(
         | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -4029,6 +4235,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => 1,
         AstExpression::Binary { lhs, rhs, .. } => {
             usize::from(temporary_requirement(lhs)?).max(offset_requirement(1, rhs)?)
@@ -4168,6 +4375,7 @@ fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet
         | AstExpression::Rune(_)
         | AstExpression::Bool(_)
         | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. }
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -4221,6 +4429,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
             array_types: &hir.array_types,
+            map_types: &hir.map_types,
             string_indices: &string_indices,
         };
         emit_statements(
@@ -4288,6 +4497,9 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
     }
     for array_type in &hir.array_types {
         module.array_type(*array_type);
+    }
+    for map_type in &hir.map_types {
+        module.map_type(*map_type);
     }
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
@@ -4364,6 +4576,7 @@ fn exact_root_maps(
             | Instruction::StringEqual { dst, .. }
             | Instruction::StructEqual { dst, .. }
             | Instruction::ClassEqual { dst, .. }
+            | Instruction::MapContains { dst, .. }
             | Instruction::StateHandleIsAlive { dst, .. }
             | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
@@ -4393,7 +4606,8 @@ fn exact_root_maps(
             | Instruction::EnumNew { type_id, dst, .. }
             | Instruction::StructNew { type_id, dst, .. }
             | Instruction::ClassNew { type_id, dst, .. }
-            | Instruction::ArrayNew { type_id, dst } => {
+            | Instruction::ArrayNew { type_id, dst }
+            | Instruction::MapNew { type_id, dst } => {
                 state[usize::from(dst)] = Some(ValueType::Named(type_id));
             }
             Instruction::StateHandleResolve {
@@ -4407,6 +4621,7 @@ fn exact_root_maps(
             | Instruction::StringLen { dst, .. }
             | Instruction::StringByteLen { dst, .. }
             | Instruction::ArrayLen { dst, .. }
+            | Instruction::MapLen { dst, .. }
             | Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
@@ -4474,6 +4689,14 @@ fn exact_root_maps(
                     .find(|array_type| array_type.type_id == type_id)
                     .map(|array_type| array_type.element);
             }
+            Instruction::MapGet {
+                result_type, dst, ..
+            }
+            | Instruction::MapRemove {
+                result_type, dst, ..
+            } => {
+                state[usize::from(dst)] = Some(ValueType::Named(result_type));
+            }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
                 successors.push(target as usize);
@@ -4492,6 +4715,8 @@ fn exact_root_maps(
             | Instruction::ArrayPush { .. }
             | Instruction::ArrayInsert { .. }
             | Instruction::ArrayClear { .. }
+            | Instruction::MapSet { .. }
+            | Instruction::MapClear { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -4576,6 +4801,7 @@ struct EmitContext<'a> {
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     array_types: &'a [ArrayType],
+    map_types: &'a [MapType],
     string_indices: &'a BTreeMap<String, u32>,
 }
 
@@ -4840,6 +5066,23 @@ fn emit_expression(
         function,
         arguments,
     } = expression.kind()
+        && map_method(function).is_some_and(|(receiver, _)| {
+            locals.get(receiver).is_some_and(|(_, ty)| {
+                matches!(ty, ValueType::Named(type_id) if context
+                    .map_types
+                    .iter()
+                    .any(|map_type| map_type.type_id == *type_id))
+            })
+        })
+    {
+        let result = emit_map_method(function, arguments, destination, locals, context, code);
+        code.replace_span(previous_span);
+        return result;
+    }
+    if let AstExpression::Call {
+        function,
+        arguments,
+    } = expression.kind()
         && array_method(function).is_some()
     {
         let result = emit_array_method(function, arguments, destination, locals, context, code);
@@ -5007,6 +5250,15 @@ fn emit_expression(
         AstExpression::ArrayNew { element_type } => {
             code.push(Instruction::ArrayNew {
                 type_id: nexa_bytecode::array_type(lower_type(element_type)),
+                dst: destination,
+            });
+        }
+        AstExpression::MapNew {
+            key_type,
+            value_type,
+        } => {
+            code.push(Instruction::MapNew {
+                type_id: nexa_bytecode::map_type(lower_type(key_type), lower_type(value_type)),
                 dst: destination,
             });
         }
@@ -5469,6 +5721,118 @@ fn emit_string_method(
 }
 
 #[allow(clippy::too_many_lines)]
+fn emit_map_method(
+    function: &str,
+    arguments: &[AstExpression],
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut TrackedCode,
+) -> Result<(), CompileError> {
+    let (receiver, method) =
+        map_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+    let (source, receiver_type) = *locals
+        .get(receiver)
+        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+    let ValueType::Named(map_type) = receiver_type else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let map_type = context
+        .map_types
+        .iter()
+        .find(|candidate| candidate.type_id == map_type)
+        .ok_or(CompileError::TypeMismatch)?;
+    let temporary = destination
+        .checked_add(1)
+        .ok_or(CompileError::TooManyRegisters)?;
+    match method {
+        MapMethod::Len => code.push(Instruction::MapLen {
+            source,
+            dst: destination,
+        }),
+        MapMethod::Get | MapMethod::Remove => {
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(map_type.key),
+                locals,
+                context,
+                code,
+            )?;
+            let result_type = nexa_bytecode::option_type(map_type.value).type_id;
+            code.push(if method == MapMethod::Get {
+                Instruction::MapGet {
+                    source,
+                    key: temporary,
+                    result_type,
+                    dst: destination,
+                }
+            } else {
+                Instruction::MapRemove {
+                    source,
+                    key: temporary,
+                    result_type,
+                    dst: destination,
+                }
+            });
+        }
+        MapMethod::Set => {
+            let value = temporary
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(map_type.key),
+                locals,
+                context,
+                code,
+            )?;
+            emit_expression(
+                &arguments[1],
+                value,
+                Some(map_type.value),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::MapSet {
+                source,
+                key: temporary,
+                value,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        MapMethod::Contains => {
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(map_type.key),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::MapContains {
+                source,
+                key: temporary,
+                dst: destination,
+            });
+        }
+        MapMethod::Clear => {
+            code.push(Instruction::MapClear { source });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn emit_array_method(
     function: &str,
     arguments: &[AstExpression],
@@ -5747,6 +6111,13 @@ fn emitted_expression_type(
         AstExpression::ArrayNew { element_type } => Ok(ValueType::Named(
             nexa_bytecode::array_type(lower_type(element_type)),
         )),
+        AstExpression::MapNew {
+            key_type,
+            value_type,
+        } => Ok(ValueType::Named(nexa_bytecode::map_type(
+            lower_type(key_type),
+            lower_type(value_type),
+        ))),
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
@@ -5803,6 +6174,33 @@ fn emitted_expression_type(
                     StateHandleMethod::IsAlive | StateHandleMethod::Equality => ValueType::Bool,
                     StateHandleMethod::StableId => nexa_bytecode::stable_id_type(),
                     StateHandleMethod::Generation | StateHandleMethod::Hash => ValueType::I32,
+                })
+            } else if let Some((receiver, method)) = map_method(function)
+                && locals.get(receiver).is_some_and(|(_, ty)| {
+                    matches!(ty, ValueType::Named(type_id) if context
+                        .map_types
+                        .iter()
+                        .any(|map_type| map_type.type_id == *type_id))
+                })
+            {
+                let ValueType::Named(map_type) = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let map_type = context
+                    .map_types
+                    .iter()
+                    .find(|candidate| candidate.type_id == map_type)
+                    .ok_or(CompileError::TypeMismatch)?;
+                Ok(match method {
+                    MapMethod::Len => ValueType::I32,
+                    MapMethod::Get | MapMethod::Remove => {
+                        ValueType::Named(nexa_bytecode::option_type(map_type.value).type_id)
+                    }
+                    MapMethod::Set | MapMethod::Contains | MapMethod::Clear => ValueType::Bool,
                 })
             } else if let Some((receiver, method)) = array_method(function) {
                 let ValueType::Named(array_type) = locals
@@ -6232,6 +6630,13 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::ArrayInsert { .. }
                     | Instruction::ArrayRemove { .. }
                     | Instruction::ArrayClear { .. }
+                    | Instruction::MapNew { .. }
+                    | Instruction::MapLen { .. }
+                    | Instruction::MapGet { .. }
+                    | Instruction::MapSet { .. }
+                    | Instruction::MapRemove { .. }
+                    | Instruction::MapContains { .. }
+                    | Instruction::MapClear { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -7281,6 +7686,158 @@ migration fn migrate() -> bool {
         ] {
             assert_eq!(compile(source).unwrap_err(), CompileError::InvalidEffect);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn maps_compile_verify_execute_and_cover_every_source_operation() {
+        let module = compile(
+            "fn map_ops() -> i32 {
+                 let values: Map<i32, string> = Map.new<i32, string>();
+                 values.set(1, \"one\");
+                 values.set(2, \"two\");
+                 let found: Option<string> = values.get(1);
+                 let removed: Option<string> = values.remove(2);
+                 let contains: bool = values.contains(1);
+                 let length: i32 = values.len();
+                 values.clear();
+                 return match found {
+                     Some(value) => value.byte_len() + length,
+                     None => 0,
+                 };
+             }
+             fn missing() -> i32 {
+                 let values: Map<i32, string> = Map.new<i32, string>();
+                 return match values.get(9) {
+                     Some(value) => value.byte_len(),
+                     None => 0,
+                 };
+             }",
+        )
+        .unwrap();
+        assert_eq!(
+            module.module().map_types,
+            vec![nexa_bytecode::MapType::new(
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::String,
+            )]
+        );
+        let code = &module.module().functions[0].code;
+        for required in [
+            "MapNew",
+            "MapLen",
+            "MapGet",
+            "MapSet",
+            "MapRemove",
+            "MapContains",
+            "MapClear",
+        ] {
+            assert!(
+                code.iter()
+                    .any(|instruction| format!("{instruction:?}").starts_with(required)),
+                "missing {required}"
+            );
+        }
+        let function = &module.module().functions[0];
+        for (pc, instruction) in function.code.iter().enumerate() {
+            if matches!(
+                instruction,
+                Instruction::MapNew { .. }
+                    | Instruction::MapLen { .. }
+                    | Instruction::MapGet { .. }
+                    | Instruction::MapSet { .. }
+                    | Instruction::MapRemove { .. }
+                    | Instruction::MapContains { .. }
+                    | Instruction::MapClear { .. }
+            ) {
+                let pc = u32::try_from(pc).unwrap();
+                assert!(function.safepoints.contains(&pc));
+                assert!(function.root_maps.iter().any(|root_map| root_map.pc == pc));
+            }
+        }
+
+        let mut heap = nexa_runtime::Heap::new_with_limits(32, 64, 16);
+        let outcome = CheckedInterpreter::run_with_heap(&module, 0, &[], 1_000, &mut heap).unwrap();
+        assert!(
+            matches!(
+                outcome,
+                InterpreterOutcome::Returned {
+                    value: Some(RuntimeValue::I32(4)),
+                    ..
+                }
+            ),
+            "{outcome:?}"
+        );
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[], 300, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(0)),
+                ..
+            }
+        ));
+
+        let remove = compile(
+            "fn remove(values: Map<i32, i32>) -> Option<i32> {
+                 return values.remove(1);
+             }",
+        )
+        .unwrap();
+        let mut full_heap = nexa_runtime::Heap::new_with_limits(1, usize::MAX, 8);
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = full_heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        assert_eq!(
+            full_heap
+                .map_set(map, RuntimeValue::I32(1), RuntimeValue::I32(7))
+                .unwrap(),
+            nexa_runtime::MapSetOutcome::Complete
+        );
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&remove, 0, &[map], 100, &mut full_heap),
+            Err(nexa_runtime::InterpreterError::Heap(
+                nexa_runtime::HeapError::CapacityExhausted
+            ))
+        ));
+        assert_eq!(full_heap.map_contains(map, RuntimeValue::I32(1)), Ok(true));
+
+        for source in [
+            "fn bad() -> Map<bool, i32> { return Map.new<bool, i32>(); }",
+            "fn bad() -> Map<f32, i32> { return Map.new<f32, i32>(); }",
+            "class Key { value: i32; }
+             fn bad() -> Map<Key, i32> { return Map.new<Key, i32>(); }",
+            "immediate fn bad() -> Map<i32, i32> { return Map.new<i32, i32>(); }",
+            "immediate fn bad(values: Map<i32, i32>) -> i32 { return values.len(); }",
+        ] {
+            assert!(matches!(
+                compile(source),
+                Err(CompileError::TypeMismatch | CompileError::InvalidEffect)
+            ));
+        }
+        assert!(
+            compile(
+                "@stateful class Store { value: i32; }
+                 fn keyed(
+                     values: Map<StateHandle<Store>, i32>,
+                     handle: StateHandle<Store>
+                 ) -> bool {
+                     values.set(handle, 1);
+                     return values.contains(handle);
+                 }
+                 fn scalar_keys() -> bool {
+                     let a: Map<i64, i32> = Map.new<i64, i32>();
+                     let b: Map<rune, i32> = Map.new<rune, i32>();
+                     let c: Map<string, i32> = Map.new<string, i32>();
+                     return true;
+                 }"
+            )
+            .is_ok()
+        );
     }
 
     #[test]

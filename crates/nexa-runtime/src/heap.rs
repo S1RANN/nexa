@@ -5,6 +5,62 @@ use nexa_core::StableId;
 
 use crate::{RuntimeFailureInjector, RuntimeFailurePoint, RuntimeValue};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapEntry {
+    key: RuntimeValue,
+    value: RuntimeValue,
+    hash: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MapRehash {
+    old_slots: Vec<Option<MapEntry>>,
+    new_slots: Vec<Option<MapEntry>>,
+    cursor: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmMap {
+    type_id: StableId,
+    key_type: nexa_bytecode::ValueType,
+    value_type: nexa_bytecode::ValueType,
+    slots: Vec<Option<MapEntry>>,
+    length: usize,
+    rehash: Option<MapRehash>,
+}
+
+impl VmMap {
+    fn references(&self) -> Vec<GcRef> {
+        let current = self
+            .slots
+            .iter()
+            .filter_map(Option::as_ref)
+            .flat_map(|entry| [entry.key, entry.value]);
+        let rehash = self.rehash.iter().flat_map(|rehash| {
+            rehash
+                .old_slots
+                .iter()
+                .chain(&rehash.new_slots)
+                .filter_map(Option::as_ref)
+                .flat_map(|entry| [entry.key, entry.value])
+        });
+        current.chain(rehash).filter_map(value_reference).collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MapSetOutcome {
+    Complete,
+    RehashPending,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MapLocation {
+    Current(usize),
+    RehashOld(usize),
+    RehashNew(usize),
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GcRef {
     pub index: u32,
@@ -18,7 +74,7 @@ pub struct GcRef {
 pub enum Object {
     String(String),
     I32Array(Vec<i32>),
-    Map(Vec<(String, GcRef)>),
+    Map(VmMap),
     Enum {
         type_id: StableId,
         variant: StableId,
@@ -70,7 +126,7 @@ impl Object {
                     _ => None,
                 })
                 .collect(),
-            Self::Map(entries) => entries.iter().map(|(_, value)| *value).collect(),
+            Self::Map(map) => map.references(),
             Self::Enum { payload, .. } => payload
                 .iter()
                 .filter_map(|payload| match payload {
@@ -97,6 +153,16 @@ impl Object {
                 .collect(),
             Self::String(_) | Self::I32Array(_) => Vec::new(),
         }
+    }
+}
+
+const fn value_reference(value: RuntimeValue) -> Option<GcRef> {
+    match value {
+        RuntimeValue::String { reference, .. }
+        | RuntimeValue::Struct { reference, .. }
+        | RuntimeValue::Ref(reference)
+        | RuntimeValue::NamedRef { reference, .. } => Some(reference),
+        _ => None,
     }
 }
 
@@ -323,13 +389,28 @@ impl Heap {
         tag: u32,
         payload: Option<RuntimeValue>,
     ) -> Result<RuntimeValue, HeapError> {
-        let reference = self.allocate(Object::Enum {
-            type_id,
-            variant,
-            tag,
-            payload,
-        })?;
-        Ok(RuntimeValue::NamedRef { reference, type_id })
+        let mut reservation = self.preflight(1)?;
+        Ok(self.allocate_enum_reserved(&mut reservation, type_id, variant, tag, payload))
+    }
+
+    pub(crate) fn allocate_enum_reserved(
+        &mut self,
+        reservation: &mut HeapReservation,
+        type_id: StableId,
+        variant: StableId,
+        tag: u32,
+        payload: Option<RuntimeValue>,
+    ) -> RuntimeValue {
+        let reference = self.commit(
+            reservation,
+            Object::Enum {
+                type_id,
+                variant,
+                tag,
+                payload,
+            },
+        );
+        RuntimeValue::NamedRef { reference, type_id }
     }
 
     pub fn enum_tag(&self, value: RuntimeValue) -> Result<u32, HeapError> {
@@ -782,6 +863,194 @@ impl Heap {
         }
     }
 
+    pub fn allocate_map(
+        &mut self,
+        type_id: StableId,
+        key_type: nexa_bytecode::ValueType,
+        value_type: nexa_bytecode::ValueType,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::map_type(key_type, value_type) {
+            return Err(invalid_value_reference());
+        }
+        let initial_capacity = self.max_collection_length.min(8);
+        let slots = empty_map_slots(initial_capacity)?;
+        let reference = self.allocate(Object::Map(VmMap {
+            type_id,
+            key_type,
+            value_type,
+            slots,
+            length: 0,
+            rehash: None,
+        }))?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub fn map_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        Ok(self.map(value)?.length)
+    }
+
+    pub fn map_get(
+        &self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Result<Option<RuntimeValue>, HeapError> {
+        let hash = self.runtime_value_hash(key)?;
+        let map = self.map(value)?;
+        Ok(self
+            .find_map_entry(map, key, hash)?
+            .map(|location| map_entry(map, location).value))
+    }
+
+    pub fn map_contains(&self, value: RuntimeValue, key: RuntimeValue) -> Result<bool, HeapError> {
+        self.map_get(value, key).map(|value| value.is_some())
+    }
+
+    pub fn map_set(
+        &mut self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+        replacement: RuntimeValue,
+    ) -> Result<MapSetOutcome, HeapError> {
+        let hash = self.runtime_value_hash(key)?;
+        let location = {
+            let map = self.map(value)?;
+            self.find_map_entry(map, key, hash)?
+        };
+        if let Some(location) = location {
+            map_entry_mut(self.map_mut(value)?, location).value = replacement;
+            return Ok(MapSetOutcome::Complete);
+        }
+
+        if self.map(value)?.length >= self.max_collection_length {
+            return Err(HeapError::CollectionTooLarge {
+                length: self.map(value)?.length.saturating_add(1),
+                max_length: self.max_collection_length,
+            });
+        }
+        if self.map(value)?.rehash.is_some() {
+            progress_map_rehash(self.map_mut(value)?)?;
+            return Ok(MapSetOutcome::RehashPending);
+        }
+        if map_needs_rehash(self.map(value)?) {
+            let old_capacity = self.map(value)?.slots.len();
+            let maximum_capacity = self
+                .max_collection_length
+                .saturating_mul(2)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX);
+            let new_capacity = old_capacity.saturating_mul(2).max(1).min(maximum_capacity);
+            if new_capacity > old_capacity {
+                let new_slots = empty_map_slots(new_capacity)?;
+                let map = self.map_mut(value)?;
+                let old_slots = std::mem::take(&mut map.slots);
+                map.rehash = Some(MapRehash {
+                    old_slots,
+                    new_slots,
+                    cursor: 0,
+                });
+                return Ok(MapSetOutcome::RehashPending);
+            }
+        }
+
+        let entry = MapEntry {
+            key,
+            value: replacement,
+            hash,
+        };
+        let map = self.map_mut(value)?;
+        insert_map_entry(&mut map.slots, entry)?;
+        map.length += 1;
+        Ok(MapSetOutcome::Complete)
+    }
+
+    pub fn map_remove(
+        &mut self,
+        value: RuntimeValue,
+        key: RuntimeValue,
+    ) -> Result<Option<RuntimeValue>, HeapError> {
+        let hash = self.runtime_value_hash(key)?;
+        let location = {
+            let map = self.map(value)?;
+            self.find_map_entry(map, key, hash)?
+        };
+        let Some(location) = location else {
+            return Ok(None);
+        };
+        let entry = take_map_entry(self.map_mut(value)?, location);
+        self.map_mut(value)?.length -= 1;
+        Ok(Some(entry.value))
+    }
+
+    pub fn map_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let map = self.map_mut(value)?;
+        map.slots.fill(None);
+        map.rehash = None;
+        map.length = 0;
+        Ok(())
+    }
+
+    fn map(&self, value: RuntimeValue) -> Result<&VmMap, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Map(map)
+                if map.type_id == type_id
+                    && type_id == nexa_bytecode::map_type(map.key_type, map.value_type) =>
+            {
+                Ok(map)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn map_mut(&mut self, value: RuntimeValue) -> Result<&mut VmMap, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve_mut(reference)? {
+            Object::Map(map)
+                if map.type_id == type_id
+                    && type_id == nexa_bytecode::map_type(map.key_type, map.value_type) =>
+            {
+                Ok(map)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn find_map_entry(
+        &self,
+        map: &VmMap,
+        key: RuntimeValue,
+        hash: u64,
+    ) -> Result<Option<MapLocation>, HeapError> {
+        for (index, entry) in map.slots.iter().enumerate() {
+            if entry.is_some_and(|entry| entry.hash == hash)
+                && self.runtime_value_equal(entry.expect("checked entry").key, key)?
+            {
+                return Ok(Some(MapLocation::Current(index)));
+            }
+        }
+        if let Some(rehash) = &map.rehash {
+            for (index, entry) in rehash.new_slots.iter().enumerate() {
+                if entry.is_some_and(|entry| entry.hash == hash)
+                    && self.runtime_value_equal(entry.expect("checked entry").key, key)?
+                {
+                    return Ok(Some(MapLocation::RehashNew(index)));
+                }
+            }
+            for (index, entry) in rehash.old_slots.iter().enumerate() {
+                if entry.is_some_and(|entry| entry.hash == hash)
+                    && self.runtime_value_equal(entry.expect("checked entry").key, key)?
+                {
+                    return Ok(Some(MapLocation::RehashOld(index)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn structural_hash(
         &self,
         type_id: StableId,
@@ -1029,6 +1298,114 @@ impl Heap {
     }
 }
 
+fn empty_map_slots(capacity: usize) -> Result<Vec<Option<MapEntry>>, HeapError> {
+    let mut slots = Vec::new();
+    slots
+        .try_reserve_exact(capacity)
+        .map_err(|_| HeapError::CapacityExhausted)?;
+    slots.resize(capacity, None);
+    Ok(slots)
+}
+
+fn map_needs_rehash(map: &VmMap) -> bool {
+    map.slots.is_empty()
+        || map.length.saturating_add(1).saturating_mul(4) > map.slots.len().saturating_mul(3)
+}
+
+fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<(), HeapError> {
+    if slots.is_empty() {
+        return Err(HeapError::CapacityExhausted);
+    }
+    let start = usize::try_from(entry.hash % slots.len() as u64)
+        .expect("hash modulo slot count fits usize");
+    for offset in 0..slots.len() {
+        let index = (start + offset) % slots.len();
+        if slots[index].is_none() {
+            slots[index] = Some(entry);
+            return Ok(());
+        }
+    }
+    Err(HeapError::CapacityExhausted)
+}
+
+fn progress_map_rehash(map: &mut VmMap) -> Result<(), HeapError> {
+    const REHASH_CHUNK: usize = 8;
+    let rehash = map.rehash.as_mut().expect("rehash state checked by caller");
+    let end = rehash
+        .cursor
+        .saturating_add(REHASH_CHUNK)
+        .min(rehash.old_slots.len());
+    for index in rehash.cursor..end {
+        if let Some(entry) = rehash.old_slots[index].take() {
+            insert_map_entry(&mut rehash.new_slots, entry)?;
+        }
+    }
+    rehash.cursor = end;
+    if end == rehash.old_slots.len() {
+        map.slots = std::mem::take(&mut rehash.new_slots);
+        map.rehash = None;
+    }
+    Ok(())
+}
+
+fn map_entry(map: &VmMap, location: MapLocation) -> MapEntry {
+    match location {
+        MapLocation::Current(index) => map.slots[index].expect("located map entry exists"),
+        MapLocation::RehashOld(index) => map
+            .rehash
+            .as_ref()
+            .expect("located rehash entry has state")
+            .old_slots[index]
+            .expect("located map entry exists"),
+        MapLocation::RehashNew(index) => map
+            .rehash
+            .as_ref()
+            .expect("located rehash entry has state")
+            .new_slots[index]
+            .expect("located map entry exists"),
+    }
+}
+
+fn map_entry_mut(map: &mut VmMap, location: MapLocation) -> &mut MapEntry {
+    match location {
+        MapLocation::Current(index) => map.slots[index].as_mut().expect("located map entry exists"),
+        MapLocation::RehashOld(index) => map
+            .rehash
+            .as_mut()
+            .expect("located rehash entry has state")
+            .old_slots[index]
+            .as_mut()
+            .expect("located map entry exists"),
+        MapLocation::RehashNew(index) => map
+            .rehash
+            .as_mut()
+            .expect("located rehash entry has state")
+            .new_slots[index]
+            .as_mut()
+            .expect("located map entry exists"),
+    }
+}
+
+fn take_map_entry(map: &mut VmMap, location: MapLocation) -> MapEntry {
+    match location {
+        MapLocation::Current(index) => map.slots[index].take().expect("located map entry exists"),
+        MapLocation::RehashOld(index) => map
+            .rehash
+            .as_mut()
+            .expect("located rehash entry has state")
+            .old_slots[index]
+            .take()
+            .expect("located map entry exists"),
+        MapLocation::RehashNew(index) => map
+            .rehash
+            .as_mut()
+            .expect("located rehash entry has state")
+            .new_slots[index]
+            .take()
+            .expect("located map entry exists"),
+    }
+}
+
 fn write_hash(hash: &mut u64, bytes: &[u8]) {
     for byte in bytes {
         *hash ^= u64::from(*byte);
@@ -1040,7 +1417,7 @@ fn write_hash(hash: &mut u64, bytes: &[u8]) {
 mod tests {
     use nexa_core::StableId;
 
-    use super::{GcRoots, Heap, HeapError, Object};
+    use super::{GcRoots, Heap, HeapError, MapSetOutcome, Object};
     use crate::{RuntimeFailurePoint, RuntimeValue};
 
     #[test]
@@ -1178,5 +1555,113 @@ mod tests {
         let stats = heap.collect(&GcRoots::default()).unwrap();
         assert_eq!(stats.reclaimed, 2);
         assert_eq!(stats.live, 0);
+    }
+
+    #[test]
+    fn maps_rehash_in_bounded_chunks_and_enforce_max_length_atomically() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 7);
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I64);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I64,
+            )
+            .unwrap();
+        for key in 0..7 {
+            loop {
+                if heap
+                    .map_set(
+                        map,
+                        RuntimeValue::I32(key),
+                        RuntimeValue::I64(i64::from(key)),
+                    )
+                    .unwrap()
+                    == MapSetOutcome::Complete
+                {
+                    break;
+                }
+                assert_eq!(
+                    heap.map_len(map).unwrap(),
+                    usize::try_from(key).expect("test keys are non-negative"),
+                );
+            }
+        }
+        assert_eq!(heap.map_len(map), Ok(7));
+        assert_eq!(
+            heap.map_set(map, RuntimeValue::I32(7), RuntimeValue::I64(7)),
+            Err(HeapError::CollectionTooLarge {
+                length: 8,
+                max_length: 7,
+            })
+        );
+        assert_eq!(
+            heap.map_get(map, RuntimeValue::I32(4)),
+            Ok(Some(RuntimeValue::I64(4)))
+        );
+        assert_eq!(heap.map_contains(map, RuntimeValue::I32(99)), Ok(false));
+        assert_eq!(
+            heap.map_remove(map, RuntimeValue::I32(2)),
+            Ok(Some(RuntimeValue::I64(2)))
+        );
+        assert_eq!(heap.map_remove(map, RuntimeValue::I32(2)), Ok(None));
+        heap.map_clear(map).unwrap();
+        assert_eq!(heap.map_len(map), Ok(0));
+    }
+
+    #[test]
+    fn map_keys_and_values_remain_gc_roots_during_rehash() {
+        let mut heap = Heap::new_with_limits(20, usize::MAX, 16);
+        let map_type = nexa_bytecode::map_type(
+            nexa_bytecode::ValueType::String,
+            nexa_bytecode::ValueType::String,
+        );
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::String,
+                nexa_bytecode::ValueType::String,
+            )
+            .unwrap();
+        let mut strings = Vec::new();
+        for index in 0..13 {
+            let reference = heap.allocate_string(&format!("value-{index}")).unwrap();
+            let value = RuntimeValue::String {
+                reference,
+                hash: heap.string_hash(reference).unwrap(),
+            };
+            strings.push(reference);
+            if index < 12 {
+                while heap.map_set(map, value, value).unwrap() == MapSetOutcome::RehashPending {}
+            } else {
+                assert_eq!(
+                    heap.map_set(map, value, value).unwrap(),
+                    MapSetOutcome::RehashPending
+                );
+                assert_eq!(
+                    heap.map_set(map, value, value).unwrap(),
+                    MapSetOutcome::RehashPending
+                );
+            }
+        }
+        let RuntimeValue::NamedRef {
+            reference: map_reference,
+            ..
+        } = map
+        else {
+            unreachable!("map allocations are named references")
+        };
+        let roots = GcRoots {
+            running_frames: vec![map_reference],
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().live, 13);
+        assert!(
+            strings[..12]
+                .iter()
+                .all(|reference| heap.string(*reference).is_ok())
+        );
+        assert!(heap.string(strings[12]).is_err());
     }
 }

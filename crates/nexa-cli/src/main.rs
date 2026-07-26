@@ -169,6 +169,16 @@ fn render_module_dump(
             )
             .expect("String writes do not fail");
         }
+        let mut maps = module.map_types.iter().collect::<Vec<_>>();
+        maps.sort_by_key(|map| map.type_id);
+        for map in maps {
+            writeln!(
+                output,
+                "map {:016x} key={:?} value={:?}",
+                map.type_id.0, map.key, map.value
+            )
+            .expect("String writes do not fail");
+        }
     }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
@@ -1085,9 +1095,9 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ArrayType, ClassType, FunctionBuilder, Instruction, ModuleBuilder, SectionKind, Signature,
-        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
-        StructType, ValueType,
+        ArrayType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder, SectionKind,
+        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
+        StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1124,6 +1134,7 @@ mod tests {
         let state_target = ValueType::Named(StableId::from_name("Store"));
         builder.state_handle_type(StateHandleType::new(state_target));
         builder.array_type(ArrayType::new(ValueType::I32));
+        builder.map_type(MapType::new(ValueType::String, ValueType::I32));
         builder.state_schema(StateSchema {
             types: vec![StateType {
                 stable_id: StableId::from_name("Store"),
@@ -1167,6 +1178,8 @@ mod tests {
         assert!(full.contains("state-handle "));
         assert!(full.contains("array "));
         assert!(full.contains("element=I32"));
+        assert!(full.contains("map "));
+        assert!(full.contains("key=String value=I32"));
         assert!(full.contains("stateful-class "));
         assert!(full.contains("persistent=true"));
         assert!(
@@ -1181,6 +1194,7 @@ mod tests {
         assert!(types.contains("section types"));
         assert!(types.contains("state-handle "));
         assert!(types.contains("array "));
+        assert!(types.contains("map "));
         assert!(!types.contains("code function="));
         let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
         assert!(code.contains("section code"));

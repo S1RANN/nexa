@@ -300,6 +300,29 @@ impl ArrayType {
 }
 
 #[must_use]
+pub fn map_type(key: ValueType, value: ValueType) -> StableId {
+    parameterized_type_id("Map", &[key, value])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MapType {
+    pub type_id: StableId,
+    pub key: ValueType,
+    pub value: ValueType,
+}
+
+impl MapType {
+    #[must_use]
+    pub fn new(key: ValueType, value: ValueType) -> Self {
+        Self {
+            type_id: map_type(key, value),
+            key,
+            value,
+        }
+    }
+}
+
+#[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
 }
@@ -720,6 +743,39 @@ pub enum Instruction {
     ArrayClear {
         source: u16,
     },
+    MapNew {
+        type_id: StableId,
+        dst: u16,
+    },
+    MapLen {
+        source: u16,
+        dst: u16,
+    },
+    MapGet {
+        source: u16,
+        key: u16,
+        result_type: StableId,
+        dst: u16,
+    },
+    MapSet {
+        source: u16,
+        key: u16,
+        value: u16,
+    },
+    MapRemove {
+        source: u16,
+        key: u16,
+        result_type: StableId,
+        dst: u16,
+    },
+    MapContains {
+        source: u16,
+        key: u16,
+        dst: u16,
+    },
+    MapClear {
+        source: u16,
+    },
     StateFinish,
     StateOldFieldGet {
         object: u16,
@@ -795,6 +851,7 @@ pub struct Module {
     pub functions: Vec<Function>,
     pub state_handle_types: Vec<StateHandleType>,
     pub array_types: Vec<ArrayType>,
+    pub map_types: Vec<MapType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -1381,7 +1438,8 @@ impl Module {
             u32::try_from(
                 self.state_handle_types
                     .len()
-                    .saturating_add(self.array_types.len()),
+                    .saturating_add(self.array_types.len())
+                    .saturating_add(self.map_types.len()),
             )
             .expect("parameterized type count exceeds wire format"),
         );
@@ -1394,6 +1452,12 @@ impl Module {
             types.push(2);
             put_u64(&mut types, array.type_id.0);
             encode_type(&mut types, array.element);
+        }
+        for map in &self.map_types {
+            types.push(3);
+            put_u64(&mut types, map.type_id.0);
+            encode_type(&mut types, map.key);
+            encode_type(&mut types, map.value);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -1501,18 +1565,23 @@ impl Module {
         enforce_limit(state_handle_type_count, limits.max_types, "types")?;
         let mut state_handle_types = Vec::with_capacity(state_handle_type_count);
         let mut array_types = Vec::new();
+        let mut map_types = Vec::new();
         for _ in 0..state_handle_type_count {
             let kind = types_reader.u8()?;
             let type_id = StableId(types_reader.u64()?);
-            let argument = decode_type(&mut types_reader)?;
             match kind {
                 1 => state_handle_types.push(StateHandleType {
                     type_id,
-                    target: argument,
+                    target: decode_type(&mut types_reader)?,
                 }),
                 2 => array_types.push(ArrayType {
                     type_id,
-                    element: argument,
+                    element: decode_type(&mut types_reader)?,
+                }),
+                3 => map_types.push(MapType {
+                    type_id,
+                    key: decode_type(&mut types_reader)?,
+                    value: decode_type(&mut types_reader)?,
                 }),
                 _ => return Err(DecodeError::InvalidType(kind)),
             }
@@ -1929,6 +1998,7 @@ impl Module {
             functions,
             state_handle_types,
             array_types,
+            map_types,
             enum_types,
             struct_types,
             class_types,
@@ -2447,6 +2517,54 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             output.push(76);
             put_u16(output, source);
         }
+        Instruction::MapNew { type_id, dst } => {
+            output.push(77);
+            put_u64(output, type_id.0);
+            put_u16(output, dst);
+        }
+        Instruction::MapLen { source, dst } => {
+            output.push(78);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::MapGet {
+            source,
+            key,
+            result_type,
+            dst,
+        }
+        | Instruction::MapRemove {
+            source,
+            key,
+            result_type,
+            dst,
+        } => {
+            output.push(match instruction {
+                Instruction::MapGet { .. } => 79,
+                Instruction::MapRemove { .. } => 81,
+                _ => unreachable!(),
+            });
+            put_u16(output, source);
+            put_u16(output, key);
+            put_u64(output, result_type.0);
+            put_u16(output, dst);
+        }
+        Instruction::MapSet { source, key, value } => {
+            output.push(80);
+            put_u16(output, source);
+            put_u16(output, key);
+            put_u16(output, value);
+        }
+        Instruction::MapContains { source, key, dst } => {
+            output.push(82);
+            put_u16(output, source);
+            put_u16(output, key);
+            put_u16(output, dst);
+        }
+        Instruction::MapClear { source } => {
+            output.push(83);
+            put_u16(output, source);
+        }
         Instruction::Jump { target } => {
             output.push(7);
             put_u32(output, target);
@@ -2944,6 +3062,39 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         76 => Instruction::ArrayClear {
             source: reader.u16()?,
         },
+        77 => Instruction::MapNew {
+            type_id: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        78 => Instruction::MapLen {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        79 => Instruction::MapGet {
+            source: reader.u16()?,
+            key: reader.u16()?,
+            result_type: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        80 => Instruction::MapSet {
+            source: reader.u16()?,
+            key: reader.u16()?,
+            value: reader.u16()?,
+        },
+        81 => Instruction::MapRemove {
+            source: reader.u16()?,
+            key: reader.u16()?,
+            result_type: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        82 => Instruction::MapContains {
+            source: reader.u16()?,
+            key: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        83 => Instruction::MapClear {
+            source: reader.u16()?,
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -3054,6 +3205,7 @@ pub struct ModuleBuilder {
     functions: Vec<Function>,
     state_handle_types: Vec<StateHandleType>,
     array_types: Vec<ArrayType>,
+    map_types: Vec<MapType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -3074,6 +3226,7 @@ impl ModuleBuilder {
             functions: Vec::new(),
             state_handle_types: Vec::new(),
             array_types: Vec::new(),
+            map_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -3153,6 +3306,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn map_type(&mut self, map_type: MapType) -> &mut Self {
+        self.map_types.push(map_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -3190,6 +3348,7 @@ impl ModuleBuilder {
             functions: self.functions,
             state_handle_types: self.state_handle_types,
             array_types: self.array_types,
+            map_types: self.map_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
@@ -3318,6 +3477,13 @@ impl FunctionBuilder {
                         | Instruction::ArrayInsert { .. }
                         | Instruction::ArrayRemove { .. }
                         | Instruction::ArrayClear { .. }
+                        | Instruction::MapNew { .. }
+                        | Instruction::MapLen { .. }
+                        | Instruction::MapGet { .. }
+                        | Instruction::MapSet { .. }
+                        | Instruction::MapRemove { .. }
+                        | Instruction::MapContains { .. }
+                        | Instruction::MapClear { .. }
                         | Instruction::Return { .. }
                         | Instruction::ReturnVoid
                         | Instruction::Trap
@@ -3374,9 +3540,10 @@ mod tests {
 
     use super::{
         ArrayType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder,
-        FunctionEffect, Instruction, Module, ModuleBuilder, SectionKind, Signature, SourceMapEntry,
-        StateField, StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
-        result_type, state_handle_error_type, state_handle_type,
+        FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind, Signature,
+        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+        StructType, ValueType, option_type, result_type, state_handle_error_type,
+        state_handle_type,
     };
 
     #[test]
@@ -3817,6 +3984,61 @@ mod tests {
             .function(function.finish().unwrap());
         let module = builder.finish();
         assert_eq!(module.array_types, vec![array]);
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn map_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+        let map = MapType::new(ValueType::I32, ValueType::String);
+        let option = option_type(ValueType::String);
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::Named(map.type_id),
+                    ValueType::I32,
+                    ValueType::String,
+                ],
+                result: Some(ValueType::I32),
+            },
+            7,
+        );
+        function
+            .emit(Instruction::MapNew {
+                type_id: map.type_id,
+                dst: 3,
+            })
+            .emit(Instruction::MapLen { source: 0, dst: 4 })
+            .emit(Instruction::MapGet {
+                source: 0,
+                key: 1,
+                result_type: option.type_id,
+                dst: 5,
+            })
+            .emit(Instruction::MapSet {
+                source: 0,
+                key: 1,
+                value: 2,
+            })
+            .emit(Instruction::MapRemove {
+                source: 0,
+                key: 1,
+                result_type: option.type_id,
+                dst: 5,
+            })
+            .emit(Instruction::MapContains {
+                source: 0,
+                key: 1,
+                dst: 6,
+            })
+            .emit(Instruction::MapClear { source: 0 })
+            .emit(Instruction::Return { source: 4 });
+        let mut builder = ModuleBuilder::new();
+        builder
+            .map_type(map)
+            .enum_type(option)
+            .function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(module.map_types, vec![map]);
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 

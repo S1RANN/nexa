@@ -61,6 +61,7 @@ pub enum VerifyErrorKind {
     InvalidClassMetadata,
     InvalidStateMetadata,
     InvalidArrayMetadata,
+    InvalidMapMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -69,6 +70,7 @@ pub enum VerifyErrorKind {
     ClassTypeOutOfRange(u64),
     ClassFieldOutOfRange(u64),
     ArrayTypeOutOfRange(u64),
+    MapTypeOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
     StringOutOfRange(u32),
@@ -246,8 +248,69 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
             });
         }
     }
+    verify_map_metadata(module)?;
     verify_state_storage_metadata(module)?;
     Ok(())
+}
+
+fn verify_map_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut map_ids = BTreeSet::new();
+    let invalid = module.map_types.iter().any(|map_type| {
+        !map_ids.insert(map_type.type_id.0)
+            || map_type.type_id != nexa_bytecode::map_type(map_type.key, map_type.value)
+            || !valid_map_key_type(module, map_type.key)
+            || module
+                .enum_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == map_type.type_id)
+            || module
+                .state_handle_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+            || module
+                .array_types
+                .iter()
+                .any(|ty| ty.type_id == map_type.type_id)
+    });
+    if invalid {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidMapMetadata,
+        });
+    }
+    Ok(())
+}
+
+fn valid_map_key_type(module: &Module, key: ValueType) -> bool {
+    match key {
+        ValueType::I32 | ValueType::I64 | ValueType::Rune | ValueType::String => true,
+        ValueType::Named(type_id) => {
+            module
+                .state_handle_types
+                .iter()
+                .any(|handle| handle.type_id == type_id)
+                || key == nexa_bytecode::stable_id_type()
+                || module
+                    .host_imports
+                    .iter()
+                    .any(|import| import.parameters.contains(&key) || import.result == Some(key))
+        }
+        ValueType::F32 | ValueType::F64 | ValueType::Bool | ValueType::Ref => false,
+    }
 }
 
 fn verify_state_storage_metadata(module: &Module) -> Result<(), VerifyError> {
@@ -510,6 +573,18 @@ fn verify_function(
                 .map(|array_type| array_type.element)
                 .ok_or_else(|| error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0)))
         };
+        let map_types = |state: &[Option<ValueType>], source: u16| {
+            let source = register(source)?;
+            let Some(ValueType::Named(type_id)) = state[source] else {
+                return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+            };
+            module
+                .map_types
+                .iter()
+                .find(|map_type| map_type.type_id == type_id)
+                .map(|map_type| (map_type.key, map_type.value))
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0)))
+        };
         let mut successors = Vec::with_capacity(2);
         if matches!(
             instruction,
@@ -522,6 +597,13 @@ fn verify_function(
                 | Instruction::ArrayInsert { .. }
                 | Instruction::ArrayRemove { .. }
                 | Instruction::ArrayClear { .. }
+                | Instruction::MapNew { .. }
+                | Instruction::MapLen { .. }
+                | Instruction::MapGet { .. }
+                | Instruction::MapSet { .. }
+                | Instruction::MapRemove { .. }
+                | Instruction::MapContains { .. }
+                | Instruction::MapClear { .. }
         ) && matches!(
             function.effect,
             FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
@@ -1173,6 +1255,59 @@ fn verify_function(
             Instruction::ArrayClear { source } => {
                 array_element(&state, source)?;
             }
+            Instruction::MapNew { type_id, dst } => {
+                if !module
+                    .map_types
+                    .iter()
+                    .any(|map_type| map_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::MapTypeOutOfRange(type_id.0),
+                    ));
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
+            Instruction::MapLen { source, dst } => {
+                map_types(&state, source)?;
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::MapGet {
+                source,
+                key,
+                result_type,
+                dst,
+            }
+            | Instruction::MapRemove {
+                source,
+                key,
+                result_type,
+                dst,
+            } => {
+                let (key_type, value_type) = map_types(&state, source)?;
+                require(&state, key, key_type)?;
+                let option = nexa_bytecode::option_type(value_type);
+                if result_type != option.type_id || !module.enum_types.contains(&option) {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::EnumTypeOutOfRange(result_type.0),
+                    ));
+                }
+                state[register(dst)?] = Some(ValueType::Named(result_type));
+            }
+            Instruction::MapSet { source, key, value } => {
+                let (key_type, value_type) = map_types(&state, source)?;
+                require(&state, key, key_type)?;
+                require(&state, value, value_type)?;
+            }
+            Instruction::MapContains { source, key, dst } => {
+                let (key_type, _) = map_types(&state, source)?;
+                require(&state, key, key_type)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::MapClear { source } => {
+                map_types(&state, source)?;
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -1361,6 +1496,13 @@ fn verify_safepoints(
                     | Instruction::ArrayInsert { .. }
                     | Instruction::ArrayRemove { .. }
                     | Instruction::ArrayClear { .. }
+                    | Instruction::MapNew { .. }
+                    | Instruction::MapLen { .. }
+                    | Instruction::MapGet { .. }
+                    | Instruction::MapSet { .. }
+                    | Instruction::MapRemove { .. }
+                    | Instruction::MapContains { .. }
+                    | Instruction::MapClear { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }
@@ -1616,9 +1758,9 @@ fn longest_path(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ArrayType, ClassType, FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap,
-        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
-        StructField, StructType, ValueType,
+        ArrayType, ClassType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
+        Instruction, MapType, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField,
+        StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1732,6 +1874,97 @@ mod tests {
                 .kind,
             VerifyErrorKind::InvalidEffect
         );
+    }
+
+    #[test]
+    fn map_keys_metadata_and_option_results_are_verified_independently() {
+        let map = MapType::new(ValueType::I32, ValueType::String);
+        let option = nexa_bytecode::option_type(ValueType::String);
+        let mut get = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(map.type_id), ValueType::I32],
+                result: Some(ValueType::Named(option.type_id)),
+            },
+            3,
+        );
+        get.set_root(0)
+            .unwrap()
+            .set_root(2)
+            .unwrap()
+            .emit(Instruction::MapGet {
+                source: 0,
+                key: 1,
+                result_type: option.type_id,
+                dst: 2,
+            })
+            .emit(Instruction::Return { source: 2 });
+        let mut get = get.finish().unwrap();
+        get.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true, false, true],
+            },
+        ];
+        let mut valid = ModuleBuilder::new();
+        valid
+            .map_type(map)
+            .enum_type(option.clone())
+            .function(get.clone());
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let opaque = ValueType::Named(StableId::from_name("EntityHandle"));
+        let mut opaque_key = ModuleBuilder::new();
+        opaque_key.host_import(HostImport {
+            stable_id: StableId::from_name("host.entity"),
+            parameters: vec![opaque],
+            result: Some(opaque),
+            mode: HostCallMode::Immediate,
+            fuel_cost: 1,
+            async_result: None,
+        });
+        opaque_key.map_type(MapType::new(opaque, ValueType::I32));
+        assert!(verify(opaque_key.finish(), VerifierLimits::default()).is_ok());
+
+        let mut invalid_key = ModuleBuilder::new();
+        invalid_key.map_type(MapType::new(ValueType::Bool, ValueType::I32));
+        assert_eq!(
+            verify(invalid_key.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidMapMetadata
+        );
+
+        let mut forged = ModuleBuilder::new();
+        forged.map_type(MapType {
+            type_id: StableId::from_name("forged-map"),
+            key: ValueType::I32,
+            value: ValueType::String,
+        });
+        assert_eq!(
+            verify(forged.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidMapMetadata
+        );
+
+        get.code[0] = Instruction::MapGet {
+            source: 0,
+            key: 1,
+            result_type: StableId::from_name("wrong-option"),
+            dst: 2,
+        };
+        let mut wrong_result = ModuleBuilder::new();
+        wrong_result.map_type(map).enum_type(option).function(get);
+        assert!(matches!(
+            verify(wrong_result.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::EnumTypeOutOfRange(_)
+        ));
     }
 
     #[test]
