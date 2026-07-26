@@ -66,6 +66,7 @@ pub enum TokenKind {
 pub struct Token {
     pub kind: TokenKind,
     pub offset: usize,
+    pub end: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -133,9 +134,16 @@ impl CompileError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstModule {
     pub name: Option<String>,
-    pub imports: Vec<String>,
+    pub imports: Vec<AstImport>,
     pub types: Vec<AstTypeDeclaration>,
     pub functions: Vec<AstFunction>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstImport {
+    pub name: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,8 +151,22 @@ pub struct AstTypeDeclaration {
     pub name: String,
     pub kind: AstTypeKind,
     pub version: u32,
-    pub fields: Vec<(String, AstType)>,
-    pub variants: Vec<String>,
+    pub fields: Vec<AstField>,
+    pub variants: Vec<AstVariant>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstField {
+    pub name: String,
+    pub ty: AstType,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstVariant {
+    pub name: String,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -161,9 +183,23 @@ pub struct AstFunction {
     pub is_task: bool,
     pub is_activation: bool,
     pub effect: FunctionEffect,
-    pub parameters: Vec<(String, AstType)>,
-    pub result: AstType,
+    pub parameters: Vec<AstParameter>,
+    pub result: AstReturnType,
     pub body: Vec<AstStatement>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstParameter {
+    pub name: String,
+    pub ty: AstType,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AstReturnType {
+    pub ty: AstType,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -172,6 +208,25 @@ pub enum AstType {
     Bool,
     Named(String),
     BuiltinGeneric { name: String, arguments: Vec<Self> },
+    Spanned { ty: Box<Self>, span: SourceSpan },
+}
+
+impl AstType {
+    #[must_use]
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Spanned { ty, .. } => ty.kind(),
+            ty => ty,
+        }
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> SourceSpan {
+        match self {
+            Self::Spanned { span, .. } => *span,
+            _ => SourceSpan::new(FileId(0), 0, 0),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -193,6 +248,35 @@ pub enum AstStatement {
         body: Vec<Self>,
     },
     Defer(AstExpression),
+    Spanned {
+        statement: Box<Self>,
+        span: SourceSpan,
+    },
+}
+
+impl AstStatement {
+    #[must_use]
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Spanned { statement, .. } => statement.kind(),
+            statement => statement,
+        }
+    }
+
+    fn kind_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Spanned { statement, .. } => statement.kind_mut(),
+            statement => statement,
+        }
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> SourceSpan {
+        match self {
+            Self::Spanned { span, .. } => *span,
+            _ => SourceSpan::new(FileId(0), 0, 0),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -201,7 +285,7 @@ pub enum AstExpression {
     Bool(bool),
     Name(String),
     Binary {
-        op: BinaryOp,
+        op: AstOperator,
         lhs: Box<Self>,
         rhs: Box<Self>,
     },
@@ -220,6 +304,35 @@ pub enum AstExpression {
     },
     Try(Box<Self>),
     Migration(MigrationIntrinsic),
+    Spanned {
+        expression: Box<Self>,
+        span: SourceSpan,
+    },
+}
+
+impl AstExpression {
+    #[must_use]
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Spanned { expression, .. } => expression.kind(),
+            expression => expression,
+        }
+    }
+
+    fn kind_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Spanned { expression, .. } => expression.kind_mut(),
+            expression => expression,
+        }
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> SourceSpan {
+        match self {
+            Self::Spanned { span, .. } => *span,
+            _ => SourceSpan::new(FileId(0), 0, 0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -246,6 +359,7 @@ pub struct MatchArm {
     pub variant: String,
     pub binding: Option<String>,
     pub value: AstExpression,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -281,6 +395,35 @@ pub enum MigrationIntrinsic {
         stable_id: String,
     },
     Finish,
+    Spanned {
+        intrinsic: Box<Self>,
+        span: SourceSpan,
+    },
+}
+
+impl MigrationIntrinsic {
+    #[must_use]
+    pub fn kind(&self) -> &Self {
+        match self {
+            Self::Spanned { intrinsic, .. } => intrinsic.kind(),
+            intrinsic => intrinsic,
+        }
+    }
+
+    fn kind_mut(&mut self) -> &mut Self {
+        match self {
+            Self::Spanned { intrinsic, .. } => intrinsic.kind_mut(),
+            intrinsic => intrinsic,
+        }
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> SourceSpan {
+        match self {
+            Self::Spanned { span, .. } => *span,
+            _ => SourceSpan::new(FileId(0), 0, 0),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -288,6 +431,12 @@ pub enum BinaryOp {
     Add,
     Subtract,
     Multiply,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AstOperator {
+    pub kind: BinaryOp,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -324,6 +473,19 @@ pub struct HirModule {
     enum_types: Vec<EnumType>,
     enum_variants: BTreeMap<(StableId, String), EnumVariant>,
     state_handle_targets: BTreeMap<StableId, ValueType>,
+    span: SourceSpan,
+}
+
+impl HirModule {
+    #[must_use]
+    pub const fn span(&self) -> SourceSpan {
+        self.span
+    }
+
+    #[must_use]
+    pub fn function_spans(&self) -> impl ExactSizeIterator<Item = SourceSpan> + '_ {
+        self.functions.iter().map(|function| function.span)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -341,6 +503,7 @@ struct HirFunction {
     signature: Signature,
     body: Vec<AstStatement>,
     locals: BTreeMap<String, (u16, ValueType)>,
+    span: SourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -360,6 +523,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
         if character.is_whitespace() {
             continue;
         }
+        let mut end = offset.saturating_add(character.len_utf8());
         let kind = match character {
             '(' => TokenKind::LParen,
             ')' => TokenKind::RParen,
@@ -371,7 +535,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             '+' => TokenKind::Plus,
             '*' => TokenKind::Star,
             '=' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
-                chars.next();
+                let (next_offset, next) = chars.next().expect("peeked token exists");
+                end = next_offset.saturating_add(next.len_utf8());
                 TokenKind::FatArrow
             }
             '=' => TokenKind::Equal,
@@ -380,22 +545,25 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             '?' => TokenKind::Question,
             '@' => TokenKind::At,
             '.' if chars.peek().is_some_and(|(_, next)| *next == '.') => {
-                chars.next();
+                let (next_offset, next) = chars.next().expect("peeked token exists");
+                end = next_offset.saturating_add(next.len_utf8());
                 TokenKind::DotDot
             }
             '.' => TokenKind::Dot,
             '-' if chars.peek().is_some_and(|(_, next)| *next == '>') => {
-                chars.next();
+                let (next_offset, next) = chars.next().expect("peeked token exists");
+                end = next_offset.saturating_add(next.len_utf8());
                 TokenKind::Arrow
             }
             '-' => TokenKind::Minus,
             digit if digit.is_ascii_digit() => {
                 let mut text = digit.to_string();
-                while let Some((_, next)) = chars.peek() {
+                while let Some((next_offset, next)) = chars.peek() {
                     if !next.is_ascii_digit() {
                         break;
                     }
                     text.push(*next);
+                    end = next_offset.saturating_add(next.len_utf8());
                     chars.next();
                 }
                 TokenKind::Integer(text.parse().map_err(|_| CompileError::UnexpectedToken {
@@ -405,11 +573,12 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
             }
             first if first == '_' || first.is_ascii_alphabetic() => {
                 let mut text = first.to_string();
-                while let Some((_, next)) = chars.peek() {
+                while let Some((next_offset, next)) = chars.peek() {
                     if *next != '_' && !next.is_ascii_alphanumeric() {
                         break;
                     }
                     text.push(*next);
+                    end = next_offset.saturating_add(next.len_utf8());
                     chars.next();
                 }
                 match text.as_str() {
@@ -445,22 +614,33 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 return Err(CompileError::UnexpectedCharacter { offset, character });
             }
         };
-        tokens.push(Token { kind, offset });
+        tokens.push(Token { kind, offset, end });
     }
     Ok(tokens)
 }
 
 pub fn parse(tokens: &[Token]) -> Result<AstModule, CompileError> {
-    Parser { tokens, cursor: 0 }.module()
+    parse_with_file(tokens, FileId(0))
+}
+
+pub fn parse_with_file(tokens: &[Token], file: FileId) -> Result<AstModule, CompileError> {
+    Parser {
+        tokens,
+        cursor: 0,
+        file,
+    }
+    .module()
 }
 
 struct Parser<'a> {
     tokens: &'a [Token],
     cursor: usize,
+    file: FileId,
 }
 
 impl Parser<'_> {
     fn module(mut self) -> Result<AstModule, CompileError> {
+        let start = self.current_start();
         let name = if self.take(&TokenKind::Module) {
             let name = self.qualified_ident()?;
             self.expect(&TokenKind::Semicolon, ";")?;
@@ -469,9 +649,15 @@ impl Parser<'_> {
             None
         };
         let mut imports = Vec::new();
-        while self.take(&TokenKind::Import) {
-            imports.push(self.qualified_ident()?);
+        while self.at(&TokenKind::Import) {
+            let import_start = self.current_start();
+            self.cursor += 1;
+            let name = self.qualified_ident()?;
             self.expect(&TokenKind::Semicolon, ";")?;
+            imports.push(AstImport {
+                name,
+                span: self.span_from(import_start),
+            });
         }
         let mut types = Vec::new();
         let mut functions = Vec::new();
@@ -499,10 +685,12 @@ impl Parser<'_> {
             imports,
             types,
             functions,
+            span: self.span_from(start),
         })
     }
 
     fn type_declaration(&mut self) -> Result<AstTypeDeclaration, CompileError> {
+        let start = self.current_start();
         let (stateful, version) = if self.take(&TokenKind::At) {
             self.expect(&TokenKind::Stateful, "stateful")?;
             let version = if self.take(&TokenKind::LParen) {
@@ -542,14 +730,23 @@ impl Parser<'_> {
         let mut fields = Vec::new();
         let mut variants = Vec::new();
         while !self.take(&TokenKind::RBrace) {
+            let member_start = self.current_start();
             let member = self.ident()?;
             if kind == AstTypeKind::Enum {
-                variants.push(member);
+                variants.push(AstVariant {
+                    name: member,
+                    span: self.span_from(member_start),
+                });
                 self.take(&TokenKind::Comma);
             } else {
                 self.expect(&TokenKind::Colon, ":")?;
-                fields.push((member, self.ty()?));
+                let ty = self.ty()?;
                 self.expect(&TokenKind::Semicolon, ";")?;
+                fields.push(AstField {
+                    name: member,
+                    ty,
+                    span: self.span_from(member_start),
+                });
             }
         }
         Ok(AstTypeDeclaration {
@@ -558,10 +755,12 @@ impl Parser<'_> {
             version,
             fields,
             variants,
+            span: self.span_from(start),
         })
     }
 
     fn function(&mut self) -> Result<AstFunction, CompileError> {
+        let start = self.current_start();
         let is_activation = if self.take(&TokenKind::At) {
             self.expect(&TokenKind::Activation, "activation")?;
             true
@@ -589,9 +788,14 @@ impl Parser<'_> {
         let mut parameters = Vec::new();
         if !self.at(&TokenKind::RParen) {
             loop {
+                let parameter_start = self.current_start();
                 let parameter = self.ident()?;
                 self.expect(&TokenKind::Colon, ":")?;
-                parameters.push((parameter, self.ty()?));
+                parameters.push(AstParameter {
+                    name: parameter,
+                    ty: self.ty()?,
+                    span: self.span_from(parameter_start),
+                });
                 if !self.take(&TokenKind::Comma) {
                     break;
                 }
@@ -599,7 +803,11 @@ impl Parser<'_> {
         }
         self.expect(&TokenKind::RParen, ")")?;
         self.expect(&TokenKind::Arrow, "->")?;
-        let result = self.ty()?;
+        let result_start = self.current_start();
+        let result = AstReturnType {
+            ty: self.ty()?,
+            span: self.span_from(result_start),
+        };
         let body = self.block()?;
         Ok(AstFunction {
             name,
@@ -609,14 +817,16 @@ impl Parser<'_> {
             parameters,
             result,
             body,
+            span: self.span_from(start),
         })
     }
 
     fn statement(&mut self) -> Result<AstStatement, CompileError> {
+        let start = self.current_start();
         if self.take(&TokenKind::Return) {
             let expression = self.expression(0)?;
             self.expect(&TokenKind::Semicolon, ";")?;
-            return Ok(AstStatement::Return(expression));
+            return Ok(self.spanned_statement(start, AstStatement::Return(expression)));
         }
         if self.take(&TokenKind::Let) || self.take(&TokenKind::Var) {
             let name = self.ident()?;
@@ -628,7 +838,7 @@ impl Parser<'_> {
             self.expect(&TokenKind::Equal, "=")?;
             let value = self.expression(0)?;
             self.expect(&TokenKind::Semicolon, ";")?;
-            return Ok(AstStatement::Bind { name, ty, value });
+            return Ok(self.spanned_statement(start, AstStatement::Bind { name, ty, value }));
         }
         if self.take(&TokenKind::If) {
             let condition = self.expression(0)?;
@@ -638,57 +848,66 @@ impl Parser<'_> {
             } else {
                 Vec::new()
             };
-            return Ok(AstStatement::If {
-                condition,
-                then_body,
-                else_body,
-            });
+            return Ok(self.spanned_statement(
+                start,
+                AstStatement::If {
+                    condition,
+                    then_body,
+                    else_body,
+                },
+            ));
         }
         if self.take(&TokenKind::For) {
             let variable = self.ident()?;
             self.expect(&TokenKind::In, "in")?;
-            let TokenKind::Integer(start) = self.next_kind()? else {
+            let TokenKind::Integer(range_start) = self.next_kind()? else {
                 return Err(self.unexpected("static range start"));
             };
             self.expect(&TokenKind::DotDot, "..")?;
-            let TokenKind::Integer(end) = self.next_kind()? else {
+            let TokenKind::Integer(range_end) = self.next_kind()? else {
                 return Err(self.unexpected("static range end"));
             };
-            if end < start || end.saturating_sub(start) > 1_024 {
+            if range_end < range_start || range_end.saturating_sub(range_start) > 1_024 {
                 return Err(CompileError::InvalidEffect);
             }
             let body = self.block()?;
             let mut expanded = Vec::new();
-            for value in start..end {
+            for value in range_start..range_end {
                 let mut iteration = body.clone();
                 substitute_name_in_statements(&mut iteration, &variable, value);
                 expanded.extend(iteration);
             }
-            return Ok(AstStatement::If {
-                condition: AstExpression::Bool(true),
-                then_body: expanded,
-                else_body: Vec::new(),
-            });
+            let condition = AstExpression::Spanned {
+                expression: Box::new(AstExpression::Bool(true)),
+                span: self.span_from(start),
+            };
+            return Ok(self.spanned_statement(
+                start,
+                AstStatement::If {
+                    condition,
+                    then_body: expanded,
+                    else_body: Vec::new(),
+                },
+            ));
         }
         if self.take(&TokenKind::While) {
             let condition = self.expression(0)?;
-            return Ok(AstStatement::While {
-                condition,
-                body: self.block()?,
-            });
+            let body = self.block()?;
+            return Ok(self.spanned_statement(start, AstStatement::While { condition, body }));
         }
         if self.take(&TokenKind::Defer) {
             let expression = self.expression(0)?;
             self.expect(&TokenKind::Semicolon, ";")?;
-            return Ok(AstStatement::Defer(expression));
+            return Ok(self.spanned_statement(start, AstStatement::Defer(expression)));
         }
         let expression = self.expression(0)?;
         self.expect(&TokenKind::Semicolon, ";")?;
-        Ok(AstStatement::Expression(expression))
+        Ok(self.spanned_statement(start, AstStatement::Expression(expression)))
     }
 
     #[allow(clippy::too_many_lines)]
     fn expression(&mut self, minimum_precedence: u8) -> Result<AstExpression, CompileError> {
+        let start = self.current_start();
         let mut lhs = match self.next_kind()? {
             TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
             TokenKind::Match => self.match_expression()?,
@@ -714,7 +933,11 @@ impl Parser<'_> {
                     Vec::new()
                 };
                 if is_migration_intrinsic(&name) {
-                    AstExpression::Migration(self.migration_intrinsic(&name, type_arguments)?)
+                    AstExpression::Migration(self.migration_intrinsic(
+                        &name,
+                        type_arguments,
+                        start,
+                    )?)
                 } else if name == "None" && type_arguments.is_empty() {
                     AstExpression::Constructor {
                         variant: BuiltinVariant::None,
@@ -768,8 +991,10 @@ impl Parser<'_> {
             _ => return Err(self.unexpected("expression")),
         };
         loop {
-            if self.take(&TokenKind::Question) {
-                lhs = AstExpression::Try(Box::new(lhs));
+            if self.at(&TokenKind::Question) {
+                let inner_end = self.previous_end();
+                self.cursor += 1;
+                lhs = AstExpression::Try(Box::new(self.spanned_expression(start, inner_end, lhs)));
                 continue;
             }
             let (precedence, op) = match self.peek_kind() {
@@ -781,15 +1006,23 @@ impl Parser<'_> {
             if precedence < minimum_precedence {
                 break;
             }
+            let operator_span = self.current_token_span();
+            let lhs_end = self.previous_end();
             self.cursor += 1;
             let rhs = self.expression(precedence + 1)?;
             lhs = AstExpression::Binary {
-                op,
-                lhs: Box::new(lhs),
+                op: AstOperator {
+                    kind: op,
+                    span: operator_span,
+                },
+                lhs: Box::new(self.spanned_expression(start, lhs_end, lhs)),
                 rhs: Box::new(rhs),
             };
         }
-        Ok(lhs)
+        Ok(AstExpression::Spanned {
+            expression: Box::new(lhs),
+            span: self.span_from(start),
+        })
     }
 
     fn match_expression(&mut self) -> Result<AstExpression, CompileError> {
@@ -797,6 +1030,7 @@ impl Parser<'_> {
         self.expect(&TokenKind::LBrace, "{")?;
         let mut arms = Vec::new();
         while !self.take(&TokenKind::RBrace) {
+            let arm_start = self.current_start();
             let variant = self.ident()?;
             let binding = if self.take(&TokenKind::LParen) {
                 let binding = self.ident()?;
@@ -811,6 +1045,7 @@ impl Parser<'_> {
                 variant,
                 binding,
                 value: arm_value,
+                span: self.span_from(arm_start),
             });
             if !self.take(&TokenKind::Comma) && !self.at(&TokenKind::RBrace) {
                 return Err(self.unexpected(", or }"));
@@ -826,6 +1061,7 @@ impl Parser<'_> {
         &mut self,
         name: &str,
         type_arguments: Vec<AstType>,
+        start: usize,
     ) -> Result<MigrationIntrinsic, CompileError> {
         self.expect(&TokenKind::LParen, "(")?;
         let intrinsic = match name {
@@ -887,7 +1123,10 @@ impl Parser<'_> {
             _ => unreachable!(),
         };
         self.expect(&TokenKind::RParen, ")")?;
-        Ok(intrinsic)
+        Ok(MigrationIntrinsic::Spanned {
+            intrinsic: Box::new(intrinsic),
+            span: self.span_from(start),
+        })
     }
 
     fn block(&mut self) -> Result<Vec<AstStatement>, CompileError> {
@@ -900,6 +1139,7 @@ impl Parser<'_> {
     }
 
     fn ty(&mut self) -> Result<AstType, CompileError> {
+        let start = self.current_start();
         let name = self.ident()?;
         let base = match name.as_str() {
             "i32" => AstType::I32,
@@ -915,9 +1155,15 @@ impl Parser<'_> {
                 }
             }
             self.expect(&TokenKind::Greater, ">")?;
-            Ok(AstType::BuiltinGeneric { name, arguments })
+            Ok(AstType::Spanned {
+                ty: Box::new(AstType::BuiltinGeneric { name, arguments }),
+                span: self.span_from(start),
+            })
         } else {
-            Ok(base)
+            Ok(AstType::Spanned {
+                ty: Box::new(base),
+                span: self.span_from(start),
+            })
         }
     }
 
@@ -981,6 +1227,63 @@ impl Parser<'_> {
                 }
             })
     }
+
+    fn current_start(&self) -> usize {
+        self.tokens
+            .get(self.cursor)
+            .map_or_else(|| self.previous_end(), |token| token.offset)
+    }
+
+    fn previous_end(&self) -> usize {
+        self.cursor
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map_or(0, |token| token.end)
+    }
+
+    fn span_from(&self, start: usize) -> SourceSpan {
+        SourceSpan::new(
+            self.file,
+            u32::try_from(start).unwrap_or(u32::MAX),
+            u32::try_from(self.previous_end()).unwrap_or(u32::MAX),
+        )
+    }
+
+    fn current_token_span(&self) -> SourceSpan {
+        self.tokens.get(self.cursor).map_or_else(
+            || self.span_from(self.previous_end()),
+            |token| {
+                SourceSpan::new(
+                    self.file,
+                    u32::try_from(token.offset).unwrap_or(u32::MAX),
+                    u32::try_from(token.end).unwrap_or(u32::MAX),
+                )
+            },
+        )
+    }
+
+    fn spanned_statement(&self, start: usize, statement: AstStatement) -> AstStatement {
+        AstStatement::Spanned {
+            statement: Box::new(statement),
+            span: self.span_from(start),
+        }
+    }
+
+    fn spanned_expression(
+        &self,
+        start: usize,
+        end: usize,
+        expression: AstExpression,
+    ) -> AstExpression {
+        AstExpression::Spanned {
+            expression: Box::new(expression),
+            span: SourceSpan::new(
+                self.file,
+                u32::try_from(start).unwrap_or(u32::MAX),
+                u32::try_from(end).unwrap_or(u32::MAX),
+            ),
+        }
+    }
 }
 
 fn is_migration_intrinsic(name: &str) -> bool {
@@ -1011,7 +1314,7 @@ fn split_field_name(name: &str) -> Result<(String, String), CompileError> {
 }
 
 fn migration_expressions(intrinsic: &MigrationIntrinsic) -> Vec<&AstExpression> {
-    match intrinsic {
+    match intrinsic.kind() {
         MigrationIntrinsic::OldFieldGet { object, .. } => vec![object],
         MigrationIntrinsic::NewSet { object, value, .. } => vec![object, value],
         MigrationIntrinsic::Replace { target, .. } => vec![target],
@@ -1020,11 +1323,12 @@ fn migration_expressions(intrinsic: &MigrationIntrinsic) -> Vec<&AstExpression> 
         | MigrationIntrinsic::Preserve { .. }
         | MigrationIntrinsic::Delete { .. }
         | MigrationIntrinsic::Finish => Vec::new(),
+        MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
 fn migration_expressions_mut(intrinsic: &mut MigrationIntrinsic) -> Vec<&mut AstExpression> {
-    match intrinsic {
+    match intrinsic.kind_mut() {
         MigrationIntrinsic::OldFieldGet { object, .. } => vec![object],
         MigrationIntrinsic::NewSet { object, value, .. } => vec![object, value],
         MigrationIntrinsic::Replace { target, .. } => vec![target],
@@ -1033,12 +1337,13 @@ fn migration_expressions_mut(intrinsic: &mut MigrationIntrinsic) -> Vec<&mut Ast
         | MigrationIntrinsic::Preserve { .. }
         | MigrationIntrinsic::Delete { .. }
         | MigrationIntrinsic::Finish => Vec::new(),
+        MigrationIntrinsic::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
 }
 
 fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, value: i32) {
     for statement in statements {
-        match statement {
+        match statement.kind_mut() {
             AstStatement::Bind {
                 value: expression, ..
             }
@@ -1058,14 +1363,16 @@ fn substitute_name_in_statements(statements: &mut [AstStatement], name: &str, va
                 substitute_name(condition, name, value);
                 substitute_name_in_statements(body, name, value);
             }
+            AstStatement::Spanned { .. } => unreachable!("kind_mut strips spans"),
         }
     }
 }
 
 fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
-    match expression {
+    let kind = expression.kind_mut();
+    match kind {
         AstExpression::Name(current) if current == name => {
-            *expression = AstExpression::Integer(value);
+            *kind = AstExpression::Integer(value);
         }
         AstExpression::Binary { lhs, rhs, .. } => {
             substitute_name(lhs, name, value);
@@ -1099,6 +1406,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i32) {
             }
         }
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+        AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
 }
 
@@ -1122,15 +1430,15 @@ fn builtin_variant_id(name: &str) -> StableId {
 fn collect_builtin_enum_types(ast: &AstModule, enum_types: &mut Vec<EnumType>) {
     let mut add_type = |ty: &AstType| collect_builtin_enum_type(ty, enum_types);
     for declaration in &ast.types {
-        for (_, ty) in &declaration.fields {
-            add_type(ty);
+        for field in &declaration.fields {
+            add_type(&field.ty);
         }
     }
     for function in &ast.functions {
-        for (_, ty) in &function.parameters {
-            add_type(ty);
+        for parameter in &function.parameters {
+            add_type(&parameter.ty);
         }
-        add_type(&function.result);
+        add_type(&function.result.ty);
         collect_statement_builtin_types(&function.body, &mut add_type);
     }
 }
@@ -1140,7 +1448,7 @@ fn collect_statement_builtin_types(
     add_type: &mut impl FnMut(&AstType),
 ) {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { ty: Some(ty), .. } => add_type(ty),
             AstStatement::If {
                 then_body,
@@ -1157,12 +1465,13 @@ fn collect_statement_builtin_types(
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
             | AstStatement::Defer(_) => {}
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
 }
 
 fn collect_builtin_enum_type(ty: &AstType, enum_types: &mut Vec<EnumType>) {
-    let AstType::BuiltinGeneric { name, arguments } = ty else {
+    let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
         return;
     };
     for argument in arguments {
@@ -1189,7 +1498,7 @@ fn collect_builtin_enum_type(ty: &AstType, enum_types: &mut Vec<EnumType>) {
 
 fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType> {
     fn collect(ty: &AstType, targets: &mut BTreeMap<StableId, ValueType>) {
-        let AstType::BuiltinGeneric { name, arguments } = ty else {
+        let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
             return;
         };
         for argument in arguments {
@@ -1203,15 +1512,15 @@ fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType
 
     let mut targets = BTreeMap::new();
     for declaration in &ast.types {
-        for (_, ty) in &declaration.fields {
-            collect(ty, &mut targets);
+        for field in &declaration.fields {
+            collect(&field.ty, &mut targets);
         }
     }
     for function in &ast.functions {
-        for (_, ty) in &function.parameters {
-            collect(ty, &mut targets);
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut targets);
         }
-        collect(&function.result, &mut targets);
+        collect(&function.result.ty, &mut targets);
         collect_statement_types(&function.body, &mut |ty| collect(ty, &mut targets));
     }
     targets
@@ -1219,7 +1528,7 @@ fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType
 
 fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { ty: Some(ty), .. } => collect(ty),
             AstStatement::If {
                 then_body,
@@ -1234,6 +1543,7 @@ fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
             | AstStatement::Defer(_) => {}
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
 }
@@ -1286,7 +1596,7 @@ fn resolve_and_typecheck_with_hosts(
                 .iter()
                 .enumerate()
                 .map(|(tag, variant)| EnumVariant {
-                    stable_id: StableId::from_parts(&[&declaration.name, "::", variant]),
+                    stable_id: StableId::from_parts(&[&declaration.name, "::", &variant.name]),
                     tag: u32::try_from(tag).expect("enum variant count is parser bounded"),
                     payload_type: None,
                 })
@@ -1329,7 +1639,7 @@ fn resolve_and_typecheck_with_hosts(
         .filter(|declaration| declaration.kind == AstTypeKind::Enum)
     {
         let type_id = StableId::from_name(&declaration.name);
-        for (name, variant) in declaration.variants.iter().zip(
+        for (source_variant, variant) in declaration.variants.iter().zip(
             enum_types
                 .iter()
                 .find(|enum_type| enum_type.type_id == type_id)
@@ -1337,7 +1647,7 @@ fn resolve_and_typecheck_with_hosts(
                 .variants
                 .iter(),
         ) {
-            enum_variants.insert((type_id, name.clone()), variant.clone());
+            enum_variants.insert((type_id, source_variant.name.clone()), variant.clone());
         }
     }
     for enum_type in &enum_types {
@@ -1369,9 +1679,9 @@ fn resolve_and_typecheck_with_hosts(
                 fields: declaration
                     .fields
                     .iter()
-                    .map(|(name, ty)| StateField {
-                        stable_id: StableId::from_parts(&[&declaration.name, "::", name]),
-                        ty: lower_type(ty),
+                    .map(|field| StateField {
+                        stable_id: StableId::from_parts(&[&declaration.name, "::", &field.name]),
+                        ty: lower_type(&field.ty),
                     })
                     .collect(),
             })
@@ -1402,8 +1712,8 @@ fn resolve_and_typecheck_with_hosts(
         }
     }
     for declaration in &ast.types {
-        for (_, ty) in &declaration.fields {
-            validate_type(ty, &known_types)?;
+        for field in &declaration.fields {
+            validate_type(&field.ty, &known_types)?;
         }
     }
     let mut signatures = host_functions
@@ -1420,18 +1730,18 @@ fn resolve_and_typecheck_with_hosts(
         if function.effect == FunctionEffect::Task {
             suspending_functions.insert(function.name.clone());
         }
-        for (_, ty) in &function.parameters {
-            validate_type(ty, &known_types)?;
+        for parameter in &function.parameters {
+            validate_type(&parameter.ty, &known_types)?;
         }
-        validate_type(&function.result, &known_types)?;
+        validate_type(&function.result.ty, &known_types)?;
         validate_statement_types(&function.body, &known_types)?;
         let signature = Signature {
             parameters: function
                 .parameters
                 .iter()
-                .map(|(_, ty)| lower_type(ty))
+                .map(|parameter| lower_type(&parameter.ty))
                 .collect(),
-            result: Some(lower_type(&function.result)),
+            result: Some(lower_type(&function.result.ty)),
         };
         if signatures
             .insert(function.name.clone(), signature)
@@ -1441,20 +1751,24 @@ fn resolve_and_typecheck_with_hosts(
         }
     }
     let mut functions = Vec::new();
+    let module_span = ast.span;
     for mut function in ast.functions {
         validate_awaits(&function.body, &suspending_functions)?;
         resolve_local_scopes(&mut function)?;
         let signature = signatures[&function.name].clone();
         let mut locals = BTreeMap::new();
-        for (index, ((name, _), ty)) in function
+        for (index, (parameter, ty)) in function
             .parameters
             .iter()
             .zip(signature.parameters.iter().copied())
             .enumerate()
         {
             let register = u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?;
-            if locals.insert(name.clone(), (register, ty)).is_some() {
-                return Err(CompileError::DuplicateName(name.clone()));
+            if locals
+                .insert(parameter.name.clone(), (register, ty))
+                .is_some()
+            {
+                return Err(CompileError::DuplicateName(parameter.name.clone()));
             }
         }
         if function.effect != FunctionEffect::Task && statements_contain_await(&function.body) {
@@ -1486,6 +1800,7 @@ fn resolve_and_typecheck_with_hosts(
             signature,
             body: function.body,
             locals,
+            span: function.span,
         });
     }
     Ok(HirModule {
@@ -1497,6 +1812,7 @@ fn resolve_and_typecheck_with_hosts(
         enum_types,
         enum_variants,
         state_handle_targets,
+        span: module_span,
     })
 }
 
@@ -1505,7 +1821,7 @@ fn validate_awaits(
     suspending_functions: &BTreeSet<String>,
 ) -> Result<(), CompileError> {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { value, .. }
             | AstStatement::Return(value)
             | AstStatement::Expression(value)
@@ -1525,6 +1841,7 @@ fn validate_awaits(
                 validate_await_expression(condition, suspending_functions, false)?;
                 validate_awaits(body, suspending_functions)?;
             }
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(())
@@ -1535,13 +1852,14 @@ fn validate_await_expression(
     suspending_functions: &BTreeSet<String>,
     awaited: bool,
 ) -> Result<(), CompileError> {
-    match expression {
+    match expression.kind() {
         AstExpression::Await(inner) => {
-            let awaited = match inner.as_ref() {
+            let awaited = match inner.kind() {
                 AstExpression::Try(expression) => expression.as_ref(),
+                AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
                 expression => expression,
             };
-            let AstExpression::Call { function, .. } = awaited else {
+            let AstExpression::Call { function, .. } = awaited.kind() else {
                 return Err(CompileError::InvalidEffect);
             };
             if !suspending_functions.contains(function) {
@@ -1588,14 +1906,18 @@ fn validate_await_expression(
             Ok(())
         }
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => Ok(()),
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
 fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> {
     let mut root = BTreeMap::new();
-    for (name, _) in &function.parameters {
-        if root.insert(name.clone(), name.clone()).is_some() {
-            return Err(CompileError::DuplicateName(name.clone()));
+    for parameter in &function.parameters {
+        if root
+            .insert(parameter.name.clone(), parameter.name.clone())
+            .is_some()
+        {
+            return Err(CompileError::DuplicateName(parameter.name.clone()));
         }
     }
     let mut scopes = vec![root];
@@ -1609,7 +1931,7 @@ fn resolve_statements(
     next_local: &mut u32,
 ) -> Result<(), CompileError> {
     for statement in statements {
-        match statement {
+        match statement.kind_mut() {
             AstStatement::Bind { name, value, .. } => {
                 resolve_expression(value, scopes, next_local)?;
                 let source_name = name.clone();
@@ -1654,6 +1976,7 @@ fn resolve_statements(
                 resolve_statements(body, scopes, next_local)?;
                 scopes.pop();
             }
+            AstStatement::Spanned { .. } => unreachable!("kind_mut strips spans"),
         }
     }
     Ok(())
@@ -1664,7 +1987,7 @@ fn resolve_expression(
     scopes: &mut Vec<BTreeMap<String, String>>,
     next_local: &mut u32,
 ) -> Result<(), CompileError> {
-    match expression {
+    match expression.kind_mut() {
         AstExpression::Name(name) => {
             let resolved = scopes
                 .iter()
@@ -1739,12 +2062,13 @@ fn resolve_expression(
             }
         }
         AstExpression::Integer(_) | AstExpression::Bool(_) => {}
+        AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
     Ok(())
 }
 
 fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), CompileError> {
-    match ty {
+    match ty.kind() {
         AstType::Named(name) if !known_types.contains(name) => {
             Err(CompileError::UnknownType(name.clone()))
         }
@@ -1763,6 +2087,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
             Ok(())
         }
         AstType::I32 | AstType::Bool | AstType::Named(_) => Ok(()),
+        AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
@@ -1771,7 +2096,7 @@ fn validate_statement_types(
     known_types: &BTreeSet<String>,
 ) -> Result<(), CompileError> {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { ty: Some(ty), .. } => validate_type(ty, known_types)?,
             AstStatement::If {
                 then_body,
@@ -1788,6 +2113,7 @@ fn validate_statement_types(
             | AstStatement::Return(_)
             | AstStatement::Expression(_)
             | AstStatement::Defer(_) => {}
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(())
@@ -1817,7 +2143,7 @@ fn check_statements(
 ) -> Result<Flow, CompileError> {
     let mut flow = Flow::FallsThrough;
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { name, ty, value } => {
                 let expected = ty.as_ref().map(lower_type);
                 let actual = expression_type(value, locals, context, next_register, expected)?;
@@ -1894,7 +2220,8 @@ fn check_statements(
                 for (name, binding) in loop_locals {
                     locals.entry(name).or_insert(binding);
                 }
-                if matches!(condition, AstExpression::Bool(true)) && body_flow != Flow::FallsThrough
+                if matches!(condition.kind(), AstExpression::Bool(true))
+                    && body_flow != Flow::FallsThrough
                 {
                     flow = body_flow;
                 }
@@ -1905,13 +2232,14 @@ fn check_statements(
                 }
                 expression_type(expression, locals, context, next_register, None)?;
             }
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(flow)
 }
 
 fn statements_contain_await(statements: &[AstStatement]) -> bool {
-    statements.iter().any(|statement| match statement {
+    statements.iter().any(|statement| match statement.kind() {
         AstStatement::Bind { value, .. }
         | AstStatement::Return(value)
         | AstStatement::Expression(value)
@@ -1928,11 +2256,12 @@ fn statements_contain_await(statements: &[AstStatement]) -> bool {
         AstStatement::While { condition, body } => {
             contains_await(condition) || statements_contain_await(body)
         }
+        AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
     })
 }
 
 fn contains_await(expression: &AstExpression) -> bool {
-    match expression {
+    match expression.kind() {
         AstExpression::Await(_) => true,
         AstExpression::Binary { lhs, rhs, .. } => contains_await(lhs) || contains_await(rhs),
         AstExpression::Call { arguments, .. } => arguments.iter().any(contains_await),
@@ -1947,6 +2276,7 @@ fn contains_await(expression: &AstExpression) -> bool {
             .into_iter()
             .any(contains_await),
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => false,
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
@@ -1958,7 +2288,7 @@ fn expression_type(
     next_register: &mut u16,
     expected: Option<ValueType>,
 ) -> Result<ValueType, CompileError> {
-    let actual = match expression {
+    let actual = match expression.kind() {
         AstExpression::Integer(_) => ValueType::I32,
         AstExpression::Bool(_) => ValueType::Bool,
         AstExpression::Name(name) => locals
@@ -2175,6 +2505,7 @@ fn expression_type(
             }
             migration_intrinsic_type(intrinsic, locals, context, next_register)?
         }
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     };
     if expected.is_some_and(|expected| actual != expected) {
         return Err(CompileError::TypeMismatch);
@@ -2188,11 +2519,11 @@ fn migration_intrinsic_type(
     context: &TypeContext<'_>,
     next_register: &mut u16,
 ) -> Result<ValueType, CompileError> {
-    match intrinsic {
+    match intrinsic.kind() {
         MigrationIntrinsic::OldGet { ty, .. }
         | MigrationIntrinsic::NewCreate { ty, .. }
         | MigrationIntrinsic::OldFieldGet { ty, .. } => {
-            if let MigrationIntrinsic::OldFieldGet { object, owner, .. } = intrinsic
+            if let MigrationIntrinsic::OldFieldGet { object, owner, .. } = intrinsic.kind()
                 && expression_type(
                     object,
                     locals,
@@ -2231,11 +2562,12 @@ fn migration_intrinsic_type(
         MigrationIntrinsic::Preserve { .. }
         | MigrationIntrinsic::Delete { .. }
         | MigrationIntrinsic::Finish => Ok(ValueType::Bool),
+        MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
 fn lower_type(ty: &AstType) -> ValueType {
-    match ty {
+    match ty.kind() {
         AstType::I32 => ValueType::I32,
         AstType::Bool => ValueType::Bool,
         AstType::Named(name) => ValueType::Named(StableId::from_name(name)),
@@ -2250,6 +2582,7 @@ fn lower_type(ty: &AstType) -> ValueType {
             ValueType::Named(nexa_bytecode::state_handle_type(lower_type(&arguments[0])))
         }
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
+        AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
@@ -2284,7 +2617,7 @@ fn inspect_statement_registers(
     plan: &mut RegisterPlan,
 ) -> Result<(), CompileError> {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { value, .. }
             | AstStatement::Return(value)
             | AstStatement::Expression(value)
@@ -2302,6 +2635,7 @@ fn inspect_statement_registers(
                 inspect_expression_registers(condition, plan)?;
                 inspect_statement_registers(body, plan)?;
             }
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(())
@@ -2313,7 +2647,7 @@ fn inspect_expression_registers(
 ) -> Result<(), CompileError> {
     let requirement = temporary_requirement(expression)?;
     plan.expression_temporaries = plan.expression_temporaries.max(requirement);
-    match expression {
+    match expression.kind() {
         AstExpression::Binary { lhs, rhs, .. } => {
             inspect_expression_registers(lhs, plan)?;
             inspect_expression_registers(rhs, plan)?;
@@ -2350,6 +2684,7 @@ fn inspect_expression_registers(
             }
         }
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => {}
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
     Ok(())
 }
@@ -2361,7 +2696,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
                 .checked_add(usize::from(temporary_requirement(nested)?))
                 .ok_or(CompileError::TooManyRegisters)
         };
-    let required = match expression {
+    let required = match expression.kind() {
         AstExpression::Integer(_) | AstExpression::Bool(_) | AstExpression::Name(_) => 1,
         AstExpression::Binary { lhs, rhs, .. } => {
             usize::from(temporary_requirement(lhs)?).max(offset_requirement(1, rhs)?)
@@ -2385,7 +2720,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
             required
         }
         AstExpression::Try(expression) => usize::from(temporary_requirement(expression)?).max(4),
-        AstExpression::Migration(intrinsic) => match intrinsic {
+        AstExpression::Migration(intrinsic) => match intrinsic.kind() {
             MigrationIntrinsic::OldGet { .. }
             | MigrationIntrinsic::NewCreate { .. }
             | MigrationIntrinsic::Preserve { .. }
@@ -2398,7 +2733,9 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
             MigrationIntrinsic::Replace { target, .. } => {
                 usize::from(temporary_requirement(target)?)
             }
+            MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
         },
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     };
     u16::try_from(required).map_err(|_| CompileError::TooManyRegisters)
 }
@@ -2674,7 +3011,7 @@ fn emit_statements(
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
     for statement in statements {
-        match statement {
+        match statement.kind() {
             AstStatement::Bind { name, value, .. } => {
                 emit_expression(
                     value,
@@ -2703,10 +3040,14 @@ fn emit_statements(
             AstStatement::Expression(expression) => {
                 emit_expression(expression, temporary, None, locals, context, code)?;
             }
-            AstStatement::Defer(AstExpression::Call {
-                function,
-                arguments,
-            }) => {
+            AstStatement::Defer(expression) => {
+                let AstExpression::Call {
+                    function,
+                    arguments,
+                } = expression.kind()
+                else {
+                    return Err(CompileError::SuspendingDefer);
+                };
                 if arguments.len() > 8 {
                     return Err(CompileError::DeferCaptureLimit);
                 }
@@ -2737,7 +3078,6 @@ fn emit_statements(
                         .map_err(|_| CompileError::TooManyRegisters)?,
                 });
             }
-            AstStatement::Defer(_) => return Err(CompileError::SuspendingDefer),
             AstStatement::If {
                 condition,
                 then_body,
@@ -2796,6 +3136,7 @@ fn emit_statements(
                     target: end,
                 };
             }
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
     }
     Ok(())
@@ -2813,12 +3154,12 @@ fn emit_expression(
     if let AstExpression::Call {
         function,
         arguments,
-    } = expression
+    } = expression.kind()
         && state_handle_method(function).is_some()
     {
         return emit_state_handle_method(function, arguments, destination, locals, context, code);
     }
-    match expression {
+    match expression.kind() {
         AstExpression::Integer(value) => code.push(Instruction::LoadI32 {
             dst: destination,
             value: *value,
@@ -2858,7 +3199,7 @@ fn emit_expression(
                 context,
                 code,
             )?;
-            code.push(match op {
+            code.push(match op.kind {
                 BinaryOp::Add => Instruction::Add {
                     dst: destination,
                     lhs: lhs_register,
@@ -2972,6 +3313,7 @@ fn emit_expression(
         AstExpression::Migration(intrinsic) => {
             emit_migration_intrinsic(intrinsic, destination, locals, context, code)?;
         }
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
     Ok(())
 }
@@ -3066,7 +3408,7 @@ fn emitted_expression_type(
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
 ) -> Result<ValueType, CompileError> {
-    match expression {
+    match expression.kind() {
         AstExpression::Integer(_) | AstExpression::Binary { .. } => Ok(ValueType::I32),
         AstExpression::Bool(_) => Ok(ValueType::Bool),
         AstExpression::Name(name) => locals
@@ -3131,7 +3473,7 @@ fn emitted_expression_type(
                 .and_then(|variant| variant.payload_type)
                 .ok_or(CompileError::TypeMismatch)
         }
-        AstExpression::Migration(intrinsic) => Ok(match intrinsic {
+        AstExpression::Migration(intrinsic) => Ok(match intrinsic.kind() {
             MigrationIntrinsic::OldGet { ty, .. }
             | MigrationIntrinsic::OldFieldGet { ty, .. }
             | MigrationIntrinsic::NewCreate { ty, .. } => lower_type(ty),
@@ -3140,7 +3482,9 @@ fn emitted_expression_type(
             | MigrationIntrinsic::Replace { .. }
             | MigrationIntrinsic::Delete { .. }
             | MigrationIntrinsic::Finish => ValueType::Bool,
+            MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
         }),
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
 
@@ -3343,7 +3687,7 @@ fn emit_migration_intrinsic(
     context: &EmitContext<'_>,
     code: &mut Vec<Instruction>,
 ) -> Result<(), CompileError> {
-    match intrinsic {
+    match intrinsic.kind() {
         MigrationIntrinsic::OldGet { stable_id, ty } => {
             code.push(Instruction::StateOldGet {
                 stable_id: StableId::from_name(stable_id),
@@ -3449,6 +3793,7 @@ fn emit_migration_intrinsic(
                 value: true,
             });
         }
+        MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
     }
     Ok(())
 }
@@ -3520,14 +3865,22 @@ pub fn compile_with_interface(
                 kind: AstTypeKind::Enum,
                 version: 0,
                 fields: Vec::new(),
-                variants: enumeration.variants.clone(),
+                variants: enumeration
+                    .variants
+                    .iter()
+                    .map(|name| AstVariant {
+                        name: name.clone(),
+                        span: SourceSpan::new(FileId(0), 0, 0),
+                    })
+                    .collect(),
+                span: SourceSpan::new(FileId(0), 0, 0),
             });
         }
     }
     let import = ast
         .imports
         .first()
-        .and_then(|name| name.rsplit('.').next())
+        .and_then(|import| import.name.rsplit('.').next())
         .ok_or_else(|| CompileError::UnknownName("missing host import".into()))?;
     let mut host_functions = BTreeMap::new();
     for (index, function) in interface.functions.iter().enumerate() {
@@ -3694,10 +4047,110 @@ fn compile_module(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{FunctionEffect, Instruction};
-    use nexa_core::StableId;
+    use nexa_core::{FileId, StableId};
     use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue};
 
-    use super::{CompileError, compile};
+    use super::{
+        AstExpression, AstStatement, AstType, CompileError, compile, lex, parse_with_file,
+        resolve_and_typecheck,
+    };
+
+    #[test]
+    fn every_required_ast_and_hir_node_preserves_its_source_span() {
+        let source = "module demo.core;
+import host.api;
+struct Pair { value: Option<Result<i32, bool>>; }
+enum Choice { A, B }
+task fn run(input: Option<i32>) -> Result<i32, bool> {
+    let x: i32 = await fetch(input)?;
+    let y: i32 = x + call(1);
+    let z: Result<i32, bool> = Ok(y);
+    let q: i32 = match z { Ok(v) => v, Err(e) => 0 };
+    return q;
+}
+migration fn migrate() -> bool {
+    old.get<i32>(store);
+    finish_migration();
+    return true;
+}";
+        let ast = parse_with_file(&lex(source).unwrap(), FileId(9)).unwrap();
+
+        assert_eq!(ast.span.file, FileId(9));
+        assert!(!ast.span.is_empty());
+        assert!(!ast.imports[0].span.is_empty());
+        assert!(!ast.types[0].span.is_empty());
+        assert!(!ast.types[0].fields[0].span.is_empty());
+        let AstType::BuiltinGeneric { arguments, .. } = ast.types[0].fields[0].ty.kind() else {
+            panic!("field type should be generic");
+        };
+        assert!(!ast.types[0].fields[0].ty.span().is_empty());
+        assert!(arguments.iter().all(|argument| !argument.span().is_empty()));
+        assert!(!ast.types[1].variants[0].span.is_empty());
+
+        let function = &ast.functions[0];
+        assert!(!function.span.is_empty());
+        assert!(!function.parameters[0].span.is_empty());
+        assert!(!function.parameters[0].ty.span().is_empty());
+        assert!(!function.result.span.is_empty());
+        assert!(!function.result.ty.span().is_empty());
+        assert!(
+            function
+                .body
+                .iter()
+                .all(|statement| !statement.span().is_empty())
+        );
+
+        let AstStatement::Bind { value, .. } = function.body[0].kind() else {
+            panic!("expected binding");
+        };
+        let AstExpression::Await(awaited) = value.kind() else {
+            panic!("expected await");
+        };
+        let AstExpression::Try(called) = awaited.kind() else {
+            panic!("expected try");
+        };
+        assert!(matches!(called.kind(), AstExpression::Call { .. }));
+        assert!(!value.span().is_empty());
+        assert!(!awaited.span().is_empty());
+        assert!(!called.span().is_empty());
+
+        let AstStatement::Bind { value, .. } = function.body[1].kind() else {
+            panic!("expected binding");
+        };
+        let AstExpression::Binary { op, rhs, .. } = value.kind() else {
+            panic!("expected binary expression");
+        };
+        assert!(!op.span.is_empty());
+        assert!(matches!(rhs.kind(), AstExpression::Call { .. }));
+
+        let AstStatement::Bind { value, .. } = function.body[2].kind() else {
+            panic!("expected binding");
+        };
+        assert!(matches!(value.kind(), AstExpression::Constructor { .. }));
+
+        let AstStatement::Bind { value, .. } = function.body[3].kind() else {
+            panic!("expected binding");
+        };
+        let AstExpression::Match { arms, .. } = value.kind() else {
+            panic!("expected match");
+        };
+        assert!(arms.iter().all(|arm| !arm.span.is_empty()));
+
+        let migration = &ast.functions[1];
+        let AstStatement::Expression(expression) = migration.body[0].kind() else {
+            panic!("expected migration expression");
+        };
+        let AstExpression::Migration(intrinsic) = expression.kind() else {
+            panic!("expected migration intrinsic");
+        };
+        assert!(!intrinsic.span().is_empty());
+
+        let hir_source = "fn identity(value: i32) -> i32 { return value; }";
+        let hir_ast = parse_with_file(&lex(hir_source).unwrap(), FileId(11)).unwrap();
+        let hir = resolve_and_typecheck(hir_ast).unwrap();
+        assert_eq!(hir.span().file, FileId(11));
+        assert!(hir.function_spans().all(|span| !span.is_empty()));
+    }
 
     #[test]
     fn arithmetic_function_compiles_verifies_and_executes() {
