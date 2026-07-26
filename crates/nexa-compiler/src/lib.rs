@@ -7132,6 +7132,8 @@ pub fn compile_with_interface(
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
     let idl_snapshot_types = collect_idl_snapshot_types(interface)?;
+    let (idl_array_types, idl_buffer_types, idl_parameterized_enums) =
+        collect_idl_boundary_types(interface);
     let tokens = lex(source)?;
     let mut ast = parse(&tokens)?;
     for structure in &interface.structs {
@@ -7294,6 +7296,33 @@ pub fn compile_with_interface(
             module.snapshot_types.push(snapshot_type);
         }
     }
+    for array_type in idl_array_types {
+        if !module
+            .array_types
+            .iter()
+            .any(|candidate| candidate.type_id == array_type.type_id)
+        {
+            module.array_types.push(array_type);
+        }
+    }
+    for buffer_type in idl_buffer_types {
+        if !module
+            .buffer_types
+            .iter()
+            .any(|candidate| candidate.type_id == buffer_type.type_id)
+        {
+            module.buffer_types.push(buffer_type);
+        }
+    }
+    for enum_type in idl_parameterized_enums {
+        if !module
+            .enum_types
+            .iter()
+            .any(|candidate| candidate.type_id == enum_type.type_id)
+        {
+            module.enum_types.push(enum_type);
+        }
+    }
     for export in &interface.exports {
         let (function, hir_function) = hir
             .functions
@@ -7339,6 +7368,10 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
             ValueType::Named(nexa_bytecode::snapshot_type(content_type))
         }
         TypeRef::Snapshot(None) => unreachable!("IDL snapshots are validated as typed"),
+        TypeRef::Array(inner) => ValueType::Named(nexa_bytecode::array_type(lower_idl_type(inner))),
+        TypeRef::Buffer(inner) => {
+            ValueType::Named(nexa_bytecode::buffer_type(lower_idl_type(inner)))
+        }
         TypeRef::Option(inner) => {
             ValueType::Named(nexa_bytecode::option_type(lower_idl_type(inner)).type_id)
         }
@@ -7366,6 +7399,8 @@ fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, Comp
             TypeRef::Snapshot(None) => return Err(CompileError::TypeMismatch),
             TypeRef::HostRequest(Some(inner))
             | TypeRef::ResourceToken(Some(inner))
+            | TypeRef::Array(inner)
+            | TypeRef::Buffer(inner)
             | TypeRef::Option(inner) => collect(inner, snapshots)?,
             TypeRef::Result(success, error) => {
                 collect(success, snapshots)?;
@@ -7415,6 +7450,89 @@ fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, Comp
     Ok(snapshots.into_values().collect())
 }
 
+fn collect_idl_boundary_types(interface: &Idl) -> (Vec<ArrayType>, Vec<BufferType>, Vec<EnumType>) {
+    fn collect(
+        ty: &TypeRef,
+        arrays: &mut BTreeMap<StableId, ArrayType>,
+        buffers: &mut BTreeMap<StableId, BufferType>,
+        enums: &mut BTreeMap<StableId, EnumType>,
+    ) {
+        match ty {
+            TypeRef::Array(inner) => {
+                collect(inner, arrays, buffers, enums);
+                let metadata = ArrayType::new(lower_idl_type(inner));
+                arrays.insert(metadata.type_id, metadata);
+            }
+            TypeRef::Buffer(inner) => {
+                collect(inner, arrays, buffers, enums);
+                let metadata = BufferType::new(lower_idl_type(inner));
+                buffers.insert(metadata.type_id, metadata);
+            }
+            TypeRef::Option(inner) => {
+                collect(inner, arrays, buffers, enums);
+                let metadata = nexa_bytecode::option_type(lower_idl_type(inner));
+                enums.insert(metadata.type_id, metadata);
+            }
+            TypeRef::Result(success, error) => {
+                collect(success, arrays, buffers, enums);
+                collect(error, arrays, buffers, enums);
+                let metadata =
+                    nexa_bytecode::result_type(lower_idl_type(success), lower_idl_type(error));
+                enums.insert(metadata.type_id, metadata);
+            }
+            TypeRef::HostRequest(Some(inner))
+            | TypeRef::ResourceToken(Some(inner))
+            | TypeRef::Snapshot(Some(inner)) => collect(inner, arrays, buffers, enums),
+            TypeRef::I32
+            | TypeRef::I64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Rune
+            | TypeRef::String
+            | TypeRef::HostRequest(None)
+            | TypeRef::ResourceToken(None)
+            | TypeRef::Snapshot(None)
+            | TypeRef::Named(_) => {}
+        }
+    }
+
+    let mut arrays = BTreeMap::new();
+    let mut buffers = BTreeMap::new();
+    let mut enums = BTreeMap::new();
+    for structure in &interface.structs {
+        for field in &structure.fields {
+            collect(&field.ty, &mut arrays, &mut buffers, &mut enums);
+        }
+    }
+    for enumeration in &interface.enums {
+        for variant in &enumeration.variants {
+            if let Some(payload) = &variant.payload {
+                collect(payload, &mut arrays, &mut buffers, &mut enums);
+            }
+        }
+    }
+    for function in &interface.functions {
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut arrays, &mut buffers, &mut enums);
+        }
+        collect(&function.result, &mut arrays, &mut buffers, &mut enums);
+    }
+    for export in &interface.exports {
+        for parameter in &export.parameters {
+            collect(&parameter.ty, &mut arrays, &mut buffers, &mut enums);
+        }
+        if let Some(result) = &export.result {
+            collect(result, &mut arrays, &mut buffers, &mut enums);
+        }
+    }
+    (
+        arrays.into_values().collect(),
+        buffers.into_values().collect(),
+        enums.into_values().collect(),
+    )
+}
+
 fn ast_type_from_idl(ty: &TypeRef) -> AstType {
     match ty {
         TypeRef::I32 => AstType::I32,
@@ -7431,6 +7549,14 @@ fn ast_type_from_idl(ty: &TypeRef) -> AstType {
             arguments: vec![ast_type_from_idl(content)],
         },
         TypeRef::Snapshot(None) => AstType::Named("Snapshot".into()),
+        TypeRef::Array(inner) => AstType::BuiltinGeneric {
+            name: "Array".into(),
+            arguments: vec![ast_type_from_idl(inner)],
+        },
+        TypeRef::Buffer(inner) => AstType::BuiltinGeneric {
+            name: "Buffer".into(),
+            arguments: vec![ast_type_from_idl(inner)],
+        },
         TypeRef::Option(inner) => AstType::BuiltinGeneric {
             name: "Option".into(),
             arguments: vec![ast_type_from_idl(inner)],

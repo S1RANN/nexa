@@ -1008,6 +1008,7 @@ pub enum HostPayload {
     Bool(bool),
     Rune(u32),
     String(String),
+    Array(CopyBuffer<HostPayload>),
     Buffer(CopyBuffer<HostPayload>),
     Struct(Vec<HostPayload>),
     Enum {
@@ -1031,6 +1032,7 @@ pub enum HostValue {
     Bool(bool),
     Rune(char),
     String(String),
+    Array(CopyBuffer<HostValue>),
     Buffer(CopyBuffer<HostValue>),
     Opaque(u64),
     Struct(Vec<HostValue>),
@@ -1126,6 +1128,18 @@ fn runtime_argument_to_host_value(
                 .map(|field| runtime_argument_to_host_value(*field, heap))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        value @ crate::RuntimeValue::NamedRef { .. }
+            if heap.is_some_and(|heap| heap.array_values(value).is_ok()) =>
+        {
+            HostValue::Array(CopyBuffer::new(
+                heap.expect("array guard requires a heap")
+                    .array_values(value)
+                    .map_err(|_| HostTrap::Type)?
+                    .iter()
+                    .map(|element| runtime_argument_to_host_value(*element, heap))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
         value @ crate::RuntimeValue::NamedRef { .. }
             if heap.is_some_and(|heap| heap.buffer_values(value).is_ok()) =>
         {

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::fmt::Write;
 
+use nexa_bytecode::ValueType;
 use nexa_core::StableId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +81,8 @@ pub enum TypeRef {
     HostRequest(Option<Box<TypeRef>>),
     ResourceToken(Option<Box<TypeRef>>),
     Snapshot(Option<Box<TypeRef>>),
+    Array(Box<TypeRef>),
+    Buffer(Box<TypeRef>),
     Option(Box<TypeRef>),
     Result(Box<TypeRef>, Box<TypeRef>),
     Named(String),
@@ -419,6 +422,31 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::String => format!("nexa_runtime::HostPayload::String({source})"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostPayload::Token({source})"),
         TypeRef::Snapshot(_) => format!("nexa_runtime::HostPayload::Snapshot({source})"),
+        TypeRef::Array(inner) => format!(
+            "nexa_runtime::HostPayload::Array(nexa_runtime::CopyBuffer::new({source}.into_iter()\
+             .map(|value| {}).collect()))",
+            encode_completion_payload(idl, inner, "value")
+        ),
+        TypeRef::Buffer(inner) => format!(
+            "nexa_runtime::HostPayload::Buffer(nexa_runtime::CopyBuffer::new({source}.into_vec()\
+             .into_iter().map(|value| {}).collect()))",
+            encode_completion_payload(idl, inner, "value")
+        ),
+        TypeRef::Option(inner) => encode_option(
+            idl,
+            inner,
+            source,
+            "nexa_runtime::HostPayload",
+            encode_completion_payload,
+        ),
+        TypeRef::Result(success, error) => encode_result(
+            idl,
+            success,
+            error,
+            source,
+            "nexa_runtime::HostPayload",
+            encode_completion_payload,
+        ),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("nexa_runtime::HostPayload::Opaque({source}.0)")
         }
@@ -515,21 +543,10 @@ fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
         TypeRef::ResourceToken(_) => decode_match(source, "Token", "*value"),
         TypeRef::Snapshot(_) => decode_match(source, "Snapshot", "*value"),
-        TypeRef::Option(inner) => format!(
-            "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == 1 => \
-             Some({}), nexa_runtime::HostValue::Struct(values) if values.is_empty() => None, \
-             _ => return Err(nexa_runtime::HostTrap::Type) }}",
-            decode_value(idl, inner, "&values[0]")
-        ),
-        TypeRef::Result(success, error) => format!(
-            "match {source} {{ nexa_runtime::HostValue::Struct(values) if values.len() == 2 => \
-             match &values[0] {{ nexa_runtime::HostValue::Bool(true) => Ok({}), \
-             nexa_runtime::HostValue::Bool(false) => Err({}), \
-             _ => return Err(nexa_runtime::HostTrap::Type) }}, \
-             _ => return Err(nexa_runtime::HostTrap::Type) }}",
-            decode_value(idl, success, "&values[1]"),
-            decode_value(idl, error, "&values[1]")
-        ),
+        TypeRef::Array(inner) => decode_collection(idl, inner, source, "Array", false),
+        TypeRef::Buffer(inner) => decode_collection(idl, inner, source, "Buffer", true),
+        TypeRef::Option(inner) => decode_option(idl, inner, source),
+        TypeRef::Result(success, error) => decode_result(idl, success, error, source),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
             "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
              _ => return Err(nexa_runtime::HostTrap::Type) }}"
@@ -607,17 +624,26 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::HostRequest(_) => format!("nexa_runtime::HostValue::Request({source})"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostValue::Token({source})"),
         TypeRef::Snapshot(_) => format!("nexa_runtime::HostValue::Snapshot({source})"),
-        TypeRef::Option(inner) => format!(
-            "match {source} {{ Some(value) => nexa_runtime::HostValue::Struct(vec![{}]), \
-             None => nexa_runtime::HostValue::Struct(vec![]) }}",
+        TypeRef::Array(inner) => format!(
+            "nexa_runtime::HostValue::Array(nexa_runtime::CopyBuffer::new({source}.into_iter()\
+             .map(|value| {}).collect()))",
             encode_value(idl, inner, "value")
         ),
-        TypeRef::Result(success, error) => format!(
-            "match {source} {{ Ok(value) => nexa_runtime::HostValue::Struct(vec![\
-             nexa_runtime::HostValue::Bool(true), {}]), Err(error) => \
-             nexa_runtime::HostValue::Struct(vec![nexa_runtime::HostValue::Bool(false), {}]) }}",
-            encode_value(idl, success, "value"),
-            encode_value(idl, error, "error")
+        TypeRef::Buffer(inner) => format!(
+            "nexa_runtime::HostValue::Buffer(nexa_runtime::CopyBuffer::new({source}.into_vec()\
+             .into_iter().map(|value| {}).collect()))",
+            encode_value(idl, inner, "value")
+        ),
+        TypeRef::Option(inner) => {
+            encode_option(idl, inner, source, "nexa_runtime::HostValue", encode_value)
+        }
+        TypeRef::Result(success, error) => encode_result(
+            idl,
+            success,
+            error,
+            source,
+            "nexa_runtime::HostValue",
+            encode_value,
         ),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("nexa_runtime::HostValue::Opaque({source}.0)")
@@ -652,6 +678,127 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
             format!("nexa_runtime::HostValue::Struct(vec![{fields}])")
         }
     }
+}
+
+fn encode_option(
+    idl: &Idl,
+    inner: &TypeRef,
+    source: &str,
+    value_path: &str,
+    encode: fn(&Idl, &TypeRef, &str) -> String,
+) -> String {
+    let metadata = nexa_bytecode::option_type(value_type(idl, inner));
+    let none = &metadata.variants[0];
+    let some = &metadata.variants[1];
+    let payload = encode(idl, inner, "value");
+    format!(
+        "match {source} {{ Some(value) => {value_path}::Enum {{ type_id: \
+         nexa_runtime::StableId({type_id}), variant: nexa_runtime::StableId({some_id}), tag: \
+         {some_tag}, payload: Some(Box::new({payload})) }}, None => {value_path}::Enum {{ type_id: \
+         nexa_runtime::StableId({type_id}), variant: nexa_runtime::StableId({none_id}), tag: \
+         {none_tag}, payload: None }} }}",
+        type_id = metadata.type_id.0,
+        some_id = some.stable_id.0,
+        some_tag = some.tag,
+        none_id = none.stable_id.0,
+        none_tag = none.tag,
+    )
+}
+
+fn encode_result(
+    idl: &Idl,
+    success: &TypeRef,
+    error: &TypeRef,
+    source: &str,
+    value_path: &str,
+    encode: fn(&Idl, &TypeRef, &str) -> String,
+) -> String {
+    let metadata = nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error));
+    let ok = &metadata.variants[0];
+    let err = &metadata.variants[1];
+    let success_payload = encode(idl, success, "value");
+    let error_payload = encode(idl, error, "error");
+    format!(
+        "match {source} {{ Ok(value) => {value_path}::Enum {{ type_id: \
+         nexa_runtime::StableId({type_id}), variant: nexa_runtime::StableId({ok_id}), tag: \
+         {ok_tag}, payload: Some(Box::new({success_payload})) }}, Err(error) => \
+         {value_path}::Enum {{ type_id: nexa_runtime::StableId({type_id}), variant: \
+         nexa_runtime::StableId({err_id}), tag: {err_tag}, payload: \
+         Some(Box::new({error_payload})) }} }}",
+        type_id = metadata.type_id.0,
+        ok_id = ok.stable_id.0,
+        ok_tag = ok.tag,
+        err_id = err.stable_id.0,
+        err_tag = err.tag,
+    )
+}
+
+fn decode_option(idl: &Idl, inner: &TypeRef, source: &str) -> String {
+    let metadata = nexa_bytecode::option_type(value_type(idl, inner));
+    let none = &metadata.variants[0];
+    let some = &metadata.variants[1];
+    let payload = decode_value(idl, inner, "value");
+    format!(
+        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} \
+         if *type_id == nexa_runtime::StableId({type_id}) && *variant == \
+         nexa_runtime::StableId({none_id}) && *tag == {none_tag} && payload.is_none() => None, \
+         nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if *type_id == \
+         nexa_runtime::StableId({type_id}) && *variant == nexa_runtime::StableId({some_id}) && \
+         *tag == {some_tag} => {{ let value = match payload.as_deref() {{ Some(value) => value, \
+         None => return Err(nexa_runtime::HostTrap::Type) }}; Some({payload}) }}, _ => return \
+         Err(nexa_runtime::HostTrap::Type) }}",
+        type_id = metadata.type_id.0,
+        none_id = none.stable_id.0,
+        none_tag = none.tag,
+        some_id = some.stable_id.0,
+        some_tag = some.tag,
+    )
+}
+
+fn decode_result(idl: &Idl, success: &TypeRef, error: &TypeRef, source: &str) -> String {
+    let metadata = nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error));
+    let ok = &metadata.variants[0];
+    let err = &metadata.variants[1];
+    let success_payload = decode_value(idl, success, "value");
+    let error_payload = decode_value(idl, error, "value");
+    format!(
+        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if \
+         *type_id == nexa_runtime::StableId({type_id}) && *variant == \
+         nexa_runtime::StableId({ok_id}) && *tag == {ok_tag} => {{ let value = match \
+         payload.as_deref() {{ Some(value) => value, None => return \
+         Err(nexa_runtime::HostTrap::Type) }}; Ok({success_payload}) }}, \
+         nexa_runtime::HostValue::Enum {{ type_id, variant, tag, payload }} if *type_id == \
+         nexa_runtime::StableId({type_id}) && *variant == nexa_runtime::StableId({err_id}) && \
+         *tag == {err_tag} => {{ let value = match payload.as_deref() {{ Some(value) => value, \
+         None => return Err(nexa_runtime::HostTrap::Type) }}; Err({error_payload}) }}, _ => return \
+         Err(nexa_runtime::HostTrap::Type) }}",
+        type_id = metadata.type_id.0,
+        ok_id = ok.stable_id.0,
+        ok_tag = ok.tag,
+        err_id = err.stable_id.0,
+        err_tag = err.tag,
+    )
+}
+
+fn decode_collection(
+    idl: &Idl,
+    inner: &TypeRef,
+    source: &str,
+    variant: &str,
+    copy_buffer: bool,
+) -> String {
+    let decoded = decode_value(idl, inner, "value");
+    let finish = if copy_buffer {
+        "nexa_runtime::CopyBuffer::new(decoded)"
+    } else {
+        "decoded"
+    };
+    format!(
+        "{{ let values = match {source} {{ nexa_runtime::HostValue::{variant}(values) => values, \
+         _ => return Err(nexa_runtime::HostTrap::Type) }}; let mut decoded = \
+         Vec::with_capacity(values.len()); for value in values.as_slice() {{ \
+         decoded.push({decoded}); }} {finish} }}"
+    )
 }
 
 fn decode_enum_value(idl: &Idl, enumeration: &Enum, source: &str) -> String {
@@ -742,6 +889,8 @@ fn type_name(ty: &TypeRef) -> String {
         TypeRef::HostRequest(inner) => parameterized_type_name("request", inner.as_deref()),
         TypeRef::ResourceToken(inner) => parameterized_type_name("token", inner.as_deref()),
         TypeRef::Snapshot(inner) => parameterized_type_name("snapshot", inner.as_deref()),
+        TypeRef::Array(inner) => format!("array<{}>", type_name(inner)),
+        TypeRef::Buffer(inner) => format!("buffer<{}>", type_name(inner)),
         TypeRef::Option(inner) => format!("Option<{}>", type_name(inner)),
         TypeRef::Result(success, error) => {
             format!("Result<{},{}>", type_name(success), type_name(error))
@@ -757,6 +906,47 @@ fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
     )
 }
 
+fn value_type(idl: &Idl, ty: &TypeRef) -> ValueType {
+    match ty {
+        TypeRef::I32 => ValueType::I32,
+        TypeRef::I64 => ValueType::I64,
+        TypeRef::F32 => ValueType::F32,
+        TypeRef::F64 => ValueType::F64,
+        TypeRef::Bool => ValueType::Bool,
+        TypeRef::Rune => ValueType::Rune,
+        TypeRef::String => ValueType::String,
+        TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
+        TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
+        TypeRef::Snapshot(Some(content)) => {
+            let ValueType::Named(content_type) = value_type(idl, content) else {
+                unreachable!("validated snapshots have nominal content")
+            };
+            ValueType::Named(nexa_bytecode::snapshot_type(content_type))
+        }
+        TypeRef::Snapshot(None) => unreachable!("validated snapshots are typed"),
+        TypeRef::Array(inner) => {
+            ValueType::Named(nexa_bytecode::array_type(value_type(idl, inner)))
+        }
+        TypeRef::Buffer(inner) => {
+            ValueType::Named(nexa_bytecode::buffer_type(value_type(idl, inner)))
+        }
+        TypeRef::Option(inner) => {
+            ValueType::Named(nexa_bytecode::option_type(value_type(idl, inner)).type_id)
+        }
+        TypeRef::Result(success, error) => ValueType::Named(
+            nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error)).type_id,
+        ),
+        TypeRef::Named(name)
+            if idl.structs.iter().any(|item| item.name == *name)
+                || idl.enums.iter().any(|item| item.name == *name)
+                || idl.opaque_handles.contains(name) =>
+        {
+            ValueType::Named(StableId::from_name(name))
+        }
+        TypeRef::Named(_) => unreachable!("IDL named types are validated"),
+    }
+}
+
 fn rust_type(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 => "i32".into(),
@@ -769,6 +959,10 @@ fn rust_type(ty: &TypeRef) -> String {
         TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle".into(),
         TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle".into(),
         TypeRef::Snapshot(_) => "nexa_runtime::SnapshotHandle".into(),
+        TypeRef::Array(inner) => format!("Vec<{}>", rust_type(inner)),
+        TypeRef::Buffer(inner) => {
+            format!("nexa_runtime::CopyBuffer<{}>", rust_type(inner))
+        }
         TypeRef::Option(inner) => format!("Option<{}>", rust_type(inner)),
         TypeRef::Result(success, error) => {
             format!("Result<{}, {}>", rust_type(success), rust_type(error))
@@ -983,6 +1177,18 @@ impl Parser {
             "host_request" | "request" => TypeRef::HostRequest(self.optional_type_argument()?),
             "resource_token" | "token" => TypeRef::ResourceToken(self.optional_type_argument()?),
             "snapshot" => TypeRef::Snapshot(self.optional_type_argument()?),
+            "array" => {
+                self.expect("<")?;
+                let inner = self.ty()?;
+                self.expect(">")?;
+                TypeRef::Array(Box::new(inner))
+            }
+            "buffer" => {
+                self.expect("<")?;
+                let inner = self.ty()?;
+                self.expect(">")?;
+                TypeRef::Buffer(Box::new(inner))
+            }
             "Option" => {
                 self.expect("<")?;
                 let inner = self.ty()?;
@@ -1101,15 +1307,38 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
             "request functions must return request<Result<Success, Error>>".into(),
         ));
     }
+    if idl
+        .functions
+        .iter()
+        .any(|function| function.synchronous && matches!(function.result, TypeRef::HostRequest(_)))
+    {
+        return Err(IdlError::Syntax(
+            "sync functions cannot return request values".into(),
+        ));
+    }
     Ok(())
 }
 
 fn validate_type_ref(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), IdlError> {
     match ty {
         TypeRef::Named(name) if !known(name) => Err(IdlError::UnknownType(name.clone())),
+        TypeRef::HostRequest(None) => Err(IdlError::Syntax(
+            "request types require a result type".into(),
+        )),
+        TypeRef::ResourceToken(None) => Err(IdlError::Syntax(
+            "token types require a resource domain".into(),
+        )),
+        TypeRef::Snapshot(None) => Err(IdlError::Syntax(
+            "snapshot types require a nominal content type".into(),
+        )),
+        TypeRef::Snapshot(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => Err(
+            IdlError::Syntax("snapshot content types must be nominal".into()),
+        ),
         TypeRef::HostRequest(Some(inner))
         | TypeRef::ResourceToken(Some(inner))
         | TypeRef::Snapshot(Some(inner))
+        | TypeRef::Array(inner)
+        | TypeRef::Buffer(inner)
         | TypeRef::Option(inner) => validate_type_ref(inner, known),
         TypeRef::Result(success, error) => {
             validate_type_ref(success, known)?;
@@ -1125,7 +1354,7 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{exact_hash, generate_rust, parse};
+    use super::{TypeRef, exact_hash, generate_rust, parse};
 
     const IDL: &str = "
         interface GameHost {
@@ -1155,6 +1384,60 @@ mod tests {
         assert!(generated.contains("entity_position"));
         assert!(generated.contains("THUNK_ENTITY_POSITION"));
         assert!(generated.contains("pub enum Update"));
+    }
+
+    #[test]
+    fn parses_the_complete_mvr_boundary_type_matrix() {
+        let idl = parse(
+            "interface Complete {
+                opaque Entity;
+                opaque ActionLock;
+                struct Packet {
+                    i: i32; wide: i64; x: f32; y: f64; flag: bool; glyph: rune;
+                    label: string; maybe: Option<Entity>; values: array<i32>;
+                    bytes: buffer<i32>; view: snapshot<Entity>; lock: token<ActionLock>;
+                }
+                enum Event { Idle, Packet(Packet) }
+                sync fn roundtrip(value: Packet) -> Result<Event, i32>;
+                request(return_error, trap) fn load(value: array<Packet>)
+                    -> request<Result<buffer<Event>, i32>>;
+            }",
+        )
+        .unwrap();
+        let packet = &idl.structs[0];
+        assert!(matches!(packet.fields[0].ty, TypeRef::I32));
+        assert!(matches!(packet.fields[1].ty, TypeRef::I64));
+        assert!(matches!(packet.fields[2].ty, TypeRef::F32));
+        assert!(matches!(packet.fields[3].ty, TypeRef::F64));
+        assert!(matches!(packet.fields[4].ty, TypeRef::Bool));
+        assert!(matches!(packet.fields[5].ty, TypeRef::Rune));
+        assert!(matches!(packet.fields[6].ty, TypeRef::String));
+        assert!(matches!(packet.fields[7].ty, TypeRef::Option(_)));
+        assert!(matches!(packet.fields[8].ty, TypeRef::Array(_)));
+        assert!(matches!(packet.fields[9].ty, TypeRef::Buffer(_)));
+        assert!(matches!(packet.fields[10].ty, TypeRef::Snapshot(_)));
+        assert!(matches!(packet.fields[11].ty, TypeRef::ResourceToken(_)));
+        assert!(matches!(
+            idl.enums[0].variants[1].payload,
+            Some(TypeRef::Named(_))
+        ));
+        assert!(matches!(idl.functions[0].result, TypeRef::Result(_, _)));
+        assert!(matches!(
+            idl.functions[1].result,
+            TypeRef::HostRequest(Some(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_untyped_resource_and_request_handles() {
+        for source in [
+            "interface Bad { sync fn load() -> request; }",
+            "interface Bad { sync fn lock() -> token; }",
+            "interface Bad { sync fn view() -> snapshot; }",
+            "interface Bad { sync fn view() -> snapshot<i32>; }",
+        ] {
+            assert!(parse(source).is_err(), "{source}");
+        }
     }
 
     #[test]
@@ -1236,6 +1519,8 @@ mod tests {
                 sync fn scalar_mix(wide: i64, ratio: f64, glyph: rune) -> f64;
                 sync fn echo(value: string) -> string;
                 sync fn echo_event(value: Event) -> Event;
+                sync fn collections(values: array<Option<i32>>, copy: buffer<i64>)
+                    -> array<Result<i32, i32>>;
                 sync fn explode() -> i32;
                 request(return_error, trap) fn next()
                     -> request<Result<Event, EventError>>;
@@ -1316,6 +1601,19 @@ impl GameHost for Mock {
         Ok(value)
     }
 
+    fn collections(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        values: Vec<Option<i32>>,
+        copy: nexa_runtime::CopyBuffer<i64>,
+    ) -> Result<Vec<Result<i32, i32>>, HostError> {
+        let offset = copy.as_slice().first().copied().unwrap_or_default() as i32;
+        Ok(values
+            .into_iter()
+            .map(|value| value.map_or(Err(offset), |value| Ok(value + offset)))
+            .collect())
+    }
+
     fn explode(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
@@ -1392,7 +1690,7 @@ fn main() {
         HostCallOutcome::Immediate(event)
     );
     assert_eq!(
-        registry.call(5, &mut context, HostArgs::new(&[])),
+        registry.call(6, &mut context, HostArgs::new(&[])),
         Err(nexa_runtime::HostTrap::Panicked)
     );
 }

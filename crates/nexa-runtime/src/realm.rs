@@ -152,7 +152,16 @@ struct RealmHostBridge<'a> {
     imports: &'a [HostImport],
     enum_types: &'a [nexa_bytecode::EnumType],
     struct_types: &'a [nexa_bytecode::StructType],
+    array_types: &'a [nexa_bytecode::ArrayType],
     buffer_types: &'a [nexa_bytecode::BufferType],
+}
+
+#[derive(Clone, Copy)]
+struct HostBoundaryTypes<'a> {
+    enums: &'a [nexa_bytecode::EnumType],
+    structs: &'a [nexa_bytecode::StructType],
+    arrays: &'a [nexa_bytecode::ArrayType],
+    buffers: &'a [nexa_bytecode::BufferType],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -178,6 +187,7 @@ impl InterpreterHost for RealmHostBridge<'_> {
                     heap,
                     self.enum_types,
                     self.struct_types,
+                    self.array_types,
                     self.buffer_types,
                 )?))
             }
@@ -217,46 +227,40 @@ fn host_to_runtime_value(
     heap: Option<&mut Heap>,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    array_types: &[nexa_bytecode::ArrayType],
     buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<RuntimeValue, HostTrap> {
+    let types = HostBoundaryTypes {
+        enums: enum_types,
+        structs: struct_types,
+        arrays: array_types,
+        buffers: buffer_types,
+    };
     let slots = validate_host_value(
         &value,
         expected,
         heap.as_deref(),
         enum_types,
         struct_types,
+        array_types,
         buffer_types,
     )?;
     if slots == 0 {
-        return commit_host_value(
-            value,
-            expected,
-            None,
-            None,
-            enum_types,
-            struct_types,
-            buffer_types,
-        );
+        return commit_host_value(value, expected, None, None, types);
     }
     let heap = heap.ok_or(HostTrap::Type)?;
     let mut reservation = heap.preflight(slots).map_err(|_| HostTrap::Type)?;
-    commit_host_value(
-        value,
-        expected,
-        Some(heap),
-        Some(&mut reservation),
-        enum_types,
-        struct_types,
-        buffer_types,
-    )
+    commit_host_value(value, expected, Some(heap), Some(&mut reservation), types)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_host_value(
     value: &HostValue,
     expected: Option<ValueType>,
     heap: Option<&Heap>,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    array_types: &[nexa_bytecode::ArrayType],
     buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<usize, HostTrap> {
     match (value, expected) {
@@ -308,6 +312,7 @@ fn validate_host_value(
                     heap,
                     enum_types,
                     struct_types,
+                    array_types,
                     buffer_types,
                 )?,
                 (None, None) => 0,
@@ -334,21 +339,62 @@ fn validate_host_value(
                             heap,
                             enum_types,
                             struct_types,
+                            array_types,
                             buffer_types,
                         )?)
                         .ok_or(HostTrap::Type)
                 })
         }
+        (HostValue::Array(array), Some(ValueType::Named(type_id))) => validate_host_array(
+            array,
+            type_id,
+            heap.ok_or(HostTrap::Type)?,
+            enum_types,
+            struct_types,
+            array_types,
+            buffer_types,
+        ),
         (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => validate_host_buffer(
             buffer,
             type_id,
             heap.ok_or(HostTrap::Type)?,
             enum_types,
             struct_types,
+            array_types,
             buffer_types,
         ),
         _ => Err(HostTrap::Type),
     }
+}
+
+fn validate_host_array(
+    array: &CopyBuffer<HostValue>,
+    type_id: StableId,
+    heap: &Heap,
+    enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
+    array_types: &[nexa_bytecode::ArrayType],
+    buffer_types: &[nexa_bytecode::BufferType],
+) -> Result<usize, HostTrap> {
+    let metadata = array_types
+        .iter()
+        .find(|array| array.type_id == type_id)
+        .ok_or(HostTrap::Type)?;
+    heap.validate_collection_length(array.len())
+        .map_err(|_| HostTrap::Type)?;
+    array.as_slice().iter().try_fold(1_usize, |slots, value| {
+        slots
+            .checked_add(validate_host_value(
+                value,
+                Some(metadata.element),
+                Some(heap),
+                enum_types,
+                struct_types,
+                array_types,
+                buffer_types,
+            )?)
+            .ok_or(HostTrap::Type)
+    })
 }
 
 fn validate_host_buffer(
@@ -357,6 +403,7 @@ fn validate_host_buffer(
     heap: &Heap,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    array_types: &[nexa_bytecode::ArrayType],
     buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<usize, HostTrap> {
     let metadata = buffer_types
@@ -373,20 +420,20 @@ fn validate_host_buffer(
                 Some(heap),
                 enum_types,
                 struct_types,
+                array_types,
                 buffer_types,
             )?)
             .ok_or(HostTrap::Type)
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn commit_host_value(
     value: HostValue,
     expected: Option<ValueType>,
     mut heap: Option<&mut Heap>,
     mut reservation: Option<&mut HeapReservation>,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    buffer_types: &[nexa_bytecode::BufferType],
+    types: HostBoundaryTypes<'_>,
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
@@ -413,7 +460,8 @@ fn commit_host_value(
             },
             Some(ValueType::Named(expected_type)),
         ) if type_id == expected_type => {
-            let metadata = enum_types
+            let metadata = types
+                .enums
                 .iter()
                 .find(|enum_type| enum_type.type_id == expected_type)
                 .and_then(|enum_type| {
@@ -429,9 +477,7 @@ fn commit_host_value(
                     Some(payload_type),
                     heap.as_deref_mut(),
                     reservation.as_deref_mut(),
-                    enum_types,
-                    struct_types,
-                    buffer_types,
+                    types,
                 )?),
                 (None, None) => None,
                 _ => return Err(HostTrap::Type),
@@ -453,18 +499,21 @@ fn commit_host_value(
             type_id,
             heap.ok_or(HostTrap::Type)?,
             reservation.ok_or(HostTrap::Type)?,
-            enum_types,
-            struct_types,
-            buffer_types,
+            types,
+        ),
+        (HostValue::Array(array), Some(ValueType::Named(type_id))) => commit_host_array(
+            array,
+            type_id,
+            heap.ok_or(HostTrap::Type)?,
+            reservation.ok_or(HostTrap::Type)?,
+            types,
         ),
         (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => commit_host_buffer(
             buffer,
             type_id,
             heap.ok_or(HostTrap::Type)?,
             reservation.ok_or(HostTrap::Type)?,
-            enum_types,
-            struct_types,
-            buffer_types,
+            types,
         ),
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
@@ -485,16 +534,48 @@ fn commit_host_value(
     }
 }
 
+fn commit_host_array(
+    array: CopyBuffer<HostValue>,
+    type_id: StableId,
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    types: HostBoundaryTypes<'_>,
+) -> Result<RuntimeValue, HostTrap> {
+    let metadata = types
+        .arrays
+        .iter()
+        .find(|array| array.type_id == type_id)
+        .ok_or(HostTrap::Type)?;
+    let mut values = Vec::with_capacity(array.len());
+    for value in array.into_vec() {
+        values.push(commit_host_value(
+            value,
+            Some(metadata.element),
+            Some(&mut *heap),
+            Some(&mut *reservation),
+            types,
+        )?);
+    }
+    let reference = heap.commit(
+        reservation,
+        Object::Array {
+            type_id,
+            element_type: metadata.element,
+            values,
+        },
+    );
+    Ok(RuntimeValue::NamedRef { reference, type_id })
+}
+
 fn commit_host_buffer(
     buffer: CopyBuffer<HostValue>,
     type_id: StableId,
     heap: &mut Heap,
     reservation: &mut HeapReservation,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    buffer_types: &[nexa_bytecode::BufferType],
+    types: HostBoundaryTypes<'_>,
 ) -> Result<RuntimeValue, HostTrap> {
-    let metadata = buffer_types
+    let metadata = types
+        .buffers
         .iter()
         .find(|buffer| buffer.type_id == type_id)
         .ok_or(HostTrap::Type)?;
@@ -505,9 +586,7 @@ fn commit_host_buffer(
             Some(metadata.element),
             Some(&mut *heap),
             Some(&mut *reservation),
-            enum_types,
-            struct_types,
-            buffer_types,
+            types,
         )?);
     }
     let reference = heap.commit(
@@ -526,11 +605,10 @@ fn commit_host_struct(
     type_id: StableId,
     heap: &mut Heap,
     reservation: &mut HeapReservation,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    buffer_types: &[nexa_bytecode::BufferType],
+    types: HostBoundaryTypes<'_>,
 ) -> Result<RuntimeValue, HostTrap> {
-    let metadata = struct_types
+    let metadata = types
+        .structs
         .iter()
         .find(|struct_type| struct_type.type_id == type_id)
         .ok_or(HostTrap::Type)?;
@@ -544,9 +622,7 @@ fn commit_host_struct(
             Some(metadata.ty),
             Some(&mut *heap),
             Some(&mut *reservation),
-            enum_types,
-            struct_types,
-            buffer_types,
+            types,
         )?;
     }
     heap.commit_struct(reservation, type_id, &values[..metadata.fields.len()])
@@ -644,6 +720,11 @@ enum PlannedResultPayload {
         tag: u32,
         payload: Option<Box<PlannedResultPayload>>,
     },
+    Array {
+        type_id: StableId,
+        element_type: ValueType,
+        values: Vec<PlannedResultPayload>,
+    },
     Buffer {
         type_id: StableId,
         element_type: ValueType,
@@ -651,11 +732,13 @@ enum PlannedResultPayload {
     },
 }
 
+#[allow(clippy::too_many_lines)]
 fn plan_host_payload(
     payload: &HostPayload,
     expected: ValueType,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    array_types: &[nexa_bytecode::ArrayType],
     buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<PlannedResultPayload, InterpreterError> {
     if let HostPayload::String(value) = payload
@@ -690,6 +773,7 @@ fn plan_host_payload(
                 payload_type,
                 enum_types,
                 struct_types,
+                array_types,
                 buffer_types,
             )?)),
             (None, None) => None,
@@ -714,10 +798,42 @@ fn plan_host_payload(
             .iter()
             .zip(&metadata.fields)
             .map(|(value, field)| {
-                plan_host_payload(value, field.ty, enum_types, struct_types, buffer_types)
+                plan_host_payload(
+                    value,
+                    field.ty,
+                    enum_types,
+                    struct_types,
+                    array_types,
+                    buffer_types,
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(PlannedResultPayload::Struct { type_id, fields });
+    }
+    if let (HostPayload::Array(array), ValueType::Named(type_id)) = (payload, expected) {
+        let metadata = array_types
+            .iter()
+            .find(|array| array.type_id == type_id)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let values = array
+            .as_slice()
+            .iter()
+            .map(|value| {
+                plan_host_payload(
+                    value,
+                    metadata.element,
+                    enum_types,
+                    struct_types,
+                    array_types,
+                    buffer_types,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PlannedResultPayload::Array {
+            type_id,
+            element_type: metadata.element,
+            values,
+        });
     }
     if let (HostPayload::Buffer(buffer), ValueType::Named(type_id)) = (payload, expected) {
         let metadata = buffer_types
@@ -733,6 +849,7 @@ fn plan_host_payload(
                     metadata.element,
                     enum_types,
                     struct_types,
+                    array_types,
                     buffer_types,
                 )
             })
@@ -765,7 +882,8 @@ fn planned_payload_slots(payload: &PlannedResultPayload) -> Result<usize, RealmE
                 .checked_add(1)
                 .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
         }),
-        PlannedResultPayload::Buffer { values, .. } => {
+        PlannedResultPayload::Array { values, .. }
+        | PlannedResultPayload::Buffer { values, .. } => {
             values.iter().try_fold(1_usize, |slots, value| {
                 slots
                     .checked_add(planned_payload_slots(value)?)
@@ -789,7 +907,8 @@ fn validate_planned_payload(heap: &Heap, payload: &PlannedResultPayload) -> Resu
                 validate_planned_payload(heap, field)?;
             }
         }
-        PlannedResultPayload::Buffer { values, .. } => {
+        PlannedResultPayload::Array { values, .. }
+        | PlannedResultPayload::Buffer { values, .. } => {
             heap.validate_collection_length(values.len())?;
             for value in values {
                 validate_planned_payload(heap, value)?;
@@ -837,6 +956,25 @@ fn commit_planned_payload(
                     variant,
                     tag,
                     payload,
+                },
+            );
+            Ok(RuntimeValue::NamedRef { reference, type_id })
+        }
+        PlannedResultPayload::Array {
+            type_id,
+            element_type,
+            values,
+        } => {
+            let values = values
+                .into_iter()
+                .map(|value| commit_planned_payload(heap, reservation, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let reference = heap.commit(
+                reservation,
+                Object::Array {
+                    type_id,
+                    element_type,
+                    values,
                 },
             );
             Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -1877,6 +2015,7 @@ impl RealmRuntime {
                 imports: &module.verified.module().host_imports,
                 enum_types: &module.verified.module().enum_types,
                 struct_types: &module.verified.module().struct_types,
+                array_types: &module.verified.module().array_types,
                 buffer_types: &module.verified.module().buffer_types,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
@@ -2451,6 +2590,7 @@ impl RealmRuntime {
         Ok(true)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn preflight_result_writeback(
         &mut self,
         task: TaskHandle,
@@ -2482,6 +2622,11 @@ impl RealmRuntime {
                             .verified
                             .module()
                             .struct_types;
+                        let array_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .array_types;
                         let buffer_types = &self
                             .module_for_task(snapshot)?
                             .verified
@@ -2492,6 +2637,7 @@ impl RealmRuntime {
                             result.success,
                             enum_types,
                             struct_types,
+                            array_types,
                             buffer_types,
                         )?
                     };
@@ -2505,6 +2651,11 @@ impl RealmRuntime {
                             .verified
                             .module()
                             .struct_types;
+                        let array_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .array_types;
                         let buffer_types = &self
                             .module_for_task(snapshot)?
                             .verified
@@ -2515,6 +2666,7 @@ impl RealmRuntime {
                             expected_type,
                             enum_types,
                             struct_types,
+                            array_types,
                             buffer_types,
                         )?
                     };
@@ -3225,9 +3377,9 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
-        BufferType, EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode,
-        HostImport, Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField,
-        StateSchema, StateType, StructField, StructType, ValueType,
+        ArrayType, BufferType, EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect,
+        HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry,
+        StateField, StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -3250,6 +3402,7 @@ mod tests {
             HostValue::String("host-result".into()),
             Some(ValueType::String),
             Some(&mut heap),
+            &[],
             &[],
             &[],
             &[],
@@ -3278,6 +3431,7 @@ mod tests {
             host,
             Some(ValueType::Named(metadata.type_id)),
             Some(&mut heap),
+            &[],
             &[],
             &[],
             &buffers,
@@ -3309,6 +3463,7 @@ mod tests {
             ValueType::Named(metadata.type_id),
             &[],
             &[],
+            &[],
             &buffers,
         )
         .unwrap();
@@ -3322,6 +3477,58 @@ mod tests {
             Ok(&HostValue::Buffer(CopyBuffer::new(vec![
                 HostValue::I32(4),
                 HostValue::I32(5),
+            ])))
+        );
+    }
+
+    #[test]
+    fn host_arrays_cross_sync_and_async_boundaries_by_copy() {
+        let metadata = ArrayType::new(ValueType::I32);
+        let arrays = [metadata];
+        let host = HostValue::Array(CopyBuffer::new(vec![HostValue::I32(1), HostValue::I32(2)]));
+        let mut heap = crate::Heap::new_with_limits(8, usize::MAX, 4);
+        let runtime = super::host_to_runtime_value(
+            host.clone(),
+            Some(ValueType::Named(metadata.type_id)),
+            Some(&mut heap),
+            &[],
+            &[],
+            &arrays,
+            &[],
+        )
+        .unwrap();
+        let outbound = HostArgs::from_runtime(&[runtime], Some(&heap))
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .clone();
+        heap.array_set(runtime, 0, RuntimeValue::I32(9)).unwrap();
+        assert_eq!(outbound, host);
+        assert_eq!(heap.array_get(runtime, 0), Ok(RuntimeValue::I32(9)));
+
+        let completion = HostPayload::Array(CopyBuffer::new(vec![
+            HostPayload::I32(3),
+            HostPayload::I32(4),
+        ]));
+        let planned = super::plan_host_payload(
+            &completion,
+            ValueType::Named(metadata.type_id),
+            &[],
+            &[],
+            &arrays,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 1);
+        let mut reservation = heap.preflight(1).unwrap();
+        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
+        assert_eq!(
+            HostArgs::from_runtime(&[runtime], Some(&heap))
+                .unwrap()
+                .get(0),
+            Ok(&HostValue::Array(CopyBuffer::new(vec![
+                HostValue::I32(3),
+                HostValue::I32(4),
             ])))
         );
     }
@@ -3346,6 +3553,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                &[],
             ),
             Ok(RuntimeValue::Snapshot(snapshot))
         );
@@ -3356,6 +3564,7 @@ mod tests {
                     StableId::from_name("OtherView"),
                 ))),
                 None,
+                &[],
                 &[],
                 &[],
                 &[],
@@ -3404,6 +3613,7 @@ mod tests {
             &enum_types,
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
@@ -3423,6 +3633,7 @@ mod tests {
                 &enum_types,
                 &[],
                 &[],
+                &[],
             ),
             Err(HostTrap::Type)
         );
@@ -3437,6 +3648,7 @@ mod tests {
             &completion,
             ValueType::Named(type_id),
             &enum_types,
+            &[],
             &[],
             &[],
         )
@@ -3482,6 +3694,7 @@ mod tests {
             &[],
             &struct_types,
             &[],
+            &[],
         )
         .unwrap();
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
@@ -3493,6 +3706,7 @@ mod tests {
                 Some(&mut heap),
                 &[],
                 &struct_types,
+                &[],
                 &[],
             ),
             Err(HostTrap::Type)
@@ -3507,6 +3721,7 @@ mod tests {
             ValueType::Named(type_id),
             &[],
             &struct_types,
+            &[],
             &[],
         )
         .unwrap();

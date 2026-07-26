@@ -79,6 +79,7 @@ version = "0.1.0"
 name = "nexa-idl"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
  "nexa-core",
 ]
 

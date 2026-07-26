@@ -844,7 +844,7 @@ impl Heap {
         Ok(())
     }
 
-    fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+    pub fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
