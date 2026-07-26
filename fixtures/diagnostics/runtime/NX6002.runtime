@@ -1,2 +1,1 @@
-expected=NX6002
-migration graph failure
+{"version":1,"scenario":"nested_state_object"}

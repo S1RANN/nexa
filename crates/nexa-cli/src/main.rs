@@ -68,7 +68,12 @@ fn main() {
             run_command(arguments, diagnostic_format, true)
         }
         [command] if command == "model-check" => check_models(),
-        [command] if command == "diagnostic-corpus-check" => diagnostic_corpus_check(),
+        [command] if command == "diagnostic-corpus-check" => diagnostic_corpus_check(false),
+        [command, flag, format]
+            if command == "diagnostic-corpus-check" && flag == "--format" && format == "json" =>
+        {
+            diagnostic_corpus_check(true)
+        }
         [command, path] if command == "model-replay" => model_replay(Path::new(path)),
         [command, arguments @ ..] if command == "fixture-check" => {
             fixture_check(arguments, diagnostic_format)
@@ -108,36 +113,27 @@ fn main() {
     }
 }
 
-fn diagnostic_corpus_check() -> Result<(), String> {
+fn diagnostic_corpus_check(json_output: bool) -> Result<(), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let registered = nexa::ERROR_CODE_TABLE
-        .iter()
-        .map(|definition| definition.code)
-        .collect::<BTreeSet<_>>();
-    let emitted = nexa::ERROR_EMISSION_TABLE
-        .iter()
-        .map(|definition| {
-            let fixture = root.join(definition.fixture);
-            let source = std::fs::read_to_string(&fixture)
-                .map_err(|error| format!("{}: {error}", fixture.display()))?;
-            if !source.contains(definition.code.as_str()) {
-                return Err(format!(
-                    "{} does not declare {}",
-                    fixture.display(),
-                    definition.code
-                ));
-            }
-            Ok(definition.code)
-        })
-        .collect::<Result<BTreeSet<_>, String>>()?;
-    if registered != emitted {
-        return Err("registered and emitted diagnostic code sets differ".into());
+    let report = nexa::run_diagnostic_corpus(&root)?;
+    if !report.missing_codes.is_empty()
+        || !report.unexpected_codes.is_empty()
+        || report.source_backed_inexact_spans != 0
+        || !report.case_format.invalid_pipelines.is_empty()
+    {
+        return Err("diagnostic corpus contains failed cases".into());
     }
-    println!(
-        "registered_codes={} emitted_codes={} source_backed_zero_zero_spans=0",
-        registered.len(),
-        emitted.len()
-    );
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "diagnostic corpus: {} registered, {} observed, {} deterministic",
+            report.registered_codes, report.observed_codes, report.deterministic_cases
+        );
+    }
     Ok(())
 }
 

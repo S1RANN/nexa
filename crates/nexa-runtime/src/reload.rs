@@ -26,6 +26,23 @@ pub enum ReloadError {
     Activation(RuntimeMessage),
 }
 
+pub fn validate_reload_completion_capacity(
+    capacity: usize,
+    buffered: usize,
+) -> Result<(), ReloadError> {
+    if buffered >= capacity {
+        Err(ReloadError::CompletionBufferCapacity)
+    } else {
+        Ok(())
+    }
+}
+
+pub fn invoke_reload_activation(
+    activation: impl FnOnce() -> Result<(), RuntimeMessage>,
+) -> Result<(), ReloadError> {
+    activation().map_err(ReloadError::Activation)
+}
+
 #[derive(Debug)]
 pub(crate) struct ReloadTransaction {
     pub(crate) old_module: ModuleHandle,
@@ -50,9 +67,7 @@ impl ReloadCompletionBuffer {
     }
 
     pub(crate) fn push(&mut self, delivery: HostCompletionDelivery) -> Result<(), ReloadError> {
-        if self.entries.len() == self.capacity {
-            return Err(ReloadError::CompletionBufferCapacity);
-        }
+        validate_reload_completion_capacity(self.capacity, self.entries.len())?;
         self.entries.push_back(delivery);
         Ok(())
     }

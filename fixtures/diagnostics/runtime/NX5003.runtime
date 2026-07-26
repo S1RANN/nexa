@@ -1,2 +1,1 @@
-expected=NX5003
-unknown host error code
+{"version":1,"scenario":"unknown_host_error_code"}

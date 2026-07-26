@@ -1,2 +1,1 @@
-expected=NX6001
-migration limit
+{"version":1,"scenario":"migration_object_limit"}

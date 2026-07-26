@@ -1894,7 +1894,7 @@ impl RealmRuntime {
                 }
             }
         })();
-        match activation_result {
+        match crate::invoke_reload_activation(|| activation_result) {
             Ok(()) => {
                 self.reload.activation_succeeded()?;
                 self.modules
@@ -1905,7 +1905,7 @@ impl RealmRuntime {
                 let transaction = self.reload.finish()?;
                 Ok(transaction.candidate)
             }
-            Err(error) => {
+            Err(ReloadError::Activation(error)) => {
                 self.reload.activation_failed()?;
                 self.modules
                     .resolve_mut(candidate.raw())
@@ -1915,6 +1915,7 @@ impl RealmRuntime {
                 self.reload.finish()?;
                 Err(ReloadError::Activation(error).into())
             }
+            Err(error) => Err(error.into()),
         }
     }
 
@@ -3694,25 +3695,7 @@ fn migration_requirement_error(
     available: MigrationLimits,
     required: MigrationLimitRequirements,
 ) -> Option<MigrationLimitError> {
-    if available.max_objects < required.max_objects {
-        Some(MigrationLimitError::Objects)
-    } else if available.max_fields < required.max_fields {
-        Some(MigrationLimitError::Fields)
-    } else if available.max_forwarding_entries < required.max_forwarding_entries {
-        Some(MigrationLimitError::Forwarding)
-    } else if u64::try_from(available.max_state_bytes).unwrap_or(u64::MAX)
-        < required.max_state_bytes
-    {
-        Some(MigrationLimitError::StateBytes)
-    } else if available.max_gc_roots < required.max_gc_roots {
-        Some(MigrationLimitError::GcRoots)
-    } else if available.max_fuel < required.max_fuel {
-        Some(MigrationLimitError::Fuel)
-    } else if available.max_call_depth < required.max_call_depth {
-        Some(MigrationLimitError::CallDepth)
-    } else {
-        None
-    }
+    available.validate_requirements(required).err()
 }
 
 fn requires_host_capabilities(

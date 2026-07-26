@@ -1,1 +1,1 @@
-{"version":1,"code":"NX5004","category":"runtime","pipeline":"runtime","input":"../runtime/NX5004.runtime","expected":{"primary_text":"","secondary_count":0,"message_contains":"runtime resource capacity","notes":[]}}
+{"version":1,"code":"NX5004","category":"host","pipeline":"runtime","input":"../runtime/NX5004.runtime","expected":{"primary_text":"","secondary_count":0,"message_contains":"runtime resource capacity","notes":[]}}

@@ -1,2 +1,1 @@
-expected=NX5002
-host abandoned
+{"version":1,"scenario":"host_abandoned_completion"}

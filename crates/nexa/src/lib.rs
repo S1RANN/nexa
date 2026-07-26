@@ -7,7 +7,9 @@ mod diagnostic_corpus;
 mod error;
 
 pub use diagnostic_corpus::{
-    CompilerDiagnosticReport, ObservedDiagnosticCase, run_compiler_diagnostic_cases,
+    BinaryDiagnosticReport, CaseFormatReport, CompilerDiagnosticReport, DiagnosticCorpusReport,
+    ObservedDiagnosticCase, PipelineReport, RuntimeDiagnosticReport, run_binary_diagnostic_cases,
+    run_compiler_diagnostic_cases, run_diagnostic_corpus, run_runtime_diagnostic_cases,
 };
 pub use error::{
     ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ERROR_EMISSION_TABLE,
@@ -98,5 +100,38 @@ mod tests {
                 && case.json_output
                 && case.primary_start < case.primary_end
         }));
+    }
+
+    #[test]
+    fn binary_diagnostic_corpus_decodes_and_verifies_real_fixtures() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let report = crate::run_binary_diagnostic_cases(&root).unwrap();
+        assert_eq!(report.case_count, 5);
+        assert_eq!(report.passed, 5);
+        assert_eq!(report.deterministic_cases, 5);
+    }
+
+    #[test]
+    fn runtime_diagnostic_corpus_calls_real_runtime_host_and_reload_apis() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let report = crate::run_runtime_diagnostic_cases(&root).unwrap();
+        assert_eq!(report.case_count, 11);
+        assert_eq!(report.passed, 11);
+        assert_eq!(report.deterministic_cases, 11);
+        assert!(!report.direct_nexa_error_construction);
+    }
+
+    #[test]
+    fn complete_diagnostic_corpus_observes_the_registered_set_twice() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let report = crate::run_diagnostic_corpus(&root).unwrap();
+        assert_eq!(report.registered_codes, 34);
+        assert_eq!(report.emission_definitions, 34);
+        assert_eq!(report.fixture_codes, 34);
+        assert_eq!(report.observed_codes, 34);
+        assert_eq!(report.deterministic_cases, 34);
+        assert!(report.missing_codes.is_empty());
+        assert!(report.unexpected_codes.is_empty());
+        assert!(report.case_format.invalid_pipelines.is_empty());
     }
 }

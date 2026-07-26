@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use nexa_core::FileId;
@@ -58,6 +59,82 @@ pub struct CompilerDiagnosticReport {
     pub cases: Vec<ObservedDiagnosticCase>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct BinaryDiagnosticReport {
+    pub schema_version: u32,
+    pub case_count: usize,
+    pub passed: usize,
+    pub deterministic_cases: usize,
+    pub codes: Vec<String>,
+    pub cases: Vec<ObservedDiagnosticCase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimeDiagnosticReport {
+    pub schema_version: u32,
+    pub case_count: usize,
+    pub passed: usize,
+    pub deterministic_cases: usize,
+    pub direct_nexa_error_construction: bool,
+    pub codes: Vec<String>,
+    pub cases: Vec<ObservedDiagnosticCase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DiagnosticCorpusReport {
+    pub schema_version: u32,
+    pub registered_codes: usize,
+    pub emission_definitions: usize,
+    pub fixture_codes: usize,
+    pub observed_codes: usize,
+    pub missing_codes: Vec<String>,
+    pub unexpected_codes: Vec<String>,
+    pub source_backed_zero_zero_spans: usize,
+    pub source_backed_inexact_spans: usize,
+    pub deterministic_cases: usize,
+    pub case_format: CaseFormatReport,
+    pub pipelines: PipelineReport,
+    pub cases: Vec<ObservedDiagnosticCase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CaseFormatReport {
+    pub version: u32,
+    pub invalid_pipelines: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PipelineReport {
+    pub compiler: CompilerPipelineReport,
+    pub bytecode_verifier: CountPipelineReport,
+    pub runtime_family: RuntimePipelineReport,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CompilerPipelineReport {
+    pub cases: usize,
+    pub direct_error_construction: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CountPipelineReport {
+    pub cases: usize,
+    pub passed: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RuntimePipelineReport {
+    pub cases: usize,
+    pub passed: usize,
+    pub direct_nexa_error_construction: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct RuntimeFixture {
+    version: u32,
+    scenario: String,
+}
+
 pub fn run_compiler_diagnostic_cases(root: &Path) -> Result<CompilerDiagnosticReport, String> {
     let cases_dir = root.join("fixtures/diagnostics/cases");
     let mut paths = std::fs::read_dir(&cases_dir)
@@ -104,6 +181,480 @@ pub fn run_compiler_diagnostic_cases(root: &Path) -> Result<CompilerDiagnosticRe
         codes,
         cases,
     })
+}
+
+pub fn run_binary_diagnostic_cases(root: &Path) -> Result<BinaryDiagnosticReport, String> {
+    let cases = load_cases(root)?;
+    let mut observed = Vec::new();
+    let mut deterministic_cases = 0;
+    for (path, case) in cases {
+        if !matches!(case.pipeline.as_str(), "bytecode_decode" | "verifier") {
+            continue;
+        }
+        if case.version != 1 {
+            return Err(format!("{} has unsupported case version", path.display()));
+        }
+        let first = execute_binary_case(&case, &path)?;
+        let second = execute_binary_case(&case, &path)?;
+        if first != second {
+            return Err(format!("{} was not deterministic", path.display()));
+        }
+        deterministic_cases += 1;
+        observed.push(first);
+    }
+    let passed = observed.iter().filter(|case| case.passed).count();
+    let codes = observed.iter().map(|case| case.code.clone()).collect();
+    Ok(BinaryDiagnosticReport {
+        schema_version: 1,
+        case_count: observed.len(),
+        passed,
+        deterministic_cases,
+        codes,
+        cases: observed,
+    })
+}
+
+fn load_cases(root: &Path) -> Result<Vec<(PathBuf, DiagnosticCase)>, String> {
+    let cases_dir = root.join("fixtures/diagnostics/cases");
+    let mut paths = std::fs::read_dir(&cases_dir)
+        .map_err(|error| format!("{}: {error}", cases_dir.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let case = serde_json::from_slice(
+                &std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?,
+            )
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+            Ok((path, case))
+        })
+        .collect()
+}
+
+pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticReport, String> {
+    let cases = load_cases(root)?;
+    let mut observed = Vec::new();
+    let mut deterministic_cases = 0;
+    for (path, case) in cases {
+        if !matches!(
+            case.pipeline.as_str(),
+            "runtime" | "host" | "reload" | "migration"
+        ) {
+            continue;
+        }
+        if case.version != 1 {
+            return Err(format!("{} has unsupported case version", path.display()));
+        }
+        let first = execute_runtime_case(&case, &path)?;
+        let second = execute_runtime_case(&case, &path)?;
+        if first != second {
+            return Err(format!("{} was not deterministic", path.display()));
+        }
+        deterministic_cases += 1;
+        observed.push(first);
+    }
+    let passed = observed.iter().filter(|case| case.passed).count();
+    let codes = observed.iter().map(|case| case.code.clone()).collect();
+    Ok(RuntimeDiagnosticReport {
+        schema_version: 1,
+        case_count: observed.len(),
+        passed,
+        deterministic_cases,
+        direct_nexa_error_construction: false,
+        codes,
+        cases: observed,
+    })
+}
+
+pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, String> {
+    let compiler = run_compiler_diagnostic_cases(root)?;
+    let binary = run_binary_diagnostic_cases(root)?;
+    let runtime = run_runtime_diagnostic_cases(root)?;
+    let loaded = load_cases(root)?;
+    let allowed = [
+        "compiler",
+        "bytecode_decode",
+        "verifier",
+        "runtime",
+        "host",
+        "reload",
+        "migration",
+    ];
+    let invalid_pipelines = loaded
+        .iter()
+        .filter(|(_, case)| !allowed.contains(&case.pipeline.as_str()))
+        .map(|(_, case)| case.pipeline.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let fixture_set = loaded
+        .iter()
+        .map(|(_, case)| case.code.clone())
+        .collect::<BTreeSet<_>>();
+    if fixture_set.len() != loaded.len() {
+        return Err("diagnostic case codes are not unique".into());
+    }
+    let registered_set = crate::ERROR_CODE_TABLE
+        .iter()
+        .map(|definition| definition.code.to_string())
+        .collect::<BTreeSet<_>>();
+    let emission_set = crate::ERROR_EMISSION_TABLE
+        .iter()
+        .map(|definition| definition.code.to_string())
+        .collect::<BTreeSet<_>>();
+    let mut cases = compiler.cases.clone();
+    cases.extend(binary.cases.clone());
+    cases.extend(runtime.cases.clone());
+    cases.sort_by(|left, right| left.code.cmp(&right.code));
+    let observed_set = cases
+        .iter()
+        .map(|case| case.observed.clone())
+        .collect::<BTreeSet<_>>();
+    let mut missing_codes = registered_set
+        .difference(&observed_set)
+        .cloned()
+        .collect::<Vec<_>>();
+    missing_codes.extend(emission_set.difference(&observed_set).cloned());
+    missing_codes.extend(fixture_set.difference(&observed_set).cloned());
+    missing_codes.sort();
+    missing_codes.dedup();
+    let mut unexpected_codes = observed_set
+        .difference(&registered_set)
+        .cloned()
+        .collect::<Vec<_>>();
+    unexpected_codes.extend(observed_set.difference(&emission_set).cloned());
+    unexpected_codes.extend(observed_set.difference(&fixture_set).cloned());
+    unexpected_codes.sort();
+    unexpected_codes.dedup();
+    Ok(DiagnosticCorpusReport {
+        schema_version: 1,
+        registered_codes: registered_set.len(),
+        emission_definitions: emission_set.len(),
+        fixture_codes: fixture_set.len(),
+        observed_codes: observed_set.len(),
+        missing_codes,
+        unexpected_codes,
+        source_backed_zero_zero_spans: compiler.source_backed_zero_zero_spans,
+        source_backed_inexact_spans: compiler.source_backed_inexact_spans,
+        deterministic_cases: compiler.deterministic_cases
+            + binary.deterministic_cases
+            + runtime.deterministic_cases,
+        case_format: CaseFormatReport {
+            version: 1,
+            invalid_pipelines,
+        },
+        pipelines: PipelineReport {
+            compiler: CompilerPipelineReport {
+                cases: compiler.case_count,
+                direct_error_construction: false,
+            },
+            bytecode_verifier: CountPipelineReport {
+                cases: binary.case_count,
+                passed: binary.passed,
+            },
+            runtime_family: RuntimePipelineReport {
+                cases: runtime.case_count,
+                passed: runtime.passed,
+                direct_nexa_error_construction: runtime.direct_nexa_error_construction,
+            },
+        },
+        cases,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_runtime_case(
+    case: &DiagnosticCase,
+    case_path: &Path,
+) -> Result<ObservedDiagnosticCase, String> {
+    use std::collections::BTreeMap;
+
+    use nexa_bytecode::{HostCallMode, HostImport, MigrationLimitRequirements, ModuleBuilder};
+    use nexa_core::StableId;
+    use nexa_runtime::{
+        HostCompletionResult, HostErrorPayload, HostTrap, MigrationLimits, RealmConfig,
+        RealmRuntime, RuntimeHostArgs, RuntimeMessage, StateObject, StateValue, StatefulDomainId,
+        StatefulRegistry, invoke_host_boundary, invoke_reload_activation, validate_host_completion,
+        validate_reload_completion_capacity,
+    };
+
+    let input = case_path
+        .parent()
+        .expect("case path has a parent")
+        .join(&case.input);
+    let fixture: RuntimeFixture = serde_json::from_slice(
+        &std::fs::read(&input).map_err(|error| format!("{}: {error}", input.display()))?,
+    )
+    .map_err(|error| format!("{}: {error}", input.display()))?;
+    if fixture.version != 1 {
+        return Err(format!(
+            "{} has unsupported runtime version",
+            input.display()
+        ));
+    }
+    let host_hash = StableId::from_name("diagnostic-host");
+    let schema_hash = StableId::from_name("diagnostic-schema");
+    let verified = |requires_host: bool| {
+        let mut builder = ModuleBuilder::new();
+        builder.metadata(host_hash, schema_hash);
+        if requires_host {
+            builder.host_import(HostImport {
+                stable_id: StableId::from_name("diagnostic.call"),
+                parameters: Vec::new(),
+                result: None,
+                mode: HostCallMode::Immediate,
+                fuel_cost: 1,
+                async_result: None,
+            });
+        }
+        nexa_verifier::verify(builder.finish(), nexa_verifier::VerifierLimits::default())
+            .expect("diagnostic module is valid")
+    };
+    let error: NexaError = match fixture.scenario.as_str() {
+        "host_hash_mismatch" => {
+            let mut realm = RealmRuntime::isolated(RealmConfig::default());
+            realm
+                .load_module(
+                    verified(false),
+                    StableId::from_name("different-host"),
+                    schema_hash,
+                )
+                .expect_err("host hash mismatch must fail")
+                .into()
+        }
+        "host_capabilities_unavailable" => {
+            let mut realm = RealmRuntime::isolated(RealmConfig::default());
+            realm
+                .load_module(verified(true), host_hash, schema_hash)
+                .expect_err("isolated realm must reject host capabilities")
+                .into()
+        }
+        "host_argument_arity" => {
+            let values = [nexa_runtime::RuntimeValue::I32(0); 9];
+            RuntimeHostArgs::new(&values, None)
+                .expect_err("nine host arguments exceed the ABI")
+                .into()
+        }
+        "host_result_mismatch" => invoke_host_boundary(|| -> Result<(), HostTrap> {
+            Err(HostTrap::Host(RuntimeMessage::Static(
+                "diagnostic host result mismatch",
+            )))
+        })
+        .expect_err("host result mismatch must be contained")
+        .into(),
+        "host_abandoned_completion" => {
+            validate_host_completion(&HostCompletionResult::Abandoned, &[])
+                .expect_err("abandoned completion must be classified")
+                .into()
+        }
+        "unknown_host_error_code" => validate_host_completion(
+            &HostCompletionResult::Error(HostErrorPayload { code: 77 }),
+            &[1, 2, 3],
+        )
+        .expect_err("unknown host error code must be rejected")
+        .into(),
+        "module_capacity" => {
+            let mut config = RealmConfig::default();
+            config.max_modules = 0;
+            let mut realm = RealmRuntime::isolated(config);
+            realm
+                .load_module(verified(false), host_hash, schema_hash)
+                .expect_err("zero module capacity must fail")
+                .into()
+        }
+        "migration_object_limit" => {
+            let mut limits = MigrationLimits::default();
+            limits.max_objects = 0;
+            limits
+                .validate_requirements(MigrationLimitRequirements {
+                    max_objects: 1,
+                    ..MigrationLimitRequirements::default()
+                })
+                .expect_err("migration object requirement must fail")
+                .into()
+        }
+        "nested_state_object" => {
+            let mut registry = StatefulRegistry::new(StatefulDomainId::new(1));
+            registry
+                .insert(
+                    StableId::from_name("root"),
+                    StateValue::Object(StateObject {
+                        type_id: StableId::from_name("Nested"),
+                        version: 1,
+                        fields: BTreeMap::from([(
+                            StableId::from_name("child"),
+                            StateValue::Object(StateObject {
+                                type_id: StableId::from_name("Child"),
+                                version: 1,
+                                fields: BTreeMap::new(),
+                            }),
+                        )]),
+                    }),
+                )
+                .expect_err("nested state object must fail graph validation")
+                .into()
+        }
+        "activation_failure" => invoke_reload_activation(|| {
+            Err(RuntimeMessage::Static("diagnostic activation failure"))
+        })
+        .expect_err("activation failure must be classified")
+        .into(),
+        "reload_completion_capacity" => validate_reload_completion_capacity(0, 0)
+            .expect_err("zero reload completion capacity must fail")
+            .into(),
+        scenario => {
+            return Err(format!(
+                "{} has unknown scenario {scenario}",
+                input.display()
+            ));
+        }
+    };
+    let summary = error
+        .code()
+        .definition()
+        .ok_or_else(|| format!("{} emitted an unregistered code", input.display()))?
+        .summary;
+    let human = error.to_string();
+    let passed = error.code().as_str() == case.code
+        && error.category().as_str() == case.category
+        && normalized(summary).contains(&normalized(&case.expected.message_contains))
+        && human.contains(&case.code);
+    if !passed {
+        return Err(format!(
+            "{} emitted {} {} instead of {} {}",
+            input.display(),
+            error.category().as_str(),
+            error.code(),
+            case.category,
+            case.code
+        ));
+    }
+    Ok(ObservedDiagnosticCase {
+        code: case.code.clone(),
+        observed: error.code().to_string(),
+        pipeline: case.pipeline.clone(),
+        category: error.category().as_str().to_owned(),
+        primary_text: String::new(),
+        primary_start: 0,
+        primary_end: 0,
+        secondary_count: 0,
+        human_output: true,
+        json_output: true,
+        passed,
+    })
+}
+
+fn execute_binary_case(
+    case: &DiagnosticCase,
+    case_path: &Path,
+) -> Result<ObservedDiagnosticCase, String> {
+    let input = case_path
+        .parent()
+        .expect("case path has a parent")
+        .join(&case.input);
+    let encoded =
+        std::fs::read_to_string(&input).map_err(|error| format!("{}: {error}", input.display()))?;
+    if encoded.contains(&case.code) {
+        return Err(format!(
+            "{} embeds its expected diagnostic code",
+            input.display()
+        ));
+    }
+    let bytes = decode_hex(encoded.trim()).map_err(|error| {
+        format!(
+            "{} is not a versioned hex fixture: {error}",
+            input.display()
+        )
+    })?;
+    let error = match case.pipeline.as_str() {
+        "bytecode_decode" => crate::decode_module(&bytes, nexa_bytecode::DecodeLimits::default())
+            .expect_err("decode fixture must fail"),
+        "verifier" => {
+            let module = crate::decode_module(&bytes, nexa_bytecode::DecodeLimits::default())
+                .map_err(|error| {
+                    format!("{} failed before verification: {error}", input.display())
+                })?;
+            crate::verify_module(module, nexa_verifier::VerifierLimits::default())
+                .expect_err("verifier fixture must fail")
+        }
+        _ => {
+            return Err(format!(
+                "{} has an invalid binary pipeline",
+                case_path.display()
+            ));
+        }
+    };
+    let summary = error
+        .code()
+        .definition()
+        .ok_or_else(|| format!("{} emitted an unregistered code", input.display()))?
+        .summary;
+    let human = error.to_string();
+    let passed = error.code().as_str() == case.code
+        && error.category().as_str() == case.category
+        && normalized(summary).contains(&normalized(&case.expected.message_contains))
+        && human.contains(&case.code);
+    if !passed {
+        return Err(format!(
+            "{} emitted {} {} instead of {} {}",
+            input.display(),
+            error.category().as_str(),
+            error.code(),
+            case.category,
+            case.code
+        ));
+    }
+    Ok(ObservedDiagnosticCase {
+        code: case.code.clone(),
+        observed: error.code().to_string(),
+        pipeline: case.pipeline.clone(),
+        category: error.category().as_str().to_owned(),
+        primary_text: String::new(),
+        primary_start: 0,
+        primary_end: 0,
+        secondary_count: 0,
+        human_output: true,
+        json_output: true,
+        passed,
+    })
+}
+
+fn normalized(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn decode_hex(encoded: &str) -> Result<Vec<u8>, &'static str> {
+    if !encoded.len().is_multiple_of(2) {
+        return Err("odd byte count");
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0]).ok_or("invalid high nibble")?;
+            let low = hex_nibble(pair[1]).ok_or("invalid low nibble")?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+const fn hex_nibble(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn validate_case_shape(case: &DiagnosticCase, path: &Path) -> Result<(), String> {

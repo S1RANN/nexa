@@ -109,7 +109,7 @@ struct ForwardingSlot {
 }
 
 #[derive(Debug)]
-pub(crate) struct StatefulRegistry {
+pub struct StatefulRegistry {
     domain: StatefulDomainId,
     objects: Vec<MigrationObjectSlot>,
     fields: Vec<MigrationFieldSlot>,
@@ -282,6 +282,30 @@ impl MigrationLimits {
                 .saturating_add(
                     forwarding_capacity.saturating_mul(std::mem::size_of::<ForwardingSlot>()),
                 ),
+        }
+    }
+
+    pub fn validate_requirements(
+        self,
+        required: nexa_bytecode::MigrationLimitRequirements,
+    ) -> Result<(), MigrationLimitError> {
+        if self.max_objects < required.max_objects {
+            Err(MigrationLimitError::Objects)
+        } else if self.max_fields < required.max_fields {
+            Err(MigrationLimitError::Fields)
+        } else if self.max_forwarding_entries < required.max_forwarding_entries {
+            Err(MigrationLimitError::Forwarding)
+        } else if u64::try_from(self.max_state_bytes).unwrap_or(u64::MAX) < required.max_state_bytes
+        {
+            Err(MigrationLimitError::StateBytes)
+        } else if self.max_gc_roots < required.max_gc_roots {
+            Err(MigrationLimitError::GcRoots)
+        } else if self.max_fuel < required.max_fuel {
+            Err(MigrationLimitError::Fuel)
+        } else if self.max_call_depth < required.max_call_depth {
+            Err(MigrationLimitError::CallDepth)
+        } else {
+            Ok(())
         }
     }
 }

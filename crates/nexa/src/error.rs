@@ -4,8 +4,8 @@ use nexa_bytecode::DecodeError;
 use nexa_compiler::CompileError;
 use nexa_core::{FileId, ModuleId, RawHandle, SourceSpan};
 use nexa_runtime::{
-    HostRequestError, HostTrap, MigrationLimitError, RealmError, ReloadError, RuntimeError,
-    RuntimeHostCloseError, RuntimeMessage, StatefulError,
+    HostCompletionProtocolError, HostRequestError, HostTrap, MigrationLimitError, RealmError,
+    ReloadError, RuntimeError, RuntimeHostCloseError, RuntimeMessage, StatefulError,
 };
 use nexa_verifier::{VerifyError, VerifyErrorKind};
 use serde::Serialize;
@@ -588,8 +588,7 @@ pub enum HostError {
     Request(HostRequestError),
     Lifecycle(RuntimeHostCloseError),
     Realm(RealmError),
-    Abandoned,
-    UnknownHostErrorCode(u32),
+    Protocol(HostCompletionProtocolError),
 }
 
 impl fmt::Display for HostError {
@@ -614,8 +613,10 @@ impl ClassifiedError for HostError {
                 Self::Request(error) => host_request_code(error),
                 Self::Lifecycle(_) => ErrorCode::NX5004,
                 Self::Realm(error) => realm_error_code(error),
-                Self::Abandoned => ErrorCode::NX5002,
-                Self::UnknownHostErrorCode(_) => ErrorCode::NX5003,
+                Self::Protocol(HostCompletionProtocolError::Abandoned) => ErrorCode::NX5002,
+                Self::Protocol(HostCompletionProtocolError::UnknownErrorCode(_)) => {
+                    ErrorCode::NX5003
+                }
             },
             category: ErrorCategory::Host,
             context: ErrorContext::default(),
@@ -770,6 +771,12 @@ impl From<HostRequestError> for NexaError {
 impl From<RuntimeHostCloseError> for NexaError {
     fn from(error: RuntimeHostCloseError) -> Self {
         Self::Host(HostError::Lifecycle(error))
+    }
+}
+
+impl From<HostCompletionProtocolError> for NexaError {
+    fn from(error: HostCompletionProtocolError) -> Self {
+        Self::Host(HostError::Protocol(error))
     }
 }
 

@@ -2091,6 +2091,39 @@ pub enum HostCompletionResult {
     Abandoned,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostCompletionProtocolError {
+    Abandoned,
+    UnknownErrorCode(u32),
+}
+
+impl fmt::Display for HostCompletionProtocolError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for HostCompletionProtocolError {}
+
+pub fn validate_host_completion(
+    completion: &HostCompletionResult,
+    known_error_codes: &[u32],
+) -> Result<(), HostCompletionProtocolError> {
+    match completion {
+        HostCompletionResult::Error(error) if !known_error_codes.contains(&error.code) => {
+            Err(HostCompletionProtocolError::UnknownErrorCode(error.code))
+        }
+        HostCompletionResult::Abandoned => Err(HostCompletionProtocolError::Abandoned),
+        HostCompletionResult::Success(_)
+        | HostCompletionResult::Error(_)
+        | HostCompletionResult::Cancelled => Ok(()),
+    }
+}
+
+pub fn invoke_host_boundary<T>(call: impl FnOnce() -> Result<T, HostTrap>) -> Result<T, HostTrap> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).map_err(|_| HostTrap::Panicked)?
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCompletionDelivery {
     pub realm_id: u32,

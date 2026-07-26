@@ -1,2 +1,1 @@
-expected=NX4003
-host argument mismatch
+{"version":1,"scenario":"host_argument_arity"}

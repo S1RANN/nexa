@@ -52,16 +52,16 @@ pub use heap::{
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
     HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome, HostCollectionBuilder,
-    HostCompletionDelivery, HostCompletionResult, HostCompletionTicket, HostEnumRef,
-    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
+    HostCompletionDelivery, HostCompletionProtocolError, HostCompletionResult,
+    HostCompletionTicket, HostEnumRef, HostErrorPayload, HostOptionRef, HostPayload, HostRegistry,
+    HostRequestError, HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
     HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValue, HostValueRef,
     MAX_HOST_RETURN_FIELDS, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
     ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
     ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
     RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
     RuntimeResources, ScriptFunction, SnapshotHandle, SnapshotLayout, TaskResourceSet,
-    TypedSnapshotRef,
+    TypedSnapshotRef, invoke_host_boundary, validate_host_completion,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};
@@ -84,14 +84,14 @@ pub use realm::{
     ReloadInspectionState, RootInspection, SchedulerInspection, TaskExecutionInspection,
     TaskInspection,
 };
-pub use reload::ReloadError;
+pub use reload::{ReloadError, invoke_reload_activation, validate_reload_completion_capacity};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use stateful::{
     MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
     OfflineMigrationError, OfflineMigrationResult, OfflineStateField, OfflineStateObject,
     OfflineStateValue, StateHandle, StateHandleError, StateObject, StateValue, StatefulDomainId,
-    StatefulError, run_offline_migration,
+    StatefulError, StatefulRegistry, run_offline_migration,
 };
 #[cfg(feature = "fuzzing")]
 pub use stateful::{fuzz_migration_arena, fuzz_stateful_registry};

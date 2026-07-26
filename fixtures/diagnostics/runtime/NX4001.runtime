@@ -1,2 +1,1 @@
-expected=NX4001
-host interface mismatch
+{"version":1,"scenario":"host_hash_mismatch"}

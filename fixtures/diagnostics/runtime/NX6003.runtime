@@ -1,2 +1,1 @@
-expected=NX6003
-activation failure
+{"version":1,"scenario":"activation_failure"}
