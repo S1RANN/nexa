@@ -1,2 +1,0 @@
-// expected: NX2501
-struct Record { value: i32; } fn main(record: Record) -> i32 { return record.missing; }

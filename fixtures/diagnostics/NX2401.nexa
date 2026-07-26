@@ -1,2 +1,0 @@
-// expected: NX2401
-fn main() -> f32 { let value: i64 = 1; return value; }

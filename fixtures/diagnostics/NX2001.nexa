@@ -1,2 +1,0 @@
-// expected: NX2001
-fn main() -> i32 { return missing; }

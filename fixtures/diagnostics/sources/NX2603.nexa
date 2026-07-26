@@ -1,0 +1,1 @@
+migration fn migrate() -> bool { old.get<i32>(legacy); finish_migration(); return true; }

@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2501","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2501.nexa","expected":{"primary_text":"record.missing","secondary_count":0,"message_contains":"invalid field","notes":[]}}

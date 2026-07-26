@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2001","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2001.nexa","expected":{"primary_text":"missing","secondary_count":0,"message_contains":"unknown name","notes":[]}}

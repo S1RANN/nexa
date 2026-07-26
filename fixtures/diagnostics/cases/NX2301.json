@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2301","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2301.nexa","expected":{"primary_text":"await","secondary_count":0,"message_contains":"await outside Task","notes":[]}}

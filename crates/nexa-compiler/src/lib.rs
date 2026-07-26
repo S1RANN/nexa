@@ -187,94 +187,73 @@ pub enum CompileError {
 }
 
 impl CompileError {
-    fn fallback_span() -> SourceSpan {
-        SourceSpan::new(FileId(0), 0, 1)
+    fn unexpected_end(span: SourceSpan) -> Self {
+        Self::UnexpectedEnd { span }
     }
 
-    fn unexpected_end() -> Self {
-        Self::UnexpectedEnd {
-            span: Self::fallback_span(),
-        }
-    }
-
-    fn duplicate_name(name: String) -> Self {
-        let span = Self::fallback_span();
+    fn duplicate_name(name: String, first: SourceSpan, duplicate: SourceSpan) -> Self {
         Self::DuplicateName {
             name,
-            first: span,
-            duplicate: span,
+            first,
+            duplicate,
         }
     }
 
-    fn unknown_name(name: String) -> Self {
-        Self::UnknownName {
-            name,
-            span: Self::fallback_span(),
-        }
+    fn unknown_name(name: String, span: SourceSpan) -> Self {
+        Self::UnknownName { name, span }
     }
 
-    fn unknown_type(name: String) -> Self {
-        Self::UnknownType {
-            name,
-            span: Self::fallback_span(),
-        }
+    fn unknown_type(name: String, span: SourceSpan) -> Self {
+        Self::UnknownType { name, span }
     }
 
-    fn type_mismatch() -> Self {
+    fn type_mismatch(
+        expected: Option<ValueType>,
+        actual: Option<ValueType>,
+        span: SourceSpan,
+    ) -> Self {
         Self::TypeMismatch {
-            expected: None,
-            actual: None,
-            span: Self::fallback_span(),
+            expected,
+            actual,
+            span,
         }
     }
 
-    fn cannot_infer_type() -> Self {
-        Self::CannotInferType {
-            span: Self::fallback_span(),
-        }
+    fn cannot_infer_type(span: SourceSpan) -> Self {
+        Self::CannotInferType { span }
     }
 
-    fn missing_return() -> Self {
-        Self::MissingReturn {
-            function_span: Self::fallback_span(),
-        }
+    fn missing_return(function_span: SourceSpan) -> Self {
+        Self::MissingReturn { function_span }
     }
 
-    fn suspending_defer() -> Self {
-        Self::SuspendingDefer {
-            span: Self::fallback_span(),
-        }
+    fn suspending_defer(span: SourceSpan) -> Self {
+        Self::SuspendingDefer { span }
     }
 
-    fn defer_capture_limit() -> Self {
-        Self::DeferCaptureLimit {
-            span: Self::fallback_span(),
-        }
+    fn defer_capture_limit(span: SourceSpan) -> Self {
+        Self::DeferCaptureLimit { span }
     }
 
-    fn invalid_effect() -> Self {
-        Self::InvalidEffect {
-            span: Self::fallback_span(),
-        }
+    fn invalid_effect(span: SourceSpan) -> Self {
+        Self::InvalidEffect { span }
     }
 
-    fn invalid_reload_metadata(message: &'static str) -> Self {
+    fn invalid_reload_metadata(message: &'static str, function_span: SourceSpan) -> Self {
         Self::InvalidReloadMetadata {
             message,
-            function_span: Self::fallback_span(),
+            function_span,
         }
     }
 
-    fn too_many_registers() -> Self {
-        Self::TooManyRegisters {
-            function_span: Self::fallback_span(),
-        }
+    fn too_many_registers(function_span: SourceSpan) -> Self {
+        Self::TooManyRegisters { function_span }
     }
 
-    fn verify(message: String) -> Self {
+    fn verify(message: String, function_span: SourceSpan) -> Self {
         Self::Verify {
             message,
-            function_span: Self::fallback_span(),
+            function_span,
         }
     }
 
@@ -341,12 +320,14 @@ pub struct AstModule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstImport {
     pub name: String,
+    pub name_span: SourceSpan,
     pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstTypeDeclaration {
     pub name: String,
+    pub name_span: SourceSpan,
     pub kind: AstTypeKind,
     pub version: u32,
     pub fields: Vec<AstField>,
@@ -357,6 +338,7 @@ pub struct AstTypeDeclaration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstField {
     pub name: String,
+    pub name_span: SourceSpan,
     pub ty: AstType,
     pub span: SourceSpan,
 }
@@ -364,6 +346,7 @@ pub struct AstField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstVariant {
     pub name: String,
+    pub name_span: SourceSpan,
     pub payload: Option<AstType>,
     pub span: SourceSpan,
 }
@@ -379,18 +362,21 @@ pub enum AstTypeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstFunction {
     pub name: String,
+    pub name_span: SourceSpan,
     pub is_task: bool,
     pub is_activation: bool,
     pub effect: FunctionEffect,
     pub parameters: Vec<AstParameter>,
     pub result: AstReturnType,
     pub body: Vec<AstStatement>,
+    pub body_span: SourceSpan,
     pub span: SourceSpan,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstParameter {
     pub name: String,
+    pub name_span: SourceSpan,
     pub ty: AstType,
     pub span: SourceSpan,
 }
@@ -428,7 +414,7 @@ impl AstType {
     pub const fn span(&self) -> SourceSpan {
         match self {
             Self::Spanned { span, .. } => *span,
-            _ => SourceSpan::new(FileId(0), 0, 0),
+            _ => panic!("AstType must carry its source span"),
         }
     }
 }
@@ -437,6 +423,7 @@ impl AstType {
 pub enum AstStatement {
     Bind {
         name: String,
+        name_span: SourceSpan,
         ty: Option<AstType>,
         value: AstExpression,
     },
@@ -484,7 +471,7 @@ impl AstStatement {
     pub const fn span(&self) -> SourceSpan {
         match self {
             Self::Spanned { span, .. } => *span,
-            _ => SourceSpan::new(FileId(0), 0, 0),
+            _ => panic!("AstStatement must carry its source span"),
         }
     }
 }
@@ -506,7 +493,10 @@ pub enum AstExpression {
         function: String,
         arguments: Vec<Self>,
     },
-    Await(Box<Self>),
+    Await {
+        expression: Box<Self>,
+        await_span: SourceSpan,
+    },
     Constructor {
         type_name: Option<String>,
         variant: String,
@@ -539,7 +529,10 @@ pub enum AstExpression {
         value: Box<Self>,
         arms: Vec<MatchArm>,
     },
-    Try(Box<Self>),
+    Try {
+        expression: Box<Self>,
+        question_span: SourceSpan,
+    },
     Migration(MigrationIntrinsic),
     Spanned {
         expression: Box<Self>,
@@ -567,7 +560,7 @@ impl AstExpression {
     pub const fn span(&self) -> SourceSpan {
         match self {
             Self::Spanned { span, .. } => *span,
-            _ => SourceSpan::new(FileId(0), 0, 0),
+            _ => panic!("AstExpression must carry its source span"),
         }
     }
 }
@@ -646,7 +639,7 @@ impl MigrationIntrinsic {
     pub const fn span(&self) -> SourceSpan {
         match self {
             Self::Spanned { span, .. } => *span,
-            _ => SourceSpan::new(FileId(0), 0, 0),
+            _ => panic!("MigrationIntrinsic must carry its source span"),
         }
     }
 }
@@ -862,6 +855,8 @@ struct RegisterPlan {
 
 #[allow(clippy::too_many_lines)]
 pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
+    let end = u32::try_from(source.len()).unwrap_or(u32::MAX);
+    let eof_span = SourceSpan::new(FileId(0), end, end);
     let mut tokens = Vec::new();
     let mut chars = source.char_indices().peekable();
     while let Some((offset, character)) = chars.next() {
@@ -911,14 +906,14 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 let mut value = String::new();
                 loop {
                     let (value_offset, character) =
-                        chars.next().ok_or(CompileError::unexpected_end())?;
+                        chars.next().ok_or(CompileError::unexpected_end(eof_span))?;
                     if character == '"' {
                         end = value_offset + 1;
                         break;
                     }
                     if character == '\\' {
                         let (escape_offset, escape) =
-                            chars.next().ok_or(CompileError::unexpected_end())?;
+                            chars.next().ok_or(CompileError::unexpected_end(eof_span))?;
                         value.push(match escape {
                             'n' => '\n',
                             'r' => '\r',
@@ -939,10 +934,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 TokenKind::String(value)
             }
             '\'' => {
-                let (_, value) = chars.next().ok_or(CompileError::unexpected_end())?;
+                let (_, value) = chars.next().ok_or(CompileError::unexpected_end(eof_span))?;
                 let value = if value == '\\' {
                     let (escape_offset, escape) =
-                        chars.next().ok_or(CompileError::unexpected_end())?;
+                        chars.next().ok_or(CompileError::unexpected_end(eof_span))?;
                     match escape {
                         'n' => '\n',
                         'r' => '\r',
@@ -959,7 +954,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 } else {
                     value
                 };
-                let (close_offset, close) = chars.next().ok_or(CompileError::unexpected_end())?;
+                let (close_offset, close) =
+                    chars.next().ok_or(CompileError::unexpected_end(eof_span))?;
                 if close != '\'' {
                     return Err(CompileError::UnexpectedToken {
                         offset: close_offset,
@@ -1103,10 +1099,13 @@ impl Parser<'_> {
         while self.at(&TokenKind::Import) {
             let import_start = self.current_start();
             self.cursor += 1;
+            let name_start = self.current_start();
             let name = self.qualified_ident()?;
+            let name_span = self.span_from(name_start);
             self.expect(&TokenKind::Semicolon, ";")?;
             imports.push(AstImport {
                 name,
+                name_span,
                 span: self.span_from(import_start),
             });
         }
@@ -1176,13 +1175,16 @@ impl Parser<'_> {
         } else {
             return Err(self.unexpected("type declaration"));
         };
+        let name_start = self.current_start();
         let name = self.ident()?;
+        let name_span = self.span_from(name_start);
         self.expect(&TokenKind::LBrace, "{")?;
         let mut fields = Vec::new();
         let mut variants = Vec::new();
         while !self.take(&TokenKind::RBrace) {
             let member_start = self.current_start();
             let member = self.ident()?;
+            let member_name_span = self.span_from(member_start);
             if kind == AstTypeKind::Enum {
                 let payload = if self.take(&TokenKind::LParen) {
                     let payload = self.ty()?;
@@ -1193,6 +1195,7 @@ impl Parser<'_> {
                 };
                 variants.push(AstVariant {
                     name: member,
+                    name_span: member_name_span,
                     payload,
                     span: self.span_from(member_start),
                 });
@@ -1203,6 +1206,7 @@ impl Parser<'_> {
                 self.expect(&TokenKind::Semicolon, ";")?;
                 fields.push(AstField {
                     name: member,
+                    name_span: member_name_span,
                     ty,
                     span: self.span_from(member_start),
                 });
@@ -1210,6 +1214,7 @@ impl Parser<'_> {
         }
         Ok(AstTypeDeclaration {
             name,
+            name_span,
             kind,
             version,
             fields,
@@ -1242,16 +1247,20 @@ impl Parser<'_> {
         }
         let is_task = effect == FunctionEffect::Task;
         self.expect(&TokenKind::Fn, "fn")?;
+        let name_start = self.current_start();
         let name = self.ident()?;
+        let name_span = self.span_from(name_start);
         self.expect(&TokenKind::LParen, "(")?;
         let mut parameters = Vec::new();
         if !self.at(&TokenKind::RParen) {
             loop {
                 let parameter_start = self.current_start();
                 let parameter = self.ident()?;
+                let parameter_name_span = self.span_from(parameter_start);
                 self.expect(&TokenKind::Colon, ":")?;
                 parameters.push(AstParameter {
                     name: parameter,
+                    name_span: parameter_name_span,
                     ty: self.ty()?,
                     span: self.span_from(parameter_start),
                 });
@@ -1267,15 +1276,19 @@ impl Parser<'_> {
             ty: self.ty()?,
             span: self.span_from(result_start),
         };
+        let body_start = self.current_start();
         let body = self.block()?;
+        let body_span = self.span_from(body_start);
         Ok(AstFunction {
             name,
+            name_span,
             is_task,
             is_activation,
             effect,
             parameters,
             result,
             body,
+            body_span,
             span: self.span_from(start),
         })
     }
@@ -1289,7 +1302,9 @@ impl Parser<'_> {
             return Ok(self.spanned_statement(start, AstStatement::Return(expression)));
         }
         if self.take(&TokenKind::Let) || self.take(&TokenKind::Var) {
+            let name_start = self.current_start();
             let name = self.ident()?;
+            let name_span = self.span_from(name_start);
             let ty = if self.take(&TokenKind::Colon) {
                 Some(self.ty()?)
             } else {
@@ -1298,7 +1313,15 @@ impl Parser<'_> {
             self.expect(&TokenKind::Equal, "=")?;
             let value = self.expression(0)?;
             self.expect(&TokenKind::Semicolon, ";")?;
-            return Ok(self.spanned_statement(start, AstStatement::Bind { name, ty, value }));
+            return Ok(self.spanned_statement(
+                start,
+                AstStatement::Bind {
+                    name,
+                    name_span,
+                    ty,
+                    value,
+                },
+            ));
         }
         if self.take(&TokenKind::If) {
             let condition = self.expression(0)?;
@@ -1328,7 +1351,7 @@ impl Parser<'_> {
                 return Err(self.unexpected("static range end"));
             };
             if range_end < range_start || range_end.saturating_sub(range_start) > 1_024 {
-                return Err(CompileError::invalid_effect());
+                return Err(CompileError::invalid_effect(self.span_from(start)));
             }
             let body = self.block()?;
             let mut expanded = Vec::new();
@@ -1389,8 +1412,12 @@ impl Parser<'_> {
     #[allow(clippy::too_many_lines)]
     fn expression(&mut self, minimum_precedence: u8) -> Result<AstExpression, CompileError> {
         let start = self.current_start();
+        let prefix_span = self.current_token_span();
         let mut lhs = match self.next_kind()? {
-            TokenKind::Await => AstExpression::Await(Box::new(self.expression(3)?)),
+            TokenKind::Await => AstExpression::Await {
+                expression: Box::new(self.expression(3)?),
+                await_span: prefix_span,
+            },
             TokenKind::Match => self.match_expression()?,
             TokenKind::New => {
                 if self.take(&TokenKind::Dot) {
@@ -1464,12 +1491,13 @@ impl Parser<'_> {
                         fields: self.struct_field_values()?,
                     }
                 } else if name == "Array.new" {
-                    let element_type = exactly_one_type(type_arguments)?;
+                    let element_type = exactly_one_type(type_arguments, self.span_from(start))?;
                     self.expect(&TokenKind::LParen, "(")?;
                     self.expect(&TokenKind::RParen, ")")?;
                     AstExpression::ArrayNew { element_type }
                 } else if name == "Map.new" {
-                    let [key_type, value_type] = exactly_two_types(type_arguments)?;
+                    let [key_type, value_type] =
+                        exactly_two_types(type_arguments, self.span_from(start))?;
                     self.expect(&TokenKind::LParen, "(")?;
                     self.expect(&TokenKind::RParen, ")")?;
                     AstExpression::MapNew {
@@ -1572,8 +1600,12 @@ impl Parser<'_> {
             }
             if self.at(&TokenKind::Question) {
                 let inner_end = self.previous_end();
+                let question_span = self.current_token_span();
                 self.cursor += 1;
-                lhs = AstExpression::Try(Box::new(self.spanned_expression(start, inner_end, lhs)));
+                lhs = AstExpression::Try {
+                    expression: Box::new(self.spanned_expression(start, inner_end, lhs)),
+                    question_span,
+                };
                 continue;
             }
             let (precedence, op) = match self.peek_kind() {
@@ -1666,31 +1698,37 @@ impl Parser<'_> {
         self.expect(&TokenKind::LParen, "(")?;
         let intrinsic = match name {
             "old.get" => MigrationIntrinsic::OldGet {
-                ty: exactly_one_type(type_arguments)?,
+                ty: exactly_one_type(type_arguments, self.span_from(start))?,
                 stable_id: self.ident()?,
             },
             "old.field" => {
                 let object = self.expression(0)?;
                 self.expect(&TokenKind::Comma, ",")?;
-                let (owner, field) = split_field_name(&self.qualified_ident()?)?;
+                let (owner, field) =
+                    split_field_name(&self.qualified_ident()?, self.span_from(start))?;
                 MigrationIntrinsic::OldFieldGet {
                     object: Box::new(object),
                     owner,
                     field,
-                    ty: exactly_one_type(type_arguments)?,
+                    ty: exactly_one_type(type_arguments, self.span_from(start))?,
                 }
             }
             "new.create" => MigrationIntrinsic::NewCreate {
-                ty: exactly_one_type(type_arguments)?,
+                ty: exactly_one_type(type_arguments, self.span_from(start))?,
                 stable_id: self.ident()?,
             },
             "new.set" => {
                 if !type_arguments.is_empty() {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(
+                        None,
+                        None,
+                        self.span_from(start),
+                    ));
                 }
                 let object = self.expression(0)?;
                 self.expect(&TokenKind::Comma, ",")?;
-                let (owner, field) = split_field_name(&self.qualified_ident()?)?;
+                let (owner, field) =
+                    split_field_name(&self.qualified_ident()?, self.span_from(start))?;
                 self.expect(&TokenKind::Comma, ",")?;
                 let value = self.expression(0)?;
                 MigrationIntrinsic::NewSet {
@@ -1716,7 +1754,11 @@ impl Parser<'_> {
             },
             "finish_migration" => {
                 if !type_arguments.is_empty() {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(
+                        None,
+                        None,
+                        self.span_from(start),
+                    ));
                 }
                 MigrationIntrinsic::Finish
             }
@@ -1792,7 +1834,7 @@ impl Parser<'_> {
         let token = self
             .tokens
             .get(self.cursor)
-            .ok_or(CompileError::unexpected_end())?;
+            .ok_or_else(|| CompileError::unexpected_end(self.current_token_span()))?;
         self.cursor += 1;
         Ok(token.kind.clone())
     }
@@ -1823,14 +1865,13 @@ impl Parser<'_> {
     }
 
     fn unexpected(&self, expected: &'static str) -> CompileError {
-        self.tokens
-            .get(self.cursor)
-            .map_or(CompileError::unexpected_end(), |token| {
-                CompileError::UnexpectedToken {
-                    offset: token.offset,
-                    expected,
-                }
-            })
+        self.tokens.get(self.cursor).map_or_else(
+            || CompileError::unexpected_end(self.current_token_span()),
+            |token| CompileError::UnexpectedToken {
+                offset: token.offset,
+                expected,
+            },
+        )
     }
 
     fn current_start(&self) -> usize {
@@ -1905,23 +1946,29 @@ fn is_migration_intrinsic(name: &str) -> bool {
     )
 }
 
-fn exactly_one_type(mut arguments: Vec<AstType>) -> Result<AstType, CompileError> {
+fn exactly_one_type(
+    mut arguments: Vec<AstType>,
+    span: SourceSpan,
+) -> Result<AstType, CompileError> {
     if arguments.len() != 1 {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, span));
     }
     Ok(arguments.pop().expect("length was checked"))
 }
 
-fn exactly_two_types(arguments: Vec<AstType>) -> Result<[AstType; 2], CompileError> {
+fn exactly_two_types(
+    arguments: Vec<AstType>,
+    span: SourceSpan,
+) -> Result<[AstType; 2], CompileError> {
     arguments
         .try_into()
-        .map_err(|_| CompileError::type_mismatch())
+        .map_err(|_| CompileError::type_mismatch(None, None, span))
 }
 
-fn split_field_name(name: &str) -> Result<(String, String), CompileError> {
+fn split_field_name(name: &str, span: SourceSpan) -> Result<(String, String), CompileError> {
     name.rsplit_once('.')
         .map(|(owner, field)| (owner.to_owned(), field.to_owned()))
-        .ok_or(CompileError::type_mismatch())
+        .ok_or(CompileError::type_mismatch(None, None, span))
 }
 
 fn migration_expressions(intrinsic: &MigrationIntrinsic) -> Vec<&AstExpression> {
@@ -2003,7 +2050,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
                 substitute_name(argument, name, value);
             }
         }
-        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+        AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
             substitute_name(expression, name, value);
         }
         AstExpression::Constructor { payload, .. } => {
@@ -2228,7 +2275,7 @@ fn collect_collection_types(ast: &AstModule) -> (Vec<ArrayType>, Vec<MapType>) {
                     collect_expression(argument, arrays, maps);
                 }
             }
-            AstExpression::Await(expression) | AstExpression::Try(expression) => {
+            AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
                 collect_expression(expression, arrays, maps);
             }
             AstExpression::Constructor { payload, .. } => {
@@ -2458,8 +2505,15 @@ fn resolve_and_typecheck_with_hosts(
         .count()
         > 1
     {
+        let span = ast
+            .functions
+            .iter()
+            .filter(|function| function.effect == FunctionEffect::Migration)
+            .nth(1)
+            .map_or(ast.span, |function| function.span);
         return Err(CompileError::invalid_reload_metadata(
             "multiple migration entries",
+            span,
         ));
     }
     let activation_count = ast
@@ -2468,8 +2522,15 @@ fn resolve_and_typecheck_with_hosts(
         .filter(|function| function.is_activation)
         .count();
     if activation_count > 1 {
+        let span = ast
+            .functions
+            .iter()
+            .filter(|function| function.is_activation)
+            .nth(1)
+            .map_or(ast.span, |function| function.span);
         return Err(CompileError::invalid_reload_metadata(
             "multiple activation entries",
+            span,
         ));
     }
     if ast
@@ -2477,8 +2538,14 @@ fn resolve_and_typecheck_with_hosts(
         .iter()
         .any(|function| function.is_activation && function.effect != FunctionEffect::Immediate)
     {
+        let span = ast
+            .functions
+            .iter()
+            .find(|function| function.is_activation && function.effect != FunctionEffect::Immediate)
+            .map_or(ast.span, |function| function.span);
         return Err(CompileError::invalid_reload_metadata(
             "activation entry must have Immediate effect",
+            span,
         ));
     }
     let mut enum_types = ast
@@ -2530,7 +2597,7 @@ fn resolve_and_typecheck_with_hosts(
                 || map_type.key == nexa_bytecode::stable_id_type()
                 || !declared_type_ids.contains(&type_id))
     }) {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, ast.span));
     }
     for map_type in &map_types {
         let option = nexa_bytecode::option_type(map_type.value);
@@ -2691,31 +2758,39 @@ fn resolve_and_typecheck_with_hosts(
     .into_iter()
     .map(str::to_owned)
     .collect::<BTreeSet<_>>();
+    let mut type_spans = BTreeMap::new();
     for declaration in &ast.types {
-        if !known_types.insert(declaration.name.clone()) {
-            return Err(CompileError::duplicate_name(declaration.name.clone()));
+        if let Some(first) = type_spans.insert(declaration.name.clone(), declaration.name_span) {
+            return Err(CompileError::duplicate_name(
+                declaration.name.clone(),
+                first,
+                declaration.name_span,
+            ));
         }
+        known_types.insert(declaration.name.clone());
     }
     for declaration in &ast.types {
         for field in &declaration.fields {
             validate_type(&field.ty, &known_types)?;
         }
-        let mut variants = BTreeSet::new();
-        let mut fields = BTreeSet::new();
+        let mut variants = BTreeMap::new();
+        let mut fields = BTreeMap::new();
         for field in &declaration.fields {
-            if !fields.insert(&field.name) {
-                return Err(CompileError::duplicate_name(format!(
-                    "{}.{}",
-                    declaration.name, field.name
-                )));
+            if let Some(first) = fields.insert(field.name.clone(), field.name_span) {
+                return Err(CompileError::duplicate_name(
+                    format!("{}.{}", declaration.name, field.name),
+                    first,
+                    field.name_span,
+                ));
             }
         }
         for variant in &declaration.variants {
-            if !variants.insert(&variant.name) {
-                return Err(CompileError::duplicate_name(format!(
-                    "{}.{}",
-                    declaration.name, variant.name
-                )));
+            if let Some(first) = variants.insert(variant.name.clone(), variant.name_span) {
+                return Err(CompileError::duplicate_name(
+                    format!("{}.{}", declaration.name, variant.name),
+                    first,
+                    variant.name_span,
+                ));
             }
             if let Some(payload) = &variant.payload {
                 validate_type(payload, &known_types)?;
@@ -2727,6 +2802,11 @@ fn resolve_and_typecheck_with_hosts(
     let mut signatures = host_functions
         .iter()
         .map(|(name, function)| (name.clone(), function.signature.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let host_span = ast.imports.first().map_or(ast.span, |import| import.span);
+    let mut signature_spans = signatures
+        .keys()
+        .map(|name| (name.clone(), host_span))
         .collect::<BTreeMap<_, _>>();
     let mut suspending_functions = host_functions
         .iter()
@@ -2751,16 +2831,19 @@ fn resolve_and_typecheck_with_hosts(
                 .collect(),
             result: Some(lower_type(&function.result.ty)),
         };
-        if signatures
-            .insert(function.name.clone(), signature)
-            .is_some()
-        {
-            return Err(CompileError::duplicate_name(function.name.clone()));
+        if let Some(first) = signature_spans.insert(function.name.clone(), function.name_span) {
+            return Err(CompileError::duplicate_name(
+                function.name.clone(),
+                first,
+                function.name_span,
+            ));
         }
+        signatures.insert(function.name.clone(), signature);
     }
     let mut functions = Vec::new();
     let module_span = ast.span;
     for mut function in ast.functions {
+        validate_migration_contract(&function)?;
         validate_awaits(&function.body, &suspending_functions)?;
         resolve_local_scopes(&mut function)?;
         let signature = signatures[&function.name].clone();
@@ -2771,19 +2854,29 @@ fn resolve_and_typecheck_with_hosts(
             .zip(signature.parameters.iter().copied())
             .enumerate()
         {
-            let register = u16::try_from(index).map_err(|_| CompileError::too_many_registers())?;
+            let register = u16::try_from(index)
+                .map_err(|_| CompileError::too_many_registers(function.span))?;
             if locals
                 .insert(parameter.name.clone(), (register, ty))
                 .is_some()
             {
-                return Err(CompileError::duplicate_name(parameter.name.clone()));
+                let first = function
+                    .parameters
+                    .iter()
+                    .find(|candidate| candidate.name == parameter.name)
+                    .map_or(function.name_span, |candidate| candidate.name_span);
+                return Err(CompileError::duplicate_name(
+                    parameter.name.clone(),
+                    first,
+                    parameter.name_span,
+                ));
             }
         }
         if function.effect != FunctionEffect::Task && statements_contain_await(&function.body) {
-            return Err(CompileError::invalid_effect());
+            return Err(CompileError::invalid_effect(function.span));
         }
         let mut next_register = u16::try_from(function.parameters.len())
-            .map_err(|_| CompileError::too_many_registers())?;
+            .map_err(|_| CompileError::too_many_registers(function.span))?;
         let type_context = TypeContext {
             signatures: &signatures,
             enum_types: &enum_types,
@@ -2807,7 +2900,7 @@ fn resolve_and_typecheck_with_hosts(
             &mut next_register,
         )?;
         if flow == Flow::FallsThrough {
-            return Err(CompileError::missing_return());
+            return Err(CompileError::missing_return(function.span));
         }
         functions.push(HirFunction {
             name: function.name,
@@ -2838,6 +2931,156 @@ fn resolve_and_typecheck_with_hosts(
         snapshot_types,
         span: module_span,
     })
+}
+
+fn validate_migration_contract(function: &AstFunction) -> Result<(), CompileError> {
+    if function.effect != FunctionEffect::Migration {
+        return Ok(());
+    }
+
+    let mut finish_seen = false;
+    let mut required_forwarding = BTreeMap::<StableId, SourceSpan>::new();
+    let mut forwarding = BTreeMap::<StableId, SourceSpan>::new();
+    visit_migration_statements(&function.body, &mut |intrinsic| {
+        match intrinsic.kind() {
+            MigrationIntrinsic::OldGet { stable_id, .. } => {
+                required_forwarding
+                    .entry(StableId::from_name(stable_id))
+                    .or_insert(intrinsic.span());
+            }
+            MigrationIntrinsic::Preserve { stable_id }
+            | MigrationIntrinsic::Replace { stable_id, .. }
+            | MigrationIntrinsic::Delete { stable_id } => {
+                let stable_id = StableId::from_name(stable_id);
+                if forwarding.insert(stable_id, intrinsic.span()).is_some() {
+                    return Err(CompileError::DuplicateForwarding {
+                        stable_id,
+                        span: intrinsic.span(),
+                    });
+                }
+            }
+            MigrationIntrinsic::Finish => finish_seen = true,
+            MigrationIntrinsic::OldFieldGet { .. }
+            | MigrationIntrinsic::NewCreate { .. }
+            | MigrationIntrinsic::NewSet { .. } => {}
+            MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
+        }
+        Ok(())
+    })?;
+
+    if !finish_seen {
+        return Err(CompileError::MissingMigrationFinish {
+            function_span: function.body_span,
+        });
+    }
+    if let Some(stable_id) = required_forwarding
+        .keys()
+        .find(|stable_id| !forwarding.contains_key(stable_id))
+        .copied()
+    {
+        return Err(CompileError::MissingForwarding {
+            stable_id,
+            function_span: function.body_span,
+        });
+    }
+    Ok(())
+}
+
+fn visit_migration_statements(
+    statements: &[AstStatement],
+    visitor: &mut impl FnMut(&MigrationIntrinsic) -> Result<(), CompileError>,
+) -> Result<(), CompileError> {
+    for statement in statements {
+        match statement.kind() {
+            AstStatement::Bind { value, .. }
+            | AstStatement::Return(value)
+            | AstStatement::Expression(value)
+            | AstStatement::Defer(value) => visit_migration_expression(value, visitor)?,
+            AstStatement::FieldSet {
+                value, replacement, ..
+            } => {
+                visit_migration_expression(value, visitor)?;
+                visit_migration_expression(replacement, visitor)?;
+            }
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                visit_migration_expression(condition, visitor)?;
+                visit_migration_statements(then_body, visitor)?;
+                visit_migration_statements(else_body, visitor)?;
+            }
+            AstStatement::While { condition, body } => {
+                visit_migration_expression(condition, visitor)?;
+                visit_migration_statements(body, visitor)?;
+            }
+            AstStatement::Yield => {}
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
+        }
+    }
+    Ok(())
+}
+
+fn visit_migration_expression(
+    expression: &AstExpression,
+    visitor: &mut impl FnMut(&MigrationIntrinsic) -> Result<(), CompileError>,
+) -> Result<(), CompileError> {
+    match expression.kind() {
+        AstExpression::Migration(intrinsic) => {
+            visitor(intrinsic)?;
+            for nested in migration_expressions(intrinsic) {
+                visit_migration_expression(nested, visitor)?;
+            }
+        }
+        AstExpression::Binary { lhs, rhs, .. } => {
+            visit_migration_expression(lhs, visitor)?;
+            visit_migration_expression(rhs, visitor)?;
+        }
+        AstExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                visit_migration_expression(argument, visitor)?;
+            }
+        }
+        AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
+            visit_migration_expression(expression, visitor)?;
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                visit_migration_expression(payload, visitor)?;
+            }
+        }
+        AstExpression::StructLiteral { fields, .. } | AstExpression::ClassNew { fields, .. } => {
+            for field in fields {
+                visit_migration_expression(&field.value, visitor)?;
+            }
+        }
+        AstExpression::FieldGet { value, .. } => {
+            visit_migration_expression(value, visitor)?;
+        }
+        AstExpression::StructWith { value, updates } => {
+            visit_migration_expression(value, visitor)?;
+            for update in updates {
+                visit_migration_expression(&update.value, visitor)?;
+            }
+        }
+        AstExpression::Match { value, arms } => {
+            visit_migration_expression(value, visitor)?;
+            for arm in arms {
+                visit_migration_expression(&arm.value, visitor)?;
+            }
+        }
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::String(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_)
+        | AstExpression::ArrayNew { .. }
+        | AstExpression::MapNew { .. } => {}
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
+    }
+    Ok(())
 }
 
 fn validate_awaits(
@@ -2884,21 +3127,20 @@ fn validate_await_expression(
     awaited: bool,
 ) -> Result<(), CompileError> {
     match expression.kind() {
-        AstExpression::Await(inner) => {
+        AstExpression::Await {
+            expression: inner,
+            await_span,
+        } => {
             let awaited = match inner.kind() {
-                AstExpression::Try(expression) => expression.as_ref(),
+                AstExpression::Try { expression, .. } => expression.as_ref(),
                 AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
                 expression => expression,
             };
             let AstExpression::Call { function, .. } = awaited.kind() else {
-                return Err(CompileError::AwaitOutsideTask {
-                    span: expression.span(),
-                });
+                return Err(CompileError::AwaitOutsideTask { span: *await_span });
             };
             if !suspending_functions.contains(function) {
-                return Err(CompileError::AwaitOutsideTask {
-                    span: expression.span(),
-                });
+                return Err(CompileError::AwaitOutsideTask { span: *await_span });
             }
             validate_await_expression(inner, suspending_functions, true)
         }
@@ -2949,7 +3191,7 @@ fn validate_await_expression(
             }
             Ok(())
         }
-        AstExpression::Try(expression) => {
+        AstExpression::Try { expression, .. } => {
             validate_await_expression(expression, suspending_functions, awaited)
         }
         AstExpression::Migration(intrinsic) => {
@@ -2973,11 +3215,15 @@ fn validate_await_expression(
 fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> {
     let mut root = BTreeMap::new();
     for parameter in &function.parameters {
-        if root
-            .insert(parameter.name.clone(), parameter.name.clone())
-            .is_some()
-        {
-            return Err(CompileError::duplicate_name(parameter.name.clone()));
+        if let Some((_, first)) = root.insert(
+            parameter.name.clone(),
+            (parameter.name.clone(), parameter.name_span),
+        ) {
+            return Err(CompileError::duplicate_name(
+                parameter.name.clone(),
+                first,
+                parameter.name_span,
+            ));
         }
     }
     let mut scopes = vec![root];
@@ -2987,29 +3233,39 @@ fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> 
 
 fn resolve_statements(
     statements: &mut [AstStatement],
-    scopes: &mut Vec<BTreeMap<String, String>>,
+    scopes: &mut Vec<BTreeMap<String, (String, SourceSpan)>>,
     next_local: &mut u32,
 ) -> Result<(), CompileError> {
     for statement in statements {
+        let statement_span = statement.span();
         match statement.kind_mut() {
-            AstStatement::Bind { name, value, .. } => {
+            AstStatement::Bind {
+                name,
+                name_span,
+                value,
+                ..
+            } => {
                 resolve_expression(value, scopes, next_local)?;
                 let source_name = name.clone();
-                if scopes
+                if let Some((_, first)) = scopes
                     .last()
                     .expect("a function always has a lexical scope")
-                    .contains_key(&source_name)
+                    .get(&source_name)
                 {
-                    return Err(CompileError::duplicate_name(source_name));
+                    return Err(CompileError::duplicate_name(
+                        source_name,
+                        *first,
+                        *name_span,
+                    ));
                 }
                 let resolved = format!("{source_name}#{}", *next_local);
                 *next_local = next_local
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(statement_span))?;
                 scopes
                     .last_mut()
                     .expect("a function always has a lexical scope")
-                    .insert(source_name, resolved.clone());
+                    .insert(source_name, (resolved.clone(), *name_span));
                 *name = resolved;
             }
             AstStatement::Return(expression)
@@ -3052,20 +3308,21 @@ fn resolve_statements(
 #[allow(clippy::too_many_lines)]
 fn resolve_expression(
     expression: &mut AstExpression,
-    scopes: &mut Vec<BTreeMap<String, String>>,
+    scopes: &mut Vec<BTreeMap<String, (String, SourceSpan)>>,
     next_local: &mut u32,
 ) -> Result<(), CompileError> {
+    let expression_span = expression.span();
     match expression.kind_mut() {
         AstExpression::Name(name) => {
             let resolved = scopes
                 .iter()
                 .rev()
-                .find_map(|scope| scope.get(name))
+                .find_map(|scope| scope.get(name).map(|(resolved, _)| resolved))
                 .cloned();
             if let Some(resolved) = resolved {
                 *name = resolved;
             } else if !name.chars().next().is_some_and(char::is_uppercase) {
-                return Err(CompileError::unknown_name(name.clone()));
+                return Err(CompileError::unknown_name(name.clone(), expression_span));
             }
         }
         AstExpression::Binary { lhs, rhs, .. } => {
@@ -3081,9 +3338,11 @@ fn resolve_expression(
                 let resolved = scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(receiver))
+                    .find_map(|scope| scope.get(receiver).map(|(resolved, _)| resolved))
                     .cloned()
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                    .ok_or_else(|| {
+                        CompileError::unknown_name(receiver.to_owned(), expression_span)
+                    })?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -3099,9 +3358,11 @@ fn resolve_expression(
                 let resolved = scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(receiver))
+                    .find_map(|scope| scope.get(receiver).map(|(resolved, _)| resolved))
                     .cloned()
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                    .ok_or_else(|| {
+                        CompileError::unknown_name(receiver.to_owned(), expression_span)
+                    })?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -3116,9 +3377,11 @@ fn resolve_expression(
                 let resolved = scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(receiver))
+                    .find_map(|scope| scope.get(receiver).map(|(resolved, _)| resolved))
                     .cloned()
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                    .ok_or_else(|| {
+                        CompileError::unknown_name(receiver.to_owned(), expression_span)
+                    })?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -3134,9 +3397,11 @@ fn resolve_expression(
                 let resolved = scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(receiver))
+                    .find_map(|scope| scope.get(receiver).map(|(resolved, _)| resolved))
                     .cloned()
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                    .ok_or_else(|| {
+                        CompileError::unknown_name(receiver.to_owned(), expression_span)
+                    })?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -3154,9 +3419,11 @@ fn resolve_expression(
                 let resolved = scopes
                     .iter()
                     .rev()
-                    .find_map(|scope| scope.get(receiver))
+                    .find_map(|scope| scope.get(receiver).map(|(resolved, _)| resolved))
                     .cloned()
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                    .ok_or_else(|| {
+                        CompileError::unknown_name(receiver.to_owned(), expression_span)
+                    })?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -3173,7 +3440,7 @@ fn resolve_expression(
                 resolve_expression(argument, scopes, next_local)?;
             }
         }
-        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+        AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
             resolve_expression(expression, scopes, next_local)?;
         }
         AstExpression::Constructor { payload, .. } => {
@@ -3204,11 +3471,11 @@ fn resolve_expression(
                     let resolved = format!("{source_name}#{}", *next_local);
                     *next_local = next_local
                         .checked_add(1)
-                        .ok_or(CompileError::too_many_registers())?;
+                        .ok_or(CompileError::too_many_registers(expression_span))?;
                     scopes
                         .last_mut()
                         .expect("match arm scope exists")
-                        .insert(source_name, resolved.clone());
+                        .insert(source_name, (resolved.clone(), arm.span));
                     *binding = resolved;
                 }
                 resolve_expression(&mut arm.value, scopes, next_local)?;
@@ -3235,19 +3502,19 @@ fn resolve_expression(
 fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), CompileError> {
     match ty.kind() {
         AstType::Named(name) if !known_types.contains(name) => {
-            Err(CompileError::unknown_type(name.clone()))
+            Err(CompileError::unknown_type(name.clone(), ty.span()))
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
                 "Option" | "StateHandle" | "Array" | "Buffer" | "Snapshot" => 1,
                 "Result" | "Map" => 2,
-                _ => return Err(CompileError::unknown_type(name.clone())),
+                _ => return Err(CompileError::unknown_type(name.clone(), ty.span())),
             };
             if arguments.len() != expected {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, ty.span()));
             }
             if name == "Snapshot" && !matches!(arguments[0].kind(), AstType::Named(_)) {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, ty.span()));
             }
             for argument in arguments {
                 validate_type(argument, known_types)?;
@@ -3332,13 +3599,13 @@ fn validate_state_handle_target(
     }
     if name == "StateHandle" {
         let [target] = arguments.as_slice() else {
-            return Err(CompileError::type_mismatch());
+            return Err(CompileError::type_mismatch(None, None, ty.span()));
         };
         let AstType::Named(target) = target.kind() else {
-            return Err(CompileError::type_mismatch());
+            return Err(CompileError::type_mismatch(None, None, ty.span()));
         };
         if !stateful_types.contains(target.as_str()) {
-            return Err(CompileError::type_mismatch());
+            return Err(CompileError::type_mismatch(None, None, ty.span()));
         }
     }
     Ok(())
@@ -3360,9 +3627,9 @@ fn validate_state_storage_type<'a>(
         AstType::Named(name) => {
             let declaration = declarations
                 .get(name.as_str())
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, ty.span()))?;
             if !matches!(declaration.kind, AstTypeKind::Struct | AstTypeKind::Enum) {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, ty.span()));
             }
             if !visiting.insert(declaration.name.as_str()) {
                 return Ok(());
@@ -3390,15 +3657,15 @@ fn validate_state_storage_type<'a>(
             if name == "StateHandle" && arguments.len() == 1 =>
         {
             let AstType::Named(target) = arguments[0].kind() else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, ty.span()));
             };
             declarations
                 .get(target.as_str())
                 .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
                 .map(|_| ())
-                .ok_or(CompileError::type_mismatch())
+                .ok_or(CompileError::type_mismatch(None, None, ty.span()))
         }
-        AstType::BuiltinGeneric { .. } => Err(CompileError::type_mismatch()),
+        AstType::BuiltinGeneric { .. } => Err(CompileError::type_mismatch(None, None, ty.span())),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
@@ -3466,20 +3733,25 @@ fn check_statements(
 ) -> Result<Flow, CompileError> {
     let mut flow = Flow::FallsThrough;
     for statement in statements {
+        let statement_span = statement.span();
         match statement.kind() {
-            AstStatement::Bind { name, ty, value } => {
+            AstStatement::Bind {
+                name, ty, value, ..
+            } => {
                 let expected = ty.as_ref().map(lower_type);
                 let actual = expression_type(value, locals, context, next_register, expected)?;
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(
+                        expected,
+                        Some(actual),
+                        value.span(),
+                    ));
                 }
                 let register = *next_register;
                 *next_register = next_register
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
-                if locals.insert(name.clone(), (register, actual)).is_some() {
-                    return Err(CompileError::duplicate_name(name.clone()));
-                }
+                    .ok_or(CompileError::too_many_registers(statement_span))?;
+                locals.insert(name.clone(), (register, actual));
             }
             AstStatement::Return(expression) => {
                 if expression_type(
@@ -3490,7 +3762,7 @@ fn check_statements(
                     Some(context.function_result),
                 )? != context.function_result
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 flow = Flow::Returns;
             }
@@ -3499,7 +3771,7 @@ fn check_statements(
             }
             AstStatement::Yield => {
                 if context.effect != FunctionEffect::Task {
-                    return Err(CompileError::invalid_effect());
+                    return Err(CompileError::invalid_effect(statement_span));
                 }
             }
             AstStatement::If {
@@ -3515,7 +3787,11 @@ fn check_statements(
                     Some(ValueType::Bool),
                 )? != ValueType::Bool
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(
+                        Some(ValueType::Bool),
+                        None,
+                        condition.span(),
+                    ));
                 }
                 let mut then_locals = locals.clone();
                 let mut else_locals = locals.clone();
@@ -3541,7 +3817,11 @@ fn check_statements(
                     Some(ValueType::Bool),
                 )? != ValueType::Bool
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(
+                        Some(ValueType::Bool),
+                        None,
+                        condition.span(),
+                    ));
                 }
                 let mut loop_locals = locals.clone();
                 let body_flow = check_statements(body, &mut loop_locals, context, next_register)?;
@@ -3556,7 +3836,7 @@ fn check_statements(
             }
             AstStatement::Defer(expression) => {
                 if contains_await(expression) {
-                    return Err(CompileError::suspending_defer());
+                    return Err(CompileError::suspending_defer(expression.span()));
                 }
                 expression_type(expression, locals, context, next_register, None)?;
             }
@@ -3581,14 +3861,18 @@ fn check_field_set(
 ) -> Result<(), CompileError> {
     let ValueType::Named(type_id) = expression_type(value, locals, context, next_register, None)?
     else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, value.span()));
     };
     let field = context
         .class_fields
         .get(&(type_id, field.to_owned()))
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, value.span()))?;
     if expression_type(replacement, locals, context, next_register, Some(field.ty))? != field.ty {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(
+            Some(field.ty),
+            None,
+            replacement.span(),
+        ));
     }
     Ok(())
 }
@@ -3621,7 +3905,7 @@ fn statements_contain_await(statements: &[AstStatement]) -> bool {
 
 fn contains_await(expression: &AstExpression) -> bool {
     match expression.kind() {
-        AstExpression::Await(_) => true,
+        AstExpression::Await { .. } => true,
         AstExpression::Binary { lhs, rhs, .. } => contains_await(lhs) || contains_await(rhs),
         AstExpression::Call { arguments, .. } => arguments.iter().any(contains_await),
         AstExpression::Constructor { payload, .. } => {
@@ -3637,7 +3921,7 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Match { value, arms } => {
             contains_await(value) || arms.iter().any(|arm| contains_await(&arm.value))
         }
-        AstExpression::Try(expression) => contains_await(expression),
+        AstExpression::Try { expression, .. } => contains_await(expression),
         AstExpression::Migration(intrinsic) => migration_expressions(intrinsic)
             .into_iter()
             .any(contains_await),
@@ -3670,18 +3954,18 @@ fn expression_type(
                 ValueType::I32
             }
             Some(ValueType::I64) => ValueType::I64,
-            Some(_) => return Err(CompileError::type_mismatch()),
+            Some(_) => return Err(CompileError::type_mismatch(None, None, expression.span())),
             None if i32::try_from(*value).is_ok() => ValueType::I32,
             None => ValueType::I64,
         },
         AstExpression::Float(_) => match expected {
             Some(ValueType::F32) => ValueType::F32,
             Some(ValueType::F64) | None => ValueType::F64,
-            Some(_) => return Err(CompileError::type_mismatch()),
+            Some(_) => return Err(CompileError::type_mismatch(None, None, expression.span())),
         },
         AstExpression::Rune(value) => {
             if char::from_u32(*value).is_none() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             ValueType::Rune
         }
@@ -3698,7 +3982,7 @@ fn expression_type(
             {
                 ValueType::Named(type_id)
             } else {
-                return Err(CompileError::unknown_name(name.clone()));
+                return Err(CompileError::unknown_name(name.clone(), expression.span()));
             }
         }
         AstExpression::StructLiteral { type_name, fields } => {
@@ -3707,16 +3991,20 @@ fn expression_type(
                 .struct_types
                 .iter()
                 .find(|struct_type| struct_type.type_id == type_id)
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))?;
             if fields.len() != struct_type.fields.len() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(
+                    Some(ValueType::Named(type_id)),
+                    None,
+                    expression.span(),
+                ));
             }
             let mut supplied = BTreeSet::new();
             for field in fields {
                 let metadata = context
                     .struct_fields
                     .get(&(type_id, field.name.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if !supplied.insert(metadata.stable_id)
                     || expression_type(
                         &field.value,
@@ -3726,7 +4014,7 @@ fn expression_type(
                         Some(metadata.ty),
                     )? != metadata.ty
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
             }
             ValueType::Named(type_id)
@@ -3737,16 +4025,16 @@ fn expression_type(
                 .class_types
                 .iter()
                 .find(|class_type| class_type.type_id == type_id)
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))?;
             if fields.len() != class_type.fields.len() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             let mut supplied = BTreeSet::new();
             for field in fields {
                 let metadata = context
                     .class_fields
                     .get(&(type_id, field.name.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if !supplied.insert(metadata.stable_id)
                     || expression_type(
                         &field.value,
@@ -3756,7 +4044,7 @@ fn expression_type(
                         Some(metadata.ty),
                     )? != metadata.ty
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
             }
             ValueType::Named(type_id)
@@ -3766,7 +4054,7 @@ fn expression_type(
                 context.effect,
                 FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
             ) {
-                return Err(CompileError::invalid_effect());
+                return Err(CompileError::invalid_effect(expression.span()));
             }
             let element = lower_type(element_type);
             let type_id = nexa_bytecode::array_type(element);
@@ -3775,7 +4063,7 @@ fn expression_type(
                 .iter()
                 .any(|array_type| array_type.type_id == type_id && array_type.element == element)
             {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             ValueType::Named(type_id)
         }
@@ -3787,7 +4075,7 @@ fn expression_type(
                 context.effect,
                 FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
             ) {
-                return Err(CompileError::invalid_effect());
+                return Err(CompileError::invalid_effect(expression.span()));
             }
             let key = lower_type(key_type);
             let value = lower_type(value_type);
@@ -3795,7 +4083,7 @@ fn expression_type(
             if !context.map_types.iter().any(|map_type| {
                 map_type.type_id == type_id && map_type.key == key && map_type.value == value
             }) {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             ValueType::Named(type_id)
         }
@@ -3803,7 +4091,7 @@ fn expression_type(
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             context
                 .struct_fields
@@ -3820,7 +4108,7 @@ fn expression_type(
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             if !context
                 .struct_types
@@ -3828,14 +4116,14 @@ fn expression_type(
                 .any(|struct_type| struct_type.type_id == type_id)
                 || updates.is_empty()
             {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             let mut supplied = BTreeSet::new();
             for update in updates {
                 let field = context
                     .struct_fields
                     .get(&(type_id, update.name.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if !supplied.insert(field.stable_id)
                     || expression_type(
                         &update.value,
@@ -3845,7 +4133,7 @@ fn expression_type(
                         Some(field.ty),
                     )? != field.ty
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
             }
             ValueType::Named(type_id)
@@ -3865,7 +4153,7 @@ fn expression_type(
                 || expression_type(rhs, locals, context, next_register, Some(operand_type))?
                     != operand_type
             {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             ValueType::Bool
         }
@@ -3885,12 +4173,12 @@ fn expression_type(
                         Some(ValueType::String),
                     )? != ValueType::String
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 if expression_type(rhs, locals, context, next_register, Some(ValueType::String))?
                     != ValueType::String
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 ValueType::String
             } else {
@@ -3898,18 +4186,18 @@ fn expression_type(
                     numeric_type,
                     ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
                 ) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 if expected.is_some()
                     && expression_type(lhs, locals, context, next_register, Some(numeric_type))?
                         != numeric_type
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 if expression_type(rhs, locals, context, next_register, Some(numeric_type))?
                     != numeric_type
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 numeric_type
             }
@@ -3922,13 +4210,17 @@ fn expression_type(
                 && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
             {
                 let [payload] = arguments.as_slice() else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
-                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch())?;
+                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch(
+                    None,
+                    None,
+                    expression.span(),
+                ))?;
                 if expression_type(payload, locals, context, next_register, Some(payload_type))?
                     != payload_type
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(ValueType::Named(type_id));
             }
@@ -3938,7 +4230,7 @@ fn expression_type(
                 let result = match method {
                     StringMethod::Len | StringMethod::ByteLen | StringMethod::Hash => {
                         if !arguments.is_empty() {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         if method == StringMethod::Hash {
                             ValueType::I64
@@ -3956,7 +4248,7 @@ fn expression_type(
                                 Some(ValueType::String),
                             )? != ValueType::String
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         if method == StringMethod::Equal {
                             ValueType::Bool
@@ -3974,13 +4266,13 @@ fn expression_type(
                                 Some(ValueType::I32),
                             )? != ValueType::I32
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Rune
                     }
                 };
                 if expected.is_some_and(|expected| expected != result) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(result);
             }
@@ -3992,24 +4284,23 @@ fn expression_type(
                         .any(|buffer| buffer.type_id == *type_id))
                 })
             {
-                let receiver_type = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                let receiver_type = locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                    CompileError::unknown_name(receiver.to_owned(), expression.span())
+                })?;
                 let ValueType::Named(buffer_type) = receiver_type else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let element = context
                     .buffer_types
                     .iter()
                     .find(|buffer| buffer.type_id == buffer_type)
                     .map(|buffer| buffer.element)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::invalid_effect());
+                    return Err(CompileError::invalid_effect(expression.span()));
                 }
                 let index = |argument: &AstExpression,
                              locals: &mut BTreeMap<String, (u16, ValueType)>,
@@ -4026,7 +4317,7 @@ fn expression_type(
                     BufferMethod::Len if arguments.is_empty() => ValueType::I32,
                     BufferMethod::Get if arguments.len() == 1 => {
                         if index(&arguments[0], locals, next_register)? != ValueType::I32 {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         element
                     }
@@ -4040,7 +4331,7 @@ fn expression_type(
                                 Some(element),
                             )? != element
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Bool
                     }
@@ -4048,7 +4339,7 @@ fn expression_type(
                         if index(&arguments[0], locals, next_register)? != ValueType::I32
                             || index(&arguments[1], locals, next_register)? != ValueType::I32
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         receiver_type
                     }
@@ -4061,19 +4352,23 @@ fn expression_type(
                             Some(receiver_type),
                         )? != receiver_type
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         for argument in &arguments[1..] {
                             if index(argument, locals, next_register)? != ValueType::I32 {
-                                return Err(CompileError::type_mismatch());
+                                return Err(CompileError::type_mismatch(
+                                    None,
+                                    None,
+                                    expression.span(),
+                                ));
                             }
                         }
                         ValueType::Bool
                     }
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(actual);
             }
@@ -4085,23 +4380,22 @@ fn expression_type(
                         .any(|map_type| map_type.type_id == *type_id))
                 })
             {
-                let receiver_type = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                let receiver_type = locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                    CompileError::unknown_name(receiver.to_owned(), expression.span())
+                })?;
                 let ValueType::Named(map_type) = receiver_type else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let map_type = context
                     .map_types
                     .iter()
                     .find(|candidate| candidate.type_id == map_type)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::invalid_effect());
+                    return Err(CompileError::invalid_effect(expression.span()));
                 }
                 let mut check_key = |argument: &AstExpression| {
                     expression_type(argument, locals, context, next_register, Some(map_type.key))
@@ -4110,7 +4404,7 @@ fn expression_type(
                     MapMethod::Len if arguments.is_empty() => ValueType::I32,
                     MapMethod::Get | MapMethod::Remove if arguments.len() == 1 => {
                         if check_key(&arguments[0])? != map_type.key {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Named(nexa_bytecode::option_type(map_type.value).type_id)
                     }
@@ -4124,43 +4418,42 @@ fn expression_type(
                                 Some(map_type.value),
                             )? != map_type.value
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Bool
                     }
                     MapMethod::Contains if arguments.len() == 1 => {
                         if check_key(&arguments[0])? != map_type.key {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Bool
                     }
                     MapMethod::Clear if arguments.is_empty() => ValueType::Bool,
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(actual);
             }
             if let Some((receiver, method)) = array_method(function) {
-                let receiver_type = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                let receiver_type = locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                    CompileError::unknown_name(receiver.to_owned(), expression.span())
+                })?;
                 let ValueType::Named(array_type) = receiver_type else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let element = context
                     .array_types
                     .iter()
                     .find(|candidate| candidate.type_id == array_type)
                     .map(|candidate| candidate.element)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::invalid_effect());
+                    return Err(CompileError::invalid_effect(expression.span()));
                 }
                 let actual = match method {
                     ArrayMethod::Len if arguments.is_empty() => ValueType::I32,
@@ -4173,7 +4466,7 @@ fn expression_type(
                             Some(ValueType::I32),
                         )? != ValueType::I32
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         element
                     }
@@ -4193,7 +4486,7 @@ fn expression_type(
                                 Some(element),
                             )? != element
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Bool
                     }
@@ -4206,16 +4499,16 @@ fn expression_type(
                             Some(element),
                         )? != element
                         {
-                            return Err(CompileError::type_mismatch());
+                            return Err(CompileError::type_mismatch(None, None, expression.span()));
                         }
                         ValueType::Bool
                     }
                     ArrayMethod::Pop if arguments.is_empty() => element,
                     ArrayMethod::Clear if arguments.is_empty() => ValueType::Bool,
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(actual);
             }
@@ -4224,19 +4517,18 @@ fn expression_type(
                     context.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::invalid_effect());
+                    return Err(CompileError::invalid_effect(expression.span()));
                 }
-                let receiver_type = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
+                let receiver_type = locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                    CompileError::unknown_name(receiver.to_owned(), expression.span())
+                })?;
                 let ValueType::Named(handle_type) = receiver_type else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let target = *context
                     .state_handle_targets
                     .get(&handle_type)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 let actual = match method {
                     StateHandleMethod::Equality => {
                         if arguments.len() != 1
@@ -4248,7 +4540,7 @@ fn expression_type(
                                 Some(receiver_type),
                             )? != receiver_type
                         {
-                            Err(CompileError::type_mismatch())
+                            Err(CompileError::type_mismatch(None, None, expression.span()))
                         } else {
                             Ok(ValueType::Bool)
                         }
@@ -4265,59 +4557,60 @@ fn expression_type(
                                 .type_id,
                             ))
                         } else {
-                            Err(CompileError::type_mismatch())
+                            Err(CompileError::type_mismatch(None, None, expression.span()))
                         }
                     }
                     StateHandleMethod::IsAlive => {
                         if arguments.is_empty() {
                             Ok(ValueType::Bool)
                         } else {
-                            Err(CompileError::type_mismatch())
+                            Err(CompileError::type_mismatch(None, None, expression.span()))
                         }
                     }
                     StateHandleMethod::StableId => {
                         if arguments.is_empty() {
                             Ok(nexa_bytecode::stable_id_type())
                         } else {
-                            Err(CompileError::type_mismatch())
+                            Err(CompileError::type_mismatch(None, None, expression.span()))
                         }
                     }
                     StateHandleMethod::Generation | StateHandleMethod::Hash => {
                         if arguments.is_empty() {
                             Ok(ValueType::I32)
                         } else {
-                            Err(CompileError::type_mismatch())
+                            Err(CompileError::type_mismatch(None, None, expression.span()))
                         }
                     }
                 }?;
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 return Ok(actual);
             }
             let signature = context
                 .signatures
                 .get(function)
-                .ok_or_else(|| CompileError::unknown_name(function.clone()))?;
+                .ok_or_else(|| CompileError::unknown_name(function.clone(), expression.span()))?;
             if arguments.len() != signature.parameters.len() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             for (argument, parameter) in arguments.iter().zip(&signature.parameters) {
                 if expression_type(argument, locals, context, next_register, Some(*parameter))?
                     != *parameter
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
             }
             signature.result.expect("functions have results")
         }
-        AstExpression::Await(expression) => {
+        AstExpression::Await {
+            expression: inner,
+            await_span,
+        } => {
             if context.effect != FunctionEffect::Task {
-                return Err(CompileError::AwaitOutsideTask {
-                    span: expression.span(),
-                });
+                return Err(CompileError::AwaitOutsideTask { span: *await_span });
             }
-            expression_type(expression, locals, context, next_register, expected)?
+            expression_type(inner, locals, context, next_register, expected)?
         }
         AstExpression::Constructor {
             type_name,
@@ -4327,30 +4620,31 @@ fn expression_type(
             let type_id = if let Some(type_name) = type_name {
                 let type_id = StableId::from_name(type_name);
                 if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 type_id
             } else {
-                let ValueType::Named(type_id) = expected.ok_or(CompileError::cannot_infer_type())?
+                let ValueType::Named(type_id) =
+                    expected.ok_or(CompileError::cannot_infer_type(expression.span()))?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 type_id
             };
             let metadata = context
                 .enum_variants
                 .get(&(type_id, variant.clone()))
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
             match (payload, metadata.payload_type) {
                 (Some(payload), Some(payload_type)) => {
                     if expression_type(payload, locals, context, next_register, Some(payload_type))?
                         != payload_type
                     {
-                        return Err(CompileError::type_mismatch());
+                        return Err(CompileError::type_mismatch(None, None, expression.span()));
                     }
                 }
                 (None, None) => {}
-                _ => return Err(CompileError::type_mismatch()),
+                _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
             }
             ValueType::Named(type_id)
         }
@@ -4358,25 +4652,25 @@ fn expression_type(
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(expected, None, value.span()));
             };
             let enum_type = context
                 .enum_types
                 .iter()
                 .find(|enum_type| enum_type.type_id == type_id)
-                .ok_or(CompileError::type_mismatch())?;
-            let mut covered = BTreeSet::new();
+                .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
+            let mut covered = BTreeMap::new();
             let mut result_type = expected;
             for arm in arms {
                 let variant = context
                     .enum_variants
                     .get(&(type_id, arm.variant.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
-                if !covered.insert(variant.stable_id) {
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
+                if let Some(first) = covered.insert(variant.stable_id, arm.span) {
                     return Err(CompileError::DuplicateMatchVariant {
                         variant: variant.stable_id,
-                        first: expression.span(),
-                        duplicate: arm.value.span(),
+                        first,
+                        duplicate: arm.span,
                     });
                 }
                 match (&arm.binding, variant.payload_type) {
@@ -4385,19 +4679,19 @@ fn expression_type(
                             let register = *next_register;
                             *next_register = next_register
                                 .checked_add(1)
-                                .ok_or(CompileError::too_many_registers())?;
+                                .ok_or(CompileError::too_many_registers(expression.span()))?;
                             locals.insert(binding.clone(), (register, payload_type));
                         }
                     }
                     (None, None) => {}
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
                 }
                 let arm_type =
                     expression_type(&arm.value, locals, context, next_register, result_type)?;
                 if let Some(expected) = result_type
                     && arm_type != expected
                 {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 }
                 result_type = Some(arm_type);
             }
@@ -4406,7 +4700,7 @@ fn expression_type(
                     missing: enum_type
                         .variants
                         .iter()
-                        .filter(|variant| !covered.contains(&variant.stable_id))
+                        .filter(|variant| !covered.contains_key(&variant.stable_id))
                         .map(|variant| variant.stable_id)
                         .collect(),
                     span: expression.span(),
@@ -4421,12 +4715,15 @@ fn expression_type(
                 span: expression.span(),
             })?
         }
-        AstExpression::Try(expression) => {
+        AstExpression::Try {
+            expression,
+            question_span,
+        } => {
             let actual = expression_type(expression, locals, context, next_register, None)?;
             let ValueType::Named(type_id) = actual else {
                 return Err(CompileError::TryRequiresResult {
                     actual,
-                    span: expression.span(),
+                    span: *question_span,
                 });
             };
             let ok = context
@@ -4434,41 +4731,41 @@ fn expression_type(
                 .get(&(type_id, "Ok".to_owned()))
                 .ok_or(CompileError::TryRequiresResult {
                     actual,
-                    span: expression.span(),
+                    span: *question_span,
                 })?;
             let error = context
                 .enum_variants
                 .get(&(type_id, "Err".to_owned()))
                 .ok_or(CompileError::TryRequiresResult {
                     actual,
-                    span: expression.span(),
+                    span: *question_span,
                 })?;
             let ValueType::Named(function_result) = context.function_result else {
                 return Err(CompileError::TryRequiresResult {
                     actual: context.function_result,
-                    span: expression.span(),
+                    span: *question_span,
                 });
             };
             let result_error = context
                 .enum_variants
                 .get(&(function_result, "Err".to_owned()))
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
             if error.payload_type != result_error.payload_type {
                 return Err(CompileError::TryErrorMismatch {
                     expected: result_error.payload_type.unwrap_or(ValueType::Ref),
                     actual: error.payload_type.unwrap_or(ValueType::Ref),
-                    span: expression.span(),
+                    span: *question_span,
                 });
             }
             ok.payload_type.ok_or(CompileError::TryRequiresResult {
                 actual,
-                span: expression.span(),
+                span: *question_span,
             })?
         }
         AstExpression::Migration(intrinsic) => {
             if context.effect != FunctionEffect::Migration {
                 return Err(CompileError::MigrationIntrinsicOutsideMigration {
-                    intrinsic: format!("{:?}", intrinsic.kind()),
+                    intrinsic: migration_intrinsic_name(intrinsic).to_owned(),
                     span: intrinsic.span(),
                 });
             }
@@ -4487,9 +4784,27 @@ fn expression_type(
                 span: expression.span(),
             });
         }
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(
+            Some(expected),
+            Some(actual),
+            expression.span(),
+        ));
     }
     Ok(actual)
+}
+
+fn migration_intrinsic_name(intrinsic: &MigrationIntrinsic) -> &'static str {
+    match intrinsic.kind() {
+        MigrationIntrinsic::OldGet { .. } => "old.get",
+        MigrationIntrinsic::OldFieldGet { .. } => "old.field",
+        MigrationIntrinsic::NewCreate { .. } => "new.create",
+        MigrationIntrinsic::NewSet { .. } => "new.set",
+        MigrationIntrinsic::Preserve { .. } => "preserve",
+        MigrationIntrinsic::Replace { .. } => "replace",
+        MigrationIntrinsic::Delete { .. } => "delete",
+        MigrationIntrinsic::Finish => "finish_migration",
+        MigrationIntrinsic::Spanned { .. } => unreachable!("kind strips spans"),
+    }
 }
 
 fn migration_intrinsic_type(
@@ -4511,7 +4826,11 @@ fn migration_intrinsic_type(
                     Some(ValueType::Named(StableId::from_name(owner))),
                 )? != ValueType::Named(StableId::from_name(owner))
             {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(
+                    Some(ValueType::Named(StableId::from_name(owner))),
+                    None,
+                    object.span(),
+                ));
             }
             Ok(lower_type(ty))
         }
@@ -4530,7 +4849,7 @@ fn migration_intrinsic_type(
                 Some(ValueType::Named(owner_type)),
             )? != ValueType::Named(owner_type)
             {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, object.span()));
             }
             let field_id = StableId::from_parts(&[owner, "::", field]);
             let expected = context
@@ -4545,16 +4864,24 @@ fn migration_intrinsic_type(
                         .find(|candidate| candidate.stable_id == field_id)
                 })
                 .map(|field| field.ty)
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, intrinsic.span()))?;
             if expression_type(value, locals, context, next_register, Some(expected))? != expected {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(
+                    Some(expected),
+                    None,
+                    value.span(),
+                ));
             }
             Ok(ValueType::Bool)
         }
         MigrationIntrinsic::Replace { target, .. } => {
             let target_type = expression_type(target, locals, context, next_register, None)?;
             if !target_type.is_reference() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(
+                    None,
+                    Some(target_type),
+                    target.span(),
+                ));
             }
             Ok(ValueType::Bool)
         }
@@ -4627,7 +4954,7 @@ fn plan_registers(function: &HirFunction) -> Result<RegisterPlan, CompileError> 
     plan.total = plan
         .local_count
         .checked_add(temporary_count)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(function.span))?;
     Ok(plan)
 }
 
@@ -4649,7 +4976,7 @@ fn inspect_statement_registers(
                 plan.expression_temporaries = plan.expression_temporaries.max(
                     temporary_requirement(replacement)?
                         .checked_add(1)
-                        .ok_or(CompileError::too_many_registers())?,
+                        .ok_or(CompileError::too_many_registers(replacement.span()))?,
                 );
             }
             AstStatement::If {
@@ -4685,15 +5012,15 @@ fn inspect_expression_registers(
         }
         AstExpression::Call { arguments, .. } => {
             let window = u16::try_from(arguments.len())
-                .map_err(|_| CompileError::too_many_registers())?
+                .map_err(|_| CompileError::too_many_registers(expression.span()))?
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             plan.max_call_arguments = plan.max_call_arguments.max(window);
             for argument in arguments {
                 inspect_expression_registers(argument, plan)?;
             }
         }
-        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+        AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
             inspect_expression_registers(expression, plan)?;
         }
         AstExpression::Constructor { payload, .. } => {
@@ -4746,7 +5073,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         |offset: usize, nested: &AstExpression| -> Result<usize, CompileError> {
             offset
                 .checked_add(usize::from(temporary_requirement(nested)?))
-                .ok_or(CompileError::too_many_registers())
+                .ok_or(CompileError::too_many_registers(expression.span()))
         };
     let required = match expression.kind() {
         AstExpression::Integer(_)
@@ -4767,7 +5094,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
             }
             required
         }
-        AstExpression::Await(expression) => usize::from(temporary_requirement(expression)?),
+        AstExpression::Await { expression, .. } => usize::from(temporary_requirement(expression)?),
         AstExpression::Constructor { payload, .. } => payload
             .as_deref()
             .map_or(Ok(1), |payload| offset_requirement(1, payload))?,
@@ -4793,7 +5120,9 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
             }
             required
         }
-        AstExpression::Try(expression) => usize::from(temporary_requirement(expression)?).max(4),
+        AstExpression::Try { expression, .. } => {
+            usize::from(temporary_requirement(expression)?).max(4)
+        }
         AstExpression::Migration(intrinsic) => match intrinsic.kind() {
             MigrationIntrinsic::OldGet { .. }
             | MigrationIntrinsic::NewCreate { .. }
@@ -4811,7 +5140,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         },
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     };
-    u16::try_from(required).map_err(|_| CompileError::too_many_registers())
+    u16::try_from(required).map_err(|_| CompileError::too_many_registers(expression.span()))
 }
 
 fn collect_string_literals(statements: &[AstStatement], strings: &mut BTreeSet<String>) {
@@ -4860,7 +5189,7 @@ fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet
                 collect_expression_strings(argument, strings);
             }
         }
-        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+        AstExpression::Await { expression, .. } | AstExpression::Try { expression, .. } => {
             collect_expression_strings(expression, strings);
         }
         AstExpression::Constructor { payload, .. } => {
@@ -5166,7 +5495,7 @@ fn exact_root_maps(
                 dst,
             } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, function.span));
                 };
                 state[usize::from(dst)] = module
                     .enum_types
@@ -5182,7 +5511,7 @@ fn exact_root_maps(
             }
             Instruction::StructGet { source, field, dst } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, function.span));
                 };
                 state[usize::from(dst)] = module
                     .struct_types
@@ -5198,7 +5527,7 @@ fn exact_root_maps(
             }
             Instruction::ClassGet { source, field, dst } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, function.span));
                 };
                 state[usize::from(dst)] = module
                     .class_types
@@ -5216,7 +5545,7 @@ fn exact_root_maps(
             | Instruction::ArrayPop { source, dst }
             | Instruction::ArrayRemove { source, dst, .. } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, function.span));
                 };
                 state[usize::from(dst)] = module
                     .array_types
@@ -5234,7 +5563,7 @@ fn exact_root_maps(
             }
             Instruction::BufferGet { source, dst, .. } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, function.span));
                 };
                 state[usize::from(dst)] = module
                     .buffer_types
@@ -5288,6 +5617,7 @@ fn exact_root_maps(
             if successor >= states.len() {
                 return Err(CompileError::verify(
                     "emitter produced an out-of-range control-flow target".into(),
+                    function.span,
                 ));
             }
             match &mut states[successor] {
@@ -5452,23 +5782,24 @@ fn emit_statements(
                     arguments,
                 } = expression.kind()
                 else {
-                    return Err(CompileError::suspending_defer());
+                    return Err(CompileError::suspending_defer(expression.span()));
                 };
                 if arguments.len() > 8 {
-                    return Err(CompileError::defer_capture_limit());
+                    return Err(CompileError::defer_capture_limit(expression.span()));
                 }
                 let args_base = temporary
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 for (index, argument) in arguments.iter().enumerate() {
                     emit_expression(
                         argument,
                         args_base
                             .checked_add(
-                                u16::try_from(index)
-                                    .map_err(|_| CompileError::too_many_registers())?,
+                                u16::try_from(index).map_err(|_| {
+                                    CompileError::too_many_registers(expression.span())
+                                })?,
                             )
-                            .ok_or(CompileError::too_many_registers())?,
+                            .ok_or(CompileError::too_many_registers(expression.span()))?,
                         None,
                         locals,
                         context,
@@ -5476,13 +5807,12 @@ fn emit_statements(
                     )?;
                 }
                 code.push(Instruction::DeferPush {
-                    function: *context
-                        .functions
-                        .get(function)
-                        .ok_or_else(|| CompileError::unknown_name(function.clone()))?,
+                    function: *context.functions.get(function).ok_or_else(|| {
+                        CompileError::unknown_name(function.clone(), expression.span())
+                    })?,
                     args_base,
                     args_count: u16::try_from(arguments.len())
-                        .map_err(|_| CompileError::too_many_registers())?,
+                        .map_err(|_| CompileError::too_many_registers(expression.span()))?,
                 });
             }
             AstStatement::If {
@@ -5506,21 +5836,21 @@ fn emit_statements(
                 emit_statements(then_body, temporary, locals, context, code)?;
                 let skip_else = code.len();
                 code.push(Instruction::Jump { target: 0 });
-                let else_start =
-                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+                let else_start = u32::try_from(code.len())
+                    .map_err(|_| CompileError::too_many_registers(condition.span()))?;
                 code[branch] = Instruction::JumpIfFalse {
                     condition: temporary,
                     target: else_start,
                 };
                 emit_statements(else_body, temporary, locals, context, code)?;
-                let end =
-                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+                let end = u32::try_from(code.len())
+                    .map_err(|_| CompileError::too_many_registers(condition.span()))?;
                 code.push(Instruction::Safepoint);
                 code[skip_else] = Instruction::Jump { target: end };
             }
             AstStatement::While { condition, body } => {
-                let loop_start =
-                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+                let loop_start = u32::try_from(code.len())
+                    .map_err(|_| CompileError::too_many_registers(condition.span()))?;
                 code.push(Instruction::Safepoint);
                 emit_expression(
                     condition,
@@ -5537,8 +5867,8 @@ fn emit_statements(
                 });
                 emit_statements(body, temporary, locals, context, code)?;
                 code.push(Instruction::Jump { target: loop_start });
-                let end =
-                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+                let end = u32::try_from(code.len())
+                    .map_err(|_| CompileError::too_many_registers(condition.span()))?;
                 code.push(Instruction::Safepoint);
                 code[exit] = Instruction::JumpIfFalse {
                     condition: temporary,
@@ -5553,12 +5883,12 @@ fn emit_statements(
                 let ValueType::Named(type_id) =
                     emitted_expression_type(value, None, locals, context)?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, value.span()));
                 };
                 let metadata = context
                     .class_fields
                     .get(&(type_id, field.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, value.span()))?;
                 emit_expression(
                     value,
                     temporary,
@@ -5569,7 +5899,7 @@ fn emit_statements(
                 )?;
                 let replacement_register = temporary
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(replacement.span()))?;
                 emit_expression(
                     replacement,
                     replacement_register,
@@ -5683,7 +6013,7 @@ fn emit_expression(
                     }
                 })?,
             }),
-            Some(_) => return Err(CompileError::type_mismatch()),
+            Some(_) => return Err(CompileError::type_mismatch(None, None, expression.span())),
         },
         AstExpression::Float(bits) => match expected {
             Some(ValueType::F32) => code.push(Instruction::LoadF32 {
@@ -5694,11 +6024,11 @@ fn emit_expression(
                 dst: destination,
                 bits: *bits,
             }),
-            Some(_) => return Err(CompileError::type_mismatch()),
+            Some(_) => return Err(CompileError::type_mismatch(None, None, expression.span())),
         },
         AstExpression::Rune(value) => {
             if char::from_u32(*value).is_none() {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             code.push(Instruction::LoadRune {
                 dst: destination,
@@ -5733,7 +6063,7 @@ fn emit_expression(
                     dst: destination,
                 });
             } else {
-                return Err(CompileError::unknown_name(name.clone()));
+                return Err(CompileError::unknown_name(name.clone(), expression.span()));
             }
         }
         AstExpression::StructLiteral { type_name, fields } => {
@@ -5742,10 +6072,10 @@ fn emit_expression(
                 .struct_types
                 .iter()
                 .find(|struct_type| struct_type.type_id == type_id)
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))?;
             let fields_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             for (index, metadata) in struct_type.fields.iter().enumerate() {
                 let field = fields
                     .iter()
@@ -5755,12 +6085,13 @@ fn emit_expression(
                             .get(&(type_id, field.name.clone()))
                             .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
                     })
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 let register = fields_base
                     .checked_add(
-                        u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                        u16::try_from(index)
+                            .map_err(|_| CompileError::too_many_registers(expression.span()))?,
                     )
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 emit_expression(
                     &field.value,
                     register,
@@ -5774,7 +6105,7 @@ fn emit_expression(
                 type_id,
                 fields_base,
                 fields_count: u16::try_from(struct_type.fields.len())
-                    .map_err(|_| CompileError::too_many_registers())?,
+                    .map_err(|_| CompileError::too_many_registers(expression.span()))?,
                 dst: destination,
             });
         }
@@ -5784,10 +6115,10 @@ fn emit_expression(
                 .class_types
                 .iter()
                 .find(|class_type| class_type.type_id == type_id)
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))?;
             let fields_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             for (index, metadata) in class_type.fields.iter().enumerate() {
                 let field = fields
                     .iter()
@@ -5797,12 +6128,13 @@ fn emit_expression(
                             .get(&(type_id, field.name.clone()))
                             .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
                     })
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 let register = fields_base
                     .checked_add(
-                        u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                        u16::try_from(index)
+                            .map_err(|_| CompileError::too_many_registers(expression.span()))?,
                     )
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 emit_expression(
                     &field.value,
                     register,
@@ -5816,7 +6148,7 @@ fn emit_expression(
                 type_id,
                 fields_base,
                 fields_count: u16::try_from(class_type.fields.len())
-                    .map_err(|_| CompileError::too_many_registers())?,
+                    .map_err(|_| CompileError::too_many_registers(expression.span()))?,
                 dst: destination,
             });
         }
@@ -5838,7 +6170,7 @@ fn emit_expression(
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             emit_expression(
                 value,
@@ -5861,13 +6193,13 @@ fn emit_expression(
                     dst: destination,
                 });
             } else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
         }
         AstExpression::StructWith { value, updates } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             emit_expression(
                 value,
@@ -5879,12 +6211,12 @@ fn emit_expression(
             )?;
             let replacement = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             for update in updates {
                 let field = context
                     .struct_fields
                     .get(&(type_id, update.name.clone()))
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 emit_expression(
                     &update.value,
                     replacement,
@@ -5907,7 +6239,7 @@ fn emit_expression(
                 let lhs_register = destination;
                 let rhs_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 emit_expression(lhs, lhs_register, Some(operand_type), locals, context, code)?;
                 emit_expression(rhs, rhs_register, Some(operand_type), locals, context, code)?;
                 code.push(match operand_type {
@@ -5940,7 +6272,7 @@ fn emit_expression(
                             rhs: rhs_register,
                         }
                     }
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
                 });
                 code.replace_span(previous_span);
                 return Ok(());
@@ -5951,7 +6283,7 @@ fn emit_expression(
                 let lhs_register = destination;
                 let rhs_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 emit_expression(
                     lhs,
                     lhs_register,
@@ -5980,12 +6312,12 @@ fn emit_expression(
                 numeric_type,
                 ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
             ) {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             }
             let lhs_register = destination;
             let rhs_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             emit_expression(lhs, lhs_register, Some(numeric_type), locals, context, code)?;
             emit_expression(rhs, rhs_register, Some(numeric_type), locals, context, code)?;
             code.push(match (numeric_type, op.kind) {
@@ -6069,7 +6401,7 @@ fn emit_expression(
                     lhs: lhs_register,
                     rhs: rhs_register,
                 },
-                _ => return Err(CompileError::type_mismatch()),
+                _ => return Err(CompileError::type_mismatch(None, None, expression.span())),
             });
         }
         AstExpression::Call {
@@ -6080,12 +6412,16 @@ fn emit_expression(
                 && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
             {
                 let [payload] = arguments.as_slice() else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
-                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch())?;
+                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch(
+                    None,
+                    None,
+                    expression.span(),
+                ))?;
                 let payload_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(expression.span()))?;
                 emit_expression(
                     payload,
                     payload_register,
@@ -6105,7 +6441,7 @@ fn emit_expression(
             }
             let args_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(expression.span()))?;
             let signature = context
                 .host_functions
                 .get(function)
@@ -6116,23 +6452,24 @@ fn emit_expression(
                         .get(function)
                         .and_then(|index| context_function_signature(context, *index))
                 })
-                .ok_or_else(|| CompileError::unknown_name(function.clone()))?;
+                .ok_or_else(|| CompileError::unknown_name(function.clone(), expression.span()))?;
             for (index, argument) in arguments.iter().enumerate() {
                 emit_expression(
                     argument,
                     args_base
                         .checked_add(
-                            u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                            u16::try_from(index)
+                                .map_err(|_| CompileError::too_many_registers(code.span))?,
                         )
-                        .ok_or(CompileError::too_many_registers())?,
+                        .ok_or(CompileError::too_many_registers(code.span))?,
                     Some(signature.parameters[index]),
                     locals,
                     context,
                     code,
                 )?;
             }
-            let args_count =
-                u16::try_from(arguments.len()).map_err(|_| CompileError::too_many_registers())?;
+            let args_count = u16::try_from(arguments.len())
+                .map_err(|_| CompileError::too_many_registers(code.span))?;
             if let Some(host) = context.host_functions.get(function) {
                 code.push(Instruction::HostCall {
                     import: host.import,
@@ -6145,14 +6482,14 @@ fn emit_expression(
                     function: *context
                         .functions
                         .get(function)
-                        .ok_or_else(|| CompileError::unknown_name(function.clone()))?,
+                        .ok_or_else(|| CompileError::unknown_name(function.clone(), code.span))?,
                     args_base,
                     args_count,
                     dst: destination,
                 });
             }
         }
-        AstExpression::Await(expression) => {
+        AstExpression::Await { expression, .. } => {
             emit_expression(expression, destination, expected, locals, context, code)?;
             code.map_next(expression_span);
         }
@@ -6164,24 +6501,25 @@ fn emit_expression(
             let type_id = if let Some(type_name) = type_name {
                 let type_id = StableId::from_name(type_name);
                 if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, code.span));
                 }
                 type_id
             } else {
-                let ValueType::Named(type_id) = expected.ok_or(CompileError::cannot_infer_type())?
+                let ValueType::Named(type_id) =
+                    expected.ok_or(CompileError::cannot_infer_type(code.span))?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, code.span));
                 };
                 type_id
             };
             let metadata = context
                 .enum_variants
                 .get(&(type_id, variant.clone()))
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, code.span))?;
             let payload_register = if let Some(payload) = payload {
                 let register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::too_many_registers())?;
+                    .ok_or(CompileError::too_many_registers(code.span))?;
                 emit_expression(
                     payload,
                     register,
@@ -6204,7 +6542,7 @@ fn emit_expression(
         AstExpression::Match { value, arms } => {
             emit_match_expression(value, arms, destination, expected, locals, context, code)?;
         }
-        AstExpression::Try(expression) => {
+        AstExpression::Try { expression, .. } => {
             emit_try_expression(expression, destination, locals, context, code)?;
         }
         AstExpression::Migration(intrinsic) => {
@@ -6224,13 +6562,13 @@ fn emit_string_method(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let (receiver, method) =
-        string_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
+    let (receiver, method) = string_method(function)
+        .ok_or_else(|| CompileError::unknown_name(function.into(), code.span))?;
     let (source, ty) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into(), code.span))?;
     if ty != ValueType::String {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, code.span));
     }
     match method {
         StringMethod::Len => code.push(Instruction::StringLen {
@@ -6248,7 +6586,7 @@ fn emit_string_method(
         StringMethod::Equal | StringMethod::Concat => {
             let rhs = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 rhs,
@@ -6274,7 +6612,7 @@ fn emit_string_method(
         StringMethod::RuneAt => {
             let index = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 index,
@@ -6302,23 +6640,23 @@ fn emit_buffer_method(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let (receiver, method) =
-        buffer_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
+    let (receiver, method) = buffer_method(function)
+        .ok_or_else(|| CompileError::unknown_name(function.into(), code.span))?;
     let (buffer, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into(), code.span))?;
     let ValueType::Named(buffer_type) = receiver_type else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, code.span));
     };
     let element = context
         .buffer_types
         .iter()
         .find(|candidate| candidate.type_id == buffer_type)
         .map(|candidate| candidate.element)
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, code.span))?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     match method {
         BufferMethod::Len => code.push(Instruction::BufferLen {
             source: buffer,
@@ -6342,7 +6680,7 @@ fn emit_buffer_method(
         BufferMethod::Set => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6365,7 +6703,7 @@ fn emit_buffer_method(
         BufferMethod::Slice => {
             let length = temporary
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6392,13 +6730,13 @@ fn emit_buffer_method(
         BufferMethod::Copy => {
             let source_start = temporary
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             let destination_start = temporary
                 .checked_add(2)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             let length = temporary
                 .checked_add(3)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6446,22 +6784,22 @@ fn emit_map_method(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let (receiver, method) =
-        map_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
+    let (receiver, method) = map_method(function)
+        .ok_or_else(|| CompileError::unknown_name(function.into(), code.span))?;
     let (source, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into(), code.span))?;
     let ValueType::Named(map_type) = receiver_type else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, code.span));
     };
     let map_type = context
         .map_types
         .iter()
         .find(|candidate| candidate.type_id == map_type)
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, code.span))?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     match method {
         MapMethod::Len => code.push(Instruction::MapLen {
             source,
@@ -6496,7 +6834,7 @@ fn emit_map_method(
         MapMethod::Set => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6558,23 +6896,23 @@ fn emit_array_method(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let (receiver, method) =
-        array_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
+    let (receiver, method) = array_method(function)
+        .ok_or_else(|| CompileError::unknown_name(function.into(), code.span))?;
     let (source, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into(), code.span))?;
     let ValueType::Named(array_type) = receiver_type else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, code.span));
     };
     let element = context
         .array_types
         .iter()
         .find(|candidate| candidate.type_id == array_type)
         .map(|candidate| candidate.element)
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, code.span))?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     match method {
         ArrayMethod::Len => code.push(Instruction::ArrayLen {
             source,
@@ -6606,7 +6944,7 @@ fn emit_array_method(
         ArrayMethod::Set | ArrayMethod::Insert => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6675,18 +7013,18 @@ fn emit_state_handle_method(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let (receiver, method) =
-        state_handle_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
+    let (receiver, method) = state_handle_method(function)
+        .ok_or_else(|| CompileError::unknown_name(function.into(), code.span))?;
     let (handle, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into(), code.span))?;
     let ValueType::Named(handle_type) = receiver_type else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, code.span));
     };
     let target = *context
         .state_handle_targets
         .get(&handle_type)
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, code.span))?;
     match method {
         StateHandleMethod::Resolve => code.push(Instruction::StateHandleResolve {
             handle,
@@ -6716,7 +7054,7 @@ fn emit_state_handle_method(
         StateHandleMethod::Equality => {
             let rhs = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(code.span))?;
             emit_expression(
                 &arguments[0],
                 rhs,
@@ -6762,16 +7100,16 @@ fn emitted_expression_type(
         AstExpression::Integer(value) => match expected {
             Some(ValueType::I32) | None if i32::try_from(*value).is_ok() => Ok(ValueType::I32),
             Some(ValueType::I64) | None => Ok(ValueType::I64),
-            Some(_) => Err(CompileError::type_mismatch()),
+            Some(_) => Err(CompileError::type_mismatch(None, None, expression.span())),
         },
         AstExpression::Float(_) => match expected {
             Some(ValueType::F32) => Ok(ValueType::F32),
             Some(ValueType::F64) | None => Ok(ValueType::F64),
-            Some(_) => Err(CompileError::type_mismatch()),
+            Some(_) => Err(CompileError::type_mismatch(None, None, expression.span())),
         },
         AstExpression::Rune(value) => char::from_u32(*value)
             .map(|_| ValueType::Rune)
-            .ok_or(CompileError::type_mismatch()),
+            .ok_or(CompileError::type_mismatch(None, None, expression.span())),
         AstExpression::String(_) => Ok(ValueType::String),
         AstExpression::Binary { op, lhs, .. } if op.kind == BinaryOp::Equal => Ok(ValueType::Bool),
         AstExpression::Binary { op, lhs, .. } => {
@@ -6789,21 +7127,21 @@ fn emitted_expression_type(
             ) {
                 Ok(ty)
             } else {
-                Err(CompileError::type_mismatch())
+                Err(CompileError::type_mismatch(None, None, expression.span()))
             }
         }
         AstExpression::Bool(_) => Ok(ValueType::Bool),
         AstExpression::Name(name) => locals.get(name).map_or_else(
             || {
                 let Some(ValueType::Named(type_id)) = expected else {
-                    return Err(CompileError::unknown_name(name.clone()));
+                    return Err(CompileError::unknown_name(name.clone(), expression.span()));
                 };
                 context
                     .enum_variants
                     .get(&(type_id, name.clone()))
                     .filter(|variant| variant.payload_type.is_none())
                     .map(|_| ValueType::Named(type_id))
-                    .ok_or_else(|| CompileError::unknown_name(name.clone()))
+                    .ok_or_else(|| CompileError::unknown_name(name.clone(), expression.span()))
             },
             |(_, ty)| Ok(*ty),
         ),
@@ -6814,7 +7152,7 @@ fn emitted_expression_type(
                 .iter()
                 .any(|struct_type| struct_type.type_id == type_id)
                 .then_some(ValueType::Named(type_id))
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))
         }
         AstExpression::ClassNew { type_name, .. } => {
             let type_id = StableId::from_name(type_name);
@@ -6823,7 +7161,7 @@ fn emitted_expression_type(
                 .iter()
                 .any(|class_type| class_type.type_id == type_id)
                 .then_some(ValueType::Named(type_id))
-                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone(), expression.span()))
         }
         AstExpression::ArrayNew { element_type } => Ok(ValueType::Named(
             nexa_bytecode::array_type(lower_type(element_type)),
@@ -6838,14 +7176,14 @@ fn emitted_expression_type(
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             context
                 .struct_fields
                 .get(&(type_id, field.clone()))
                 .or_else(|| context.class_fields.get(&(type_id, field.clone())))
                 .map(|field| field.ty)
-                .ok_or(CompileError::type_mismatch())
+                .ok_or(CompileError::type_mismatch(None, None, expression.span()))
         }
         AstExpression::StructWith { value, .. } => {
             emitted_expression_type(value, None, locals, context)
@@ -6869,17 +7207,17 @@ fn emitted_expression_type(
                     StringMethod::RuneAt => ValueType::Rune,
                 })
             } else if let Some((receiver, method)) = state_handle_method(function) {
-                let ValueType::Named(handle_type) = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
+                let ValueType::Named(handle_type) =
+                    locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                        CompileError::unknown_name(receiver.into(), expression.span())
+                    })?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let target = *context
                     .state_handle_targets
                     .get(&handle_type)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 Ok(match method {
                     StateHandleMethod::Resolve => ValueType::Named(
                         nexa_bytecode::result_type(
@@ -6900,19 +7238,18 @@ fn emitted_expression_type(
                         .any(|buffer| buffer.type_id == *type_id))
                 })
             {
-                let receiver_type = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
+                let receiver_type = locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                    CompileError::unknown_name(receiver.into(), expression.span())
+                })?;
                 let ValueType::Named(buffer_type) = receiver_type else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let element = context
                     .buffer_types
                     .iter()
                     .find(|buffer| buffer.type_id == buffer_type)
                     .map(|buffer| buffer.element)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 Ok(match method {
                     BufferMethod::Len => ValueType::I32,
                     BufferMethod::Get => element,
@@ -6927,18 +7264,18 @@ fn emitted_expression_type(
                         .any(|map_type| map_type.type_id == *type_id))
                 })
             {
-                let ValueType::Named(map_type) = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
+                let ValueType::Named(map_type) =
+                    locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                        CompileError::unknown_name(receiver.into(), expression.span())
+                    })?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let map_type = context
                     .map_types
                     .iter()
                     .find(|candidate| candidate.type_id == map_type)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 Ok(match method {
                     MapMethod::Len => ValueType::I32,
                     MapMethod::Get | MapMethod::Remove => {
@@ -6947,19 +7284,19 @@ fn emitted_expression_type(
                     MapMethod::Set | MapMethod::Contains | MapMethod::Clear => ValueType::Bool,
                 })
             } else if let Some((receiver, method)) = array_method(function) {
-                let ValueType::Named(array_type) = locals
-                    .get(receiver)
-                    .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
+                let ValueType::Named(array_type) =
+                    locals.get(receiver).map(|(_, ty)| *ty).ok_or_else(|| {
+                        CompileError::unknown_name(receiver.into(), expression.span())
+                    })?
                 else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, expression.span()));
                 };
                 let element = context
                     .array_types
                     .iter()
                     .find(|candidate| candidate.type_id == array_type)
                     .map(|candidate| candidate.element)
-                    .ok_or(CompileError::type_mismatch())?;
+                    .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
                 Ok(match method {
                     ArrayMethod::Len => ValueType::I32,
                     ArrayMethod::Get | ArrayMethod::Pop | ArrayMethod::Remove => element,
@@ -6980,28 +7317,30 @@ fn emitted_expression_type(
                             .and_then(|index| context_function_signature(context, *index))
                     })
                     .and_then(|signature| signature.result)
-                    .ok_or_else(|| CompileError::unknown_name(function.clone()))
+                    .ok_or_else(|| CompileError::unknown_name(function.clone(), expression.span()))
             }
         }
-        AstExpression::Await(expression) => {
+        AstExpression::Await { expression, .. } => {
             emitted_expression_type(expression, expected, locals, context)
         }
         AstExpression::Constructor { type_name, .. } => type_name.as_ref().map_or_else(
-            || expected.ok_or(CompileError::cannot_infer_type()),
+            || expected.ok_or(CompileError::cannot_infer_type(expression.span())),
             |type_name| Ok(ValueType::Named(StableId::from_name(type_name))),
         ),
-        AstExpression::Match { .. } => expected.ok_or(CompileError::cannot_infer_type()),
-        AstExpression::Try(expression) => {
+        AstExpression::Match { .. } => {
+            expected.ok_or(CompileError::cannot_infer_type(expression.span()))
+        }
+        AstExpression::Try { expression, .. } => {
             let ValueType::Named(type_id) =
                 emitted_expression_type(expression, None, locals, context)?
             else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, expression.span()));
             };
             context
                 .enum_variants
                 .get(&(type_id, "Ok".to_owned()))
                 .and_then(|variant| variant.payload_type)
-                .ok_or(CompileError::type_mismatch())
+                .ok_or(CompileError::type_mismatch(None, None, expression.span()))
         }
         AstExpression::Migration(intrinsic) => Ok(match intrinsic.kind() {
             MigrationIntrinsic::OldGet { ty, .. }
@@ -7028,9 +7367,9 @@ fn emit_match_expression(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let result_type = expected.ok_or(CompileError::cannot_infer_type())?;
+    let result_type = expected.ok_or(CompileError::cannot_infer_type(code.span))?;
     let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)? else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, value.span()));
     };
     emit_expression(
         value,
@@ -7042,13 +7381,13 @@ fn emit_match_expression(
     )?;
     let tag_register = destination
         .checked_add(1)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     let expected_tag = destination
         .checked_add(2)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     let condition = destination
         .checked_add(3)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(code.span))?;
     code.push(Instruction::EnumTag {
         source: destination,
         dst: tag_register,
@@ -7057,7 +7396,7 @@ fn emit_match_expression(
     let mut pending_false = None;
     for arm in arms {
         let arm_start =
-            u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+            u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers(code.span))?;
         if let Some(branch) = pending_false.take() {
             code[branch] = Instruction::JumpIfFalse {
                 condition,
@@ -7067,7 +7406,7 @@ fn emit_match_expression(
         let variant = context
             .enum_variants
             .get(&(type_id, arm.variant.clone()))
-            .ok_or(CompileError::type_mismatch())?;
+            .ok_or(CompileError::type_mismatch(None, None, arm.span))?;
         code.push(Instruction::LoadI32 {
             dst: expected_tag,
             value: i32::from_ne_bytes(variant.tag.to_ne_bytes()),
@@ -7101,7 +7440,8 @@ fn emit_match_expression(
         success_jumps.push(code.len());
         code.push(Instruction::Jump { target: 0 });
     }
-    let trap = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+    let trap =
+        u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers(code.span))?;
     if let Some(branch) = pending_false {
         code[branch] = Instruction::JumpIfFalse {
             condition,
@@ -7109,7 +7449,7 @@ fn emit_match_expression(
         };
     }
     code.push(Instruction::Trap);
-    let end = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+    let end = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers(code.span))?;
     code.push(Instruction::Safepoint);
     for jump in success_jumps {
         code[jump] = Instruction::Jump { target: end };
@@ -7126,23 +7466,23 @@ fn emit_try_expression(
 ) -> Result<(), CompileError> {
     let ValueType::Named(type_id) = emitted_expression_type(expression, None, locals, context)?
     else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, expression.span()));
     };
     let ok = context
         .enum_variants
         .get(&(type_id, "Ok".to_owned()))
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
     let error = context
         .enum_variants
         .get(&(type_id, "Err".to_owned()))
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
     let ValueType::Named(function_result) = context.function_result else {
-        return Err(CompileError::type_mismatch());
+        return Err(CompileError::type_mismatch(None, None, expression.span()));
     };
     let result_error = context
         .enum_variants
         .get(&(function_result, "Err".to_owned()))
-        .ok_or(CompileError::type_mismatch())?;
+        .ok_or(CompileError::type_mismatch(None, None, expression.span()))?;
     emit_expression(
         expression,
         destination,
@@ -7153,13 +7493,13 @@ fn emit_try_expression(
     )?;
     let tag = destination
         .checked_add(1)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(expression.span()))?;
     let expected_tag = destination
         .checked_add(2)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(expression.span()))?;
     let condition = destination
         .checked_add(3)
-        .ok_or(CompileError::too_many_registers())?;
+        .ok_or(CompileError::too_many_registers(expression.span()))?;
     code.push(Instruction::EnumTag {
         source: destination,
         dst: tag,
@@ -7185,7 +7525,8 @@ fn emit_try_expression(
     });
     let success = code.len();
     code.push(Instruction::Jump { target: 0 });
-    let error_start = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+    let error_start = u32::try_from(code.len())
+        .map_err(|_| CompileError::too_many_registers(expression.span()))?;
     code[error_branch] = Instruction::JumpIfFalse {
         condition,
         target: error_start,
@@ -7204,7 +7545,8 @@ fn emit_try_expression(
     code.push(Instruction::Return {
         source: destination,
     });
-    let end = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
+    let end = u32::try_from(code.len())
+        .map_err(|_| CompileError::too_many_registers(expression.span()))?;
     code.push(Instruction::Safepoint);
     code[success] = Instruction::Jump { target: end };
     Ok(())
@@ -7234,7 +7576,7 @@ fn emit_migration_intrinsic(
         } => {
             let object_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(intrinsic.span()))?;
             emit_expression(
                 object,
                 object_register,
@@ -7252,7 +7594,7 @@ fn emit_migration_intrinsic(
         }
         MigrationIntrinsic::NewCreate { stable_id, ty } => {
             let ValueType::Named(type_id) = lower_type(ty) else {
-                return Err(CompileError::type_mismatch());
+                return Err(CompileError::type_mismatch(None, None, ty.span()));
             };
             code.push(Instruction::StateNewCreate {
                 stable_id: StableId::from_name(stable_id),
@@ -7280,7 +7622,7 @@ fn emit_migration_intrinsic(
                         .find(|candidate| candidate.stable_id == field_id)
                 })
                 .map(|field| field.ty)
-                .ok_or(CompileError::type_mismatch())?;
+                .ok_or(CompileError::type_mismatch(None, None, intrinsic.span()))?;
             emit_expression(
                 object,
                 destination,
@@ -7291,7 +7633,7 @@ fn emit_migration_intrinsic(
             )?;
             let value_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::too_many_registers())?;
+                .ok_or(CompileError::too_many_registers(intrinsic.span()))?;
             emit_expression(
                 value,
                 value_register,
@@ -7432,11 +7774,12 @@ pub fn compile_with_interface(
     interface: &Idl,
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
-    let idl_snapshot_types = collect_idl_snapshot_types(interface)?;
     let (idl_array_types, idl_buffer_types, idl_parameterized_enums) =
         collect_idl_boundary_types(interface);
     let tokens = lex(source)?;
     let mut ast = parse(&tokens)?;
+    let interface_span = ast.imports.first().map_or(ast.span, |import| import.span);
+    let idl_snapshot_types = collect_idl_snapshot_types(interface, interface_span)?;
     for structure in &interface.structs {
         if !ast
             .types
@@ -7445,6 +7788,7 @@ pub fn compile_with_interface(
         {
             ast.types.push(AstTypeDeclaration {
                 name: structure.name.clone(),
+                name_span: interface_span,
                 kind: AstTypeKind::Struct,
                 version: 0,
                 fields: structure
@@ -7452,12 +7796,13 @@ pub fn compile_with_interface(
                     .iter()
                     .map(|field| AstField {
                         name: field.name.clone(),
+                        name_span: interface_span,
                         ty: ast_type_from_idl(&field.ty),
-                        span: SourceSpan::new(FileId(0), 0, 0),
+                        span: interface_span,
                     })
                     .collect(),
                 variants: Vec::new(),
-                span: SourceSpan::new(FileId(0), 0, 0),
+                span: interface_span,
             });
         }
     }
@@ -7469,6 +7814,7 @@ pub fn compile_with_interface(
         {
             ast.types.push(AstTypeDeclaration {
                 name: enumeration.name.clone(),
+                name_span: interface_span,
                 kind: AstTypeKind::Enum,
                 version: 0,
                 fields: Vec::new(),
@@ -7477,11 +7823,12 @@ pub fn compile_with_interface(
                     .iter()
                     .map(|variant| AstVariant {
                         name: variant.name.clone(),
+                        name_span: interface_span,
                         payload: variant.payload.as_ref().map(ast_type_from_idl),
-                        span: SourceSpan::new(FileId(0), 0, 0),
+                        span: interface_span,
                     })
                     .collect(),
-                span: SourceSpan::new(FileId(0), 0, 0),
+                span: interface_span,
             });
         }
     }
@@ -7489,7 +7836,7 @@ pub fn compile_with_interface(
         .imports
         .first()
         .and_then(|import| import.name.rsplit('.').next())
-        .ok_or_else(|| CompileError::unknown_name("missing host import".into()))?;
+        .ok_or_else(|| CompileError::unknown_name("missing host import".into(), interface_span))?;
     let mut host_functions = BTreeMap::new();
     for (index, function) in interface.functions.iter().enumerate() {
         let parameters = function
@@ -7505,9 +7852,9 @@ pub fn compile_with_interface(
                     TypeRef::Result(success, error) => {
                         (lower_idl_type(success), lower_idl_type(error))
                     }
-                    _ => return Err(CompileError::type_mismatch()),
+                    _ => return Err(CompileError::type_mismatch(None, None, interface_span)),
                 },
-                _ => return Err(CompileError::type_mismatch()),
+                _ => return Err(CompileError::type_mismatch(None, None, interface_span)),
             };
             let result_type = nexa_bytecode::result_type(success, error).type_id;
             let policy_error = |ty: &TypeRef, variant: &str, fallback: u32| match ty {
@@ -7533,14 +7880,14 @@ pub fn compile_with_interface(
             let cancel_error = match function.cancel_policy {
                 nexa_idl::CancelPolicy::ReturnError => Some(
                     policy_error(error_ref, "Cancelled", u32::MAX - 1)
-                        .ok_or(CompileError::type_mismatch())?,
+                        .ok_or(CompileError::type_mismatch(None, None, interface_span))?,
                 ),
                 nexa_idl::CancelPolicy::CancelTask => None,
             };
             let abandon_error = match function.abandon_policy {
                 nexa_idl::AbandonPolicy::ReturnError => Some(
                     policy_error(error_ref, "Abandoned", u32::MAX)
-                        .ok_or(CompileError::type_mismatch())?,
+                        .ok_or(CompileError::type_mismatch(None, None, interface_span))?,
                 ),
                 nexa_idl::AbandonPolicy::Trap => None,
             };
@@ -7578,7 +7925,8 @@ pub fn compile_with_interface(
         host_functions.insert(
             format!("{import}.{}", function.name),
             HostFunction {
-                import: u32::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                import: u32::try_from(index)
+                    .map_err(|_| CompileError::too_many_registers(interface_span))?,
                 signature: Signature { parameters, result },
                 metadata,
             },
@@ -7630,7 +7978,7 @@ pub fn compile_with_interface(
             .iter()
             .enumerate()
             .find(|(_, function)| function.name.eq_ignore_ascii_case(&export.name))
-            .ok_or_else(|| CompileError::unknown_name(export.name.clone()))?;
+            .ok_or_else(|| CompileError::unknown_name(export.name.clone(), hir.span()))?;
         let signature = Signature {
             parameters: export
                 .parameters
@@ -7640,16 +7988,21 @@ pub fn compile_with_interface(
             result: export.result.as_ref().map(lower_idl_type),
         };
         if hir_function.signature != signature {
-            return Err(CompileError::type_mismatch());
+            return Err(CompileError::type_mismatch(
+                Some(signature.result.unwrap_or(ValueType::Ref)),
+                hir_function.signature.result,
+                hir_function.span,
+            ));
         }
         module.exports.push(ScriptExport {
             stable_id: StableId::from_parts(&[&interface.interface, "::export::", &export.name]),
-            function: u32::try_from(function).map_err(|_| CompileError::too_many_registers())?,
+            function: u32::try_from(function)
+                .map_err(|_| CompileError::too_many_registers(hir_function.span))?,
             signature,
         });
     }
     verify(module, VerifierLimits::default())
-        .map_err(|error| CompileError::verify(error.to_string()))
+        .map_err(|error| CompileError::verify(error.to_string(), hir.span()))
 }
 
 fn lower_idl_type(ty: &TypeRef) -> ValueType {
@@ -7684,28 +8037,34 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
     }
 }
 
-fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, CompileError> {
+fn collect_idl_snapshot_types(
+    interface: &Idl,
+    span: SourceSpan,
+) -> Result<Vec<SnapshotType>, CompileError> {
     fn collect(
         ty: &TypeRef,
         snapshots: &mut BTreeMap<StableId, SnapshotType>,
+        span: SourceSpan,
     ) -> Result<(), CompileError> {
         match ty {
             TypeRef::Snapshot(Some(content)) => {
                 let TypeRef::Named(name) = content.as_ref() else {
-                    return Err(CompileError::type_mismatch());
+                    return Err(CompileError::type_mismatch(None, None, span));
                 };
                 let snapshot = SnapshotType::new(StableId::from_name(name));
                 snapshots.insert(snapshot.type_id, snapshot);
             }
-            TypeRef::Snapshot(None) => return Err(CompileError::type_mismatch()),
+            TypeRef::Snapshot(None) => {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
             TypeRef::HostRequest(Some(inner))
             | TypeRef::ResourceToken(Some(inner))
             | TypeRef::Array(inner)
             | TypeRef::Buffer(inner)
-            | TypeRef::Option(inner) => collect(inner, snapshots)?,
+            | TypeRef::Option(inner) => collect(inner, snapshots, span)?,
             TypeRef::Result(success, error) => {
-                collect(success, snapshots)?;
-                collect(error, snapshots)?;
+                collect(success, snapshots, span)?;
+                collect(error, snapshots, span)?;
             }
             TypeRef::I32
             | TypeRef::I64
@@ -7724,28 +8083,28 @@ fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, Comp
     let mut snapshots = BTreeMap::new();
     for structure in &interface.structs {
         for field in &structure.fields {
-            collect(&field.ty, &mut snapshots)?;
+            collect(&field.ty, &mut snapshots, span)?;
         }
     }
     for enumeration in &interface.enums {
         for variant in &enumeration.variants {
             if let Some(payload) = &variant.payload {
-                collect(payload, &mut snapshots)?;
+                collect(payload, &mut snapshots, span)?;
             }
         }
     }
     for function in &interface.functions {
         for parameter in &function.parameters {
-            collect(&parameter.ty, &mut snapshots)?;
+            collect(&parameter.ty, &mut snapshots, span)?;
         }
-        collect(&function.result, &mut snapshots)?;
+        collect(&function.result, &mut snapshots, span)?;
     }
     for export in &interface.exports {
         for parameter in &export.parameters {
-            collect(&parameter.ty, &mut snapshots)?;
+            collect(&parameter.ty, &mut snapshots, span)?;
         }
         if let Some(result) = &export.result {
-            collect(result, &mut snapshots)?;
+            collect(result, &mut snapshots, span)?;
         }
     }
     Ok(snapshots.into_values().collect())
@@ -7877,19 +8236,20 @@ fn compile_module(
     let tokens = lex(source)?;
     let ast = parse(&tokens)?;
     let hir = resolve_and_typecheck(ast)?;
+    let module_span = hir.span();
     let mut module = emit_bytecode(&hir)?;
     if let Some((host_hash, schema_hash)) = metadata {
         module.host_interface_hash = Some(host_hash);
         module.schema_hash = Some(schema_hash);
     }
     verify(module, VerifierLimits::default())
-        .map_err(|error| CompileError::verify(error.to_string()))
+        .map_err(|error| CompileError::verify(error.to_string(), module_span))
 }
 
 #[cfg(test)]
 mod tests {
-    use nexa_bytecode::{FunctionEffect, Instruction, ValueType};
-    use nexa_core::{FileId, SourceSpan, StableId};
+    use nexa_bytecode::{FunctionEffect, Instruction};
+    use nexa_core::{FileId, StableId};
     use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue, TrapKind};
 
     use super::{
@@ -7898,100 +8258,44 @@ mod tests {
     };
 
     #[test]
-    fn diagnostic_spans_cover_every_source_backed_compile_error() {
-        let span = SourceSpan::new(FileId(7), 3, 9);
-        let errors = vec![
-            CompileError::UnexpectedCharacter {
-                offset: 3,
-                character: '#',
-            },
-            CompileError::UnexpectedToken {
-                offset: 3,
-                expected: "identifier",
-            },
-            CompileError::UnexpectedEnd { span },
-            CompileError::DuplicateName {
-                name: "value".into(),
-                first: span,
-                duplicate: span,
-            },
-            CompileError::UnknownName {
-                name: "value".into(),
-                span,
-            },
-            CompileError::UnknownType {
-                name: "Value".into(),
-                span,
-            },
-            CompileError::TypeMismatch {
-                expected: Some(ValueType::I32),
-                actual: Some(ValueType::Bool),
-                span,
-            },
-            CompileError::InvalidNumericConversion { span },
-            CompileError::CannotInferType { span },
-            CompileError::NonExhaustiveMatch {
-                missing: vec![StableId::from_name("Missing")],
-                span,
-            },
-            CompileError::DuplicateMatchVariant {
-                variant: StableId::from_name("Duplicate"),
-                first: span,
-                duplicate: span,
-            },
-            CompileError::TryRequiresResult {
-                actual: ValueType::I32,
-                span,
-            },
-            CompileError::TryErrorMismatch {
-                expected: ValueType::I32,
-                actual: ValueType::Bool,
-                span,
-            },
-            CompileError::AwaitOutsideTask { span },
-            CompileError::MissingAwait { span },
-            CompileError::MigrationIntrinsicOutsideMigration {
-                intrinsic: "old_get".into(),
-                span,
-            },
-            CompileError::MissingMigrationFinish {
-                function_span: span,
-            },
-            CompileError::DuplicateForwarding {
-                stable_id: StableId::from_name("duplicate"),
-                span,
-            },
-            CompileError::MissingForwarding {
-                stable_id: StableId::from_name("missing"),
-                function_span: span,
-            },
-            CompileError::InvalidFieldAccess {
-                type_id: StableId::from_name("Record"),
-                field: "missing".into(),
-                span,
-            },
-            CompileError::MissingReturn {
-                function_span: span,
-            },
-            CompileError::SuspendingDefer { span },
-            CompileError::DeferCaptureLimit { span },
-            CompileError::InvalidEffect { span },
-            CompileError::InvalidReloadMetadata {
-                message: "invalid",
-                function_span: span,
-            },
-            CompileError::TooManyRegisters {
-                function_span: span,
-            },
-            CompileError::Verify {
-                message: "invalid".into(),
-                function_span: span,
-            },
-        ];
-        for error in errors {
-            let span = error.source_span().expect("source-backed error has a span");
-            assert!(span.start < span.end, "{error:?}");
-        }
+    fn resolver_effect_and_reload_errors_use_real_source_slices() {
+        let duplicate_source = "struct Entry { value: i32; }\nstruct Entry { other: i32; }";
+        let CompileError::DuplicateName {
+            first, duplicate, ..
+        } = compile(duplicate_source).unwrap_err()
+        else {
+            panic!("duplicate declaration must be rejected");
+        };
+        assert_eq!(
+            &duplicate_source[first.start as usize..first.end as usize],
+            "Entry"
+        );
+        assert_eq!(
+            &duplicate_source[duplicate.start as usize..duplicate.end as usize],
+            "Entry"
+        );
+
+        let defer_source = "task fn work() -> i32 { return 1; }
+task fn main() -> i32 { defer await work(); return 0; }";
+        let CompileError::SuspendingDefer { span } = compile(defer_source).unwrap_err() else {
+            panic!("suspending defer must be rejected");
+        };
+        assert_eq!(
+            &defer_source[span.start as usize..span.end as usize],
+            "await work()"
+        );
+
+        let reload_source = "migration fn first() -> bool { finish_migration(); return true; }
+migration fn second() -> bool { finish_migration(); return true; }";
+        let CompileError::InvalidReloadMetadata { function_span, .. } =
+            compile(reload_source).unwrap_err()
+        else {
+            panic!("duplicate migration entry must be rejected");
+        };
+        assert_eq!(
+            &reload_source[function_span.start as usize..function_span.end as usize],
+            "migration fn second() -> bool { finish_migration(); return true; }"
+        );
     }
 
     #[test]
@@ -8042,10 +8346,17 @@ migration fn migrate() -> bool {
         let AstStatement::Bind { value, .. } = function.body[0].kind() else {
             panic!("expected binding");
         };
-        let AstExpression::Await(awaited) = value.kind() else {
+        let AstExpression::Await {
+            expression: awaited,
+            ..
+        } = value.kind()
+        else {
             panic!("expected await");
         };
-        let AstExpression::Try(called) = awaited.kind() else {
+        let AstExpression::Try {
+            expression: called, ..
+        } = awaited.kind()
+        else {
             panic!("expected try");
         };
         assert!(matches!(called.kind(), AstExpression::Call { .. }));
@@ -8742,7 +9053,10 @@ migration fn migrate() -> bool {
             "immediate fn bad() -> Array<i32> { return Array.new<i32>(); }",
             "immediate fn bad(values: Array<i32>) -> i32 { return values.len(); }",
         ] {
-            assert_eq!(compile(source).unwrap_err(), CompileError::invalid_effect());
+            assert!(matches!(
+                compile(source),
+                Err(CompileError::InvalidEffect { .. })
+            ));
         }
     }
 
@@ -8851,11 +9165,10 @@ migration fn migrate() -> bool {
                 ..
             }
         ));
-        assert_eq!(
-            compile("immediate fn bad(buffer: Buffer<i32>) -> i32 { return buffer.len(); }")
-                .unwrap_err(),
-            CompileError::invalid_effect()
-        );
+        assert!(matches!(
+            compile("immediate fn bad(buffer: Buffer<i32>) -> i32 { return buffer.len(); }"),
+            Err(CompileError::InvalidEffect { .. })
+        ));
     }
 
     #[test]
@@ -9292,6 +9605,7 @@ migration fn migrate() -> bool {
             fn wrap(value: i32) -> Option<i32> { return Some(value); }
             migration fn migrate() -> bool {
                 old.get<i32>(legacy);
+                preserve(legacy);
                 finish_migration();
                 return true;
             }";
@@ -9348,10 +9662,10 @@ migration fn migrate() -> bool {
             ),
             Err(CompileError::AwaitOutsideTask { span }) if !span.is_empty()
         ));
-        assert_eq!(
-            compile("fn partial(flag: bool) -> i32 { if flag { return 1; } }").unwrap_err(),
-            CompileError::missing_return()
-        );
+        assert!(matches!(
+            compile("fn partial(flag: bool) -> i32 { if flag { return 1; } }"),
+            Err(CompileError::MissingReturn { .. })
+        ));
         assert!(matches!(
             compile(
                 "fn scoped(flag: bool) -> i32 {
@@ -9361,16 +9675,15 @@ migration fn migrate() -> bool {
             ),
             Err(CompileError::UnknownName { name, .. }) if name == "hidden"
         ));
-        assert_eq!(
+        assert!(matches!(
             compile(
                 "struct A { value: i32; }
                  struct B { value: i32; }
                  fn take(value: A) -> A { return value; }
                  fn bad(value: B) -> A { return take(value); }"
-            )
-            .unwrap_err(),
-            CompileError::type_mismatch()
-        );
+            ),
+            Err(CompileError::TypeMismatch { .. })
+        ));
 
         let shadow = compile(
             "fn shadow() -> i32 {
@@ -9445,26 +9758,33 @@ migration fn migrate() -> bool {
         assert!(metadata.minimum_migration_limits.max_fuel > 0);
         assert_eq!(metadata.minimum_migration_limits.max_call_depth, 1);
 
-        assert_eq!(
+        assert!(matches!(
             compile(
                 "migration fn first() -> bool { return true; }
                  migration fn second() -> bool { return true; }"
-            )
-            .unwrap_err(),
-            CompileError::invalid_reload_metadata("multiple migration entries")
-        );
-        assert_eq!(
+            ),
+            Err(CompileError::InvalidReloadMetadata {
+                message: "multiple migration entries",
+                ..
+            })
+        ));
+        assert!(matches!(
             compile(
                 "@activation fn first() -> bool { return true; }
                  @activation fn second() -> bool { return true; }"
-            )
-            .unwrap_err(),
-            CompileError::invalid_reload_metadata("multiple activation entries")
-        );
-        assert_eq!(
-            compile("@activation task fn invalid() -> bool { return true; }").unwrap_err(),
-            CompileError::invalid_reload_metadata("activation entry must have Immediate effect")
-        );
+            ),
+            Err(CompileError::InvalidReloadMetadata {
+                message: "multiple activation entries",
+                ..
+            })
+        ));
+        assert!(matches!(
+            compile("@activation task fn invalid() -> bool { return true; }"),
+            Err(CompileError::InvalidReloadMetadata {
+                message: "activation entry must have Immediate effect",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -9591,10 +9911,13 @@ migration fn migrate() -> bool {
              @stateful class Store { snapshot: Snapshot<View>; }",
             "@stateful class Store { buffer: Buffer; }",
         ] {
-            assert_eq!(compile(source).unwrap_err(), CompileError::type_mismatch());
+            assert!(matches!(
+                compile(source),
+                Err(CompileError::TypeMismatch { .. })
+            ));
         }
 
-        assert_eq!(
+        assert!(matches!(
             compile(
                 "@stateful class Store { value: i32; }
                  migration fn migrate() -> bool {
@@ -9603,9 +9926,8 @@ migration fn migrate() -> bool {
                      finish_migration();
                      return true;
                  }"
-            )
-            .unwrap_err(),
-            CompileError::type_mismatch()
-        );
+            ),
+            Err(CompileError::TypeMismatch { .. })
+        ));
     }
 }

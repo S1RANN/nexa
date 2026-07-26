@@ -1,2 +1,0 @@
-// expected: NX2604
-migration fn migrate() { preserve(1); preserve(1); finish_migration(); }

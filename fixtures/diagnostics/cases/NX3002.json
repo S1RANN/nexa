@@ -1,0 +1,1 @@
+{"version":1,"code":"NX3002","category":"verify","pipeline":"verifier","input":"../binaries/NX3002.bin","expected":{"primary_text":"","secondary_count":0,"message_contains":"register","notes":[]}}

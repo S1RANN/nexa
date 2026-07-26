@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2604","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2604.nexa","expected":{"primary_text":"preserve(legacy)","primary_occurrence":2,"secondary_count":0,"message_contains":"duplicate forwarding","notes":[]}}

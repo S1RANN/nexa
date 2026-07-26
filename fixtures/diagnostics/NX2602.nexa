@@ -1,2 +1,0 @@
-// expected: NX2602
-migration fn migrate() { return; }

@@ -1,0 +1,1 @@
+{"version":1,"code":"NX6005","category":"verify","pipeline":"verifier","input":"../binaries/NX6005.bin","expected":{"primary_text":"","secondary_count":0,"message_contains":"reload metadata","notes":[]}}

@@ -159,7 +159,7 @@ macro_rules! emission {
             ErrorCode::$code,
             $module,
             $variant,
-            concat!("fixtures/diagnostics/", stringify!($code), $ext),
+            concat!("fixtures/diagnostics/cases/", stringify!($code), ".json"),
         )
     };
 }
@@ -377,7 +377,7 @@ impl Diagnostic {
     #[must_use]
     pub fn new(error: &CompileError, file: FileId) -> Self {
         let message = RuntimeMessage::inline(&CompileErrorMessage(error).to_string());
-        Self {
+        let mut diagnostic = Self {
             code: compile_error_code(error),
             severity: Severity::Error,
             message,
@@ -387,7 +387,65 @@ impl Diagnostic {
             }),
             secondary: Vec::new(),
             notes: Vec::new(),
+        };
+        match error {
+            CompileError::DuplicateName { first, .. } => {
+                diagnostic.secondary.push(Label {
+                    span: SourceSpan { file, ..*first },
+                    message: RuntimeMessage::Static("first declaration"),
+                });
+            }
+            CompileError::DuplicateMatchVariant { first, variant, .. } => {
+                diagnostic.secondary.push(Label {
+                    span: SourceSpan { file, ..*first },
+                    message: RuntimeMessage::Static("first matching arm"),
+                });
+                diagnostic.notes.push(RuntimeMessage::inline(&format!(
+                    "duplicate variant: {variant:?}"
+                )));
+            }
+            CompileError::TypeMismatch {
+                expected, actual, ..
+            } => {
+                if let Some(expected) = expected {
+                    diagnostic.notes.push(RuntimeMessage::inline(&format!(
+                        "expected type: {expected:?}"
+                    )));
+                }
+                if let Some(actual) = actual {
+                    diagnostic
+                        .notes
+                        .push(RuntimeMessage::inline(&format!("actual type: {actual:?}")));
+                }
+            }
+            CompileError::NonExhaustiveMatch { missing, .. } => {
+                diagnostic.notes.extend(missing.iter().map(|variant| {
+                    RuntimeMessage::inline(&format!("missing variant: {variant:?}"))
+                }));
+            }
+            CompileError::TryRequiresResult { actual, .. } => {
+                diagnostic
+                    .notes
+                    .push(RuntimeMessage::inline(&format!("actual type: {actual:?}")));
+            }
+            CompileError::TryErrorMismatch {
+                expected, actual, ..
+            } => {
+                diagnostic.notes.push(RuntimeMessage::inline(&format!(
+                    "function error type: {expected:?}"
+                )));
+                diagnostic.notes.push(RuntimeMessage::inline(&format!(
+                    "expression error type: {actual:?}"
+                )));
+            }
+            CompileError::MissingForwarding { stable_id, .. } => {
+                diagnostic.notes.push(RuntimeMessage::inline(&format!(
+                    "missing stable ID: {stable_id:?}"
+                )));
+            }
+            _ => {}
         }
+        diagnostic
     }
 
     #[must_use]

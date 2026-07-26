@@ -1,0 +1,1 @@
+{"version":1,"code":"NX6004","category":"reload","pipeline":"reload","input":"../runtime/NX6004.runtime","expected":{"primary_text":"","secondary_count":0,"message_contains":"reload completion capacity","notes":[]}}
