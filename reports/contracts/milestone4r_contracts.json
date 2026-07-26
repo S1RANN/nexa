@@ -1,0 +1,188 @@
+{
+  "version": 1,
+  "status_source": "nexa-release-audit milestone4r",
+  "contracts": [
+    {
+      "id": "M4R-STATUS-001",
+      "work_package": 1,
+      "description": "The prior Milestone 4 report remains INCOMPLETE until the release audit succeeds",
+      "required_tests": ["release_audit::prior_report_status"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-CONTRACT-001",
+      "work_package": 2,
+      "description": "Every Milestone 4.0R work package has a machine-readable contract with a real verification entry",
+      "required_tests": ["release_audit::contract_manifest_is_complete"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-001",
+      "work_package": 3,
+      "description": "Realm v5 adapter owns RealmRuntime and contains no reload, epoch, registry, root, or completion-buffer shadow state",
+      "required_tests": ["model_adapter::tests::real_realm_v5_adapter_has_no_shadow_state"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-002",
+      "work_package": 4,
+      "description": "Realm v5 A, B, C, and D fixtures compile from Nexa source and pass bytecode v4 round-trip and verification",
+      "required_tests": ["model_adapter::tests::real_realm_v5_modules_compile_round_trip_and_verify"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-003",
+      "work_package": 5,
+      "description": "Every Realm v5 event invokes its production RealmRuntime or RuntimeHost API",
+      "required_tests": ["model_adapter::tests::real_realm_v5_events_use_production_apis"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-004",
+      "work_package": 6,
+      "description": "Realm inspection snapshots read all required fields from production runtime structures",
+      "required_tests": ["realm::tests::inspection_snapshot_reads_production_state"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-005",
+      "work_package": 7,
+      "description": "Every Realm v5 shortest path replays against a fresh RealmRuntime with field-level snapshot equality",
+      "required_tests": ["realm_v5_differential::every_realm_v5_shortest_path_replays_real_realm_runtime"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-REALM-006",
+      "work_package": 8,
+      "description": "Every rejected Realm v5 event has a stable rejection class and leaves the production snapshot unchanged",
+      "required_tests": ["realm_v5_differential::every_realm_v5_rejection_matches_without_runtime_mutation"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-FAILURE-001",
+      "work_package": 9,
+      "description": "All fifteen failure points are injected at production pre-commit boundaries",
+      "required_tests": ["realm_v5_failure_differential::all_failure_points_execute_in_realm_runtime"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-FAILURE-002",
+      "work_package": 10,
+      "description": "Failure injection supports once, Nth, always, disarm, clear, and per-point statistics",
+      "required_tests": ["failure::tests::failure_trigger_modes_and_stats_are_complete"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-FAILURE-003",
+      "work_package": 11,
+      "description": "Failure differential uses RealmRuntime and verifies atomic failure plus activation and cleanup trap semantics",
+      "required_tests": ["realm_v5_failure_differential::every_failure_point_preserves_real_runtime_boundary"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-FAILURE-004",
+      "work_package": 12,
+      "description": "Failure artifacts are populated from RealmInspectionSnapshot and declare zero shadow state fields",
+      "required_tests": ["artifact::tests::realm_runtime_artifact_contains_production_snapshot"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-001",
+      "work_package": 13,
+      "description": "Complex host arguments expose non-owning string, struct, enum, array, buffer, option, and result views",
+      "required_tests": ["host::tests::complex_host_views_borrow_runtime_storage"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-002",
+      "work_package": 14,
+      "description": "Generated Rust host input bindings use borrowed complex types",
+      "required_tests": ["tests::generated_runtime_thunks_use_borrowed_inputs"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-003",
+      "work_package": 15,
+      "description": "Generated call_runtime decodes every complex type directly without HostValue materialization",
+      "required_tests": ["tests::generated_runtime_thunks_decode_complex_inputs_directly"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-004",
+      "work_package": 16,
+      "description": "Complex host returns preflight once and encode directly into reserved VM heap slots",
+      "required_tests": ["realm::tests::complex_host_returns_use_direct_reserved_writer"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-005",
+      "work_package": 17,
+      "description": "Production RealmRuntime always uses call_runtime and never materializing HostRegistry::call",
+      "required_tests": ["realm::tests::production_registry_never_calls_materializing_api"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-HOST-006",
+      "work_package": 18,
+      "description": "The complete complex generated host input, return, and error matrix performs zero system allocations",
+      "required_tests": ["allocation-observer::complex_host_allocation_matrix"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-DIAGNOSTIC-001",
+      "work_package": 19,
+      "description": "Every source-backed CompileError carries its exact non-empty source span or whole-function span",
+      "required_tests": ["tests::diagnostic_spans_cover_every_source_backed_compile_error"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-DIAGNOSTIC-002",
+      "work_package": 20,
+      "description": "Source-backed diagnostics never synthesize a zero-to-zero source location",
+      "required_tests": ["error::tests::source_backed_diagnostics_have_no_zero_zero_spans"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-DIAGNOSTIC-003",
+      "work_package": 21,
+      "description": "All 34 stable diagnostic codes have real emission definitions",
+      "required_tests": ["error::tests::diagnostic_code_emission_table_is_complete"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-DIAGNOSTIC-004",
+      "work_package": 22,
+      "description": "A real diagnostic fixture emits and validates every registered stable code",
+      "required_tests": ["cli::diagnostic_corpus_check"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-DIAGNOSTIC-005",
+      "work_package": 23,
+      "description": "High-value runtime traps resolve every script frame and host boundary to original Nexa source",
+      "required_tests": ["realm::tests::runtime_script_stack_end_to_end_matrix"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-SNAPSHOT-001",
+      "work_package": 24,
+      "description": "Snapshot storage is byte-backed, typed, layout-checked, and independent of i32",
+      "required_tests": ["host::tests::typed_snapshot_storage_is_layout_checked"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-SNAPSHOT-002",
+      "work_package": 25,
+      "description": "Generated typed snapshot codecs cover nested values and Combat stores a real EnemyView snapshot",
+      "required_tests": ["tests::typed_snapshot_codec", "combat-runtime::typed_enemy_view_snapshot"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R-AUDIT-001",
+      "work_package": 26,
+      "description": "Release audit binds the clean implementation commit and tree to generated JSON and Markdown evidence",
+      "required_tests": ["release_audit::milestone4r_evidence_chain"],
+      "status": "pending"
+    }
+  ]
+}
