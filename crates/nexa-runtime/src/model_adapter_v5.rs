@@ -124,8 +124,8 @@ impl RealmV5RuntimeAdapter {
         &self,
         event: RealmV5RuntimeEvent,
         snapshot: &RealmV5RuntimeSnapshot,
-    ) -> Result<(), super::RealmV5RuntimeRejection> {
-        use super::RealmV5RuntimeRejection as Rejection;
+    ) -> Result<(), super::RealmV5RejectionClass> {
+        use super::RealmV5RejectionClass as Rejection;
         let all_tasks = |state| snapshot.tasks.iter().all(|task| task.state == state);
         let live_task = |state| {
             !matches!(
@@ -224,7 +224,7 @@ impl RealmV5RuntimeAdapter {
                     || snapshot.release_backlog.iter().any(|count| *count != 0)
                     || snapshot.heap_object
                 {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
                 if usize::from(snapshot.active_epoch) + 1 >= REALM_V5_EPOCH_COUNT {
                     return Err(Rejection::Capacity);
@@ -271,7 +271,7 @@ impl RealmV5RuntimeAdapter {
                     return Err(Rejection::HostNotOpen);
                 }
                 if snapshot.release_backlog.iter().any(|count| *count != 0) {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
                 if snapshot.reload != RealmV5RuntimeReloadState::Idle
                     || snapshot.tasks[0].state != RealmV5RuntimeTaskState::Ready
@@ -289,17 +289,17 @@ impl RealmV5RuntimeAdapter {
             }
             RealmV5RuntimeEvent::TokenRelease => {
                 if !snapshot.token_live {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::SnapshotRelease => {
                 if !snapshot.snapshot_live {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::ReleaseDrain => {
                 if snapshot.release_backlog.iter().all(|count| *count == 0) {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::GcRootAttach => {
@@ -308,12 +308,12 @@ impl RealmV5RuntimeAdapter {
                     || snapshot.tasks.iter().any(|task| live_task(task.state))
                     || snapshot.reload != RealmV5RuntimeReloadState::Idle
                 {
-                    return Err(Rejection::RootUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::GcRootDrop => {
                 if !snapshot.gc_root {
-                    return Err(Rejection::RootUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::GcCollect => {
@@ -322,19 +322,19 @@ impl RealmV5RuntimeAdapter {
                     || snapshot.tasks.iter().any(|task| live_task(task.state))
                     || snapshot.reload != RealmV5RuntimeReloadState::Idle
                 {
-                    return Err(Rejection::RootUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::RetiredEpochReap(index) => {
                 let Some(epoch) = snapshot.retired_epochs.get(usize::from(index)) else {
-                    return Err(Rejection::InvalidRetiredEpoch);
+                    return Err(Rejection::EpochConflict);
                 };
                 if !matches!(epoch, RealmV5RuntimeRetiredEpoch::Retired(_)) {
-                    return Err(Rejection::InvalidRetiredEpoch);
+                    return Err(Rejection::EpochConflict);
                 }
                 let inspection = self.realm.inspection_snapshot();
                 let Some(retired) = inspection.retired_epochs.get(usize::from(index)) else {
-                    return Err(Rejection::InvalidRetiredEpoch);
+                    return Err(Rejection::EpochConflict);
                 };
                 if retired.task_count != 0
                     || retired.request_count != 0
@@ -343,7 +343,7 @@ impl RealmV5RuntimeAdapter {
                     || retired.gc_root_count != 0
                     || retired.pending_completions != 0
                 {
-                    return Err(Rejection::ResourceUnavailable);
+                    return Err(Rejection::RootConflict);
                 }
             }
             RealmV5RuntimeEvent::RuntimeHostBeginClose => {
@@ -368,7 +368,7 @@ impl RealmV5RuntimeAdapter {
             RealmV5RuntimeEvent::RuntimeHostFinishClose => {
                 return Err(
                     if snapshot.runtime_host == crate::RuntimeHostState::Closing {
-                        Rejection::HostResourcesLive
+                        Rejection::RootConflict
                     } else {
                         Rejection::HostNotOpen
                     },

@@ -123,21 +123,19 @@ pub const REALM_V5_EVENTS: [RealmV5Event; 30] = [
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RealmV5Rejection {
-    Capacity,
-    HostNotOpen,
-    HostResourcesLive,
+pub enum RealmV5RejectionClass {
     InvalidTaskState,
-    InvalidRequestState,
     InvalidReloadState,
-    InvalidRetiredEpoch,
-    ResourceUnavailable,
-    RootUnavailable,
+    InvalidRequestState,
+    HostNotOpen,
+    Capacity,
+    RootConflict,
+    EpochConflict,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealmV5ApplyError {
-    Rejected(RealmV5Rejection),
+    Rejected(RealmV5RejectionClass),
     Invariant(&'static str),
 }
 
@@ -250,7 +248,7 @@ impl RealmV5World {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn apply_inner(&mut self, event: RealmV5Event) -> Result<(), RealmV5Rejection> {
+    fn apply_inner(&mut self, event: RealmV5Event) -> Result<(), RealmV5RejectionClass> {
         match event {
             RealmV5Event::TaskAdmission => self.admit_task(),
             RealmV5Event::PollTask | RealmV5Event::FuelYield => {
@@ -279,7 +277,7 @@ impl RealmV5World {
                     Ok(())
                 }
                 RealmV5TaskState::Running => self.complete_tasks(),
-                _ => Err(RealmV5Rejection::InvalidTaskState),
+                _ => Err(RealmV5RejectionClass::InvalidTaskState),
             },
             RealmV5Event::TaskComplete => self.complete_tasks(),
             RealmV5Event::HostWait => self.begin_host_wait(),
@@ -289,18 +287,18 @@ impl RealmV5World {
                     self.reload,
                     RealmV5ReloadState::Idle | RealmV5ReloadState::ActivationFaulted
                 ) {
-                    return Err(RealmV5Rejection::InvalidReloadState);
+                    return Err(RealmV5RejectionClass::InvalidReloadState);
                 }
                 let state = self.tasks[0].state;
                 if !task_is_live(state) || self.tasks.iter().any(|task| task.state != state) {
-                    return Err(RealmV5Rejection::InvalidTaskState);
+                    return Err(RealmV5RejectionClass::InvalidTaskState);
                 }
                 for task in 0..self.tasks.len() {
                     if self.requests[task].state == RealmV5RequestState::Pending {
                         let epoch = usize::from(self.requests[task].epoch);
                         self.release_backlog[epoch] = self.release_backlog[epoch]
                             .checked_add(1)
-                            .ok_or(RealmV5Rejection::Capacity)?;
+                            .ok_or(RealmV5RejectionClass::Capacity)?;
                         self.requests[task].state = RealmV5RequestState::Late;
                     }
                     self.finish_task(task, RealmV5TaskState::Cancelled);
@@ -313,7 +311,7 @@ impl RealmV5World {
                     .iter()
                     .any(|task| task.state != RealmV5TaskState::Cancelled)
                 {
-                    return Err(RealmV5Rejection::InvalidTaskState);
+                    return Err(RealmV5RejectionClass::InvalidTaskState);
                 }
                 Ok(())
             }
@@ -321,11 +319,11 @@ impl RealmV5World {
             RealmV5Event::Quiesce => self.quiesce(),
             RealmV5Event::Migration => {
                 if self.reload != RealmV5ReloadState::Quiesced {
-                    return Err(RealmV5Rejection::InvalidReloadState);
+                    return Err(RealmV5RejectionClass::InvalidReloadState);
                 }
                 let candidate = usize::from(
                     self.candidate_epoch
-                        .ok_or(RealmV5Rejection::InvalidReloadState)?,
+                        .ok_or(RealmV5RejectionClass::InvalidReloadState)?,
                 );
                 self.state_registry_objects[candidate] =
                     self.state_registry_objects[usize::from(self.active_epoch)].max(1);
@@ -341,7 +339,7 @@ impl RealmV5World {
                     .iter()
                     .any(|request| request.state != RealmV5RequestState::Late)
                 {
-                    return Err(RealmV5Rejection::InvalidRequestState);
+                    return Err(RealmV5RejectionClass::InvalidRequestState);
                 }
                 for request in &mut self.requests {
                     request.state = RealmV5RequestState::Completed;
@@ -356,7 +354,7 @@ impl RealmV5World {
             RealmV5Event::SnapshotRelease => self.release_resource(false),
             RealmV5Event::ReleaseDrain => {
                 if self.release_backlog.iter().all(|count| *count == 0) {
-                    return Err(RealmV5Rejection::ResourceUnavailable);
+                    return Err(RealmV5RejectionClass::RootConflict);
                 }
                 self.release_backlog.fill(0);
                 self.release_transferred.fill(0);
@@ -369,7 +367,7 @@ impl RealmV5World {
                     || self.tasks.iter().any(|task| task_is_live(task.state))
                     || self.reload != RealmV5ReloadState::Idle
                 {
-                    return Err(RealmV5Rejection::RootUnavailable);
+                    return Err(RealmV5RejectionClass::RootConflict);
                 }
                 self.heap_object = true;
                 self.heap_objects = 1;
@@ -380,7 +378,7 @@ impl RealmV5World {
             }
             RealmV5Event::GcRootDrop => {
                 if !self.gc_root {
-                    return Err(RealmV5Rejection::RootUnavailable);
+                    return Err(RealmV5RejectionClass::RootConflict);
                 }
                 self.gc_root = false;
                 Ok(())
@@ -391,7 +389,7 @@ impl RealmV5World {
                     || self.tasks.iter().any(|task| task_is_live(task.state))
                     || self.reload != RealmV5ReloadState::Idle
                 {
-                    return Err(RealmV5Rejection::RootUnavailable);
+                    return Err(RealmV5RejectionClass::RootConflict);
                 }
                 self.heap_object = false;
                 self.heap_objects = 0;
@@ -405,40 +403,40 @@ impl RealmV5World {
                     || self.candidate_epoch.is_some()
                     || self.host_resources_live()
                 {
-                    return Err(RealmV5Rejection::HostNotOpen);
+                    return Err(RealmV5RejectionClass::HostNotOpen);
                 }
                 self.runtime_host = RealmV5RuntimeHostState::Closing;
                 Ok(())
             }
             RealmV5Event::RuntimeHostFinishClose => {
                 Err(if self.runtime_host == RealmV5RuntimeHostState::Closing {
-                    RealmV5Rejection::HostResourcesLive
+                    RealmV5RejectionClass::RootConflict
                 } else {
-                    RealmV5Rejection::HostNotOpen
+                    RealmV5RejectionClass::HostNotOpen
                 })
             }
         }
     }
 
-    fn admit_task(&mut self) -> Result<(), RealmV5Rejection> {
+    fn admit_task(&mut self) -> Result<(), RealmV5RejectionClass> {
         if self.runtime_host != RealmV5RuntimeHostState::Open {
-            return Err(RealmV5Rejection::HostNotOpen);
+            return Err(RealmV5RejectionClass::HostNotOpen);
         }
         if !matches!(
             self.reload,
             RealmV5ReloadState::Idle | RealmV5ReloadState::ActivationFaulted
         ) {
-            return Err(RealmV5Rejection::InvalidReloadState);
+            return Err(RealmV5RejectionClass::InvalidReloadState);
         }
         if self.active_epoch != 0 {
-            return Err(RealmV5Rejection::Capacity);
+            return Err(RealmV5RejectionClass::Capacity);
         }
         if self
             .tasks
             .iter()
             .any(|task| task.state != RealmV5TaskState::Vacant)
         {
-            return Err(RealmV5Rejection::Capacity);
+            return Err(RealmV5RejectionClass::Capacity);
         }
         for (task, scheduled) in self.tasks.iter_mut().zip(&mut self.scheduler) {
             *task = RealmV5Task {
@@ -451,9 +449,9 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn begin_host_wait(&mut self) -> Result<(), RealmV5Rejection> {
+    fn begin_host_wait(&mut self) -> Result<(), RealmV5RejectionClass> {
         if self.runtime_host != RealmV5RuntimeHostState::Open {
-            return Err(RealmV5Rejection::HostNotOpen);
+            return Err(RealmV5RejectionClass::HostNotOpen);
         }
         self.require_all_tasks(RealmV5TaskState::ExplicitYielded)?;
         if self
@@ -461,7 +459,7 @@ impl RealmV5World {
             .iter()
             .any(|request| request.state != RealmV5RequestState::Vacant)
         {
-            return Err(RealmV5Rejection::InvalidRequestState);
+            return Err(RealmV5RejectionClass::InvalidRequestState);
         }
         for index in 0..self.requests.len() {
             self.requests[index] = RealmV5Request {
@@ -475,13 +473,13 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn complete_host_request(&mut self) -> Result<(), RealmV5Rejection> {
+    fn complete_host_request(&mut self) -> Result<(), RealmV5RejectionClass> {
         if self
             .requests
             .iter()
             .any(|request| request.state != RealmV5RequestState::Pending)
         {
-            return Err(RealmV5Rejection::InvalidRequestState);
+            return Err(RealmV5RejectionClass::InvalidRequestState);
         }
         if matches!(
             self.reload,
@@ -501,7 +499,7 @@ impl RealmV5World {
             self.heap_objects = self
                 .heap_objects
                 .checked_add(REALM_V5_REQUESTS_U8)
-                .ok_or(RealmV5Rejection::Capacity)?;
+                .ok_or(RealmV5RejectionClass::Capacity)?;
             self.heap_object = self.heap_objects != 0;
             for index in 0..self.requests.len() {
                 self.requests[index].state = RealmV5RequestState::Completed;
@@ -514,25 +512,25 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn record_request_releases(&mut self) -> Result<(), RealmV5Rejection> {
+    fn record_request_releases(&mut self) -> Result<(), RealmV5RejectionClass> {
         for request in self.requests {
             let epoch = usize::from(request.epoch);
             self.release_backlog[epoch] = self.release_backlog[epoch]
                 .checked_add(1)
-                .ok_or(RealmV5Rejection::Capacity)?;
+                .ok_or(RealmV5RejectionClass::Capacity)?;
             self.release_transferred[epoch] = self.release_transferred[epoch]
                 .checked_add(1)
-                .ok_or(RealmV5Rejection::Capacity)?;
+                .ok_or(RealmV5RejectionClass::Capacity)?;
         }
         Ok(())
     }
 
-    fn complete_tasks(&mut self) -> Result<(), RealmV5Rejection> {
+    fn complete_tasks(&mut self) -> Result<(), RealmV5RejectionClass> {
         self.require_all_tasks(RealmV5TaskState::Running)?;
         self.heap_objects = self
             .heap_objects
             .checked_add(REALM_V5_REQUESTS_U8)
-            .ok_or(RealmV5Rejection::Capacity)?;
+            .ok_or(RealmV5RejectionClass::Capacity)?;
         self.heap_object = self.heap_objects != 0;
         for task in 0..self.tasks.len() {
             self.finish_task(task, RealmV5TaskState::Completed);
@@ -540,39 +538,39 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn begin_reload(&mut self) -> Result<(), RealmV5Rejection> {
+    fn begin_reload(&mut self) -> Result<(), RealmV5RejectionClass> {
         if self.runtime_host == RealmV5RuntimeHostState::Closed {
-            return Err(RealmV5Rejection::HostNotOpen);
+            return Err(RealmV5RejectionClass::HostNotOpen);
         }
         if !matches!(
             self.reload,
             RealmV5ReloadState::Idle | RealmV5ReloadState::ActivationFaulted
         ) {
-            return Err(RealmV5Rejection::InvalidReloadState);
+            return Err(RealmV5RejectionClass::InvalidReloadState);
         }
         if self.token.live
             || self.snapshot.live
             || self.release_backlog.iter().any(|count| *count != 0)
             || self.heap_object
         {
-            return Err(RealmV5Rejection::ResourceUnavailable);
+            return Err(RealmV5RejectionClass::RootConflict);
         }
         let candidate = self
             .active_epoch
             .checked_add(1)
             .filter(|epoch| usize::from(*epoch) < REALM_V5_EPOCH_SLOTS)
-            .ok_or(RealmV5Rejection::Capacity)?;
+            .ok_or(RealmV5RejectionClass::Capacity)?;
         self.candidate_epoch = Some(candidate);
         self.state_registry_objects[usize::from(candidate)] = 0;
         self.reload = RealmV5ReloadState::Prepared;
         Ok(())
     }
 
-    fn quiesce(&mut self) -> Result<(), RealmV5Rejection> {
+    fn quiesce(&mut self) -> Result<(), RealmV5RejectionClass> {
         if self.reload != RealmV5ReloadState::Prepared
             || self.active_epoch >= REALM_V5_RETIRED_EPOCHS_U8
         {
-            return Err(RealmV5Rejection::InvalidReloadState);
+            return Err(RealmV5RejectionClass::InvalidReloadState);
         }
         if self.tasks.iter().any(|task| {
             task_is_live(task.state)
@@ -585,7 +583,7 @@ impl RealmV5World {
                         | RealmV5TaskState::Waiting
                 )
         }) {
-            return Err(RealmV5Rejection::InvalidTaskState);
+            return Err(RealmV5RejectionClass::InvalidTaskState);
         }
         for (index, task) in self.tasks.iter_mut().enumerate() {
             if task.epoch == self.active_epoch && task_is_live(task.state) {
@@ -598,28 +596,32 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn rollback_reload(&mut self) -> Result<(), RealmV5Rejection> {
+    fn rollback_reload(&mut self) -> Result<(), RealmV5RejectionClass> {
         if !matches!(
             self.reload,
             RealmV5ReloadState::Prepared
                 | RealmV5ReloadState::Quiesced
                 | RealmV5ReloadState::Migrated
         ) {
-            return Err(RealmV5Rejection::InvalidReloadState);
+            return Err(RealmV5RejectionClass::InvalidReloadState);
         }
         for (index, task) in self.tasks.iter_mut().enumerate() {
             if task.state == RealmV5TaskState::ReloadPaused {
                 let restore = task
                     .reload_restore
                     .take()
-                    .ok_or(RealmV5Rejection::InvalidTaskState)?;
+                    .ok_or(RealmV5RejectionClass::InvalidTaskState)?;
                 task.state = restore;
                 self.scheduler[index] = task_is_scheduled(restore);
             }
         }
         for request in &mut self.requests {
             if request.state == RealmV5RequestState::Buffered {
-                let owner = usize::from(request.task.ok_or(RealmV5Rejection::InvalidRequestState)?);
+                let owner = usize::from(
+                    request
+                        .task
+                        .ok_or(RealmV5RejectionClass::InvalidRequestState)?,
+                );
                 request.state = RealmV5RequestState::Completed;
                 self.tasks[owner].state = RealmV5TaskState::Running;
                 self.tasks[owner].reload_restore = None;
@@ -627,7 +629,7 @@ impl RealmV5World {
                 self.heap_objects = self
                     .heap_objects
                     .checked_add(1)
-                    .ok_or(RealmV5Rejection::Capacity)?;
+                    .ok_or(RealmV5RejectionClass::Capacity)?;
                 self.heap_object = true;
             }
         }
@@ -640,19 +642,19 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn publish_reload(&mut self, activation_fault: bool) -> Result<(), RealmV5Rejection> {
+    fn publish_reload(&mut self, activation_fault: bool) -> Result<(), RealmV5RejectionClass> {
         if self.reload != RealmV5ReloadState::Migrated {
-            return Err(RealmV5Rejection::InvalidReloadState);
+            return Err(RealmV5RejectionClass::InvalidReloadState);
         }
         let retired_slot = self
             .retired_epochs
             .iter()
             .position(|epoch| matches!(epoch, RealmV5RetiredEpoch::Vacant))
-            .ok_or(RealmV5Rejection::Capacity)?;
+            .ok_or(RealmV5RejectionClass::Capacity)?;
         let old_epoch = self.active_epoch;
         let candidate = self
             .candidate_epoch
-            .ok_or(RealmV5Rejection::InvalidReloadState)?;
+            .ok_or(RealmV5RejectionClass::InvalidReloadState)?;
         self.retired_epochs[retired_slot] = RealmV5RetiredEpoch::Retired(old_epoch);
         self.active_epoch = candidate;
         self.candidate_epoch = None;
@@ -669,7 +671,7 @@ impl RealmV5World {
                     let epoch = usize::from(self.requests[index].epoch);
                     self.release_backlog[epoch] = self.release_backlog[epoch]
                         .checked_add(1)
-                        .ok_or(RealmV5Rejection::Capacity)?;
+                        .ok_or(RealmV5RejectionClass::Capacity)?;
                     self.requests[index].state = RealmV5RequestState::Late;
                 }
                 RealmV5RequestState::Buffered => {
@@ -687,16 +689,16 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn acquire_resource(&mut self, token: bool) -> Result<(), RealmV5Rejection> {
+    fn acquire_resource(&mut self, token: bool) -> Result<(), RealmV5RejectionClass> {
         if self.runtime_host != RealmV5RuntimeHostState::Open {
-            return Err(RealmV5Rejection::HostNotOpen);
+            return Err(RealmV5RejectionClass::HostNotOpen);
         }
         if self.release_backlog.iter().any(|count| *count != 0) {
-            return Err(RealmV5Rejection::ResourceUnavailable);
+            return Err(RealmV5RejectionClass::RootConflict);
         }
         if self.reload != RealmV5ReloadState::Idle || self.tasks[0].state != RealmV5TaskState::Ready
         {
-            return Err(RealmV5Rejection::InvalidTaskState);
+            return Err(RealmV5RejectionClass::InvalidTaskState);
         }
         let task = 0;
         let resource = if token {
@@ -705,7 +707,7 @@ impl RealmV5World {
             &mut self.snapshot
         };
         if resource.live {
-            return Err(RealmV5Rejection::Capacity);
+            return Err(RealmV5RejectionClass::Capacity);
         }
         *resource = RealmV5Resource {
             live: true,
@@ -715,19 +717,19 @@ impl RealmV5World {
         Ok(())
     }
 
-    fn release_resource(&mut self, token: bool) -> Result<(), RealmV5Rejection> {
+    fn release_resource(&mut self, token: bool) -> Result<(), RealmV5RejectionClass> {
         let resource = if token {
             &mut self.token
         } else {
             &mut self.snapshot
         };
         if !resource.live {
-            return Err(RealmV5Rejection::ResourceUnavailable);
+            return Err(RealmV5RejectionClass::RootConflict);
         }
         let epoch = usize::from(resource.epoch);
         self.release_backlog[epoch] = self.release_backlog[epoch]
             .checked_add(1)
-            .ok_or(RealmV5Rejection::Capacity)?;
+            .ok_or(RealmV5RejectionClass::Capacity)?;
         *resource = RealmV5Resource::default();
         Ok(())
     }
@@ -749,19 +751,19 @@ impl RealmV5World {
         self.terminal_records = self.terminal_records.saturating_add(1);
     }
 
-    fn reap_retired(&mut self, index: u8) -> Result<(), RealmV5Rejection> {
+    fn reap_retired(&mut self, index: u8) -> Result<(), RealmV5RejectionClass> {
         let slot = self
             .retired_epochs
             .get(usize::from(index))
-            .ok_or(RealmV5Rejection::InvalidRetiredEpoch)?;
+            .ok_or(RealmV5RejectionClass::EpochConflict)?;
         let epoch = match *slot {
             RealmV5RetiredEpoch::Retired(epoch) => epoch,
             RealmV5RetiredEpoch::Vacant | RealmV5RetiredEpoch::Drained(_) => {
-                return Err(RealmV5Rejection::InvalidRetiredEpoch);
+                return Err(RealmV5RejectionClass::EpochConflict);
             }
         };
         if self.epoch_is_blocked(epoch) {
-            return Err(RealmV5Rejection::ResourceUnavailable);
+            return Err(RealmV5RejectionClass::RootConflict);
         }
         self.release_transferred = self.release_backlog;
         self.reap_eligible_retired();
@@ -798,11 +800,11 @@ impl RealmV5World {
             || (self.gc_root && self.gc_epoch == epoch)
     }
 
-    fn require_all_tasks(&self, state: RealmV5TaskState) -> Result<(), RealmV5Rejection> {
+    fn require_all_tasks(&self, state: RealmV5TaskState) -> Result<(), RealmV5RejectionClass> {
         if self.tasks.iter().all(|task| task.state == state) {
             Ok(())
         } else {
-            Err(RealmV5Rejection::InvalidTaskState)
+            Err(RealmV5RejectionClass::InvalidTaskState)
         }
     }
 
@@ -957,7 +959,7 @@ impl Default for RealmV5Config {
 pub struct RealmV5Report {
     pub visited_worlds: usize,
     pub rejected_operations: usize,
-    pub rejection_reasons: BTreeMap<RealmV5Rejection, usize>,
+    pub rejection_reasons: BTreeMap<RealmV5RejectionClass, usize>,
     pub accepted_events: BTreeSet<RealmV5Event>,
     pub reached_task_states: BTreeSet<RealmV5TaskState>,
     pub reached_request_states: BTreeSet<RealmV5RequestState>,

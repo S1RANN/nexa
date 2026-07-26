@@ -924,21 +924,19 @@ pub enum RealmV5RuntimeEvent {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RealmV5RuntimeRejection {
-    Capacity,
-    HostNotOpen,
-    HostResourcesLive,
+pub enum RealmV5RejectionClass {
     InvalidTaskState,
-    InvalidRequestState,
     InvalidReloadState,
-    InvalidRetiredEpoch,
-    ResourceUnavailable,
-    RootUnavailable,
+    InvalidRequestState,
+    HostNotOpen,
+    Capacity,
+    RootConflict,
+    EpochConflict,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RealmV5RuntimeApplyError {
-    Rejected(RealmV5RuntimeRejection),
+    Rejected(RealmV5RejectionClass),
     InjectedFailure(crate::RuntimeFailurePoint),
     Invariant(String),
 }

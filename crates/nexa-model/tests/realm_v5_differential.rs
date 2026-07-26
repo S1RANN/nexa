@@ -1,13 +1,14 @@
 use nexa_model::realm_v5::{
-    REALM_V5_EVENTS, RealmV5ApplyError, RealmV5Config, RealmV5Event, RealmV5Rejection,
+    REALM_V5_EVENTS, RealmV5ApplyError, RealmV5Config, RealmV5Event, RealmV5RejectionClass,
     RealmV5ReloadState, RealmV5RequestState, RealmV5RetiredEpoch, RealmV5TaskState, RealmV5World,
     explore_realm_v5,
 };
 use nexa_runtime::RuntimeHostState;
 use nexa_runtime::model_adapter::{
-    RealmV5RuntimeAdapter, RealmV5RuntimeApplyError, RealmV5RuntimeEvent, RealmV5RuntimeExecution,
-    RealmV5RuntimeRejection, RealmV5RuntimeReloadState, RealmV5RuntimeRequestState,
-    RealmV5RuntimeRetiredEpoch, RealmV5RuntimeSnapshot, RealmV5RuntimeTaskState,
+    RealmV5RejectionClass as RuntimeRealmV5RejectionClass, RealmV5RuntimeAdapter,
+    RealmV5RuntimeApplyError, RealmV5RuntimeEvent, RealmV5RuntimeExecution,
+    RealmV5RuntimeReloadState, RealmV5RuntimeRequestState, RealmV5RuntimeRetiredEpoch,
+    RealmV5RuntimeSnapshot, RealmV5RuntimeTaskState,
 };
 
 #[test]
@@ -39,10 +40,26 @@ fn every_real_realm_v5_shortest_path_matches_inspection() {
 }
 
 #[test]
-fn every_realm_v5_rejection_matches_fresh_runtime_without_mutation() {
+fn every_real_realm_v5_rejection_class_matches_without_mutation() {
     let report = explore_realm_v5(RealmV5Config::default());
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(!report.truncated);
+    let required_classes = [
+        RealmV5RejectionClass::InvalidTaskState,
+        RealmV5RejectionClass::InvalidReloadState,
+        RealmV5RejectionClass::InvalidRequestState,
+        RealmV5RejectionClass::HostNotOpen,
+        RealmV5RejectionClass::Capacity,
+        RealmV5RejectionClass::RootConflict,
+        RealmV5RejectionClass::EpochConflict,
+    ];
+    assert_eq!(report.rejection_reasons.len(), required_classes.len());
+    for class in required_classes {
+        assert!(
+            report.rejection_reasons.contains_key(&class),
+            "rejection class {class:?} is unreachable"
+        );
+    }
     for path in report.shortest_paths {
         let mut model = RealmV5World::default();
         let mut runtime = RealmV5RuntimeAdapter::new();
@@ -51,6 +68,7 @@ fn every_realm_v5_rejection_matches_fresh_runtime_without_mutation() {
             runtime.apply(runtime_event(*event)).unwrap();
         }
         let before = runtime.snapshot().unwrap();
+        let before_inspection = runtime.realm().inspection_snapshot();
         for event in REALM_V5_EVENTS {
             let mut rejected_model = model;
             if let Err(RealmV5ApplyError::Rejected(reason)) = rejected_model.apply(event) {
@@ -69,6 +87,12 @@ fn every_realm_v5_rejection_matches_fresh_runtime_without_mutation() {
                     runtime.snapshot().unwrap(),
                     before,
                     "rejected runtime event mutated state: {event:?} after {path:?}"
+                );
+                assert_eq!(
+                    runtime.realm().inspection_snapshot(),
+                    before_inspection,
+                    "rejected runtime event mutated production inspection: \
+                     {event:?} after {path:?}"
                 );
             }
         }
@@ -481,17 +505,19 @@ const fn runtime_event(event: RealmV5Event) -> RealmV5RuntimeEvent {
     }
 }
 
-const fn runtime_rejection(rejection: RealmV5Rejection) -> RealmV5RuntimeRejection {
+const fn runtime_rejection(rejection: RealmV5RejectionClass) -> RuntimeRealmV5RejectionClass {
     match rejection {
-        RealmV5Rejection::Capacity => RealmV5RuntimeRejection::Capacity,
-        RealmV5Rejection::HostNotOpen => RealmV5RuntimeRejection::HostNotOpen,
-        RealmV5Rejection::HostResourcesLive => RealmV5RuntimeRejection::HostResourcesLive,
-        RealmV5Rejection::InvalidTaskState => RealmV5RuntimeRejection::InvalidTaskState,
-        RealmV5Rejection::InvalidRequestState => RealmV5RuntimeRejection::InvalidRequestState,
-        RealmV5Rejection::InvalidReloadState => RealmV5RuntimeRejection::InvalidReloadState,
-        RealmV5Rejection::InvalidRetiredEpoch => RealmV5RuntimeRejection::InvalidRetiredEpoch,
-        RealmV5Rejection::ResourceUnavailable => RealmV5RuntimeRejection::ResourceUnavailable,
-        RealmV5Rejection::RootUnavailable => RealmV5RuntimeRejection::RootUnavailable,
+        RealmV5RejectionClass::InvalidTaskState => RuntimeRealmV5RejectionClass::InvalidTaskState,
+        RealmV5RejectionClass::InvalidReloadState => {
+            RuntimeRealmV5RejectionClass::InvalidReloadState
+        }
+        RealmV5RejectionClass::InvalidRequestState => {
+            RuntimeRealmV5RejectionClass::InvalidRequestState
+        }
+        RealmV5RejectionClass::HostNotOpen => RuntimeRealmV5RejectionClass::HostNotOpen,
+        RealmV5RejectionClass::Capacity => RuntimeRealmV5RejectionClass::Capacity,
+        RealmV5RejectionClass::RootConflict => RuntimeRealmV5RejectionClass::RootConflict,
+        RealmV5RejectionClass::EpochConflict => RuntimeRealmV5RejectionClass::EpochConflict,
     }
 }
 
