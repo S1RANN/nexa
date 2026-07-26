@@ -263,6 +263,29 @@ pub struct HostCallBoundary {
 }
 
 impl Trap {
+    /// Stable facade diagnostic code for a runtime trap.
+    #[must_use]
+    pub const fn diagnostic_code(&self) -> &'static str {
+        match self.kind {
+            TrapKind::Host => "NX5001",
+            TrapKind::BytecodeTrap
+            | TrapKind::DivideByZero
+            | TrapKind::StringIndexOutOfBounds
+            | TrapKind::ArrayIndexOutOfBounds
+            | TrapKind::BufferIndexOutOfBounds
+            | TrapKind::CleanupBudgetExceeded => "NX5001",
+        }
+    }
+
+    /// Production module identity attached by [`crate::RealmRuntime`].
+    #[must_use]
+    pub const fn module_id(&self) -> Option<u32> {
+        match self.module {
+            Some(module) => Some(module.index),
+            None => None,
+        }
+    }
+
     pub(crate) fn from_continuation(
         module: &VerifiedModule,
         continuation: &InterpreterContinuation,

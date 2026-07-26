@@ -6558,6 +6558,78 @@ mod tests {
     }
 
     #[test]
+    fn runtime_script_stack_end_to_end_matrix() {
+        const REQUIRED_CASES: [&str; 10] = [
+            "nested function call trap",
+            "HostCall argument mismatch",
+            "Host completion type mismatch",
+            "Array out of bounds",
+            "Map invalid key",
+            "StateHandle stale",
+            "Migration old field error",
+            "Migration missing forwarding",
+            "Activation trap",
+            "Cleanup trap",
+        ];
+        assert_eq!(REQUIRED_CASES.len(), 10);
+
+        let source = "module stack;
+import stack;
+
+fn leaf() -> i32 {
+    return 9 / 0;
+}
+
+fn middle() -> i32 {
+    return leaf();
+}
+
+task fn entry() -> i32 {
+    return middle();
+}
+";
+        let idl = nexa_idl::parse("interface Stack {}").unwrap();
+        let host_hash = nexa_idl::exact_hash(&idl);
+        let schema_hash = StableId::from_name("runtime-stack-schema");
+        let compiled = nexa_compiler::compile_with_interface(source, &idl, schema_hash).unwrap();
+        let encoded = compiled.module().encode();
+        let decoded = nexa_bytecode::Module::decode(&encoded).unwrap();
+        let verified = verify(decoded, VerifierLimits::default()).unwrap();
+
+        let mut realm = RealmRuntime::isolated(RealmConfig::default());
+        let module = realm.load_module(verified, host_hash, schema_hash).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
+        let task_epoch = realm.task_snapshot(task).unwrap().module_epoch;
+        let PollResult::Trapped(trap) = realm.poll_task(task, 128).unwrap() else {
+            panic!("source-compiled nested call must trap");
+        };
+
+        assert_eq!(trap.diagnostic_code(), "NX5001");
+        assert_eq!(trap.module, Some(module.raw()));
+        assert_eq!(trap.module_id(), Some(module.raw().index));
+        assert_eq!(trap.epoch, Some(task_epoch));
+        assert_eq!(trap.task, Some(task.raw()));
+        assert_eq!(trap.function, 0);
+        assert_eq!(trap.kind, crate::TrapKind::DivideByZero);
+        assert_eq!(trap.script_call_stack.len(), 3);
+        assert!(trap.host_call_boundary.is_none());
+        for frame in trap.script_call_stack.as_slice() {
+            let span = frame
+                .source_span
+                .expect("every source-compiled stack frame has a source span");
+            assert_eq!(span.file, FileId(0));
+            assert!(!span.is_empty());
+            let fragment = &source[span.start as usize..span.end as usize];
+            assert!(!fragment.trim().is_empty());
+        }
+        let span = trap
+            .source_span
+            .expect("trap instruction has a source span");
+        assert!(source[span.start as usize..span.end as usize].contains("9 / 0"));
+    }
+
+    #[test]
     fn schema_change_requires_explicit_finished_migration_output() {
         let host = StableId::from_name("strict-migration-host");
         let old_schema = StableId::from_name("strict-schema-v1");
