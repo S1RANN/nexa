@@ -113,6 +113,10 @@ dependencies = [
 name = "nexa-migrate"
 version = "0.1.0"
 dependencies = [
+ "nexa-bytecode",
+ "nexa-core",
+ "nexa-runtime",
+ "nexa-verifier",
  "serde",
  "serde_json",
 ]

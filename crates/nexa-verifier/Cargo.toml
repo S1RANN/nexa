@@ -8,5 +8,8 @@ publish.workspace = true
 [dependencies]
 nexa-bytecode = { path = "../nexa-bytecode" }
 
+[dev-dependencies]
+nexa-core = { path = "../nexa-core" }
+
 [lints]
 workspace = true

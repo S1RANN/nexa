@@ -2,11 +2,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, Function, FunctionEffect,
     HostCallMode, HostImport, Instruction, Module, ModuleBuilder, RootMap, ScriptExport, Signature,
-    StateField, StateSchema, StateType, ValueType,
+    SourceMapEntry, StateField, StateSchema, StateType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_idl::{Idl, TypeRef};
@@ -2738,8 +2739,9 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
     }
-    for function in &hir.functions {
-        let mut code = Vec::new();
+    let mut source_map = Vec::new();
+    for (function_index, function) in hir.functions.iter().enumerate() {
+        let mut code = TrackedCode::new(function.span);
         let register_plan = plan_registers(function)?;
         let temporary = register_plan.local_count;
         let emit_context = EmitContext {
@@ -2758,9 +2760,20 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             &mut code,
         )?;
         let registers = register_plan.total;
-        let safepoints = collect_safepoints(&code);
+        let safepoints = collect_safepoints(&code.instructions);
         let (root_bitmap, root_maps) =
-            exact_root_maps(function, &code, &safepoints, hir, registers)?;
+            exact_root_maps(function, &code.instructions, &safepoints, hir, registers)?;
+        source_map.extend(
+            code.entries
+                .iter()
+                .map(|(pc_start, pc_end, span)| SourceMapEntry {
+                    function: u32::try_from(function_index)
+                        .expect("function count is compiler bounded"),
+                    pc_start: *pc_start,
+                    pc_end: *pc_end,
+                    span: *span,
+                }),
+        );
         module.function(Function {
             signature: function.signature.clone(),
             registers,
@@ -2771,9 +2784,10 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             loop_bounds: Vec::new(),
             effect: function.effect,
             max_static_call_depth: 1,
-            code,
+            code: code.instructions,
         });
     }
+    module.source_map(source_map);
     let mut module = module.finish();
     module.reload_metadata.migration_entry = hir
         .functions
@@ -2975,15 +2989,69 @@ struct EmitContext<'a> {
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
 }
 
+struct TrackedCode {
+    instructions: Vec<Instruction>,
+    entries: Vec<(u32, u32, SourceSpan)>,
+    span: SourceSpan,
+    pending_next: Vec<SourceSpan>,
+}
+
+impl TrackedCode {
+    fn new(span: SourceSpan) -> Self {
+        Self {
+            instructions: Vec::new(),
+            entries: Vec::new(),
+            span,
+            pending_next: Vec::new(),
+        }
+    }
+
+    fn replace_span(&mut self, span: SourceSpan) -> SourceSpan {
+        std::mem::replace(&mut self.span, span)
+    }
+
+    fn push(&mut self, instruction: Instruction) {
+        let start =
+            u32::try_from(self.instructions.len()).expect("instruction count is compiler bounded");
+        self.instructions.push(instruction);
+        self.entries
+            .push((start, start.saturating_add(1), self.span));
+        self.entries.extend(
+            self.pending_next
+                .drain(..)
+                .map(|span| (start, start.saturating_add(1), span)),
+        );
+    }
+
+    fn map_next(&mut self, span: SourceSpan) {
+        self.pending_next.push(span);
+    }
+}
+
+impl Deref for TrackedCode {
+    type Target = Vec<Instruction>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.instructions
+    }
+}
+
+impl DerefMut for TrackedCode {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.instructions
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn emit_statements(
     statements: &[AstStatement],
     temporary: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     for statement in statements {
+        let previous_span = code.replace_span(statement.span());
         match statement.kind() {
             AstStatement::Bind { name, value, .. } => {
                 emit_expression(
@@ -3111,6 +3179,7 @@ fn emit_statements(
             }
             AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
         }
+        code.replace_span(previous_span);
     }
     Ok(())
 }
@@ -3122,15 +3191,20 @@ fn emit_expression(
     expected: Option<ValueType>,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
+    let expression_span = expression.span();
+    let previous_span = code.replace_span(expression_span);
     if let AstExpression::Call {
         function,
         arguments,
     } = expression.kind()
         && state_handle_method(function).is_some()
     {
-        return emit_state_handle_method(function, arguments, destination, locals, context, code);
+        let result =
+            emit_state_handle_method(function, arguments, destination, locals, context, code);
+        code.replace_span(previous_span);
+        return result;
     }
     match expression.kind() {
         AstExpression::Integer(value) => code.push(Instruction::LoadI32 {
@@ -3245,6 +3319,7 @@ fn emit_expression(
         }
         AstExpression::Await(expression) => {
             emit_expression(expression, destination, expected, locals, context, code)?;
+            code.map_next(expression_span);
         }
         AstExpression::Constructor { variant, payload } => {
             let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)? else {
@@ -3288,6 +3363,7 @@ fn emit_expression(
         }
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     }
+    code.replace_span(previous_span);
     Ok(())
 }
 
@@ -3297,7 +3373,7 @@ fn emit_state_handle_method(
     destination: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
         state_handle_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
@@ -3469,7 +3545,7 @@ fn emit_match_expression(
     expected: Option<ValueType>,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let result_type = expected.ok_or(CompileError::CannotInferType)?;
     let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)? else {
@@ -3564,7 +3640,7 @@ fn emit_try_expression(
     destination: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let ValueType::Named(type_id) = emitted_expression_type(expression, None, locals, context)?
     else {
@@ -3658,7 +3734,7 @@ fn emit_migration_intrinsic(
     destination: u16,
     locals: &BTreeMap<String, (u16, ValueType)>,
     context: &EmitContext<'_>,
-    code: &mut Vec<Instruction>,
+    code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     match intrinsic.kind() {
         MigrationIntrinsic::OldGet { stable_id, ty } => {
@@ -4311,17 +4387,14 @@ migration fn migrate() -> bool {
             }",
         )
         .unwrap();
-        let module = super::compile_with_interface(
-            "module game.combat;
+        let source = "module game.combat;
              import engine;
              task fn update(entity: i32) -> i32 {
                  await engine.animation(entity);
                  return entity;
-             }",
-            &idl,
-            StableId::from_name("schema"),
-        )
-        .unwrap();
+             }";
+        let module =
+            super::compile_with_interface(source, &idl, StableId::from_name("schema")).unwrap();
         assert_eq!(module.module().host_imports.len(), 1);
         assert!(
             module.module().functions[0]
@@ -4338,6 +4411,86 @@ migration fn migrate() -> bool {
                 .iter()
                 .any(|instruction| matches!(instruction, nexa_bytecode::Instruction::Yield))
         );
+        let host_pc = module.module().functions[0]
+            .code
+            .iter()
+            .position(|instruction| {
+                matches!(
+                    instruction,
+                    nexa_bytecode::Instruction::HostCall { import: 0, .. }
+                )
+            })
+            .unwrap();
+        let host_span = module
+            .module()
+            .source_span(0, u32::try_from(host_pc).unwrap())
+            .unwrap();
+        assert_eq!(
+            &source[host_span.start as usize..host_span.end as usize],
+            "engine.animation(entity)"
+        );
+        let resume_span = module
+            .module()
+            .source_span(0, u32::try_from(host_pc + 1).unwrap())
+            .unwrap();
+        assert_eq!(
+            &source[resume_span.start as usize..resume_span.end as usize],
+            "await engine.animation(entity)"
+        );
+        assert!((0..module.module().functions[0].code.len()).all(|pc| {
+            module
+                .module()
+                .source_span(0, u32::try_from(pc).unwrap())
+                .is_some()
+        }));
+    }
+
+    #[test]
+    fn source_map_covers_calls_matches_enums_migration_and_safepoints() {
+        let source = "enum Failure { Bad }
+            fn increment(value: i32) -> i32 { return value + 1; }
+            fn inspect(value: Option<i32>) -> i32 {
+                return match value {
+                    Some(found) => increment(found),
+                    None => 0,
+                };
+            }
+            fn wrap(value: i32) -> Option<i32> { return Some(value); }
+            migration fn migrate() -> bool {
+                old.get<i32>(legacy);
+                finish_migration();
+                return true;
+            }";
+        let module = compile(source).unwrap();
+        let module = module.module();
+        let mut required_instruction_count = 0_usize;
+        for (function_index, function) in module.functions.iter().enumerate() {
+            for (pc, instruction) in function.code.iter().enumerate() {
+                if matches!(
+                    instruction,
+                    Instruction::Call { .. }
+                        | Instruction::EnumNew { .. }
+                        | Instruction::EnumTag { .. }
+                        | Instruction::EnumPayload { .. }
+                        | Instruction::JumpIfFalse { .. }
+                        | Instruction::StateOldGet { .. }
+                        | Instruction::StateFinish
+                        | Instruction::Safepoint
+                ) {
+                    required_instruction_count += 1;
+                    let span = module
+                        .source_span(
+                            u32::try_from(function_index).unwrap(),
+                            u32::try_from(pc).unwrap(),
+                        )
+                        .unwrap();
+                    assert_eq!(span.file, FileId(0));
+                    assert!(!span.is_empty());
+                    assert!(span.end as usize <= source.len());
+                }
+            }
+        }
+        assert!(required_instruction_count >= 8);
     }
 
     #[test]

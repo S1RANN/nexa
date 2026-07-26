@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use nexa_core::StableId;
+use nexa_core::{FileId, SourceSpan, StableId};
 
 pub const MAGIC: [u8; 4] = *b"NXBC";
 pub const BYTECODE_VERSION: u16 = 4;
@@ -49,6 +49,14 @@ pub struct RootMap {
 pub struct LoopBound {
     pub back_edge: u32,
     pub max_iterations: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceMapEntry {
+    pub function: u32,
+    pub pc_start: u32,
+    pub pc_end: u32,
+    pub span: SourceSpan,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -449,6 +457,7 @@ pub struct Module {
     pub host_interface_hash: Option<StableId>,
     pub schema_hash: Option<StableId>,
     pub reload_metadata: ReloadMetadata,
+    pub source_map: Vec<SourceMapEntry>,
 }
 
 #[must_use]
@@ -584,6 +593,7 @@ pub enum DecodeError {
     TrailingBytes,
     SizeOverflow,
     InvalidSectionDirectory,
+    InvalidSourceMap,
     ChecksumMismatch(u8),
     ResourceLimit(&'static str),
 }
@@ -601,6 +611,7 @@ pub struct DecodeLimits {
     pub max_state_types: usize,
     pub max_enum_types: usize,
     pub max_exports: usize,
+    pub max_source_map_entries: usize,
 }
 
 impl Default for DecodeLimits {
@@ -617,6 +628,7 @@ impl Default for DecodeLimits {
             max_state_types: 65_536,
             max_enum_types: 65_536,
             max_exports: 65_536,
+            max_source_map_entries: 1_000_000,
         }
     }
 }
@@ -630,6 +642,15 @@ impl fmt::Display for DecodeError {
 impl std::error::Error for DecodeError {}
 
 impl Module {
+    #[must_use]
+    pub fn source_span(&self, function: u32, pc: u32) -> Option<SourceSpan> {
+        self.source_map
+            .iter()
+            .rev()
+            .find(|entry| entry.function == function && entry.pc_start <= pc && pc < entry.pc_end)
+            .map(|entry| entry.span)
+    }
+
     #[must_use]
     #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
@@ -811,7 +832,21 @@ impl Module {
                 encode_instruction(&mut output, *instruction);
             }
         }
-        encode_sections(&[(1, metadata), (2, output)])
+        let functions = output;
+        let mut source_map = Vec::new();
+        put_u32(
+            &mut source_map,
+            u32::try_from(self.source_map.len()).expect("source-map count exceeds wire format"),
+        );
+        for entry in &self.source_map {
+            put_u32(&mut source_map, entry.function);
+            put_u32(&mut source_map, entry.pc_start);
+            put_u32(&mut source_map, entry.pc_end);
+            put_u32(&mut source_map, entry.span.file.0);
+            put_u32(&mut source_map, entry.span.start);
+            put_u32(&mut source_map, entry.span.end);
+        }
+        encode_sections(&[(1, metadata), (2, functions), (3, source_map)])
     }
 
     #[allow(clippy::too_many_lines)]
@@ -832,6 +867,10 @@ impl Module {
         let function_bytes = sections
             .iter()
             .find_map(|(kind, bytes)| (*kind == 2).then_some(*bytes))
+            .ok_or(DecodeError::InvalidSectionDirectory)?;
+        let source_map_bytes = sections
+            .iter()
+            .find_map(|(kind, bytes)| (*kind == 3).then_some(*bytes))
             .ok_or(DecodeError::InvalidSectionDirectory)?;
         let mut reader = Reader {
             bytes: metadata,
@@ -1132,6 +1171,34 @@ impl Module {
         if reader.cursor != function_bytes.len() {
             return Err(DecodeError::TrailingBytes);
         }
+        let mut reader = Reader {
+            bytes: source_map_bytes,
+            cursor: 0,
+        };
+        let source_map_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if source_map_count > limits.max_source_map_entries {
+            return Err(DecodeError::ResourceLimit("source map"));
+        }
+        if source_map_count > reader.remaining() / 24 {
+            return Err(DecodeError::Truncated);
+        }
+        let mut source_map = Vec::with_capacity(source_map_count);
+        for _ in 0..source_map_count {
+            let entry = SourceMapEntry {
+                function: reader.u32()?,
+                pc_start: reader.u32()?,
+                pc_end: reader.u32()?,
+                span: SourceSpan::new(FileId(reader.u32()?), reader.u32()?, reader.u32()?),
+            };
+            if entry.pc_start >= entry.pc_end || entry.span.is_empty() {
+                return Err(DecodeError::InvalidSourceMap);
+            }
+            source_map.push(entry);
+        }
+        if reader.cursor != source_map_bytes.len() {
+            return Err(DecodeError::TrailingBytes);
+        }
         Ok(Self {
             functions,
             enum_types,
@@ -1141,6 +1208,7 @@ impl Module {
             host_interface_hash,
             schema_hash,
             reload_metadata,
+            source_map,
         })
     }
 }
@@ -1779,6 +1847,7 @@ pub struct ModuleBuilder {
     host_interface_hash: Option<StableId>,
     schema_hash: Option<StableId>,
     reload_metadata: ReloadMetadata,
+    source_map: Vec<SourceMapEntry>,
 }
 
 impl ModuleBuilder {
@@ -1806,6 +1875,7 @@ impl ModuleBuilder {
                     max_call_depth: 0,
                 },
             },
+            source_map: Vec::new(),
         }
     }
 
@@ -1857,6 +1927,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn source_map(&mut self, entries: impl IntoIterator<Item = SourceMapEntry>) -> &mut Self {
+        self.source_map.extend(entries);
+        self
+    }
+
     #[must_use]
     pub fn finish(self) -> Module {
         let mut module = Module {
@@ -1868,6 +1943,7 @@ impl ModuleBuilder {
             host_interface_hash: self.host_interface_hash,
             schema_hash: self.schema_hash,
             reload_metadata: self.reload_metadata,
+            source_map: self.source_map,
         };
         let migration_entries = module
             .functions
@@ -2029,9 +2105,12 @@ impl FunctionBuilder {
 
 #[cfg(test)]
 mod tests {
+    use nexa_core::{FileId, SourceSpan};
+
     use super::{
         DecodeError, FunctionBuilder, FunctionEffect, Instruction, Module, ModuleBuilder,
-        Signature, ValueType, result_type, state_handle_error_type, state_handle_type,
+        Signature, SourceMapEntry, ValueType, result_type, state_handle_error_type,
+        state_handle_type,
     };
 
     #[test]
@@ -2051,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn wire_format_round_trips_and_rejects_corrupt_instruction_bytes() {
+    fn wire_format_round_trips_source_maps_and_rejects_corrupt_section_bytes() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -2070,8 +2149,18 @@ mod tests {
         function.loop_bound(99, 3);
         let mut builder = ModuleBuilder::new();
         builder.function(function.finish().unwrap());
+        builder.source_map([SourceMapEntry {
+            function: 0,
+            pc_start: 0,
+            pc_end: 1,
+            span: SourceSpan::new(FileId(7), 4, 9),
+        }]);
         let module = builder.finish();
         let encoded = module.encode();
+        assert_eq!(
+            module.source_span(0, 0),
+            Some(SourceSpan::new(FileId(7), 4, 9))
+        );
         assert_eq!(Module::decode(&encoded), Ok(module));
         assert_eq!(
             Module::decode(&encoded[..encoded.len() - 1]),
@@ -2082,7 +2171,7 @@ mod tests {
         corrupt[opcode] = u8::MAX;
         assert_eq!(
             Module::decode(&corrupt),
-            Err(DecodeError::ChecksumMismatch(2))
+            Err(DecodeError::ChecksumMismatch(3))
         );
     }
 

@@ -573,7 +573,11 @@ impl From<MigrationLimitError> for NexaError {
 impl ClassifiedError for DecodeError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: ErrorCode::NX3001,
+            code: if matches!(self, DecodeError::InvalidSourceMap) {
+                ErrorCode::NX3004
+            } else {
+                ErrorCode::NX3001
+            },
             category: ErrorCategory::Decode,
             context: ErrorContext::default(),
         }
@@ -591,6 +595,7 @@ impl ClassifiedError for VerifyError {
             | VerifyErrorKind::ForgedRoot(_)
             | VerifyErrorKind::MissingRoot(_)
             | VerifyErrorKind::InvalidRootMap(_) => ErrorCode::NX3003,
+            VerifyErrorKind::InvalidSourceMap => ErrorCode::NX3004,
             VerifyErrorKind::InvalidReloadMetadata => ErrorCode::NX6005,
             _ => ErrorCode::NX3001,
         };

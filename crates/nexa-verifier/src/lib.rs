@@ -57,6 +57,7 @@ pub enum VerifyErrorKind {
     ImmediateRecursion,
     WcetComplexityLimit,
     InvalidEnumMetadata,
+    InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
     InvalidReloadMetadata,
@@ -91,6 +92,7 @@ impl VerifiedModule {
 
 pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModule, VerifyError> {
     verify_reload_metadata(&module)?;
+    verify_source_map(&module)?;
     let mut enum_ids = BTreeSet::new();
     for enum_type in &module.enum_types {
         let mut variant_ids = BTreeSet::new();
@@ -182,6 +184,29 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
         }
     }
     Ok(VerifiedModule(module))
+}
+
+fn verify_source_map(module: &Module) -> Result<(), VerifyError> {
+    for entry in &module.source_map {
+        let Some(function) = module.functions.get(entry.function as usize) else {
+            return Err(VerifyError {
+                function: entry.function as usize,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidSourceMap,
+            });
+        };
+        if entry.pc_start >= entry.pc_end
+            || entry.pc_end as usize > function.code.len()
+            || entry.span.is_empty()
+        {
+            return Err(VerifyError {
+                function: entry.function as usize,
+                instruction: Some(entry.pc_start as usize),
+                kind: VerifyErrorKind::InvalidSourceMap,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub fn verify_reload_transition(
@@ -1074,10 +1099,38 @@ fn longest_path(
 mod tests {
     use nexa_bytecode::{
         FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature,
-        StateSchema, StateType, ValueType,
+        SourceMapEntry, StateSchema, StateType, ValueType,
     };
+    use nexa_core::{FileId, SourceSpan};
 
     use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
+
+    #[test]
+    fn rejects_source_map_ranges_outside_their_function() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        function.emit(Instruction::ReturnVoid);
+        let mut module = ModuleBuilder::new();
+        module.function(function.finish().unwrap());
+        module.source_map([SourceMapEntry {
+            function: 0,
+            pc_start: 0,
+            pc_end: 2,
+            span: SourceSpan::new(FileId(1), 2, 3),
+        }]);
+
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidSourceMap
+        );
+    }
 
     #[test]
     fn rejects_bad_jump_type_and_forged_root_bitmap() {
