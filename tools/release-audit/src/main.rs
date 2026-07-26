@@ -321,14 +321,17 @@ fn realm_artifact(sha: &str, tree: &str) -> Value {
 }
 
 fn failure_artifact(sha: &str, tree: &str) -> Value {
-    let points = RuntimeFailurePoint::ALL
+    let production_points = RuntimeFailurePoint::REALM_PRODUCTION
         .iter()
         .map(|point| format!("{point:?}"))
         .collect::<Vec<_>>();
-    let host_points = points
+    let host_points = RuntimeFailurePoint::HOST_RETURN
         .iter()
-        .filter(|point| point.starts_with("HostReturn"))
-        .cloned()
+        .map(|point| format!("{point:?}"))
+        .collect::<Vec<_>>();
+    let all_points = RuntimeFailurePoint::ALL
+        .iter()
+        .map(|point| format!("{point:?}"))
         .collect::<Vec<_>>();
     artifact(
         sha,
@@ -337,8 +340,9 @@ fn failure_artifact(sha: &str, tree: &str) -> Value {
         "passed",
         json!({
             "runtime_kind": "RealmRuntime",
-            "points": points,
-            "production_failure_points": points.len() - host_points.len(),
+            "points": all_points,
+            "production_failure_points": production_points.len(),
+            "production_points": production_points,
             "host_return_failure_points": host_points,
             "shadow_state_fields": 0,
         }),

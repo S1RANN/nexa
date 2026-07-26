@@ -372,7 +372,7 @@ fn every_production_failure_point_is_differentially_atomic() {
     assert_cleanup_trap_is_terminal_and_exactly_once();
     covered.push(RuntimeFailurePoint::CleanupTrap);
 
-    for point in RuntimeFailurePoint::ALL {
+    for point in RuntimeFailurePoint::REALM_PRODUCTION {
         assert!(
             covered.contains(&point),
             "missing production coverage for {point:?}"

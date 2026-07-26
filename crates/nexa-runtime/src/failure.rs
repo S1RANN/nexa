@@ -27,6 +27,31 @@ pub enum RuntimeFailurePoint {
 }
 
 impl RuntimeFailurePoint {
+    pub const REALM_PRODUCTION: [Self; 15] = [
+        Self::TaskSlot,
+        Self::ScopeSlot,
+        Self::SchedulerSlot,
+        Self::FrameSlot,
+        Self::HeapSlot,
+        Self::RequestSlot,
+        Self::CompletionSlot,
+        Self::ReleaseSlot,
+        Self::SnapshotSlot,
+        Self::MigrationObjectSlot,
+        Self::MigrationFieldSlot,
+        Self::MigrationForwardingSlot,
+        Self::ReloadCompletionSlot,
+        Self::ActivationTrap,
+        Self::CleanupTrap,
+    ];
+    pub const HOST_RETURN: [Self; 6] = [
+        Self::HostReturnObjectReservation,
+        Self::HostReturnCollectionReservation,
+        Self::HostReturnStringReservation,
+        Self::HostReturnStructWrite,
+        Self::HostReturnCollectionWrite,
+        Self::HostReturnCommit,
+    ];
     pub const ALL: [Self; 21] = [
         Self::TaskSlot,
         Self::ScopeSlot,
@@ -209,6 +234,11 @@ mod tests {
 
     #[test]
     fn every_failure_point_supports_once_at_always_disarm_and_clear() {
+        let classified = RuntimeFailurePoint::REALM_PRODUCTION
+            .into_iter()
+            .chain(RuntimeFailurePoint::HOST_RETURN)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(classified, RuntimeFailurePoint::ALL.into_iter().collect());
         let injector = RuntimeFailureInjector::default();
         for point in RuntimeFailurePoint::ALL {
             injector.arm_once(point);
