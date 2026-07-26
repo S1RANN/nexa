@@ -90,24 +90,235 @@ pub enum CompileError {
         offset: usize,
         expected: &'static str,
     },
-    UnexpectedEnd,
-    DuplicateName(String),
-    UnknownName(String),
-    UnknownType(String),
-    TypeMismatch,
+    UnexpectedEnd {
+        span: SourceSpan,
+    },
+    DuplicateName {
+        name: String,
+        first: SourceSpan,
+        duplicate: SourceSpan,
+    },
+    UnknownName {
+        name: String,
+        span: SourceSpan,
+    },
+    UnknownType {
+        name: String,
+        span: SourceSpan,
+    },
+    TypeMismatch {
+        expected: Option<ValueType>,
+        actual: Option<ValueType>,
+        span: SourceSpan,
+    },
     InvalidNumericConversion {
         span: SourceSpan,
     },
-    CannotInferType,
-    NonExhaustiveMatch,
-    DuplicateMatchVariant,
-    MissingReturn,
-    SuspendingDefer,
-    DeferCaptureLimit,
-    InvalidEffect,
-    InvalidReloadMetadata(&'static str),
-    TooManyRegisters,
-    Verify(String),
+    CannotInferType {
+        span: SourceSpan,
+    },
+    NonExhaustiveMatch {
+        missing: Vec<StableId>,
+        span: SourceSpan,
+    },
+    DuplicateMatchVariant {
+        variant: StableId,
+        first: SourceSpan,
+        duplicate: SourceSpan,
+    },
+    TryRequiresResult {
+        actual: ValueType,
+        span: SourceSpan,
+    },
+    TryErrorMismatch {
+        expected: ValueType,
+        actual: ValueType,
+        span: SourceSpan,
+    },
+    AwaitOutsideTask {
+        span: SourceSpan,
+    },
+    MissingAwait {
+        span: SourceSpan,
+    },
+    MigrationIntrinsicOutsideMigration {
+        intrinsic: String,
+        span: SourceSpan,
+    },
+    MissingMigrationFinish {
+        function_span: SourceSpan,
+    },
+    DuplicateForwarding {
+        stable_id: StableId,
+        span: SourceSpan,
+    },
+    MissingForwarding {
+        stable_id: StableId,
+        function_span: SourceSpan,
+    },
+    InvalidFieldAccess {
+        type_id: StableId,
+        field: String,
+        span: SourceSpan,
+    },
+    MissingReturn {
+        function_span: SourceSpan,
+    },
+    SuspendingDefer {
+        span: SourceSpan,
+    },
+    DeferCaptureLimit {
+        span: SourceSpan,
+    },
+    InvalidEffect {
+        span: SourceSpan,
+    },
+    InvalidReloadMetadata {
+        message: &'static str,
+        function_span: SourceSpan,
+    },
+    TooManyRegisters {
+        function_span: SourceSpan,
+    },
+    Verify {
+        message: String,
+        function_span: SourceSpan,
+    },
+}
+
+impl CompileError {
+    fn fallback_span() -> SourceSpan {
+        SourceSpan::new(FileId(0), 0, 1)
+    }
+
+    fn unexpected_end() -> Self {
+        Self::UnexpectedEnd {
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn duplicate_name(name: String) -> Self {
+        let span = Self::fallback_span();
+        Self::DuplicateName {
+            name,
+            first: span,
+            duplicate: span,
+        }
+    }
+
+    fn unknown_name(name: String) -> Self {
+        Self::UnknownName {
+            name,
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn unknown_type(name: String) -> Self {
+        Self::UnknownType {
+            name,
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn type_mismatch() -> Self {
+        Self::TypeMismatch {
+            expected: None,
+            actual: None,
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn cannot_infer_type() -> Self {
+        Self::CannotInferType {
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn missing_return() -> Self {
+        Self::MissingReturn {
+            function_span: Self::fallback_span(),
+        }
+    }
+
+    fn suspending_defer() -> Self {
+        Self::SuspendingDefer {
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn defer_capture_limit() -> Self {
+        Self::DeferCaptureLimit {
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn invalid_effect() -> Self {
+        Self::InvalidEffect {
+            span: Self::fallback_span(),
+        }
+    }
+
+    fn invalid_reload_metadata(message: &'static str) -> Self {
+        Self::InvalidReloadMetadata {
+            message,
+            function_span: Self::fallback_span(),
+        }
+    }
+
+    fn too_many_registers() -> Self {
+        Self::TooManyRegisters {
+            function_span: Self::fallback_span(),
+        }
+    }
+
+    fn verify(message: String) -> Self {
+        Self::Verify {
+            message,
+            function_span: Self::fallback_span(),
+        }
+    }
+
+    #[must_use]
+    pub fn source_span(&self) -> Option<SourceSpan> {
+        match self {
+            Self::UnexpectedCharacter { offset, character } => Some(SourceSpan::new(
+                FileId(0),
+                u32::try_from(*offset).unwrap_or(u32::MAX),
+                u32::try_from(offset.saturating_add(character.len_utf8())).unwrap_or(u32::MAX),
+            )),
+            Self::UnexpectedToken { offset, .. } => Some(SourceSpan::new(
+                FileId(0),
+                u32::try_from(*offset).unwrap_or(u32::MAX),
+                u32::try_from(offset.saturating_add(1)).unwrap_or(u32::MAX),
+            )),
+            Self::UnexpectedEnd { span }
+            | Self::UnknownName { span, .. }
+            | Self::UnknownType { span, .. }
+            | Self::TypeMismatch { span, .. }
+            | Self::InvalidNumericConversion { span }
+            | Self::CannotInferType { span }
+            | Self::NonExhaustiveMatch { span, .. }
+            | Self::AwaitOutsideTask { span }
+            | Self::MissingAwait { span }
+            | Self::MigrationIntrinsicOutsideMigration { span, .. }
+            | Self::DuplicateForwarding { span, .. }
+            | Self::InvalidFieldAccess { span, .. }
+            | Self::SuspendingDefer { span }
+            | Self::DeferCaptureLimit { span }
+            | Self::InvalidEffect { span } => Some(*span),
+            Self::DuplicateName { duplicate, .. }
+            | Self::DuplicateMatchVariant { duplicate, .. } => Some(*duplicate),
+            Self::TryRequiresResult { span, .. } | Self::TryErrorMismatch { span, .. } => {
+                Some(*span)
+            }
+            Self::MissingMigrationFinish { function_span }
+            | Self::MissingForwarding { function_span, .. }
+            | Self::MissingReturn { function_span }
+            | Self::InvalidReloadMetadata { function_span, .. }
+            | Self::TooManyRegisters { function_span }
+            | Self::Verify { function_span, .. } => Some(*function_span),
+        }
+    }
 }
 
 impl fmt::Display for CompileError {
@@ -700,14 +911,14 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 let mut value = String::new();
                 loop {
                     let (value_offset, character) =
-                        chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                        chars.next().ok_or(CompileError::unexpected_end())?;
                     if character == '"' {
                         end = value_offset + 1;
                         break;
                     }
                     if character == '\\' {
                         let (escape_offset, escape) =
-                            chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                            chars.next().ok_or(CompileError::unexpected_end())?;
                         value.push(match escape {
                             'n' => '\n',
                             'r' => '\r',
@@ -728,10 +939,10 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 TokenKind::String(value)
             }
             '\'' => {
-                let (_, value) = chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                let (_, value) = chars.next().ok_or(CompileError::unexpected_end())?;
                 let value = if value == '\\' {
                     let (escape_offset, escape) =
-                        chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                        chars.next().ok_or(CompileError::unexpected_end())?;
                     match escape {
                         'n' => '\n',
                         'r' => '\r',
@@ -748,7 +959,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 } else {
                     value
                 };
-                let (close_offset, close) = chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                let (close_offset, close) = chars.next().ok_or(CompileError::unexpected_end())?;
                 if close != '\'' {
                     return Err(CompileError::UnexpectedToken {
                         offset: close_offset,
@@ -1117,7 +1328,7 @@ impl Parser<'_> {
                 return Err(self.unexpected("static range end"));
             };
             if range_end < range_start || range_end.saturating_sub(range_start) > 1_024 {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::invalid_effect());
             }
             let body = self.block()?;
             let mut expanded = Vec::new();
@@ -1475,7 +1686,7 @@ impl Parser<'_> {
             },
             "new.set" => {
                 if !type_arguments.is_empty() {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 let object = self.expression(0)?;
                 self.expect(&TokenKind::Comma, ",")?;
@@ -1505,7 +1716,7 @@ impl Parser<'_> {
             },
             "finish_migration" => {
                 if !type_arguments.is_empty() {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 MigrationIntrinsic::Finish
             }
@@ -1581,7 +1792,7 @@ impl Parser<'_> {
         let token = self
             .tokens
             .get(self.cursor)
-            .ok_or(CompileError::UnexpectedEnd)?;
+            .ok_or(CompileError::unexpected_end())?;
         self.cursor += 1;
         Ok(token.kind.clone())
     }
@@ -1614,7 +1825,7 @@ impl Parser<'_> {
     fn unexpected(&self, expected: &'static str) -> CompileError {
         self.tokens
             .get(self.cursor)
-            .map_or(CompileError::UnexpectedEnd, |token| {
+            .map_or(CompileError::unexpected_end(), |token| {
                 CompileError::UnexpectedToken {
                     offset: token.offset,
                     expected,
@@ -1696,19 +1907,21 @@ fn is_migration_intrinsic(name: &str) -> bool {
 
 fn exactly_one_type(mut arguments: Vec<AstType>) -> Result<AstType, CompileError> {
     if arguments.len() != 1 {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     }
     Ok(arguments.pop().expect("length was checked"))
 }
 
 fn exactly_two_types(arguments: Vec<AstType>) -> Result<[AstType; 2], CompileError> {
-    arguments.try_into().map_err(|_| CompileError::TypeMismatch)
+    arguments
+        .try_into()
+        .map_err(|_| CompileError::type_mismatch())
 }
 
 fn split_field_name(name: &str) -> Result<(String, String), CompileError> {
     name.rsplit_once('.')
         .map(|(owner, field)| (owner.to_owned(), field.to_owned()))
-        .ok_or(CompileError::TypeMismatch)
+        .ok_or(CompileError::type_mismatch())
 }
 
 fn migration_expressions(intrinsic: &MigrationIntrinsic) -> Vec<&AstExpression> {
@@ -2245,7 +2458,7 @@ fn resolve_and_typecheck_with_hosts(
         .count()
         > 1
     {
-        return Err(CompileError::InvalidReloadMetadata(
+        return Err(CompileError::invalid_reload_metadata(
             "multiple migration entries",
         ));
     }
@@ -2255,7 +2468,7 @@ fn resolve_and_typecheck_with_hosts(
         .filter(|function| function.is_activation)
         .count();
     if activation_count > 1 {
-        return Err(CompileError::InvalidReloadMetadata(
+        return Err(CompileError::invalid_reload_metadata(
             "multiple activation entries",
         ));
     }
@@ -2264,7 +2477,7 @@ fn resolve_and_typecheck_with_hosts(
         .iter()
         .any(|function| function.is_activation && function.effect != FunctionEffect::Immediate)
     {
-        return Err(CompileError::InvalidReloadMetadata(
+        return Err(CompileError::invalid_reload_metadata(
             "activation entry must have Immediate effect",
         ));
     }
@@ -2317,7 +2530,7 @@ fn resolve_and_typecheck_with_hosts(
                 || map_type.key == nexa_bytecode::stable_id_type()
                 || !declared_type_ids.contains(&type_id))
     }) {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     }
     for map_type in &map_types {
         let option = nexa_bytecode::option_type(map_type.value);
@@ -2480,7 +2693,7 @@ fn resolve_and_typecheck_with_hosts(
     .collect::<BTreeSet<_>>();
     for declaration in &ast.types {
         if !known_types.insert(declaration.name.clone()) {
-            return Err(CompileError::DuplicateName(declaration.name.clone()));
+            return Err(CompileError::duplicate_name(declaration.name.clone()));
         }
     }
     for declaration in &ast.types {
@@ -2491,7 +2704,7 @@ fn resolve_and_typecheck_with_hosts(
         let mut fields = BTreeSet::new();
         for field in &declaration.fields {
             if !fields.insert(&field.name) {
-                return Err(CompileError::DuplicateName(format!(
+                return Err(CompileError::duplicate_name(format!(
                     "{}.{}",
                     declaration.name, field.name
                 )));
@@ -2499,7 +2712,7 @@ fn resolve_and_typecheck_with_hosts(
         }
         for variant in &declaration.variants {
             if !variants.insert(&variant.name) {
-                return Err(CompileError::DuplicateName(format!(
+                return Err(CompileError::duplicate_name(format!(
                     "{}.{}",
                     declaration.name, variant.name
                 )));
@@ -2542,7 +2755,7 @@ fn resolve_and_typecheck_with_hosts(
             .insert(function.name.clone(), signature)
             .is_some()
         {
-            return Err(CompileError::DuplicateName(function.name.clone()));
+            return Err(CompileError::duplicate_name(function.name.clone()));
         }
     }
     let mut functions = Vec::new();
@@ -2558,19 +2771,19 @@ fn resolve_and_typecheck_with_hosts(
             .zip(signature.parameters.iter().copied())
             .enumerate()
         {
-            let register = u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?;
+            let register = u16::try_from(index).map_err(|_| CompileError::too_many_registers())?;
             if locals
                 .insert(parameter.name.clone(), (register, ty))
                 .is_some()
             {
-                return Err(CompileError::DuplicateName(parameter.name.clone()));
+                return Err(CompileError::duplicate_name(parameter.name.clone()));
             }
         }
         if function.effect != FunctionEffect::Task && statements_contain_await(&function.body) {
-            return Err(CompileError::InvalidEffect);
+            return Err(CompileError::invalid_effect());
         }
-        let mut next_register =
-            u16::try_from(function.parameters.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        let mut next_register = u16::try_from(function.parameters.len())
+            .map_err(|_| CompileError::too_many_registers())?;
         let type_context = TypeContext {
             signatures: &signatures,
             enum_types: &enum_types,
@@ -2594,7 +2807,7 @@ fn resolve_and_typecheck_with_hosts(
             &mut next_register,
         )?;
         if flow == Flow::FallsThrough {
-            return Err(CompileError::MissingReturn);
+            return Err(CompileError::missing_return());
         }
         functions.push(HirFunction {
             name: function.name,
@@ -2678,10 +2891,14 @@ fn validate_await_expression(
                 expression => expression,
             };
             let AstExpression::Call { function, .. } = awaited.kind() else {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::AwaitOutsideTask {
+                    span: expression.span(),
+                });
             };
             if !suspending_functions.contains(function) {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::AwaitOutsideTask {
+                    span: expression.span(),
+                });
             }
             validate_await_expression(inner, suspending_functions, true)
         }
@@ -2690,7 +2907,9 @@ fn validate_await_expression(
             arguments,
         } => {
             if suspending_functions.contains(function) && !awaited {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::MissingAwait {
+                    span: expression.span(),
+                });
             }
             for argument in arguments {
                 validate_await_expression(argument, suspending_functions, false)?;
@@ -2758,7 +2977,7 @@ fn resolve_local_scopes(function: &mut AstFunction) -> Result<(), CompileError> 
             .insert(parameter.name.clone(), parameter.name.clone())
             .is_some()
         {
-            return Err(CompileError::DuplicateName(parameter.name.clone()));
+            return Err(CompileError::duplicate_name(parameter.name.clone()));
         }
     }
     let mut scopes = vec![root];
@@ -2781,12 +3000,12 @@ fn resolve_statements(
                     .expect("a function always has a lexical scope")
                     .contains_key(&source_name)
                 {
-                    return Err(CompileError::DuplicateName(source_name));
+                    return Err(CompileError::duplicate_name(source_name));
                 }
                 let resolved = format!("{source_name}#{}", *next_local);
                 *next_local = next_local
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 scopes
                     .last_mut()
                     .expect("a function always has a lexical scope")
@@ -2846,7 +3065,7 @@ fn resolve_expression(
             if let Some(resolved) = resolved {
                 *name = resolved;
             } else if !name.chars().next().is_some_and(char::is_uppercase) {
-                return Err(CompileError::UnknownName(name.clone()));
+                return Err(CompileError::unknown_name(name.clone()));
             }
         }
         AstExpression::Binary { lhs, rhs, .. } => {
@@ -2864,7 +3083,7 @@ fn resolve_expression(
                     .rev()
                     .find_map(|scope| scope.get(receiver))
                     .cloned()
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -2882,7 +3101,7 @@ fn resolve_expression(
                     .rev()
                     .find_map(|scope| scope.get(receiver))
                     .cloned()
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -2899,7 +3118,7 @@ fn resolve_expression(
                     .rev()
                     .find_map(|scope| scope.get(receiver))
                     .cloned()
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -2917,7 +3136,7 @@ fn resolve_expression(
                     .rev()
                     .find_map(|scope| scope.get(receiver))
                     .cloned()
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -2937,7 +3156,7 @@ fn resolve_expression(
                     .rev()
                     .find_map(|scope| scope.get(receiver))
                     .cloned()
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 *function = format!(
                     "{resolved}.{}",
                     match method {
@@ -2985,7 +3204,7 @@ fn resolve_expression(
                     let resolved = format!("{source_name}#{}", *next_local);
                     *next_local = next_local
                         .checked_add(1)
-                        .ok_or(CompileError::TooManyRegisters)?;
+                        .ok_or(CompileError::too_many_registers())?;
                     scopes
                         .last_mut()
                         .expect("match arm scope exists")
@@ -3016,19 +3235,19 @@ fn resolve_expression(
 fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), CompileError> {
     match ty.kind() {
         AstType::Named(name) if !known_types.contains(name) => {
-            Err(CompileError::UnknownType(name.clone()))
+            Err(CompileError::unknown_type(name.clone()))
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
                 "Option" | "StateHandle" | "Array" | "Buffer" | "Snapshot" => 1,
                 "Result" | "Map" => 2,
-                _ => return Err(CompileError::UnknownType(name.clone())),
+                _ => return Err(CompileError::unknown_type(name.clone())),
             };
             if arguments.len() != expected {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             if name == "Snapshot" && !matches!(arguments[0].kind(), AstType::Named(_)) {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             for argument in arguments {
                 validate_type(argument, known_types)?;
@@ -3113,13 +3332,13 @@ fn validate_state_handle_target(
     }
     if name == "StateHandle" {
         let [target] = arguments.as_slice() else {
-            return Err(CompileError::TypeMismatch);
+            return Err(CompileError::type_mismatch());
         };
         let AstType::Named(target) = target.kind() else {
-            return Err(CompileError::TypeMismatch);
+            return Err(CompileError::type_mismatch());
         };
         if !stateful_types.contains(target.as_str()) {
-            return Err(CompileError::TypeMismatch);
+            return Err(CompileError::type_mismatch());
         }
     }
     Ok(())
@@ -3141,9 +3360,9 @@ fn validate_state_storage_type<'a>(
         AstType::Named(name) => {
             let declaration = declarations
                 .get(name.as_str())
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             if !matches!(declaration.kind, AstTypeKind::Struct | AstTypeKind::Enum) {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             if !visiting.insert(declaration.name.as_str()) {
                 return Ok(());
@@ -3171,15 +3390,15 @@ fn validate_state_storage_type<'a>(
             if name == "StateHandle" && arguments.len() == 1 =>
         {
             let AstType::Named(target) = arguments[0].kind() else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             declarations
                 .get(target.as_str())
                 .filter(|declaration| declaration.kind == AstTypeKind::StatefulClass)
                 .map(|_| ())
-                .ok_or(CompileError::TypeMismatch)
+                .ok_or(CompileError::type_mismatch())
         }
-        AstType::BuiltinGeneric { .. } => Err(CompileError::TypeMismatch),
+        AstType::BuiltinGeneric { .. } => Err(CompileError::type_mismatch()),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
 }
@@ -3252,14 +3471,14 @@ fn check_statements(
                 let expected = ty.as_ref().map(lower_type);
                 let actual = expression_type(value, locals, context, next_register, expected)?;
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 let register = *next_register;
                 *next_register = next_register
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 if locals.insert(name.clone(), (register, actual)).is_some() {
-                    return Err(CompileError::DuplicateName(name.clone()));
+                    return Err(CompileError::duplicate_name(name.clone()));
                 }
             }
             AstStatement::Return(expression) => {
@@ -3271,7 +3490,7 @@ fn check_statements(
                     Some(context.function_result),
                 )? != context.function_result
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 flow = Flow::Returns;
             }
@@ -3280,7 +3499,7 @@ fn check_statements(
             }
             AstStatement::Yield => {
                 if context.effect != FunctionEffect::Task {
-                    return Err(CompileError::InvalidEffect);
+                    return Err(CompileError::invalid_effect());
                 }
             }
             AstStatement::If {
@@ -3296,7 +3515,7 @@ fn check_statements(
                     Some(ValueType::Bool),
                 )? != ValueType::Bool
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 let mut then_locals = locals.clone();
                 let mut else_locals = locals.clone();
@@ -3322,7 +3541,7 @@ fn check_statements(
                     Some(ValueType::Bool),
                 )? != ValueType::Bool
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 let mut loop_locals = locals.clone();
                 let body_flow = check_statements(body, &mut loop_locals, context, next_register)?;
@@ -3337,7 +3556,7 @@ fn check_statements(
             }
             AstStatement::Defer(expression) => {
                 if contains_await(expression) {
-                    return Err(CompileError::SuspendingDefer);
+                    return Err(CompileError::suspending_defer());
                 }
                 expression_type(expression, locals, context, next_register, None)?;
             }
@@ -3362,14 +3581,14 @@ fn check_field_set(
 ) -> Result<(), CompileError> {
     let ValueType::Named(type_id) = expression_type(value, locals, context, next_register, None)?
     else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let field = context
         .class_fields
         .get(&(type_id, field.to_owned()))
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     if expression_type(replacement, locals, context, next_register, Some(field.ty))? != field.ty {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     }
     Ok(())
 }
@@ -3451,18 +3670,18 @@ fn expression_type(
                 ValueType::I32
             }
             Some(ValueType::I64) => ValueType::I64,
-            Some(_) => return Err(CompileError::TypeMismatch),
+            Some(_) => return Err(CompileError::type_mismatch()),
             None if i32::try_from(*value).is_ok() => ValueType::I32,
             None => ValueType::I64,
         },
         AstExpression::Float(_) => match expected {
             Some(ValueType::F32) => ValueType::F32,
             Some(ValueType::F64) | None => ValueType::F64,
-            Some(_) => return Err(CompileError::TypeMismatch),
+            Some(_) => return Err(CompileError::type_mismatch()),
         },
         AstExpression::Rune(value) => {
             if char::from_u32(*value).is_none() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             ValueType::Rune
         }
@@ -3479,7 +3698,7 @@ fn expression_type(
             {
                 ValueType::Named(type_id)
             } else {
-                return Err(CompileError::UnknownName(name.clone()));
+                return Err(CompileError::unknown_name(name.clone()));
             }
         }
         AstExpression::StructLiteral { type_name, fields } => {
@@ -3488,16 +3707,16 @@ fn expression_type(
                 .struct_types
                 .iter()
                 .find(|struct_type| struct_type.type_id == type_id)
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
             if fields.len() != struct_type.fields.len() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             let mut supplied = BTreeSet::new();
             for field in fields {
                 let metadata = context
                     .struct_fields
                     .get(&(type_id, field.name.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if !supplied.insert(metadata.stable_id)
                     || expression_type(
                         &field.value,
@@ -3507,7 +3726,7 @@ fn expression_type(
                         Some(metadata.ty),
                     )? != metadata.ty
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
             }
             ValueType::Named(type_id)
@@ -3518,16 +3737,16 @@ fn expression_type(
                 .class_types
                 .iter()
                 .find(|class_type| class_type.type_id == type_id)
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
             if fields.len() != class_type.fields.len() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             let mut supplied = BTreeSet::new();
             for field in fields {
                 let metadata = context
                     .class_fields
                     .get(&(type_id, field.name.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if !supplied.insert(metadata.stable_id)
                     || expression_type(
                         &field.value,
@@ -3537,7 +3756,7 @@ fn expression_type(
                         Some(metadata.ty),
                     )? != metadata.ty
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
             }
             ValueType::Named(type_id)
@@ -3547,7 +3766,7 @@ fn expression_type(
                 context.effect,
                 FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
             ) {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::invalid_effect());
             }
             let element = lower_type(element_type);
             let type_id = nexa_bytecode::array_type(element);
@@ -3556,7 +3775,7 @@ fn expression_type(
                 .iter()
                 .any(|array_type| array_type.type_id == type_id && array_type.element == element)
             {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             ValueType::Named(type_id)
         }
@@ -3568,7 +3787,7 @@ fn expression_type(
                 context.effect,
                 FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
             ) {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::invalid_effect());
             }
             let key = lower_type(key_type);
             let value = lower_type(value_type);
@@ -3576,7 +3795,7 @@ fn expression_type(
             if !context.map_types.iter().any(|map_type| {
                 map_type.type_id == type_id && map_type.key == key && map_type.value == value
             }) {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             ValueType::Named(type_id)
         }
@@ -3584,20 +3803,24 @@ fn expression_type(
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             context
                 .struct_fields
                 .get(&(type_id, field.clone()))
                 .or_else(|| context.class_fields.get(&(type_id, field.clone())))
                 .map(|field| field.ty)
-                .ok_or(CompileError::TypeMismatch)?
+                .ok_or_else(|| CompileError::InvalidFieldAccess {
+                    type_id,
+                    field: field.clone(),
+                    span: expression.span(),
+                })?
         }
         AstExpression::StructWith { value, updates } => {
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             if !context
                 .struct_types
@@ -3605,14 +3828,14 @@ fn expression_type(
                 .any(|struct_type| struct_type.type_id == type_id)
                 || updates.is_empty()
             {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             let mut supplied = BTreeSet::new();
             for update in updates {
                 let field = context
                     .struct_fields
                     .get(&(type_id, update.name.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if !supplied.insert(field.stable_id)
                     || expression_type(
                         &update.value,
@@ -3622,7 +3845,7 @@ fn expression_type(
                         Some(field.ty),
                     )? != field.ty
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
             }
             ValueType::Named(type_id)
@@ -3642,7 +3865,7 @@ fn expression_type(
                 || expression_type(rhs, locals, context, next_register, Some(operand_type))?
                     != operand_type
             {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             ValueType::Bool
         }
@@ -3662,12 +3885,12 @@ fn expression_type(
                         Some(ValueType::String),
                     )? != ValueType::String
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 if expression_type(rhs, locals, context, next_register, Some(ValueType::String))?
                     != ValueType::String
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 ValueType::String
             } else {
@@ -3675,18 +3898,18 @@ fn expression_type(
                     numeric_type,
                     ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
                 ) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 if expected.is_some()
                     && expression_type(lhs, locals, context, next_register, Some(numeric_type))?
                         != numeric_type
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 if expression_type(rhs, locals, context, next_register, Some(numeric_type))?
                     != numeric_type
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 numeric_type
             }
@@ -3699,13 +3922,13 @@ fn expression_type(
                 && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
             {
                 let [payload] = arguments.as_slice() else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
-                let payload_type = variant.payload_type.ok_or(CompileError::TypeMismatch)?;
+                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch())?;
                 if expression_type(payload, locals, context, next_register, Some(payload_type))?
                     != payload_type
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(ValueType::Named(type_id));
             }
@@ -3715,7 +3938,7 @@ fn expression_type(
                 let result = match method {
                     StringMethod::Len | StringMethod::ByteLen | StringMethod::Hash => {
                         if !arguments.is_empty() {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         if method == StringMethod::Hash {
                             ValueType::I64
@@ -3733,7 +3956,7 @@ fn expression_type(
                                 Some(ValueType::String),
                             )? != ValueType::String
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         if method == StringMethod::Equal {
                             ValueType::Bool
@@ -3751,13 +3974,13 @@ fn expression_type(
                                 Some(ValueType::I32),
                             )? != ValueType::I32
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Rune
                     }
                 };
                 if expected.is_some_and(|expected| expected != result) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(result);
             }
@@ -3772,21 +3995,21 @@ fn expression_type(
                 let receiver_type = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 let ValueType::Named(buffer_type) = receiver_type else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let element = context
                     .buffer_types
                     .iter()
                     .find(|buffer| buffer.type_id == buffer_type)
                     .map(|buffer| buffer.element)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::InvalidEffect);
+                    return Err(CompileError::invalid_effect());
                 }
                 let index = |argument: &AstExpression,
                              locals: &mut BTreeMap<String, (u16, ValueType)>,
@@ -3803,7 +4026,7 @@ fn expression_type(
                     BufferMethod::Len if arguments.is_empty() => ValueType::I32,
                     BufferMethod::Get if arguments.len() == 1 => {
                         if index(&arguments[0], locals, next_register)? != ValueType::I32 {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         element
                     }
@@ -3817,7 +4040,7 @@ fn expression_type(
                                 Some(element),
                             )? != element
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Bool
                     }
@@ -3825,7 +4048,7 @@ fn expression_type(
                         if index(&arguments[0], locals, next_register)? != ValueType::I32
                             || index(&arguments[1], locals, next_register)? != ValueType::I32
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         receiver_type
                     }
@@ -3838,19 +4061,19 @@ fn expression_type(
                             Some(receiver_type),
                         )? != receiver_type
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         for argument in &arguments[1..] {
                             if index(argument, locals, next_register)? != ValueType::I32 {
-                                return Err(CompileError::TypeMismatch);
+                                return Err(CompileError::type_mismatch());
                             }
                         }
                         ValueType::Bool
                     }
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(actual);
             }
@@ -3865,20 +4088,20 @@ fn expression_type(
                 let receiver_type = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 let ValueType::Named(map_type) = receiver_type else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let map_type = context
                     .map_types
                     .iter()
                     .find(|candidate| candidate.type_id == map_type)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::InvalidEffect);
+                    return Err(CompileError::invalid_effect());
                 }
                 let mut check_key = |argument: &AstExpression| {
                     expression_type(argument, locals, context, next_register, Some(map_type.key))
@@ -3887,7 +4110,7 @@ fn expression_type(
                     MapMethod::Len if arguments.is_empty() => ValueType::I32,
                     MapMethod::Get | MapMethod::Remove if arguments.len() == 1 => {
                         if check_key(&arguments[0])? != map_type.key {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Named(nexa_bytecode::option_type(map_type.value).type_id)
                     }
@@ -3901,21 +4124,21 @@ fn expression_type(
                                 Some(map_type.value),
                             )? != map_type.value
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Bool
                     }
                     MapMethod::Contains if arguments.len() == 1 => {
                         if check_key(&arguments[0])? != map_type.key {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Bool
                     }
                     MapMethod::Clear if arguments.is_empty() => ValueType::Bool,
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(actual);
             }
@@ -3923,21 +4146,21 @@ fn expression_type(
                 let receiver_type = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 let ValueType::Named(array_type) = receiver_type else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let element = context
                     .array_types
                     .iter()
                     .find(|candidate| candidate.type_id == array_type)
                     .map(|candidate| candidate.element)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if matches!(
                     context.effect,
                     FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::InvalidEffect);
+                    return Err(CompileError::invalid_effect());
                 }
                 let actual = match method {
                     ArrayMethod::Len if arguments.is_empty() => ValueType::I32,
@@ -3950,7 +4173,7 @@ fn expression_type(
                             Some(ValueType::I32),
                         )? != ValueType::I32
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         element
                     }
@@ -3970,7 +4193,7 @@ fn expression_type(
                                 Some(element),
                             )? != element
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Bool
                     }
@@ -3983,16 +4206,16 @@ fn expression_type(
                             Some(element),
                         )? != element
                         {
-                            return Err(CompileError::TypeMismatch);
+                            return Err(CompileError::type_mismatch());
                         }
                         ValueType::Bool
                     }
                     ArrayMethod::Pop if arguments.is_empty() => element,
                     ArrayMethod::Clear if arguments.is_empty() => ValueType::Bool,
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 };
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(actual);
             }
@@ -4001,19 +4224,19 @@ fn expression_type(
                     context.effect,
                     FunctionEffect::Migration | FunctionEffect::Cleanup
                 ) {
-                    return Err(CompileError::InvalidEffect);
+                    return Err(CompileError::invalid_effect());
                 }
                 let receiver_type = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.to_owned()))?;
                 let ValueType::Named(handle_type) = receiver_type else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let target = *context
                     .state_handle_targets
                     .get(&handle_type)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 let actual = match method {
                     StateHandleMethod::Equality => {
                         if arguments.len() != 1
@@ -4025,7 +4248,7 @@ fn expression_type(
                                 Some(receiver_type),
                             )? != receiver_type
                         {
-                            Err(CompileError::TypeMismatch)
+                            Err(CompileError::type_mismatch())
                         } else {
                             Ok(ValueType::Bool)
                         }
@@ -4042,53 +4265,58 @@ fn expression_type(
                                 .type_id,
                             ))
                         } else {
-                            Err(CompileError::TypeMismatch)
+                            Err(CompileError::type_mismatch())
                         }
                     }
                     StateHandleMethod::IsAlive => {
                         if arguments.is_empty() {
                             Ok(ValueType::Bool)
                         } else {
-                            Err(CompileError::TypeMismatch)
+                            Err(CompileError::type_mismatch())
                         }
                     }
                     StateHandleMethod::StableId => {
                         if arguments.is_empty() {
                             Ok(nexa_bytecode::stable_id_type())
                         } else {
-                            Err(CompileError::TypeMismatch)
+                            Err(CompileError::type_mismatch())
                         }
                     }
                     StateHandleMethod::Generation | StateHandleMethod::Hash => {
                         if arguments.is_empty() {
                             Ok(ValueType::I32)
                         } else {
-                            Err(CompileError::TypeMismatch)
+                            Err(CompileError::type_mismatch())
                         }
                     }
                 }?;
                 if expected.is_some_and(|expected| expected != actual) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 return Ok(actual);
             }
             let signature = context
                 .signatures
                 .get(function)
-                .ok_or_else(|| CompileError::UnknownName(function.clone()))?;
+                .ok_or_else(|| CompileError::unknown_name(function.clone()))?;
             if arguments.len() != signature.parameters.len() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             for (argument, parameter) in arguments.iter().zip(&signature.parameters) {
                 if expression_type(argument, locals, context, next_register, Some(*parameter))?
                     != *parameter
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
             }
             signature.result.expect("functions have results")
         }
         AstExpression::Await(expression) => {
+            if context.effect != FunctionEffect::Task {
+                return Err(CompileError::AwaitOutsideTask {
+                    span: expression.span(),
+                });
+            }
             expression_type(expression, locals, context, next_register, expected)?
         }
         AstExpression::Constructor {
@@ -4099,30 +4327,30 @@ fn expression_type(
             let type_id = if let Some(type_name) = type_name {
                 let type_id = StableId::from_name(type_name);
                 if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 type_id
             } else {
-                let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)?
+                let ValueType::Named(type_id) = expected.ok_or(CompileError::cannot_infer_type())?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 type_id
             };
             let metadata = context
                 .enum_variants
                 .get(&(type_id, variant.clone()))
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             match (payload, metadata.payload_type) {
                 (Some(payload), Some(payload_type)) => {
                     if expression_type(payload, locals, context, next_register, Some(payload_type))?
                         != payload_type
                     {
-                        return Err(CompileError::TypeMismatch);
+                        return Err(CompileError::type_mismatch());
                     }
                 }
                 (None, None) => {}
-                _ => return Err(CompileError::TypeMismatch),
+                _ => return Err(CompileError::type_mismatch()),
             }
             ValueType::Named(type_id)
         }
@@ -4130,22 +4358,26 @@ fn expression_type(
             let ValueType::Named(type_id) =
                 expression_type(value, locals, context, next_register, None)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             let enum_type = context
                 .enum_types
                 .iter()
                 .find(|enum_type| enum_type.type_id == type_id)
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             let mut covered = BTreeSet::new();
             let mut result_type = expected;
             for arm in arms {
                 let variant = context
                     .enum_variants
                     .get(&(type_id, arm.variant.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 if !covered.insert(variant.stable_id) {
-                    return Err(CompileError::DuplicateMatchVariant);
+                    return Err(CompileError::DuplicateMatchVariant {
+                        variant: variant.stable_id,
+                        first: expression.span(),
+                        duplicate: arm.value.span(),
+                    });
                 }
                 match (&arm.binding, variant.payload_type) {
                     (Some(binding), Some(payload_type)) => {
@@ -4153,56 +4385,92 @@ fn expression_type(
                             let register = *next_register;
                             *next_register = next_register
                                 .checked_add(1)
-                                .ok_or(CompileError::TooManyRegisters)?;
+                                .ok_or(CompileError::too_many_registers())?;
                             locals.insert(binding.clone(), (register, payload_type));
                         }
                     }
                     (None, None) => {}
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 }
                 let arm_type =
                     expression_type(&arm.value, locals, context, next_register, result_type)?;
                 if let Some(expected) = result_type
                     && arm_type != expected
                 {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 result_type = Some(arm_type);
             }
             if covered.len() != enum_type.variants.len() {
-                return Err(CompileError::NonExhaustiveMatch);
+                return Err(CompileError::NonExhaustiveMatch {
+                    missing: enum_type
+                        .variants
+                        .iter()
+                        .filter(|variant| !covered.contains(&variant.stable_id))
+                        .map(|variant| variant.stable_id)
+                        .collect(),
+                    span: expression.span(),
+                });
             }
-            result_type.ok_or(CompileError::NonExhaustiveMatch)?
+            result_type.ok_or_else(|| CompileError::NonExhaustiveMatch {
+                missing: enum_type
+                    .variants
+                    .iter()
+                    .map(|variant| variant.stable_id)
+                    .collect(),
+                span: expression.span(),
+            })?
         }
         AstExpression::Try(expression) => {
-            let ValueType::Named(type_id) =
-                expression_type(expression, locals, context, next_register, None)?
-            else {
-                return Err(CompileError::TypeMismatch);
+            let actual = expression_type(expression, locals, context, next_register, None)?;
+            let ValueType::Named(type_id) = actual else {
+                return Err(CompileError::TryRequiresResult {
+                    actual,
+                    span: expression.span(),
+                });
             };
             let ok = context
                 .enum_variants
                 .get(&(type_id, "Ok".to_owned()))
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::TryRequiresResult {
+                    actual,
+                    span: expression.span(),
+                })?;
             let error = context
                 .enum_variants
                 .get(&(type_id, "Err".to_owned()))
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::TryRequiresResult {
+                    actual,
+                    span: expression.span(),
+                })?;
             let ValueType::Named(function_result) = context.function_result else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::TryRequiresResult {
+                    actual: context.function_result,
+                    span: expression.span(),
+                });
             };
             let result_error = context
                 .enum_variants
                 .get(&(function_result, "Err".to_owned()))
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             if error.payload_type != result_error.payload_type {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::TryErrorMismatch {
+                    expected: result_error.payload_type.unwrap_or(ValueType::Ref),
+                    actual: error.payload_type.unwrap_or(ValueType::Ref),
+                    span: expression.span(),
+                });
             }
-            ok.payload_type.ok_or(CompileError::TypeMismatch)?
+            ok.payload_type.ok_or(CompileError::TryRequiresResult {
+                actual,
+                span: expression.span(),
+            })?
         }
         AstExpression::Migration(intrinsic) => {
             if context.effect != FunctionEffect::Migration {
-                return Err(CompileError::InvalidEffect);
+                return Err(CompileError::MigrationIntrinsicOutsideMigration {
+                    intrinsic: format!("{:?}", intrinsic.kind()),
+                    span: intrinsic.span(),
+                });
             }
             migration_intrinsic_type(intrinsic, locals, context, next_register)?
         }
@@ -4219,7 +4487,7 @@ fn expression_type(
                 span: expression.span(),
             });
         }
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     }
     Ok(actual)
 }
@@ -4243,7 +4511,7 @@ fn migration_intrinsic_type(
                     Some(ValueType::Named(StableId::from_name(owner))),
                 )? != ValueType::Named(StableId::from_name(owner))
             {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             Ok(lower_type(ty))
         }
@@ -4262,7 +4530,7 @@ fn migration_intrinsic_type(
                 Some(ValueType::Named(owner_type)),
             )? != ValueType::Named(owner_type)
             {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             let field_id = StableId::from_parts(&[owner, "::", field]);
             let expected = context
@@ -4277,16 +4545,16 @@ fn migration_intrinsic_type(
                         .find(|candidate| candidate.stable_id == field_id)
                 })
                 .map(|field| field.ty)
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             if expression_type(value, locals, context, next_register, Some(expected))? != expected {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             Ok(ValueType::Bool)
         }
         MigrationIntrinsic::Replace { target, .. } => {
             let target_type = expression_type(target, locals, context, next_register, None)?;
             if !target_type.is_reference() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             Ok(ValueType::Bool)
         }
@@ -4359,7 +4627,7 @@ fn plan_registers(function: &HirFunction) -> Result<RegisterPlan, CompileError> 
     plan.total = plan
         .local_count
         .checked_add(temporary_count)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     Ok(plan)
 }
 
@@ -4381,7 +4649,7 @@ fn inspect_statement_registers(
                 plan.expression_temporaries = plan.expression_temporaries.max(
                     temporary_requirement(replacement)?
                         .checked_add(1)
-                        .ok_or(CompileError::TooManyRegisters)?,
+                        .ok_or(CompileError::too_many_registers())?,
                 );
             }
             AstStatement::If {
@@ -4417,9 +4685,9 @@ fn inspect_expression_registers(
         }
         AstExpression::Call { arguments, .. } => {
             let window = u16::try_from(arguments.len())
-                .map_err(|_| CompileError::TooManyRegisters)?
+                .map_err(|_| CompileError::too_many_registers())?
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             plan.max_call_arguments = plan.max_call_arguments.max(window);
             for argument in arguments {
                 inspect_expression_registers(argument, plan)?;
@@ -4478,7 +4746,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         |offset: usize, nested: &AstExpression| -> Result<usize, CompileError> {
             offset
                 .checked_add(usize::from(temporary_requirement(nested)?))
-                .ok_or(CompileError::TooManyRegisters)
+                .ok_or(CompileError::too_many_registers())
         };
     let required = match expression.kind() {
         AstExpression::Integer(_)
@@ -4543,7 +4811,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         },
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
     };
-    u16::try_from(required).map_err(|_| CompileError::TooManyRegisters)
+    u16::try_from(required).map_err(|_| CompileError::too_many_registers())
 }
 
 fn collect_string_literals(statements: &[AstStatement], strings: &mut BTreeSet<String>) {
@@ -4898,7 +5166,7 @@ fn exact_root_maps(
                 dst,
             } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 state[usize::from(dst)] = module
                     .enum_types
@@ -4914,7 +5182,7 @@ fn exact_root_maps(
             }
             Instruction::StructGet { source, field, dst } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 state[usize::from(dst)] = module
                     .struct_types
@@ -4930,7 +5198,7 @@ fn exact_root_maps(
             }
             Instruction::ClassGet { source, field, dst } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 state[usize::from(dst)] = module
                     .class_types
@@ -4948,7 +5216,7 @@ fn exact_root_maps(
             | Instruction::ArrayPop { source, dst }
             | Instruction::ArrayRemove { source, dst, .. } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 state[usize::from(dst)] = module
                     .array_types
@@ -4966,7 +5234,7 @@ fn exact_root_maps(
             }
             Instruction::BufferGet { source, dst, .. } => {
                 let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 state[usize::from(dst)] = module
                     .buffer_types
@@ -5018,7 +5286,7 @@ fn exact_root_maps(
         }
         for successor in successors {
             if successor >= states.len() {
-                return Err(CompileError::Verify(
+                return Err(CompileError::verify(
                     "emitter produced an out-of-range control-flow target".into(),
                 ));
             }
@@ -5184,22 +5452,23 @@ fn emit_statements(
                     arguments,
                 } = expression.kind()
                 else {
-                    return Err(CompileError::SuspendingDefer);
+                    return Err(CompileError::suspending_defer());
                 };
                 if arguments.len() > 8 {
-                    return Err(CompileError::DeferCaptureLimit);
+                    return Err(CompileError::defer_capture_limit());
                 }
                 let args_base = temporary
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 for (index, argument) in arguments.iter().enumerate() {
                     emit_expression(
                         argument,
                         args_base
                             .checked_add(
-                                u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                                u16::try_from(index)
+                                    .map_err(|_| CompileError::too_many_registers())?,
                             )
-                            .ok_or(CompileError::TooManyRegisters)?,
+                            .ok_or(CompileError::too_many_registers())?,
                         None,
                         locals,
                         context,
@@ -5210,10 +5479,10 @@ fn emit_statements(
                     function: *context
                         .functions
                         .get(function)
-                        .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
+                        .ok_or_else(|| CompileError::unknown_name(function.clone()))?,
                     args_base,
                     args_count: u16::try_from(arguments.len())
-                        .map_err(|_| CompileError::TooManyRegisters)?,
+                        .map_err(|_| CompileError::too_many_registers())?,
                 });
             }
             AstStatement::If {
@@ -5238,19 +5507,20 @@ fn emit_statements(
                 let skip_else = code.len();
                 code.push(Instruction::Jump { target: 0 });
                 let else_start =
-                    u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
                 code[branch] = Instruction::JumpIfFalse {
                     condition: temporary,
                     target: else_start,
                 };
                 emit_statements(else_body, temporary, locals, context, code)?;
-                let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                let end =
+                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
                 code.push(Instruction::Safepoint);
                 code[skip_else] = Instruction::Jump { target: end };
             }
             AstStatement::While { condition, body } => {
                 let loop_start =
-                    u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
                 code.push(Instruction::Safepoint);
                 emit_expression(
                     condition,
@@ -5267,7 +5537,8 @@ fn emit_statements(
                 });
                 emit_statements(body, temporary, locals, context, code)?;
                 code.push(Instruction::Jump { target: loop_start });
-                let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                let end =
+                    u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
                 code.push(Instruction::Safepoint);
                 code[exit] = Instruction::JumpIfFalse {
                     condition: temporary,
@@ -5282,12 +5553,12 @@ fn emit_statements(
                 let ValueType::Named(type_id) =
                     emitted_expression_type(value, None, locals, context)?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let metadata = context
                     .class_fields
                     .get(&(type_id, field.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 emit_expression(
                     value,
                     temporary,
@@ -5298,7 +5569,7 @@ fn emit_statements(
                 )?;
                 let replacement_register = temporary
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     replacement,
                     replacement_register,
@@ -5412,7 +5683,7 @@ fn emit_expression(
                     }
                 })?,
             }),
-            Some(_) => return Err(CompileError::TypeMismatch),
+            Some(_) => return Err(CompileError::type_mismatch()),
         },
         AstExpression::Float(bits) => match expected {
             Some(ValueType::F32) => code.push(Instruction::LoadF32 {
@@ -5423,11 +5694,11 @@ fn emit_expression(
                 dst: destination,
                 bits: *bits,
             }),
-            Some(_) => return Err(CompileError::TypeMismatch),
+            Some(_) => return Err(CompileError::type_mismatch()),
         },
         AstExpression::Rune(value) => {
             if char::from_u32(*value).is_none() {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             code.push(Instruction::LoadRune {
                 dst: destination,
@@ -5462,7 +5733,7 @@ fn emit_expression(
                     dst: destination,
                 });
             } else {
-                return Err(CompileError::UnknownName(name.clone()));
+                return Err(CompileError::unknown_name(name.clone()));
             }
         }
         AstExpression::StructLiteral { type_name, fields } => {
@@ -5471,10 +5742,10 @@ fn emit_expression(
                 .struct_types
                 .iter()
                 .find(|struct_type| struct_type.type_id == type_id)
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
             let fields_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             for (index, metadata) in struct_type.fields.iter().enumerate() {
                 let field = fields
                     .iter()
@@ -5484,10 +5755,12 @@ fn emit_expression(
                             .get(&(type_id, field.name.clone()))
                             .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
                     })
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 let register = fields_base
-                    .checked_add(u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .checked_add(
+                        u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                    )
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     &field.value,
                     register,
@@ -5501,7 +5774,7 @@ fn emit_expression(
                 type_id,
                 fields_base,
                 fields_count: u16::try_from(struct_type.fields.len())
-                    .map_err(|_| CompileError::TooManyRegisters)?,
+                    .map_err(|_| CompileError::too_many_registers())?,
                 dst: destination,
             });
         }
@@ -5511,10 +5784,10 @@ fn emit_expression(
                 .class_types
                 .iter()
                 .find(|class_type| class_type.type_id == type_id)
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))?;
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))?;
             let fields_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             for (index, metadata) in class_type.fields.iter().enumerate() {
                 let field = fields
                     .iter()
@@ -5524,10 +5797,12 @@ fn emit_expression(
                             .get(&(type_id, field.name.clone()))
                             .is_some_and(|candidate| candidate.stable_id == metadata.stable_id)
                     })
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 let register = fields_base
-                    .checked_add(u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .checked_add(
+                        u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
+                    )
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     &field.value,
                     register,
@@ -5541,7 +5816,7 @@ fn emit_expression(
                 type_id,
                 fields_base,
                 fields_count: u16::try_from(class_type.fields.len())
-                    .map_err(|_| CompileError::TooManyRegisters)?,
+                    .map_err(|_| CompileError::too_many_registers())?,
                 dst: destination,
             });
         }
@@ -5563,7 +5838,7 @@ fn emit_expression(
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             emit_expression(
                 value,
@@ -5586,13 +5861,13 @@ fn emit_expression(
                     dst: destination,
                 });
             } else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
         }
         AstExpression::StructWith { value, updates } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             emit_expression(
                 value,
@@ -5604,12 +5879,12 @@ fn emit_expression(
             )?;
             let replacement = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             for update in updates {
                 let field = context
                     .struct_fields
                     .get(&(type_id, update.name.clone()))
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 emit_expression(
                     &update.value,
                     replacement,
@@ -5632,7 +5907,7 @@ fn emit_expression(
                 let lhs_register = destination;
                 let rhs_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(lhs, lhs_register, Some(operand_type), locals, context, code)?;
                 emit_expression(rhs, rhs_register, Some(operand_type), locals, context, code)?;
                 code.push(match operand_type {
@@ -5665,7 +5940,7 @@ fn emit_expression(
                             rhs: rhs_register,
                         }
                     }
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 });
                 code.replace_span(previous_span);
                 return Ok(());
@@ -5676,7 +5951,7 @@ fn emit_expression(
                 let lhs_register = destination;
                 let rhs_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     lhs,
                     lhs_register,
@@ -5705,12 +5980,12 @@ fn emit_expression(
                 numeric_type,
                 ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
             ) {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             }
             let lhs_register = destination;
             let rhs_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(lhs, lhs_register, Some(numeric_type), locals, context, code)?;
             emit_expression(rhs, rhs_register, Some(numeric_type), locals, context, code)?;
             code.push(match (numeric_type, op.kind) {
@@ -5794,7 +6069,7 @@ fn emit_expression(
                     lhs: lhs_register,
                     rhs: rhs_register,
                 },
-                _ => return Err(CompileError::TypeMismatch),
+                _ => return Err(CompileError::type_mismatch()),
             });
         }
         AstExpression::Call {
@@ -5805,12 +6080,12 @@ fn emit_expression(
                 && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
             {
                 let [payload] = arguments.as_slice() else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
-                let payload_type = variant.payload_type.ok_or(CompileError::TypeMismatch)?;
+                let payload_type = variant.payload_type.ok_or(CompileError::type_mismatch())?;
                 let payload_register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     payload,
                     payload_register,
@@ -5830,7 +6105,7 @@ fn emit_expression(
             }
             let args_base = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             let signature = context
                 .host_functions
                 .get(function)
@@ -5841,15 +6116,15 @@ fn emit_expression(
                         .get(function)
                         .and_then(|index| context_function_signature(context, *index))
                 })
-                .ok_or_else(|| CompileError::UnknownName(function.clone()))?;
+                .ok_or_else(|| CompileError::unknown_name(function.clone()))?;
             for (index, argument) in arguments.iter().enumerate() {
                 emit_expression(
                     argument,
                     args_base
                         .checked_add(
-                            u16::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                            u16::try_from(index).map_err(|_| CompileError::too_many_registers())?,
                         )
-                        .ok_or(CompileError::TooManyRegisters)?,
+                        .ok_or(CompileError::too_many_registers())?,
                     Some(signature.parameters[index]),
                     locals,
                     context,
@@ -5857,7 +6132,7 @@ fn emit_expression(
                 )?;
             }
             let args_count =
-                u16::try_from(arguments.len()).map_err(|_| CompileError::TooManyRegisters)?;
+                u16::try_from(arguments.len()).map_err(|_| CompileError::too_many_registers())?;
             if let Some(host) = context.host_functions.get(function) {
                 code.push(Instruction::HostCall {
                     import: host.import,
@@ -5870,7 +6145,7 @@ fn emit_expression(
                     function: *context
                         .functions
                         .get(function)
-                        .ok_or_else(|| CompileError::UnknownName(function.clone()))?,
+                        .ok_or_else(|| CompileError::unknown_name(function.clone()))?,
                     args_base,
                     args_count,
                     dst: destination,
@@ -5889,24 +6164,24 @@ fn emit_expression(
             let type_id = if let Some(type_name) = type_name {
                 let type_id = StableId::from_name(type_name);
                 if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 }
                 type_id
             } else {
-                let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)?
+                let ValueType::Named(type_id) = expected.ok_or(CompileError::cannot_infer_type())?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 type_id
             };
             let metadata = context
                 .enum_variants
                 .get(&(type_id, variant.clone()))
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             let payload_register = if let Some(payload) = payload {
                 let register = destination
                     .checked_add(1)
-                    .ok_or(CompileError::TooManyRegisters)?;
+                    .ok_or(CompileError::too_many_registers())?;
                 emit_expression(
                     payload,
                     register,
@@ -5950,12 +6225,12 @@ fn emit_string_method(
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
-        string_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+        string_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
     let (source, ty) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
     if ty != ValueType::String {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     }
     match method {
         StringMethod::Len => code.push(Instruction::StringLen {
@@ -5973,7 +6248,7 @@ fn emit_string_method(
         StringMethod::Equal | StringMethod::Concat => {
             let rhs = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 rhs,
@@ -5999,7 +6274,7 @@ fn emit_string_method(
         StringMethod::RuneAt => {
             let index = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 index,
@@ -6028,22 +6303,22 @@ fn emit_buffer_method(
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
-        buffer_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+        buffer_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
     let (buffer, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
     let ValueType::Named(buffer_type) = receiver_type else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let element = context
         .buffer_types
         .iter()
         .find(|candidate| candidate.type_id == buffer_type)
         .map(|candidate| candidate.element)
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     match method {
         BufferMethod::Len => code.push(Instruction::BufferLen {
             source: buffer,
@@ -6067,7 +6342,7 @@ fn emit_buffer_method(
         BufferMethod::Set => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6090,7 +6365,7 @@ fn emit_buffer_method(
         BufferMethod::Slice => {
             let length = temporary
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6117,13 +6392,13 @@ fn emit_buffer_method(
         BufferMethod::Copy => {
             let source_start = temporary
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             let destination_start = temporary
                 .checked_add(2)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             let length = temporary
                 .checked_add(3)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6172,21 +6447,21 @@ fn emit_map_method(
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
-        map_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+        map_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
     let (source, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
     let ValueType::Named(map_type) = receiver_type else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let map_type = context
         .map_types
         .iter()
         .find(|candidate| candidate.type_id == map_type)
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     match method {
         MapMethod::Len => code.push(Instruction::MapLen {
             source,
@@ -6221,7 +6496,7 @@ fn emit_map_method(
         MapMethod::Set => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6284,22 +6559,22 @@ fn emit_array_method(
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
-        array_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+        array_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
     let (source, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
     let ValueType::Named(array_type) = receiver_type else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let element = context
         .array_types
         .iter()
         .find(|candidate| candidate.type_id == array_type)
         .map(|candidate| candidate.element)
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     let temporary = destination
         .checked_add(1)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     match method {
         ArrayMethod::Len => code.push(Instruction::ArrayLen {
             source,
@@ -6331,7 +6606,7 @@ fn emit_array_method(
         ArrayMethod::Set | ArrayMethod::Insert => {
             let value = temporary
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 temporary,
@@ -6401,17 +6676,17 @@ fn emit_state_handle_method(
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
     let (receiver, method) =
-        state_handle_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+        state_handle_method(function).ok_or_else(|| CompileError::unknown_name(function.into()))?;
     let (handle, receiver_type) = *locals
         .get(receiver)
-        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+        .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
     let ValueType::Named(handle_type) = receiver_type else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let target = *context
         .state_handle_targets
         .get(&handle_type)
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     match method {
         StateHandleMethod::Resolve => code.push(Instruction::StateHandleResolve {
             handle,
@@ -6441,7 +6716,7 @@ fn emit_state_handle_method(
         StateHandleMethod::Equality => {
             let rhs = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 &arguments[0],
                 rhs,
@@ -6487,16 +6762,16 @@ fn emitted_expression_type(
         AstExpression::Integer(value) => match expected {
             Some(ValueType::I32) | None if i32::try_from(*value).is_ok() => Ok(ValueType::I32),
             Some(ValueType::I64) | None => Ok(ValueType::I64),
-            Some(_) => Err(CompileError::TypeMismatch),
+            Some(_) => Err(CompileError::type_mismatch()),
         },
         AstExpression::Float(_) => match expected {
             Some(ValueType::F32) => Ok(ValueType::F32),
             Some(ValueType::F64) | None => Ok(ValueType::F64),
-            Some(_) => Err(CompileError::TypeMismatch),
+            Some(_) => Err(CompileError::type_mismatch()),
         },
         AstExpression::Rune(value) => char::from_u32(*value)
             .map(|_| ValueType::Rune)
-            .ok_or(CompileError::TypeMismatch),
+            .ok_or(CompileError::type_mismatch()),
         AstExpression::String(_) => Ok(ValueType::String),
         AstExpression::Binary { op, lhs, .. } if op.kind == BinaryOp::Equal => Ok(ValueType::Bool),
         AstExpression::Binary { op, lhs, .. } => {
@@ -6514,21 +6789,21 @@ fn emitted_expression_type(
             ) {
                 Ok(ty)
             } else {
-                Err(CompileError::TypeMismatch)
+                Err(CompileError::type_mismatch())
             }
         }
         AstExpression::Bool(_) => Ok(ValueType::Bool),
         AstExpression::Name(name) => locals.get(name).map_or_else(
             || {
                 let Some(ValueType::Named(type_id)) = expected else {
-                    return Err(CompileError::UnknownName(name.clone()));
+                    return Err(CompileError::unknown_name(name.clone()));
                 };
                 context
                     .enum_variants
                     .get(&(type_id, name.clone()))
                     .filter(|variant| variant.payload_type.is_none())
                     .map(|_| ValueType::Named(type_id))
-                    .ok_or_else(|| CompileError::UnknownName(name.clone()))
+                    .ok_or_else(|| CompileError::unknown_name(name.clone()))
             },
             |(_, ty)| Ok(*ty),
         ),
@@ -6539,7 +6814,7 @@ fn emitted_expression_type(
                 .iter()
                 .any(|struct_type| struct_type.type_id == type_id)
                 .then_some(ValueType::Named(type_id))
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))
         }
         AstExpression::ClassNew { type_name, .. } => {
             let type_id = StableId::from_name(type_name);
@@ -6548,7 +6823,7 @@ fn emitted_expression_type(
                 .iter()
                 .any(|class_type| class_type.type_id == type_id)
                 .then_some(ValueType::Named(type_id))
-                .ok_or_else(|| CompileError::UnknownType(type_name.clone()))
+                .ok_or_else(|| CompileError::unknown_type(type_name.clone()))
         }
         AstExpression::ArrayNew { element_type } => Ok(ValueType::Named(
             nexa_bytecode::array_type(lower_type(element_type)),
@@ -6563,14 +6838,14 @@ fn emitted_expression_type(
         AstExpression::FieldGet { value, field } => {
             let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             context
                 .struct_fields
                 .get(&(type_id, field.clone()))
                 .or_else(|| context.class_fields.get(&(type_id, field.clone())))
                 .map(|field| field.ty)
-                .ok_or(CompileError::TypeMismatch)
+                .ok_or(CompileError::type_mismatch())
         }
         AstExpression::StructWith { value, .. } => {
             emitted_expression_type(value, None, locals, context)
@@ -6597,14 +6872,14 @@ fn emitted_expression_type(
                 let ValueType::Named(handle_type) = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let target = *context
                     .state_handle_targets
                     .get(&handle_type)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 Ok(match method {
                     StateHandleMethod::Resolve => ValueType::Named(
                         nexa_bytecode::result_type(
@@ -6628,16 +6903,16 @@ fn emitted_expression_type(
                 let receiver_type = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?;
                 let ValueType::Named(buffer_type) = receiver_type else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let element = context
                     .buffer_types
                     .iter()
                     .find(|buffer| buffer.type_id == buffer_type)
                     .map(|buffer| buffer.element)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 Ok(match method {
                     BufferMethod::Len => ValueType::I32,
                     BufferMethod::Get => element,
@@ -6655,15 +6930,15 @@ fn emitted_expression_type(
                 let ValueType::Named(map_type) = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let map_type = context
                     .map_types
                     .iter()
                     .find(|candidate| candidate.type_id == map_type)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 Ok(match method {
                     MapMethod::Len => ValueType::I32,
                     MapMethod::Get | MapMethod::Remove => {
@@ -6675,16 +6950,16 @@ fn emitted_expression_type(
                 let ValueType::Named(array_type) = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
-                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?
+                    .ok_or_else(|| CompileError::unknown_name(receiver.into()))?
                 else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let element = context
                     .array_types
                     .iter()
                     .find(|candidate| candidate.type_id == array_type)
                     .map(|candidate| candidate.element)
-                    .ok_or(CompileError::TypeMismatch)?;
+                    .ok_or(CompileError::type_mismatch())?;
                 Ok(match method {
                     ArrayMethod::Len => ValueType::I32,
                     ArrayMethod::Get | ArrayMethod::Pop | ArrayMethod::Remove => element,
@@ -6705,28 +6980,28 @@ fn emitted_expression_type(
                             .and_then(|index| context_function_signature(context, *index))
                     })
                     .and_then(|signature| signature.result)
-                    .ok_or_else(|| CompileError::UnknownName(function.clone()))
+                    .ok_or_else(|| CompileError::unknown_name(function.clone()))
             }
         }
         AstExpression::Await(expression) => {
             emitted_expression_type(expression, expected, locals, context)
         }
         AstExpression::Constructor { type_name, .. } => type_name.as_ref().map_or_else(
-            || expected.ok_or(CompileError::CannotInferType),
+            || expected.ok_or(CompileError::cannot_infer_type()),
             |type_name| Ok(ValueType::Named(StableId::from_name(type_name))),
         ),
-        AstExpression::Match { .. } => expected.ok_or(CompileError::CannotInferType),
+        AstExpression::Match { .. } => expected.ok_or(CompileError::cannot_infer_type()),
         AstExpression::Try(expression) => {
             let ValueType::Named(type_id) =
                 emitted_expression_type(expression, None, locals, context)?
             else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             context
                 .enum_variants
                 .get(&(type_id, "Ok".to_owned()))
                 .and_then(|variant| variant.payload_type)
-                .ok_or(CompileError::TypeMismatch)
+                .ok_or(CompileError::type_mismatch())
         }
         AstExpression::Migration(intrinsic) => Ok(match intrinsic.kind() {
             MigrationIntrinsic::OldGet { ty, .. }
@@ -6753,9 +7028,9 @@ fn emit_match_expression(
     context: &EmitContext<'_>,
     code: &mut TrackedCode,
 ) -> Result<(), CompileError> {
-    let result_type = expected.ok_or(CompileError::CannotInferType)?;
+    let result_type = expected.ok_or(CompileError::cannot_infer_type())?;
     let ValueType::Named(type_id) = emitted_expression_type(value, None, locals, context)? else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     emit_expression(
         value,
@@ -6767,13 +7042,13 @@ fn emit_match_expression(
     )?;
     let tag_register = destination
         .checked_add(1)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     let expected_tag = destination
         .checked_add(2)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     let condition = destination
         .checked_add(3)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     code.push(Instruction::EnumTag {
         source: destination,
         dst: tag_register,
@@ -6781,7 +7056,8 @@ fn emit_match_expression(
     let mut success_jumps = Vec::with_capacity(arms.len());
     let mut pending_false = None;
     for arm in arms {
-        let arm_start = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+        let arm_start =
+            u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
         if let Some(branch) = pending_false.take() {
             code[branch] = Instruction::JumpIfFalse {
                 condition,
@@ -6791,7 +7067,7 @@ fn emit_match_expression(
         let variant = context
             .enum_variants
             .get(&(type_id, arm.variant.clone()))
-            .ok_or(CompileError::TypeMismatch)?;
+            .ok_or(CompileError::type_mismatch())?;
         code.push(Instruction::LoadI32 {
             dst: expected_tag,
             value: i32::from_ne_bytes(variant.tag.to_ne_bytes()),
@@ -6825,7 +7101,7 @@ fn emit_match_expression(
         success_jumps.push(code.len());
         code.push(Instruction::Jump { target: 0 });
     }
-    let trap = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    let trap = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
     if let Some(branch) = pending_false {
         code[branch] = Instruction::JumpIfFalse {
             condition,
@@ -6833,7 +7109,7 @@ fn emit_match_expression(
         };
     }
     code.push(Instruction::Trap);
-    let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    let end = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
     code.push(Instruction::Safepoint);
     for jump in success_jumps {
         code[jump] = Instruction::Jump { target: end };
@@ -6850,23 +7126,23 @@ fn emit_try_expression(
 ) -> Result<(), CompileError> {
     let ValueType::Named(type_id) = emitted_expression_type(expression, None, locals, context)?
     else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let ok = context
         .enum_variants
         .get(&(type_id, "Ok".to_owned()))
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     let error = context
         .enum_variants
         .get(&(type_id, "Err".to_owned()))
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     let ValueType::Named(function_result) = context.function_result else {
-        return Err(CompileError::TypeMismatch);
+        return Err(CompileError::type_mismatch());
     };
     let result_error = context
         .enum_variants
         .get(&(function_result, "Err".to_owned()))
-        .ok_or(CompileError::TypeMismatch)?;
+        .ok_or(CompileError::type_mismatch())?;
     emit_expression(
         expression,
         destination,
@@ -6877,13 +7153,13 @@ fn emit_try_expression(
     )?;
     let tag = destination
         .checked_add(1)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     let expected_tag = destination
         .checked_add(2)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     let condition = destination
         .checked_add(3)
-        .ok_or(CompileError::TooManyRegisters)?;
+        .ok_or(CompileError::too_many_registers())?;
     code.push(Instruction::EnumTag {
         source: destination,
         dst: tag,
@@ -6909,7 +7185,7 @@ fn emit_try_expression(
     });
     let success = code.len();
     code.push(Instruction::Jump { target: 0 });
-    let error_start = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    let error_start = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
     code[error_branch] = Instruction::JumpIfFalse {
         condition,
         target: error_start,
@@ -6928,7 +7204,7 @@ fn emit_try_expression(
     code.push(Instruction::Return {
         source: destination,
     });
-    let end = u32::try_from(code.len()).map_err(|_| CompileError::TooManyRegisters)?;
+    let end = u32::try_from(code.len()).map_err(|_| CompileError::too_many_registers())?;
     code.push(Instruction::Safepoint);
     code[success] = Instruction::Jump { target: end };
     Ok(())
@@ -6958,7 +7234,7 @@ fn emit_migration_intrinsic(
         } => {
             let object_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 object,
                 object_register,
@@ -6976,7 +7252,7 @@ fn emit_migration_intrinsic(
         }
         MigrationIntrinsic::NewCreate { stable_id, ty } => {
             let ValueType::Named(type_id) = lower_type(ty) else {
-                return Err(CompileError::TypeMismatch);
+                return Err(CompileError::type_mismatch());
             };
             code.push(Instruction::StateNewCreate {
                 stable_id: StableId::from_name(stable_id),
@@ -7004,7 +7280,7 @@ fn emit_migration_intrinsic(
                         .find(|candidate| candidate.stable_id == field_id)
                 })
                 .map(|field| field.ty)
-                .ok_or(CompileError::TypeMismatch)?;
+                .ok_or(CompileError::type_mismatch())?;
             emit_expression(
                 object,
                 destination,
@@ -7015,7 +7291,7 @@ fn emit_migration_intrinsic(
             )?;
             let value_register = destination
                 .checked_add(1)
-                .ok_or(CompileError::TooManyRegisters)?;
+                .ok_or(CompileError::too_many_registers())?;
             emit_expression(
                 value,
                 value_register,
@@ -7213,7 +7489,7 @@ pub fn compile_with_interface(
         .imports
         .first()
         .and_then(|import| import.name.rsplit('.').next())
-        .ok_or_else(|| CompileError::UnknownName("missing host import".into()))?;
+        .ok_or_else(|| CompileError::unknown_name("missing host import".into()))?;
     let mut host_functions = BTreeMap::new();
     for (index, function) in interface.functions.iter().enumerate() {
         let parameters = function
@@ -7229,9 +7505,9 @@ pub fn compile_with_interface(
                     TypeRef::Result(success, error) => {
                         (lower_idl_type(success), lower_idl_type(error))
                     }
-                    _ => return Err(CompileError::TypeMismatch),
+                    _ => return Err(CompileError::type_mismatch()),
                 },
-                _ => return Err(CompileError::TypeMismatch),
+                _ => return Err(CompileError::type_mismatch()),
             };
             let result_type = nexa_bytecode::result_type(success, error).type_id;
             let policy_error = |ty: &TypeRef, variant: &str, fallback: u32| match ty {
@@ -7257,14 +7533,14 @@ pub fn compile_with_interface(
             let cancel_error = match function.cancel_policy {
                 nexa_idl::CancelPolicy::ReturnError => Some(
                     policy_error(error_ref, "Cancelled", u32::MAX - 1)
-                        .ok_or(CompileError::TypeMismatch)?,
+                        .ok_or(CompileError::type_mismatch())?,
                 ),
                 nexa_idl::CancelPolicy::CancelTask => None,
             };
             let abandon_error = match function.abandon_policy {
                 nexa_idl::AbandonPolicy::ReturnError => Some(
                     policy_error(error_ref, "Abandoned", u32::MAX)
-                        .ok_or(CompileError::TypeMismatch)?,
+                        .ok_or(CompileError::type_mismatch())?,
                 ),
                 nexa_idl::AbandonPolicy::Trap => None,
             };
@@ -7302,7 +7578,7 @@ pub fn compile_with_interface(
         host_functions.insert(
             format!("{import}.{}", function.name),
             HostFunction {
-                import: u32::try_from(index).map_err(|_| CompileError::TooManyRegisters)?,
+                import: u32::try_from(index).map_err(|_| CompileError::too_many_registers())?,
                 signature: Signature { parameters, result },
                 metadata,
             },
@@ -7354,7 +7630,7 @@ pub fn compile_with_interface(
             .iter()
             .enumerate()
             .find(|(_, function)| function.name.eq_ignore_ascii_case(&export.name))
-            .ok_or_else(|| CompileError::UnknownName(export.name.clone()))?;
+            .ok_or_else(|| CompileError::unknown_name(export.name.clone()))?;
         let signature = Signature {
             parameters: export
                 .parameters
@@ -7364,16 +7640,16 @@ pub fn compile_with_interface(
             result: export.result.as_ref().map(lower_idl_type),
         };
         if hir_function.signature != signature {
-            return Err(CompileError::TypeMismatch);
+            return Err(CompileError::type_mismatch());
         }
         module.exports.push(ScriptExport {
             stable_id: StableId::from_parts(&[&interface.interface, "::export::", &export.name]),
-            function: u32::try_from(function).map_err(|_| CompileError::TooManyRegisters)?,
+            function: u32::try_from(function).map_err(|_| CompileError::too_many_registers())?,
             signature,
         });
     }
     verify(module, VerifierLimits::default())
-        .map_err(|error| CompileError::Verify(error.to_string()))
+        .map_err(|error| CompileError::verify(error.to_string()))
 }
 
 fn lower_idl_type(ty: &TypeRef) -> ValueType {
@@ -7416,12 +7692,12 @@ fn collect_idl_snapshot_types(interface: &Idl) -> Result<Vec<SnapshotType>, Comp
         match ty {
             TypeRef::Snapshot(Some(content)) => {
                 let TypeRef::Named(name) = content.as_ref() else {
-                    return Err(CompileError::TypeMismatch);
+                    return Err(CompileError::type_mismatch());
                 };
                 let snapshot = SnapshotType::new(StableId::from_name(name));
                 snapshots.insert(snapshot.type_id, snapshot);
             }
-            TypeRef::Snapshot(None) => return Err(CompileError::TypeMismatch),
+            TypeRef::Snapshot(None) => return Err(CompileError::type_mismatch()),
             TypeRef::HostRequest(Some(inner))
             | TypeRef::ResourceToken(Some(inner))
             | TypeRef::Array(inner)
@@ -7607,19 +7883,116 @@ fn compile_module(
         module.schema_hash = Some(schema_hash);
     }
     verify(module, VerifierLimits::default())
-        .map_err(|error| CompileError::Verify(error.to_string()))
+        .map_err(|error| CompileError::verify(error.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
-    use nexa_bytecode::{FunctionEffect, Instruction};
-    use nexa_core::{FileId, StableId};
+    use nexa_bytecode::{FunctionEffect, Instruction, ValueType};
+    use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_runtime::{CheckedInterpreter, GcRef, InterpreterOutcome, RuntimeValue, TrapKind};
 
     use super::{
         AstExpression, AstStatement, AstType, CompileError, compile, lex, parse_with_file,
         resolve_and_typecheck,
     };
+
+    #[test]
+    fn diagnostic_spans_cover_every_source_backed_compile_error() {
+        let span = SourceSpan::new(FileId(7), 3, 9);
+        let errors = vec![
+            CompileError::UnexpectedCharacter {
+                offset: 3,
+                character: '#',
+            },
+            CompileError::UnexpectedToken {
+                offset: 3,
+                expected: "identifier",
+            },
+            CompileError::UnexpectedEnd { span },
+            CompileError::DuplicateName {
+                name: "value".into(),
+                first: span,
+                duplicate: span,
+            },
+            CompileError::UnknownName {
+                name: "value".into(),
+                span,
+            },
+            CompileError::UnknownType {
+                name: "Value".into(),
+                span,
+            },
+            CompileError::TypeMismatch {
+                expected: Some(ValueType::I32),
+                actual: Some(ValueType::Bool),
+                span,
+            },
+            CompileError::InvalidNumericConversion { span },
+            CompileError::CannotInferType { span },
+            CompileError::NonExhaustiveMatch {
+                missing: vec![StableId::from_name("Missing")],
+                span,
+            },
+            CompileError::DuplicateMatchVariant {
+                variant: StableId::from_name("Duplicate"),
+                first: span,
+                duplicate: span,
+            },
+            CompileError::TryRequiresResult {
+                actual: ValueType::I32,
+                span,
+            },
+            CompileError::TryErrorMismatch {
+                expected: ValueType::I32,
+                actual: ValueType::Bool,
+                span,
+            },
+            CompileError::AwaitOutsideTask { span },
+            CompileError::MissingAwait { span },
+            CompileError::MigrationIntrinsicOutsideMigration {
+                intrinsic: "old_get".into(),
+                span,
+            },
+            CompileError::MissingMigrationFinish {
+                function_span: span,
+            },
+            CompileError::DuplicateForwarding {
+                stable_id: StableId::from_name("duplicate"),
+                span,
+            },
+            CompileError::MissingForwarding {
+                stable_id: StableId::from_name("missing"),
+                function_span: span,
+            },
+            CompileError::InvalidFieldAccess {
+                type_id: StableId::from_name("Record"),
+                field: "missing".into(),
+                span,
+            },
+            CompileError::MissingReturn {
+                function_span: span,
+            },
+            CompileError::SuspendingDefer { span },
+            CompileError::DeferCaptureLimit { span },
+            CompileError::InvalidEffect { span },
+            CompileError::InvalidReloadMetadata {
+                message: "invalid",
+                function_span: span,
+            },
+            CompileError::TooManyRegisters {
+                function_span: span,
+            },
+            CompileError::Verify {
+                message: "invalid".into(),
+                function_span: span,
+            },
+        ];
+        for error in errors {
+            let span = error.source_span().expect("source-backed error has a span");
+            assert!(span.start < span.end, "{error:?}");
+        }
+    }
 
     #[test]
     fn every_required_ast_and_hir_node_preserves_its_source_span() {
@@ -7959,14 +8332,14 @@ migration fn migrate() -> bool {
                      return match value { Idle => 0 };
                  }"
             ),
-            Err(CompileError::NonExhaustiveMatch)
+            Err(CompileError::NonExhaustiveMatch { .. })
         ));
         assert!(matches!(
             compile(
                 "enum Event { Idle, Damage(i32) }
                  fn bad() -> Event { return Event.Damage(true); }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::TypeMismatch { .. })
         ));
 
         let idl = nexa_idl::parse(
@@ -8115,14 +8488,14 @@ migration fn migrate() -> bool {
                 "struct Pair { left: i32; right: i32; }
                  fn bad() -> Pair { return Pair { left: 1 }; }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::TypeMismatch { .. })
         ));
         assert!(matches!(
             compile(
                 "struct Pair { left: i32; right: i32; }
                  fn bad(value: Pair) -> i32 { return value.missing; }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::InvalidFieldAccess { .. })
         ));
         assert!(matches!(
             compile(
@@ -8130,7 +8503,7 @@ migration fn migrate() -> bool {
                  struct Right { value: i32; }
                  fn bad(value: Left) -> Right { return value; }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::TypeMismatch { .. })
         ));
 
         let idl = nexa_idl::parse(
@@ -8271,7 +8644,7 @@ migration fn migrate() -> bool {
                  class Right { value: i32; }
                  fn bad(value: Left) -> Right { return value; }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::TypeMismatch { .. })
         ));
         assert!(matches!(
             compile(
@@ -8281,14 +8654,14 @@ migration fn migrate() -> bool {
                      return node.value;
                  }"
             ),
-            Err(CompileError::TypeMismatch)
+            Err(CompileError::TypeMismatch { .. })
         ));
         assert!(matches!(
             compile(
                 "class Node { value: i32; }
                  fn bad() -> Node { return null; }"
             ),
-            Err(CompileError::UnknownName(name)) if name == "null"
+            Err(CompileError::UnknownName { name, .. }) if name == "null"
         ));
     }
 
@@ -8369,7 +8742,7 @@ migration fn migrate() -> bool {
             "immediate fn bad() -> Array<i32> { return Array.new<i32>(); }",
             "immediate fn bad(values: Array<i32>) -> i32 { return values.len(); }",
         ] {
-            assert_eq!(compile(source).unwrap_err(), CompileError::InvalidEffect);
+            assert_eq!(compile(source).unwrap_err(), CompileError::invalid_effect());
         }
     }
 
@@ -8481,7 +8854,7 @@ migration fn migrate() -> bool {
         assert_eq!(
             compile("immediate fn bad(buffer: Buffer<i32>) -> i32 { return buffer.len(); }")
                 .unwrap_err(),
-            CompileError::InvalidEffect
+            CompileError::invalid_effect()
         );
     }
 
@@ -8529,7 +8902,7 @@ migration fn migrate() -> bool {
         ] {
             assert!(matches!(
                 compile(source),
-                Err(CompileError::UnknownType(_) | CompileError::TypeMismatch)
+                Err(CompileError::UnknownType { .. } | CompileError::TypeMismatch { .. })
             ));
         }
     }
@@ -8662,7 +9035,7 @@ migration fn migrate() -> bool {
         ] {
             assert!(matches!(
                 compile(source),
-                Err(CompileError::TypeMismatch | CompileError::InvalidEffect)
+                Err(CompileError::TypeMismatch { .. } | CompileError::InvalidEffect { .. })
             ));
         }
         assert!(
@@ -8956,30 +9329,28 @@ migration fn migrate() -> bool {
 
     #[test]
     fn effects_flow_scopes_defer_and_nominal_types_are_enforced() {
-        assert_eq!(
+        assert!(matches!(
             compile(
                 "fn id(value: i32) -> i32 { return value; }
                  fn bad(value: i32) -> i32 { return await id(value); }"
-            )
-            .unwrap_err(),
-            CompileError::InvalidEffect
-        );
+            ),
+            Err(CompileError::AwaitOutsideTask { span }) if !span.is_empty()
+        ));
         let immediate = compile("immediate fn one() -> i32 { return 1; }").unwrap();
         assert_eq!(
             immediate.module().functions[0].effect,
             FunctionEffect::Immediate
         );
-        assert_eq!(
+        assert!(matches!(
             compile(
                 "fn id(value: i32) -> i32 { return value; }
                  cleanup fn bad(value: i32) -> i32 { return await id(value); }"
-            )
-            .unwrap_err(),
-            CompileError::InvalidEffect
-        );
+            ),
+            Err(CompileError::AwaitOutsideTask { span }) if !span.is_empty()
+        ));
         assert_eq!(
             compile("fn partial(flag: bool) -> i32 { if flag { return 1; } }").unwrap_err(),
-            CompileError::MissingReturn
+            CompileError::missing_return()
         );
         assert!(matches!(
             compile(
@@ -8988,7 +9359,7 @@ migration fn migrate() -> bool {
                     return hidden;
                  }"
             ),
-            Err(CompileError::UnknownName(name)) if name == "hidden"
+            Err(CompileError::UnknownName { name, .. }) if name == "hidden"
         ));
         assert_eq!(
             compile(
@@ -8998,7 +9369,7 @@ migration fn migrate() -> bool {
                  fn bad(value: B) -> A { return take(value); }"
             )
             .unwrap_err(),
-            CompileError::TypeMismatch
+            CompileError::type_mismatch()
         );
 
         let shadow = compile(
@@ -9080,7 +9451,7 @@ migration fn migrate() -> bool {
                  migration fn second() -> bool { return true; }"
             )
             .unwrap_err(),
-            CompileError::InvalidReloadMetadata("multiple migration entries")
+            CompileError::invalid_reload_metadata("multiple migration entries")
         );
         assert_eq!(
             compile(
@@ -9088,11 +9459,11 @@ migration fn migrate() -> bool {
                  @activation fn second() -> bool { return true; }"
             )
             .unwrap_err(),
-            CompileError::InvalidReloadMetadata("multiple activation entries")
+            CompileError::invalid_reload_metadata("multiple activation entries")
         );
         assert_eq!(
             compile("@activation task fn invalid() -> bool { return true; }").unwrap_err(),
-            CompileError::InvalidReloadMetadata("activation entry must have Immediate effect")
+            CompileError::invalid_reload_metadata("activation entry must have Immediate effect")
         );
     }
 
@@ -9220,7 +9591,7 @@ migration fn migrate() -> bool {
              @stateful class Store { snapshot: Snapshot<View>; }",
             "@stateful class Store { buffer: Buffer; }",
         ] {
-            assert_eq!(compile(source).unwrap_err(), CompileError::TypeMismatch);
+            assert_eq!(compile(source).unwrap_err(), CompileError::type_mismatch());
         }
 
         assert_eq!(
@@ -9234,7 +9605,7 @@ migration fn migrate() -> bool {
                  }"
             )
             .unwrap_err(),
-            CompileError::TypeMismatch
+            CompileError::type_mismatch()
         );
     }
 }

@@ -1,0 +1,2 @@
+// expected: NX2002
+fn main(value: Missing) -> i32 { return 0; }

@@ -1,0 +1,2 @@
+// expected: NX2301
+fn main() -> i32 { return await work(); }

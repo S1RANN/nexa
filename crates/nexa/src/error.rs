@@ -127,6 +127,160 @@ pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
     ErrorCodeDefinition::new(ErrorCode::NX6005, "Invalid ReloadMetadata"),
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ErrorEmissionDefinition {
+    pub code: ErrorCode,
+    pub module: &'static str,
+    pub variant: &'static str,
+    pub test: &'static str,
+    pub fixture: &'static str,
+}
+
+impl ErrorEmissionDefinition {
+    const fn new(
+        code: ErrorCode,
+        module: &'static str,
+        variant: &'static str,
+        fixture: &'static str,
+    ) -> Self {
+        Self {
+            code,
+            module,
+            variant,
+            test: "cli::diagnostic_corpus_check",
+            fixture,
+        }
+    }
+}
+
+macro_rules! emission {
+    ($code:ident, $module:literal, $variant:literal, $ext:literal) => {
+        ErrorEmissionDefinition::new(
+            ErrorCode::$code,
+            $module,
+            $variant,
+            concat!("fixtures/diagnostics/", stringify!($code), $ext),
+        )
+    };
+}
+
+pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
+    emission!(
+        NX1001,
+        "nexa-compiler::lexer",
+        "UnexpectedCharacter",
+        ".nexa"
+    ),
+    emission!(NX1002, "nexa-compiler::parser", "UnexpectedToken", ".nexa"),
+    emission!(NX2001, "nexa-compiler::resolver", "UnknownName", ".nexa"),
+    emission!(NX2002, "nexa-compiler::resolver", "UnknownType", ".nexa"),
+    emission!(NX2101, "nexa-compiler::typecheck", "TypeMismatch", ".nexa"),
+    emission!(
+        NX2201,
+        "nexa-compiler::match",
+        "NonExhaustiveMatch",
+        ".nexa"
+    ),
+    emission!(
+        NX2202,
+        "nexa-compiler::match",
+        "DuplicateMatchVariant",
+        ".nexa"
+    ),
+    emission!(
+        NX2210,
+        "nexa-compiler::typecheck",
+        "CannotInferType",
+        ".nexa"
+    ),
+    emission!(NX2220, "nexa-compiler::try", "TryRequiresResult", ".nexa"),
+    emission!(NX2221, "nexa-compiler::try", "TryErrorMismatch", ".nexa"),
+    emission!(NX2301, "nexa-compiler::effect", "AwaitOutsideTask", ".nexa"),
+    emission!(NX2302, "nexa-compiler::effect", "MissingAwait", ".nexa"),
+    emission!(
+        NX2401,
+        "nexa-compiler::numeric",
+        "InvalidNumericConversion",
+        ".nexa"
+    ),
+    emission!(
+        NX2501,
+        "nexa-compiler::field",
+        "InvalidFieldAccess",
+        ".nexa"
+    ),
+    emission!(
+        NX2601,
+        "nexa-compiler::migration",
+        "MigrationIntrinsicOutsideMigration",
+        ".nexa"
+    ),
+    emission!(
+        NX2602,
+        "nexa-compiler::migration",
+        "MissingMigrationFinish",
+        ".nexa"
+    ),
+    emission!(
+        NX2603,
+        "nexa-compiler::migration",
+        "MissingForwarding",
+        ".nexa"
+    ),
+    emission!(
+        NX2604,
+        "nexa-compiler::migration",
+        "DuplicateForwarding",
+        ".nexa"
+    ),
+    emission!(NX3001, "nexa-bytecode::decode", "InvalidMagic", ".bin"),
+    emission!(NX3002, "nexa-verifier", "RegisterOutOfRange", ".bin"),
+    emission!(NX3003, "nexa-verifier", "InvalidRootMap", ".bin"),
+    emission!(NX3004, "nexa-verifier", "InvalidSourceMap", ".bin"),
+    emission!(
+        NX4001,
+        "nexa-runtime::realm",
+        "HostHashMismatch",
+        ".runtime"
+    ),
+    emission!(
+        NX4002,
+        "nexa-runtime::realm",
+        "HostCapabilitiesUnavailable",
+        ".runtime"
+    ),
+    emission!(NX4003, "nexa-runtime::host", "Arity", ".runtime"),
+    emission!(NX5001, "nexa-runtime::host", "Panicked", ".runtime"),
+    emission!(NX5002, "nexa-runtime::host", "Abandoned", ".runtime"),
+    emission!(
+        NX5003,
+        "nexa-runtime::host",
+        "UnknownHostErrorCode",
+        ".runtime"
+    ),
+    emission!(NX5004, "nexa-runtime::kernel", "ResourceLimit", ".runtime"),
+    emission!(
+        NX6001,
+        "nexa-runtime::migration",
+        "MigrationLimit",
+        ".runtime"
+    ),
+    emission!(NX6002, "nexa-runtime::stateful", "GraphFailure", ".runtime"),
+    emission!(
+        NX6003,
+        "nexa-runtime::realm",
+        "ActivationFailure",
+        ".runtime"
+    ),
+    emission!(
+        NX6004,
+        "nexa-runtime::reload",
+        "CompletionBufferCapacity",
+        ".runtime"
+    ),
+    emission!(NX6005, "nexa-verifier", "InvalidReloadMetadata", ".bin"),
+];
+
 /// The stable top-level class of an error crossing the Nexa facade.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorCategory {
@@ -214,7 +368,7 @@ pub struct Diagnostic {
     pub code: DiagnosticCode,
     pub severity: Severity,
     pub message: RuntimeMessage,
-    pub primary: Label,
+    pub primary: Option<Label>,
     pub secondary: Vec<Label>,
     pub notes: Vec<RuntimeMessage>,
 }
@@ -222,16 +376,15 @@ pub struct Diagnostic {
 impl Diagnostic {
     #[must_use]
     pub fn new(error: &CompileError, file: FileId) -> Self {
-        let span = compile_error_span(error, file).unwrap_or_else(|| SourceSpan::new(file, 0, 0));
         let message = RuntimeMessage::inline(&CompileErrorMessage(error).to_string());
         Self {
             code: compile_error_code(error),
             severity: Severity::Error,
             message,
-            primary: Label {
+            primary: compile_error_span(error, file).map(|span| Label {
                 span,
                 message: RuntimeMessage::Static("primary source location"),
-            },
+            }),
             secondary: Vec::new(),
             notes: Vec::new(),
         }
@@ -248,7 +401,23 @@ impl Diagnostic {
             code,
             severity,
             message,
-            primary,
+            primary: Some(primary),
+            secondary: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn without_source(
+        code: DiagnosticCode,
+        severity: Severity,
+        message: RuntimeMessage,
+    ) -> Self {
+        Self {
+            code,
+            severity,
+            message,
+            primary: None,
             secondary: Vec::new(),
             notes: Vec::new(),
         }
@@ -268,7 +437,9 @@ impl fmt::Display for Diagnostic {
             self.code,
             self.message
         )?;
-        write_label(formatter, "primary", &self.primary)?;
+        if let Some(primary) = &self.primary {
+            write_label(formatter, "primary", primary)?;
+        }
         for label in &self.secondary {
             write_label(formatter, "secondary", label)?;
         }
@@ -287,7 +458,7 @@ impl ClassifiedError for Diagnostic {
             code: self.code,
             category: ErrorCategory::Diagnostic,
             context: ErrorContext {
-                span: Some(self.primary.span),
+                span: self.primary.as_ref().map(|label| label.span),
                 ..ErrorContext::default()
             },
         }
@@ -299,7 +470,7 @@ struct DiagnosticOutput {
     code: &'static str,
     severity: &'static str,
     message: String,
-    primary: LabelOutput,
+    primary: Option<LabelOutput>,
     secondary: Vec<LabelOutput>,
     notes: Vec<String>,
 }
@@ -318,7 +489,7 @@ impl From<&Diagnostic> for DiagnosticOutput {
             code: diagnostic.code.as_str(),
             severity: diagnostic.severity.as_str(),
             message: diagnostic.message.to_string(),
-            primary: LabelOutput::from(&diagnostic.primary),
+            primary: diagnostic.primary.as_ref().map(LabelOutput::from),
             secondary: diagnostic.secondary.iter().map(LabelOutput::from).collect(),
             notes: diagnostic.notes.iter().map(ToString::to_string).collect(),
         }
@@ -359,6 +530,8 @@ pub enum HostError {
     Request(HostRequestError),
     Lifecycle(RuntimeHostCloseError),
     Realm(RealmError),
+    Abandoned,
+    UnknownHostErrorCode(u32),
 }
 
 impl fmt::Display for HostError {
@@ -383,6 +556,8 @@ impl ClassifiedError for HostError {
                 Self::Request(error) => host_request_code(error),
                 Self::Lifecycle(_) => ErrorCode::NX5004,
                 Self::Realm(error) => realm_error_code(error),
+                Self::Abandoned => ErrorCode::NX5002,
+                Self::UnknownHostErrorCode(_) => ErrorCode::NX5003,
             },
             category: ErrorCategory::Host,
             context: ErrorContext::default(),
@@ -714,40 +889,38 @@ impl ClassifiedError for MigrationLimitError {
 }
 
 fn compile_error_span(error: &CompileError, file: FileId) -> Option<SourceSpan> {
-    let (start, end) = match error {
-        CompileError::UnexpectedCharacter { offset, character } => {
-            (*offset, offset.saturating_add(character.len_utf8()))
-        }
-        CompileError::UnexpectedToken { offset, .. } => (*offset, offset.saturating_add(1)),
-        CompileError::UnexpectedEnd => return Some(SourceSpan::new(file, 0, 0)),
-        CompileError::InvalidNumericConversion { span } => return Some(*span),
-        _ => return None,
-    };
-    Some(SourceSpan::new(
-        file,
-        u32::try_from(start).unwrap_or(u32::MAX),
-        u32::try_from(end).unwrap_or(u32::MAX),
-    ))
+    error.source_span().map(|span| SourceSpan { file, ..span })
 }
 
 fn compile_error_code(error: &CompileError) -> ErrorCode {
     match error {
         CompileError::UnexpectedCharacter { .. } => ErrorCode::NX1001,
-        CompileError::UnexpectedToken { .. } | CompileError::UnexpectedEnd => ErrorCode::NX1002,
-        CompileError::UnknownName(_) | CompileError::DuplicateName(_) => ErrorCode::NX2001,
-        CompileError::UnknownType(_)
-        | CompileError::MissingReturn
-        | CompileError::SuspendingDefer
-        | CompileError::DeferCaptureLimit
-        | CompileError::InvalidEffect
-        | CompileError::TooManyRegisters
-        | CompileError::Verify(_) => ErrorCode::NX2002,
-        CompileError::InvalidReloadMetadata(_) => ErrorCode::NX6005,
-        CompileError::TypeMismatch => ErrorCode::NX2101,
+        CompileError::UnexpectedToken { .. } | CompileError::UnexpectedEnd { .. } => {
+            ErrorCode::NX1002
+        }
+        CompileError::UnknownName { .. } | CompileError::DuplicateName { .. } => ErrorCode::NX2001,
+        CompileError::UnknownType { .. }
+        | CompileError::MissingReturn { .. }
+        | CompileError::SuspendingDefer { .. }
+        | CompileError::DeferCaptureLimit { .. }
+        | CompileError::InvalidEffect { .. }
+        | CompileError::TooManyRegisters { .. }
+        | CompileError::Verify { .. } => ErrorCode::NX2002,
+        CompileError::InvalidReloadMetadata { .. } => ErrorCode::NX6005,
+        CompileError::TypeMismatch { .. } => ErrorCode::NX2101,
         CompileError::InvalidNumericConversion { .. } => ErrorCode::NX2401,
-        CompileError::CannotInferType => ErrorCode::NX2210,
-        CompileError::NonExhaustiveMatch => ErrorCode::NX2201,
-        CompileError::DuplicateMatchVariant => ErrorCode::NX2202,
+        CompileError::CannotInferType { .. } => ErrorCode::NX2210,
+        CompileError::NonExhaustiveMatch { .. } => ErrorCode::NX2201,
+        CompileError::DuplicateMatchVariant { .. } => ErrorCode::NX2202,
+        CompileError::TryRequiresResult { .. } => ErrorCode::NX2220,
+        CompileError::TryErrorMismatch { .. } => ErrorCode::NX2221,
+        CompileError::AwaitOutsideTask { .. } => ErrorCode::NX2301,
+        CompileError::MissingAwait { .. } => ErrorCode::NX2302,
+        CompileError::InvalidFieldAccess { .. } => ErrorCode::NX2501,
+        CompileError::MigrationIntrinsicOutsideMigration { .. } => ErrorCode::NX2601,
+        CompileError::MissingMigrationFinish { .. } => ErrorCode::NX2602,
+        CompileError::MissingForwarding { .. } => ErrorCode::NX2603,
+        CompileError::DuplicateForwarding { .. } => ErrorCode::NX2604,
     }
 }
 
@@ -765,26 +938,54 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
                 "unexpected token at byte {offset}; expected {expected}"
             )
         }
-        CompileError::UnexpectedEnd => formatter.write_str("unexpected end of input"),
-        CompileError::DuplicateName(name) => write!(formatter, "duplicate name `{name}`"),
-        CompileError::UnknownName(name) => write!(formatter, "unknown name `{name}`"),
-        CompileError::UnknownType(name) => write!(formatter, "unknown type `{name}`"),
-        CompileError::TypeMismatch => formatter.write_str("type mismatch"),
+        CompileError::UnexpectedEnd { .. } => formatter.write_str("unexpected end of input"),
+        CompileError::DuplicateName { name, .. } => write!(formatter, "duplicate name `{name}`"),
+        CompileError::UnknownName { name, .. } => write!(formatter, "unknown name `{name}`"),
+        CompileError::UnknownType { name, .. } => write!(formatter, "unknown type `{name}`"),
+        CompileError::TypeMismatch { .. } => formatter.write_str("type mismatch"),
         CompileError::InvalidNumericConversion { .. } => {
             formatter.write_str("invalid implicit numeric conversion")
         }
-        CompileError::CannotInferType => formatter.write_str("cannot infer type"),
-        CompileError::NonExhaustiveMatch => formatter.write_str("non-exhaustive match"),
-        CompileError::DuplicateMatchVariant => formatter.write_str("duplicate match variant"),
-        CompileError::MissingReturn => formatter.write_str("missing return"),
-        CompileError::SuspendingDefer => formatter.write_str("defer body may suspend"),
-        CompileError::DeferCaptureLimit => formatter.write_str("defer capture limit exceeded"),
-        CompileError::InvalidEffect => formatter.write_str("invalid function effect"),
-        CompileError::InvalidReloadMetadata(message) => {
+        CompileError::CannotInferType { .. } => formatter.write_str("cannot infer type"),
+        CompileError::NonExhaustiveMatch { .. } => formatter.write_str("non-exhaustive match"),
+        CompileError::DuplicateMatchVariant { .. } => {
+            formatter.write_str("duplicate match variant")
+        }
+        CompileError::TryRequiresResult { .. } => formatter.write_str("`?` requires Result"),
+        CompileError::TryErrorMismatch { .. } => formatter.write_str("`?` error type mismatch"),
+        CompileError::AwaitOutsideTask { .. } => formatter.write_str("await outside Task"),
+        CompileError::MissingAwait { .. } => formatter.write_str("missing await"),
+        CompileError::MigrationIntrinsicOutsideMigration { intrinsic, .. } => {
+            write!(
+                formatter,
+                "migration intrinsic `{intrinsic}` outside Migration"
+            )
+        }
+        CompileError::MissingMigrationFinish { .. } => {
+            formatter.write_str("missing finish_migration")
+        }
+        CompileError::DuplicateForwarding { stable_id, .. } => {
+            write!(formatter, "duplicate forwarding for {stable_id:?}")
+        }
+        CompileError::MissingForwarding { stable_id, .. } => {
+            write!(formatter, "missing forwarding for {stable_id:?}")
+        }
+        CompileError::InvalidFieldAccess { type_id, field, .. } => {
+            write!(formatter, "invalid field `{field}` on {type_id:?}")
+        }
+        CompileError::MissingReturn { .. } => formatter.write_str("missing return"),
+        CompileError::SuspendingDefer { .. } => formatter.write_str("defer body may suspend"),
+        CompileError::DeferCaptureLimit { .. } => {
+            formatter.write_str("defer capture limit exceeded")
+        }
+        CompileError::InvalidEffect { .. } => formatter.write_str("invalid function effect"),
+        CompileError::InvalidReloadMetadata { message, .. } => {
             write!(formatter, "invalid reload metadata: {message}")
         }
-        CompileError::TooManyRegisters => formatter.write_str("register limit exceeded"),
-        CompileError::Verify(message) => write!(formatter, "verification failed: {message}"),
+        CompileError::TooManyRegisters { .. } => formatter.write_str("register limit exceeded"),
+        CompileError::Verify { message, .. } => {
+            write!(formatter, "verification failed: {message}")
+        }
     }
 }
 
@@ -848,8 +1049,8 @@ mod tests {
     use nexa_verifier::{VerifyError, VerifyErrorKind};
 
     use super::{
-        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ErrorCategory, ErrorCode, HostError, Label,
-        MigrationError, NexaError, Severity,
+        ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ERROR_EMISSION_TABLE, ErrorCategory,
+        ErrorCode, HostError, Label, MigrationError, NexaError, Severity,
     };
 
     #[test]
@@ -906,6 +1107,32 @@ mod tests {
             Some("Invalid ReloadMetadata")
         );
         assert_eq!(ErrorCode::new("NX9999").definition(), None);
+    }
+
+    #[test]
+    fn diagnostic_code_emission_table_is_complete() {
+        let registered = ERROR_CODE_TABLE
+            .iter()
+            .map(|definition| definition.code)
+            .collect::<std::collections::BTreeSet<_>>();
+        let emitted = ERROR_EMISSION_TABLE
+            .iter()
+            .map(|definition| definition.code)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(registered, emitted);
+        assert_eq!(ERROR_CODE_TABLE.len(), 34);
+        assert_eq!(ERROR_EMISSION_TABLE.len(), 34);
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for definition in ERROR_EMISSION_TABLE {
+            assert!(!definition.module.is_empty());
+            assert!(!definition.variant.is_empty());
+            assert!(!definition.test.is_empty());
+            assert!(
+                root.join(definition.fixture).is_file(),
+                "{}",
+                definition.fixture
+            );
+        }
     }
 
     #[test]
@@ -971,6 +1198,50 @@ mod tests {
         assert_eq!(
             numeric.context().span,
             Some(SourceSpan::new(FileId(9), 12, 17))
+        );
+    }
+
+    #[test]
+    fn source_backed_diagnostics_have_no_zero_zero_spans() {
+        let cases = [
+            CompileError::UnexpectedCharacter {
+                offset: 4,
+                character: '#',
+            },
+            CompileError::UnexpectedToken {
+                offset: 8,
+                expected: "identifier",
+            },
+            CompileError::UnexpectedEnd {
+                span: SourceSpan::new(FileId(2), 11, 12),
+            },
+            CompileError::TypeMismatch {
+                expected: Some(nexa_bytecode::ValueType::I32),
+                actual: Some(nexa_bytecode::ValueType::Bool),
+                span: SourceSpan::new(FileId(2), 15, 19),
+            },
+            CompileError::TryRequiresResult {
+                actual: nexa_bytecode::ValueType::I32,
+                span: SourceSpan::new(FileId(2), 21, 23),
+            },
+        ];
+        for error in cases {
+            let diagnostic = Diagnostic::new(&error, FileId(2));
+            let primary = diagnostic
+                .primary
+                .expect("compiler diagnostics are located");
+            assert!(primary.span.start < primary.span.end, "{error:?}");
+            assert_ne!((primary.span.start, primary.span.end), (0, 0));
+        }
+        let unlocated = Diagnostic::without_source(
+            ErrorCode::NX3001,
+            Severity::Error,
+            RuntimeMessage::Static("invalid bytecode"),
+        );
+        assert!(unlocated.primary.is_none());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&unlocated.to_json().unwrap()).unwrap()["primary"],
+            serde_json::Value::Null
         );
     }
 

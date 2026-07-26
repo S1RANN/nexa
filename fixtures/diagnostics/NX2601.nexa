@@ -1,0 +1,2 @@
+// expected: NX2601
+fn main() -> i32 { return old_get(1); }

@@ -1,0 +1,2 @@
+// expected: NX2210
+fn main() { let value = None; }

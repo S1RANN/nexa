@@ -1,0 +1,2 @@
+// expected: NX2603
+migration fn migrate() { finish_migration(); }

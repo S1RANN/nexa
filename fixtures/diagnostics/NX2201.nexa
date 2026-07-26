@@ -1,0 +1,2 @@
+// expected: NX2201
+enum Choice { A, B } fn main(value: Choice) -> i32 { return match value { A => 1 }; }

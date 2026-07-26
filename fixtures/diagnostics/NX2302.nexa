@@ -1,0 +1,2 @@
+// expected: NX2302
+task fn main() -> i32 { return work(); }
