@@ -666,7 +666,7 @@ pub enum NexaError {
     Decode(DecodeError),
     Verify(VerifyError),
     Runtime(RuntimeError),
-    Trap(Trap),
+    Trap(Box<Trap>),
     Host(HostError),
     Reload(ReloadError),
     Migration(MigrationError),
@@ -790,7 +790,7 @@ impl From<RuntimeError> for NexaError {
 
 impl From<Trap> for NexaError {
     fn from(error: Trap) -> Self {
-        Self::Trap(error)
+        Self::Trap(Box::new(error))
     }
 }
 

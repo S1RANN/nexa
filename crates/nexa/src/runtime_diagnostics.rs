@@ -26,6 +26,9 @@ const RUNTIME_CODES: [&str; 11] = [
     "NX6003", "NX6004",
 ];
 
+type PendingRequestSlot = Arc<Mutex<Option<PendingHostRequest>>>;
+type HostedHarness = (RuntimeDiagnosticHarness, ModuleHandle, PendingRequestSlot);
+
 pub struct RuntimeDiagnosticHarness {
     realm: RealmRuntime,
     host: RuntimeHost,
@@ -38,7 +41,7 @@ impl RuntimeDiagnosticHarness {
     fn hosted(
         config: RealmConfig,
         registry: DiagnosticRegistry,
-    ) -> Result<(Self, Arc<Mutex<Option<PendingHostRequest>>>), String> {
+    ) -> Result<(Self, PendingRequestSlot), String> {
         let pending = Arc::clone(&registry.pending);
         let host = RuntimeHost::new(config.max_host_resources.max(1) as usize);
         let realm = RealmRuntime::hosted(config, host.clone(), Box::new(registry))
@@ -152,6 +155,7 @@ fn module_snapshot(module: &nexa_runtime::ModuleInspection) -> Value {
     })
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct RuntimeDiagnosticCaseEvidence {
     pub scenario: String,
@@ -329,6 +333,7 @@ fn execute_case(code: &str) -> Result<RuntimeDiagnosticCaseEvidence, String> {
     }
 }
 
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn evidence(
     scenario: &str,
     error: NexaError,
@@ -1143,14 +1148,7 @@ fn hosted_host_call(
     mode: RegistryMode,
     asynchronous: bool,
     typed_error: bool,
-) -> Result<
-    (
-        RuntimeDiagnosticHarness,
-        ModuleHandle,
-        Arc<Mutex<Option<PendingHostRequest>>>,
-    ),
-    String,
-> {
+) -> Result<HostedHarness, String> {
     hosted_host_call_with_config(mode, asynchronous, typed_error, RealmConfig::default())
 }
 
@@ -1159,14 +1157,7 @@ fn hosted_host_call_with_config(
     asynchronous: bool,
     typed_error: bool,
     config: RealmConfig,
-) -> Result<
-    (
-        RuntimeDiagnosticHarness,
-        ModuleHandle,
-        Arc<Mutex<Option<PendingHostRequest>>>,
-    ),
-    String,
-> {
+) -> Result<HostedHarness, String> {
     let host = StableId::from_name("r3-diagnostic-host");
     let schema = StableId::from_name("r3-diagnostic-schema");
     let registry = DiagnosticRegistry::new(host, mode);
@@ -1653,6 +1644,7 @@ fn add_void_function(module: &mut ModuleBuilder, parameters: Vec<ValueType>) {
     module.function(function.finish().expect("capability function"));
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn verify_round_trip(module: Module) -> VerifiedModule {
     let bytes = module.encode();
     let decoded = Module::decode(&bytes).expect("diagnostic bytecode round trip");

@@ -1815,11 +1815,7 @@ impl RealmRuntime {
         match execution {
             InterpreterOutcome::Returned { value, .. } => {
                 let (migrated, hash, usage) = migration.finish()?.into_shared();
-                if migrated
-                    .gc_roots()
-                    .into_iter()
-                    .any(|reference| self.heap.resolve(reference).is_err())
-                {
+                if migrated_graph_has_invalid_gc_root(&self.heap, &migrated) {
                     return Err(ReloadError::GraphCheck.into());
                 }
                 self.last_migration_usage_report = Some(usage);
@@ -3714,6 +3710,13 @@ fn module_requires_host_capabilities(module: &nexa_bytecode::Module) -> bool {
         .types
         .iter()
         .any(|state_type| state_type.fields.iter().any(|field| requires(field.ty)))
+}
+
+fn migrated_graph_has_invalid_gc_root(heap: &Heap, state: &StatefulRegistry) -> bool {
+    state
+        .gc_roots()
+        .into_iter()
+        .any(|reference| heap.resolve(reference).is_err())
 }
 
 fn migration_requirement_error(

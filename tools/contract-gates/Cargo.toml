@@ -1,12 +1,15 @@
 [package]
-name = "nexa-release-audit"
+name = "nexa-contract-gates"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
+nexa = { path = "../../crates/nexa" }
 nexa-contract-gate-protocol = { path = "../contract-gate-protocol" }
+nexa-model = { path = "../../crates/nexa-model" }
+nexa-runtime = { path = "../../crates/nexa-runtime" }
 serde.workspace = true
 serde_json.workspace = true
 

@@ -89,6 +89,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-contract-gate-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexa-contract-gates"
+version = "0.1.0"
+dependencies = [
+ "nexa",
+ "nexa-contract-gate-protocol",
+ "nexa-model",
+ "nexa-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-core"
 version = "0.1.0"
 
@@ -152,9 +172,7 @@ dependencies = [
 name = "nexa-release-audit"
 version = "0.1.0"
 dependencies = [
- "nexa",
- "nexa-model",
- "nexa-runtime",
+ "nexa-contract-gate-protocol",
  "serde",
  "serde_json",
 ]

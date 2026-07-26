@@ -4,6 +4,8 @@ members = [
     "crates/*",
     "examples/combat-runtime",
     "tools/benchmark-v6",
+    "tools/contract-gate-protocol",
+    "tools/contract-gates",
     "tools/milestone4-experiments",
     "tools/release-audit",
 ]
