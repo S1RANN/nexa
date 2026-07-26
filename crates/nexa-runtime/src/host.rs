@@ -1664,6 +1664,7 @@ pub enum HostRequestError {
     UnknownCustomDomain(u32),
     AlreadyCompleted,
     InvalidState,
+    InjectedFailure(crate::RuntimeFailurePoint),
 }
 
 impl fmt::Display for HostRequestError {
@@ -2525,6 +2526,7 @@ pub struct RuntimeResources {
     releases: ReleaseQueue,
     ownership: Vec<OwnedResource>,
     host_admission: Option<HostAdmissionGate>,
+    failure_injector: crate::RuntimeFailureInjector,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2600,7 +2602,12 @@ impl RuntimeResources {
                     .expect("host resource ownership capacity overflow"),
             ),
             host_admission: resource_admission,
+            failure_injector: crate::RuntimeFailureInjector::default(),
         }
+    }
+
+    pub(crate) fn set_failure_injector(&mut self, injector: crate::RuntimeFailureInjector) {
+        self.failure_injector = injector;
     }
 
     pub fn context(&mut self, task: TaskHandle, module_id: u32, epoch: u64) -> ResourceContext<'_> {
@@ -2865,6 +2872,9 @@ pub struct ResourceContext<'a> {
 impl ResourceContext<'_> {
     pub fn create_request(&mut self) -> Result<PendingHostRequest, HostRequestError> {
         self.admit(HostAdmissionKind::AsyncHostCall)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::RequestSlot)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::CompletionSlot)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::ReleaseSlot)?;
         let pending = self.resources.requests.create_for_module(
             self.module_id,
             self.epoch,
@@ -2883,6 +2893,7 @@ impl ResourceContext<'_> {
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
         self.admit(HostAdmissionKind::ResourceToken)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::ReleaseSlot)?;
         let token = self.resources.tokens.create(
             self.task,
             self.module_id,
@@ -2904,6 +2915,8 @@ impl ResourceContext<'_> {
         data: Arc<[i32]>,
     ) -> Result<SnapshotHandle, HostRequestError> {
         self.admit(HostAdmissionKind::Snapshot)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::SnapshotSlot)?;
+        self.fail_if_injected(crate::RuntimeFailurePoint::ReleaseSlot)?;
         let snapshot = self.resources.snapshots.create(
             self.task,
             self.module_id,
@@ -2927,6 +2940,14 @@ impl ResourceContext<'_> {
             .map_or(Ok(()), |gate| {
                 gate.admit(kind).map_err(host_admission_error)
             })
+    }
+
+    fn fail_if_injected(&self, point: crate::RuntimeFailurePoint) -> Result<(), HostRequestError> {
+        if self.resources.failure_injector.trigger(point) {
+            Err(HostRequestError::InjectedFailure(point))
+        } else {
+            Ok(())
+        }
     }
 }
 

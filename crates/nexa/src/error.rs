@@ -808,7 +808,8 @@ fn host_request_code(error: &HostRequestError) -> ErrorCode {
         | HostRequestError::HostClosed
         | HostRequestError::CompletionQueueClosed
         | HostRequestError::AlreadyCompleted
-        | HostRequestError::InvalidState => ErrorCode::NX5001,
+        | HostRequestError::InvalidState
+        | HostRequestError::InjectedFailure(_) => ErrorCode::NX5001,
     }
 }
 
@@ -830,7 +831,8 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
         | RealmError::MissingModule(_)
         | RealmError::ModuleNotCallable
         | RealmError::TerminalTask
-        | RealmError::TaskWaiting => ErrorCode::NX5001,
+        | RealmError::TaskWaiting
+        | RealmError::InjectedFailure(_) => ErrorCode::NX5001,
     }
 }
 

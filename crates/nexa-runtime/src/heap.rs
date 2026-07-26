@@ -1461,6 +1461,10 @@ impl Heap {
         &mut self.failure_injector
     }
 
+    pub(crate) fn set_failure_injector(&mut self, injector: RuntimeFailureInjector) {
+        self.failure_injector = injector;
+    }
+
     #[must_use]
     pub fn live_len(&self) -> usize {
         self.slots

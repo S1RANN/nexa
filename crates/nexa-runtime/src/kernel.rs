@@ -346,6 +346,10 @@ impl TaskRuntime {
         &mut self.failure_injector
     }
 
+    pub(crate) fn set_failure_injector(&mut self, injector: RuntimeFailureInjector) {
+        self.failure_injector = injector;
+    }
+
     pub fn inject_failure_once(&mut self, point: RuntimeFailurePoint) {
         self.failure_injector.arm_once(point);
     }

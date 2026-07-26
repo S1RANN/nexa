@@ -52,7 +52,6 @@ pub struct RealmV5RuntimeAdapter {
     tasks: [Option<TaskHandle>; REALM_V5_TASK_COUNT],
     requests: [Option<HostCompletionTicket>; REALM_V5_REQUEST_COUNT],
     fixtures: RealmV5Fixtures,
-    failure_injector: RuntimeFailureInjector,
 }
 
 impl RealmV5RuntimeAdapter {
@@ -101,12 +100,12 @@ impl RealmV5RuntimeAdapter {
                 snapshots: [None; REALM_V5_TASK_COUNT],
                 gc_object: None,
             },
-            failure_injector: RuntimeFailureInjector::default(),
         }
     }
 
-    pub fn failure_injector(&mut self) -> &mut RuntimeFailureInjector {
-        &mut self.failure_injector
+    #[must_use]
+    pub fn failure_injector(&self) -> &RuntimeFailureInjector {
+        self.realm.failure_injector()
     }
 
     pub fn apply(&mut self, event: RealmV5RuntimeEvent) -> Result<(), RealmV5RuntimeApplyError> {
@@ -115,8 +114,18 @@ impl RealmV5RuntimeAdapter {
             .map_err(RealmV5RuntimeApplyError::Invariant)?;
         self.preflight(event, &before)
             .map_err(RealmV5RuntimeApplyError::Rejected)?;
-        self.apply_production(event)
-            .map_err(RealmV5RuntimeApplyError::Invariant)
+        let before_stats = self.realm.failure_injector().all_stats();
+        let result = self.apply_production(event);
+        let after_stats = self.realm.failure_injector().all_stats();
+        if let Some((point, _)) = after_stats
+            .iter()
+            .zip(before_stats)
+            .find(|((_, after), (_, before))| after.injected > before.injected)
+            .map(|(after, _)| after)
+        {
+            return Err(RealmV5RuntimeApplyError::InjectedFailure(*point));
+        }
+        result.map_err(RealmV5RuntimeApplyError::Invariant)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -385,8 +394,13 @@ impl RealmV5RuntimeAdapter {
             RealmV5RuntimeEvent::PollTask | RealmV5RuntimeEvent::FuelYield => self.poll_tasks(1),
             RealmV5RuntimeEvent::ExplicitYield
             | RealmV5RuntimeEvent::ResumeTask
-            | RealmV5RuntimeEvent::HostWait
             | RealmV5RuntimeEvent::TaskComplete => self.poll_tasks(1_024),
+            RealmV5RuntimeEvent::HostWait => {
+                self.realm
+                    .preflight_host_request_admission()
+                    .map_err(debug)?;
+                self.poll_tasks(1_024)
+            }
             RealmV5RuntimeEvent::HostComplete => self.complete_requests(false),
             RealmV5RuntimeEvent::LateCompletion => self.complete_requests(true),
             RealmV5RuntimeEvent::Cancel | RealmV5RuntimeEvent::Cleanup => {
@@ -626,6 +640,9 @@ impl RealmV5RuntimeAdapter {
 
     fn complete_requests(&mut self, late: bool) -> Result<(), String> {
         self.capture_requests();
+        self.realm
+            .preflight_reload_completion_admission()
+            .map_err(debug)?;
         for ticket in &mut self.requests {
             if let Some(mut ticket) = ticket.take() {
                 match ticket.complete(HostPayload::I32(7)) {

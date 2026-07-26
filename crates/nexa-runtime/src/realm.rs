@@ -1248,6 +1248,7 @@ pub enum RealmError {
     TaskWaiting,
     Reload(ReloadError),
     State(crate::StatefulError),
+    InjectedFailure(crate::RuntimeFailurePoint),
 }
 
 impl fmt::Display for RealmError {
@@ -1319,23 +1320,32 @@ pub struct RealmRuntime {
     host_registry: Option<Box<dyn HostRegistry>>,
     host_registry_hash: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
+    failure_injector: crate::RuntimeFailureInjector,
 }
 
 impl RealmRuntime {
     fn base(config: RealmConfig) -> Self {
+        let failure_injector = crate::RuntimeFailureInjector::default();
+        let mut tasks = TaskRuntime::new(config.realm_id, config.runtime_limits);
+        tasks.set_failure_injector(failure_injector.clone());
+        let mut resources = RuntimeResources::new(
+            config.realm_id,
+            config.max_host_resources,
+            config.release_capacity,
+        );
+        resources.set_failure_injector(failure_injector.clone());
+        let mut heap =
+            Heap::new_with_string_limit(config.max_heap_objects, config.max_string_bytes);
+        heap.set_failure_injector(failure_injector.clone());
         Self {
             realm_id: config.realm_id,
             modules: SlotPool::with_capacity_limit(config.realm_id, config.max_modules),
             active_root: None,
             root_publications: VecDeque::with_capacity(config.max_modules as usize),
             next_publication_id: 1,
-            tasks: TaskRuntime::new(config.realm_id, config.runtime_limits),
-            resources: RuntimeResources::new(
-                config.realm_id,
-                config.max_host_resources,
-                config.release_capacity,
-            ),
-            heap: Heap::new_with_string_limit(config.max_heap_objects, config.max_string_bytes),
+            tasks,
+            resources,
+            heap,
             scheduler: Scheduler::with_capacity(
                 config.runtime_limits.max_scheduler_tokens as usize,
             ),
@@ -1354,6 +1364,7 @@ impl RealmRuntime {
             host_registry: None,
             host_registry_hash: None,
             runtime_host: None,
+            failure_injector,
         }
     }
 
@@ -1385,12 +1396,40 @@ impl RealmRuntime {
             resource_config.release_capacity,
             &runtime_host,
         );
+        realm
+            .resources
+            .set_failure_injector(realm.failure_injector.clone());
         realm.runtime_host = Some(runtime_host);
         Ok(realm)
     }
 
     pub fn create_scope(&mut self, parent: Option<ScopeHandle>) -> Result<ScopeHandle, RealmError> {
         Ok(self.tasks.create_scope(parent)?)
+    }
+
+    #[must_use]
+    pub fn failure_injector(&self) -> &crate::RuntimeFailureInjector {
+        &self.failure_injector
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    pub fn preflight_reload_completion_admission(&self) -> Result<(), RealmError> {
+        if self.reload.active() {
+            self.fail_if_injected(crate::RuntimeFailurePoint::ReloadCompletionSlot)?;
+        }
+        Ok(())
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    pub fn preflight_host_request_admission(&self) -> Result<(), RealmError> {
+        for point in [
+            crate::RuntimeFailurePoint::RequestSlot,
+            crate::RuntimeFailurePoint::CompletionSlot,
+            crate::RuntimeFailurePoint::ReleaseSlot,
+        ] {
+            self.fail_if_injected(point)?;
+        }
+        Ok(())
     }
 
     pub fn scope_snapshot(&self, scope: ScopeHandle) -> Result<crate::ScopeSnapshot, RealmError> {
@@ -1745,6 +1784,13 @@ impl RealmRuntime {
             .map_err(RealmError::ModuleHandle)?;
         let schema_unchanged = old_root.verified.module().state_schema == candidate_schema;
         let old_state = old_root.state.clone();
+        for point in [
+            crate::RuntimeFailurePoint::MigrationObjectSlot,
+            crate::RuntimeFailurePoint::MigrationFieldSlot,
+            crate::RuntimeFailurePoint::MigrationForwardingSlot,
+        ] {
+            self.fail_if_injected(point)?;
+        }
         let mut migration = crate::stateful::MigrationContext::new(
             old_state,
             candidate_domain,
@@ -1817,6 +1863,21 @@ impl RealmRuntime {
             .clone();
         let activation_entry = verified.module().reload_metadata.activation_entry;
         self.publish_reload_root()?;
+        if self
+            .failure_injector
+            .trigger(crate::RuntimeFailurePoint::ActivationTrap)
+        {
+            self.reload.activation_failed()?;
+            self.modules
+                .resolve_mut(candidate.raw())
+                .map_err(RealmError::ModuleHandle)?
+                .lifecycle = ModuleLifecycle::ActivationFaulted;
+            self.discard_reload_completions()?;
+            self.reload.finish()?;
+            return Err(RealmError::InjectedFailure(
+                crate::RuntimeFailurePoint::ActivationTrap,
+            ));
+        }
         let activation_result: Result<(), RuntimeMessage> = (|| {
             let Some(activation_entry) = activation_entry else {
                 return Ok(());
@@ -2830,6 +2891,7 @@ impl RealmRuntime {
                 .resolve(old.raw())
                 .map_err(RealmError::ModuleHandle)?;
             if delivery.module_id == root.module_id && delivery.epoch == root.epoch {
+                self.fail_if_injected(crate::RuntimeFailurePoint::ReloadCompletionSlot)?;
                 return Ok(None);
             }
         }
@@ -3337,13 +3399,25 @@ impl RealmRuntime {
         let cleanup = if run_user_cleanup {
             let verified = Arc::clone(&self.module_for_task(snapshot)?.verified);
             let continuation = self.tasks.take_execution(task)?.into_continuation();
-            CheckedInterpreter::run_cleanup(
-                &verified,
-                continuation,
-                snapshot.limits.max_cleanup_ops,
-                snapshot.limits.max_cleanup_fuel,
-                &self.cost_table,
-            )?
+            if self
+                .failure_injector
+                .trigger(crate::RuntimeFailurePoint::CleanupTrap)
+            {
+                Err(crate::Trap::from_continuation(
+                    &verified,
+                    &continuation,
+                    crate::TrapKind::Host,
+                    "injected cleanup trap",
+                ))
+            } else {
+                CheckedInterpreter::run_cleanup(
+                    &verified,
+                    continuation,
+                    snapshot.limits.max_cleanup_ops,
+                    snapshot.limits.max_cleanup_fuel,
+                    &self.cost_table,
+                )?
+            }
         } else {
             Ok(ExecutionCharge::default())
         };
@@ -3423,6 +3497,14 @@ impl RealmRuntime {
             .as_ref()
             .map(|_| ())
             .ok_or(RealmError::HostCapabilitiesUnavailable)
+    }
+
+    fn fail_if_injected(&self, point: crate::RuntimeFailurePoint) -> Result<(), RealmError> {
+        if self.failure_injector.trigger(point) {
+            Err(RealmError::InjectedFailure(point))
+        } else {
+            Ok(())
+        }
     }
 
     fn require_reload_idle(&self) -> Result<(), RealmError> {
