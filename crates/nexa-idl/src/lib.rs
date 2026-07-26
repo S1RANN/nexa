@@ -553,7 +553,8 @@ pub fn generate_rust(idl: &Idl) -> String {
             output,
             "impl nexa_runtime::EncodeHostReturn for {} {{ \
              fn requirements(&self) -> Result<nexa_runtime::HostReturnRequirements, \
-             nexa_runtime::HostTrap> {{ Ok({requirements}) }} fn encode_into(self, transaction: \
+             nexa_runtime::HostTrap> {{ let requirements = {requirements}; Ok(requirements) }} \
+             fn encode_into(self, transaction: \
              &mut nexa_runtime::HostReturnTransaction<'_>) -> Result<nexa_runtime::RuntimeValue, \
              nexa_runtime::HostTrap> {{ Ok({encoded}) }} }}",
             enumeration.name
