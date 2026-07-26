@@ -23,6 +23,7 @@ fuzz_target!(|bytes: &[u8]| {
             max_enum_types: 256,
             max_exports: 256,
             max_source_map_entries: 2_048,
+            ..nexa_bytecode::DecodeLimits::default()
         },
     );
 });

@@ -662,33 +662,55 @@ pub enum DecodeError {
 pub struct DecodeLimits {
     pub max_bytes: usize,
     pub max_sections: usize,
+    pub max_strings: usize,
+    pub max_string_bytes: usize,
+    pub max_types: usize,
+    pub max_constants: usize,
     pub max_functions: usize,
     pub max_instructions: usize,
     pub max_registers: usize,
     pub max_root_maps: usize,
+    pub max_root_map_bytes: usize,
     pub max_loop_bounds: usize,
+    pub max_safepoints: usize,
     pub max_host_imports: usize,
     pub max_state_types: usize,
     pub max_enum_types: usize,
+    pub max_enum_variants: usize,
+    pub max_structs: usize,
+    pub max_classes: usize,
+    pub max_fields: usize,
     pub max_exports: usize,
     pub max_source_map_entries: usize,
+    pub max_reload_metadata_bytes: usize,
 }
 
 impl Default for DecodeLimits {
     fn default() -> Self {
         Self {
             max_bytes: 16 * 1024 * 1024,
-            max_sections: 16,
+            max_sections: 64,
+            max_strings: 65_536,
+            max_string_bytes: 4 * 1024 * 1024,
+            max_types: 65_536,
+            max_constants: 65_536,
             max_functions: 65_536,
             max_instructions: 1_000_000,
             max_registers: u16::MAX as usize,
             max_root_maps: 1_000_000,
+            max_root_map_bytes: 4 * 1024 * 1024,
             max_loop_bounds: 1_000_000,
+            max_safepoints: 1_000_000,
             max_host_imports: 65_536,
             max_state_types: 65_536,
             max_enum_types: 65_536,
+            max_enum_variants: 1_000_000,
+            max_structs: 65_536,
+            max_classes: 65_536,
+            max_fields: 1_000_000,
             max_exports: 65_536,
             max_source_map_entries: 1_000_000,
+            max_reload_metadata_bytes: 64 * 1024,
         }
     }
 }
@@ -1018,6 +1040,46 @@ impl Module {
         for kind in SectionKind::ALL {
             required_section(&sections, kind)?;
         }
+        enforce_section_limit(
+            &sections,
+            SectionKind::Strings,
+            limits.max_strings,
+            "strings",
+        )?;
+        let string_bytes = required_section(&sections, SectionKind::Strings)?
+            .len()
+            .checked_sub(4)
+            .ok_or(DecodeError::SizeOverflow)?;
+        enforce_limit(string_bytes, limits.max_string_bytes, "string bytes")?;
+        enforce_section_limit(&sections, SectionKind::Types, limits.max_types, "types")?;
+        enforce_section_limit(
+            &sections,
+            SectionKind::Constants,
+            limits.max_constants,
+            "constants",
+        )?;
+        enforce_section_limit(
+            &sections,
+            SectionKind::Structs,
+            limits.max_structs,
+            "structs",
+        )?;
+        enforce_section_limit(
+            &sections,
+            SectionKind::Classes,
+            limits.max_classes,
+            "classes",
+        )?;
+        let root_map_bytes = required_section(&sections, SectionKind::RootMaps)?
+            .len()
+            .checked_sub(4)
+            .ok_or(DecodeError::SizeOverflow)?;
+        enforce_limit(root_map_bytes, limits.max_root_map_bytes, "root map bytes")?;
+        enforce_limit(
+            required_section(&sections, SectionKind::ReloadMetadata)?.len(),
+            limits.max_reload_metadata_bytes,
+            "reload metadata bytes",
+        )?;
         let mut metadata = Vec::new();
         metadata.extend_from_slice(
             required_section(&sections, SectionKind::ReloadMetadata)?
@@ -1129,9 +1191,18 @@ impl Module {
             return Err(DecodeError::ResourceLimit("enum types"));
         }
         let mut enum_types = Vec::with_capacity(enum_type_count);
+        let mut total_enum_variants = 0_usize;
         for _ in 0..enum_type_count {
             let type_id = StableId(reader.u64()?);
             let variant_count = usize::from(reader.u16()?);
+            total_enum_variants = total_enum_variants
+                .checked_add(variant_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(
+                total_enum_variants,
+                limits.max_enum_variants,
+                "enum variants",
+            )?;
             let mut variants = Vec::with_capacity(variant_count);
             for _ in 0..variant_count {
                 let stable_id = StableId(reader.u64()?);
@@ -1158,10 +1229,15 @@ impl Module {
             return Err(DecodeError::Truncated);
         }
         let mut state_types = Vec::with_capacity(state_type_count);
+        let mut total_fields = 0_usize;
         for _ in 0..state_type_count {
             let stable_id = StableId(reader.u64()?);
             let version = reader.u32()?;
             let field_count = usize::from(reader.u16()?);
+            total_fields = total_fields
+                .checked_add(field_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_fields, limits.max_fields, "fields")?;
             if field_count > reader.remaining() {
                 return Err(DecodeError::Truncated);
             }
@@ -1222,6 +1298,9 @@ impl Module {
         }
         let mut functions = Vec::with_capacity(function_count);
         let mut total_instructions = 0_usize;
+        let mut total_root_maps = 0_usize;
+        let mut total_safepoints = 0_usize;
+        let mut total_loop_bounds = 0_usize;
         for _ in 0..function_count {
             let parameter_count = usize::from(reader.u16()?);
             if parameter_count > reader.remaining() {
@@ -1260,9 +1339,10 @@ impl Module {
             }
             let root_map_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
-            if root_map_count > limits.max_root_maps {
-                return Err(DecodeError::ResourceLimit("root maps"));
-            }
+            total_root_maps = total_root_maps
+                .checked_add(root_map_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_root_maps, limits.max_root_maps, "root maps")?;
             let mut root_maps = Vec::with_capacity(root_map_count);
             for _ in 0..root_map_count {
                 let pc = reader.u32()?;
@@ -1282,15 +1362,20 @@ impl Module {
             }
             let safepoint_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            total_safepoints = total_safepoints
+                .checked_add(safepoint_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_safepoints, limits.max_safepoints, "safepoints")?;
             let mut safepoints = Vec::with_capacity(safepoint_count);
             for _ in 0..safepoint_count {
                 safepoints.push(reader.u32()?);
             }
             let loop_bound_count =
                 usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
-            if loop_bound_count > limits.max_loop_bounds {
-                return Err(DecodeError::ResourceLimit("loop bounds"));
-            }
+            total_loop_bounds = total_loop_bounds
+                .checked_add(loop_bound_count)
+                .ok_or(DecodeError::SizeOverflow)?;
+            enforce_limit(total_loop_bounds, limits.max_loop_bounds, "loop bounds")?;
             let mut loop_bounds = Vec::with_capacity(loop_bound_count);
             for _ in 0..loop_bound_count {
                 loop_bounds.push(LoopBound {
@@ -1537,6 +1622,32 @@ fn required_section<'a>(
         .iter()
         .find_map(|(candidate, bytes)| (*candidate == kind as u16).then_some(*bytes))
         .ok_or(DecodeError::InvalidSectionDirectory)
+}
+
+fn enforce_section_limit(
+    sections: &[(u16, &[u8])],
+    kind: SectionKind,
+    limit: usize,
+    name: &'static str,
+) -> Result<(), DecodeError> {
+    let bytes = required_section(sections, kind)?;
+    let count = usize::try_from(u32::from_le_bytes(
+        bytes
+            .get(..4)
+            .ok_or(DecodeError::Truncated)?
+            .try_into()
+            .map_err(|_| DecodeError::Truncated)?,
+    ))
+    .map_err(|_| DecodeError::SizeOverflow)?;
+    enforce_limit(count, limit, name)
+}
+
+fn enforce_limit(value: usize, limit: usize, name: &'static str) -> Result<(), DecodeError> {
+    if value > limit {
+        Err(DecodeError::ResourceLimit(name))
+    } else {
+        Ok(())
+    }
 }
 
 fn checksum(bytes: &[u8]) -> u32 {
@@ -2345,12 +2456,12 @@ impl FunctionBuilder {
 
 #[cfg(test)]
 mod tests {
-    use nexa_core::{FileId, SourceSpan};
+    use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{
-        DecodeError, FunctionBuilder, FunctionEffect, Instruction, Module, ModuleBuilder,
-        SectionKind, Signature, SourceMapEntry, ValueType, result_type, state_handle_error_type,
-        state_handle_type,
+        DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder, FunctionEffect,
+        Instruction, Module, ModuleBuilder, SectionKind, Signature, SourceMapEntry, StateField,
+        StateSchema, StateType, ValueType, result_type, state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -2497,6 +2608,154 @@ mod tests {
         let mut trailing = encoded;
         trailing.push(0);
         assert_eq!(Module::decode(&trailing), Err(DecodeError::TrailingBytes));
+    }
+
+    #[test]
+    #[allow(
+        clippy::items_after_statements,
+        clippy::too_many_lines,
+        clippy::type_complexity
+    )]
+    fn every_decode_resource_class_has_an_independent_limit() {
+        let type_id = StableId::from_name("Limited");
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        function
+            .emit(Instruction::Safepoint)
+            .emit(Instruction::Trap);
+        let mut builder = ModuleBuilder::new();
+        builder
+            .enum_type(EnumType {
+                type_id,
+                variants: vec![EnumVariant {
+                    stable_id: StableId::from_name("Limited::One"),
+                    tag: 0,
+                    payload_type: Some(ValueType::I32),
+                }],
+            })
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: type_id,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: StableId::from_name("Limited::value"),
+                        ty: ValueType::I32,
+                    }],
+                }],
+            })
+            .source_map([SourceMapEntry {
+                function: 0,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(1), 0, 1),
+            }]);
+        builder.function(function.finish().unwrap());
+        let encoded = builder.finish().encode();
+
+        let cases: &[(DecodeLimits, &'static str)] = &[
+            (
+                DecodeLimits {
+                    max_enum_variants: 0,
+                    ..DecodeLimits::default()
+                },
+                "enum variants",
+            ),
+            (
+                DecodeLimits {
+                    max_fields: 0,
+                    ..DecodeLimits::default()
+                },
+                "fields",
+            ),
+            (
+                DecodeLimits {
+                    max_root_map_bytes: 0,
+                    ..DecodeLimits::default()
+                },
+                "root map bytes",
+            ),
+            (
+                DecodeLimits {
+                    max_safepoints: 0,
+                    ..DecodeLimits::default()
+                },
+                "safepoints",
+            ),
+            (
+                DecodeLimits {
+                    max_reload_metadata_bytes: 0,
+                    ..DecodeLimits::default()
+                },
+                "reload metadata bytes",
+            ),
+        ];
+        for (limits, name) in cases {
+            assert_eq!(
+                Module::decode_with_limits(&encoded, *limits),
+                Err(DecodeError::ResourceLimit(name))
+            );
+        }
+
+        fn section_with_count(bytes: &[u8], kind: SectionKind, count: u32) -> Vec<u8> {
+            const ENTRY_BYTES: usize = 20;
+            let mut mutated = bytes.to_vec();
+            let section_index = SectionKind::ALL
+                .iter()
+                .position(|candidate| *candidate == kind)
+                .unwrap();
+            let entry = 8 + section_index * ENTRY_BYTES;
+            let offset =
+                u32::from_le_bytes(mutated[entry + 4..entry + 8].try_into().unwrap()) as usize;
+            let length =
+                u32::from_le_bytes(mutated[entry + 8..entry + 12].try_into().unwrap()) as usize;
+            mutated[offset..offset + 4].copy_from_slice(&count.to_le_bytes());
+            mutated[entry + 12..entry + 16].copy_from_slice(&count.to_le_bytes());
+            let checksum = super::checksum(&mutated[offset..offset + length]);
+            mutated[entry + 16..entry + 20].copy_from_slice(&checksum.to_le_bytes());
+            mutated
+        }
+
+        let empty_section_limits: [(SectionKind, fn(&mut DecodeLimits), &'static str); 5] = [
+            (
+                SectionKind::Strings,
+                |limits: &mut DecodeLimits| limits.max_strings = 0,
+                "strings",
+            ),
+            (
+                SectionKind::Types,
+                |limits: &mut DecodeLimits| limits.max_types = 0,
+                "types",
+            ),
+            (
+                SectionKind::Constants,
+                |limits: &mut DecodeLimits| limits.max_constants = 0,
+                "constants",
+            ),
+            (
+                SectionKind::Structs,
+                |limits: &mut DecodeLimits| limits.max_structs = 0,
+                "structs",
+            ),
+            (
+                SectionKind::Classes,
+                |limits: &mut DecodeLimits| limits.max_classes = 0,
+                "classes",
+            ),
+        ];
+        for (kind, configure, name) in empty_section_limits {
+            let mutated = section_with_count(&encoded, kind, 1);
+            let mut limits = DecodeLimits::default();
+            configure(&mut limits);
+            assert_eq!(
+                Module::decode_with_limits(&mutated, limits),
+                Err(DecodeError::ResourceLimit(name))
+            );
+        }
     }
 
     #[test]
