@@ -11,33 +11,55 @@ use nexa_runtime::model_adapter::{
 };
 
 #[test]
-fn every_realm_v5_shortest_path_and_rejection_matches_fresh_runtime() {
+fn every_real_realm_v5_shortest_path_matches_inspection() {
     let report = explore_realm_v5(RealmV5Config::default());
     assert!(report.failures.is_empty(), "{:?}", report.failures);
     assert!(!report.truncated);
     assert_eq!(report.shortest_paths.len(), report.visited_worlds);
 
-    for path in report.shortest_paths {
+    for path in &report.shortest_paths {
         let mut model = RealmV5World::default();
         let mut runtime = RealmV5RuntimeAdapter::new();
-        assert_matches(model, runtime.snapshot().unwrap(), &path);
-        for event in &path {
+        assert_matches(model, runtime.snapshot().unwrap(), path);
+        assert_inspection_matches(model, &runtime.realm().inspection_snapshot(), path);
+        for event in path {
+            let before = runtime.realm().inspection_snapshot();
+            assert_inspection_matches(model, &before, path);
             model.apply(*event).unwrap();
             runtime
                 .apply(runtime_event(*event))
                 .unwrap_or_else(|error| {
                     panic!("runtime rejected {event:?} on {path:?}: {error:?}")
                 });
-            assert_matches(model, runtime.snapshot().unwrap(), &path);
+            let after = runtime.realm().inspection_snapshot();
+            assert_inspection_matches(model, &after, path);
+            assert_matches(model, runtime.snapshot().unwrap(), path);
         }
+    }
+}
 
+#[test]
+fn every_realm_v5_rejection_matches_fresh_runtime_without_mutation() {
+    let report = explore_realm_v5(RealmV5Config::default());
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(!report.truncated);
+    for path in report.shortest_paths {
+        let mut model = RealmV5World::default();
+        let mut runtime = RealmV5RuntimeAdapter::new();
+        for event in &path {
+            model.apply(*event).unwrap();
+            runtime.apply(runtime_event(*event)).unwrap();
+        }
         let before = runtime.snapshot().unwrap();
         for event in REALM_V5_EVENTS {
             let mut rejected_model = model;
             if let Err(RealmV5ApplyError::Rejected(reason)) = rejected_model.apply(event) {
-                let runtime_error = runtime
-                    .apply(runtime_event(event))
-                    .expect_err("runtime accepted a model-rejected event");
+                let Err(runtime_error) = runtime.apply(runtime_event(event)) else {
+                    panic!(
+                        "runtime accepted {event:?} after model path {path:?}; \
+                         model rejection={reason:?}; model={model:#?}"
+                    );
+                };
                 assert_eq!(
                     runtime_error,
                     RealmV5RuntimeApplyError::Rejected(runtime_rejection(reason)),
@@ -51,6 +73,148 @@ fn every_realm_v5_shortest_path_and_rejection_matches_fresh_runtime() {
             }
         }
     }
+}
+
+#[allow(clippy::too_many_lines)]
+fn assert_inspection_matches(
+    model: RealmV5World,
+    inspection: &nexa_runtime::RealmInspectionSnapshot,
+    path: &[RealmV5Event],
+) {
+    let active = inspection.active_root.as_ref().expect("active root exists");
+    assert_eq!(
+        normalize_runtime_epoch(active.epoch),
+        model.active_epoch,
+        "inspection active root: {path:?}"
+    );
+    assert_eq!(
+        active.lifecycle,
+        if model.reload == RealmV5ReloadState::ActivationFaulted {
+            nexa_runtime::ModuleLifecycle::ActivationFaulted
+        } else {
+            nexa_runtime::ModuleLifecycle::Active
+        },
+        "inspection active lifecycle: {path:?}"
+    );
+    assert_eq!(
+        inspection
+            .candidate_root
+            .as_ref()
+            .map(|candidate| normalize_runtime_epoch(candidate.epoch)),
+        model.candidate_epoch,
+        "inspection candidate root: {path:?}"
+    );
+    if let Some(candidate) = &inspection.candidate_root {
+        assert_eq!(
+            candidate.lifecycle,
+            nexa_runtime::ModuleLifecycle::Staging,
+            "inspection candidate lifecycle: {path:?}"
+        );
+    }
+
+    for module in &inspection.modules {
+        let epoch = normalize_runtime_epoch(module.epoch);
+        assert_eq!(
+            module.state_objects,
+            usize::from(model.state_registry_objects[usize::from(epoch)]),
+            "inspection state registry at epoch {epoch}: {path:?}"
+        );
+        let expected = if epoch == model.active_epoch {
+            if model.reload == RealmV5ReloadState::ActivationFaulted {
+                nexa_runtime::ModuleLifecycle::ActivationFaulted
+            } else {
+                nexa_runtime::ModuleLifecycle::Active
+            }
+        } else if model.candidate_epoch == Some(epoch) {
+            nexa_runtime::ModuleLifecycle::Staging
+        } else if model.retired_epochs.iter().any(
+            |retired| matches!(retired, RealmV5RetiredEpoch::Retired(value) if *value == epoch),
+        ) {
+            nexa_runtime::ModuleLifecycle::Retired
+        } else {
+            panic!("unexpected live module epoch {epoch} after {path:?}");
+        };
+        assert_eq!(
+            module.lifecycle, expected,
+            "inspection module lifecycle at epoch {epoch}: {path:?}"
+        );
+        assert_eq!(
+            module.generation,
+            module.handle.raw().generation,
+            "inspection module generation at epoch {epoch}: {path:?}"
+        );
+        assert_eq!(
+            module.module_id,
+            module.handle.raw().index,
+            "inspection module identity at epoch {epoch}: {path:?}"
+        );
+    }
+
+    assert_eq!(
+        inspection.reload.root_publications.len(),
+        model
+            .retired_epochs
+            .iter()
+            .filter(|retired| !matches!(retired, RealmV5RetiredEpoch::Vacant))
+            .count(),
+        "inspection root publication count: {path:?}"
+    );
+    for (index, publication) in inspection.reload.root_publications.iter().enumerate() {
+        assert_eq!(
+            normalize_runtime_epoch(publication.candidate_epoch),
+            u8::try_from(index + 1).expect("bounded publication index"),
+            "inspection root publication order: {path:?}"
+        );
+    }
+    assert_eq!(
+        inspection.reload.completion_buffer,
+        usize::from(model.reload_completion_buffer),
+        "inspection reload completion buffer: {path:?}"
+    );
+    assert_eq!(
+        inspection.heap.live_objects,
+        usize::from(model.heap_objects),
+        "inspection heap objects: {path:?}"
+    );
+    assert_eq!(
+        inspection.roots.module_globals,
+        usize::from(model.gc_root),
+        "inspection module GC roots: {path:?}"
+    );
+    assert_eq!(
+        inspection.terminal_records.len(),
+        usize::from(model.terminal_records),
+        "inspection terminal records: {path:?}"
+    );
+    assert_eq!(
+        inspection.runtime_host,
+        Some(runtime_host_state(model.runtime_host)),
+        "inspection RuntimeHost state: {path:?}"
+    );
+    assert_eq!(
+        inspection.tasks.len(),
+        model
+            .tasks
+            .iter()
+            .filter(|task| task_is_live(task.state))
+            .count(),
+        "inspection live task count: {path:?}"
+    );
+    assert_eq!(
+        usize::try_from(inspection.resources.tasks).expect("bounded task ledger"),
+        inspection.tasks.len(),
+        "inspection task ledger: {path:?}"
+    );
+    assert_eq!(
+        usize::try_from(inspection.resources.heap_objects).expect("bounded heap ledger"),
+        inspection.heap.live_objects,
+        "inspection heap ledger: {path:?}"
+    );
+}
+
+fn normalize_runtime_epoch(epoch: u64) -> u8 {
+    u8::try_from(epoch.checked_sub(1).expect("runtime epochs are positive"))
+        .expect("Realm v5 epoch is bounded")
 }
 
 #[allow(clippy::too_many_lines)]
@@ -138,6 +302,11 @@ fn assert_matches(model: RealmV5World, runtime: RealmV5RuntimeSnapshot, path: &[
         runtime.heap_object, model.heap_object,
         "heap object: {path:?}"
     );
+    assert_eq!(
+        runtime.heap_objects,
+        usize::from(model.heap_objects),
+        "heap object count: {path:?}"
+    );
     assert_eq!(runtime.gc_root, model.gc_root, "GC root: {path:?}");
     assert_eq!(runtime.gc_epoch, model.gc_epoch, "GC epoch: {path:?}");
     assert_eq!(
@@ -194,10 +363,16 @@ fn assert_matches(model: RealmV5World, runtime: RealmV5RuntimeSnapshot, path: &[
         .requests
         .iter()
         .filter(|request| {
-            matches!(
-                request.state,
-                RealmV5RequestState::Pending | RealmV5RequestState::Late
-            )
+            request.state == RealmV5RequestState::Pending
+                || (request.state == RealmV5RequestState::Late
+                    && model.retired_epochs.iter().any(|retired| {
+                        matches!(
+                            retired,
+                            RealmV5RetiredEpoch::Retired(epoch)
+                                | RealmV5RetiredEpoch::Drained(epoch)
+                                if *epoch == request.epoch
+                        )
+                    }))
         })
         .count();
     let release_records: usize = model
@@ -255,7 +430,7 @@ fn assert_matches(model: RealmV5World, runtime: RealmV5RuntimeSnapshot, path: &[
     );
     assert_eq!(
         runtime.ledger.heap_objects,
-        usize::from(model.heap_object),
+        usize::from(model.heap_objects),
         "heap ledger: {path:?}"
     );
     assert_eq!(

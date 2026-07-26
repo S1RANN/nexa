@@ -484,6 +484,29 @@ impl RuntimeHost {
         }
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
+    #[must_use]
+    pub fn inspection_releases(&self) -> Vec<ReleaseRecord> {
+        let state = self
+            .releases
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut records =
+            Vec::with_capacity(state.host_lists.iter().map(|list| list.len).sum::<usize>());
+        for list in &state.host_lists {
+            let mut node = list.head;
+            while let Some(index) = node {
+                let entry = state.pool.nodes[index];
+                if let Some(record) = entry.record {
+                    records.push(record);
+                }
+                node = entry.next;
+            }
+        }
+        records
+    }
+
     #[must_use]
     pub fn pending_completions(&self) -> usize {
         self.pending_completions.load(Ordering::Acquire)

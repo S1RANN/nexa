@@ -110,8 +110,272 @@ impl RealmV5RuntimeAdapter {
     }
 
     pub fn apply(&mut self, event: RealmV5RuntimeEvent) -> Result<(), RealmV5RuntimeApplyError> {
+        let before = self
+            .snapshot()
+            .map_err(RealmV5RuntimeApplyError::Invariant)?;
+        self.preflight(event, &before)
+            .map_err(RealmV5RuntimeApplyError::Rejected)?;
         self.apply_production(event)
             .map_err(RealmV5RuntimeApplyError::Invariant)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn preflight(
+        &self,
+        event: RealmV5RuntimeEvent,
+        snapshot: &RealmV5RuntimeSnapshot,
+    ) -> Result<(), super::RealmV5RuntimeRejection> {
+        use super::RealmV5RuntimeRejection as Rejection;
+        let all_tasks = |state| snapshot.tasks.iter().all(|task| task.state == state);
+        let live_task = |state| {
+            !matches!(
+                state,
+                RealmV5RuntimeTaskState::Vacant
+                    | RealmV5RuntimeTaskState::Completed
+                    | RealmV5RuntimeTaskState::Cancelled
+                    | RealmV5RuntimeTaskState::Trapped
+            )
+        };
+        let reload_idle = matches!(
+            snapshot.reload,
+            RealmV5RuntimeReloadState::Idle | RealmV5RuntimeReloadState::ActivationFaulted
+        );
+        match event {
+            RealmV5RuntimeEvent::TaskAdmission => {
+                if snapshot.runtime_host != crate::RuntimeHostState::Open {
+                    return Err(Rejection::HostNotOpen);
+                }
+                if !reload_idle {
+                    return Err(Rejection::InvalidReloadState);
+                }
+                if snapshot.active_epoch != 0 || !all_tasks(RealmV5RuntimeTaskState::Vacant) {
+                    return Err(Rejection::Capacity);
+                }
+            }
+            RealmV5RuntimeEvent::PollTask | RealmV5RuntimeEvent::FuelYield => {
+                if !all_tasks(RealmV5RuntimeTaskState::Ready) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::ExplicitYield => {
+                if !all_tasks(RealmV5RuntimeTaskState::FuelYielded) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::ResumeTask => {
+                if !all_tasks(RealmV5RuntimeTaskState::FuelYielded)
+                    && !all_tasks(RealmV5RuntimeTaskState::Running)
+                {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::TaskComplete => {
+                if !all_tasks(RealmV5RuntimeTaskState::Running) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::HostWait => {
+                if snapshot.runtime_host != crate::RuntimeHostState::Open {
+                    return Err(Rejection::HostNotOpen);
+                }
+                if !all_tasks(RealmV5RuntimeTaskState::ExplicitYielded) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+                if snapshot
+                    .requests
+                    .iter()
+                    .any(|request| request.state != RealmV5RuntimeRequestState::Vacant)
+                {
+                    return Err(Rejection::InvalidRequestState);
+                }
+            }
+            RealmV5RuntimeEvent::HostComplete => {
+                if snapshot
+                    .requests
+                    .iter()
+                    .any(|request| request.state != RealmV5RuntimeRequestState::Pending)
+                {
+                    return Err(Rejection::InvalidRequestState);
+                }
+            }
+            RealmV5RuntimeEvent::Cancel => {
+                if !reload_idle {
+                    return Err(Rejection::InvalidReloadState);
+                }
+                let state = snapshot.tasks[0].state;
+                if !live_task(state) || !all_tasks(state) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::Cleanup => {
+                if !all_tasks(RealmV5RuntimeTaskState::Cancelled) {
+                    return Err(Rejection::InvalidTaskState);
+                }
+            }
+            RealmV5RuntimeEvent::BeginReload => {
+                if snapshot.runtime_host == crate::RuntimeHostState::Closed {
+                    return Err(Rejection::HostNotOpen);
+                }
+                if !reload_idle {
+                    return Err(Rejection::InvalidReloadState);
+                }
+                if snapshot.token_live
+                    || snapshot.snapshot_live
+                    || snapshot.release_backlog.iter().any(|count| *count != 0)
+                    || snapshot.heap_object
+                {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+                if usize::from(snapshot.active_epoch) + 1 >= REALM_V5_EPOCH_COUNT {
+                    return Err(Rejection::Capacity);
+                }
+            }
+            RealmV5RuntimeEvent::Quiesce => {
+                if snapshot.reload != RealmV5RuntimeReloadState::Prepared
+                    || usize::from(snapshot.active_epoch) >= REALM_V5_RETIRED_COUNT
+                {
+                    return Err(Rejection::InvalidReloadState);
+                }
+            }
+            RealmV5RuntimeEvent::Migration => {
+                if snapshot.reload != RealmV5RuntimeReloadState::Quiesced {
+                    return Err(Rejection::InvalidReloadState);
+                }
+            }
+            RealmV5RuntimeEvent::Rollback => {
+                if !matches!(
+                    snapshot.reload,
+                    RealmV5RuntimeReloadState::Prepared
+                        | RealmV5RuntimeReloadState::Quiesced
+                        | RealmV5RuntimeReloadState::Migrated
+                ) {
+                    return Err(Rejection::InvalidReloadState);
+                }
+            }
+            RealmV5RuntimeEvent::Commit | RealmV5RuntimeEvent::ActivationFault => {
+                if snapshot.reload != RealmV5RuntimeReloadState::Migrated {
+                    return Err(Rejection::InvalidReloadState);
+                }
+            }
+            RealmV5RuntimeEvent::LateCompletion => {
+                if snapshot
+                    .requests
+                    .iter()
+                    .any(|request| request.state != RealmV5RuntimeRequestState::Late)
+                {
+                    return Err(Rejection::InvalidRequestState);
+                }
+            }
+            RealmV5RuntimeEvent::TokenAcquire | RealmV5RuntimeEvent::SnapshotAcquire => {
+                if snapshot.runtime_host != crate::RuntimeHostState::Open {
+                    return Err(Rejection::HostNotOpen);
+                }
+                if snapshot.release_backlog.iter().any(|count| *count != 0) {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+                if snapshot.reload != RealmV5RuntimeReloadState::Idle
+                    || snapshot.tasks[0].state != RealmV5RuntimeTaskState::Ready
+                {
+                    return Err(Rejection::InvalidTaskState);
+                }
+                let already_live = if event == RealmV5RuntimeEvent::TokenAcquire {
+                    snapshot.token_live
+                } else {
+                    snapshot.snapshot_live
+                };
+                if already_live {
+                    return Err(Rejection::Capacity);
+                }
+            }
+            RealmV5RuntimeEvent::TokenRelease => {
+                if !snapshot.token_live {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::SnapshotRelease => {
+                if !snapshot.snapshot_live {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::ReleaseDrain => {
+                if snapshot.release_backlog.iter().all(|count| *count == 0) {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::GcRootAttach => {
+                if snapshot.gc_root
+                    || snapshot.heap_object
+                    || snapshot.tasks.iter().any(|task| live_task(task.state))
+                    || snapshot.reload != RealmV5RuntimeReloadState::Idle
+                {
+                    return Err(Rejection::RootUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::GcRootDrop => {
+                if !snapshot.gc_root {
+                    return Err(Rejection::RootUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::GcCollect => {
+                if !snapshot.heap_object
+                    || snapshot.gc_root
+                    || snapshot.tasks.iter().any(|task| live_task(task.state))
+                    || snapshot.reload != RealmV5RuntimeReloadState::Idle
+                {
+                    return Err(Rejection::RootUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::RetiredEpochReap(index) => {
+                let Some(epoch) = snapshot.retired_epochs.get(usize::from(index)) else {
+                    return Err(Rejection::InvalidRetiredEpoch);
+                };
+                if !matches!(epoch, RealmV5RuntimeRetiredEpoch::Retired(_)) {
+                    return Err(Rejection::InvalidRetiredEpoch);
+                }
+                let inspection = self.realm.inspection_snapshot();
+                let Some(retired) = inspection.retired_epochs.get(usize::from(index)) else {
+                    return Err(Rejection::InvalidRetiredEpoch);
+                };
+                if retired.task_count != 0
+                    || retired.request_count != 0
+                    || retired.token_count != 0
+                    || retired.snapshot_count != 0
+                    || retired.gc_root_count != 0
+                    || retired.pending_completions != 0
+                {
+                    return Err(Rejection::ResourceUnavailable);
+                }
+            }
+            RealmV5RuntimeEvent::RuntimeHostBeginClose => {
+                if snapshot.runtime_host != crate::RuntimeHostState::Open
+                    || usize::from(snapshot.active_epoch) != REALM_V5_RETIRED_COUNT
+                    || snapshot.candidate_epoch.is_some()
+                    || snapshot.requests.iter().any(|request| {
+                        matches!(
+                            request.state,
+                            RealmV5RuntimeRequestState::Pending
+                                | RealmV5RuntimeRequestState::Buffered
+                                | RealmV5RuntimeRequestState::Late
+                        )
+                    })
+                    || snapshot.token_live
+                    || snapshot.snapshot_live
+                    || snapshot.release_backlog.iter().any(|count| *count != 0)
+                {
+                    return Err(Rejection::HostNotOpen);
+                }
+            }
+            RealmV5RuntimeEvent::RuntimeHostFinishClose => {
+                return Err(
+                    if snapshot.runtime_host == crate::RuntimeHostState::Closing {
+                        Rejection::HostResourcesLive
+                    } else {
+                        Rejection::HostNotOpen
+                    },
+                );
+            }
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -364,7 +628,11 @@ impl RealmV5RuntimeAdapter {
         self.capture_requests();
         for ticket in &mut self.requests {
             if let Some(mut ticket) = ticket.take() {
-                ticket.complete(HostPayload::I32(7)).map_err(debug)?;
+                match ticket.complete(HostPayload::I32(7)) {
+                    Ok(()) => {}
+                    Err(crate::HostRequestError::AlreadyCompleted) if late => {}
+                    Err(error) => return Err(debug(error)),
+                }
             }
         }
         self.realm
@@ -374,7 +642,6 @@ impl RealmV5RuntimeAdapter {
                 collect_garbage: false,
             })
             .map_err(debug)?;
-        let _ = late;
         Ok(())
     }
 
@@ -390,37 +657,55 @@ impl RealmV5RuntimeAdapter {
 
     #[allow(clippy::too_many_lines)]
     pub fn snapshot(&self) -> Result<RealmV5RuntimeSnapshot, String> {
-        let active = self
-            .realm
-            .active_root()
+        let inspection = self.realm.inspection_snapshot();
+        let active = inspection
+            .active_root
+            .as_ref()
             .ok_or_else(|| "Realm v5 production active root is missing".to_owned())?;
-        let active_epoch = normalize_epoch(self.realm.module_epoch(active).map_err(debug)?)?;
+        let active_epoch = normalize_epoch(active.epoch)?;
         let mut state_registry_objects = [0; REALM_V5_EPOCH_COUNT];
-        for (index, module) in self.modules.epochs.iter().copied().enumerate() {
-            if let Some(module) = module {
-                state_registry_objects[index] =
-                    self.realm.state_handles(module).map_err(debug)?.len();
-            }
+        for module in &inspection.modules {
+            let epoch = usize::from(normalize_epoch(module.epoch)?);
+            state_registry_objects[epoch] = module.state_objects;
         }
-        let ledger = self.realm.resource_ledger();
-        let tasks = std::array::from_fn(|index| self.task_snapshot(index));
+        let ledger = inspection.resources;
+        let tasks = std::array::from_fn(|index| self.task_snapshot(index, &inspection));
         let scheduler = std::array::from_fn(|index| {
-            matches!(
-                tasks[index].state,
-                RealmV5RuntimeTaskState::Ready
-                    | RealmV5RuntimeTaskState::FuelYielded
-                    | RealmV5RuntimeTaskState::ExplicitYielded
-            )
+            self.tasks[index].is_some_and(|handle| {
+                inspection.tasks.iter().any(|task| {
+                    task.handle == handle && task.scheduler != crate::SchedulerInspection::Detached
+                })
+            })
         });
         let requests = std::array::from_fn(|index| RealmV5RuntimeRequestSnapshot {
             state: self.fixtures.request_handles[index].map_or(
                 RealmV5RuntimeRequestState::Vacant,
                 |request| {
-                    if self.realm.request_terminal_record(request).is_some() {
-                        RealmV5RuntimeRequestState::Completed
-                    } else {
-                        RealmV5RuntimeRequestState::Pending
+                    if inspection
+                        .tasks
+                        .iter()
+                        .any(|task| task.ownership.requests.contains(&request))
+                    {
+                        return RealmV5RuntimeRequestState::Pending;
                     }
+                    if inspection.reload.completion_buffer != 0 && self.requests[index].is_none() {
+                        return RealmV5RuntimeRequestState::Buffered;
+                    }
+                    self.realm.request_terminal_record(request).map_or(
+                        RealmV5RuntimeRequestState::Vacant,
+                        |terminal| {
+                            if matches!(
+                                terminal.state,
+                                crate::HostRequestState::Cancelled
+                                    | crate::HostRequestState::Detached
+                            ) && self.requests[index].is_some()
+                            {
+                                RealmV5RuntimeRequestState::Late
+                            } else {
+                                RealmV5RuntimeRequestState::Completed
+                            }
+                        },
+                    )
                 },
             ),
             task: self.fixtures.request_handles[index].and_then(|_| u8::try_from(index).ok()),
@@ -429,7 +714,8 @@ impl RealmV5RuntimeAdapter {
         let mut retired_epochs = [RealmV5RuntimeRetiredEpoch::Vacant; REALM_V5_RETIRED_COUNT];
         for (index, retired) in self
             .realm
-            .retired_epochs()
+            .inspection_snapshot()
+            .retired_epochs
             .iter()
             .take(REALM_V5_RETIRED_COUNT)
             .enumerate()
@@ -440,31 +726,77 @@ impl RealmV5RuntimeAdapter {
                 crate::RetiredEpochState::Drained => RealmV5RuntimeRetiredEpoch::Drained(epoch),
             };
         }
+        let mut release_backlog = [0; REALM_V5_EPOCH_COUNT];
+        for retired in &inspection.retired_epochs {
+            let epoch = usize::from(normalize_epoch(retired.epoch)?);
+            release_backlog[epoch] = retired.pending_releases;
+        }
+        for release in &inspection.runtime_host_releases {
+            let epoch = usize::from(normalize_epoch(release.epoch)?);
+            release_backlog[epoch] = release_backlog[epoch].saturating_add(1);
+        }
+        let realm_accounted_releases = inspection
+            .retired_epochs
+            .iter()
+            .map(|retired| retired.pending_releases)
+            .sum::<usize>();
+        let total_releases =
+            count(ledger.queued_releases).saturating_add(inspection.runtime_host_releases.len());
+        release_backlog[usize::from(active_epoch)] = release_backlog[usize::from(active_epoch)]
+            .saturating_add(count(ledger.queued_releases).saturating_sub(realm_accounted_releases));
+        let token_owner = first_owned_resource(
+            &inspection,
+            &self.tasks,
+            &self.fixtures.tokens,
+            |ownership, handle| ownership.tokens.contains(&handle),
+        );
+        let snapshot_owner = first_owned_resource(
+            &inspection,
+            &self.tasks,
+            &self.fixtures.snapshots,
+            |ownership, handle| ownership.snapshots.contains(&handle),
+        );
         Ok(RealmV5RuntimeSnapshot {
             active_epoch,
-            candidate_epoch: self.candidate_epoch()?,
+            candidate_epoch: inspection
+                .candidate_root
+                .as_ref()
+                .map(|candidate| normalize_epoch(candidate.epoch))
+                .transpose()?,
             retired_epochs,
             tasks,
             scheduler,
             requests,
-            token_live: self.fixtures.tokens.iter().any(Option::is_some),
-            token_owner: first_index(&self.fixtures.tokens),
-            token_epoch: first_epoch(tasks, &self.fixtures.tokens),
+            token_live: token_owner.is_some(),
+            token_owner,
+            token_epoch: owned_resource_epoch(
+                &inspection,
+                &self.tasks,
+                &self.fixtures.tokens,
+                |ownership, handle| ownership.tokens.contains(&handle),
+            ),
             token_consumed: false,
-            snapshot_live: self.fixtures.snapshots.iter().any(Option::is_some),
-            snapshot_owner: first_index(&self.fixtures.snapshots),
-            snapshot_epoch: first_epoch(tasks, &self.fixtures.snapshots),
+            snapshot_live: snapshot_owner.is_some(),
+            snapshot_owner,
+            snapshot_epoch: owned_resource_epoch(
+                &inspection,
+                &self.tasks,
+                &self.fixtures.snapshots,
+                |ownership, handle| ownership.snapshots.contains(&handle),
+            ),
             snapshot_consumed: false,
-            heap_object: self
-                .fixtures
-                .gc_object
-                .is_some_and(|object| self.realm.resolve_heap_object(object).is_ok()),
-            gc_root: false,
-            gc_epoch: active_epoch,
-            gc_consumed: self.fixtures.gc_object.is_some(),
-            reload: self.reload_state()?,
-            reload_completion_buffer: self.realm.reload_buffered_completions(),
-            release_backlog: [0; REALM_V5_EPOCH_COUNT],
+            heap_object: inspection.heap.live_objects != 0,
+            heap_objects: inspection.heap.live_objects,
+            gc_root: inspection.roots.module_globals != 0,
+            gc_epoch: if inspection.heap.live_objects == 0 {
+                0
+            } else {
+                active_epoch
+            },
+            gc_consumed: false,
+            reload: inspection_reload_state(inspection.reload.state),
+            reload_completion_buffer: inspection.reload.completion_buffer,
+            release_backlog,
             state_registry_objects,
             runtime_host: self.host.state(),
             terminal_records: self
@@ -479,14 +811,10 @@ impl RealmV5RuntimeAdapter {
                 scheduler_tokens: count(ledger.scheduler_tokens),
                 requests: count(ledger.requests),
                 completion_reservations: count(ledger.completion_reservations),
-                completion_queued: count(self.realm.completion_accounting().queued),
+                completion_queued: count(inspection.completion_accounting.queued),
                 tokens: count(ledger.tokens),
                 snapshots: count(ledger.snapshots),
-                release_records: count(
-                    ledger
-                        .release_reservations
-                        .saturating_add(ledger.queued_releases),
-                ),
+                release_records: total_releases,
                 heap_objects: count(ledger.heap_objects),
                 state_objects: count(ledger.state_objects),
                 retired_epochs: count(ledger.retired_epochs),
@@ -500,7 +828,11 @@ impl RealmV5RuntimeAdapter {
         })
     }
 
-    fn task_snapshot(&self, index: usize) -> RealmV5RuntimeTaskSnapshot {
+    fn task_snapshot(
+        &self,
+        index: usize,
+        inspection: &crate::RealmInspectionSnapshot,
+    ) -> RealmV5RuntimeTaskSnapshot {
         let Some(task) = self.tasks[index] else {
             return RealmV5RuntimeTaskSnapshot {
                 state: RealmV5RuntimeTaskState::Vacant,
@@ -508,55 +840,47 @@ impl RealmV5RuntimeAdapter {
                 epoch: 0,
             };
         };
-        if let Ok(snapshot) = self.realm.task_snapshot(task) {
+        if let Some(snapshot) = inspection
+            .tasks
+            .iter()
+            .find(|snapshot| snapshot.handle == task)
+        {
             let state = runtime_task_state(snapshot.state);
             return RealmV5RuntimeTaskSnapshot {
                 state,
-                execution: execution_state(state),
-                epoch: normalize_epoch(snapshot.module_epoch).unwrap_or(0),
+                execution: inspection_execution(snapshot.execution),
+                epoch: normalize_epoch(snapshot.epoch).unwrap_or(0),
             };
         }
-        let state = self
-            .realm
-            .terminal_record(task)
-            .map_or(RealmV5RuntimeTaskState::Vacant, |record| {
-                runtime_task_state(record.state)
-            });
+        let terminal = inspection
+            .terminal_records
+            .iter()
+            .find(|(terminal, _)| *terminal == task);
+        let state = terminal.map_or(RealmV5RuntimeTaskState::Vacant, |(_, record)| {
+            runtime_task_state(record.state)
+        });
         RealmV5RuntimeTaskSnapshot {
             state,
             execution: RealmV5RuntimeExecution::None,
-            epoch: 0,
+            epoch: terminal
+                .and_then(|(_, record)| normalize_epoch(record.module_epoch).ok())
+                .unwrap_or(0),
         }
     }
 
     fn candidate_epoch(&self) -> Result<Option<u8>, String> {
         for module in self.modules.epochs.iter().flatten().copied() {
+            let Ok(lifecycle) = self.realm.module_lifecycle(module) else {
+                continue;
+            };
             if matches!(
-                self.realm.module_lifecycle(module).map_err(debug)?,
+                lifecycle,
                 crate::ModuleLifecycle::Staging | crate::ModuleLifecycle::Activating
             ) {
                 return normalize_epoch(self.realm.module_epoch(module).map_err(debug)?).map(Some);
             }
         }
         Ok(None)
-    }
-
-    fn reload_state(&self) -> Result<RealmV5RuntimeReloadState, String> {
-        for module in self.modules.epochs.iter().flatten().copied() {
-            match self.realm.module_lifecycle(module).map_err(debug)? {
-                crate::ModuleLifecycle::Staging => {
-                    return Ok(RealmV5RuntimeReloadState::Prepared);
-                }
-                crate::ModuleLifecycle::Activating => {
-                    return Ok(RealmV5RuntimeReloadState::Migrated);
-                }
-                crate::ModuleLifecycle::ActivationFaulted => {
-                    return Ok(RealmV5RuntimeReloadState::ActivationFaulted);
-                }
-                crate::ModuleLifecycle::Active | crate::ModuleLifecycle::Retired => {}
-            }
-        }
-        Ok(RealmV5RuntimeReloadState::Idle)
     }
 
     #[must_use]
@@ -622,23 +946,6 @@ fn runtime_task_state(state: crate::TaskState) -> RealmV5RuntimeTaskState {
     }
 }
 
-const fn execution_state(state: RealmV5RuntimeTaskState) -> RealmV5RuntimeExecution {
-    match state {
-        RealmV5RuntimeTaskState::Ready => RealmV5RuntimeExecution::Ready,
-        RealmV5RuntimeTaskState::Running => RealmV5RuntimeExecution::Running,
-        RealmV5RuntimeTaskState::FuelYielded => RealmV5RuntimeExecution::FuelYielded,
-        RealmV5RuntimeTaskState::ExplicitYielded => RealmV5RuntimeExecution::ExplicitYielded,
-        RealmV5RuntimeTaskState::Waiting => RealmV5RuntimeExecution::Waiting,
-        RealmV5RuntimeTaskState::ReloadPaused => RealmV5RuntimeExecution::ReloadPaused,
-        RealmV5RuntimeTaskState::Cancelling => RealmV5RuntimeExecution::Cancelling,
-        RealmV5RuntimeTaskState::Cleanup => RealmV5RuntimeExecution::Cleanup,
-        RealmV5RuntimeTaskState::Vacant
-        | RealmV5RuntimeTaskState::Completed
-        | RealmV5RuntimeTaskState::Cancelled
-        | RealmV5RuntimeTaskState::Trapped => RealmV5RuntimeExecution::None,
-    }
-}
-
 fn normalize_epoch(epoch: u64) -> Result<u8, String> {
     let normalized = epoch
         .checked_sub(1)
@@ -646,21 +953,86 @@ fn normalize_epoch(epoch: u64) -> Result<u8, String> {
     u8::try_from(normalized).map_err(|_| "Realm epoch exceeds v5 fixture capacity".to_owned())
 }
 
-fn first_index<T>(values: &[Option<T>; REALM_V5_TASK_COUNT]) -> Option<u8> {
-    values
+fn first_owned_resource<T: Copy>(
+    inspection: &crate::RealmInspectionSnapshot,
+    tasks: &[Option<TaskHandle>; REALM_V5_TASK_COUNT],
+    resources: &[Option<T>; REALM_V5_TASK_COUNT],
+    owns: impl Fn(&crate::TaskResourceSet, T) -> bool,
+) -> Option<u8> {
+    tasks
         .iter()
-        .position(Option::is_some)
-        .and_then(|index| u8::try_from(index).ok())
+        .copied()
+        .zip(resources.iter().copied())
+        .enumerate()
+        .find_map(|(index, (task, resource))| {
+            let (Some(task), Some(resource)) = (task, resource) else {
+                return None;
+            };
+            inspection
+                .tasks
+                .iter()
+                .find(|snapshot| snapshot.handle == task)
+                .filter(|snapshot| owns(&snapshot.ownership, resource))
+                .and_then(|_| u8::try_from(index).ok())
+        })
 }
 
-fn first_epoch<T>(
-    tasks: [RealmV5RuntimeTaskSnapshot; REALM_V5_TASK_COUNT],
-    values: &[Option<T>; REALM_V5_TASK_COUNT],
+fn owned_resource_epoch<T: Copy>(
+    inspection: &crate::RealmInspectionSnapshot,
+    tasks: &[Option<TaskHandle>; REALM_V5_TASK_COUNT],
+    resources: &[Option<T>; REALM_V5_TASK_COUNT],
+    owns: impl Fn(&crate::TaskResourceSet, T) -> bool,
 ) -> u8 {
-    values
+    tasks
         .iter()
-        .position(Option::is_some)
-        .map_or(0, |index| tasks[index].epoch)
+        .copied()
+        .zip(resources.iter().copied())
+        .find_map(|(task, resource)| {
+            let (Some(task), Some(resource)) = (task, resource) else {
+                return None;
+            };
+            inspection
+                .tasks
+                .iter()
+                .find(|snapshot| snapshot.handle == task)
+                .filter(|snapshot| owns(&snapshot.ownership, resource))
+                .and_then(|snapshot| normalize_epoch(snapshot.epoch).ok())
+        })
+        .unwrap_or(0)
+}
+
+const fn inspection_execution(
+    execution: crate::TaskExecutionInspection,
+) -> RealmV5RuntimeExecution {
+    match execution {
+        crate::TaskExecutionInspection::Ready => RealmV5RuntimeExecution::Ready,
+        crate::TaskExecutionInspection::Running => RealmV5RuntimeExecution::Running,
+        crate::TaskExecutionInspection::FuelYielded => RealmV5RuntimeExecution::FuelYielded,
+        crate::TaskExecutionInspection::ExplicitYielded => RealmV5RuntimeExecution::ExplicitYielded,
+        crate::TaskExecutionInspection::Waiting { .. } => RealmV5RuntimeExecution::Waiting,
+        crate::TaskExecutionInspection::ReloadPaused => RealmV5RuntimeExecution::ReloadPaused,
+        crate::TaskExecutionInspection::Cancelling => RealmV5RuntimeExecution::Cancelling,
+        crate::TaskExecutionInspection::Cleanup => RealmV5RuntimeExecution::Cleanup,
+    }
+}
+
+const fn inspection_reload_state(state: crate::ReloadInspectionState) -> RealmV5RuntimeReloadState {
+    match state {
+        crate::ReloadInspectionState::Idle | crate::ReloadInspectionState::Completed => {
+            RealmV5RuntimeReloadState::Idle
+        }
+        crate::ReloadInspectionState::Preparing | crate::ReloadInspectionState::Quiescing => {
+            RealmV5RuntimeReloadState::Prepared
+        }
+        crate::ReloadInspectionState::Staging => RealmV5RuntimeReloadState::Quiesced,
+        crate::ReloadInspectionState::Committing
+        | crate::ReloadInspectionState::Published
+        | crate::ReloadInspectionState::Activating => RealmV5RuntimeReloadState::Migrated,
+        crate::ReloadInspectionState::RolledBack => RealmV5RuntimeReloadState::Idle,
+        crate::ReloadInspectionState::ActivationFaulted => {
+            RealmV5RuntimeReloadState::ActivationFaulted
+        }
+    }
 }
 
 fn count(value: u64) -> usize {

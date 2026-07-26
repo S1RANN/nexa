@@ -1223,6 +1223,7 @@ pub struct RealmInspectionSnapshot {
     pub roots: RootInspection,
     pub heap: HeapInspection,
     pub runtime_host: Option<RuntimeHostState>,
+    pub runtime_host_releases: Vec<crate::ReleaseRecord>,
     pub terminal_records: Vec<(TaskHandle, TaskTerminalRecord)>,
 }
 
@@ -2616,6 +2617,10 @@ impl RealmRuntime {
                 capacity: self.heap.capacity_limit(),
             },
             runtime_host: self.runtime_host.as_ref().map(RuntimeHost::state),
+            runtime_host_releases: self
+                .runtime_host
+                .as_ref()
+                .map_or_else(Vec::new, RuntimeHost::inspection_releases),
             terminal_records: self.tombstones.iter().cloned().collect(),
         }
     }

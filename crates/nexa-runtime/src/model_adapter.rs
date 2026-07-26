@@ -889,7 +889,7 @@ impl Default for RealmV4RoutingRuntimeAdapter {
 const REALM_V5_TASK_COUNT: usize = 2;
 const REALM_V5_REQUEST_COUNT: usize = 2;
 const REALM_V5_RETIRED_COUNT: usize = 3;
-const REALM_V5_EPOCH_COUNT: usize = 5;
+const REALM_V5_EPOCH_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RealmV5RuntimeEvent {
@@ -1048,6 +1048,7 @@ pub struct RealmV5RuntimeSnapshot {
     pub snapshot_epoch: u8,
     pub snapshot_consumed: bool,
     pub heap_object: bool,
+    pub heap_objects: usize,
     pub gc_root: bool,
     pub gc_epoch: u8,
     pub gc_consumed: bool,
