@@ -175,11 +175,7 @@ fn generate(root: &Path) -> Result<(), String> {
         ],
     )?;
 
-    let artifact_names = manifest
-        .contracts
-        .iter()
-        .map(|contract| contract.artifact.clone())
-        .collect::<BTreeSet<_>>();
+    let artifact_names = artifact_files(&gate_dir)?;
     let mut artifacts = BTreeMap::new();
     let mut artifact_hashes = BTreeMap::new();
     for name in artifact_names {
@@ -201,6 +197,16 @@ fn generate(root: &Path) -> Result<(), String> {
             name,
             serde_json::to_value(artifact).map_err(|error| error.to_string())?,
         );
+    }
+    let declared_artifact_count = artifacts
+        .values()
+        .find(|artifact| artifact["gate"] == "workspace-gates")
+        .and_then(|artifact| artifact.pointer("/metrics/artifacts/generated"))
+        .and_then(Value::as_u64)
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or("workspace gate omitted generated artifact count")?;
+    if declared_artifact_count != artifacts.len() {
+        return Err("gate output directory does not match workspace artifact count".into());
     }
 
     let (contracts, gaps, work_package_commits) = evaluate_contracts(&manifest, &artifacts)?;
@@ -827,6 +833,29 @@ fn ensure_absent(path: &Path, label: &str) -> Result<(), String> {
         Err(format!("{label} must not exist before this phase"))
     } else {
         Ok(())
+    }
+}
+
+fn artifact_files(directory: &Path) -> Result<Vec<String>, String> {
+    let mut names = std::fs::read_dir(directory)
+        .map_err(|error| format!("{}: {error}", directory.display()))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    names.sort();
+    if names.is_empty() {
+        Err("gate output directory contains no artifacts".into())
+    } else {
+        Ok(names)
     }
 }
 
