@@ -1653,7 +1653,10 @@ fn main() {
             )
             .unwrap();
         let async_admission_capacity_failure = observed(|| {
-            assert!(realm.poll_task(rejected, 64).is_err());
+            assert!(matches!(
+                realm.poll_task(rejected, 64),
+                Ok(PollResult::Trapped(_))
+            ));
         });
         drop(realm);
         drop(pending.lock().unwrap().take());

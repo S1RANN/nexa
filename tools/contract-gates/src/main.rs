@@ -634,7 +634,7 @@ fn typed_snapshots(context: &Context) -> GateArtifact<Value> {
             "typed_snapshot_host_boundaries_reject_content_type_confusion",
         ],
     );
-    let host = read_production_source(
+    let host = read_text(
         &context.root.join("crates/nexa-runtime/src/host.rs"),
         &mut failures,
         "runtime-host-source",
