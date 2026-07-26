@@ -102,7 +102,7 @@ fn production_failure_modes_and_stats_are_complete() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn every_failure_point_runs_inside_production_realm_boundaries() {
+fn every_production_failure_point_is_differentially_atomic() {
     let atomic_cases: &[(
         RuntimeFailurePoint,
         &[RealmV5RuntimeEvent],
@@ -217,6 +217,20 @@ fn every_failure_point_runs_inside_production_realm_boundaries() {
         runtime
             .apply(event)
             .unwrap_or_else(|error| panic!("{point:?} did not recover: {error:?}"));
+        if matches!(
+            point,
+            RuntimeFailurePoint::MigrationObjectSlot
+                | RuntimeFailurePoint::MigrationFieldSlot
+                | RuntimeFailurePoint::MigrationForwardingSlot
+        ) {
+            runtime.apply(RealmV5RuntimeEvent::Rollback).unwrap();
+            let recovered = runtime.realm().inspection_snapshot();
+            assert_eq!(
+                recovered.reload.state,
+                nexa_runtime::ReloadInspectionState::Idle
+            );
+            assert!(recovered.candidate_root.is_none());
+        }
         covered.push(point);
     }
 
@@ -253,6 +267,7 @@ fn assert_scope_slot_is_injected_by_realm_runtime() {
 
 fn assert_activation_trap_is_post_publication_and_exactly_once() {
     let mut runtime = replay(&[
+        RealmV5RuntimeEvent::TaskAdmission,
         RealmV5RuntimeEvent::BeginReload,
         RealmV5RuntimeEvent::Quiesce,
         RealmV5RuntimeEvent::Migration,
@@ -277,6 +292,10 @@ fn assert_activation_trap_is_post_publication_and_exactly_once() {
     );
     assert_eq!(failed.state_registry_objects[0], 0);
     assert_eq!(failed.state_registry_objects[1], 1);
+    assert_eq!(failed.terminal_records, 2);
+    assert_eq!(failed.ledger.task_slots, 0);
+    assert_eq!(failed.ledger.continuations, 0);
+    assert_eq!(failed.ledger.scheduler_tokens, 0);
     assert_eq!(
         runtime
             .realm()
@@ -296,6 +315,8 @@ fn assert_activation_trap_is_post_publication_and_exactly_once() {
 fn assert_cleanup_trap_is_terminal_and_exactly_once() {
     let mut runtime = replay(&[
         RealmV5RuntimeEvent::TaskAdmission,
+        RealmV5RuntimeEvent::TokenAcquire,
+        RealmV5RuntimeEvent::SnapshotAcquire,
         RealmV5RuntimeEvent::PollTask,
     ]);
     runtime
@@ -317,6 +338,9 @@ fn assert_cleanup_trap_is_terminal_and_exactly_once() {
     );
     assert!(trapped.scheduler.iter().all(|scheduled| !*scheduled));
     assert_eq!(trapped.terminal_records, 2);
+    assert_eq!(trapped.ledger.tokens, 0);
+    assert_eq!(trapped.ledger.snapshots, 0);
+    assert_eq!(trapped.ledger.release_records, 2);
     assert_eq!(
         runtime
             .failure_injector()
@@ -329,6 +353,8 @@ fn assert_cleanup_trap_is_terminal_and_exactly_once() {
         Err(RealmV5RuntimeApplyError::Rejected(_))
     ));
     assert_eq!(runtime.snapshot().unwrap(), trapped);
+    runtime.apply(RealmV5RuntimeEvent::ReleaseDrain).unwrap();
+    assert_eq!(runtime.snapshot().unwrap().ledger.release_records, 0);
 }
 
 fn replay(path: &[RealmV5RuntimeEvent]) -> RealmV5RuntimeAdapter {
