@@ -12,6 +12,7 @@ exclude = [
     "fuzz/state-schema",
     "fuzz/source",
     "fuzz/idl",
+    "fuzz/mvr",
 ]
 
 [workspace.package]

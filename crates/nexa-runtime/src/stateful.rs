@@ -1679,6 +1679,121 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
     }
 }
 
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_stateful_registry(data: &[u8]) {
+    if data.len() > 256 {
+        return;
+    }
+    let limits = MigrationLimits {
+        max_objects: 16,
+        max_fields: 16,
+        max_forwarding_entries: 16,
+        max_state_bytes: 1_024,
+        max_gc_roots: 8,
+        max_fuel: 128,
+        max_call_depth: 8,
+    };
+    let Ok(mut registry) = StatefulRegistry::try_new(StatefulDomainId::new(7), limits) else {
+        return;
+    };
+    let mut handles = Vec::with_capacity(16);
+    for chunk in data.chunks(4).take(64) {
+        let stable_id = StableId(u64::from(chunk.get(1).copied().unwrap_or_default()) + 1);
+        match chunk.first().copied().unwrap_or_default() % 4 {
+            0 => {
+                if let Ok(handle) = registry.insert(
+                    stable_id,
+                    StateValue::I32(i32::from(chunk.get(2).copied().unwrap_or_default())),
+                ) {
+                    if handles.len() == handles.capacity() {
+                        handles.remove(0);
+                    }
+                    handles.push(handle);
+                }
+            }
+            1 => {
+                let _ = registry.insert(
+                    stable_id,
+                    StateValue::Bool(chunk.get(2).copied().unwrap_or_default() & 1 != 0),
+                );
+            }
+            2 => {
+                if let Some(handle) = handles.get(
+                    usize::from(chunk.get(2).copied().unwrap_or_default()) % handles.len().max(1),
+                ) {
+                    let _ = registry.resolve(*handle);
+                }
+            }
+            _ => {
+                let _ = registry.object(stable_id);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_migration_arena(data: &[u8]) {
+    if data.len() > 256 {
+        return;
+    }
+    let limits = MigrationLimits {
+        max_objects: 16,
+        max_fields: 32,
+        max_forwarding_entries: 16,
+        max_state_bytes: 2_048,
+        max_gc_roots: 8,
+        max_fuel: 128,
+        max_call_depth: 8,
+    };
+    let Ok(mut arena) = MigrationArena::try_new(limits) else {
+        return;
+    };
+    for chunk in data.chunks(4).take(64) {
+        let id = StableId(u64::from(chunk.get(1).copied().unwrap_or_default()) + 1);
+        match chunk.first().copied().unwrap_or_default() % 4 {
+            0 => {
+                if let Err(index) = arena.object_index(id) {
+                    let usage = arena.usage();
+                    let next = MigrationUsage {
+                        objects: usage.objects + 1,
+                        payload_bytes: usage
+                            .payload_bytes
+                            .saturating_add(std::mem::size_of::<i32>()),
+                        ..usage
+                    };
+                    if arena.check_usage(next).is_ok() {
+                        arena.insert_object(
+                            index,
+                            id,
+                            StableId::from_name("FuzzScalar"),
+                            1,
+                            0,
+                            Some(StateValue::I32(i32::from(
+                                chunk.get(2).copied().unwrap_or_default(),
+                            ))),
+                        );
+                        arena.rebuild_caches();
+                    }
+                }
+            }
+            1 => {
+                if let Err(index) = arena.forwarding_index(id)
+                    && arena.check_forwarding().is_ok()
+                {
+                    let target = arena.objects.first().map(|slot| slot.stable_id);
+                    arena.insert_forwarding(index, id, target);
+                }
+            }
+            2 => {
+                arena.rebuild_caches();
+            }
+            _ => {
+                let _ = arena.check_usage(arena.usage());
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{

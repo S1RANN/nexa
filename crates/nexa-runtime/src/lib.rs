@@ -52,6 +52,8 @@ pub use host::{
     RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
     RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle, TaskResourceSet,
 };
+#[cfg(feature = "fuzzing")]
+pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};
 pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
     InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, OpcodeCostTable,
@@ -71,5 +73,7 @@ pub use stateful::{
     MigrationCapacityReport, MigrationLimitError, MigrationLimits, MigrationUsageReport,
     StateHandle, StateHandleError, StateObject, StateValue, StatefulDomainId, StatefulError,
 };
+#[cfg(feature = "fuzzing")]
+pub use stateful::{fuzz_migration_arena, fuzz_stateful_registry};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
 pub use trace::{RuntimeTrace, TraceRecords};

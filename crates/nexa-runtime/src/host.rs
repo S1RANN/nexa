@@ -1564,7 +1564,7 @@ impl HostRequestManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn drain_completions(
         &mut self,
         releases: &mut ReleaseQueue,
@@ -2675,6 +2675,126 @@ impl<T> CopyBuffer<T> {
     pub fn into_vec(self) -> Vec<T> {
         self.data
     }
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_completion_ticket_terminal_race(data: &[u8]) {
+    if data.len() > 64 {
+        return;
+    }
+    let mut releases = ReleaseQueue::new(1);
+    let mut requests = HostRequestManager::with_completion_counter(5, 1, None, None);
+    let Ok(pending) = requests.create_for_module(2, 3, &mut releases) else {
+        return;
+    };
+    let request = pending.request;
+    let mut ticket = pending.ticket;
+    let requests = Arc::new(Mutex::new(requests));
+    let releases = Arc::new(Mutex::new(releases));
+    let barrier = Arc::new(std::sync::Barrier::new(3));
+    let operation = data.first().copied().unwrap_or_default() % 4;
+
+    let ticket_barrier = Arc::clone(&barrier);
+    let terminal = std::thread::spawn(move || {
+        ticket_barrier.wait();
+        match operation {
+            0 => ticket.complete(HostPayload::I32(1)),
+            1 => ticket.fail(HostErrorPayload { code: 7 }),
+            2 => ticket.cancelled(),
+            _ => ticket.abandon(),
+        }
+    });
+    let cancel_requests = Arc::clone(&requests);
+    let cancel_releases = Arc::clone(&releases);
+    let cancel_barrier = Arc::clone(&barrier);
+    let cancel = std::thread::spawn(move || {
+        cancel_barrier.wait();
+        cancel_requests
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel(
+                request,
+                false,
+                &mut cancel_releases
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+    });
+    barrier.wait();
+    let _ = terminal.join();
+    let _ = cancel.join();
+    let mut requests = requests
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut releases = releases
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = requests.drain_completions(&mut releases);
+    let _ = releases.drain().count();
+}
+
+#[cfg(feature = "fuzzing")]
+pub fn fuzz_release_intrusive_list(data: &[u8]) {
+    if data.len() > 128 {
+        return;
+    }
+    const CAPACITY: usize = 16;
+    let host = RuntimeHost::new(CAPACITY);
+    let mut queue = host.release_queue(CAPACITY);
+    let mut reservations = Vec::with_capacity(CAPACITY);
+    for (index, byte) in data.iter().copied().enumerate().take(64) {
+        match byte % 5 {
+            0 if reservations.len() < CAPACITY => {
+                if let Ok(reservation) = queue.reserve(u32::from(byte % 4), u64::from(byte % 8)) {
+                    reservations.push(reservation);
+                }
+            }
+            1 => {
+                if let Some(reservation) = reservations.pop() {
+                    let domain = RuntimeHostDomain::ALL[usize::from(byte) % RELEASE_DOMAIN_COUNT];
+                    let _ = queue.enqueue_reserved(
+                        reservation,
+                        ReleaseRecord {
+                            realm_id: 1,
+                            module_id: reservation.module_id,
+                            epoch: reservation.epoch,
+                            kind: ReleaseKind::ResourceToken,
+                            object_id: index as u64,
+                            domain,
+                        },
+                    );
+                }
+            }
+            2 => {
+                if let Some(reservation) = reservations.pop() {
+                    queue.cancel_reservation(reservation);
+                }
+            }
+            3 => {
+                let mut records = [ReleaseRecord {
+                    realm_id: 0,
+                    module_id: 0,
+                    epoch: 0,
+                    kind: ReleaseKind::HostRequest,
+                    object_id: 0,
+                    domain: RuntimeHostDomain::VmThread,
+                }; 4];
+                let _ = queue.drain_into(&mut records);
+            }
+            _ => {
+                let _ = queue.transfer_to_host();
+                let _ = host.drain_releases();
+            }
+        }
+    }
+    for reservation in reservations {
+        queue.cancel_reservation(reservation);
+    }
+    let _ = queue.drain().count();
+    let _ = queue.transfer_to_host();
+    let _ = host.drain_releases();
+    let _ = host.begin_close();
+    let _ = host.try_finish_close();
 }
 
 #[cfg(test)]

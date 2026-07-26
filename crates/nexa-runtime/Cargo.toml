@@ -12,6 +12,7 @@ nexa-verifier = { path = "../nexa-verifier" }
 
 [features]
 allocation-counting = []
+fuzzing = ["model-adapter"]
 model-adapter = []
 
 [lints]
