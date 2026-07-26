@@ -1170,7 +1170,8 @@ fn git(root: &Path, arguments: &[&str]) -> Result<String, String> {
 }
 
 fn git_status(root: &Path) -> Result<String, String> {
-    git(root, &["status", "--porcelain"])
+    run(root, "git", &["status", "--porcelain"], "git status")
+        .map(|output| output.trim_end().to_owned())
 }
 
 fn git_hash_object(root: &Path, path: &Path) -> Result<String, String> {
