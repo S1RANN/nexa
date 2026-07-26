@@ -362,9 +362,9 @@ fn render_report(result: &AuditResult) -> String {
     format!(
         "# Nexa Milestone 4.0R Final MVR Closure\n\n\
          Status: **COMPLETE**\n\n\
-         Implementation SHA: `{implementation_sha}`  \n\
-         Implementation Tree SHA: `{implementation_tree}`  \n\
-         Evidence SHA: `SELF`\n\n\
+         - Implementation SHA: `{implementation_sha}`\n\
+         - Implementation Tree SHA: `{implementation_tree}`\n\
+         - Evidence SHA: `SELF`\n\n\
          本报告与机器证据由 `cargo run -p nexa-release-audit -- milestone4r` 从干净的\
          implementation commit 自动生成。Evidence SHA 使用 `SELF` 表示包含本报告的\
          evidence commit；Git 提交不能无循环地包含自身哈希。\n\n\
