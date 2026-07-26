@@ -2,6 +2,10 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use nexa_machine::{MachineSpec, stable_id_map};
+use nexa_model::artifact::{
+    MODEL_FAILURE_ARTIFACT_VERSION, ModelFailureArtifact, current_commit_sha,
+    write_model_failure_artifact,
+};
 use nexa_model::explore;
 use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
 use nexa_model::realm_v4::{
@@ -10,6 +14,7 @@ use nexa_model::realm_v4::{
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
+use serde_json::{Value, json};
 
 const REQUIRED_BASELINE: &[&str] = &[
     "baseline/BASELINE_INDEX.md",
@@ -386,8 +391,9 @@ fn check_machines() -> Result<(), String> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_models() -> Result<(), String> {
-    let artifact = Path::new("target/model-artifacts/shortest-failure.txt");
+    let artifact = Path::new("target/model-artifacts/shortest-failure.json");
     if let Some(parent) = artifact.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|error| format!("could not create model artifact directory: {error}"))?;
@@ -397,12 +403,23 @@ fn check_models() -> Result<(), String> {
     for (_, spec) in &specs {
         let report = explore(spec);
         if !report.is_success(spec) {
-            let failure = report.failures.first().map_or_else(
-                || "coverage failure without transition path\n".to_owned(),
-                |failure| format!("{}\npath={:?}\n", failure.message, failure.path),
+            let (message, path) = report.failures.first().map_or_else(
+                || {
+                    (
+                        "coverage failure without transition path".to_owned(),
+                        Vec::new(),
+                    )
+                },
+                |failure| (failure.message.clone(), failure.path.clone()),
             );
-            std::fs::write(artifact, failure)
-                .map_err(|error| format!("could not write model failure artifact: {error}"))?;
+            write_exploration_failure(
+                artifact,
+                &spec.name,
+                &json!({"max_depth": 256, "max_snapshots": 100_000}),
+                &path,
+                &message,
+                "NEXA_MODEL_MACHINE_FAILURE",
+            )?;
             return Err(format!(
                 "model `{}` failed:\n{}",
                 spec.name,
@@ -422,8 +439,17 @@ fn check_models() -> Result<(), String> {
     let system_report = explore_task_scope(system_config);
     if !system_report.failures.is_empty() {
         let (message, path) = &system_report.failures[0];
-        std::fs::write(artifact, format!("{message}\npath={path:?}\n"))
-            .map_err(|error| format!("could not write model failure artifact: {error}"))?;
+        write_exploration_failure(
+            artifact,
+            "task-scope-system",
+            &json!({"max_depth": 32, "max_worlds": 16_384}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_SYSTEM_FAILURE",
+        )?;
         return Err(format!(
             "TaskScope system model failed: {:?}",
             system_report.failures
@@ -434,6 +460,18 @@ fn check_models() -> Result<(), String> {
     ))?;
     let realm_report = explore_realm_runtime(realm_config);
     if !realm_report.failures.is_empty() {
+        let (message, path) = &realm_report.failures[0];
+        write_exploration_failure(
+            artifact,
+            "realm-runtime-system",
+            &json!({}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_REALM_FAILURE",
+        )?;
         return Err(format!(
             "RealmRuntime system model failed: {:?}",
             realm_report.failures
@@ -445,8 +483,17 @@ fn check_models() -> Result<(), String> {
     });
     if !realm_v3.failures.is_empty() {
         let (message, path) = &realm_v3.failures[0];
-        std::fs::write(artifact, format!("{message}\npath={path:?}\n"))
-            .map_err(|error| format!("could not write model artifact: {error}"))?;
+        write_exploration_failure(
+            artifact,
+            "realm-v3",
+            &json!({"max_depth": 14, "max_worlds": 4_096}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_REALM_V3_FAILURE",
+        )?;
         return Err(format!("Realm v3 model failed: {:?}", realm_v3.failures));
     }
     if realm_v3.truncated {
@@ -454,19 +501,23 @@ fn check_models() -> Result<(), String> {
     }
     let realm_v4 = check_realm_v4(artifact)?;
     let realm_v4_routing_worlds = check_realm_v4_routing(artifact)?;
-    std::fs::write(
-        artifact,
-        format!(
-            "success: {} machine snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds, {} realm-v4 routing worlds\n",
-            snapshot_count,
-            system_report.visited_worlds,
-            realm_report.visited_worlds,
-            realm_v3.visited_worlds,
-            realm_v4.visited_worlds,
-            realm_v4_routing_worlds,
-        ),
+    let summary = std::fs::File::create("target/model-artifacts/model-check-summary.json")
+        .map_err(|error| format!("could not create model summary: {error}"))?;
+    serde_json::to_writer_pretty(
+        summary,
+        &json!({
+            "format_version": 1,
+            "commit_sha": current_commit_sha(),
+            "status": "success",
+            "machine_snapshots": snapshot_count,
+            "task_scope_worlds": system_report.visited_worlds,
+            "realm_worlds": realm_report.visited_worlds,
+            "realm_v3_worlds": realm_v3.visited_worlds,
+            "realm_v4_worlds": realm_v4.visited_worlds,
+            "realm_v4_routing_worlds": realm_v4_routing_worlds
+        }),
     )
-    .map_err(|error| format!("could not write model artifact: {error}"))?;
+    .map_err(|error| format!("could not write model summary: {error}"))?;
     println!(
         "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds, {} realm-v4 routing worlds",
         specs.len(),
@@ -486,8 +537,17 @@ fn check_realm_v4(artifact: &Path) -> Result<RealmV4Report, String> {
     });
     if !report.failures.is_empty() {
         let (message, path) = &report.failures[0];
-        std::fs::write(artifact, format!("{message}\npath={path:?}\n"))
-            .map_err(|error| format!("could not write model artifact: {error}"))?;
+        write_exploration_failure(
+            artifact,
+            "realm-v4",
+            &json!({"max_depth": 16, "max_worlds": 4_096}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_REALM_V4_FAILURE",
+        )?;
         return Err(format!("Realm v4 model failed: {:?}", report.failures));
     }
     if report.truncated {
@@ -503,8 +563,17 @@ fn check_realm_v4_routing(artifact: &Path) -> Result<usize, String> {
     });
     if !report.failures.is_empty() {
         let (message, path) = &report.failures[0];
-        std::fs::write(artifact, format!("{message}\npath={path:?}\n"))
-            .map_err(|error| format!("could not write model artifact: {error}"))?;
+        write_exploration_failure(
+            artifact,
+            "realm-v4-routing",
+            &json!({"max_depth": 8, "max_worlds": 256}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_REALM_V4_ROUTING_FAILURE",
+        )?;
         return Err(format!(
             "Realm v4 routing model failed: {:?}",
             report.failures
@@ -514,6 +583,48 @@ fn check_realm_v4_routing(artifact: &Path) -> Result<usize, String> {
         return Err("Realm v4 routing model exploration was truncated".into());
     }
     Ok(report.visited_worlds)
+}
+
+fn write_exploration_failure(
+    path: &Path,
+    model: &str,
+    model_config: &Value,
+    trace: &[String],
+    message: &str,
+    error_code: &str,
+) -> Result<(), String> {
+    let failure_event = trace
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "exploration".into());
+    let artifact = ModelFailureArtifact {
+        format_version: MODEL_FAILURE_ARTIFACT_VERSION,
+        commit_sha: current_commit_sha(),
+        model_config: json!({
+            "model": model,
+            "bounds": model_config
+        }),
+        path: trace.to_owned(),
+        failure_event,
+        model_before: Value::Null,
+        model_after: json!({"failure": message}),
+        runtime_before: Value::Null,
+        runtime_after: Value::Null,
+        ledger: json!({}),
+        epochs: json!({}),
+        tasks: json!([]),
+        requests: json!([]),
+        completions: json!([]),
+        releases: json!([]),
+        heap: json!({}),
+        roots: json!([]),
+        trace: json!(trace),
+        error_code: error_code.into(),
+    };
+    let file = std::fs::File::create(path)
+        .map_err(|error| format!("could not create model failure artifact: {error}"))?;
+    write_model_failure_artifact(file, &artifact)
+        .map_err(|error| format!("could not write model failure artifact: {error}"))
 }
 
 fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {

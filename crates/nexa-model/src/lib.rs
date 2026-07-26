@@ -1,5 +1,6 @@
 //! Bounded exploration of generated Nexa machine specifications.
 
+pub mod artifact;
 pub mod realm_v3;
 pub mod realm_v4;
 pub mod realm_v5;

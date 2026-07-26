@@ -8,6 +8,8 @@ publish.workspace = true
 [dependencies]
 nexa-core = { path = "../nexa-core" }
 nexa-machine = { path = "../nexa-machine" }
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 nexa-bytecode = { path = "../nexa-bytecode" }

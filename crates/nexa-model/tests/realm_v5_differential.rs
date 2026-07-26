@@ -200,12 +200,12 @@ fn assert_matches(model: RealmV5World, runtime: RealmV5RuntimeSnapshot, path: &[
             )
         })
         .count();
-    let release_records = model
+    let release_records: usize = model
         .release_backlog
         .iter()
         .map(|count| usize::from(*count))
         .sum();
-    let state_objects = model
+    let state_objects: usize = model
         .state_registry_objects
         .iter()
         .map(|count| usize::from(*count))

@@ -1,3 +1,7 @@
+use nexa_model::artifact::{
+    MODEL_FAILURE_ARTIFACT_VERSION, ModelFailureArtifact, current_commit_sha,
+    write_model_failure_artifact,
+};
 use nexa_model::realm_v4::{
     RealmV4CancelKind, RealmV4CompletionState, RealmV4Config, RealmV4Event, RealmV4ReloadState,
     RealmV4RoutingEvent, RealmV4RoutingWorld, RealmV4TaskState, RealmV4World, explore_realm_v4,
@@ -9,6 +13,7 @@ use nexa_runtime::model_adapter::{
     RealmV4RuntimeAdapter, RealmV4RuntimeCancelKind, RealmV4RuntimeEvent, RealmV4RuntimeSnapshot,
     RealmV4RuntimeTaskState, RealmV4RuntimeTerminalReason,
 };
+use serde_json::{Value, json};
 
 #[test]
 fn every_realm_v4_shortest_path_replays_against_runtime() {
@@ -25,15 +30,33 @@ fn every_realm_v4_shortest_path_replays_against_runtime() {
         let mut model = RealmV4World::default();
         let mut runtime = RealmV4RuntimeAdapter::new();
         assert_matches(model, runtime.snapshot().unwrap()).unwrap();
-        for event in path {
+        for (event_index, event) in path.into_iter().enumerate() {
+            let model_before = model;
+            let runtime_before = runtime.snapshot().unwrap();
             model.apply(event).unwrap();
             if let Err(error) = runtime.apply(runtime_event(event)) {
-                write_failure(&replay_path, event, model, None, &error);
+                write_failure(
+                    &replay_path[..=event_index],
+                    event,
+                    model_before,
+                    model,
+                    Some(runtime_before),
+                    None,
+                    &error,
+                );
                 panic!("{error}; event={event:?}; path={replay_path:?}");
             }
             let snapshot = runtime.snapshot().unwrap();
             if let Err(error) = assert_matches(model, snapshot) {
-                write_failure(&replay_path, event, model, Some(snapshot), &error);
+                write_failure(
+                    &replay_path[..=event_index],
+                    event,
+                    model_before,
+                    model,
+                    Some(runtime_before),
+                    Some(snapshot),
+                    &error,
+                );
                 panic!("{error}; event={event:?}; path={replay_path:?}");
             }
         }
@@ -55,15 +78,33 @@ fn every_realm_v4_dual_module_routing_path_replays_against_realm_runtime() {
         let mut model = RealmV4RoutingWorld::default();
         let mut runtime = RealmV4RoutingRuntimeAdapter::new();
         assert_routing_matches(model, runtime.snapshot()).unwrap();
-        for event in path {
+        for (event_index, event) in path.into_iter().enumerate() {
+            let model_before = model;
+            let runtime_before = runtime.snapshot();
             model.apply(event).unwrap();
             if let Err(error) = runtime.apply(routing_runtime_event(event)) {
-                write_routing_failure(&replay_path, event, model, None, &error);
+                write_routing_failure(
+                    &replay_path[..=event_index],
+                    event,
+                    model_before,
+                    model,
+                    Some(runtime_before),
+                    None,
+                    &error,
+                );
                 panic!("{error}; event={event:?}; path={replay_path:?}");
             }
             let snapshot = runtime.snapshot();
             if let Err(error) = assert_routing_matches(model, snapshot) {
-                write_routing_failure(&replay_path, event, model, Some(snapshot), &error);
+                write_routing_failure(
+                    &replay_path[..=event_index],
+                    event,
+                    model_before,
+                    model,
+                    Some(runtime_before),
+                    Some(snapshot),
+                    &error,
+                );
                 panic!("{error}; event={event:?}; path={replay_path:?}");
             }
         }
@@ -309,8 +350,10 @@ const fn terminal_reason(state: RealmV4TaskState) -> RealmV4RuntimeTerminalReaso
 fn write_failure(
     path: &[RealmV4Event],
     event: RealmV4Event,
-    model: RealmV4World,
-    runtime: Option<RealmV4RuntimeSnapshot>,
+    model_before: RealmV4World,
+    model_after: RealmV4World,
+    runtime_before: Option<RealmV4RuntimeSnapshot>,
+    runtime_after: Option<RealmV4RuntimeSnapshot>,
     error: &str,
 ) {
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -318,73 +361,57 @@ fn write_failure(
     if let Some(parent) = artifact.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
-    let path = path
-        .iter()
-        .map(|event| format!("\"{event:?}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    let runtime_json = runtime.map_or_else(
-        || String::from("null"),
-        |value| {
-            format!(
-                "{{\"task_state\":\"{:?}\",\"execution\":\"{:?}\",\"scheduler_tokens\":{},\"request_owned\":{},\"continuation_owned\":{},\"reload_checkpoint\":{},\"cancel_kind\":\"{:?}\",\"user_defer\":{},\"terminal_reason\":\"{:?}\",\"vm_resources\":\"{:?}\"}}",
-                value.task_state,
-                value.execution,
-                value.scheduler_tokens,
-                value.request_owned,
-                value.continuation_owned,
-                value.reload_checkpoint,
-                value.cancel_kind,
-                value.user_defer,
-                value.terminal_reason,
-                value.vm_resources,
-            )
-        },
-    );
-    let (task_state, execution, scheduler, request, reload, terminal) = runtime.map_or_else(
-        || {
-            (
-                "null".into(),
-                "null".into(),
-                0,
-                false,
-                false,
-                String::from("null"),
-            )
-        },
-        |value| {
-            (
-                format!("\"{:?}\"", value.task_state),
-                format!("\"{:?}\"", value.execution),
-                value.scheduler_tokens,
-                value.request_owned,
-                value.reload_checkpoint,
-                format!("\"{:?}\"", value.terminal_reason),
-            )
-        },
-    );
-    std::fs::write(
-        artifact,
-        format!(
-            "{{\n  \"path\": [{path}],\n  \"event\": \"{event:?}\",\n  \"model\": {{\"task_state\":\"{:?}\",\"scheduler_tokens\":{},\"request_owned\":{},\"continuation_owned\":{},\"reload_checkpoint\":{},\"cancel_kind\":\"{:?}\",\"user_defer\":{}}},\n  \"runtime\": {runtime_json},\n  \"task_state\": {task_state},\n  \"execution\": {execution},\n  \"scheduler\": {{\"tokens\": {scheduler}}},\n  \"requests\": {{\"owned\": {request}}},\n  \"reload_buffer\": {{\"checkpoint\": {reload}}},\n  \"terminal_records\": [{terminal}],\n  \"error\": \"{}\"\n}}\n",
-            model.task,
-            model.scheduler_tokens,
-            model.has_request(),
-            model.has_continuation(),
-            model.reload_active(),
-            model.cancel_kind(),
-            model.has_user_defer(),
-            error.replace('\\', "\\\\").replace('"', "\\\"")
+    let last_runtime = runtime_after.or(runtime_before);
+    let failure = ModelFailureArtifact {
+        format_version: MODEL_FAILURE_ARTIFACT_VERSION,
+        commit_sha: current_commit_sha(),
+        model_config: json!({
+            "model": "realm-v4",
+            "max_depth": 16,
+            "max_worlds": 4_096
+        }),
+        path: path.iter().map(|event| format!("{event:?}")).collect(),
+        failure_event: format!("{event:?}"),
+        model_before: v4_model_value(model_before),
+        model_after: v4_model_value(model_after),
+        runtime_before: runtime_before.map_or(Value::Null, v4_runtime_value),
+        runtime_after: runtime_after.map_or(Value::Null, v4_runtime_value),
+        ledger: last_runtime.map_or(Value::Null, |runtime| {
+            json!({
+                "task_slots": runtime.vm_resources.task_slots,
+                "continuations": usize::from(runtime.continuation_owned),
+                "requests": runtime.vm_resources.requests,
+                "scheduler_tokens": runtime.scheduler_tokens
+            })
+        }),
+        epochs: json!({"reload_checkpoint": model_after.reload_active()}),
+        tasks: json!([{
+            "state": format!("{:?}", model_after.task),
+            "execution": format!("{:?}", execution(model_after.task))
+        }]),
+        requests: json!({"owned": model_after.has_request()}),
+        completions: json!([]),
+        releases: json!([]),
+        heap: json!({"objects": 0}),
+        roots: json!([]),
+        trace: json!(
+            path.iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>()
         ),
-    )
-    .unwrap();
+        error_code: failure_code(runtime_after.is_none(), error),
+    };
+    let file = std::fs::File::create(artifact).unwrap();
+    write_model_failure_artifact(file, &failure).unwrap();
 }
 
 fn write_routing_failure(
     path: &[RealmV4RoutingEvent],
     event: RealmV4RoutingEvent,
-    model: RealmV4RoutingWorld,
-    runtime: Option<RealmV4RoutingRuntimeSnapshot>,
+    model_before: RealmV4RoutingWorld,
+    model_after: RealmV4RoutingWorld,
+    runtime_before: Option<RealmV4RoutingRuntimeSnapshot>,
+    runtime_after: Option<RealmV4RoutingRuntimeSnapshot>,
     error: &str,
 ) {
     let artifact = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -392,65 +419,114 @@ fn write_routing_failure(
     if let Some(parent) = artifact.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
-    let path = path
-        .iter()
-        .map(|event| format!("\"{event:?}\""))
-        .collect::<Vec<_>>()
-        .join(",");
-    let runtime_json = runtime.map_or_else(
-        || String::from("null"),
-        |value| {
-            format!(
-                "{{\"reload\":\"{:?}\",\"completion_a\":\"{:?}\",\"completion_b\":\"{:?}\",\"buffered\":{},\"replayed\":{},\"discarded_after_commit\":{},\"pending_completions\":{},\"request_reservations\":{}}}",
-                value.reload,
-                value.completion_a,
-                value.completion_b,
-                value.buffered,
-                value.replayed,
-                value.discarded_after_commit,
-                value.pending_completions,
-                value.request_reservations,
-            )
-        },
-    );
-    let (task_state, execution, requests, reload_buffer, terminal_records) = runtime.map_or_else(
-        || {
-            (
-                String::from("null"),
-                String::from("null"),
-                String::from("null"),
-                String::from("null"),
-                String::from("[]"),
-            )
-        },
-        |value| {
-            (
-                "\"dual-module-routing\"".into(),
-                "\"RealmRuntime\"".into(),
-                format!(
-                    "{{\"pending_completions\":{},\"reservations\":{}}}",
-                    value.pending_completions, value.request_reservations
-                ),
-                format!(
-                    "{{\"buffered\":{},\"replayed\":{},\"discarded_after_commit\":{}}}",
-                    value.buffered, value.replayed, value.discarded_after_commit
-                ),
-                format!(
-                    "[\"module_a={:?}\",\"module_b={:?}\"]",
-                    value.completion_a, value.completion_b
-                ),
-            )
-        },
-    );
-    std::fs::write(
-        artifact,
-        format!(
-            "{{\n  \"path\": [{path}],\n  \"event\": \"{event:?}\",\n  \"model\": {{\"reload\":\"{:?}\",\"completion_a\":\"{:?}\",\"completion_b\":\"{:?}\"}},\n  \"runtime\": {runtime_json},\n  \"task_state\": {task_state},\n  \"execution\": {execution},\n  \"scheduler\": {{}},\n  \"requests\": {requests},\n  \"reload_buffer\": {reload_buffer},\n  \"terminal_records\": {terminal_records},\n  \"error\": \"{}\"\n}}\n",
-            model.reload,
-            model.completion_a,
-            model.completion_b,
-            error.replace('\\', "\\\\").replace('"', "\\\"")
+    let last_runtime = runtime_after.or(runtime_before);
+    let failure = ModelFailureArtifact {
+        format_version: MODEL_FAILURE_ARTIFACT_VERSION,
+        commit_sha: current_commit_sha(),
+        model_config: json!({
+            "model": "realm-v4-routing",
+            "max_depth": 8,
+            "max_worlds": 256
+        }),
+        path: path.iter().map(|event| format!("{event:?}")).collect(),
+        failure_event: format!("{event:?}"),
+        model_before: routing_model_value(model_before),
+        model_after: routing_model_value(model_after),
+        runtime_before: runtime_before.map_or(Value::Null, routing_runtime_value),
+        runtime_after: runtime_after.map_or(Value::Null, routing_runtime_value),
+        ledger: last_runtime.map_or(Value::Null, |runtime| {
+            json!({
+                "pending_completions": runtime.pending_completions,
+                "request_reservations": runtime.request_reservations,
+                "buffered": runtime.buffered,
+                "replayed": runtime.replayed,
+                "discarded_after_commit": runtime.discarded_after_commit
+            })
+        }),
+        epochs: json!({"reload": format!("{:?}", model_after.reload)}),
+        tasks: json!([]),
+        requests: last_runtime.map_or(
+            Value::Null,
+            |runtime| json!({"reservations": runtime.request_reservations}),
         ),
-    )
-    .unwrap();
+        completions: json!({
+            "module_a": format!("{:?}", model_after.completion_a),
+            "module_b": format!("{:?}", model_after.completion_b),
+            "buffered": last_runtime.map_or(0, |runtime| runtime.buffered),
+            "replayed": last_runtime.map_or(0, |runtime| runtime.replayed)
+        }),
+        releases: json!([]),
+        heap: json!({"objects": 0}),
+        roots: json!([]),
+        trace: json!(
+            path.iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>()
+        ),
+        error_code: failure_code(runtime_after.is_none(), error),
+    };
+    let file = std::fs::File::create(artifact).unwrap();
+    write_model_failure_artifact(file, &failure).unwrap();
+}
+
+fn v4_model_value(model: RealmV4World) -> Value {
+    json!({
+        "task_state": format!("{:?}", model.task),
+        "scheduler_tokens": model.scheduler_tokens,
+        "request_owned": model.has_request(),
+        "continuation_owned": model.has_continuation(),
+        "reload_checkpoint": model.reload_active(),
+        "cancel_kind": format!("{:?}", model.cancel_kind()),
+        "user_defer": model.has_user_defer()
+    })
+}
+
+fn v4_runtime_value(runtime: RealmV4RuntimeSnapshot) -> Value {
+    json!({
+        "task_state": format!("{:?}", runtime.task_state),
+        "execution": format!("{:?}", runtime.execution),
+        "scheduler_tokens": runtime.scheduler_tokens,
+        "request_owned": runtime.request_owned,
+        "continuation_owned": runtime.continuation_owned,
+        "reload_checkpoint": runtime.reload_checkpoint,
+        "cancel_kind": format!("{:?}", runtime.cancel_kind),
+        "user_defer": runtime.user_defer,
+        "terminal_reason": format!("{:?}", runtime.terminal_reason),
+        "ledger": {
+            "task_slots": runtime.vm_resources.task_slots,
+            "continuations": usize::from(runtime.continuation_owned),
+            "requests": runtime.vm_resources.requests
+        }
+    })
+}
+
+fn routing_model_value(model: RealmV4RoutingWorld) -> Value {
+    json!({
+        "reload": format!("{:?}", model.reload),
+        "completion_a": format!("{:?}", model.completion_a),
+        "completion_b": format!("{:?}", model.completion_b)
+    })
+}
+
+fn routing_runtime_value(runtime: RealmV4RoutingRuntimeSnapshot) -> Value {
+    json!({
+        "reload": format!("{:?}", runtime.reload),
+        "completion_a": format!("{:?}", runtime.completion_a),
+        "completion_b": format!("{:?}", runtime.completion_b),
+        "buffered": runtime.buffered,
+        "replayed": runtime.replayed,
+        "discarded_after_commit": runtime.discarded_after_commit,
+        "pending_completions": runtime.pending_completions,
+        "request_reservations": runtime.request_reservations
+    })
+}
+
+fn failure_code(runtime_rejected: bool, error: &str) -> String {
+    if runtime_rejected {
+        "NEXA_MODEL_RUNTIME_REJECTED".into()
+    } else if error.contains("ledger") || error.contains("resource") {
+        "NEXA_MODEL_LEDGER_MISMATCH".into()
+    } else {
+        "NEXA_MODEL_STATE_MISMATCH".into()
+    }
 }

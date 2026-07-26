@@ -61,6 +61,7 @@ jobs:
           name: failure-diagnostics-${{ matrix.os }}
           if-no-files-found: ignore
           path: |
-            target/model-artifacts/shortest-failure.txt
+            target/model-artifacts/shortest-failure.json
+            target/model-artifacts/model-check-summary.json
             target/model-artifacts/realm-v4-failure.json
             target/runtime-traces/
