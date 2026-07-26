@@ -1785,6 +1785,7 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::Yield
         | Instruction::LoadString { .. }
         | Instruction::StringConcat { .. }
+        | Instruction::EnumNew { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }

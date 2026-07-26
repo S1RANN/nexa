@@ -910,6 +910,7 @@ fn verify_safepoints(
                     | Instruction::Yield
                     | Instruction::LoadString { .. }
                     | Instruction::StringConcat { .. }
+                    | Instruction::EnumNew { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }

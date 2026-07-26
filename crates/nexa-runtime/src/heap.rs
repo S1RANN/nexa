@@ -269,6 +269,27 @@ impl Heap {
         }
     }
 
+    pub fn enum_parts(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<(StableId, StableId, u32, Option<RuntimeValue>), HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(HeapError::InvalidReference(GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            }));
+        };
+        match self.resolve(reference)? {
+            Object::Enum {
+                type_id: actual,
+                variant,
+                tag,
+                payload,
+            } if *actual == type_id => Ok((*actual, *variant, *tag, *payload)),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
     pub fn enum_payload(
         &self,
         value: RuntimeValue,

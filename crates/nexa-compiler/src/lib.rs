@@ -148,6 +148,7 @@ pub struct AstField {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstVariant {
     pub name: String,
+    pub payload: Option<AstType>,
     pub span: SourceSpan,
 }
 
@@ -285,7 +286,8 @@ pub enum AstExpression {
     },
     Await(Box<Self>),
     Constructor {
-        variant: BuiltinVariant,
+        type_name: Option<String>,
+        variant: String,
         payload: Option<Box<Self>>,
     },
     Match {
@@ -321,25 +323,6 @@ impl AstExpression {
         match self {
             Self::Spanned { span, .. } => *span,
             _ => SourceSpan::new(FileId(0), 0, 0),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BuiltinVariant {
-    None,
-    Some,
-    Ok,
-    Err,
-}
-
-impl BuiltinVariant {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::None => "None",
-            Self::Some => "Some",
-            Self::Ok => "Ok",
-            Self::Err => "Err",
         }
     }
 }
@@ -477,6 +460,17 @@ fn state_handle_method(function: &str) -> Option<(&str, StateHandleMethod)> {
         _ => return None,
     };
     Some((receiver, method))
+}
+
+fn enum_constructor_name(name: &str) -> Option<(&str, &str)> {
+    let (type_name, variant) = name.split_once('.')?;
+    if type_name.contains('.')
+        || !type_name.chars().next().is_some_and(char::is_uppercase)
+        || variant.is_empty()
+    {
+        return None;
+    }
+    Some((type_name, variant))
 }
 
 #[derive(Clone, Debug)]
@@ -853,8 +847,16 @@ impl Parser<'_> {
             let member_start = self.current_start();
             let member = self.ident()?;
             if kind == AstTypeKind::Enum {
+                let payload = if self.take(&TokenKind::LParen) {
+                    let payload = self.ty()?;
+                    self.expect(&TokenKind::RParen, ")")?;
+                    Some(payload)
+                } else {
+                    None
+                };
                 variants.push(AstVariant {
                     name: member,
+                    payload,
                     span: self.span_from(member_start),
                 });
                 self.take(&TokenKind::Comma);
@@ -1063,7 +1065,8 @@ impl Parser<'_> {
                     )?)
                 } else if name == "None" && type_arguments.is_empty() {
                     AstExpression::Constructor {
-                        variant: BuiltinVariant::None,
+                        type_name: None,
+                        variant: "None".into(),
                         payload: None,
                     }
                 } else if matches!(name.as_str(), "Some" | "Ok" | "Err")
@@ -1073,13 +1076,25 @@ impl Parser<'_> {
                     let payload = self.expression(0)?;
                     self.expect(&TokenKind::RParen, ")")?;
                     AstExpression::Constructor {
-                        variant: match name.as_str() {
-                            "Some" => BuiltinVariant::Some,
-                            "Ok" => BuiltinVariant::Ok,
-                            "Err" => BuiltinVariant::Err,
-                            _ => unreachable!(),
-                        },
+                        type_name: None,
+                        variant: name,
                         payload: Some(Box::new(payload)),
+                    }
+                } else if let Some((type_name, variant)) = enum_constructor_name(&name) {
+                    if !type_arguments.is_empty() {
+                        return Err(self.unexpected("non-generic enum constructor"));
+                    }
+                    let payload = if self.take(&TokenKind::LParen) {
+                        let payload = self.expression(0)?;
+                        self.expect(&TokenKind::RParen, ")")?;
+                        Some(Box::new(payload))
+                    } else {
+                        None
+                    };
+                    AstExpression::Constructor {
+                        type_name: Some(type_name.to_owned()),
+                        variant: variant.to_owned(),
+                        payload,
                     }
                 } else if self.take(&TokenKind::LParen) {
                     if !type_arguments.is_empty() {
@@ -1568,6 +1583,11 @@ fn collect_builtin_enum_types(ast: &AstModule, enum_types: &mut Vec<EnumType>) {
         for field in &declaration.fields {
             add_type(&field.ty);
         }
+        for variant in &declaration.variants {
+            if let Some(payload) = &variant.payload {
+                add_type(payload);
+            }
+        }
     }
     for function in &ast.functions {
         for parameter in &function.parameters {
@@ -1649,6 +1669,11 @@ fn collect_state_handle_targets(ast: &AstModule) -> BTreeMap<StableId, ValueType
     for declaration in &ast.types {
         for field in &declaration.fields {
             collect(&field.ty, &mut targets);
+        }
+        for variant in &declaration.variants {
+            if let Some(payload) = &variant.payload {
+                collect(payload, &mut targets);
+            }
         }
     }
     for function in &ast.functions {
@@ -1733,7 +1758,7 @@ fn resolve_and_typecheck_with_hosts(
                 .map(|(tag, variant)| EnumVariant {
                     stable_id: StableId::from_parts(&[&declaration.name, "::", &variant.name]),
                     tag: u32::try_from(tag).expect("enum variant count is parser bounded"),
-                    payload_type: None,
+                    payload_type: variant.payload.as_ref().map(lower_type),
                 })
                 .collect(),
         })
@@ -1849,6 +1874,18 @@ fn resolve_and_typecheck_with_hosts(
     for declaration in &ast.types {
         for field in &declaration.fields {
             validate_type(&field.ty, &known_types)?;
+        }
+        let mut variants = BTreeSet::new();
+        for variant in &declaration.variants {
+            if !variants.insert(&variant.name) {
+                return Err(CompileError::DuplicateName(format!(
+                    "{}.{}",
+                    declaration.name, variant.name
+                )));
+            }
+            if let Some(payload) = &variant.payload {
+                validate_type(payload, &known_types)?;
+            }
         }
     }
     let mut signatures = host_functions
@@ -2134,9 +2171,12 @@ fn resolve_expression(
                 .iter()
                 .rev()
                 .find_map(|scope| scope.get(name))
-                .cloned()
-                .ok_or_else(|| CompileError::UnknownName(name.clone()))?;
-            *name = resolved;
+                .cloned();
+            if let Some(resolved) = resolved {
+                *name = resolved;
+            } else if !name.chars().next().is_some_and(char::is_uppercase) {
+                return Err(CompileError::UnknownName(name.clone()));
+            }
         }
         AstExpression::Binary { lhs, rhs, .. } => {
             resolve_expression(lhs, scopes, next_local)?;
@@ -2490,10 +2530,20 @@ fn expression_type(
         }
         AstExpression::String(_) => ValueType::String,
         AstExpression::Bool(_) => ValueType::Bool,
-        AstExpression::Name(name) => locals
-            .get(name)
-            .map(|(_, ty)| *ty)
-            .ok_or_else(|| CompileError::UnknownName(name.clone()))?,
+        AstExpression::Name(name) => {
+            if let Some((_, ty)) = locals.get(name) {
+                *ty
+            } else if let Some(ValueType::Named(type_id)) = expected
+                && context
+                    .enum_variants
+                    .get(&(type_id, name.clone()))
+                    .is_some_and(|variant| variant.payload_type.is_none())
+            {
+                ValueType::Named(type_id)
+            } else {
+                return Err(CompileError::UnknownName(name.clone()));
+            }
+        }
         AstExpression::Binary { op, lhs, rhs } if op.kind == BinaryOp::Equal => {
             let operand_type = expression_type(lhs, locals, context, next_register, None)?;
             if operand_type != ValueType::String
@@ -2553,6 +2603,20 @@ fn expression_type(
             function,
             arguments,
         } => {
+            if let Some(ValueType::Named(type_id)) = expected
+                && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
+            {
+                let [payload] = arguments.as_slice() else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let payload_type = variant.payload_type.ok_or(CompileError::TypeMismatch)?;
+                if expression_type(payload, locals, context, next_register, Some(payload_type))?
+                    != payload_type
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(ValueType::Named(type_id));
+            }
             if let Some((receiver, method)) = string_method(function)
                 && locals.get(receiver).map(|(_, ty)| *ty) == Some(ValueType::String)
             {
@@ -2700,13 +2764,27 @@ fn expression_type(
         AstExpression::Await(expression) => {
             expression_type(expression, locals, context, next_register, expected)?
         }
-        AstExpression::Constructor { variant, payload } => {
-            let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)? else {
-                return Err(CompileError::TypeMismatch);
+        AstExpression::Constructor {
+            type_name,
+            variant,
+            payload,
+        } => {
+            let type_id = if let Some(type_name) = type_name {
+                let type_id = StableId::from_name(type_name);
+                if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                type_id
+            } else {
+                let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                type_id
             };
             let metadata = context
                 .enum_variants
-                .get(&(type_id, variant.name().to_owned()))
+                .get(&(type_id, variant.clone()))
                 .ok_or(CompileError::TypeMismatch)?;
             match (payload, metadata.payload_type) {
                 (Some(payload), Some(payload_type)) => {
@@ -3725,14 +3803,24 @@ fn emit_expression(
             value: *value,
         }),
         AstExpression::Name(name) => {
-            let source = locals
-                .get(name)
-                .ok_or_else(|| CompileError::UnknownName(name.clone()))?
-                .0;
-            code.push(Instruction::Move {
-                dst: destination,
-                source,
-            });
+            if let Some((source, _)) = locals.get(name) {
+                code.push(Instruction::Move {
+                    dst: destination,
+                    source: *source,
+                });
+            } else if let Some(ValueType::Named(type_id)) = expected
+                && let Some(variant) = context.enum_variants.get(&(type_id, name.clone()))
+                && variant.payload_type.is_none()
+            {
+                code.push(Instruction::EnumNew {
+                    type_id,
+                    variant: variant.stable_id,
+                    payload: None,
+                    dst: destination,
+                });
+            } else {
+                return Err(CompileError::UnknownName(name.clone()));
+            }
         }
         AstExpression::Binary { op, lhs, rhs } => {
             let numeric_type =
@@ -3876,6 +3964,33 @@ fn emit_expression(
             function,
             arguments,
         } => {
+            if let Some(ValueType::Named(type_id)) = expected
+                && let Some(variant) = context.enum_variants.get(&(type_id, function.clone()))
+            {
+                let [payload] = arguments.as_slice() else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let payload_type = variant.payload_type.ok_or(CompileError::TypeMismatch)?;
+                let payload_register = destination
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    payload,
+                    payload_register,
+                    Some(payload_type),
+                    locals,
+                    context,
+                    code,
+                )?;
+                code.push(Instruction::EnumNew {
+                    type_id,
+                    variant: variant.stable_id,
+                    payload: Some(payload_register),
+                    dst: destination,
+                });
+                code.replace_span(previous_span);
+                return Ok(());
+            }
             let args_base = destination
                 .checked_add(1)
                 .ok_or(CompileError::TooManyRegisters)?;
@@ -3929,13 +4044,27 @@ fn emit_expression(
             emit_expression(expression, destination, expected, locals, context, code)?;
             code.map_next(expression_span);
         }
-        AstExpression::Constructor { variant, payload } => {
-            let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)? else {
-                return Err(CompileError::TypeMismatch);
+        AstExpression::Constructor {
+            type_name,
+            variant,
+            payload,
+        } => {
+            let type_id = if let Some(type_name) = type_name {
+                let type_id = StableId::from_name(type_name);
+                if expected.is_some_and(|expected| expected != ValueType::Named(type_id)) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                type_id
+            } else {
+                let ValueType::Named(type_id) = expected.ok_or(CompileError::CannotInferType)?
+                else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                type_id
             };
             let metadata = context
                 .enum_variants
-                .get(&(type_id, variant.name().to_owned()))
+                .get(&(type_id, variant.clone()))
                 .ok_or(CompileError::TypeMismatch)?;
             let payload_register = if let Some(payload) = payload {
                 let register = destination
@@ -4178,12 +4307,29 @@ fn emitted_expression_type(
             }
         }
         AstExpression::Bool(_) => Ok(ValueType::Bool),
-        AstExpression::Name(name) => locals
-            .get(name)
-            .map(|(_, ty)| *ty)
-            .ok_or_else(|| CompileError::UnknownName(name.clone())),
+        AstExpression::Name(name) => locals.get(name).map_or_else(
+            || {
+                let Some(ValueType::Named(type_id)) = expected else {
+                    return Err(CompileError::UnknownName(name.clone()));
+                };
+                context
+                    .enum_variants
+                    .get(&(type_id, name.clone()))
+                    .filter(|variant| variant.payload_type.is_none())
+                    .map(|_| ValueType::Named(type_id))
+                    .ok_or_else(|| CompileError::UnknownName(name.clone()))
+            },
+            |(_, ty)| Ok(*ty),
+        ),
         AstExpression::Call { function, .. } => {
-            if let Some((receiver, method)) = string_method(function)
+            if let Some(ValueType::Named(type_id)) = expected
+                && context
+                    .enum_variants
+                    .get(&(type_id, function.clone()))
+                    .is_some()
+            {
+                Ok(ValueType::Named(type_id))
+            } else if let Some((receiver, method)) = string_method(function)
                 && locals.get(receiver).map(|(_, ty)| *ty) == Some(ValueType::String)
             {
                 Ok(match method {
@@ -4235,9 +4381,11 @@ fn emitted_expression_type(
         AstExpression::Await(expression) => {
             emitted_expression_type(expression, expected, locals, context)
         }
-        AstExpression::Constructor { .. } | AstExpression::Match { .. } => {
-            expected.ok_or(CompileError::CannotInferType)
-        }
+        AstExpression::Constructor { type_name, .. } => type_name.as_ref().map_or_else(
+            || expected.ok_or(CompileError::CannotInferType),
+            |type_name| Ok(ValueType::Named(StableId::from_name(type_name))),
+        ),
+        AstExpression::Match { .. } => expected.ok_or(CompileError::CannotInferType),
         AstExpression::Try(expression) => {
             let ValueType::Named(type_id) =
                 emitted_expression_type(expression, None, locals, context)?
@@ -4586,6 +4734,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                 Instruction::Safepoint
                     | Instruction::LoadString { .. }
                     | Instruction::StringConcat { .. }
+                    | Instruction::EnumNew { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -4647,8 +4796,9 @@ pub fn compile_with_interface(
                 variants: enumeration
                     .variants
                     .iter()
-                    .map(|name| AstVariant {
-                        name: name.clone(),
+                    .map(|variant| AstVariant {
+                        name: variant.name.clone(),
+                        payload: variant.payload.as_ref().map(ast_type_from_idl),
                         span: SourceSpan::new(FileId(0), 0, 0),
                     })
                     .collect(),
@@ -4688,10 +4838,9 @@ pub fn compile_with_interface(
                     .iter()
                     .find(|enumeration| enumeration.name == *name)
                     .and_then(|enumeration| {
-                        enumeration
-                            .variants
-                            .iter()
-                            .position(|candidate| candidate == variant)
+                        enumeration.variants.iter().position(|candidate| {
+                            candidate.name == variant && candidate.payload.is_none()
+                        })
                     })
                     .and_then(|tag| u32::try_from(tag).ok()),
                 _ => None,
@@ -4807,6 +4956,30 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         ),
         TypeRef::String => ValueType::String,
         TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
+    }
+}
+
+fn ast_type_from_idl(ty: &TypeRef) -> AstType {
+    match ty {
+        TypeRef::I32 => AstType::I32,
+        TypeRef::I64 => AstType::I64,
+        TypeRef::F32 => AstType::F32,
+        TypeRef::F64 => AstType::F64,
+        TypeRef::Bool => AstType::Bool,
+        TypeRef::Rune => AstType::Rune,
+        TypeRef::String => AstType::String,
+        TypeRef::HostRequest(_) => AstType::Named("HostRequest".into()),
+        TypeRef::ResourceToken(_) => AstType::Named("ResourceToken".into()),
+        TypeRef::Snapshot(_) => AstType::Named("Snapshot".into()),
+        TypeRef::Option(inner) => AstType::BuiltinGeneric {
+            name: "Option".into(),
+            arguments: vec![ast_type_from_idl(inner)],
+        },
+        TypeRef::Result(success, error) => AstType::BuiltinGeneric {
+            name: "Result".into(),
+            arguments: vec![ast_type_from_idl(success), ast_type_from_idl(error)],
+        },
+        TypeRef::Named(name) => AstType::Named(name.clone()),
     }
 }
 
@@ -5060,6 +5233,158 @@ migration fn migrate() -> bool {
                 ..
             }
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn user_enum_payloads_construct_match_bind_and_nest_builtin_enums() {
+        let source = "enum Failure { Rejected }
+             enum Event {
+                 Idle,
+                 Damage(i32),
+                 Deferred(Option<Result<i32, Failure>>),
+             }
+             fn damage(value: i32) -> Event {
+                 return Damage(value);
+             }
+             fn read(value: Event) -> i32 {
+                 return match value {
+                     Idle => 0,
+                     Damage(amount) => amount,
+                     Deferred(pending) => match pending {
+                         None => 1,
+                         Some(result) => match result {
+                             Ok(amount) => amount,
+                             Err(error) => 2,
+                         },
+                     },
+                 };
+             }
+             fn nested() -> Event {
+                 let result: Result<i32, Failure> = Ok(9);
+                 let pending: Option<Result<i32, Failure>> = Some(result);
+                 return Deferred(pending);
+             }
+             fn idle() -> Event {
+                 return Idle;
+             }";
+        let module = compile(source).unwrap();
+        let event = module
+            .module()
+            .enum_types
+            .iter()
+            .find(|enum_type| enum_type.type_id == StableId::from_name("Event"))
+            .unwrap();
+        assert_eq!(
+            event
+                .variants
+                .iter()
+                .map(|variant| variant.payload_type)
+                .collect::<Vec<_>>(),
+            [
+                None,
+                Some(nexa_bytecode::ValueType::I32),
+                Some(nexa_bytecode::ValueType::Named(
+                    nexa_bytecode::option_type(nexa_bytecode::ValueType::Named(
+                        nexa_bytecode::result_type(
+                            nexa_bytecode::ValueType::I32,
+                            nexa_bytecode::ValueType::Named(StableId::from_name("Failure")),
+                        )
+                        .type_id,
+                    ))
+                    .type_id,
+                )),
+            ]
+        );
+
+        let mut heap = nexa_runtime::Heap::new(16);
+        let InterpreterOutcome::Returned {
+            value: Some(damage),
+            ..
+        } = CheckedInterpreter::run_with_heap(&module, 0, &[RuntimeValue::I32(37)], 100, &mut heap)
+            .unwrap()
+        else {
+            panic!("payload enum constructor must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[damage], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(37)),
+                ..
+            }
+        ));
+        let InterpreterOutcome::Returned {
+            value: Some(nested),
+            ..
+        } = CheckedInterpreter::run_with_heap(&module, 2, &[], 100, &mut heap).unwrap()
+        else {
+            panic!("nested enum constructor must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[nested], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(9)),
+                ..
+            }
+        ));
+        let InterpreterOutcome::Returned {
+            value: Some(idle), ..
+        } = CheckedInterpreter::run_with_heap(&module, 3, &[], 100, &mut heap).unwrap()
+        else {
+            panic!("unit enum constructor must return");
+        };
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[idle], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(0)),
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            compile(
+                "enum Event { Idle, Damage(i32) }
+                 fn bad(value: Event) -> i32 {
+                     return match value { Idle => 0 };
+                 }"
+            ),
+            Err(CompileError::NonExhaustiveMatch)
+        ));
+        assert!(matches!(
+            compile(
+                "enum Event { Idle, Damage(i32) }
+                 fn bad() -> Event { return Event.Damage(true); }"
+            ),
+            Err(CompileError::TypeMismatch)
+        ));
+
+        let idl = nexa_idl::parse(
+            "interface Engine {
+                 enum Event { Idle, Damage(i32) }
+                 sync fn echo(value: Event) -> Event;
+             }",
+        )
+        .unwrap();
+        let host_module = super::compile_with_interface(
+            "module game;
+             import engine;
+             fn echo_damage(value: i32) -> Event {
+                 return engine.echo(Event.Damage(value));
+             }",
+            &idl,
+            StableId::from_name("schema"),
+        )
+        .unwrap();
+        let event = host_module
+            .module()
+            .enum_types
+            .iter()
+            .find(|enum_type| enum_type.type_id == StableId::from_name("Event"))
+            .unwrap();
+        assert_eq!(
+            event.variants[1].payload_type,
+            Some(nexa_bytecode::ValueType::I32)
+        );
     }
 
     #[test]

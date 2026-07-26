@@ -150,6 +150,7 @@ struct RealmHostBridge<'a> {
     module_id: u32,
     epoch: u64,
     imports: &'a [HostImport],
+    enum_types: &'a [nexa_bytecode::EnumType],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -169,7 +170,7 @@ impl InterpreterHost for RealmHostBridge<'_> {
             .context(self.task, self.module_id, self.epoch);
         match self.registry.call(import, &mut context, values)? {
             HostCallOutcome::Immediate(value) => Ok(InterpreterHostOutcome::Immediate(
-                host_to_runtime_value(value, metadata.result, heap)?,
+                host_to_runtime_value(value, metadata.result, heap, self.enum_types)?,
             )),
             HostCallOutcome::Pending(request) => {
                 if !self.resources.owns_request(self.task, request) {
@@ -205,6 +206,88 @@ fn host_to_runtime_value(
     value: HostValue,
     expected: Option<ValueType>,
     heap: Option<&mut Heap>,
+    enum_types: &[nexa_bytecode::EnumType],
+) -> Result<RuntimeValue, HostTrap> {
+    let slots = validate_host_value(&value, expected, heap.as_deref(), enum_types)?;
+    if slots == 0 {
+        return commit_host_value(value, expected, None, None, enum_types);
+    }
+    let heap = heap.ok_or(HostTrap::Type)?;
+    let mut reservation = heap.preflight(slots).map_err(|_| HostTrap::Type)?;
+    commit_host_value(
+        value,
+        expected,
+        Some(heap),
+        Some(&mut reservation),
+        enum_types,
+    )
+}
+
+fn validate_host_value(
+    value: &HostValue,
+    expected: Option<ValueType>,
+    heap: Option<&Heap>,
+    enum_types: &[nexa_bytecode::EnumType],
+) -> Result<usize, HostTrap> {
+    match (value, expected) {
+        (HostValue::I32(_), Some(ValueType::I32))
+        | (HostValue::I64(_), Some(ValueType::I64))
+        | (HostValue::F32(_), Some(ValueType::F32))
+        | (HostValue::F64(_), Some(ValueType::F64))
+        | (HostValue::Bool(_), Some(ValueType::Bool))
+        | (HostValue::Rune(_), Some(ValueType::Rune))
+        | (
+            HostValue::Request(_)
+            | HostValue::Token(_)
+            | HostValue::Snapshot(_)
+            | HostValue::Opaque(_),
+            Some(ValueType::Named(_)),
+        )
+        | (HostValue::Unit, None) => Ok(0),
+        (HostValue::String(value), Some(ValueType::String)) => {
+            heap.ok_or(HostTrap::Type)?
+                .validate_string_length(value.len())
+                .map_err(|_| HostTrap::Type)?;
+            Ok(1)
+        }
+        (
+            HostValue::Enum {
+                type_id,
+                variant,
+                tag,
+                payload,
+            },
+            Some(ValueType::Named(expected_type)),
+        ) if *type_id == expected_type => {
+            let metadata = enum_types
+                .iter()
+                .find(|enum_type| enum_type.type_id == expected_type)
+                .and_then(|enum_type| {
+                    enum_type
+                        .variants
+                        .iter()
+                        .find(|candidate| candidate.stable_id == *variant && candidate.tag == *tag)
+                })
+                .ok_or(HostTrap::Type)?;
+            let payload_slots = match (payload.as_deref(), metadata.payload_type) {
+                (Some(payload), Some(payload_type)) => {
+                    validate_host_value(payload, Some(payload_type), heap, enum_types)?
+                }
+                (None, None) => 0,
+                _ => return Err(HostTrap::Type),
+            };
+            payload_slots.checked_add(1).ok_or(HostTrap::Type)
+        }
+        _ => Err(HostTrap::Type),
+    }
+}
+
+fn commit_host_value(
+    value: HostValue,
+    expected: Option<ValueType>,
+    mut heap: Option<&mut Heap>,
+    mut reservation: Option<&mut HeapReservation>,
+    enum_types: &[nexa_bytecode::EnumType],
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
@@ -214,10 +297,55 @@ fn host_to_runtime_value(
         (HostValue::Bool(value), Some(ValueType::Bool)) => Ok(RuntimeValue::Bool(value)),
         (HostValue::Rune(value), Some(ValueType::Rune)) => Ok(RuntimeValue::Rune(value.into())),
         (HostValue::String(value), Some(ValueType::String)) => {
-            let heap = heap.ok_or(HostTrap::Type)?;
-            let reference = heap.allocate_string(&value).map_err(|_| HostTrap::Type)?;
+            let heap = heap.as_deref_mut().ok_or(HostTrap::Type)?;
+            let reference = heap.commit(
+                reservation.as_deref_mut().ok_or(HostTrap::Type)?,
+                Object::String(value),
+            );
             let hash = heap.string_hash(reference).map_err(|_| HostTrap::Type)?;
             Ok(RuntimeValue::String { reference, hash })
+        }
+        (
+            HostValue::Enum {
+                type_id,
+                variant,
+                tag,
+                payload,
+            },
+            Some(ValueType::Named(expected_type)),
+        ) if type_id == expected_type => {
+            let metadata = enum_types
+                .iter()
+                .find(|enum_type| enum_type.type_id == expected_type)
+                .and_then(|enum_type| {
+                    enum_type
+                        .variants
+                        .iter()
+                        .find(|candidate| candidate.stable_id == variant && candidate.tag == tag)
+                })
+                .ok_or(HostTrap::Type)?;
+            let payload = match (payload, metadata.payload_type) {
+                (Some(payload), Some(payload_type)) => Some(commit_host_value(
+                    *payload,
+                    Some(payload_type),
+                    heap.as_deref_mut(),
+                    reservation.as_deref_mut(),
+                    enum_types,
+                )?),
+                (None, None) => None,
+                _ => return Err(HostTrap::Type),
+            };
+            let heap = heap.ok_or(HostTrap::Type)?;
+            let reference = heap.commit(
+                reservation.ok_or(HostTrap::Type)?,
+                Object::Enum {
+                    type_id,
+                    variant,
+                    tag,
+                    payload,
+                },
+            );
+            Ok(RuntimeValue::NamedRef { reference, type_id })
         }
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
@@ -319,14 +447,129 @@ enum PlannedResultPayload {
         type_id: StableId,
         variant: StableId,
         tag: u32,
+        payload: Option<Box<PlannedResultPayload>>,
     },
+}
+
+fn plan_host_payload(
+    payload: &HostPayload,
+    expected: ValueType,
+    enum_types: &[nexa_bytecode::EnumType],
+) -> Result<PlannedResultPayload, InterpreterError> {
+    if let HostPayload::String(value) = payload
+        && expected == ValueType::String
+    {
+        return Ok(PlannedResultPayload::String(value.clone()));
+    }
+    if let (
+        HostPayload::Enum {
+            type_id,
+            variant,
+            tag,
+            payload,
+        },
+        ValueType::Named(expected_type),
+    ) = (payload, expected)
+        && *type_id == expected_type
+    {
+        let metadata = enum_types
+            .iter()
+            .find(|enum_type| enum_type.type_id == expected_type)
+            .and_then(|enum_type| {
+                enum_type
+                    .variants
+                    .iter()
+                    .find(|candidate| candidate.stable_id == *variant && candidate.tag == *tag)
+            })
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let payload = match (payload.as_deref(), metadata.payload_type) {
+            (Some(payload), Some(payload_type)) => Some(Box::new(plan_host_payload(
+                payload,
+                payload_type,
+                enum_types,
+            )?)),
+            (None, None) => None,
+            _ => return Err(InterpreterError::TypeMismatch),
+        };
+        return Ok(PlannedResultPayload::Enum {
+            type_id: *type_id,
+            variant: *variant,
+            tag: *tag,
+            payload,
+        });
+    }
+    Ok(PlannedResultPayload::Value(completion_to_runtime(
+        payload.clone(),
+        Some(expected),
+    )?))
+}
+
+fn planned_payload_slots(payload: &PlannedResultPayload) -> Result<usize, RealmError> {
+    match payload {
+        PlannedResultPayload::Value(_) => Ok(0),
+        PlannedResultPayload::String(_) => Ok(1),
+        PlannedResultPayload::Enum { payload, .. } => payload.as_deref().map_or(Ok(1), |payload| {
+            planned_payload_slots(payload)?
+                .checked_add(1)
+                .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
+        }),
+    }
+}
+
+fn validate_planned_payload(heap: &Heap, payload: &PlannedResultPayload) -> Result<(), RealmError> {
+    match payload {
+        PlannedResultPayload::String(value) => {
+            heap.validate_string_length(value.len())?;
+        }
+        PlannedResultPayload::Enum {
+            payload: Some(payload),
+            ..
+        } => validate_planned_payload(heap, payload)?,
+        PlannedResultPayload::Value(_) | PlannedResultPayload::Enum { payload: None, .. } => {}
+    }
+    Ok(())
+}
+
+fn commit_planned_payload(
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    payload: PlannedResultPayload,
+) -> Result<RuntimeValue, RealmError> {
+    match payload {
+        PlannedResultPayload::Value(value) => Ok(value),
+        PlannedResultPayload::String(value) => {
+            let reference = heap.commit(reservation, Object::String(value));
+            let hash = heap.string_hash(reference)?;
+            Ok(RuntimeValue::String { reference, hash })
+        }
+        PlannedResultPayload::Enum {
+            type_id,
+            variant,
+            tag,
+            payload,
+        } => {
+            let payload = payload
+                .map(|payload| commit_planned_payload(heap, reservation, *payload))
+                .transpose()?;
+            let reference = heap.commit(
+                reservation,
+                Object::Enum {
+                    type_id,
+                    variant,
+                    tag,
+                    payload,
+                },
+            );
+            Ok(RuntimeValue::NamedRef { reference, type_id })
+        }
+    }
 }
 
 #[derive(Debug)]
 enum ResultWritebackAction {
     ResumeDirect(RuntimeValue),
-    ResumeDirectString {
-        value: String,
+    ResumeDirectPlanned {
+        payload: PlannedResultPayload,
         heap: HeapReservation,
     },
     ResumeAsync {
@@ -1334,6 +1577,7 @@ impl RealmRuntime {
                 module_id: snapshot.module_id,
                 epoch: snapshot.module_epoch,
                 imports: &module.verified.module().host_imports,
+                enum_types: &module.verified.module().enum_types,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
                 &module.verified,
@@ -1925,29 +2169,33 @@ impl RealmRuntime {
         let action = match result {
             HostCompletionResult::Success(payload) => {
                 if let Some(result) = async_result {
-                    let payload = match (payload, result.success) {
-                        (HostPayload::String(value), ValueType::String) => {
-                            PlannedResultPayload::String(value.clone())
-                        }
-                        _ => PlannedResultPayload::Value(completion_to_runtime(
-                            payload.clone(),
-                            Some(result.success),
-                        )?),
+                    let payload = {
+                        let enum_types =
+                            &self.module_for_task(snapshot)?.verified.module().enum_types;
+                        plan_host_payload(payload, result.success, enum_types)?
                     };
                     self.preflight_async_result(result, true, payload)?
-                } else if let (HostPayload::String(value), Some(ValueType::String)) =
-                    (payload, expected_type)
-                {
-                    self.heap.validate_string_length(value.len())?;
-                    ResultWritebackAction::ResumeDirectString {
-                        value: value.clone(),
-                        heap: self.heap.preflight(1)?,
+                } else if let Some(expected_type) = expected_type {
+                    let payload = {
+                        let enum_types =
+                            &self.module_for_task(snapshot)?.verified.module().enum_types;
+                        plan_host_payload(payload, expected_type, enum_types)?
+                    };
+                    validate_planned_payload(&self.heap, &payload)?;
+                    let slots = planned_payload_slots(&payload)?;
+                    if slots == 0 {
+                        let PlannedResultPayload::Value(value) = payload else {
+                            unreachable!("zero-slot planned payload is a runtime value");
+                        };
+                        ResultWritebackAction::ResumeDirect(value)
+                    } else {
+                        ResultWritebackAction::ResumeDirectPlanned {
+                            payload,
+                            heap: self.heap.preflight(slots)?,
+                        }
                     }
                 } else {
-                    ResultWritebackAction::ResumeDirect(completion_to_runtime(
-                        payload.clone(),
-                        expected_type,
-                    )?)
+                    ResultWritebackAction::ResumeDirect(RuntimeValue::Unit)
                 }
             }
             HostCompletionResult::Error(error) => match async_result {
@@ -2023,6 +2271,7 @@ impl RealmRuntime {
                     type_id,
                     variant: variant.stable_id,
                     tag: variant.tag,
+                    payload: None,
                 }
             }
             ValueType::Bool | ValueType::String | ValueType::Ref => {
@@ -2040,13 +2289,10 @@ impl RealmRuntime {
         success: bool,
         payload: PlannedResultPayload,
     ) -> Result<ResultWritebackAction, RealmError> {
-        if let PlannedResultPayload::String(value) = &payload {
-            self.heap.validate_string_length(value.len())?;
-        }
-        let slots = 1 + usize::from(matches!(
-            &payload,
-            PlannedResultPayload::Enum { .. } | PlannedResultPayload::String(_)
-        ));
+        validate_planned_payload(&self.heap, &payload)?;
+        let slots = planned_payload_slots(&payload)?
+            .checked_add(1)
+            .ok_or(RealmError::Heap(HeapError::CapacityExhausted))?;
         let heap = self.heap.preflight(slots)?;
         Ok(ResultWritebackAction::ResumeAsync {
             result,
@@ -2065,10 +2311,8 @@ impl RealmRuntime {
     ) -> Result<(), RealmError> {
         let value = match preflight.action {
             ResultWritebackAction::ResumeDirect(value) => value,
-            ResultWritebackAction::ResumeDirectString { value, mut heap } => {
-                let reference = self.heap.commit(&mut heap, Object::String(value));
-                let hash = self.heap.string_hash(reference)?;
-                RuntimeValue::String { reference, hash }
+            ResultWritebackAction::ResumeDirectPlanned { payload, mut heap } => {
+                commit_planned_payload(&mut self.heap, &mut heap, payload)?
             }
             ResultWritebackAction::ResumeAsync {
                 result,
@@ -2076,30 +2320,7 @@ impl RealmRuntime {
                 payload,
                 mut heap,
             } => {
-                let payload = match payload {
-                    PlannedResultPayload::Value(value) => value,
-                    PlannedResultPayload::String(value) => {
-                        let reference = self.heap.commit(&mut heap, Object::String(value));
-                        let hash = self.heap.string_hash(reference)?;
-                        RuntimeValue::String { reference, hash }
-                    }
-                    PlannedResultPayload::Enum {
-                        type_id,
-                        variant,
-                        tag,
-                    } => {
-                        let reference = self.heap.commit(
-                            &mut heap,
-                            Object::Enum {
-                                type_id,
-                                variant,
-                                tag,
-                                payload: None,
-                            },
-                        );
-                        RuntimeValue::NamedRef { reference, type_id }
-                    }
-                };
+                let payload = commit_planned_payload(&mut self.heap, &mut heap, payload)?;
                 let (variant, tag) = if success {
                     (StableId::from_parts(&["Result", "::Ok"]), 0)
                 } else {
@@ -2664,9 +2885,9 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
-        Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-        ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema, StateType,
-        ValueType,
+        EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
+        Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema,
+        StateType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -2689,6 +2910,7 @@ mod tests {
             HostValue::String("host-result".into()),
             Some(ValueType::String),
             Some(&mut heap),
+            &[],
         )
         .unwrap();
         let RuntimeValue::String { reference, .. } = runtime else {
@@ -2697,6 +2919,75 @@ mod tests {
         assert_eq!(heap.string(reference), Ok("host-result"));
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
         assert_eq!(args.get(0), Ok(&HostValue::String("host-result".into())));
+    }
+
+    #[test]
+    fn host_enum_payloads_cross_the_gc_boundary_with_metadata_validation() {
+        let type_id = StableId::from_name("Event");
+        let variant = StableId::from_parts(&["Event", "::", "Damage"]);
+        let enum_types = [EnumType {
+            type_id,
+            variants: vec![EnumVariant {
+                stable_id: variant,
+                tag: 0,
+                payload_type: Some(ValueType::String),
+            }],
+        }];
+        let host = HostValue::Enum {
+            type_id,
+            variant,
+            tag: 0,
+            payload: Some(Box::new(HostValue::String("critical".into()))),
+        };
+        let mut heap = crate::Heap::new_with_string_limit(4, 32);
+        let runtime = super::host_to_runtime_value(
+            host.clone(),
+            Some(ValueType::Named(type_id)),
+            Some(&mut heap),
+            &enum_types,
+        )
+        .unwrap();
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(args.get(0), Ok(&host));
+
+        let invalid = HostValue::Enum {
+            type_id,
+            variant,
+            tag: 1,
+            payload: Some(Box::new(HostValue::String("wrong-tag".into()))),
+        };
+        assert_eq!(
+            super::host_to_runtime_value(
+                invalid,
+                Some(ValueType::Named(type_id)),
+                Some(&mut heap),
+                &enum_types,
+            ),
+            Err(HostTrap::Type)
+        );
+
+        let completion = HostPayload::Enum {
+            type_id,
+            variant,
+            tag: 0,
+            payload: Some(Box::new(HostPayload::String("async".into()))),
+        };
+        let planned =
+            super::plan_host_payload(&completion, ValueType::Named(type_id), &enum_types).unwrap();
+        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
+        super::validate_planned_payload(&heap, &planned).unwrap();
+        let mut reservation = heap.preflight(2).unwrap();
+        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(
+            args.get(0),
+            Ok(&HostValue::Enum {
+                type_id,
+                variant,
+                tag: 0,
+                payload: Some(Box::new(HostValue::String("async".into()))),
+            })
+        );
     }
 
     fn module(yields: bool) -> (nexa_verifier::VerifiedModule, StableId, StableId) {

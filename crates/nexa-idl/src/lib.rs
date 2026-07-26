@@ -18,7 +18,13 @@ pub struct Idl {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Enum {
     pub name: String,
-    pub variants: Vec<String>,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnumVariant {
+    pub name: String,
+    pub payload: Option<TypeRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +134,11 @@ pub fn canonical(idl: &Idl) -> String {
     for enumeration in &idl.enums {
         write!(output, "enum:{}{{", enumeration.name).expect("String writes do not fail");
         for variant in &enumeration.variants {
-            write!(output, "{variant};").expect("String writes do not fail");
+            write!(output, "{}", variant.name).expect("String writes do not fail");
+            if let Some(payload) = &variant.payload {
+                write!(output, "({})", type_name(payload)).expect("String writes do not fail");
+            }
+            output.push(';');
         }
         output.push('}');
     }
@@ -190,14 +200,34 @@ pub fn generate_rust(idl: &Idl) -> String {
     for enumeration in &idl.enums {
         writeln!(
             output,
-            "#[repr(u32)]\n#[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum {} {{",
+            "#[derive(Clone, Debug, PartialEq)] pub enum {} {{",
+            enumeration.name
+        )
+        .expect("String writes do not fail");
+        for variant in &enumeration.variants {
+            if let Some(payload) = &variant.payload {
+                writeln!(output, "    {}({}),", variant.name, rust_type(payload))
+                    .expect("String writes do not fail");
+            } else {
+                writeln!(output, "    {},", variant.name).expect("String writes do not fail");
+            }
+        }
+        output.push_str("}\n");
+        writeln!(
+            output,
+            "impl {} {{ pub const fn nexa_tag(&self) -> u32 {{ match self {{",
             enumeration.name
         )
         .expect("String writes do not fail");
         for (tag, variant) in enumeration.variants.iter().enumerate() {
-            writeln!(output, "    {variant} = {tag},").expect("String writes do not fail");
+            let pattern = if variant.payload.is_some() {
+                format!("Self::{}(_)", variant.name)
+            } else {
+                format!("Self::{}", variant.name)
+            };
+            writeln!(output, "{pattern} => {tag},").expect("String writes do not fail");
         }
-        output.push_str("}\n");
+        output.push_str("} } }\n");
     }
     for structure in &idl.structs {
         writeln!(
@@ -393,17 +423,58 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
             format!("nexa_runtime::HostPayload::Opaque({source}.0)")
         }
         TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
-            format!("nexa_runtime::HostPayload::Opaque({source} as u64)")
+            encode_enum_completion_payload(
+                idl,
+                idl.enums
+                    .iter()
+                    .find(|enumeration| enumeration.name == *name)
+                    .expect("validated enum exists"),
+                source,
+            )
         }
         _ => "nexa_runtime::HostPayload::Unit".into(),
     }
+}
+
+fn encode_enum_completion_payload(idl: &Idl, enumeration: &Enum, source: &str) -> String {
+    let mut output = format!("match {source} {{");
+    for (tag, variant) in enumeration.variants.iter().enumerate() {
+        let variant_id = format!(
+            "nexa_runtime::StableId::from_parts(&[\"{}\", \"::\", \"{}\"])",
+            enumeration.name, variant.name
+        );
+        let type_id = format!(
+            "nexa_runtime::StableId::from_name(\"{}\")",
+            enumeration.name
+        );
+        if let Some(payload_type) = &variant.payload {
+            let payload = encode_completion_payload(idl, payload_type, "value");
+            write!(
+                output,
+                "{}::{}(value) => nexa_runtime::HostPayload::Enum {{ type_id: {type_id}, \
+                 variant: {variant_id}, tag: {tag}, payload: Some(Box::new({payload})) }},",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        } else {
+            write!(
+                output,
+                "{}::{} => nexa_runtime::HostPayload::Enum {{ type_id: {type_id}, \
+                 variant: {variant_id}, tag: {tag}, payload: None }},",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        }
+    }
+    output.push('}');
+    output
 }
 
 fn encode_completion_error(idl: &Idl, ty: &TypeRef, source: &str) -> String {
     match ty {
         TypeRef::I32 => format!("u32::from_ne_bytes({source}.to_ne_bytes())"),
         TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
-            format!("{source} as u32")
+            format!("{source}.nexa_tag()")
         }
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("{source}.0 as u32")
@@ -447,6 +518,21 @@ fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
             "match {source} {{ nexa_runtime::HostValue::Opaque(value) => {name}(*value), \
              _ => return Err(nexa_runtime::HostTrap::Type) }}"
         ),
+        TypeRef::Named(name)
+            if idl
+                .enums
+                .iter()
+                .any(|enumeration| enumeration.name == *name) =>
+        {
+            decode_enum_value(
+                idl,
+                idl.enums
+                    .iter()
+                    .find(|enumeration| enumeration.name == *name)
+                    .expect("validated enum exists"),
+                source,
+            )
+        }
         TypeRef::Named(name) => {
             let structure = idl
                 .structs
@@ -520,6 +606,21 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
             format!("nexa_runtime::HostValue::Opaque({source}.0)")
         }
+        TypeRef::Named(name)
+            if idl
+                .enums
+                .iter()
+                .any(|enumeration| enumeration.name == *name) =>
+        {
+            encode_enum_value(
+                idl,
+                idl.enums
+                    .iter()
+                    .find(|enumeration| enumeration.name == *name)
+                    .expect("validated enum exists"),
+                source,
+            )
+        }
         TypeRef::Named(name) => {
             let structure = idl
                 .structs
@@ -535,6 +636,82 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
             format!("nexa_runtime::HostValue::Struct(vec![{fields}])")
         }
     }
+}
+
+fn decode_enum_value(idl: &Idl, enumeration: &Enum, source: &str) -> String {
+    let mut output = format!(
+        "match {source} {{ nexa_runtime::HostValue::Enum {{ type_id, variant, payload, .. }} \
+         if *type_id == nexa_runtime::StableId::from_name(\"{}\") => {{",
+        enumeration.name
+    );
+    for (index, variant) in enumeration.variants.iter().enumerate() {
+        if index != 0 {
+            output.push_str(" else ");
+        }
+        write!(
+            output,
+            "if *variant == nexa_runtime::StableId::from_parts(&[\"{}\", \"::\", \"{}\"]) {{",
+            enumeration.name, variant.name
+        )
+        .expect("String writes do not fail");
+        if let Some(payload_type) = &variant.payload {
+            let decoded = decode_value(idl, payload_type, "value");
+            write!(
+                output,
+                "let value = match payload.as_deref() {{ Some(value) => value, None => return \
+                 Err(nexa_runtime::HostTrap::Type) }}; {}::{}({decoded})",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        } else {
+            write!(
+                output,
+                "if payload.is_some() {{ return Err(nexa_runtime::HostTrap::Type); }} {}::{}",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        }
+        output.push('}');
+    }
+    output.push_str(
+        " else { return Err(nexa_runtime::HostTrap::Type) } }, \
+         _ => return Err(nexa_runtime::HostTrap::Type) }",
+    );
+    output
+}
+
+fn encode_enum_value(idl: &Idl, enumeration: &Enum, source: &str) -> String {
+    let mut output = format!("match {source} {{");
+    for (tag, variant) in enumeration.variants.iter().enumerate() {
+        let variant_id = format!(
+            "nexa_runtime::StableId::from_parts(&[\"{}\", \"::\", \"{}\"])",
+            enumeration.name, variant.name
+        );
+        let type_id = format!(
+            "nexa_runtime::StableId::from_name(\"{}\")",
+            enumeration.name
+        );
+        if let Some(payload_type) = &variant.payload {
+            let payload = encode_value(idl, payload_type, "value");
+            write!(
+                output,
+                "{}::{}(value) => nexa_runtime::HostValue::Enum {{ type_id: {type_id}, \
+                 variant: {variant_id}, tag: {tag}, payload: Some(Box::new({payload})) }},",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        } else {
+            write!(
+                output,
+                "{}::{} => nexa_runtime::HostValue::Enum {{ type_id: {type_id}, \
+                 variant: {variant_id}, tag: {tag}, payload: None }},",
+                enumeration.name, variant.name
+            )
+            .expect("String writes do not fail");
+        }
+    }
+    output.push('}');
+    output
 }
 
 fn type_name(ty: &TypeRef) -> String {
@@ -651,11 +828,24 @@ impl Parser {
                     self.expect("{")?;
                     let mut variants = Vec::new();
                     while !self.take("}") {
-                        let variant = self.word()?;
-                        if variants.contains(&variant) {
-                            return Err(IdlError::Duplicate(format!("{name}::{variant}")));
+                        let variant_name = self.word()?;
+                        if variants
+                            .iter()
+                            .any(|variant: &EnumVariant| variant.name == variant_name)
+                        {
+                            return Err(IdlError::Duplicate(format!("{name}::{variant_name}")));
                         }
-                        variants.push(variant);
+                        let payload = if self.take("(") {
+                            let payload = self.ty()?;
+                            self.expect(")")?;
+                            Some(payload)
+                        } else {
+                            None
+                        };
+                        variants.push(EnumVariant {
+                            name: variant_name,
+                            payload,
+                        });
                         self.take(",");
                     }
                     if idl.enums.iter().any(|item| item.name == name) {
@@ -860,6 +1050,12 @@ fn validate_types(idl: &Idl) -> Result<(), IdlError> {
         .structs
         .iter()
         .flat_map(|structure| structure.fields.iter().map(|field| &field.ty))
+        .chain(idl.enums.iter().flat_map(|enumeration| {
+            enumeration
+                .variants
+                .iter()
+                .filter_map(|variant| variant.payload.as_ref())
+        }))
         .chain(idl.functions.iter().flat_map(|function| {
             function
                 .parameters
@@ -931,6 +1127,9 @@ mod tests {
         assert_eq!(exact_hash(&first), exact_hash(&second));
         let reordered = parse(&IDL.replace("x: f32; y: f32", "y: f32; x: f32")).unwrap();
         assert_ne!(exact_hash(&first), exact_hash(&reordered));
+        let payload_i32 = parse("interface Events { enum Event { Idle, Damage(i32) } }").unwrap();
+        let payload_i64 = parse("interface Events { enum Event { Idle, Damage(i64) } }").unwrap();
+        assert_ne!(exact_hash(&payload_i32), exact_hash(&payload_i64));
     }
 
     #[test]
@@ -977,6 +1176,20 @@ mod tests {
             .unwrap(),
         );
         assert!(scalar.contains("HostPayload::F64(value.to_bits())"));
+
+        let enum_payload = generate_rust(
+            &parse(
+                "interface Events {
+                    enum Event { Idle, Damage(i32) }
+                    enum EventError { Cancelled }
+                    request(return_error, trap) fn next()
+                        -> request<Result<Event, EventError>>;
+                }",
+            )
+            .unwrap(),
+        );
+        assert!(enum_payload.contains("HostPayload::Enum"));
+        assert!(enum_payload.contains("payload: Some(Box::new"));
     }
 
     #[test]
@@ -986,11 +1199,16 @@ mod tests {
             "interface GameHost {
                 opaque Entity;
                 struct Vec3 { x: f32; y: f32; z: f32; }
+                enum Event { Idle, Damage(i32), Label(string) }
+                enum EventError { Cancelled }
                 sync fn add(lhs: i32, rhs: i32) -> i32;
                 sync fn position(entity: Entity, value: Vec3) -> Vec3;
                 sync fn scalar_mix(wide: i64, ratio: f64, glyph: rune) -> f64;
                 sync fn echo(value: string) -> string;
+                sync fn echo_event(value: Event) -> Event;
                 sync fn explode() -> i32;
+                request(return_error, trap) fn next()
+                    -> request<Result<Event, EventError>>;
                 export Update(value: i32) -> i32;
             }",
         )
@@ -1018,7 +1236,7 @@ mod tests {
         fs::write(
             directory.join("src/main.rs"),
             r#"mod bindings;
-use bindings::{Entity, GameHost, GeneratedHostRegistry, HostError, Vec3};
+use bindings::{Entity, Event, GameHost, GeneratedHostRegistry, HostError, Vec3};
 use nexa_runtime::{HostArgs, HostCallOutcome, HostRegistry, HostValue, RuntimeLimits, RuntimeResources, TaskRuntime};
 
 struct Mock;
@@ -1060,11 +1278,29 @@ impl GameHost for Mock {
         Ok(value)
     }
 
+    fn echo_event(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        value: Event,
+    ) -> Result<Event, HostError> {
+        Ok(value)
+    }
+
     fn explode(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
     ) -> Result<i32, HostError> {
         panic!("host panic")
+    }
+
+    fn next(
+        &mut self,
+        context: &mut nexa_runtime::ResourceContext<'_>,
+    ) -> Result<nexa_runtime::HostRequestHandle, HostError> {
+        context
+            .create_request()
+            .map(|pending| pending.request)
+            .map_err(|error| HostError(error.to_string()))
     }
 }
 
@@ -1113,8 +1349,20 @@ fn main() {
             .unwrap(),
         HostCallOutcome::Immediate(HostValue::String("Nexa界".into()))
     );
+    let event = HostValue::Enum {
+        type_id: nexa_runtime::StableId::from_name("Event"),
+        variant: nexa_runtime::StableId::from_parts(&["Event", "::", "Damage"]),
+        tag: 1,
+        payload: Some(Box::new(HostValue::I32(7))),
+    };
     assert_eq!(
-        registry.call(4, &mut context, HostArgs::new(&[])),
+        registry
+            .call(4, &mut context, HostArgs::new(std::slice::from_ref(&event)))
+            .unwrap(),
+        HostCallOutcome::Immediate(event)
+    );
+    assert_eq!(
+        registry.call(5, &mut context, HostArgs::new(&[])),
         Err(nexa_runtime::HostTrap::Panicked)
     );
 }

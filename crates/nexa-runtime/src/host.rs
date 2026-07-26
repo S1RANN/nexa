@@ -1008,6 +1008,12 @@ pub enum HostPayload {
     Bool(bool),
     Rune(u32),
     String(String),
+    Enum {
+        type_id: nexa_core::StableId,
+        variant: nexa_core::StableId,
+        tag: u32,
+        payload: Option<Box<HostPayload>>,
+    },
     Opaque(u64),
     Token(ResourceTokenHandle),
     Snapshot(SnapshotHandle),
@@ -1025,6 +1031,12 @@ pub enum HostValue {
     String(String),
     Opaque(u64),
     Struct(Vec<HostValue>),
+    Enum {
+        type_id: nexa_core::StableId,
+        variant: nexa_core::StableId,
+        tag: u32,
+        payload: Option<Box<HostValue>>,
+    },
     Request(HostRequestHandle),
     Token(ResourceTokenHandle),
     Snapshot(SnapshotHandle),
@@ -1103,6 +1115,23 @@ fn runtime_argument_to_host_value(
                 .map_err(|_| HostTrap::Type)?
                 .to_owned(),
         ),
+        value @ crate::RuntimeValue::NamedRef { .. }
+            if heap.is_some_and(|heap| heap.enum_parts(value).is_ok()) =>
+        {
+            let (type_id, variant, tag, payload) = heap
+                .expect("enum guard requires a heap")
+                .enum_parts(value)
+                .map_err(|_| HostTrap::Type)?;
+            HostValue::Enum {
+                type_id,
+                variant,
+                tag,
+                payload: payload
+                    .map(|payload| runtime_argument_to_host_value(payload, heap))
+                    .transpose()?
+                    .map(Box::new),
+            }
+        }
         crate::RuntimeValue::Ref(reference) | crate::RuntimeValue::NamedRef { reference, .. } => {
             HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
         }
