@@ -492,14 +492,15 @@ pub fn generate_rust(idl: &Idl) -> String {
         output.push_str("}\n");
     }
     for structure in &idl.structs {
-        let nested_requirements = structure
-            .fields
-            .iter()
-            .map(|field| requirements_value_expr(idl, &field.ty, &format!("&self.{}", field.name)))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .map(|item| format!("__nexa_requirements = __nexa_requirements.checked_add({item})?;"))
-            .collect::<String>();
+        let mut nested_requirements = String::new();
+        for field in &structure.fields {
+            let item = requirements_value_expr(idl, &field.ty, &format!("&self.{}", field.name));
+            write!(
+                nested_requirements,
+                "__nexa_requirements = __nexa_requirements.checked_add({item})?;"
+            )
+            .expect("String writes do not fail");
+        }
         let requirements = format!(
             "{{ let mut __nexa_requirements = nexa_runtime::HostReturnRequirements {{ \
              object_slots: 1, struct_fields: {}, ..nexa_runtime::HostReturnRequirements::ZERO }}; \

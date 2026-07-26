@@ -460,8 +460,10 @@ fn execute_runtime_case(
         .expect_err("unknown host error code must be rejected")
         .into(),
         "module_capacity" => {
-            let mut config = RealmConfig::default();
-            config.max_modules = 0;
+            let config = RealmConfig {
+                max_modules: 0,
+                ..RealmConfig::default()
+            };
             let mut realm = RealmRuntime::isolated(config);
             realm
                 .load_module(verified(false), host_hash, schema_hash)
@@ -469,8 +471,10 @@ fn execute_runtime_case(
                 .into()
         }
         "migration_object_limit" => {
-            let mut limits = MigrationLimits::default();
-            limits.max_objects = 0;
+            let limits = MigrationLimits {
+                max_objects: 0,
+                ..MigrationLimits::default()
+            };
             limits
                 .validate_requirements(MigrationLimitRequirements {
                     max_objects: 1,
@@ -676,6 +680,7 @@ fn validate_case_shape(case: &DiagnosticCase, path: &Path) -> Result<(), String>
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn execute_compiler_case(
     case: &DiagnosticCase,
     case_path: &Path,

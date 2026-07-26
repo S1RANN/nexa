@@ -264,7 +264,6 @@ impl Object {
                     _ => None,
                 })
                 .collect(),
-            Self::Array { .. } | Self::Buffer { .. } => Vec::new(),
             Self::Map(map) => map.references(),
             Self::Enum { payload, .. } => payload
                 .iter()
@@ -290,7 +289,9 @@ impl Object {
                     _ => None,
                 })
                 .collect(),
-            Self::String(_) | Self::I32Array(_) => Vec::new(),
+            Self::Array { .. } | Self::Buffer { .. } | Self::String(_) | Self::I32Array(_) => {
+                Vec::new()
+            }
         }
     }
 }
@@ -706,10 +707,11 @@ impl Heap {
     pub(crate) fn rollback_host_transaction(&mut self) {
         self.host_transaction_active = false;
         while let Some(reference) = self.host_staging.pop() {
-            if let Some(slot) = self.slots.get_mut(reference.index as usize) {
-                if slot.generation == reference.generation && slot.object.take().is_some() {
-                    self.free.push(reference.index);
-                }
+            if let Some(slot) = self.slots.get_mut(reference.index as usize)
+                && slot.generation == reference.generation
+                && slot.object.take().is_some()
+            {
+                self.free.push(reference.index);
             }
         }
     }

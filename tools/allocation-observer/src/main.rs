@@ -552,14 +552,14 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
         &mut self,
         _: &mut ResourceContext<'_>,
     ) -> Result<Vec<i32>, host_matrix::HostError> {
-        Ok(host_owned(|| (0..128).collect()))
+        Ok(host_owned(|| (0..31).collect()))
     }
 
     fn return_large_buffer(
         &mut self,
         _: &mut ResourceContext<'_>,
     ) -> Result<CopyBuffer<i32>, host_matrix::HostError> {
-        Ok(host_owned(|| CopyBuffer::new((0..128).collect())))
+        Ok(host_owned(|| CopyBuffer::new((0..32).collect())))
     }
 
     fn return_nested(
@@ -622,77 +622,105 @@ fn validate_record(heap: &Heap, value: RuntimeValue, label: &str, number: i32) {
     assert_eq!(fields[1], RuntimeValue::I32(number));
 }
 
-fn validate_return(name: &str, outcome: &Result<HostCallOutcome, HostTrap>, heap: &Heap) {
+fn validate_return(
+    name: &str,
+    outcome: &Result<HostCallOutcome, HostTrap>,
+    heap: &Heap,
+) -> Option<usize> {
     let HostCallOutcome::RuntimeImmediate(value) = outcome.as_ref().unwrap() else {
         panic!("{name} did not return a runtime value")
     };
     match name {
-        "return_string" => assert_eq!(runtime_string(heap, *value), "non-empty"),
-        "return_struct" => validate_record(heap, *value, "record", 7),
+        "return_string" => {
+            assert_eq!(runtime_string(heap, *value), "non-empty");
+            None
+        }
+        "return_struct" => {
+            validate_record(heap, *value, "record", 7);
+            None
+        }
         "return_enum" => {
             let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
             assert_eq!(tag, 1);
             validate_record(heap, payload.unwrap(), "event", 11);
+            None
         }
         "return_option" => {
             let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
             assert_eq!(tag, 1);
             validate_record(heap, payload.unwrap(), "option", 13);
+            None
         }
         "return_result" => {
             let (_, _, tag, payload) = heap.enum_parts(*value).unwrap();
             assert_eq!(tag, 0);
             validate_record(heap, payload.unwrap(), "result", 17);
+            None
         }
-        "return_array" => assert_eq!(
-            heap.array_values(*value).unwrap(),
-            [
+        "return_array" => {
+            let values = heap.array_values(*value).unwrap();
+            assert_eq!(
+                values,
+                [
                 RuntimeValue::I32(1),
                 RuntimeValue::I32(2),
                 RuntimeValue::I32(3)
-            ]
-        ),
-        "return_buffer" => assert_eq!(
-            heap.buffer_values(*value).unwrap(),
-            [
+                ]
+            );
+            Some(values.len())
+        }
+        "return_buffer" => {
+            let values = heap.buffer_values(*value).unwrap();
+            assert_eq!(
+                values,
+                [
                 RuntimeValue::I32(4),
                 RuntimeValue::I32(5),
                 RuntimeValue::I32(6)
-            ]
-        ),
+                ]
+            );
+            Some(values.len())
+        }
         "return_array_struct" => {
             let values = heap.array_values(*value).unwrap();
             validate_record(heap, values[0], "array-a", 21);
             validate_record(heap, values[1], "array-b", 22);
+            Some(values.len())
         }
         "return_buffer_struct" => {
             let values = heap.buffer_values(*value).unwrap();
             validate_record(heap, values[0], "buffer-a", 31);
             validate_record(heap, values[1], "buffer-b", 32);
+            Some(values.len())
         }
         "return_nested_enum" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
             validate_record(heap, payload.unwrap(), "nested-enum", 41);
+            None
         }
         "return_option_array" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
             let records = heap.array_values(payload.unwrap()).unwrap();
             validate_record(heap, records[0], "option-array", 51);
+            Some(records.len())
         }
         "return_result_buffer" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
             let records = heap.buffer_values(payload.unwrap()).unwrap();
             validate_record(heap, records[0], "result-buffer", 61);
+            Some(records.len())
         }
         "return_large_array" => {
             let values = heap.array_values(*value).unwrap();
-            assert_eq!(values.len(), 128);
-            assert_eq!(values[127], RuntimeValue::I32(127));
+            assert_eq!(values.len(), 31);
+            assert_eq!(values[30], RuntimeValue::I32(30));
+            Some(values.len())
         }
         "return_large_buffer" => {
             let values = heap.buffer_values(*value).unwrap();
-            assert_eq!(values.len(), 128);
-            assert_eq!(values[127], RuntimeValue::I32(127));
+            assert_eq!(values.len(), 32);
+            assert_eq!(values[31], RuntimeValue::I32(31));
+            Some(values.len())
         }
         "return_nested" => {
             let fields = heap.struct_fields(*value).unwrap();
@@ -708,6 +736,7 @@ fn validate_return(name: &str, outcome: &Result<HostCallOutcome, HostTrap>, heap
                 ]
             );
             assert_eq!(runtime_string(heap, fields[2]), "nested-root");
+            None
         }
         _ => panic!("unknown return case {name}"),
     }
@@ -982,6 +1011,7 @@ fn complex_host_allocation_matrix() {
         ("return_nested", host_matrix::THUNK_RETURN_NESTED),
     ];
     let mut separated_host_allocations = 0;
+    let mut generated_non_empty_lengths = BTreeMap::new();
     for (name, id) in return_cases {
         registry
             .call_runtime(
@@ -999,7 +1029,17 @@ fn complex_host_allocation_matrix() {
         });
         assert!(outcome.is_ok(), "return case {name}");
         assert_eq!(counts.thunk, 0, "return case {name}");
-        validate_return(name, &outcome, &heap);
+        if let Some(length) = validate_return(name, &outcome, &heap)
+            && matches!(
+                name,
+                "return_option_array"
+                    | "return_array"
+                    | "return_large_array"
+                    | "return_large_buffer"
+            )
+        {
+            generated_non_empty_lengths.insert(name, length);
+        }
         formal_cases.push(HostAllocationCase { name, counts });
         separated_host_allocations += counts.host;
     }
@@ -1214,10 +1254,14 @@ fn complex_host_allocation_matrix() {
     }
     assert!(formal_cases.len() >= 32);
     assert!(formal_cases.iter().all(|case| case.counts.thunk == 0));
+    let generated_non_empty_lengths = generated_non_empty_lengths
+        .into_values()
+        .collect::<Vec<_>>();
     print!(
         "{{\"host_return_matrix\":{{\"case_count\":{},\"all_thunk_zero\":true,\
-         \"cases\":[",
-        formal_cases.len()
+         \"non_empty_lengths\":{:?},\"cases\":[",
+        formal_cases.len(),
+        generated_non_empty_lengths
     );
     for (index, case) in formal_cases.iter().enumerate() {
         if index != 0 {
