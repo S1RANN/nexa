@@ -1,0 +1,22 @@
+interface CombatHost {
+    sync fuel 1 fn apply_damage(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn heal(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_armor(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn remove_armor(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_mana(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn spend_mana(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_stamina(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn spend_stamina(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_threat(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn clear_threat(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn start_cooldown(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn reduce_cooldown(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_combo(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn consume_combo(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn set_target(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn clear_target(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn set_phase(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn advance_phase(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn add_score(entity: i32, amount: i32) -> i32;
+    sync fuel 1 fn update_rank(entity: i32, amount: i32) -> i32;
+}

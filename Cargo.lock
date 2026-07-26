@@ -120,6 +120,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-milestone4-experiments"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-idl",
+ "nexa-migrate",
+ "nexa-runtime",
+ "nexa-verifier",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-model"
 version = "0.1.0"
 dependencies = [

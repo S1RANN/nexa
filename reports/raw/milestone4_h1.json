@@ -1,0 +1,29 @@
+{
+  "experiment": "H1 IDL generated value",
+  "api_count": 20,
+  "handwritten": {
+    "maintained_lines": 78,
+    "emitted_lines": 78,
+    "repeated_dispatch_sites": 20,
+    "interface_change_edit_points": 3,
+    "error_detection_phase": "runtime interface-hash check or handwritten review",
+    "diagnostic_quality": "hash mismatch identifies interface, not stale method site"
+  },
+  "generated": {
+    "maintained_lines": 22,
+    "emitted_lines": 259,
+    "repeated_dispatch_sites": 0,
+    "interface_change_edit_points": 1,
+    "error_detection_phase": "IDL parse/generation and Rust compile",
+    "diagnostic_quality": "typed method and argument conversion site"
+  },
+  "interface_change": {
+    "old_hash": 9470101881694883561,
+    "new_hash": 10781261018193141365,
+    "hash_changed": true,
+    "stale_handwritten_registry_rejected": true,
+    "generated_output_changed": true,
+    "changed_api": "CombatHost::apply_damage amount i32 -> i64"
+  },
+  "invalid_idl_diagnostic": "UnknownType(\"Unsupported\")"
+}
