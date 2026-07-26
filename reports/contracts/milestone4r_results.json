@@ -1,6 +1,8 @@
 {
   "milestone": "4.0R",
   "status": "complete",
+  "superseded": true,
+  "superseded_reason": "The prior audit used hard-coded contract outcomes and incomplete semantic gates.",
   "implementation_sha": "a13102e1b682269b3af1e4e574c5d7edc20c2d51",
   "implementation_tree": "57dd882d1d8dc6e6587e98f73af2e62fff998c12",
   "evidence_sha": "SELF",

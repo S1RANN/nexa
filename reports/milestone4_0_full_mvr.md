@@ -1,6 +1,14 @@
 # Nexa Milestone 4.0R Final MVR Closure
 
-Status: **COMPLETE**
+Status: **INCOMPLETE**
+
+Milestone 4.0R 的 `COMPLETE` 已被 Milestone 4.0R2 事实复核取代。旧审计结果仅作为
+历史证据保留，不再表示当前有效完成状态。4.0R2 开始时确认以下四个未关闭契约：
+
+- `M4R2-HOST-RETURN`：非空复杂 Host 返回仍可能由 Thunk 分配。
+- `M4R2-SOURCE-SPAN`：Compiler SourceSpan 仍存在伪造回退位置。
+- `M4R2-DIAGNOSTIC-CORPUS`：Diagnostic Corpus 没有真实执行发射路径。
+- `M4R2-RELEASE-AUDIT`：Release Audit 的 PASS、计数和缺口状态存在硬编码。
 
 - Implementation SHA: `a13102e1b682269b3af1e4e574c5d7edc20c2d51`
 - Implementation Tree SHA: `57dd882d1d8dc6e6587e98f73af2e62fff998c12`
@@ -82,6 +90,9 @@ Status: **COMPLETE**
 
 ## 已知范围内缺口
 
-无。
+- `M4R2-HOST-RETURN`
+- `M4R2-SOURCE-SPAN`
+- `M4R2-DIAGNOSTIC-CORPUS`
+- `M4R2-RELEASE-AUDIT`
 
-Milestone 4.0R = **COMPLETE**。
+Milestone 4.0R2 = **INCOMPLETE**。
