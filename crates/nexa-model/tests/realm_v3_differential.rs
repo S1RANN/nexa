@@ -133,10 +133,14 @@ impl RuntimeAdapter {
                         )
                         .map_err(debug)?;
                     self.realm
-                        .create_snapshot(
+                        .create_typed_snapshot(
                             self.tasks[task].expect("task was stored"),
-                            nexa_core::StableId::from_name("ModelSnapshot"),
-                            Arc::<[i32]>::from([1, 2, 3]),
+                            nexa_runtime::EncodedSnapshot::copy_i32_slice(
+                                nexa_core::StableId::from_name("ModelSnapshot"),
+                                nexa_core::StableId::from_name("ModelSnapshot::snapshot-schema"),
+                                &[1, 2, 3],
+                            )
+                            .map_err(debug)?,
                         )
                         .map_err(debug)?;
                 }
@@ -517,4 +521,3 @@ fn schema_hash() -> StableId {
 fn debug(error: impl std::fmt::Debug) -> String {
     format!("{error:?}")
 }
-use std::sync::Arc;

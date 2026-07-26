@@ -2515,11 +2515,10 @@ impl RealmRuntime {
         Ok(())
     }
 
-    pub fn create_snapshot(
+    pub fn create_typed_snapshot(
         &mut self,
         task: TaskHandle,
-        content_type: StableId,
-        data: Arc<[i32]>,
+        encoded: crate::EncodedSnapshot,
     ) -> Result<SnapshotHandle, RealmError> {
         self.require_host_capabilities()?;
         self.require_reload_idle()?;
@@ -2527,7 +2526,7 @@ impl RealmRuntime {
         Ok(self
             .resources
             .context(task, snapshot.module_id, snapshot.module_epoch)
-            .create_snapshot(content_type, data)?)
+            .create_typed_snapshot(encoded)?)
     }
 
     pub fn release_snapshot(
@@ -2539,8 +2538,38 @@ impl RealmRuntime {
         Ok(())
     }
 
-    pub fn snapshot_data(&self, snapshot: SnapshotHandle) -> Result<&[i32], RealmError> {
-        Ok(self.resources.snapshot_data(snapshot)?)
+    pub fn snapshot_payload(&self, snapshot: SnapshotHandle) -> Result<&[u8], RealmError> {
+        Ok(self.resources.snapshot_payload(snapshot)?)
+    }
+
+    pub fn snapshot_layout(
+        &self,
+        snapshot: SnapshotHandle,
+    ) -> Result<crate::SnapshotLayout, RealmError> {
+        Ok(self.resources.snapshot_layout(snapshot)?)
+    }
+
+    pub fn snapshot_view<'a, T>(&'a self, snapshot: SnapshotHandle) -> Result<T, RealmError>
+    where
+        T: crate::DecodeTypedSnapshot<'a>,
+    {
+        if snapshot.type_id() != T::TYPE_ID
+            || self.snapshot_content_type(snapshot)? != T::CONTENT_TYPE
+        {
+            return Err(crate::HostRequestError::InvalidState.into());
+        }
+        let layout = self.snapshot_layout(snapshot)?;
+        if layout.schema_hash != T::SCHEMA_HASH
+            || layout.alignment != T::ALIGNMENT
+            || layout.size as usize != self.snapshot_payload(snapshot)?.len()
+        {
+            return Err(crate::HostRequestError::InvalidState.into());
+        }
+        T::decode(crate::TypedSnapshotRef {
+            payload: self.snapshot_payload(snapshot)?,
+            layout,
+        })
+        .map_err(|_| crate::HostRequestError::InvalidState.into())
     }
 
     pub fn snapshot_external_bytes(&self, snapshot: SnapshotHandle) -> Result<usize, RealmError> {
@@ -3802,10 +3831,64 @@ mod tests {
     };
     use crate::task::TaskExecution;
     use crate::{
-        CopyBuffer, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
-        HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostArgs,
-        RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskState, TickBudget,
+        CopyBuffer, DecodeTypedSnapshot, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload,
+        HostRegistry, HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost,
+        RuntimeHostArgs, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskState,
+        TickBudget,
     };
+
+    #[derive(Clone, Copy)]
+    struct TypedStorageRef<'a>(crate::TypedSnapshotRef<'a>);
+
+    impl<'a> crate::DecodeTypedSnapshot<'a> for TypedStorageRef<'a> {
+        const TYPE_ID: StableId = StableId(17_249_825_611_412_504_198);
+        const CONTENT_TYPE: StableId = StableId(7_258_453_658_367_051_832);
+        const SCHEMA_HASH: StableId = StableId(99);
+        const ALIGNMENT: u16 = 1;
+
+        fn decode(view: crate::TypedSnapshotRef<'a>) -> Result<Self, HostTrap> {
+            Ok(Self(view))
+        }
+    }
+
+    struct WrongTypeRef;
+
+    impl<'a> crate::DecodeTypedSnapshot<'a> for WrongTypeRef {
+        const TYPE_ID: StableId = StableId(1);
+        const CONTENT_TYPE: StableId = TypedStorageRef::<'static>::CONTENT_TYPE;
+        const SCHEMA_HASH: StableId = TypedStorageRef::<'static>::SCHEMA_HASH;
+        const ALIGNMENT: u16 = 1;
+
+        fn decode(_: crate::TypedSnapshotRef<'a>) -> Result<Self, HostTrap> {
+            Ok(Self)
+        }
+    }
+
+    struct WrongSchemaRef;
+
+    impl<'a> crate::DecodeTypedSnapshot<'a> for WrongSchemaRef {
+        const TYPE_ID: StableId = TypedStorageRef::<'static>::TYPE_ID;
+        const CONTENT_TYPE: StableId = TypedStorageRef::<'static>::CONTENT_TYPE;
+        const SCHEMA_HASH: StableId = StableId(100);
+        const ALIGNMENT: u16 = 1;
+
+        fn decode(_: crate::TypedSnapshotRef<'a>) -> Result<Self, HostTrap> {
+            Ok(Self)
+        }
+    }
+
+    struct WrongLayoutRef;
+
+    impl<'a> crate::DecodeTypedSnapshot<'a> for WrongLayoutRef {
+        const TYPE_ID: StableId = TypedStorageRef::<'static>::TYPE_ID;
+        const CONTENT_TYPE: StableId = TypedStorageRef::<'static>::CONTENT_TYPE;
+        const SCHEMA_HASH: StableId = TypedStorageRef::<'static>::SCHEMA_HASH;
+        const ALIGNMENT: u16 = 8;
+
+        fn decode(_: crate::TypedSnapshotRef<'a>) -> Result<Self, HostTrap> {
+            Ok(Self)
+        }
+    }
 
     #[test]
     fn host_string_arguments_and_results_cross_the_gc_boundary() {
@@ -3954,7 +4037,14 @@ mod tests {
         let content_type = StableId::from_name("EnemyView");
         let snapshot = resources
             .context(task, 1, 1)
-            .create_snapshot(content_type, Arc::from([1, 2, 3]))
+            .create_typed_snapshot(
+                crate::EncodedSnapshot::copy_i32_slice(
+                    content_type,
+                    StableId::from_name("EnemyView::snapshot-schema"),
+                    &[1, 2, 3],
+                )
+                .unwrap(),
+            )
             .unwrap();
         let snapshot_type = nexa_bytecode::snapshot_type(content_type);
         assert_eq!(
@@ -3997,6 +4087,75 @@ mod tests {
             ),
             Err(crate::InterpreterError::TypeMismatch)
         );
+    }
+
+    #[test]
+    fn typed_snapshot_storage() {
+        struct SnapshotHost(StableId);
+
+        impl HostRegistry for SnapshotHost {
+            fn interface_hash(&self) -> Option<StableId> {
+                Some(self.0)
+            }
+
+            fn call(
+                &mut self,
+                _id: u32,
+                _context: &mut ResourceContext<'_>,
+                _args: HostArgs<'_>,
+            ) -> Result<HostCallOutcome, HostTrap> {
+                Err(HostTrap::UnknownFunction(0))
+            }
+        }
+
+        let (verified, host_hash, schema_hash) = module(false);
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            RuntimeHost::new(8),
+            Box::new(SnapshotHost(host_hash)),
+        )
+        .unwrap();
+        let module = realm.load_module(verified, host_hash, schema_hash).unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm
+            .call(module, 0, &[RuntimeValue::I32(1)], task_config(scope))
+            .unwrap();
+        let content = TypedStorageRef::<'static>::CONTENT_TYPE;
+        assert_eq!(
+            nexa_bytecode::snapshot_type(content),
+            TypedStorageRef::<'static>::TYPE_ID
+        );
+        let encoded = crate::EncodedSnapshot::new(
+            content,
+            TypedStorageRef::<'static>::SCHEMA_HASH,
+            1,
+            Arc::from([0x7f, 0, 0xff, 3, 9]),
+        )
+        .unwrap();
+        let snapshot = realm.create_typed_snapshot(task, encoded).unwrap();
+        let view = realm
+            .snapshot_view::<TypedStorageRef<'_>>(snapshot)
+            .unwrap();
+        assert_eq!(view.0.payload(), &[0x7f, 0, 0xff, 3, 9]);
+        assert_eq!(view.0.layout().size, 5);
+        assert_eq!(realm.snapshot_external_bytes(snapshot).unwrap(), 5);
+        assert!(realm.snapshot_view::<WrongTypeRef>(snapshot).is_err());
+        assert!(realm.snapshot_view::<WrongSchemaRef>(snapshot).is_err());
+        assert!(realm.snapshot_view::<WrongLayoutRef>(snapshot).is_err());
+
+        let before = realm.resource_ledger();
+        let invalid = crate::EncodedSnapshot {
+            type_id: nexa_bytecode::snapshot_type(content),
+            content_type: content,
+            payload: Arc::from([1, 2, 3]),
+            layout: crate::SnapshotLayout {
+                size: 4,
+                alignment: 1,
+                schema_hash: TypedStorageRef::<'static>::SCHEMA_HASH,
+            },
+        };
+        assert!(realm.create_typed_snapshot(task, invalid).is_err());
+        assert_eq!(realm.resource_ledger(), before);
     }
 
     #[test]
@@ -5735,10 +5894,14 @@ mod tests {
             .create_resource_token(task, RuntimeHostDomain::Render)
             .unwrap();
         realm
-            .create_snapshot(
+            .create_typed_snapshot(
                 task,
-                StableId::from_name("LedgerSnapshot"),
-                Arc::from([1, 2, 3]),
+                crate::EncodedSnapshot::copy_i32_slice(
+                    StableId::from_name("LedgerSnapshot"),
+                    StableId::from_name("LedgerSnapshot::snapshot-schema"),
+                    &[1, 2, 3],
+                )
+                .unwrap(),
             )
             .unwrap();
         realm.allocate(Object::String("ledger".to_owned())).unwrap();

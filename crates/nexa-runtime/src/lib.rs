@@ -47,16 +47,17 @@ pub use frame::{
 };
 pub use heap::{CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object};
 pub use host::{
-    CompletionAccounting, CopyBuffer, EncodeHostReturn, HostArgs, HostArrayRef, HostBufferRef,
-    HostCallOutcome, HostCompletionDelivery, HostCompletionResult, HostCompletionTicket,
-    HostEnumRef, HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostRequestState, HostResultRef, HostReturnWriter, HostStr, HostStructRef,
-    HostTrap, HostValue, HostValueRef, MAX_HOST_RETURN_FIELDS, PendingHostRequest,
-    RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState,
-    ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle, RuntimeHost,
-    RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
-    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
-    TaskResourceSet,
+    CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
+    HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome, HostCompletionDelivery,
+    HostCompletionResult, HostCompletionTicket, HostEnumRef, HostErrorPayload, HostOptionRef,
+    HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostRequestState,
+    HostResultRef, HostReturnWriter, HostStr, HostStructRef, HostTrap, HostValue, HostValueRef,
+    MAX_HOST_RETURN_FIELDS, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
+    ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
+    RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
+    RuntimeResources, ScriptFunction, SnapshotHandle, SnapshotLayout, TaskResourceSet,
+    TypedSnapshotRef,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

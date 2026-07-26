@@ -1342,10 +1342,14 @@ fn main() {
             )
             .unwrap();
         realm
-            .create_snapshot(
+            .create_typed_snapshot(
                 task,
-                StableId::from_name("ObserverSnapshot"),
-                Arc::from([1_i32, 2, 3]),
+                nexa_runtime::EncodedSnapshot::copy_i32_slice(
+                    StableId::from_name("ObserverSnapshot"),
+                    StableId::from_name("ObserverSnapshot::snapshot-schema"),
+                    &[1_i32, 2, 3],
+                )
+                .unwrap(),
             )
             .unwrap();
         let snapshot_release = observed(|| {

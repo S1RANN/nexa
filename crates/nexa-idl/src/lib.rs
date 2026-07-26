@@ -267,7 +267,8 @@ pub fn generate_rust(idl: &Idl) -> String {
         .expect("String writes do not fail");
     }
     for content in snapshot_contents {
-        let snapshot_type = nexa_bytecode::snapshot_type(StableId::from_name(&content)).0;
+        let content_type = StableId::from_name(&content);
+        let snapshot_type = nexa_bytecode::snapshot_type(content_type).0;
         writeln!(
             output,
             "#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] \
@@ -287,6 +288,75 @@ pub fn generate_rust(idl: &Idl) -> String {
              fn from(value: {content}Snapshot) -> Self {{ value.into_raw() }} }}"
         )
         .expect("String writes do not fail");
+        if let Some(structure) = idl.structs.iter().find(|item| item.name == content) {
+            let schema_hash = StableId::from_name(&format!("typed-snapshot:{structure:?}"));
+            let encoded = structure
+                .fields
+                .iter()
+                .map(|field| {
+                    snapshot_encode_statements(
+                        idl,
+                        &field.ty,
+                        &format!("&value.{}", field.name),
+                        "__nexa_bytes",
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let decoded = structure
+                .fields
+                .iter()
+                .map(|field| {
+                    format!(
+                        "{}: {},",
+                        field.name,
+                        snapshot_decode_expression(
+                            idl,
+                            &field.ty,
+                            "__nexa_payload",
+                            "__nexa_cursor"
+                        )
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            writeln!(
+                output,
+                "pub struct {content}SnapshotEncoder;\n\
+                 impl {content}SnapshotEncoder {{\n\
+                 pub const CONTENT_TYPE: nexa_runtime::StableId = \
+                 nexa_runtime::StableId({content_id});\n\
+                 pub const SCHEMA_HASH: nexa_runtime::StableId = \
+                 nexa_runtime::StableId({schema_id});\n\
+                 #[allow(clippy::deref_addrof)] \
+                 pub fn encode(value: &{content}) -> Result<nexa_runtime::EncodedSnapshot, \
+                 HostError> {{ let mut __nexa_bytes = Vec::new(); {encoded} \
+                 nexa_runtime::EncodedSnapshot::new(Self::CONTENT_TYPE, Self::SCHEMA_HASH, 1, \
+                 std::sync::Arc::from(__nexa_bytes)).map_err(|error| \
+                 HostError(format!(\"{{error:?}}\"))) }} }}\n\
+                 #[derive(Clone, Copy, Debug)] pub struct {content}SnapshotRef<'a>(\
+                 nexa_runtime::TypedSnapshotRef<'a>);\n\
+                 impl<'a> nexa_runtime::DecodeTypedSnapshot<'a> for \
+                 {content}SnapshotRef<'a> {{\n\
+                 const TYPE_ID: nexa_runtime::StableId = nexa_runtime::StableId({snapshot_type});\n\
+                 const CONTENT_TYPE: nexa_runtime::StableId = \
+                 nexa_runtime::StableId({content_id});\n\
+                 const SCHEMA_HASH: nexa_runtime::StableId = \
+                 nexa_runtime::StableId({schema_id});\n\
+                 const ALIGNMENT: u16 = 1;\n\
+                 fn decode(view: nexa_runtime::TypedSnapshotRef<'a>) -> \
+                 Result<Self, nexa_runtime::HostTrap> {{ Ok(Self(view)) }} }}\n\
+                 impl<'a> {content}SnapshotRef<'a> {{\n\
+                 pub fn decode_owned(self) -> Result<{content}, nexa_runtime::HostTrap> {{ \
+                 let __nexa_payload = self.0.payload(); let mut __nexa_cursor = 0usize; \
+                 let value = {content} {{ {decoded} }}; \
+                 if __nexa_cursor != __nexa_payload.len() {{ \
+                 return Err(nexa_runtime::HostTrap::Type); }} Ok(value) }} }}",
+                content_id = content_type.0,
+                schema_id = schema_hash.0,
+            )
+            .expect("String writes do not fail");
+        }
     }
     for enumeration in &idl.enums {
         writeln!(
@@ -1309,6 +1379,255 @@ fn encode_result(
     )
 }
 
+#[allow(clippy::too_many_lines)]
+fn snapshot_encode_statements(idl: &Idl, ty: &TypeRef, source: &str, bytes: &str) -> String {
+    match ty {
+        TypeRef::I32 | TypeRef::I64 => {
+            format!("{bytes}.extend_from_slice(&(*{source}).to_le_bytes());")
+        }
+        TypeRef::F32 | TypeRef::F64 => {
+            format!("{bytes}.extend_from_slice(&(*{source}).to_bits().to_le_bytes());")
+        }
+        TypeRef::Bool => format!("{bytes}.push(u8::from(*{source}));"),
+        TypeRef::Rune => {
+            format!("{bytes}.extend_from_slice(&u32::from(*{source}).to_le_bytes());")
+        }
+        TypeRef::String => format!(
+            "let __nexa_len = u32::try_from(({source}).len()).map_err(|_| \
+             HostError(\"snapshot string is too large\".into()))?; \
+             {bytes}.extend_from_slice(&__nexa_len.to_le_bytes()); \
+             {bytes}.extend_from_slice(({source}).as_bytes());"
+        ),
+        TypeRef::Array(inner) => {
+            let item = snapshot_encode_statements(idl, inner, "__nexa_item", bytes);
+            format!(
+                "let __nexa_len = u32::try_from(({source}).len()).map_err(|_| \
+                 HostError(\"snapshot array is too large\".into()))?; \
+                 {bytes}.extend_from_slice(&__nexa_len.to_le_bytes()); \
+                 for __nexa_item in ({source}).iter() {{ {item} }}"
+            )
+        }
+        TypeRef::Buffer(inner) => {
+            let item = snapshot_encode_statements(idl, inner, "__nexa_item", bytes);
+            format!(
+                "let __nexa_len = u32::try_from(({source}).len()).map_err(|_| \
+                 HostError(\"snapshot buffer is too large\".into()))?; \
+                 {bytes}.extend_from_slice(&__nexa_len.to_le_bytes()); \
+                 for __nexa_item in ({source}).as_slice() {{ {item} }}"
+            )
+        }
+        TypeRef::Option(inner) => {
+            let some = snapshot_encode_statements(idl, inner, "__nexa_value", bytes);
+            format!(
+                "match {source} {{ Some(__nexa_value) => {{ {bytes}.push(1); {some} }}, \
+                 None => {bytes}.push(0), }}"
+            )
+        }
+        TypeRef::Result(success, error) => {
+            let ok = snapshot_encode_statements(idl, success, "__nexa_value", bytes);
+            let error = snapshot_encode_statements(idl, error, "__nexa_error", bytes);
+            format!(
+                "match {source} {{ Ok(__nexa_value) => {{ {bytes}.push(0); {ok} }}, \
+                 Err(__nexa_error) => {{ {bytes}.push(1); {error} }}, }}"
+            )
+        }
+        TypeRef::Named(name) => {
+            if let Some(structure) = idl.structs.iter().find(|item| item.name == *name) {
+                structure
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        snapshot_encode_statements(
+                            idl,
+                            &field.ty,
+                            &format!("&({source}).{}", field.name),
+                            bytes,
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else if let Some(enumeration) = idl.enums.iter().find(|item| item.name == *name) {
+                let arms = enumeration
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .map(|(tag, variant)| {
+                        variant.payload.as_ref().map_or_else(
+                            || {
+                                format!(
+                                    "{name}::{} => {bytes}.extend_from_slice(&{tag}_u32.to_le_bytes()),",
+                                    variant.name
+                                )
+                            },
+                            |payload| {
+                                let encoded = snapshot_encode_statements(
+                                    idl,
+                                    payload,
+                                    "__nexa_payload",
+                                    bytes,
+                                );
+                                format!(
+                                    "{name}::{}(__nexa_payload) => {{ \
+                                     {bytes}.extend_from_slice(&{tag}_u32.to_le_bytes()); \
+                                     {encoded} }},",
+                                    variant.name
+                                )
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("match {source} {{ {arms} }}")
+            } else {
+                format!("{bytes}.extend_from_slice(&({source}).0.to_le_bytes());")
+            }
+        }
+        TypeRef::HostRequest(_) | TypeRef::ResourceToken(_) | TypeRef::Snapshot(_) => {
+            "return Err(HostError(\"host handles cannot be embedded in snapshots\".into()));".into()
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn snapshot_decode_expression(idl: &Idl, ty: &TypeRef, payload: &str, cursor: &str) -> String {
+    let fixed = |size: usize, conversion: &str| {
+        format!(
+            "{{ let __nexa_end = {cursor}.checked_add({size}).ok_or(\
+             nexa_runtime::HostTrap::Type)?; let __nexa_slice = {payload}.get({cursor}..__nexa_end)\
+             .ok_or(nexa_runtime::HostTrap::Type)?; {cursor} = __nexa_end; \
+             {conversion} }}"
+        )
+    };
+    match ty {
+        TypeRef::I32 => fixed(
+            4,
+            "i32::from_le_bytes(__nexa_slice.try_into().map_err(|_| nexa_runtime::HostTrap::Type)?)",
+        ),
+        TypeRef::I64 => fixed(
+            8,
+            "i64::from_le_bytes(__nexa_slice.try_into().map_err(|_| nexa_runtime::HostTrap::Type)?)",
+        ),
+        TypeRef::F32 => fixed(
+            4,
+            "f32::from_bits(u32::from_le_bytes(__nexa_slice.try_into().map_err(|_| \
+             nexa_runtime::HostTrap::Type)?))",
+        ),
+        TypeRef::F64 => fixed(
+            8,
+            "f64::from_bits(u64::from_le_bytes(__nexa_slice.try_into().map_err(|_| \
+             nexa_runtime::HostTrap::Type)?))",
+        ),
+        TypeRef::Bool => format!(
+            "{{ let __nexa_value = *{payload}.get({cursor}).ok_or(\
+             nexa_runtime::HostTrap::Type)?; {cursor} += 1; match __nexa_value {{ \
+             0 => false, 1 => true, _ => return Err(nexa_runtime::HostTrap::Type), }} }}"
+        ),
+        TypeRef::Rune => {
+            let value = fixed(
+                4,
+                "u32::from_le_bytes(__nexa_slice.try_into().map_err(|_| \
+                 nexa_runtime::HostTrap::Type)?)",
+            );
+            format!("char::from_u32({value}).ok_or(nexa_runtime::HostTrap::Type)?")
+        }
+        TypeRef::String => {
+            let length = snapshot_decode_expression(idl, &TypeRef::I32, payload, cursor);
+            format!(
+                "{{ let __nexa_len = usize::try_from({length}).map_err(|_| \
+                 nexa_runtime::HostTrap::Type)?; let __nexa_end = {cursor}.checked_add(__nexa_len)\
+                 .ok_or(nexa_runtime::HostTrap::Type)?; let __nexa_value = std::str::from_utf8(\
+                 {payload}.get({cursor}..__nexa_end).ok_or(nexa_runtime::HostTrap::Type)?)\
+                 .map_err(|_| nexa_runtime::HostTrap::Type)?.to_owned(); {cursor} = __nexa_end; \
+                 __nexa_value }}"
+            )
+        }
+        TypeRef::Array(inner) => {
+            let length = snapshot_decode_expression(idl, &TypeRef::I32, payload, cursor);
+            let item = snapshot_decode_expression(idl, inner, payload, cursor);
+            format!(
+                "{{ let __nexa_len = usize::try_from({length}).map_err(|_| \
+                 nexa_runtime::HostTrap::Type)?; let mut __nexa_values = \
+                 Vec::with_capacity(__nexa_len); for _ in 0..__nexa_len {{ \
+                 __nexa_values.push({item}); }} __nexa_values }}"
+            )
+        }
+        TypeRef::Buffer(inner) => {
+            let array =
+                snapshot_decode_expression(idl, &TypeRef::Array(inner.clone()), payload, cursor);
+            format!("nexa_runtime::CopyBuffer::new({array})")
+        }
+        TypeRef::Option(inner) => {
+            let value = snapshot_decode_expression(idl, inner, payload, cursor);
+            format!(
+                "{{ let __nexa_tag = *{payload}.get({cursor}).ok_or(\
+                 nexa_runtime::HostTrap::Type)?; {cursor} += 1; match __nexa_tag {{ \
+                 0 => None, 1 => Some({value}), _ => return Err(nexa_runtime::HostTrap::Type), }} }}"
+            )
+        }
+        TypeRef::Result(success, error) => {
+            let success = snapshot_decode_expression(idl, success, payload, cursor);
+            let error = snapshot_decode_expression(idl, error, payload, cursor);
+            format!(
+                "{{ let __nexa_tag = *{payload}.get({cursor}).ok_or(\
+                 nexa_runtime::HostTrap::Type)?; {cursor} += 1; match __nexa_tag {{ \
+                 0 => Ok({success}), 1 => Err({error}), \
+                 _ => return Err(nexa_runtime::HostTrap::Type), }} }}"
+            )
+        }
+        TypeRef::Named(name) => {
+            if let Some(structure) = idl.structs.iter().find(|item| item.name == *name) {
+                let fields = structure
+                    .fields
+                    .iter()
+                    .map(|field| {
+                        format!(
+                            "{}: {},",
+                            field.name,
+                            snapshot_decode_expression(idl, &field.ty, payload, cursor)
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!("{name} {{ {fields} }}")
+            } else if let Some(enumeration) = idl.enums.iter().find(|item| item.name == *name) {
+                let tag = snapshot_decode_expression(idl, &TypeRef::I32, payload, cursor);
+                let arms = enumeration
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .map(|(tag, variant)| {
+                        variant.payload.as_ref().map_or_else(
+                            || format!("{tag} => {name}::{},", variant.name),
+                            |item| {
+                                format!(
+                                    "{tag} => {name}::{}({}),",
+                                    variant.name,
+                                    snapshot_decode_expression(idl, item, payload, cursor)
+                                )
+                            },
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                format!(
+                    "{{ let __nexa_tag = {tag}; match __nexa_tag {{ {arms} \
+                     _ => return Err(nexa_runtime::HostTrap::Type), }} }}"
+                )
+            } else {
+                let value = fixed(
+                    8,
+                    "u64::from_le_bytes(__nexa_slice.try_into().map_err(|_| \
+                     nexa_runtime::HostTrap::Type)?)",
+                );
+                format!("{name}({value})")
+            }
+        }
+        TypeRef::HostRequest(_) | TypeRef::ResourceToken(_) | TypeRef::Snapshot(_) => {
+            "return Err(nexa_runtime::HostTrap::Type)".into()
+        }
+    }
+}
+
 fn type_name(ty: &TypeRef) -> String {
     match ty {
         TypeRef::I32 => "i32".into(),
@@ -2102,6 +2421,41 @@ mod tests {
             "pub const EXPORT_ID",
         ] {
             assert!(first.contains(expected), "{expected}");
+        }
+    }
+
+    #[test]
+    fn typed_snapshot_codec() {
+        let generated = generate_rust(
+            &parse(
+                "interface Snapshots {
+                    struct Position { x: i32; y: i32; }
+                    enum Status { Idle, Named(string) }
+                    struct EnemyView {
+                        health: i32;
+                        name: string;
+                        status: Status;
+                        samples: array<i32>;
+                        position: Position;
+                    }
+                    sync fn view() -> snapshot<EnemyView>;
+                }",
+            )
+            .unwrap(),
+        );
+        for required in [
+            "pub struct EnemyViewSnapshotEncoder",
+            "pub struct EnemyViewSnapshotRef<'a>",
+            "impl<'a> nexa_runtime::DecodeTypedSnapshot<'a>",
+            "pub const SCHEMA_HASH",
+            "EncodedSnapshot::new",
+            "decode_owned",
+            "std::str::from_utf8",
+            "Vec::with_capacity",
+            "Status::Named",
+            "Position {",
+        ] {
+            assert!(generated.contains(required), "{required}\n{generated}");
         }
     }
 

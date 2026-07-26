@@ -267,8 +267,8 @@ impl Trap {
     #[must_use]
     pub const fn diagnostic_code(&self) -> &'static str {
         match self.kind {
-            TrapKind::Host => "NX5001",
-            TrapKind::BytecodeTrap
+            TrapKind::Host
+            | TrapKind::BytecodeTrap
             | TrapKind::DivideByZero
             | TrapKind::StringIndexOutOfBounds
             | TrapKind::ArrayIndexOutOfBounds

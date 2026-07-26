@@ -58,8 +58,10 @@ impl generated::GameHost for EngineHost {
         &mut self,
         context: &mut ResourceContext<'_>,
     ) -> Result<generated::EnemyViewSnapshot, generated::HostError> {
+        let value = generated::EnemyView { health: 10 };
+        let encoded = generated::EnemyViewSnapshotEncoder::encode(&value)?;
         context
-            .create_snapshot(StableId::from_name("EnemyView"), Arc::from([10, 20, 30]))
+            .create_typed_snapshot(encoded)
             .map(|handle| {
                 generated::EnemyViewSnapshot::try_from_raw(handle)
                     .expect("snapshot was created with the generated content type")

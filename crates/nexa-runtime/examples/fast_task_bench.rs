@@ -220,13 +220,17 @@ fn main() {
         let (mut realm, module, scope, host) = loaded_hosted(fast.clone());
         let task = call(&mut realm, module, scope, 1);
         let snapshot = realm
-            .create_snapshot(
+            .create_typed_snapshot(
                 task,
-                nexa_core::StableId::from_name("BenchSnapshot"),
-                [1, 2, 3].into(),
+                nexa_runtime::EncodedSnapshot::copy_i32_slice(
+                    nexa_core::StableId::from_name("BenchSnapshot"),
+                    nexa_core::StableId::from_name("BenchSnapshot::snapshot-schema"),
+                    &[1, 2, 3],
+                )
+                .unwrap(),
             )
             .unwrap();
-        black_box(realm.snapshot_data(snapshot).unwrap());
+        black_box(realm.snapshot_payload(snapshot).unwrap());
         drop(realm);
         let _ = host.drain_releases();
         let _ = host.begin_close();

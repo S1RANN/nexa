@@ -2841,13 +2841,92 @@ impl SnapshotHandle {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotLayout {
+    pub size: u32,
+    pub alignment: u16,
+    pub schema_hash: StableId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EncodedSnapshot {
+    pub type_id: StableId,
+    pub content_type: StableId,
+    pub payload: Arc<[u8]>,
+    pub layout: SnapshotLayout,
+}
+
+impl EncodedSnapshot {
+    pub fn new(
+        content_type: StableId,
+        schema_hash: StableId,
+        alignment: u16,
+        payload: Arc<[u8]>,
+    ) -> Result<Self, HostTrap> {
+        let size = u32::try_from(payload.len()).map_err(|_| HostTrap::Type)?;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(HostTrap::Type);
+        }
+        Ok(Self {
+            type_id: nexa_bytecode::snapshot_type(content_type),
+            content_type,
+            payload,
+            layout: SnapshotLayout {
+                size,
+                alignment,
+                schema_hash,
+            },
+        })
+    }
+
+    pub fn copy_i32_slice(
+        content_type: StableId,
+        schema_hash: StableId,
+        values: &[i32],
+    ) -> Result<Self, HostTrap> {
+        let mut bytes = Vec::with_capacity(values.len().saturating_mul(std::mem::size_of::<i32>()));
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Self::new(content_type, schema_hash, 4, Arc::from(bytes))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypedSnapshotRef<'a> {
+    pub(crate) payload: &'a [u8],
+    pub(crate) layout: SnapshotLayout,
+}
+
+impl<'a> TypedSnapshotRef<'a> {
+    #[must_use]
+    pub const fn payload(self) -> &'a [u8] {
+        self.payload
+    }
+
+    #[must_use]
+    pub const fn layout(self) -> SnapshotLayout {
+        self.layout
+    }
+}
+
+pub trait DecodeTypedSnapshot<'a>: Sized {
+    const TYPE_ID: StableId;
+    const CONTENT_TYPE: StableId;
+    const SCHEMA_HASH: StableId;
+    const ALIGNMENT: u16;
+
+    fn decode(view: TypedSnapshotRef<'a>) -> Result<Self, HostTrap>;
+}
+
 #[derive(Debug)]
 struct SnapshotEntry {
     module_id: u32,
     epoch: u64,
     type_id: StableId,
     content_type: StableId,
-    data: Arc<[i32]>,
+    payload: Arc<[u8]>,
+    layout: SnapshotLayout,
     external_bytes: usize,
     release: ReleaseReservation,
 }
@@ -2874,19 +2953,27 @@ impl SnapshotManager {
         _owner: TaskHandle,
         module_id: u32,
         epoch: u64,
-        content_type: StableId,
-        data: Arc<[i32]>,
+        encoded: EncodedSnapshot,
         releases: &mut ReleaseQueue,
     ) -> Result<SnapshotHandle, HostRequestError> {
         let release = releases.reserve(module_id, epoch)?;
-        let type_id = nexa_bytecode::snapshot_type(content_type);
-        let external_bytes = data.len().saturating_mul(std::mem::size_of::<i32>());
+        if encoded.type_id != nexa_bytecode::snapshot_type(encoded.content_type)
+            || encoded.layout.size as usize != encoded.payload.len()
+            || encoded.layout.alignment == 0
+            || !encoded.layout.alignment.is_power_of_two()
+        {
+            releases.cancel_reservation(release);
+            return Err(HostRequestError::InvalidState);
+        }
+        let external_bytes = encoded.payload.len();
+        let type_id = encoded.type_id;
         match self.snapshots.try_allocate(SnapshotEntry {
             module_id,
             epoch,
             type_id,
-            content_type,
-            data,
+            content_type: encoded.content_type,
+            payload: encoded.payload,
+            layout: encoded.layout,
             external_bytes,
             release,
         }) {
@@ -2901,8 +2988,12 @@ impl SnapshotManager {
         }
     }
 
-    pub fn data(&self, handle: SnapshotHandle) -> Result<&[i32], HostRequestError> {
-        Ok(&self.resolve(handle)?.data)
+    pub fn payload(&self, handle: SnapshotHandle) -> Result<&[u8], HostRequestError> {
+        Ok(&self.resolve(handle)?.payload)
+    }
+
+    pub fn layout(&self, handle: SnapshotHandle) -> Result<SnapshotLayout, HostRequestError> {
+        Ok(self.resolve(handle)?.layout)
     }
 
     pub fn external_bytes(&self, handle: SnapshotHandle) -> Result<usize, HostRequestError> {
@@ -3180,8 +3271,15 @@ impl RuntimeResources {
         self.releases.transfer_to_host()
     }
 
-    pub fn snapshot_data(&self, snapshot: SnapshotHandle) -> Result<&[i32], HostRequestError> {
-        self.snapshots.data(snapshot)
+    pub fn snapshot_payload(&self, snapshot: SnapshotHandle) -> Result<&[u8], HostRequestError> {
+        self.snapshots.payload(snapshot)
+    }
+
+    pub fn snapshot_layout(
+        &self,
+        snapshot: SnapshotHandle,
+    ) -> Result<SnapshotLayout, HostRequestError> {
+        self.snapshots.layout(snapshot)
     }
 
     pub fn snapshot_external_bytes(
@@ -3372,10 +3470,9 @@ impl ResourceContext<'_> {
         Ok(token)
     }
 
-    pub fn create_snapshot(
+    pub fn create_typed_snapshot(
         &mut self,
-        content_type: StableId,
-        data: Arc<[i32]>,
+        encoded: EncodedSnapshot,
     ) -> Result<SnapshotHandle, HostRequestError> {
         self.admit(HostAdmissionKind::Snapshot)?;
         self.fail_if_injected(crate::RuntimeFailurePoint::SnapshotSlot)?;
@@ -3384,8 +3481,7 @@ impl ResourceContext<'_> {
             self.task,
             self.module_id,
             self.epoch,
-            content_type,
-            data,
+            encoded,
             &mut self.resources.releases,
         )?;
         debug_assert!(self.resources.ownership.len() < self.resources.ownership.capacity());
@@ -3581,10 +3677,11 @@ mod tests {
     use nexa_core::RawHandle;
 
     use super::{
-        HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload, HostRequestError,
-        HostRequestHandle, HostRequestManager, ReleaseKind, ReleaseQueue, ReleaseQueueError,
-        ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostArgs,
-        RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotManager,
+        EncodedSnapshot, HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload,
+        HostRequestError, HostRequestHandle, HostRequestManager, ReleaseKind, ReleaseQueue,
+        ReleaseQueueError, ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostArgs,
+        RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, SnapshotLayout,
+        SnapshotManager,
     };
     use crate::{Heap, Object, RuntimeLimits, RuntimeValue, StableId, TaskRuntime};
 
@@ -3693,30 +3790,44 @@ mod tests {
         let task = runtime.admit_task(scope, 1, true).unwrap();
         let mut releases = ReleaseQueue::new(1);
         let mut snapshots = SnapshotManager::new(1, 1);
+        let content_type = nexa_core::StableId::from_name("EnemyView");
+        let schema_hash = nexa_core::StableId::from_name("EnemyView::snapshot-schema");
         let snapshot = snapshots
             .create(
                 task,
                 0,
                 1,
-                nexa_core::StableId::from_name("EnemyView"),
-                Arc::<[i32]>::from([1, 2, 3]),
+                EncodedSnapshot::copy_i32_slice(content_type, schema_hash, &[1, 2, 3]).unwrap(),
                 &mut releases,
             )
             .unwrap();
-        let content_type = nexa_core::StableId::from_name("EnemyView");
         assert_eq!(
             snapshot.type_id(),
             nexa_bytecode::snapshot_type(content_type)
         );
         assert_eq!(snapshots.content_type(snapshot), Ok(content_type));
-        assert_eq!(snapshots.data(snapshot).unwrap(), &[1, 2, 3]);
+        assert_eq!(
+            snapshots.payload(snapshot).unwrap(),
+            &[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]
+        );
+        assert_eq!(
+            snapshots.layout(snapshot).unwrap(),
+            SnapshotLayout {
+                size: 12,
+                alignment: 4,
+                schema_hash,
+            }
+        );
         assert_eq!(snapshots.external_bytes(snapshot).unwrap(), 12);
         let wrong_content = nexa_core::StableId::from_name("OtherView");
         let forged = super::SnapshotHandle {
             raw: snapshot.raw(),
             type_id: nexa_bytecode::snapshot_type(wrong_content),
         };
-        assert_eq!(snapshots.data(forged), Err(HostRequestError::InvalidState));
+        assert_eq!(
+            snapshots.payload(forged),
+            Err(HostRequestError::InvalidState)
+        );
         assert!(releases.reserve(0, 1).is_err());
         assert_eq!(releases.state(), ReleaseQueueState::Stalled);
         snapshots.release(snapshot, &mut releases).unwrap();
@@ -4168,8 +4279,12 @@ mod tests {
                 task,
                 2,
                 3,
-                nexa_core::StableId::from_name("EnemyView"),
-                Arc::from([1]),
+                EncodedSnapshot::copy_i32_slice(
+                    nexa_core::StableId::from_name("EnemyView"),
+                    nexa_core::StableId::from_name("EnemyView::snapshot-schema"),
+                    &[1],
+                )
+                .unwrap(),
                 &mut snapshot_releases,
             ),
             Err(HostRequestError::HostClosing)

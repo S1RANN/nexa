@@ -497,10 +497,14 @@ impl RealmV5RuntimeAdapter {
                 let task = self.live_task(0)?;
                 self.fixtures.snapshots[0] = Some(
                     self.realm
-                        .create_snapshot(
+                        .create_typed_snapshot(
                             task,
-                            StableId::from_name("RealmV5Snapshot"),
-                            Arc::from([1, 2, 3]),
+                            crate::EncodedSnapshot::copy_i32_slice(
+                                StableId::from_name("RealmV5Snapshot"),
+                                StableId::from_name("RealmV5Snapshot::snapshot-schema"),
+                                &[1, 2, 3],
+                            )
+                            .map_err(debug)?,
                         )
                         .map_err(debug)?,
                 );

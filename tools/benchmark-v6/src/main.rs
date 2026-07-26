@@ -279,10 +279,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let snapshot_module = snapshot_realm.load_module(fast.clone(), HOST, SCHEMA_V1)?;
     let snapshot_scope = snapshot_realm.create_scope(None)?;
     let snapshot_task = call(&mut snapshot_realm, snapshot_module, snapshot_scope, 1)?;
-    let snapshot = snapshot_realm.create_snapshot(
+    let snapshot = snapshot_realm.create_typed_snapshot(
         snapshot_task,
-        StableId::from_name("BenchSnapshot"),
-        Arc::from([1_i32, 2, 3, 4]),
+        nexa_runtime::EncodedSnapshot::copy_i32_slice(
+            StableId::from_name("BenchSnapshot"),
+            StableId::from_name("BenchSnapshot::snapshot-schema"),
+            &[1_i32, 2, 3, 4],
+        )
+        .expect("benchmark snapshot encoding is fixed"),
     )?;
     cases.push(bench(
         "snapshot_access",
@@ -291,7 +295,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |()| {
             black_box(
                 snapshot_realm
-                    .snapshot_data(snapshot)
+                    .snapshot_payload(snapshot)
                     .expect("snapshot data"),
             );
             Observation {
