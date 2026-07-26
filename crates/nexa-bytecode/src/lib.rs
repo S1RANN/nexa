@@ -97,6 +97,7 @@ pub enum ValueType {
     F64,
     Bool,
     Rune,
+    String,
     Ref,
     Named(StableId),
 }
@@ -104,7 +105,7 @@ pub enum ValueType {
 impl ValueType {
     #[must_use]
     pub const fn is_reference(self) -> bool {
-        matches!(self, Self::Ref | Self::Named(_))
+        matches!(self, Self::String | Self::Ref | Self::Named(_))
     }
 }
 
@@ -282,6 +283,7 @@ pub fn parameterized_type_id(name: &str, arguments: &[ValueType]) -> StableId {
             ValueType::F64 => canonical.push_str("f64"),
             ValueType::Bool => canonical.push_str("bool"),
             ValueType::Rune => canonical.push_str("rune"),
+            ValueType::String => canonical.push_str("string"),
             ValueType::Ref => canonical.push_str("ref"),
             ValueType::Named(id) => {
                 use std::fmt::Write;
@@ -400,6 +402,10 @@ pub enum Instruction {
         dst: u16,
         value: u32,
     },
+    LoadString {
+        dst: u16,
+        string: u32,
+    },
     Move {
         dst: u16,
         source: u16,
@@ -483,6 +489,33 @@ pub enum Instruction {
         dst: u16,
         lhs: u16,
         rhs: u16,
+    },
+    StringLen {
+        dst: u16,
+        source: u16,
+    },
+    StringByteLen {
+        dst: u16,
+        source: u16,
+    },
+    StringEqual {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringConcat {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    StringRuneAt {
+        dst: u16,
+        source: u16,
+        index: u16,
+    },
+    StringHash {
+        dst: u16,
+        source: u16,
     },
     CompareEq {
         dst: u16,
@@ -619,6 +652,7 @@ pub struct Function {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Module {
+    pub strings: Vec<String>,
     pub functions: Vec<Function>,
     pub enum_types: Vec<EnumType>,
     pub host_imports: Vec<HostImport>,
@@ -748,9 +782,10 @@ fn hash_value_type(hash: &mut u64, value: ValueType) {
         ValueType::F64 => hash_u64(hash, 3),
         ValueType::Bool => hash_u64(hash, 4),
         ValueType::Rune => hash_u64(hash, 5),
-        ValueType::Ref => hash_u64(hash, 6),
+        ValueType::String => hash_u64(hash, 6),
+        ValueType::Ref => hash_u64(hash, 7),
         ValueType::Named(stable_id) => {
-            hash_u64(hash, 7);
+            hash_u64(hash, 8);
             hash_u64(hash, stable_id.0);
         }
     }
@@ -764,6 +799,7 @@ pub enum DecodeError {
     InvalidType(u8),
     InvalidOpcode(u8),
     InvalidBoolean(u8),
+    InvalidUtf8,
     TrailingBytes,
     SizeOverflow,
     InvalidSectionDirectory,
@@ -1148,13 +1184,25 @@ impl Module {
             put_u32(&mut source_map, entry.span.start);
             put_u32(&mut source_map, entry.span.end);
         }
+        let mut strings = Vec::new();
+        put_u32(
+            &mut strings,
+            u32::try_from(self.strings.len()).expect("string count exceeds wire format"),
+        );
+        for string in &self.strings {
+            put_u32(
+                &mut strings,
+                u32::try_from(string.len()).expect("string length exceeds wire format"),
+            );
+            strings.extend_from_slice(string.as_bytes());
+        }
         let empty = || {
             let mut section = Vec::new();
             put_u32(&mut section, 0);
             section
         };
         encode_sections(&[
-            (SectionKind::Strings, empty()),
+            (SectionKind::Strings, strings),
             (SectionKind::Types, empty()),
             (SectionKind::Constants, empty()),
             (SectionKind::Enums, enums),
@@ -1227,6 +1275,24 @@ impl Module {
             limits.max_reload_metadata_bytes,
             "reload metadata bytes",
         )?;
+        let mut string_reader = Reader {
+            bytes: required_section(&sections, SectionKind::Strings)?,
+            cursor: 0,
+        };
+        let string_count =
+            usize::try_from(string_reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        enforce_limit(string_count, limits.max_strings, "strings")?;
+        let mut strings = Vec::with_capacity(string_count);
+        for _ in 0..string_count {
+            let length =
+                usize::try_from(string_reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+            let value = std::str::from_utf8(string_reader.take(length)?)
+                .map_err(|_| DecodeError::InvalidUtf8)?;
+            strings.push(value.to_owned());
+        }
+        if string_reader.remaining() != 0 {
+            return Err(DecodeError::TrailingBytes);
+        }
         let mut metadata = Vec::new();
         metadata.extend_from_slice(
             required_section(&sections, SectionKind::ReloadMetadata)?
@@ -1590,6 +1656,7 @@ impl Module {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(Self {
+            strings,
             functions,
             enum_types,
             host_imports,
@@ -1840,6 +1907,7 @@ fn encode_type(output: &mut Vec<u8>, ty: ValueType) {
         ValueType::F32 => output.push(5),
         ValueType::F64 => output.push(6),
         ValueType::Rune => output.push(7),
+        ValueType::String => output.push(8),
     }
 }
 
@@ -1853,6 +1921,7 @@ fn decode_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
         5 => Ok(ValueType::F32),
         6 => Ok(ValueType::F64),
         7 => Ok(ValueType::Rune),
+        8 => Ok(ValueType::String),
         value => Err(DecodeError::InvalidType(value)),
     }
 }
@@ -1889,6 +1958,11 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             output.push(39);
             put_u16(output, dst);
             put_u32(output, value);
+        }
+        Instruction::LoadString { dst, string } => {
+            output.push(53);
+            put_u16(output, dst);
+            put_u32(output, string);
         }
         Instruction::Move { dst, source } => {
             output.push(2);
@@ -1941,6 +2015,35 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
                 Instruction::SubF64 { .. } => 50,
                 Instruction::MulF64 { .. } => 51,
                 Instruction::DivF64 { .. } => 52,
+                _ => unreachable!(),
+            });
+            put_u16(output, dst);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+        }
+        Instruction::StringLen { dst, source }
+        | Instruction::StringByteLen { dst, source }
+        | Instruction::StringHash { dst, source } => {
+            output.push(match instruction {
+                Instruction::StringLen { .. } => 54,
+                Instruction::StringByteLen { .. } => 55,
+                Instruction::StringHash { .. } => 59,
+                _ => unreachable!(),
+            });
+            put_u16(output, dst);
+            put_u16(output, source);
+        }
+        Instruction::StringEqual { dst, lhs, rhs }
+        | Instruction::StringConcat { dst, lhs, rhs }
+        | Instruction::StringRuneAt {
+            dst,
+            source: lhs,
+            index: rhs,
+        } => {
+            output.push(match instruction {
+                Instruction::StringEqual { .. } => 56,
+                Instruction::StringConcat { .. } => 57,
+                Instruction::StringRuneAt { .. } => 58,
                 _ => unreachable!(),
             });
             put_u16(output, dst);
@@ -2333,6 +2436,35 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 _ => unreachable!(),
             }
         }
+        53 => Instruction::LoadString {
+            dst: reader.u16()?,
+            string: reader.u32()?,
+        },
+        opcode @ (54..=55 | 59) => {
+            let dst = reader.u16()?;
+            let source = reader.u16()?;
+            match opcode {
+                54 => Instruction::StringLen { dst, source },
+                55 => Instruction::StringByteLen { dst, source },
+                59 => Instruction::StringHash { dst, source },
+                _ => unreachable!(),
+            }
+        }
+        opcode @ 56..=58 => {
+            let dst = reader.u16()?;
+            let lhs = reader.u16()?;
+            let rhs = reader.u16()?;
+            match opcode {
+                56 => Instruction::StringEqual { dst, lhs, rhs },
+                57 => Instruction::StringConcat { dst, lhs, rhs },
+                58 => Instruction::StringRuneAt {
+                    dst,
+                    source: lhs,
+                    index: rhs,
+                },
+                _ => unreachable!(),
+            }
+        }
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -2439,6 +2571,7 @@ impl std::error::Error for BuildError {}
 
 #[derive(Default)]
 pub struct ModuleBuilder {
+    strings: Vec<String>,
     functions: Vec<Function>,
     enum_types: Vec<EnumType>,
     host_imports: Vec<HostImport>,
@@ -2454,6 +2587,7 @@ impl ModuleBuilder {
     #[must_use]
     pub const fn new() -> Self {
         Self {
+            strings: Vec::new(),
             functions: Vec::new(),
             enum_types: Vec::new(),
             host_imports: Vec::new(),
@@ -2489,6 +2623,16 @@ impl ModuleBuilder {
         let id = u32::try_from(self.functions.len()).expect("module function count exceeds u32");
         self.functions.push(function);
         id
+    }
+
+    pub fn string(&mut self, value: impl Into<String>) -> u32 {
+        let value = value.into();
+        if let Some(index) = self.strings.iter().position(|existing| *existing == value) {
+            return u32::try_from(index).expect("module string count exceeds u32");
+        }
+        let index = u32::try_from(self.strings.len()).expect("module string count exceeds u32");
+        self.strings.push(value);
+        index
     }
 
     pub fn host_import(&mut self, import: HostImport) -> u32 {
@@ -2535,6 +2679,7 @@ impl ModuleBuilder {
     #[must_use]
     pub fn finish(self) -> Module {
         let mut module = Module {
+            strings: self.strings,
             functions: self.functions,
             enum_types: self.enum_types,
             host_imports: self.host_imports,
@@ -3195,5 +3340,69 @@ mod tests {
         builder.function(function.finish().unwrap());
         let module = builder.finish();
         assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v4() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I64),
+            },
+            8,
+        );
+        function
+            .emit(Instruction::LoadString { dst: 0, string: 0 })
+            .emit(Instruction::LoadString { dst: 1, string: 1 })
+            .emit(Instruction::StringLen { dst: 2, source: 0 })
+            .emit(Instruction::StringByteLen { dst: 3, source: 0 })
+            .emit(Instruction::StringEqual {
+                dst: 4,
+                lhs: 0,
+                rhs: 1,
+            })
+            .emit(Instruction::StringConcat {
+                dst: 5,
+                lhs: 0,
+                rhs: 1,
+            })
+            .emit(Instruction::StringRuneAt {
+                dst: 6,
+                source: 5,
+                index: 2,
+            })
+            .emit(Instruction::StringHash { dst: 7, source: 5 })
+            .emit(Instruction::Return { source: 7 });
+        let mut builder = ModuleBuilder::new();
+        assert_eq!(builder.string("a界"), 0);
+        assert_eq!(builder.string("!"), 1);
+        assert_eq!(builder.string("a界"), 0);
+        builder.function(function.finish().unwrap());
+        let module = builder.finish();
+        let encoded = module.encode();
+        assert_eq!(Module::decode(&encoded), Ok(module));
+        assert_eq!(
+            Module::decode_with_limits(
+                &encoded,
+                DecodeLimits {
+                    max_strings: 1,
+                    ..DecodeLimits::default()
+                }
+            ),
+            Err(DecodeError::ResourceLimit("strings"))
+        );
+
+        let mut invalid_utf8 = encoded.clone();
+        let entry = Module::inspect_section_directory(&encoded, DecodeLimits::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == SectionKind::Strings as u16)
+            .unwrap();
+        let offset = entry.offset as usize;
+        let length = entry.length as usize;
+        invalid_utf8[offset + 8] = 0xff;
+        let checksum = super::checksum(&invalid_utf8[offset..offset + length]);
+        invalid_utf8[24..28].copy_from_slice(&checksum.to_le_bytes());
+        assert_eq!(Module::decode(&invalid_utf8), Err(DecodeError::InvalidUtf8));
     }
 }

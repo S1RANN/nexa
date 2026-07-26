@@ -143,6 +143,11 @@ fn render_module_dump(
         }
     }
     let render = |kind| selected.is_none_or(|selected| selected == kind);
+    if render(nexa_bytecode::SectionKind::Strings) {
+        for (index, string) in module.strings.iter().enumerate() {
+            writeln!(output, "string {index} {string:?}").expect("String writes do not fail");
+        }
+    }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
             writeln!(
@@ -1024,6 +1029,7 @@ mod tests {
             .emit(Instruction::LoadI32 { dst: 0, value: 7 })
             .emit(Instruction::Return { source: 0 });
         let mut builder = ModuleBuilder::new();
+        builder.string("Nexa界\n");
         builder.function(function.finish().unwrap());
         builder.source_map([
             SourceMapEntry {
@@ -1049,6 +1055,7 @@ mod tests {
         );
         assert!(full.contains("header magic=NXBC version=4 sections=16"));
         assert!(full.contains("000000 LoadI32"));
+        assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(
             full.find("pc=0..1")
                 .expect("first source map entry is present")

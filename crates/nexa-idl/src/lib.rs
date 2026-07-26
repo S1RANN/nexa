@@ -386,6 +386,7 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::F64 => format!("nexa_runtime::HostPayload::F64({source}.to_bits())"),
         TypeRef::Bool => format!("nexa_runtime::HostPayload::Bool({source})"),
         TypeRef::Rune => format!("nexa_runtime::HostPayload::Rune({source} as u32)"),
+        TypeRef::String => format!("nexa_runtime::HostPayload::String({source})"),
         TypeRef::ResourceToken(_) => format!("nexa_runtime::HostPayload::Token({source})"),
         TypeRef::Snapshot(_) => format!("nexa_runtime::HostPayload::Snapshot({source})"),
         TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
@@ -988,6 +989,7 @@ mod tests {
                 sync fn add(lhs: i32, rhs: i32) -> i32;
                 sync fn position(entity: Entity, value: Vec3) -> Vec3;
                 sync fn scalar_mix(wide: i64, ratio: f64, glyph: rune) -> f64;
+                sync fn echo(value: string) -> string;
                 sync fn explode() -> i32;
                 export Update(value: i32) -> i32;
             }",
@@ -1050,6 +1052,14 @@ impl GameHost for Mock {
         Ok(wide as f64 + ratio + f64::from(glyph as u32))
     }
 
+    fn echo(
+        &mut self,
+        _: &mut nexa_runtime::ResourceContext<'_>,
+        value: String,
+    ) -> Result<String, HostError> {
+        Ok(value)
+    }
+
     fn explode(
         &mut self,
         _: &mut nexa_runtime::ResourceContext<'_>,
@@ -1094,7 +1104,17 @@ fn main() {
         HostCallOutcome::Immediate(HostValue::F64(69.5))
     );
     assert_eq!(
-        registry.call(3, &mut context, HostArgs::new(&[])),
+        registry
+            .call(
+                3,
+                &mut context,
+                HostArgs::new(&[HostValue::String("Nexa界".into())]),
+            )
+            .unwrap(),
+        HostCallOutcome::Immediate(HostValue::String("Nexa界".into()))
+    );
+    assert_eq!(
+        registry.call(4, &mut context, HostArgs::new(&[])),
         Err(nexa_runtime::HostTrap::Panicked)
     );
 }

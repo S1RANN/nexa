@@ -189,6 +189,7 @@ fn fixture_schema(schema: &nexa_bytecode::StateSchema) -> StateFixtureSchema {
                             ValueType::F64 => StateFixtureValueKind::F64,
                             ValueType::Bool => StateFixtureValueKind::Bool,
                             ValueType::Rune => StateFixtureValueKind::Rune,
+                            ValueType::String => StateFixtureValueKind::String,
                             ValueType::Ref => StateFixtureValueKind::ObjectReference,
                             ValueType::Named(_) => StateFixtureValueKind::StateHandle,
                         },
@@ -231,6 +232,7 @@ fn offline_field(
         StateFixtureValue::F64 { value } => OfflineStateValue::F64(value.to_bits()),
         StateFixtureValue::Bool { value } => OfflineStateValue::Bool(*value),
         StateFixtureValue::Rune { value } => OfflineStateValue::Rune((*value).into()),
+        StateFixtureValue::String { value } => OfflineStateValue::String(value.clone()),
         StateFixtureValue::StateHandle {
             domain,
             stable_id,
@@ -241,7 +243,7 @@ fn offline_field(
             generation: u32::try_from(*generation)
                 .expect("fixture validation rejects generation overflow"),
         }),
-        value => {
+        value @ StateFixtureValue::ObjectReference { .. } => {
             return Err(MigrateCheckError::UnsupportedFixtureValue {
                 object: object.stable_id,
                 field: field.stable_id,
@@ -258,7 +260,8 @@ fn offline_field(
             | OfflineStateValue::F32(_)
             | OfflineStateValue::F64(_)
             | OfflineStateValue::Bool(_)
-            | OfflineStateValue::Rune(_) => fixture.stateful_domain,
+            | OfflineStateValue::Rune(_)
+            | OfflineStateValue::String(_) => fixture.stateful_domain,
         }
     );
     Ok(OfflineStateField {
@@ -296,6 +299,7 @@ fn output_fixture(domain: u64, objects: Vec<OfflineStateObject>) -> StateFixture
                                 value: char::from_u32(value)
                                     .expect("verified rune is a Unicode scalar value"),
                             },
+                            OfflineStateValue::String(value) => StateFixtureValue::String { value },
                             OfflineStateValue::Handle(handle) => StateFixtureValue::StateHandle {
                                 domain: handle.domain.get(),
                                 stable_id: handle.stable_id.0,

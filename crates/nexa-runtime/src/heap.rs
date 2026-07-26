@@ -35,9 +35,9 @@ impl Object {
             Self::Enum { payload, .. } => payload
                 .iter()
                 .filter_map(|payload| match payload {
-                    RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
-                        Some(*reference)
-                    }
+                    RuntimeValue::String { reference, .. }
+                    | RuntimeValue::Ref(reference)
+                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
                     _ => None,
                 })
                 .collect(),
@@ -56,6 +56,7 @@ struct ObjectSlot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
+    StringTooLarge { bytes: usize, max_bytes: usize },
     InjectedFailure(RuntimeFailurePoint),
     InvalidReference(GcRef),
 }
@@ -107,17 +108,82 @@ pub struct Heap {
     slots: Vec<ObjectSlot>,
     free: Vec<u32>,
     max_objects: u32,
+    max_string_bytes: usize,
     failure_injector: RuntimeFailureInjector,
 }
 
 impl Heap {
     #[must_use]
     pub fn new(max_objects: u32) -> Self {
+        Self::new_with_string_limit(max_objects, usize::MAX)
+    }
+
+    #[must_use]
+    pub fn new_with_string_limit(max_objects: u32, max_string_bytes: usize) -> Self {
         Self {
             slots: Vec::with_capacity(max_objects as usize),
             free: Vec::with_capacity(max_objects as usize),
             max_objects,
+            max_string_bytes,
             failure_injector: RuntimeFailureInjector::default(),
+        }
+    }
+
+    pub fn allocate_string(&mut self, value: &str) -> Result<GcRef, HeapError> {
+        self.validate_string_length(value.len())?;
+        let mut reservation = self.preflight(1)?;
+        let value = value.to_owned();
+        Ok(self.commit(&mut reservation, Object::String(value)))
+    }
+
+    pub fn concat_strings(&mut self, lhs: GcRef, rhs: GcRef) -> Result<GcRef, HeapError> {
+        let (lhs_len, rhs_len) = (self.string(lhs)?.len(), self.string(rhs)?.len());
+        let length = lhs_len
+            .checked_add(rhs_len)
+            .ok_or(HeapError::StringTooLarge {
+                bytes: usize::MAX,
+                max_bytes: self.max_string_bytes,
+            })?;
+        self.validate_string_length(length)?;
+        let mut reservation = self.preflight(1)?;
+        let mut value = String::with_capacity(length);
+        value.push_str(self.string(lhs)?);
+        value.push_str(self.string(rhs)?);
+        Ok(self.commit(&mut reservation, Object::String(value)))
+    }
+
+    pub fn string(&self, reference: GcRef) -> Result<&str, HeapError> {
+        match self.resolve(reference)? {
+            Object::String(value) => Ok(value),
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn string_rune_at(
+        &self,
+        reference: GcRef,
+        index: usize,
+    ) -> Result<Option<char>, HeapError> {
+        Ok(self.string(reference)?.chars().nth(index))
+    }
+
+    pub fn string_hash(&self, reference: GcRef) -> Result<u64, HeapError> {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in self.string(reference)?.bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Ok(hash)
+    }
+
+    pub(crate) fn validate_string_length(&self, bytes: usize) -> Result<(), HeapError> {
+        if bytes > self.max_string_bytes {
+            Err(HeapError::StringTooLarge {
+                bytes,
+                max_bytes: self.max_string_bytes,
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -324,6 +390,23 @@ mod tests {
         };
         assert_eq!(heap.collect(&roots).unwrap().live, 1);
         assert!(heap.resolve(waiting).is_ok());
+    }
+
+    #[test]
+    fn string_limits_are_checked_before_concat_allocation() {
+        let mut heap = Heap::new_with_string_limit(3, 4);
+        let lhs = heap.allocate_string("ab").unwrap();
+        let rhs = heap.allocate_string("界").unwrap();
+        let before = heap.live_len();
+        assert_eq!(
+            heap.concat_strings(lhs, rhs),
+            Err(HeapError::StringTooLarge {
+                bytes: 5,
+                max_bytes: 4,
+            })
+        );
+        assert_eq!(heap.live_len(), before);
+        assert_eq!(heap.string(lhs), Ok("ab"));
     }
 
     #[test]

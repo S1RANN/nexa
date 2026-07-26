@@ -157,18 +157,19 @@ impl InterpreterHost for RealmHostBridge<'_> {
         &mut self,
         import: u32,
         arguments: &[RuntimeValue],
+        heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
         let metadata = self
             .imports
             .get(import as usize)
             .ok_or(HostTrap::UnknownFunction(import))?;
-        let values = HostArgs::from_runtime(arguments)?;
+        let values = HostArgs::from_runtime(arguments, heap.as_deref())?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
         match self.registry.call(import, &mut context, values)? {
             HostCallOutcome::Immediate(value) => Ok(InterpreterHostOutcome::Immediate(
-                host_to_runtime_value(value, metadata.result)?,
+                host_to_runtime_value(value, metadata.result, heap)?,
             )),
             HostCallOutcome::Pending(request) => {
                 if !self.resources.owns_request(self.task, request) {
@@ -203,6 +204,7 @@ impl InterpreterState for RealmStateBridge<'_> {
 fn host_to_runtime_value(
     value: HostValue,
     expected: Option<ValueType>,
+    heap: Option<&mut Heap>,
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
@@ -211,6 +213,12 @@ fn host_to_runtime_value(
         (HostValue::F64(value), Some(ValueType::F64)) => Ok(RuntimeValue::F64(value.to_bits())),
         (HostValue::Bool(value), Some(ValueType::Bool)) => Ok(RuntimeValue::Bool(value)),
         (HostValue::Rune(value), Some(ValueType::Rune)) => Ok(RuntimeValue::Rune(value.into())),
+        (HostValue::String(value), Some(ValueType::String)) => {
+            let heap = heap.ok_or(HostTrap::Type)?;
+            let reference = heap.allocate_string(&value).map_err(|_| HostTrap::Type)?;
+            let hash = heap.string_hash(reference).map_err(|_| HostTrap::Type)?;
+            Ok(RuntimeValue::String { reference, hash })
+        }
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
         }
@@ -263,6 +271,7 @@ pub struct RealmConfig {
     pub runtime_limits: RuntimeLimits,
     pub max_modules: u32,
     pub max_heap_objects: u32,
+    pub max_string_bytes: usize,
     pub max_host_resources: u32,
     pub release_capacity: usize,
     pub tombstone_capacity: usize,
@@ -277,6 +286,7 @@ impl Default for RealmConfig {
             runtime_limits: RuntimeLimits::default(),
             max_modules: 16,
             max_heap_objects: 4_096,
+            max_string_bytes: 1024 * 1024,
             max_host_resources: 1_024,
             release_capacity: 2_048,
             tombstone_capacity: 1_024,
@@ -304,6 +314,7 @@ pub enum CompletionRoute {
 #[derive(Debug)]
 enum PlannedResultPayload {
     Value(RuntimeValue),
+    String(String),
     Enum {
         type_id: StableId,
         variant: StableId,
@@ -314,6 +325,10 @@ enum PlannedResultPayload {
 #[derive(Debug)]
 enum ResultWritebackAction {
     ResumeDirect(RuntimeValue),
+    ResumeDirectString {
+        value: String,
+        heap: HeapReservation,
+    },
     ResumeAsync {
         result: AsyncResultType,
         success: bool,
@@ -527,7 +542,7 @@ impl RealmRuntime {
                 config.max_host_resources,
                 config.release_capacity,
             ),
-            heap: Heap::new(config.max_heap_objects),
+            heap: Heap::new_with_string_limit(config.max_heap_objects, config.max_string_bytes),
             scheduler: Scheduler::with_capacity(
                 config.runtime_limits.max_scheduler_tokens as usize,
             ),
@@ -1910,8 +1925,24 @@ impl RealmRuntime {
         let action = match result {
             HostCompletionResult::Success(payload) => {
                 if let Some(result) = async_result {
-                    let payload = completion_to_runtime(payload.clone(), Some(result.success))?;
-                    self.preflight_async_result(result, true, PlannedResultPayload::Value(payload))?
+                    let payload = match (payload, result.success) {
+                        (HostPayload::String(value), ValueType::String) => {
+                            PlannedResultPayload::String(value.clone())
+                        }
+                        _ => PlannedResultPayload::Value(completion_to_runtime(
+                            payload.clone(),
+                            Some(result.success),
+                        )?),
+                    };
+                    self.preflight_async_result(result, true, payload)?
+                } else if let (HostPayload::String(value), Some(ValueType::String)) =
+                    (payload, expected_type)
+                {
+                    self.heap.validate_string_length(value.len())?;
+                    ResultWritebackAction::ResumeDirectString {
+                        value: value.clone(),
+                        heap: self.heap.preflight(1)?,
+                    }
                 } else {
                     ResultWritebackAction::ResumeDirect(completion_to_runtime(
                         payload.clone(),
@@ -1994,7 +2025,7 @@ impl RealmRuntime {
                     tag: variant.tag,
                 }
             }
-            ValueType::Bool | ValueType::Ref => {
+            ValueType::Bool | ValueType::String | ValueType::Ref => {
                 return Ok(ResultWritebackAction::TrapMessage(
                     "host error payload type mismatch",
                 ));
@@ -2009,7 +2040,13 @@ impl RealmRuntime {
         success: bool,
         payload: PlannedResultPayload,
     ) -> Result<ResultWritebackAction, RealmError> {
-        let slots = 1 + usize::from(matches!(payload, PlannedResultPayload::Enum { .. }));
+        if let PlannedResultPayload::String(value) = &payload {
+            self.heap.validate_string_length(value.len())?;
+        }
+        let slots = 1 + usize::from(matches!(
+            &payload,
+            PlannedResultPayload::Enum { .. } | PlannedResultPayload::String(_)
+        ));
         let heap = self.heap.preflight(slots)?;
         Ok(ResultWritebackAction::ResumeAsync {
             result,
@@ -2028,6 +2065,11 @@ impl RealmRuntime {
     ) -> Result<(), RealmError> {
         let value = match preflight.action {
             ResultWritebackAction::ResumeDirect(value) => value,
+            ResultWritebackAction::ResumeDirectString { value, mut heap } => {
+                let reference = self.heap.commit(&mut heap, Object::String(value));
+                let hash = self.heap.string_hash(reference)?;
+                RuntimeValue::String { reference, hash }
+            }
             ResultWritebackAction::ResumeAsync {
                 result,
                 success,
@@ -2036,6 +2078,11 @@ impl RealmRuntime {
             } => {
                 let payload = match payload {
                     PlannedResultPayload::Value(value) => value,
+                    PlannedResultPayload::String(value) => {
+                        let reference = self.heap.commit(&mut heap, Object::String(value));
+                        let hash = self.heap.string_hash(reference)?;
+                        RuntimeValue::String { reference, hash }
+                    }
                     PlannedResultPayload::Enum {
                         type_id,
                         variant,
@@ -2630,10 +2677,27 @@ mod tests {
     };
     use crate::task::TaskExecution;
     use crate::{
-        HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap, Object,
-        ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain, RuntimeValue, StepConfig,
-        TaskLimits, TickBudget,
+        HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap,
+        HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain,
+        RuntimeValue, StepConfig, TaskLimits, TickBudget,
     };
+
+    #[test]
+    fn host_string_arguments_and_results_cross_the_gc_boundary() {
+        let mut heap = crate::Heap::new_with_string_limit(4, 32);
+        let runtime = super::host_to_runtime_value(
+            HostValue::String("host-result".into()),
+            Some(ValueType::String),
+            Some(&mut heap),
+        )
+        .unwrap();
+        let RuntimeValue::String { reference, .. } = runtime else {
+            panic!("host string result must become a GC string");
+        };
+        assert_eq!(heap.string(reference), Ok("host-result"));
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(args.get(0), Ok(&HostValue::String("host-result".into())));
+    }
 
     fn module(yields: bool) -> (nexa_verifier::VerifiedModule, StableId, StableId) {
         let host = StableId::from_name("host");

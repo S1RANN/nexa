@@ -44,6 +44,7 @@ pub enum TokenKind {
     Integer(i64),
     Float(u64),
     Rune(u32),
+    String(String),
     LParen,
     RParen,
     LBrace,
@@ -57,6 +58,7 @@ pub enum TokenKind {
     Star,
     Slash,
     Equal,
+    EqualEqual,
     FatArrow,
     Less,
     Greater,
@@ -190,6 +192,7 @@ pub enum AstType {
     F64,
     Bool,
     Rune,
+    String,
     Named(String),
     BuiltinGeneric { name: String, arguments: Vec<Self> },
     Spanned { ty: Box<Self>, span: SourceSpan },
@@ -268,6 +271,7 @@ pub enum AstExpression {
     Integer(i64),
     Float(u64),
     Rune(u32),
+    String(String),
     Bool(bool),
     Name(String),
     Binary {
@@ -418,6 +422,7 @@ pub enum BinaryOp {
     Subtract,
     Multiply,
     Divide,
+    Equal,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -434,6 +439,30 @@ enum StateHandleMethod {
     Generation,
     Equality,
     Hash,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StringMethod {
+    Len,
+    ByteLen,
+    Equal,
+    Concat,
+    RuneAt,
+    Hash,
+}
+
+fn string_method(function: &str) -> Option<(&str, StringMethod)> {
+    let (receiver, method) = function.rsplit_once('.')?;
+    let method = match method {
+        "len" | "rune_count" => StringMethod::Len,
+        "byte_len" => StringMethod::ByteLen,
+        "equals" => StringMethod::Equal,
+        "concat" => StringMethod::Concat,
+        "rune_at" => StringMethod::RuneAt,
+        "hash" => StringMethod::Hash,
+        _ => return None,
+    };
+    Some((receiver, method))
 }
 
 fn state_handle_method(function: &str) -> Option<(&str, StateHandleMethod)> {
@@ -528,6 +557,11 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 end = next_offset.saturating_add(next.len_utf8());
                 TokenKind::FatArrow
             }
+            '=' if chars.peek().is_some_and(|(_, next)| *next == '=') => {
+                let (next_offset, next) = chars.next().expect("peeked token exists");
+                end = next_offset.saturating_add(next.len_utf8());
+                TokenKind::EqualEqual
+            }
             '=' => TokenKind::Equal,
             '<' => TokenKind::Less,
             '>' => TokenKind::Greater,
@@ -545,6 +579,37 @@ pub fn lex(source: &str) -> Result<Vec<Token>, CompileError> {
                 TokenKind::Arrow
             }
             '-' => TokenKind::Minus,
+            '"' => {
+                let mut value = String::new();
+                loop {
+                    let (value_offset, character) =
+                        chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                    if character == '"' {
+                        end = value_offset + 1;
+                        break;
+                    }
+                    if character == '\\' {
+                        let (escape_offset, escape) =
+                            chars.next().ok_or(CompileError::UnexpectedEnd)?;
+                        value.push(match escape {
+                            'n' => '\n',
+                            'r' => '\r',
+                            't' => '\t',
+                            '\\' => '\\',
+                            '"' => '"',
+                            character => {
+                                return Err(CompileError::UnexpectedCharacter {
+                                    offset: escape_offset,
+                                    character,
+                                });
+                            }
+                        });
+                    } else {
+                        value.push(character);
+                    }
+                }
+                TokenKind::String(value)
+            }
             '\'' => {
                 let (_, value) = chars.next().ok_or(CompileError::UnexpectedEnd)?;
                 let value = if value == '\\' {
@@ -969,6 +1034,7 @@ impl Parser<'_> {
             TokenKind::Integer(value) => AstExpression::Integer(value),
             TokenKind::Float(bits) => AstExpression::Float(bits),
             TokenKind::Rune(value) => AstExpression::Rune(value),
+            TokenKind::String(value) => AstExpression::String(value),
             TokenKind::True => AstExpression::Bool(true),
             TokenKind::False => AstExpression::Bool(false),
             TokenKind::Ident(mut name) => {
@@ -1055,6 +1121,7 @@ impl Parser<'_> {
                 continue;
             }
             let (precedence, op) = match self.peek_kind() {
+                Some(TokenKind::EqualEqual) => (0, BinaryOp::Equal),
                 Some(TokenKind::Plus) => (1, BinaryOp::Add),
                 Some(TokenKind::Minus) => (1, BinaryOp::Subtract),
                 Some(TokenKind::Star) => (2, BinaryOp::Multiply),
@@ -1206,6 +1273,7 @@ impl Parser<'_> {
             "f64" => AstType::F64,
             "bool" => AstType::Bool,
             "rune" => AstType::Rune,
+            "string" => AstType::String,
             named => AstType::Named(named.to_owned()),
         };
         if self.take(&TokenKind::Less) {
@@ -1470,6 +1538,7 @@ fn substitute_name(expression: &mut AstExpression, name: &str, value: i64) {
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
@@ -1974,6 +2043,7 @@ fn validate_await_expression(
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::Name(_) => Ok(()),
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
@@ -2052,6 +2122,7 @@ fn resolve_statements(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn resolve_expression(
     expression: &mut AstExpression,
     scopes: &mut Vec<BTreeMap<String, String>>,
@@ -2075,7 +2146,8 @@ fn resolve_expression(
             function,
             arguments,
         } => {
-            if let Some((receiver, method)) = state_handle_method(function) {
+            let state_method = state_handle_method(function);
+            if let Some((receiver, method)) = state_method {
                 let resolved = scopes
                     .iter()
                     .rev()
@@ -2091,6 +2163,24 @@ fn resolve_expression(
                         StateHandleMethod::Generation => "generation",
                         StateHandleMethod::Equality => "equality",
                         StateHandleMethod::Hash => "hash",
+                    }
+                );
+            } else if let Some((receiver, method)) = string_method(function) {
+                let resolved = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(receiver))
+                    .cloned()
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                *function = format!(
+                    "{resolved}.{}",
+                    match method {
+                        StringMethod::Len => "len",
+                        StringMethod::ByteLen => "byte_len",
+                        StringMethod::Equal => "equals",
+                        StringMethod::Concat => "concat",
+                        StringMethod::RuneAt => "rune_at",
+                        StringMethod::Hash => "hash",
                     }
                 );
             }
@@ -2134,6 +2224,7 @@ fn resolve_expression(
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind_mut strips spans"),
     }
@@ -2165,6 +2256,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         | AstType::F64
         | AstType::Bool
         | AstType::Rune
+        | AstType::String
         | AstType::Named(_) => Ok(()),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -2357,6 +2449,7 @@ fn contains_await(expression: &AstExpression) -> bool {
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::Name(_) => false,
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
@@ -2395,40 +2488,123 @@ fn expression_type(
             }
             ValueType::Rune
         }
+        AstExpression::String(_) => ValueType::String,
         AstExpression::Bool(_) => ValueType::Bool,
         AstExpression::Name(name) => locals
             .get(name)
             .map(|(_, ty)| *ty)
             .ok_or_else(|| CompileError::UnknownName(name.clone()))?,
-        AstExpression::Binary { lhs, rhs, .. } => {
+        AstExpression::Binary { op, lhs, rhs } if op.kind == BinaryOp::Equal => {
+            let operand_type = expression_type(lhs, locals, context, next_register, None)?;
+            if operand_type != ValueType::String
+                || expression_type(rhs, locals, context, next_register, Some(ValueType::String))?
+                    != ValueType::String
+            {
+                return Err(CompileError::TypeMismatch);
+            }
+            ValueType::Bool
+        }
+        AstExpression::Binary { op, lhs, rhs } => {
             let numeric_type = if let Some(expected) = expected {
                 expected
             } else {
                 expression_type(lhs, locals, context, next_register, None)?
             };
-            if !matches!(
-                numeric_type,
-                ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
-            ) {
-                return Err(CompileError::TypeMismatch);
-            }
-            if expected.is_some()
-                && expression_type(lhs, locals, context, next_register, Some(numeric_type))?
+            if op.kind == BinaryOp::Add && numeric_type == ValueType::String {
+                if expected.is_some()
+                    && expression_type(
+                        lhs,
+                        locals,
+                        context,
+                        next_register,
+                        Some(ValueType::String),
+                    )? != ValueType::String
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                if expression_type(rhs, locals, context, next_register, Some(ValueType::String))?
+                    != ValueType::String
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                ValueType::String
+            } else {
+                if !matches!(
+                    numeric_type,
+                    ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
+                ) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                if expected.is_some()
+                    && expression_type(lhs, locals, context, next_register, Some(numeric_type))?
+                        != numeric_type
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                if expression_type(rhs, locals, context, next_register, Some(numeric_type))?
                     != numeric_type
-            {
-                return Err(CompileError::TypeMismatch);
+                {
+                    return Err(CompileError::TypeMismatch);
+                }
+                numeric_type
             }
-            if expression_type(rhs, locals, context, next_register, Some(numeric_type))?
-                != numeric_type
-            {
-                return Err(CompileError::TypeMismatch);
-            }
-            numeric_type
         }
         AstExpression::Call {
             function,
             arguments,
         } => {
+            if let Some((receiver, method)) = string_method(function)
+                && locals.get(receiver).map(|(_, ty)| *ty) == Some(ValueType::String)
+            {
+                let result = match method {
+                    StringMethod::Len | StringMethod::ByteLen | StringMethod::Hash => {
+                        if !arguments.is_empty() {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        if method == StringMethod::Hash {
+                            ValueType::I64
+                        } else {
+                            ValueType::I32
+                        }
+                    }
+                    StringMethod::Equal | StringMethod::Concat => {
+                        if arguments.len() != 1
+                            || expression_type(
+                                &arguments[0],
+                                locals,
+                                context,
+                                next_register,
+                                Some(ValueType::String),
+                            )? != ValueType::String
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        if method == StringMethod::Equal {
+                            ValueType::Bool
+                        } else {
+                            ValueType::String
+                        }
+                    }
+                    StringMethod::RuneAt => {
+                        if arguments.len() != 1
+                            || expression_type(
+                                &arguments[0],
+                                locals,
+                                context,
+                                next_register,
+                                Some(ValueType::I32),
+                            )? != ValueType::I32
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Rune
+                    }
+                };
+                if expected.is_some_and(|expected| expected != result) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(result);
+            }
             if let Some((receiver, method)) = state_handle_method(function) {
                 if matches!(
                     context.effect,
@@ -2704,6 +2880,7 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::F64 => ValueType::F64,
         AstType::Bool => ValueType::Bool,
         AstType::Rune => ValueType::Rune,
+        AstType::String => ValueType::String,
         AstType::Named(name) => ValueType::Named(StableId::from_name(name)),
         AstType::BuiltinGeneric { name, arguments } if name == "Option" => {
             ValueType::Named(nexa_bytecode::option_type(lower_type(&arguments[0])).type_id)
@@ -2820,6 +2997,7 @@ fn inspect_expression_registers(
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::Name(_) => {}
         AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
@@ -2838,6 +3016,7 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
         AstExpression::Integer(_)
         | AstExpression::Float(_)
         | AstExpression::Rune(_)
+        | AstExpression::String(_)
         | AstExpression::Bool(_)
         | AstExpression::Name(_) => 1,
         AstExpression::Binary { lhs, rhs, .. } => {
@@ -2882,6 +3061,73 @@ fn temporary_requirement(expression: &AstExpression) -> Result<u16, CompileError
     u16::try_from(required).map_err(|_| CompileError::TooManyRegisters)
 }
 
+fn collect_string_literals(statements: &[AstStatement], strings: &mut BTreeSet<String>) {
+    for statement in statements {
+        match statement.kind() {
+            AstStatement::Bind { value, .. }
+            | AstStatement::Return(value)
+            | AstStatement::Expression(value)
+            | AstStatement::Defer(value) => collect_expression_strings(value, strings),
+            AstStatement::If {
+                condition,
+                then_body,
+                else_body,
+            } => {
+                collect_expression_strings(condition, strings);
+                collect_string_literals(then_body, strings);
+                collect_string_literals(else_body, strings);
+            }
+            AstStatement::While { condition, body } => {
+                collect_expression_strings(condition, strings);
+                collect_string_literals(body, strings);
+            }
+            AstStatement::Spanned { .. } => unreachable!("kind strips spans"),
+        }
+    }
+}
+
+fn collect_expression_strings(expression: &AstExpression, strings: &mut BTreeSet<String>) {
+    match expression.kind() {
+        AstExpression::String(value) => {
+            strings.insert(value.clone());
+        }
+        AstExpression::Binary { lhs, rhs, .. } => {
+            collect_expression_strings(lhs, strings);
+            collect_expression_strings(rhs, strings);
+        }
+        AstExpression::Call { arguments, .. } => {
+            for argument in arguments {
+                collect_expression_strings(argument, strings);
+            }
+        }
+        AstExpression::Await(expression) | AstExpression::Try(expression) => {
+            collect_expression_strings(expression, strings);
+        }
+        AstExpression::Constructor { payload, .. } => {
+            if let Some(payload) = payload {
+                collect_expression_strings(payload, strings);
+            }
+        }
+        AstExpression::Match { value, arms } => {
+            collect_expression_strings(value, strings);
+            for arm in arms {
+                collect_expression_strings(&arm.value, strings);
+            }
+        }
+        AstExpression::Migration(intrinsic) => {
+            for expression in migration_expressions(intrinsic) {
+                collect_expression_strings(expression, strings);
+            }
+        }
+        AstExpression::Integer(_)
+        | AstExpression::Float(_)
+        | AstExpression::Rune(_)
+        | AstExpression::Bool(_)
+        | AstExpression::Name(_) => {}
+        AstExpression::Spanned { .. } => unreachable!("kind strips spans"),
+    }
+}
+
 pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     let function_ids = hir
         .functions
@@ -2895,6 +3141,17 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
         })
         .collect::<BTreeMap<_, _>>();
     let mut module = ModuleBuilder::new();
+    let mut string_literals = BTreeSet::new();
+    for function in &hir.functions {
+        collect_string_literals(&function.body, &mut string_literals);
+    }
+    let string_indices = string_literals
+        .into_iter()
+        .map(|value| {
+            let index = module.string(value.clone());
+            (value, index)
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut host_functions = hir.host_functions.values().collect::<Vec<_>>();
     host_functions.sort_by_key(|function| function.import);
     for function in host_functions {
@@ -2919,6 +3176,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             enum_variants: &hir.enum_variants,
             function_result: function.signature.result.expect("result is required"),
             state_handle_targets: &hir.state_handle_targets,
+            string_indices: &string_indices,
         };
         emit_statements(
             &function.body,
@@ -3007,7 +3265,8 @@ fn exact_root_maps(
             | Instruction::AddI64 { dst, .. }
             | Instruction::SubI64 { dst, .. }
             | Instruction::MulI64 { dst, .. }
-            | Instruction::DivI64 { dst, .. } => {
+            | Instruction::DivI64 { dst, .. }
+            | Instruction::StringHash { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I64);
             }
             Instruction::LoadF32 { dst, .. }
@@ -3024,11 +3283,15 @@ fn exact_root_maps(
             | Instruction::DivF64 { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::F64);
             }
-            Instruction::LoadRune { dst, .. } => {
+            Instruction::LoadRune { dst, .. } | Instruction::StringRuneAt { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Rune);
+            }
+            Instruction::LoadString { dst, .. } | Instruction::StringConcat { dst, .. } => {
+                state[usize::from(dst)] = Some(ValueType::String);
             }
             Instruction::LoadBool { dst, .. }
             | Instruction::CompareEq { dst, .. }
+            | Instruction::StringEqual { dst, .. }
             | Instruction::StateHandleIsAlive { dst, .. }
             | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
@@ -3066,6 +3329,8 @@ fn exact_root_maps(
             }
             Instruction::StateHandleGeneration { dst, .. }
             | Instruction::StateHandleHash { dst, .. }
+            | Instruction::StringLen { dst, .. }
+            | Instruction::StringByteLen { dst, .. }
             | Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
@@ -3180,6 +3445,7 @@ struct EmitContext<'a> {
     enum_variants: &'a BTreeMap<(StableId, String), EnumVariant>,
     function_result: ValueType,
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
+    string_indices: &'a BTreeMap<String, u32>,
 }
 
 struct TrackedCode {
@@ -3392,6 +3658,18 @@ fn emit_expression(
         function,
         arguments,
     } = expression.kind()
+        && string_method(function).is_some_and(|(receiver, _)| {
+            locals.get(receiver).map(|(_, ty)| *ty) == Some(ValueType::String)
+        })
+    {
+        let result = emit_string_method(function, arguments, destination, locals, context, code);
+        code.replace_span(previous_span);
+        return result;
+    }
+    if let AstExpression::Call {
+        function,
+        arguments,
+    } = expression.kind()
         && state_handle_method(function).is_some()
     {
         let result =
@@ -3435,6 +3713,13 @@ fn emit_expression(
                 value: *value,
             });
         }
+        AstExpression::String(value) => code.push(Instruction::LoadString {
+            dst: destination,
+            string: *context
+                .string_indices
+                .get(value)
+                .expect("all string literals are collected before emission"),
+        }),
         AstExpression::Bool(value) => code.push(Instruction::LoadBool {
             dst: destination,
             value: *value,
@@ -3452,6 +3737,45 @@ fn emit_expression(
         AstExpression::Binary { op, lhs, rhs } => {
             let numeric_type =
                 expected.unwrap_or(emitted_expression_type(lhs, None, locals, context)?);
+            if op.kind == BinaryOp::Equal
+                || (op.kind == BinaryOp::Add && numeric_type == ValueType::String)
+            {
+                let lhs_register = destination;
+                let rhs_register = destination
+                    .checked_add(1)
+                    .ok_or(CompileError::TooManyRegisters)?;
+                emit_expression(
+                    lhs,
+                    lhs_register,
+                    Some(ValueType::String),
+                    locals,
+                    context,
+                    code,
+                )?;
+                emit_expression(
+                    rhs,
+                    rhs_register,
+                    Some(ValueType::String),
+                    locals,
+                    context,
+                    code,
+                )?;
+                code.push(if op.kind == BinaryOp::Equal {
+                    Instruction::StringEqual {
+                        dst: destination,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    }
+                } else {
+                    Instruction::StringConcat {
+                        dst: destination,
+                        lhs: lhs_register,
+                        rhs: rhs_register,
+                    }
+                });
+                code.replace_span(previous_span);
+                return Ok(());
+            }
             if !matches!(
                 numeric_type,
                 ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
@@ -3651,6 +3975,83 @@ fn emit_expression(
     Ok(())
 }
 
+fn emit_string_method(
+    function: &str,
+    arguments: &[AstExpression],
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut TrackedCode,
+) -> Result<(), CompileError> {
+    let (receiver, method) =
+        string_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+    let (source, ty) = *locals
+        .get(receiver)
+        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+    if ty != ValueType::String {
+        return Err(CompileError::TypeMismatch);
+    }
+    match method {
+        StringMethod::Len => code.push(Instruction::StringLen {
+            dst: destination,
+            source,
+        }),
+        StringMethod::ByteLen => code.push(Instruction::StringByteLen {
+            dst: destination,
+            source,
+        }),
+        StringMethod::Hash => code.push(Instruction::StringHash {
+            dst: destination,
+            source,
+        }),
+        StringMethod::Equal | StringMethod::Concat => {
+            let rhs = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                rhs,
+                Some(ValueType::String),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(if method == StringMethod::Equal {
+                Instruction::StringEqual {
+                    dst: destination,
+                    lhs: source,
+                    rhs,
+                }
+            } else {
+                Instruction::StringConcat {
+                    dst: destination,
+                    lhs: source,
+                    rhs,
+                }
+            });
+        }
+        StringMethod::RuneAt => {
+            let index = destination
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                index,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::StringRuneAt {
+                dst: destination,
+                source,
+                index,
+            });
+        }
+    }
+    Ok(())
+}
+
 fn emit_state_handle_method(
     function: &str,
     arguments: &[AstExpression],
@@ -3756,12 +4157,17 @@ fn emitted_expression_type(
         AstExpression::Rune(value) => char::from_u32(*value)
             .map(|_| ValueType::Rune)
             .ok_or(CompileError::TypeMismatch),
-        AstExpression::Binary { lhs, .. } => {
+        AstExpression::String(_) => Ok(ValueType::String),
+        AstExpression::Binary { op, lhs, .. } if op.kind == BinaryOp::Equal => Ok(ValueType::Bool),
+        AstExpression::Binary { op, lhs, .. } => {
             let ty = if let Some(expected) = expected {
                 expected
             } else {
                 emitted_expression_type(lhs, None, locals, context)?
             };
+            if op.kind == BinaryOp::Add && ty == ValueType::String {
+                return Ok(ValueType::String);
+            }
             if matches!(
                 ty,
                 ValueType::I32 | ValueType::I64 | ValueType::F32 | ValueType::F64
@@ -3777,7 +4183,17 @@ fn emitted_expression_type(
             .map(|(_, ty)| *ty)
             .ok_or_else(|| CompileError::UnknownName(name.clone())),
         AstExpression::Call { function, .. } => {
-            if let Some((receiver, method)) = state_handle_method(function) {
+            if let Some((receiver, method)) = string_method(function)
+                && locals.get(receiver).map(|(_, ty)| *ty) == Some(ValueType::String)
+            {
+                Ok(match method {
+                    StringMethod::Len | StringMethod::ByteLen => ValueType::I32,
+                    StringMethod::Hash => ValueType::I64,
+                    StringMethod::Equal => ValueType::Bool,
+                    StringMethod::Concat => ValueType::String,
+                    StringMethod::RuneAt => ValueType::Rune,
+                })
+            } else if let Some((receiver, method)) = state_handle_method(function) {
                 let ValueType::Named(handle_type) = locals
                     .get(receiver)
                     .map(|(_, ty)| *ty)
@@ -4168,6 +4584,8 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
             let explicit = matches!(
                 instruction,
                 Instruction::Safepoint
+                    | Instruction::LoadString { .. }
+                    | Instruction::StringConcat { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -4387,7 +4805,7 @@ fn lower_idl_type(ty: &TypeRef) -> ValueType {
         TypeRef::Result(success, error) => ValueType::Named(
             nexa_bytecode::result_type(lower_idl_type(success), lower_idl_type(error)).type_id,
         ),
-        TypeRef::String => ValueType::Named(StableId::from_name("string")),
+        TypeRef::String => ValueType::String,
         TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
     }
 }
@@ -4576,6 +4994,71 @@ migration fn migrate() -> bool {
         assert!(matches!(
             compile("fn narrow(value: i64) -> i32 { return value; }"),
             Err(CompileError::InvalidNumericConversion { .. })
+        ));
+    }
+
+    #[test]
+    fn immutable_utf8_strings_cover_literals_operations_and_rune_iteration() {
+        let module = compile(
+            "fn concat(value: string) -> string { return value + \"界\"; }
+             fn rune_len() -> i32 { let value: string = \"a界\"; return value.len(); }
+             fn byte_len() -> i32 { let value: string = \"a界\"; return value.byte_len(); }
+             fn equal() -> bool { return \"same\" == \"same\"; }
+             fn rune() -> rune { let value: string = \"a界\"; return value.rune_at(1); }
+             fn hash() -> i64 { let value: string = \"key\"; return value.hash(); }
+             fn invalid() -> rune { let value: string = \"a\"; return value.rune_at(1); }",
+        )
+        .unwrap();
+        assert_eq!(module.module().strings, ["a", "a界", "key", "same", "界"]);
+        let mut heap = nexa_runtime::Heap::new_with_string_limit(32, 32);
+        let input = heap.allocate_string("Nexa").unwrap();
+        let input_hash = heap.string_hash(input).unwrap();
+        let InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::String {
+                reference: result, ..
+            }),
+            ..
+        } = CheckedInterpreter::run_with_heap(
+            &module,
+            0,
+            &[RuntimeValue::String {
+                reference: input,
+                hash: input_hash,
+            }],
+            100,
+            &mut heap,
+        )
+        .unwrap()
+        else {
+            panic!("concat must return a GC string");
+        };
+        assert_eq!(heap.string(result), Ok("Nexa界"));
+
+        let returned = |function, heap: &mut nexa_runtime::Heap| {
+            let InterpreterOutcome::Returned { value, .. } =
+                CheckedInterpreter::run_with_heap(&module, function, &[], 100, heap).unwrap()
+            else {
+                panic!("string operation must return");
+            };
+            value
+        };
+        assert_eq!(returned(1, &mut heap), Some(RuntimeValue::I32(2)));
+        assert_eq!(returned(2, &mut heap), Some(RuntimeValue::I32(4)));
+        assert_eq!(returned(3, &mut heap), Some(RuntimeValue::Bool(true)));
+        assert_eq!(
+            returned(4, &mut heap),
+            Some(RuntimeValue::Rune('界' as u32))
+        );
+        assert!(matches!(returned(5, &mut heap), Some(RuntimeValue::I64(_))));
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 6, &[], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Trapped {
+                trap: nexa_runtime::Trap {
+                    kind: TrapKind::StringIndexOutOfBounds,
+                    ..
+                },
+                ..
+            }
         ));
     }
 

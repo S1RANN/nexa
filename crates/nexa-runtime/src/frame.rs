@@ -11,6 +11,10 @@ pub enum RuntimeValue {
     F64(u64),
     Bool(bool),
     Rune(u32),
+    String {
+        reference: GcRef,
+        hash: u64,
+    },
     Ref(GcRef),
     NamedRef {
         reference: GcRef,
@@ -324,9 +328,9 @@ impl FrameArena {
         self.registers
             .iter()
             .filter_map(|value| match value {
-                RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
-                    Some(*reference)
-                }
+                RuntimeValue::String { reference, .. }
+                | RuntimeValue::Ref(reference)
+                | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
                 RuntimeValue::I32(_)
                 | RuntimeValue::I64(_)
                 | RuntimeValue::F32(_)
@@ -357,7 +361,9 @@ impl FrameArena {
             for (register, is_root) in bitmap.into_iter().enumerate() {
                 if is_root {
                     match self.registers[frame.register_start as usize + register] {
-                        RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
+                        RuntimeValue::String { reference, .. }
+                        | RuntimeValue::Ref(reference)
+                        | RuntimeValue::NamedRef { reference, .. } => {
                             roots.push(reference);
                         }
                         RuntimeValue::I32(_)

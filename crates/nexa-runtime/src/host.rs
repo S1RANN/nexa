@@ -1007,6 +1007,7 @@ pub enum HostPayload {
     F64(u64),
     Bool(bool),
     Rune(u32),
+    String(String),
     Opaque(u64),
     Token(ResourceTokenHandle),
     Snapshot(SnapshotHandle),
@@ -1049,13 +1050,16 @@ impl<'a> HostArgs<'a> {
         }
     }
 
-    pub(crate) fn from_runtime(values: &[crate::RuntimeValue]) -> Result<Self, HostTrap> {
+    pub(crate) fn from_runtime(
+        values: &[crate::RuntimeValue],
+        heap: Option<&crate::Heap>,
+    ) -> Result<Self, HostTrap> {
         if values.len() > MAX_HOST_ARGUMENTS {
             return Err(HostTrap::Arity);
         }
         let mut inline = std::array::from_fn(|_| HostValue::Unit);
         for (destination, value) in inline.iter_mut().zip(values.iter().copied()) {
-            *destination = runtime_argument_to_host_value(value);
+            *destination = runtime_argument_to_host_value(value, heap)?;
         }
         Ok(Self {
             borrowed: None,
@@ -1080,8 +1084,11 @@ impl<'a> HostArgs<'a> {
     }
 }
 
-fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
-    match value {
+fn runtime_argument_to_host_value(
+    value: crate::RuntimeValue,
+    heap: Option<&crate::Heap>,
+) -> Result<HostValue, HostTrap> {
+    Ok(match value {
         crate::RuntimeValue::I32(value) => HostValue::I32(value),
         crate::RuntimeValue::I64(value) => HostValue::I64(value),
         crate::RuntimeValue::F32(bits) => HostValue::F32(f32::from_bits(bits)),
@@ -1090,6 +1097,12 @@ fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
         crate::RuntimeValue::Rune(value) => {
             HostValue::Rune(char::from_u32(value).expect("verified rune is a Unicode scalar value"))
         }
+        crate::RuntimeValue::String { reference, .. } => HostValue::String(
+            heap.ok_or(HostTrap::Type)?
+                .string(reference)
+                .map_err(|_| HostTrap::Type)?
+                .to_owned(),
+        ),
         crate::RuntimeValue::Ref(reference) | crate::RuntimeValue::NamedRef { reference, .. } => {
             HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
         }
@@ -1106,7 +1119,7 @@ fn runtime_argument_to_host_value(value: crate::RuntimeValue) -> HostValue {
             domain ^ stable_id.0.rotate_left(17) ^ u64::from(generation).rotate_left(41),
         ),
         crate::RuntimeValue::Unit => HostValue::Unit,
-    }
+    })
 }
 
 #[derive(Clone, Debug, PartialEq)]

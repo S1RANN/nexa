@@ -313,6 +313,7 @@ impl Trap {
 pub enum TrapKind {
     BytecodeTrap,
     DivideByZero,
+    StringIndexOutOfBounds,
     CleanupBudgetExceeded,
     Host,
 }
@@ -328,6 +329,8 @@ pub enum InterpreterError {
     ContinuationLimit(FrameError),
     RootMapMismatch,
     HostUnavailable,
+    HeapUnavailable,
+    StringLengthOverflow,
     Host(crate::HostTrap),
     Migration(crate::RuntimeMessage),
     Heap(HeapError),
@@ -359,14 +362,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 53],
+    costs: [u16; 60],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 53],
+            costs: [1; 60],
         }
     }
 }
@@ -385,6 +388,7 @@ pub trait InterpreterHost {
         &mut self,
         import: u32,
         arguments: &[RuntimeValue],
+        heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, crate::HostTrap>;
 }
 
@@ -631,6 +635,34 @@ impl CheckedInterpreter {
         )
     }
 
+    pub fn run_migration_with_heap(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: u64,
+        limits: FrameLimits,
+        migration: &mut dyn InterpreterMigration,
+        heap: &mut Heap,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        let continuation = Self::start(
+            module,
+            function,
+            arguments,
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )?;
+        Self::execute(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            &OpcodeCostTable::default(),
+            None,
+            Some(migration),
+            None,
+            Some(heap),
+        )
+    }
+
     pub fn resume(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,
@@ -794,6 +826,24 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, RuntimeValue::Rune(value))?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::LoadString { dst, string } => {
+                    let value = module
+                        .module()
+                        .strings
+                        .get(string as usize)
+                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    let reference = heap.allocate_string(value)?;
+                    let hash = heap.string_hash(reference)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::String { reference, hash },
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::Move { dst, source } => {
                     let value = register(&continuation.arena, source)?;
                     set_register(&mut continuation.arena, dst, value)?;
@@ -917,6 +967,111 @@ impl CheckedInterpreter {
                     )?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::StringLen { dst, source }
+                | Instruction::StringByteLen { dst, source }
+                | Instruction::StringHash { dst, source } => {
+                    let RuntimeValue::String { reference, .. } =
+                        register(&continuation.arena, source)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    let value = match instruction {
+                        Instruction::StringLen { .. } => RuntimeValue::I32(
+                            i32::try_from(heap.string(reference)?.chars().count())
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                        Instruction::StringByteLen { .. } => RuntimeValue::I32(
+                            i32::try_from(heap.string(reference)?.len())
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                        Instruction::StringHash { .. } => RuntimeValue::I64(i64::from_ne_bytes(
+                            heap.string_hash(reference)?.to_ne_bytes(),
+                        )),
+                        _ => unreachable!(),
+                    };
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StringEqual { dst, lhs, rhs } => {
+                    let RuntimeValue::String { reference: lhs, .. } =
+                        register(&continuation.arena, lhs)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::String { reference: rhs, .. } =
+                        register(&continuation.arena, rhs)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Bool(heap.string(lhs)? == heap.string(rhs)?),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StringConcat { dst, lhs, rhs } => {
+                    let RuntimeValue::String { reference: lhs, .. } =
+                        register(&continuation.arena, lhs)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::String { reference: rhs, .. } =
+                        register(&continuation.arena, rhs)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let heap = heap
+                        .as_deref_mut()
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    let reference = heap.concat_strings(lhs, rhs)?;
+                    let hash = heap.string_hash(reference)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::String { reference, hash },
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StringRuneAt { dst, source, index } => {
+                    let RuntimeValue::String {
+                        reference: source, ..
+                    } = register(&continuation.arena, source)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let value = if let Ok(index) = usize::try_from(index) {
+                        heap.as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .string_rune_at(source, index)?
+                    } else {
+                        None
+                    };
+                    let Some(value) = value else {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::StringIndexOutOfBounds,
+                                "string rune index out of bounds",
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    };
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Rune(value.into()),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::CompareEq { dst, lhs, rhs } => {
                     let lhs = register(&continuation.arena, lhs)?;
                     let rhs = register(&continuation.arena, rhs)?;
@@ -1015,7 +1170,11 @@ impl CheckedInterpreter {
                     let outcome = host
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
-                        .call(import, &arguments[..usize::from(args_count)])
+                        .call(
+                            import,
+                            &arguments[..usize::from(args_count)],
+                            heap.as_deref_mut(),
+                        )
                         .map_err(InterpreterError::Host)?;
                     match outcome {
                         InterpreterHostOutcome::Immediate(value) => {
@@ -1561,6 +1720,7 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::F64(_) => Some(ValueType::F64),
         RuntimeValue::Bool(_) => Some(ValueType::Bool),
         RuntimeValue::Rune(_) => Some(ValueType::Rune),
+        RuntimeValue::String { .. } => Some(ValueType::String),
         RuntimeValue::Ref(_) => Some(ValueType::Ref),
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             Some(ValueType::Named(type_id))
@@ -1623,6 +1783,8 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
     match instruction {
         Instruction::Safepoint
         | Instruction::Yield
+        | Instruction::LoadString { .. }
+        | Instruction::StringConcat { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -1690,6 +1852,13 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::SubF64 { .. } => 50,
         Instruction::MulF64 { .. } => 51,
         Instruction::DivF64 { .. } => 52,
+        Instruction::LoadString { .. } => 53,
+        Instruction::StringLen { .. } => 54,
+        Instruction::StringByteLen { .. } => 55,
+        Instruction::StringEqual { .. } => 56,
+        Instruction::StringConcat { .. } => 57,
+        Instruction::StringRuneAt { .. } => 58,
+        Instruction::StringHash { .. } => 59,
     }
 }
 

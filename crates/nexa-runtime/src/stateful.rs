@@ -61,6 +61,7 @@ pub enum StateValue {
     F64(u64),
     Bool(bool),
     Rune(u32),
+    String { reference: GcRef, hash: u64 },
     Ref(GcRef),
     Handle(StateHandle),
     Object(StateObject),
@@ -217,6 +218,7 @@ pub enum OfflineStateValue {
     F64(u64),
     Bool(bool),
     Rune(u32),
+    String(String),
     Handle(StateHandle),
 }
 
@@ -803,6 +805,7 @@ fn state_value_payload_bytes(value: &StateValue) -> usize {
         StateValue::I64(_) | StateValue::F64(_) => std::mem::size_of::<u64>(),
         StateValue::F32(_) | StateValue::Rune(_) => std::mem::size_of::<u32>(),
         StateValue::Bool(_) => 1,
+        StateValue::String { .. } => std::mem::size_of::<GcRef>() + std::mem::size_of::<u64>(),
         StateValue::Ref(_) => std::mem::size_of::<GcRef>(),
         StateValue::Handle(_) => std::mem::size_of::<StateHandle>(),
         StateValue::Object(_) => usize::MAX,
@@ -817,6 +820,7 @@ fn state_value_type(value: &StateValue) -> ValueType {
         StateValue::F64(_) => ValueType::F64,
         StateValue::Bool(_) => ValueType::Bool,
         StateValue::Rune(_) => ValueType::Rune,
+        StateValue::String { .. } => ValueType::String,
         StateValue::Ref(_) => ValueType::Ref,
         StateValue::Handle(_) => ValueType::Named(nexa_bytecode::state_handle_type(
             ValueType::Named(StableId::from_name("StateValue")),
@@ -826,12 +830,18 @@ fn state_value_type(value: &StateValue) -> ValueType {
 }
 
 fn state_value_root_count(value: &StateValue) -> usize {
-    usize::from(matches!(value, StateValue::Ref(_)))
+    usize::from(matches!(
+        value,
+        StateValue::String { .. } | StateValue::Ref(_)
+    ))
 }
 
 fn push_root(value: &StateValue, roots: &mut Vec<GcRef>) {
-    if let StateValue::Ref(reference) = value {
-        roots.push(*reference);
+    match value {
+        StateValue::String { reference, .. } | StateValue::Ref(reference) => {
+            roots.push(*reference);
+        }
+        _ => {}
     }
 }
 
@@ -852,7 +862,8 @@ fn state_value_matches(value: &StateValue, expected: nexa_bytecode::ValueType) -
         (&StateValue::Rune(value), nexa_bytecode::ValueType::Rune) => {
             char::from_u32(value).is_some()
         }
-        (&StateValue::I32(_), nexa_bytecode::ValueType::I32)
+        (&StateValue::String { .. }, nexa_bytecode::ValueType::String)
+        | (&StateValue::I32(_), nexa_bytecode::ValueType::I32)
         | (&StateValue::I64(_), nexa_bytecode::ValueType::I64)
         | (&StateValue::F32(_), nexa_bytecode::ValueType::F32)
         | (&StateValue::F64(_), nexa_bytecode::ValueType::F64)
@@ -871,6 +882,10 @@ fn clone_leaf_value(value: &StateValue) -> StateValue {
         StateValue::F64(value) => StateValue::F64(*value),
         StateValue::Bool(value) => StateValue::Bool(*value),
         StateValue::Rune(value) => StateValue::Rune(*value),
+        StateValue::String { reference, hash } => StateValue::String {
+            reference: *reference,
+            hash: *hash,
+        },
         StateValue::Ref(reference) => StateValue::Ref(*reference),
         StateValue::Handle(handle) => StateValue::Handle(*handle),
         StateValue::Object(_) => unreachable!("nested state objects are rejected at admission"),
@@ -1136,6 +1151,10 @@ fn hash_state_value(hash: &mut DeterministicMigrationHasher, value: &StateValue)
         StateValue::Rune(value) => {
             hash.write_u8(8);
             hash.write_u32(*value);
+        }
+        StateValue::String { hash: value, .. } => {
+            hash.write_u8(9);
+            hash.write_u64(*value);
         }
         StateValue::Bool(value) => {
             hash.write_u8(2);
@@ -1760,6 +1779,10 @@ fn state_to_runtime_value(stable_id: StableId, value: &StateValue) -> RuntimeVal
         StateValue::F64(bits) => RuntimeValue::F64(*bits),
         StateValue::Bool(value) => RuntimeValue::Bool(*value),
         StateValue::Rune(value) => RuntimeValue::Rune(*value),
+        StateValue::String { reference, hash } => RuntimeValue::String {
+            reference: *reference,
+            hash: *hash,
+        },
         StateValue::Ref(reference) => RuntimeValue::Ref(*reference),
         StateValue::Handle(handle) => RuntimeValue::Opaque {
             type_id: StableId::from_name("StateHandle"),
@@ -1784,6 +1807,7 @@ fn runtime_to_state_value(
         RuntimeValue::F64(bits) => Ok(StateValue::F64(bits)),
         RuntimeValue::Bool(value) => Ok(StateValue::Bool(value)),
         RuntimeValue::Rune(value) => Ok(StateValue::Rune(value)),
+        RuntimeValue::String { reference, hash } => Ok(StateValue::String { reference, hash }),
         RuntimeValue::Ref(reference) | RuntimeValue::NamedRef { reference, .. } => {
             Ok(StateValue::Ref(reference))
         }
@@ -1824,6 +1848,7 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::F64(_) => nexa_bytecode::ValueType::F64,
         RuntimeValue::Bool(_) => nexa_bytecode::ValueType::Bool,
         RuntimeValue::Rune(_) => nexa_bytecode::ValueType::Rune,
+        RuntimeValue::String { .. } => nexa_bytecode::ValueType::String,
         RuntimeValue::Ref(_) => nexa_bytecode::ValueType::Ref,
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             nexa_bytecode::ValueType::Named(type_id)
@@ -1866,6 +1891,12 @@ pub fn run_offline_migration(
             return Err(OfflineMigrationError::DuplicateObject(pair[0].stable_id));
         }
     }
+    let heap_capacity = limits
+        .max_gc_roots
+        .saturating_add(limits.max_objects)
+        .saturating_add(64)
+        .max(1);
+    let mut heap = crate::Heap::new_with_string_limit(heap_capacity, limits.max_state_bytes);
     for object in sorted {
         let version = old_module
             .module()
@@ -1909,19 +1940,34 @@ pub fn run_offline_migration(
             field_len,
             scalar: None,
         });
-        old.fields
-            .extend(fields.into_iter().map(|field| MigrationFieldSlot {
-                field_id: field.stable_id,
-                value: match field.value {
-                    OfflineStateValue::I32(value) => StateValue::I32(value),
-                    OfflineStateValue::I64(value) => StateValue::I64(value),
-                    OfflineStateValue::F32(value) => StateValue::F32(value),
-                    OfflineStateValue::F64(value) => StateValue::F64(value),
-                    OfflineStateValue::Bool(value) => StateValue::Bool(value),
-                    OfflineStateValue::Rune(value) => StateValue::Rune(value),
-                    OfflineStateValue::Handle(handle) => StateValue::Handle(handle),
-                },
-            }));
+        old.fields.extend(
+            fields
+                .into_iter()
+                .map(|field| {
+                    Ok(MigrationFieldSlot {
+                        field_id: field.stable_id,
+                        value: match field.value {
+                            OfflineStateValue::I32(value) => StateValue::I32(value),
+                            OfflineStateValue::I64(value) => StateValue::I64(value),
+                            OfflineStateValue::F32(value) => StateValue::F32(value),
+                            OfflineStateValue::F64(value) => StateValue::F64(value),
+                            OfflineStateValue::Bool(value) => StateValue::Bool(value),
+                            OfflineStateValue::Rune(value) => StateValue::Rune(value),
+                            OfflineStateValue::String(value) => {
+                                let reference = heap.allocate_string(&value).map_err(|error| {
+                                    OfflineMigrationError::Interpreter(error.to_string())
+                                })?;
+                                let hash = heap.string_hash(reference).map_err(|error| {
+                                    OfflineMigrationError::Interpreter(error.to_string())
+                                })?;
+                                StateValue::String { reference, hash }
+                            }
+                            OfflineStateValue::Handle(handle) => StateValue::Handle(handle),
+                        },
+                    })
+                })
+                .collect::<Result<Vec<_>, OfflineMigrationError>>()?,
+        );
     }
     old.rebuild_caches();
     if old.payload.len() > old.byte_capacity || old.gc_roots.len() > old.gc_root_capacity {
@@ -1943,7 +1989,7 @@ pub fn run_offline_migration(
         limits,
     )
     .map_err(OfflineMigrationError::Migration)?;
-    let outcome = crate::CheckedInterpreter::run_migration(
+    let outcome = crate::CheckedInterpreter::run_migration_with_heap(
         new_module,
         migration_entry,
         &[],
@@ -1953,6 +1999,7 @@ pub fn run_offline_migration(
             ..crate::FrameLimits::default()
         },
         &mut migration,
+        &mut heap,
     )
     .map_err(|error| OfflineMigrationError::Interpreter(error.to_string()))?;
     if !matches!(outcome, crate::InterpreterOutcome::Returned { .. }) {
@@ -1999,6 +2046,11 @@ pub fn run_offline_migration(
                         StateValue::Bool(value) => OfflineStateValue::Bool(value),
                         StateValue::Rune(value) => OfflineStateValue::Rune(value),
                         StateValue::Handle(handle) => OfflineStateValue::Handle(handle),
+                        StateValue::String { reference, .. } => OfflineStateValue::String(
+                            heap.string(reference)
+                                .map_err(|_| OfflineMigrationError::UnsupportedOutputValue)?
+                                .to_owned(),
+                        ),
                         StateValue::Ref(_) | StateValue::Object(_) => {
                             return Err(OfflineMigrationError::UnsupportedOutputValue);
                         }
@@ -2180,6 +2232,23 @@ mod tests {
             max_fuel: 64,
             max_call_depth: 8,
         }
+    }
+
+    #[test]
+    fn stateful_string_fields_hold_gc_roots() {
+        let mut heap = crate::Heap::new_with_string_limit(2, 16);
+        let reference = heap.allocate_string("persistent").unwrap();
+        let hash = heap.string_hash(reference).unwrap();
+        let mut registry = StatefulRegistry::try_new(StatefulDomainId::new(7), limits()).unwrap();
+        let stable_id = StableId::from_name("persistent-label");
+        let handle = registry
+            .insert(stable_id, StateValue::String { reference, hash })
+            .unwrap();
+        assert_eq!(
+            registry.resolve(handle),
+            Ok(StateValue::String { reference, hash })
+        );
+        assert_eq!(registry.gc_roots(), vec![reference]);
     }
 
     fn context(schema: StateSchema, limits: MigrationLimits) -> MigrationContext {

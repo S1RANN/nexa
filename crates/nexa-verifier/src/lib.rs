@@ -62,6 +62,7 @@ pub enum VerifyErrorKind {
     EnumVariantOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
+    StringOutOfRange(u32),
 }
 
 impl fmt::Display for VerifyError {
@@ -338,6 +339,12 @@ fn verify_function(
                 }
                 state[register(dst)?] = Some(ValueType::Rune);
             }
+            Instruction::LoadString { dst, string } => {
+                if string as usize >= module.strings.len() {
+                    return Err(error(Some(pc), VerifyErrorKind::StringOutOfRange(string)));
+                }
+                state[register(dst)?] = Some(ValueType::String);
+            }
             Instruction::LoadBool { dst, .. } => state[register(dst)?] = Some(ValueType::Bool),
             Instruction::Move { dst, source } => {
                 let source = register(source)?;
@@ -376,6 +383,29 @@ fn verify_function(
                 require(&state, lhs, ValueType::F64)?;
                 require(&state, rhs, ValueType::F64)?;
                 state[register(dst)?] = Some(ValueType::F64);
+            }
+            Instruction::StringLen { dst, source } | Instruction::StringByteLen { dst, source } => {
+                require(&state, source, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::StringEqual { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::String)?;
+                require(&state, rhs, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::StringConcat { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::String)?;
+                require(&state, rhs, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::StringRuneAt { dst, source, index } => {
+                require(&state, source, ValueType::String)?;
+                require(&state, index, ValueType::I32)?;
+                state[register(dst)?] = Some(ValueType::Rune);
+            }
+            Instruction::StringHash { dst, source } => {
+                require(&state, source, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::I64);
             }
             Instruction::CompareEq { dst, lhs, rhs } => {
                 let lhs = register(lhs)?;
@@ -878,6 +908,8 @@ fn verify_safepoints(
                 instruction,
                 Instruction::Safepoint
                     | Instruction::Yield
+                    | Instruction::LoadString { .. }
+                    | Instruction::StringConcat { .. }
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
                     | Instruction::StateHandleResolve { .. }
