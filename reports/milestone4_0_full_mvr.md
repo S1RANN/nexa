@@ -1,6 +1,15 @@
-# Nexa Milestone 4.0R2 可验证契约最终收口
+# Nexa Milestone 4.0R3 端到端诊断与可信证据最终收口
 
-Status: **COMPLETE**
+Status: **INCOMPLETE**
+
+当前重新打开的真实缺口：
+
+- `M4R3-RUNTIME-DIAGNOSTIC`
+- `M4R3-GATE-PROVENANCE`
+- `M4R3-AUDIT-DERIVATION`
+- `M4R3-EVIDENCE-RECEIPT`
+
+下方 R2 内容仅作为已被取代的历史证据保留，不再代表当前有效完成状态。
 
 - Implementation SHA: `3bc6a81b8bcb61307698ece3b80f118fdb2c64df`
 - Implementation Tree SHA: `7faecfe1cbf7b24a7da04959c3fa4fff6c83dcf4`

@@ -1,4 +1,7 @@
 {
+  "superseded": true,
+  "superseded_by": "Milestone 4.0R3",
+  "reason": "Runtime-family diagnostic cases and several audit conclusions were not fully end-to-end derived.",
   "schema_version": 2,
   "milestone": "4.0R2",
   "status": "complete",

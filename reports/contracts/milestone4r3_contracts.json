@@ -1,0 +1,384 @@
+{
+  "version": 3,
+  "milestone": "4.0R3",
+  "contracts": [
+    {
+      "id": "M4R3-STATUS-001",
+      "work_package": 1,
+      "description": "R2 is superseded and the four R3 gaps are the only active milestone status.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/milestone/status", "operator": "eq", "expected": "INCOMPLETE"},
+        {"pointer": "/metrics/milestone/gaps", "operator": "set_equals", "expected": ["M4R3-RUNTIME-DIAGNOSTIC", "M4R3-GATE-PROVENANCE", "M4R3-AUDIT-DERIVATION", "M4R3-EVIDENCE-RECEIPT"]},
+        {"pointer": "/metrics/milestone/r2_superseded", "operator": "eq", "expected": true}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["reports/milestone4_0_full_mvr.md", "reports/contracts/milestone4r2_results.json"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-CONTRACT-001",
+      "work_package": 2,
+      "description": "Manifest v3 covers every work package with executable provenance declarations.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/contracts/version", "operator": "eq", "expected": 3},
+        {"pointer": "/metrics/contracts/work_packages", "operator": "eq", "expected": 24},
+        {"pointer": "/metrics/contracts/invalid_contracts", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["reports/contracts/milestone4r3_contracts.json"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-CORPUS-STATIC-001",
+      "work_package": 3,
+      "description": "Runtime corpus contains no direct error construction or classification shortcuts.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/static/forbidden_runtime_corpus_calls", "operator": "empty", "expected": null},
+        {"pointer": "/metrics/static/direct_nexa_error_construction", "operator": "eq", "expected": 0},
+        {"pointer": "/metrics/static/direct_error_variant_construction", "operator": "eq", "expected": 0}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/diagnostic_corpus.rs", "crates/nexa/src/runtime_diagnostics.rs"],
+      "forbidden_calls": ["NexaError::Host(", "NexaError::Reload(", "NexaError::Migration(", "invoke_host_boundary(", "validate_host_completion(", "invoke_reload_activation(", "validate_reload_completion_capacity(", "MigrationLimits::validate_requirements("],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-001",
+      "work_package": 4,
+      "description": "Every runtime case uses an independent real RuntimeDiagnosticHarness.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/harness/independent_cases", "operator": "eq", "expected": 11},
+        {"pointer": "/metrics/harness/facade_classification_helpers", "operator": "eq", "expected": 0}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
+      "forbidden_calls": ["emit_error", "classify", "make_nexa_error"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-002",
+      "work_package": 5,
+      "description": "NX4001 is emitted by a real hosted RealmRuntime module load hash mismatch.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX4001/scenario", "operator": "eq", "expected": "realm_host_hash_mismatch"},
+        {"pointer": "/metrics/cases/NX4001/observed", "operator": "eq", "expected": "NX4001"},
+        {"pointer": "/metrics/cases/NX4001/real_realm_runtime", "operator": "eq", "expected": true}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["classify"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-003",
+      "work_package": 6,
+      "description": "NX4002 is emitted by recursive isolated-Realm host capability validation.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX4002/scenario", "operator": "eq", "expected": "isolated_recursive_host_capability"},
+        {"pointer": "/metrics/cases/NX4002/subcases", "operator": "eq", "expected": 5},
+        {"pointer": "/metrics/cases/NX4002/observed", "operator": "eq", "expected": "NX4002"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["classify"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-004",
+      "work_package": 7,
+      "description": "NX4003 traverses Realm call, Interpreter HostCall, registry arity rejection, and terminal trap.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX4003/scenario", "operator": "eq", "expected": "realm_host_argument_mismatch"},
+        {"pointer": "/metrics/cases/NX4003/task_terminal_state", "operator": "eq", "expected": "Trapped"},
+        {"pointer": "/metrics/cases/NX4003/script_stack", "operator": "not_empty", "expected": null},
+        {"pointer": "/metrics/cases/NX4003/request_leaks", "operator": "eq", "expected": 0}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/interpreter.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["RuntimeHostArgs::new"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-005",
+      "work_package": 8,
+      "description": "NX5001 is emitted by real Realm host panic containment and result mismatch.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX5001/scenario", "operator": "eq", "expected": "realm_host_panic_and_result_mismatch"},
+        {"pointer": "/metrics/cases/NX5001/subcases", "operator": "eq", "expected": 2},
+        {"pointer": "/metrics/cases/NX5001/task_terminal_state", "operator": "eq", "expected": "Trapped"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs", "crates/nexa-runtime/src/interpreter.rs"],
+      "forbidden_calls": ["invoke_host_boundary"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-006",
+      "work_package": 9,
+      "description": "NX5002 traverses async ticket abandonment, completion queue, tick, and policy.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX5002/scenario", "operator": "eq", "expected": "realm_async_ticket_abandoned"},
+        {"pointer": "/metrics/cases/NX5002/completion_exactly_once", "operator": "eq", "expected": true},
+        {"pointer": "/metrics/cases/NX5002/observed", "operator": "eq", "expected": "NX5002"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/host.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["validate_host_completion"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-007",
+      "work_package": 10,
+      "description": "NX5003 traverses unknown async error code completion writeback.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX5003/scenario", "operator": "eq", "expected": "realm_unknown_host_error_writeback"},
+        {"pointer": "/metrics/cases/NX5003/unknown_error_code", "operator": "eq", "expected": 77},
+        {"pointer": "/metrics/cases/NX5003/observed", "operator": "eq", "expected": "NX5003"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["validate_host_completion"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-008",
+      "work_package": 11,
+      "description": "NX5004 is emitted by task, module, and request admission capacity paths.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX5004/scenario", "operator": "eq", "expected": "runtime_capacity_admission"},
+        {"pointer": "/metrics/cases/NX5004/subcases", "operator": "eq", "expected": 3},
+        {"pointer": "/metrics/cases/NX5004/partial_mutation", "operator": "eq", "expected": false}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["classify"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-009",
+      "work_package": 12,
+      "description": "NX6001 is emitted by real reload migration limit execution.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX6001/scenario", "operator": "eq", "expected": "realm_stage_reload_migration_limit"},
+        {"pointer": "/metrics/cases/NX6001/migration_limit_subcases", "operator": "eq", "expected": 7},
+        {"pointer": "/metrics/cases/NX6001/observed", "operator": "eq", "expected": "NX6001"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/stateful.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["MigrationLimits::validate_requirements"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-010",
+      "work_package": 13,
+      "description": "NX6002 is emitted by real migration graph finalization.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX6002/scenario", "operator": "eq", "expected": "realm_migration_graph_validation"},
+        {"pointer": "/metrics/cases/NX6002/graph_subcases", "operator": "eq", "expected": 5},
+        {"pointer": "/metrics/cases/NX6002/observed", "operator": "eq", "expected": "NX6002"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/stateful.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["StatefulRegistry::insert"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-011",
+      "work_package": 14,
+      "description": "NX6003 is emitted after real candidate publication and activation trap.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX6003/scenario", "operator": "eq", "expected": "realm_commit_reload_activation_trap"},
+        {"pointer": "/metrics/cases/NX6003/candidate_lifecycle", "operator": "eq", "expected": "ActivationFaulted"},
+        {"pointer": "/metrics/cases/NX6003/root_publications", "operator": "eq", "expected": 1}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["invoke_reload_activation"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-012",
+      "work_package": 15,
+      "description": "NX6004 is emitted by real ReloadCompletionBuffer capacity failure.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/cases/NX6004/scenario", "operator": "eq", "expected": "realm_reload_completion_buffer_capacity"},
+        {"pointer": "/metrics/cases/NX6004/real_reload_buffer", "operator": "eq", "expected": true},
+        {"pointer": "/metrics/cases/NX6004/partial_buffer_write", "operator": "eq", "expected": false}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs", "crates/nexa-runtime/src/reload.rs", "crates/nexa-runtime/src/realm.rs"],
+      "forbidden_calls": ["validate_reload_completion_capacity"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-SNAPSHOT-001",
+      "work_package": 16,
+      "description": "Every runtime case records before and after production snapshots with mutation allowlists.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/snapshots/cases", "operator": "eq", "expected": 11},
+        {"pointer": "/metrics/snapshots/unexpected_mutations", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-DETERMINISM-001",
+      "work_package": 17,
+      "description": "All runtime cases execute twice with identical semantic observations.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/metrics/deterministic_cases", "operator": "eq", "expected": 11},
+        {"pointer": "/metrics/nondeterministic_cases", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["crates/nexa/src/runtime_diagnostics.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-RUNTIME-GATE-001",
+      "work_package": 18,
+      "description": "Runtime diagnostic gate owns execution, status, failures, and artifact production.",
+      "gate": "runtime-diagnostic-corpus",
+      "artifact": "runtime_diagnostics.json",
+      "assertions": [
+        {"pointer": "/status", "operator": "eq", "expected": "passed"},
+        {"pointer": "/metrics/observed_codes", "operator": "eq", "expected": 11},
+        {"pointer": "/failures", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/contract-gates/src/main.rs", "crates/nexa/src/runtime_diagnostics.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-GATE-PROTOCOL-001",
+      "work_package": 19,
+      "description": "All contract gates use the shared self-contained artifact protocol.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/gate_protocol/schema_version", "operator": "eq", "expected": 1},
+        {"pointer": "/metrics/gate_protocol/self_deciding_gates", "operator": "eq", "expected": 9}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/contract-gate-protocol/src/lib.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-GATE-ARTIFACTS-001",
+      "work_package": 20,
+      "description": "Nine independent gate commands generate nine implementation-bound raw artifacts.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/artifacts/generated", "operator": "eq", "expected": 9},
+        {"pointer": "/metrics/artifacts/missing", "operator": "empty", "expected": null},
+        {"pointer": "/metrics/artifacts/provenance_mismatches", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/contract-gates/src/main.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-AUDIT-DERIVATION-001",
+      "work_package": 21,
+      "description": "Release Audit derives no domain facts and contains no expected domain counts.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/audit/domain_fill_values", "operator": "empty", "expected": null},
+        {"pointer": "/metrics/audit/forbidden_domain_counts", "operator": "empty", "expected": null}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/release-audit/src/main.rs"],
+      "forbidden_calls": ["592", "15", "6", "18", "34", "38"],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-AUDIT-NEGATIVE-001",
+      "work_package": 22,
+      "description": "Contract audit rejects every required corruption and derives gaps from failed assertions.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/audit/negative_cases", "operator": "eq", "expected": 15},
+        {"pointer": "/metrics/audit/negative_failures", "operator": "empty", "expected": null},
+        {"pointer": "/metrics/audit/gap_derivation", "operator": "eq", "expected": true}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/release-audit/src/main.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-EVIDENCE-PROTOCOL-001",
+      "work_package": 23,
+      "description": "Implementation, Evidence, and Receipt are enforced as three direct commits.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/evidence/protocol", "operator": "eq", "expected": "implementation-evidence-receipt"},
+        {"pointer": "/metrics/evidence/premature_receipt", "operator": "eq", "expected": false}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/release-audit/src/main.rs"],
+      "forbidden_calls": [],
+      "status": "pending"
+    },
+    {
+      "id": "M4R3-FINAL-VERIFY-001",
+      "work_package": 24,
+      "description": "The final verifier enforces the complete three-commit evidence chain and all local gates.",
+      "gate": "workspace-gates",
+      "artifact": "workspace_gates.json",
+      "assertions": [
+        {"pointer": "/metrics/evidence/commands", "operator": "set_equals", "expected": ["generate", "verify-evidence", "generate-receipt", "verify-final"]},
+        {"pointer": "/metrics/local_gates/status", "operator": "eq", "expected": "passed"}
+      ],
+      "implementation_commit": null,
+      "affected_paths": ["tools/release-audit/src/main.rs", "scripts/milestone4-local-gates.sh"],
+      "forbidden_calls": [],
+      "status": "pending"
+    }
+  ]
+}
