@@ -7271,7 +7271,7 @@ pub fn compile_with_interface(
             } else {
                 HostCallMode::Async
             },
-            fuel_cost: 1,
+            fuel_cost: function.fuel_cost,
             async_result,
         };
         host_functions.insert(
@@ -8480,7 +8480,7 @@ migration fn migrate() -> bool {
         let idl = nexa_idl::parse(
             "interface Engine {
                  struct EnemyView { health: i32; }
-                 sync fn world_snapshot() -> snapshot<EnemyView>;
+                 sync fuel 13 fn world_snapshot() -> snapshot<EnemyView>;
              }",
         )
         .unwrap();
@@ -8495,6 +8495,7 @@ migration fn migrate() -> bool {
         )
         .unwrap();
         assert_eq!(module.module().snapshot_types, vec![metadata]);
+        assert_eq!(module.module().host_imports[0].fuel_cost, 13);
 
         for source in [
             "struct EnemyView { health: i32; }

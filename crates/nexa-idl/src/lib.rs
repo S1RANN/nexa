@@ -46,6 +46,7 @@ pub struct HostFunction {
     pub parameters: Vec<Field>,
     pub result: TypeRef,
     pub synchronous: bool,
+    pub fuel_cost: u32,
     pub cancel_policy: CancelPolicy,
     pub abandon_policy: AbandonPolicy,
 }
@@ -121,25 +122,56 @@ pub fn exact_hash(idl: &Idl) -> StableId {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn canonical(idl: &Idl) -> String {
     let mut output = format!("interface:{};", idl.interface);
     for handle in &idl.opaque_handles {
-        write!(output, "opaque:{handle};").expect("String writes do not fail");
+        write!(
+            output,
+            "opaque:{handle}#{:016x};",
+            StableId::from_name(handle).0
+        )
+        .expect("String writes do not fail");
     }
     for structure in &idl.structs {
-        write!(output, "struct:{}{{", structure.name).expect("String writes do not fail");
+        write!(
+            output,
+            "struct:{}#{:016x}{{",
+            structure.name,
+            StableId::from_name(&structure.name).0
+        )
+        .expect("String writes do not fail");
         for field in &structure.fields {
-            write!(output, "{}:{};", field.name, type_name(&field.ty))
-                .expect("String writes do not fail");
+            write!(
+                output,
+                "{}#{:016x}:{};",
+                field.name,
+                StableId::from_parts(&[&structure.name, "::", &field.name]).0,
+                abi_type_descriptor(idl, &field.ty)
+            )
+            .expect("String writes do not fail");
         }
         output.push('}');
     }
     for enumeration in &idl.enums {
-        write!(output, "enum:{}{{", enumeration.name).expect("String writes do not fail");
+        write!(
+            output,
+            "enum:{}#{:016x}{{",
+            enumeration.name,
+            StableId::from_name(&enumeration.name).0
+        )
+        .expect("String writes do not fail");
         for variant in &enumeration.variants {
-            write!(output, "{}", variant.name).expect("String writes do not fail");
+            write!(
+                output,
+                "{}#{:016x}",
+                variant.name,
+                StableId::from_parts(&[&enumeration.name, "::", &variant.name]).0
+            )
+            .expect("String writes do not fail");
             if let Some(payload) = &variant.payload {
-                write!(output, "({})", type_name(payload)).expect("String writes do not fail");
+                write!(output, "({})", abi_type_descriptor(idl, payload))
+                    .expect("String writes do not fail");
             }
             output.push(';');
         }
@@ -148,13 +180,15 @@ pub fn canonical(idl: &Idl) -> String {
     for function in &idl.functions {
         write!(
             output,
-            "fn:{}:{}:{}:{}(",
+            "fn:{}#{:016x}:{}:fuel={}:{}:{}(",
+            function.name,
+            StableId::from_parts(&[&idl.interface, "::", &function.name]).0,
             if function.synchronous {
                 "sync"
             } else {
                 "request"
             },
-            function.name,
+            function.fuel_cost,
             match function.cancel_policy {
                 CancelPolicy::ReturnError => "return_error",
                 CancelPolicy::CancelTask => "cancel_task",
@@ -166,19 +200,31 @@ pub fn canonical(idl: &Idl) -> String {
         )
         .expect("String writes do not fail");
         for parameter in &function.parameters {
-            write!(output, "{}:{};", parameter.name, type_name(&parameter.ty))
-                .expect("String writes do not fail");
+            write!(
+                output,
+                "{}:{};",
+                parameter.name,
+                abi_type_descriptor(idl, &parameter.ty)
+            )
+            .expect("String writes do not fail");
         }
-        write!(output, ")->{};", type_name(&function.result)).expect("String writes do not fail");
+        write!(output, ")->{};", abi_type_descriptor(idl, &function.result))
+            .expect("String writes do not fail");
     }
     for export in &idl.exports {
         write!(output, "export:{}(", export.name).expect("String writes do not fail");
         for parameter in &export.parameters {
-            write!(output, "{}:{};", parameter.name, type_name(&parameter.ty))
-                .expect("String writes do not fail");
+            write!(
+                output,
+                "{}:{};",
+                parameter.name,
+                abi_type_descriptor(idl, &parameter.ty)
+            )
+            .expect("String writes do not fail");
         }
         if let Some(result) = &export.result {
-            write!(output, ")->{};", type_name(result)).expect("String writes do not fail");
+            write!(output, ")->{};", abi_type_descriptor(idl, result))
+                .expect("String writes do not fail");
         } else {
             output.push_str(")->void;");
         }
@@ -899,6 +945,21 @@ fn type_name(ty: &TypeRef) -> String {
     }
 }
 
+fn abi_type_descriptor(idl: &Idl, ty: &TypeRef) -> String {
+    let lowered = match value_type(idl, ty) {
+        ValueType::I32 => "i32".into(),
+        ValueType::I64 => "i64".into(),
+        ValueType::F32 => "f32".into(),
+        ValueType::F64 => "f64".into(),
+        ValueType::Bool => "bool".into(),
+        ValueType::Rune => "rune".into(),
+        ValueType::String => "string".into(),
+        ValueType::Ref => "ref".into(),
+        ValueType::Named(id) => format!("named#{:016x}", id.0),
+    };
+    format!("{}[{lowered}]", type_name(ty))
+}
+
 fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
     inner.map_or_else(
         || name.to_owned(),
@@ -1090,6 +1151,20 @@ impl Parser {
                     } else {
                         (CancelPolicy::ReturnError, AbandonPolicy::Trap)
                     };
+                    let fuel_cost = if self.take("fuel") {
+                        let value = self.word()?;
+                        let fuel_cost = value
+                            .parse::<u32>()
+                            .map_err(|_| IdlError::Syntax(format!("invalid fuel cost {value}")))?;
+                        if fuel_cost == 0 {
+                            return Err(IdlError::Syntax(
+                                "fuel cost must be greater than zero".into(),
+                            ));
+                        }
+                        fuel_cost
+                    } else {
+                        1
+                    };
                     self.expect("fn")?;
                     let name = self.word()?;
                     self.expect("(")?;
@@ -1114,6 +1189,7 @@ impl Parser {
                         parameters,
                         result,
                         synchronous,
+                        fuel_cost,
                         cancel_policy,
                         abandon_policy,
                     });
@@ -1354,7 +1430,7 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use super::{TypeRef, exact_hash, generate_rust, parse};
+    use super::{AbandonPolicy, CancelPolicy, TypeRef, exact_hash, generate_rust, parse};
 
     const IDL: &str = "
         interface GameHost {
@@ -1375,6 +1451,70 @@ mod tests {
         let payload_i32 = parse("interface Events { enum Event { Idle, Damage(i32) } }").unwrap();
         let payload_i64 = parse("interface Events { enum Event { Idle, Damage(i64) } }").unwrap();
         assert_ne!(exact_hash(&payload_i32), exact_hash(&payload_i64));
+    }
+
+    #[test]
+    fn exact_hash_covers_every_mvr_abi_dimension() {
+        let base = parse(
+            "interface Exact {
+                opaque DomainA;
+                opaque DomainB;
+                struct Payload { value: i32; }
+                enum Failure { Cancelled, Invalid(i32) }
+                sync fuel 7 fn send(
+                    data: buffer<Payload>,
+                    view: snapshot<Payload>,
+                    lease: token<DomainA>
+                ) -> i32;
+            }",
+        )
+        .unwrap();
+        let base_hash = exact_hash(&base);
+        let changed = |idl| assert_ne!(base_hash, exact_hash(&idl));
+
+        let mut idl = base.clone();
+        idl.functions[0].name = "renamed".into();
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].parameters[0].ty = TypeRef::Buffer(Box::new(TypeRef::I64));
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].result = TypeRef::I64;
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].synchronous = false;
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].fuel_cost = 8;
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].cancel_policy = CancelPolicy::CancelTask;
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].abandon_policy = AbandonPolicy::ReturnError;
+        changed(idl);
+        let mut idl = base.clone();
+        idl.enums[0].variants[0].name = "Stopped".into();
+        changed(idl);
+        let mut idl = base.clone();
+        idl.structs[0].fields[0].name = "other".into();
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].parameters[1].ty =
+            TypeRef::Snapshot(Some(Box::new(TypeRef::Named("DomainA".into()))));
+        changed(idl);
+        let mut idl = base.clone();
+        idl.functions[0].parameters[2].ty =
+            TypeRef::ResourceToken(Some(Box::new(TypeRef::Named("DomainB".into()))));
+        changed(idl);
+    }
+
+    #[test]
+    fn fuel_cost_is_explicitly_parsed_and_validated() {
+        let idl = parse("interface Fuel { sync fuel 9 fn work() -> i32; }").unwrap();
+        assert_eq!(idl.functions[0].fuel_cost, 9);
+        assert!(parse("interface Fuel { sync fuel 0 fn work() -> i32; }").is_err());
+        assert!(parse("interface Fuel { sync fuel many fn work() -> i32; }").is_err());
     }
 
     #[test]
