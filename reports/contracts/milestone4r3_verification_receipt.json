@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "status": "verified",
+  "implementation_sha": "011110bc1f4a381b16e614ade2d8c9c23f231636",
+  "implementation_tree": "c55200964bc6a5f630d3a1a3e4e96e4aed9f8e4b",
+  "evidence_sha": "aac5656fddebb5568c56b9b3a41dba3b68182655",
+  "evidence_tree": "cda41bcdff4b5270d877d925cc24979867f22ced",
+  "results_hash": "ae847752c46aa84d79505f6cce859d12a549eed7",
+  "report_hash": "02eec78768289fefbb2985c7bf335444f6a5b5f0",
+  "artifact_hashes": {
+    "diagnostic_corpus.json": "96469aaa01049ef626b569bc300c3974c9b2ea14",
+    "diagnostic_spans.json": "13a54e2fc831293cb4c42163b2eb0027a16fb4df",
+    "failure_injection.json": "c65f73556c637046ffa697db772ba68ad118ad5b",
+    "host_allocations.json": "6ee1353bdf9b43698accfc677b5d16706a5bc2c7",
+    "host_returns.json": "c91dfee0ebcf25f3c2b56433eb88cce6d9b9980c",
+    "realm_v5.json": "317889805263d3590e47be501a6a821f083a54ff",
+    "runtime_diagnostics.json": "7baefb976d31f77950dd62646433c8cb76da933b",
+    "typed_snapshots.json": "d5bd04dc1d4600f19b79f42eb7a5868cd1e2c8bb",
+    "workspace_gates.json": "30ba836466d6f787d04d60ebe5b743675b144136"
+  },
+  "verification": {
+    "artifact_hashes_match": true,
+    "contracts_recomputed": true,
+    "evidence_paths_allowed": true,
+    "implementation_parent_matches": true,
+    "markdown_regenerated_equal": true
+  }
+}
