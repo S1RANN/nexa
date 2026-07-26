@@ -1242,6 +1242,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn real_realm_v5_events_use_production_apis() {
         let mut adapter = RealmV5RuntimeAdapter::new();
         adapter.apply(RealmV5RuntimeEvent::TaskAdmission).unwrap();
