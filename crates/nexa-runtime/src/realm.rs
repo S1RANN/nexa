@@ -345,6 +345,7 @@ pub enum CancelReason {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PollResult<T> {
     Completed(T),
     Pending(PendingReason),
@@ -353,6 +354,7 @@ pub enum PollResult<T> {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum TaskTerminalReason {
     Completed(Option<RuntimeValue>),
     Cancelled(CancelReason),
@@ -1412,8 +1414,19 @@ impl RealmRuntime {
                 self.scheduler.wait_for(request, task);
                 Ok(PollResult::Pending(PendingReason::HostRequest))
             }
-            InterpreterOutcome::Trapped { trap, charge, .. } => {
+            InterpreterOutcome::Trapped {
+                mut trap, charge, ..
+            } => {
                 let final_charge = self.tasks.record_charge(task, charge)?;
+                trap.attach_runtime_context(
+                    RawHandle::new(
+                        self.realm_id,
+                        snapshot.module_id,
+                        snapshot.module_generation,
+                    ),
+                    snapshot.module_epoch,
+                    task.raw(),
+                );
                 self.trap_task(
                     task,
                     snapshot.module_epoch,
@@ -2095,6 +2108,18 @@ impl RealmRuntime {
         snapshot: crate::TaskSnapshot,
         message: RuntimeMessage,
     ) -> Result<(), RealmError> {
+        let module = Arc::clone(&self.module_for_task(snapshot)?.verified);
+        let continuation = self.tasks.execution(task)?.continuation();
+        let mut trap = Trap::from_continuation(&module, continuation, TrapKind::Host, message);
+        trap.attach_runtime_context(
+            RawHandle::new(
+                self.realm_id,
+                snapshot.module_id,
+                snapshot.module_generation,
+            ),
+            snapshot.module_epoch,
+            task.raw(),
+        );
         self.tasks.request_task_cancel(task)?;
         self.tasks.reach_task_safepoint(task)?;
         self.tasks.mark_execution_cancelling(task)?;
@@ -2103,10 +2128,7 @@ impl RealmRuntime {
             snapshot.module_epoch,
             self.trace_cursor(),
             snapshot.charge,
-            Trap {
-                kind: TrapKind::Host,
-                message,
-            },
+            trap,
         )
     }
 
@@ -2220,7 +2242,16 @@ impl RealmRuntime {
             .cleanup_task(task, reason == CancelReason::ReloadCommit)?;
         let cleanup_charge = match cleanup {
             Ok(cleanup_charge) => cleanup_charge,
-            Err(trap) => {
+            Err(mut trap) => {
+                trap.attach_runtime_context(
+                    RawHandle::new(
+                        self.realm_id,
+                        snapshot.module_id,
+                        snapshot.module_generation,
+                    ),
+                    snapshot.module_epoch,
+                    task.raw(),
+                );
                 self.tasks.trap_task(task)?;
                 self.record_terminal(
                     task,
@@ -2561,9 +2592,10 @@ mod tests {
 
     use nexa_bytecode::{
         Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-        ModuleBuilder, RootMap, Signature, StateField, StateSchema, StateType, ValueType,
+        ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema, StateType,
+        ValueType,
     };
-    use nexa_core::StableId;
+    use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{
@@ -2622,6 +2654,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reloadable_async_module(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
         let error_enum = test_host_error_enum();
         let error_type = error_enum.type_id;
@@ -2714,6 +2747,44 @@ mod tests {
         ];
         module.function(async_task);
         module.function(yielding_task.finish().unwrap());
+        module.source_map([
+            SourceMapEntry {
+                function: 0,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(11), 0, 1),
+            },
+            SourceMapEntry {
+                function: 1,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(11), 10, 11),
+            },
+            SourceMapEntry {
+                function: 2,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(11), 20, 21),
+            },
+            SourceMapEntry {
+                function: 2,
+                pc_start: 1,
+                pc_end: 2,
+                span: SourceSpan::new(FileId(11), 22, 23),
+            },
+            SourceMapEntry {
+                function: 3,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(11), 30, 31),
+            },
+            SourceMapEntry {
+                function: 3,
+                pc_start: 1,
+                pc_end: 2,
+                span: SourceSpan::new(FileId(11), 32, 33),
+            },
+        ]);
         verify(module.finish(), VerifierLimits::default()).unwrap()
     }
 
@@ -4761,6 +4832,74 @@ mod tests {
             realm.resolve_heap_object(error_reference).unwrap(),
             Object::Enum { tag: 7, .. }
         ));
+    }
+
+    #[test]
+    fn abandoned_host_call_trap_retains_runtime_context_and_call_boundary() {
+        let host = StableId::from_name("trap-context-host");
+        let schema = StableId::from_name("trap-context-schema");
+        let request = Arc::new(Mutex::new(None));
+        let mut realm = RealmRuntime::hosted(
+            RealmConfig::default(),
+            RuntimeHost::new(8),
+            Box::new(AsyncRegistry {
+                hash: host,
+                request: Arc::clone(&request),
+            }),
+        )
+        .unwrap();
+        let module = realm
+            .load_module(reloadable_async_module(host, schema), host, schema)
+            .unwrap();
+        let scope = realm.create_scope(None).unwrap();
+        let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
+        let snapshot = realm.task_snapshot(task).unwrap();
+        assert_eq!(
+            realm.poll_task(task, 32).unwrap(),
+            PollResult::Pending(PendingReason::HostRequest)
+        );
+        request
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+            .unwrap()
+            .ticket
+            .abandon()
+            .unwrap();
+        realm
+            .tick(TickBudget {
+                max_tasks: 1,
+                frame_fuel_budget: 32,
+                collect_garbage: false,
+            })
+            .unwrap();
+
+        let Some(TaskTerminalReason::Trapped(trap)) =
+            realm.terminal_record(task).map(|record| &record.reason)
+        else {
+            panic!("abandoned host call must trap");
+        };
+        assert_eq!(trap.module, Some(module.raw()));
+        assert_eq!(trap.epoch, Some(snapshot.module_epoch));
+        assert_eq!(trap.task, Some(task.raw()));
+        assert_eq!(trap.function, 2);
+        assert_eq!(trap.pc, 1);
+        assert_eq!(trap.source_span, Some(SourceSpan::new(FileId(11), 22, 23)));
+        assert_eq!(trap.script_call_stack.len(), 1);
+        assert_eq!(
+            trap.script_call_stack.as_slice()[0].source_span,
+            trap.source_span
+        );
+        let boundary = trap
+            .host_call_boundary
+            .expect("host trap must identify its call boundary");
+        assert_eq!(boundary.import, 0);
+        assert_eq!(boundary.function, 2);
+        assert_eq!(boundary.pc, 0);
+        assert_eq!(
+            boundary.source_span,
+            Some(SourceSpan::new(FileId(11), 20, 21))
+        );
     }
 
     #[test]

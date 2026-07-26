@@ -261,6 +261,10 @@ impl FrameArena {
         self.frames.get(index)
     }
 
+    pub(crate) fn frames(&self) -> impl ExactSizeIterator<Item = &Frame> {
+        self.frames.iter()
+    }
+
     pub fn push_defer(&mut self, action: DeferAction) -> Result<(), FrameError> {
         if self.defer_records.len() >= self.limits.max_defer_records as usize
             || self.defer_records.len() == self.defer_records.capacity()

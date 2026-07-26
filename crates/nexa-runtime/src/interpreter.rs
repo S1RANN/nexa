@@ -1,7 +1,7 @@
 use std::fmt;
 
 use nexa_bytecode::{AsyncResultType, HostCallMode, Instruction, ValueType};
-use nexa_core::StableId;
+use nexa_core::{RawHandle, SourceSpan, StableId};
 use nexa_verifier::VerifiedModule;
 
 use crate::{
@@ -49,6 +49,7 @@ pub struct InterpreterContinuation {
     pending_fuel: u64,
     cumulative_exhausted: bool,
     cleanup_mode: bool,
+    host_call_boundary: Option<HostCallBoundary>,
 }
 
 impl InterpreterContinuation {
@@ -59,6 +60,11 @@ impl InterpreterContinuation {
         limits: FrameLimits,
         reservation: ContinuationReservation,
     ) -> Result<Self, InterpreterError> {
+        if limits.max_call_depth as usize > MAX_SCRIPT_CALL_STACK_DEPTH {
+            return Err(InterpreterError::ContinuationLimit(
+                FrameError::ReservationExceedsLimit,
+            ));
+        }
         let function_meta = module
             .module()
             .functions
@@ -77,6 +83,7 @@ impl InterpreterContinuation {
             pending_fuel: 0,
             cumulative_exhausted: false,
             cleanup_mode: false,
+            host_call_boundary: None,
         })
     }
 
@@ -154,6 +161,7 @@ impl InterpreterContinuation {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum InterpreterOutcome {
     Returned {
         value: Option<RuntimeValue>,
@@ -186,6 +194,119 @@ pub enum InterpreterOutcome {
 pub struct Trap {
     pub kind: TrapKind,
     pub message: crate::RuntimeMessage,
+    pub module: Option<RawHandle>,
+    pub epoch: Option<u64>,
+    pub function: u32,
+    pub pc: u32,
+    pub source_span: Option<SourceSpan>,
+    pub task: Option<RawHandle>,
+    pub script_call_stack: ScriptCallStack,
+    pub host_call_boundary: Option<HostCallBoundary>,
+}
+
+pub const MAX_SCRIPT_CALL_STACK_DEPTH: usize = 128;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScriptFrame {
+    pub function: u32,
+    pub pc: u32,
+    pub source_span: Option<SourceSpan>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ScriptCallStack {
+    frames: [ScriptFrame; MAX_SCRIPT_CALL_STACK_DEPTH],
+    len: u16,
+}
+
+impl ScriptCallStack {
+    #[must_use]
+    pub const fn as_slice(&self) -> &[ScriptFrame] {
+        self.frames.split_at(self.len as usize).0
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len as usize
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl Default for ScriptCallStack {
+    fn default() -> Self {
+        Self {
+            frames: [ScriptFrame::default(); MAX_SCRIPT_CALL_STACK_DEPTH],
+            len: 0,
+        }
+    }
+}
+
+impl fmt::Debug for ScriptCallStack {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ScriptCallStack")
+            .field(&self.as_slice())
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostCallBoundary {
+    pub import: u32,
+    pub function: u32,
+    pub pc: u32,
+    pub source_span: Option<SourceSpan>,
+}
+
+impl Trap {
+    pub(crate) fn from_continuation(
+        module: &VerifiedModule,
+        continuation: &InterpreterContinuation,
+        kind: TrapKind,
+        message: impl Into<crate::RuntimeMessage>,
+    ) -> Self {
+        let mut script_call_stack = ScriptCallStack::default();
+        for (index, frame) in continuation.arena.frames().enumerate() {
+            script_call_stack.frames[index] = ScriptFrame {
+                function: frame.function,
+                pc: frame.pc,
+                source_span: module.module().source_span(frame.function, frame.pc),
+            };
+            script_call_stack.len += 1;
+        }
+        let current = script_call_stack
+            .as_slice()
+            .last()
+            .copied()
+            .unwrap_or_default();
+        Self {
+            kind,
+            message: message.into(),
+            module: None,
+            epoch: None,
+            function: current.function,
+            pc: current.pc,
+            source_span: current.source_span,
+            task: None,
+            script_call_stack,
+            host_call_boundary: continuation.host_call_boundary,
+        }
+    }
+
+    pub(crate) fn attach_runtime_context(
+        &mut self,
+        module: RawHandle,
+        epoch: u64,
+        task: RawHandle,
+    ) {
+        self.module = Some(module);
+        self.epoch = Some(epoch);
+        self.task = Some(task);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -535,10 +656,12 @@ impl CheckedInterpreter {
             .nth(max_ops as usize)
             .is_some();
         if exceeds_budget {
-            return Ok(Err(Trap {
-                kind: TrapKind::CleanupBudgetExceeded,
-                message: "cleanup operation budget exceeded".into(),
-            }));
+            return Ok(Err(Trap::from_continuation(
+                module,
+                &continuation,
+                TrapKind::CleanupBudgetExceeded,
+                "cleanup operation budget exceeded",
+            )));
         }
         continuation.cleanup_mode = true;
         if !start_next_defer(module, &mut continuation.arena)? {
@@ -552,14 +675,20 @@ impl CheckedInterpreter {
         )? {
             InterpreterOutcome::Returned { charge, .. } => Ok(Ok(charge)),
             InterpreterOutcome::Trapped { trap, .. } => Ok(Err(trap)),
-            InterpreterOutcome::HostPending { .. } => Ok(Err(Trap {
-                kind: TrapKind::CleanupBudgetExceeded,
-                message: "cleanup attempted a host call".into(),
-            })),
-            InterpreterOutcome::Suspended { .. } => Ok(Err(Trap {
-                kind: TrapKind::CleanupBudgetExceeded,
-                message: "cleanup attempted to suspend or exhausted fuel".into(),
-            })),
+            InterpreterOutcome::HostPending { continuation, .. } => {
+                Ok(Err(Trap::from_continuation(
+                    module,
+                    &continuation,
+                    TrapKind::CleanupBudgetExceeded,
+                    "cleanup attempted a host call",
+                )))
+            }
+            InterpreterOutcome::Suspended { continuation, .. } => Ok(Err(Trap::from_continuation(
+                module,
+                &continuation,
+                TrapKind::CleanupBudgetExceeded,
+                "cleanup attempted to suspend or exhausted fuel",
+            ))),
         }
     }
 
@@ -773,6 +902,12 @@ impl CheckedInterpreter {
                         .map_err(InterpreterError::Host)?;
                     match outcome {
                         InterpreterHostOutcome::Immediate(value) => {
+                            continuation.host_call_boundary = Some(HostCallBoundary {
+                                import,
+                                function: frame.function,
+                                pc: frame.pc,
+                                source_span: module.module().source_span(frame.function, frame.pc),
+                            });
                             if metadata.result != runtime_value_type(value) {
                                 return Err(InterpreterError::TypeMismatch);
                             }
@@ -785,6 +920,12 @@ impl CheckedInterpreter {
                             if metadata.mode != HostCallMode::Async {
                                 return Err(InterpreterError::TypeMismatch);
                             }
+                            continuation.host_call_boundary = Some(HostCallBoundary {
+                                import,
+                                function: frame.function,
+                                pc: frame.pc,
+                                source_span: module.module().source_span(frame.function, frame.pc),
+                            });
                             increment_pc(&mut continuation.arena)?;
                             continuation.suspend_reason = Some(SuspendReason::HostRequest);
                             continuation.pending_fuel = pending_cost;
@@ -1142,10 +1283,12 @@ impl CheckedInterpreter {
                         migration.observe_fuel_used(charge.fuel_used);
                     }
                     return Ok(InterpreterOutcome::Trapped {
-                        trap: Trap {
-                            kind: TrapKind::BytecodeTrap,
-                            message: "bytecode trap".into(),
-                        },
+                        trap: Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::BytecodeTrap,
+                            "bytecode trap",
+                        ),
                         charge,
                         fuel,
                     });
@@ -1415,13 +1558,93 @@ fn opcode_index(instruction: Instruction) -> usize {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
+        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, SourceMapEntry,
+        ValueType,
     };
-    use nexa_core::StableId;
+    use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{CheckedInterpreter, InterpreterOutcome, SuspendReason};
     use crate::{GcRoots, Heap, Object, RuntimeValue};
+
+    #[test]
+    fn trap_resolves_each_script_frame_through_the_source_map() {
+        let mut trap_function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        trap_function.emit(Instruction::Trap);
+        let mut entry_function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        entry_function
+            .effect(FunctionEffect::Task)
+            .emit(Instruction::Call {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let caller_return = SourceSpan::new(FileId(7), 20, 26);
+        let callee_trap = SourceSpan::new(FileId(7), 40, 44);
+        let mut module = ModuleBuilder::new();
+        module.function(entry_function.finish().unwrap());
+        module.function(trap_function.finish().unwrap());
+        module.source_map([
+            SourceMapEntry {
+                function: 0,
+                pc_start: 0,
+                pc_end: 1,
+                span: SourceSpan::new(FileId(7), 10, 19),
+            },
+            SourceMapEntry {
+                function: 0,
+                pc_start: 1,
+                pc_end: 2,
+                span: caller_return,
+            },
+            SourceMapEntry {
+                function: 1,
+                pc_start: 0,
+                pc_end: 1,
+                span: callee_trap,
+            },
+        ]);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+
+        let InterpreterOutcome::Trapped { trap, .. } =
+            CheckedInterpreter::run(&module, 0, &[], 32).unwrap()
+        else {
+            panic!("nested bytecode trap must produce a script stack");
+        };
+
+        assert_eq!(trap.function, 1);
+        assert_eq!(trap.pc, 0);
+        assert_eq!(trap.source_span, Some(callee_trap));
+        assert_eq!(
+            trap.script_call_stack.as_slice(),
+            [
+                super::ScriptFrame {
+                    function: 0,
+                    pc: 1,
+                    source_span: Some(caller_return),
+                },
+                super::ScriptFrame {
+                    function: 1,
+                    pc: 0,
+                    source_span: Some(callee_trap),
+                },
+            ]
+        );
+    }
 
     #[test]
     fn frame_arena_continuation_yields_and_resumes_without_repeating_add() {

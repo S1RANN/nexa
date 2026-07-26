@@ -55,8 +55,9 @@ pub use host::{
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};
 pub use interpreter::{
-    CheckedInterpreter, ExecutionCharge, FuelState, InterpreterContinuation, InterpreterError,
-    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, OpcodeCostTable,
+    CheckedInterpreter, ExecutionCharge, FuelState, HostCallBoundary, InterpreterContinuation,
+    InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
+    InterpreterState, MAX_SCRIPT_CALL_STACK_DEPTH, OpcodeCostTable, ScriptCallStack, ScriptFrame,
     SuspendReason, Trap, TrapKind,
 };
 pub use metrics::ExecutionMetrics;
