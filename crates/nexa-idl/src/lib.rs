@@ -1,5 +1,6 @@
 //! Exact-build IDL parsing, canonical hashing and Rust binding generation.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::fmt::Write;
 
@@ -246,6 +247,47 @@ pub fn generate_rust(idl: &Idl) -> String {
         )
         .expect("String writes do not fail");
     }
+    let (token_domains, snapshot_contents) = collect_typed_handles(idl);
+    for domain in token_domains {
+        writeln!(
+            output,
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] \
+             pub struct {domain}Token(nexa_runtime::ResourceTokenHandle);\n\
+             impl {domain}Token {{\n\
+             pub const fn from_raw(handle: nexa_runtime::ResourceTokenHandle) -> Self {{ \
+             Self(handle) }}\n\
+             pub const fn into_raw(self) -> nexa_runtime::ResourceTokenHandle {{ self.0 }}\n\
+             }}\n\
+             impl From<{domain}Token> for nexa_runtime::ResourceTokenHandle {{ \
+             fn from(value: {domain}Token) -> Self {{ value.into_raw() }} }}\n\
+             impl From<nexa_runtime::ResourceTokenHandle> for {domain}Token {{ \
+             fn from(value: nexa_runtime::ResourceTokenHandle) -> Self {{ Self::from_raw(value) }} \
+             }}"
+        )
+        .expect("String writes do not fail");
+    }
+    for content in snapshot_contents {
+        let snapshot_type = nexa_bytecode::snapshot_type(StableId::from_name(&content)).0;
+        writeln!(
+            output,
+            "#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)] \
+             pub struct {content}Snapshot(nexa_runtime::SnapshotHandle);\n\
+             impl {content}Snapshot {{\n\
+             pub const TYPE_ID: nexa_runtime::StableId = nexa_runtime::StableId({snapshot_type});\n\
+             pub fn try_from_raw(handle: nexa_runtime::SnapshotHandle) \
+             -> Result<Self, nexa_runtime::HostTrap> {{ if handle.type_id() == Self::TYPE_ID {{ \
+             Ok(Self(handle)) }} else {{ Err(nexa_runtime::HostTrap::Type) }} }}\n\
+             pub const fn into_raw(self) -> nexa_runtime::SnapshotHandle {{ self.0 }}\n\
+             }}\n\
+             impl TryFrom<nexa_runtime::SnapshotHandle> for {content}Snapshot {{ \
+             type Error = nexa_runtime::HostTrap; \
+             fn try_from(value: nexa_runtime::SnapshotHandle) -> Result<Self, Self::Error> {{ \
+             Self::try_from_raw(value) }} }}\n\
+             impl From<{content}Snapshot> for nexa_runtime::SnapshotHandle {{ \
+             fn from(value: {content}Snapshot) -> Self {{ value.into_raw() }} }}"
+        )
+        .expect("String writes do not fail");
+    }
     for enumeration in &idl.enums {
         writeln!(
             output,
@@ -418,7 +460,10 @@ pub fn generate_rust(idl: &Idl) -> String {
     );
     for (index, export) in idl.exports.iter().enumerate() {
         let args = if export.parameters.is_empty() {
-            format!("pub struct {}Args;", export.name)
+            format!(
+                "#[derive(Clone, Debug, PartialEq)] pub struct {}Args;",
+                export.name
+            )
         } else {
             let fields = export
                 .parameters
@@ -426,9 +471,13 @@ pub fn generate_rust(idl: &Idl) -> String {
                 .map(|field| format!("pub {}: {}", field.name, rust_type(&field.ty)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            format!("pub struct {}Args {{ {fields} }}", export.name)
+            format!(
+                "#[derive(Clone, Debug, PartialEq)] pub struct {}Args {{ {fields} }}",
+                export.name
+            )
         };
         let output_type = export.result.as_ref().map_or("()".to_owned(), rust_type);
+        let export_id = StableId::from_parts(&[&idl.interface, "::export::", &export.name]).0;
         writeln!(
             output,
             "{args}\n\
@@ -437,12 +486,81 @@ pub fn generate_rust(idl: &Idl) -> String {
              impl nexa_runtime::ScriptFunction for {name} {{\n\
              type Args = {name}Args; type Output = {name}Output;\n\
              const FUNCTION_ID: u32 = {index}; }}\n\
-             impl {name} {{ pub const EXPORT_NAME: &'static str = \"{name}\"; }}",
+             impl {name} {{ pub const EXPORT_NAME: &'static str = \"{name}\"; \
+             pub const EXPORT_ID: nexa_runtime::StableId = nexa_runtime::StableId({export_id}); }}",
             name = export.name,
         )
         .expect("String writes do not fail");
     }
     output
+}
+
+fn collect_typed_handles(idl: &Idl) -> (BTreeSet<String>, BTreeSet<String>) {
+    fn collect(ty: &TypeRef, tokens: &mut BTreeSet<String>, snapshots: &mut BTreeSet<String>) {
+        match ty {
+            TypeRef::ResourceToken(Some(inner)) => {
+                let TypeRef::Named(name) = inner.as_ref() else {
+                    unreachable!("validated resource domains are nominal")
+                };
+                tokens.insert(name.clone());
+            }
+            TypeRef::Snapshot(Some(inner)) => {
+                let TypeRef::Named(name) = inner.as_ref() else {
+                    unreachable!("validated snapshot contents are nominal")
+                };
+                snapshots.insert(name.clone());
+            }
+            TypeRef::HostRequest(Some(inner))
+            | TypeRef::Array(inner)
+            | TypeRef::Buffer(inner)
+            | TypeRef::Option(inner) => collect(inner, tokens, snapshots),
+            TypeRef::Result(success, error) => {
+                collect(success, tokens, snapshots);
+                collect(error, tokens, snapshots);
+            }
+            TypeRef::I32
+            | TypeRef::I64
+            | TypeRef::F32
+            | TypeRef::F64
+            | TypeRef::Bool
+            | TypeRef::Rune
+            | TypeRef::String
+            | TypeRef::HostRequest(None)
+            | TypeRef::ResourceToken(None)
+            | TypeRef::Snapshot(None)
+            | TypeRef::Named(_) => {}
+        }
+    }
+
+    let mut tokens = BTreeSet::new();
+    let mut snapshots = BTreeSet::new();
+    for structure in &idl.structs {
+        for field in &structure.fields {
+            collect(&field.ty, &mut tokens, &mut snapshots);
+        }
+    }
+    for enumeration in &idl.enums {
+        for variant in &enumeration.variants {
+            if let Some(payload) = &variant.payload {
+                collect(payload, &mut tokens, &mut snapshots);
+            }
+        }
+    }
+    for function in &idl.functions {
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut tokens, &mut snapshots);
+        }
+        collect(&function.result, &mut tokens, &mut snapshots);
+    }
+    for export in &idl.exports {
+        for parameter in &export.parameters {
+            collect(&parameter.ty, &mut tokens, &mut snapshots);
+        }
+        if let Some(result) = &export.result {
+            collect(result, &mut tokens, &mut snapshots);
+        }
+    }
+    (tokens, snapshots)
 }
 
 fn pascal_case(name: &str) -> String {
@@ -466,8 +584,12 @@ fn encode_completion_payload(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::Bool => format!("nexa_runtime::HostPayload::Bool({source})"),
         TypeRef::Rune => format!("nexa_runtime::HostPayload::Rune({source} as u32)"),
         TypeRef::String => format!("nexa_runtime::HostPayload::String({source})"),
-        TypeRef::ResourceToken(_) => format!("nexa_runtime::HostPayload::Token({source})"),
-        TypeRef::Snapshot(_) => format!("nexa_runtime::HostPayload::Snapshot({source})"),
+        TypeRef::ResourceToken(_) => {
+            format!("nexa_runtime::HostPayload::Token({source}.into_raw())")
+        }
+        TypeRef::Snapshot(_) => {
+            format!("nexa_runtime::HostPayload::Snapshot({source}.into_raw())")
+        }
         TypeRef::Array(inner) => format!(
             "nexa_runtime::HostPayload::Array(nexa_runtime::CopyBuffer::new({source}.into_iter()\
              .map(|value| {}).collect()))",
@@ -587,8 +709,19 @@ fn decode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::Rune => decode_match(source, "Rune", "*value"),
         TypeRef::String => decode_match(source, "String", "value.clone()"),
         TypeRef::HostRequest(_) => decode_match(source, "Request", "*value"),
-        TypeRef::ResourceToken(_) => decode_match(source, "Token", "*value"),
-        TypeRef::Snapshot(_) => decode_match(source, "Snapshot", "*value"),
+        TypeRef::ResourceToken(Some(inner)) => format!(
+            "match {source} {{ nexa_runtime::HostValue::Token(value) => \
+             {}::from_raw(*value), _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            typed_handle_name(inner, "Token")
+        ),
+        TypeRef::ResourceToken(None) => unreachable!("validated tokens are typed"),
+        TypeRef::Snapshot(Some(inner)) => format!(
+            "match {source} {{ nexa_runtime::HostValue::Snapshot(value) => \
+             {}::try_from(*value).map_err(|_| nexa_runtime::HostTrap::Type)?, \
+             _ => return Err(nexa_runtime::HostTrap::Type) }}",
+            typed_handle_name(inner, "Snapshot")
+        ),
+        TypeRef::Snapshot(None) => unreachable!("validated snapshots are typed"),
         TypeRef::Array(inner) => decode_collection(idl, inner, source, "Array", false),
         TypeRef::Buffer(inner) => decode_collection(idl, inner, source, "Buffer", true),
         TypeRef::Option(inner) => decode_option(idl, inner, source),
@@ -668,8 +801,12 @@ fn encode_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
         TypeRef::Rune => format!("nexa_runtime::HostValue::Rune({source})"),
         TypeRef::String => format!("nexa_runtime::HostValue::String({source})"),
         TypeRef::HostRequest(_) => format!("nexa_runtime::HostValue::Request({source})"),
-        TypeRef::ResourceToken(_) => format!("nexa_runtime::HostValue::Token({source})"),
-        TypeRef::Snapshot(_) => format!("nexa_runtime::HostValue::Snapshot({source})"),
+        TypeRef::ResourceToken(_) => {
+            format!("nexa_runtime::HostValue::Token({source}.into_raw())")
+        }
+        TypeRef::Snapshot(_) => {
+            format!("nexa_runtime::HostValue::Snapshot({source}.into_raw())")
+        }
         TypeRef::Array(inner) => format!(
             "nexa_runtime::HostValue::Array(nexa_runtime::CopyBuffer::new({source}.into_iter()\
              .map(|value| {}).collect()))",
@@ -967,6 +1104,13 @@ fn parameterized_type_name(name: &str, inner: Option<&TypeRef>) -> String {
     )
 }
 
+fn typed_handle_name(inner: &TypeRef, suffix: &str) -> String {
+    let TypeRef::Named(name) = inner else {
+        unreachable!("typed host handles use nominal domains")
+    };
+    format!("{name}{suffix}")
+}
+
 fn value_type(idl: &Idl, ty: &TypeRef) -> ValueType {
     match ty {
         TypeRef::I32 => ValueType::I32,
@@ -1018,8 +1162,10 @@ fn rust_type(ty: &TypeRef) -> String {
         TypeRef::Rune => "char".into(),
         TypeRef::String => "String".into(),
         TypeRef::HostRequest(_) => "nexa_runtime::HostRequestHandle".into(),
-        TypeRef::ResourceToken(_) => "nexa_runtime::ResourceTokenHandle".into(),
-        TypeRef::Snapshot(_) => "nexa_runtime::SnapshotHandle".into(),
+        TypeRef::ResourceToken(Some(inner)) => typed_handle_name(inner, "Token"),
+        TypeRef::ResourceToken(None) => unreachable!("validated tokens are typed"),
+        TypeRef::Snapshot(Some(inner)) => typed_handle_name(inner, "Snapshot"),
+        TypeRef::Snapshot(None) => unreachable!("validated snapshots are typed"),
         TypeRef::Array(inner) => format!("Vec<{}>", rust_type(inner)),
         TypeRef::Buffer(inner) => {
             format!("nexa_runtime::CopyBuffer<{}>", rust_type(inner))
@@ -1410,6 +1556,9 @@ fn validate_type_ref(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), 
         TypeRef::Snapshot(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => Err(
             IdlError::Syntax("snapshot content types must be nominal".into()),
         ),
+        TypeRef::ResourceToken(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => Err(
+            IdlError::Syntax("token resource domains must be nominal".into()),
+        ),
         TypeRef::HostRequest(Some(inner))
         | TypeRef::ResourceToken(Some(inner))
         | TypeRef::Snapshot(Some(inner))
@@ -1524,6 +1673,40 @@ mod tests {
         assert!(generated.contains("entity_position"));
         assert!(generated.contains("THUNK_ENTITY_POSITION"));
         assert!(generated.contains("pub enum Update"));
+        assert!(generated.contains("pub const EXPORT_ID"));
+        assert!(generated.contains("pub struct UpdateArgs"));
+    }
+
+    #[test]
+    fn generated_types_are_deterministic_and_cover_typed_host_handles() {
+        let idl = parse(
+            "interface Typed {
+                opaque ActionLock;
+                struct EnemyView { health: i32; }
+                enum Failure { Cancelled }
+                sync fn lock() -> token<ActionLock>;
+                sync fn view() -> snapshot<EnemyView>;
+                request(return_error, trap) fn load(values: buffer<i32>)
+                    -> request<Result<buffer<EnemyView>, Failure>>;
+                export Update(view: snapshot<EnemyView>) -> buffer<i32>;
+            }",
+        )
+        .unwrap();
+        let first = generate_rust(&idl);
+        let second = generate_rust(&idl);
+        assert_eq!(first, second);
+        for expected in [
+            "pub struct ActionLockToken",
+            "pub struct EnemyViewSnapshot",
+            "impl TryFrom<nexa_runtime::SnapshotHandle> for EnemyViewSnapshot",
+            "pub trait Typed",
+            "pub struct LoadCompletionTicket",
+            "nexa_runtime::CopyBuffer<EnemyView>",
+            "impl nexa_runtime::ScriptFunction for Update",
+            "pub const EXPORT_ID",
+        ] {
+            assert!(first.contains(expected), "{expected}");
+        }
     }
 
     #[test]

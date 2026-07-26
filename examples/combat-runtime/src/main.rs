@@ -47,18 +47,23 @@ impl generated::GameHost for EngineHost {
         &mut self,
         context: &mut ResourceContext<'_>,
         _: i32,
-    ) -> Result<nexa_runtime::ResourceTokenHandle, generated::HostError> {
+    ) -> Result<generated::ActionLockToken, generated::HostError> {
         context
             .create_token(RuntimeHostDomain::Render)
+            .map(generated::ActionLockToken::from_raw)
             .map_err(|error| generated::HostError(error.to_string()))
     }
 
     fn world_snapshot(
         &mut self,
         context: &mut ResourceContext<'_>,
-    ) -> Result<nexa_runtime::SnapshotHandle, generated::HostError> {
+    ) -> Result<generated::EnemyViewSnapshot, generated::HostError> {
         context
             .create_snapshot(StableId::from_name("EnemyView"), Arc::from([10, 20, 30]))
+            .map(|handle| {
+                generated::EnemyViewSnapshot::try_from_raw(handle)
+                    .expect("snapshot was created with the generated content type")
+            })
             .map_err(|error| generated::HostError(error.to_string()))
     }
 }
