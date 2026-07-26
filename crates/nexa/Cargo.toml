@@ -10,7 +10,7 @@ nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-core = { path = "../nexa-core" }
 nexa-idl = { path = "../nexa-idl" }
-nexa-runtime = { path = "../nexa-runtime" }
+nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
 nexa-verifier = { path = "../nexa-verifier" }
 serde.workspace = true
 serde_json.workspace = true

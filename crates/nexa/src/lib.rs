@@ -5,6 +5,7 @@
 
 mod diagnostic_corpus;
 mod error;
+mod runtime_diagnostics;
 
 pub use diagnostic_corpus::{
     BinaryDiagnosticReport, CaseFormatReport, CompilerDiagnosticReport, DiagnosticCorpusReport,
@@ -15,6 +16,10 @@ pub use error::{
     ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ERROR_EMISSION_TABLE,
     ErrorCategory, ErrorCode, ErrorCodeDefinition, ErrorContext, ErrorEmissionDefinition,
     ErrorMetadata, ErrorModuleEpoch, HostError, Label, MigrationError, NexaError, Severity,
+};
+pub use runtime_diagnostics::{
+    RuntimeDiagnosticCaseEvidence, RuntimeDiagnosticEndToEndReport, RuntimeDiagnosticHarness,
+    run_runtime_diagnostic_end_to_end,
 };
 
 use nexa_bytecode::{DecodeLimits, Module};

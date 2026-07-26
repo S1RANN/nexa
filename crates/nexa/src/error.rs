@@ -4,8 +4,9 @@ use nexa_bytecode::DecodeError;
 use nexa_compiler::CompileError;
 use nexa_core::{FileId, ModuleId, RawHandle, SourceSpan};
 use nexa_runtime::{
-    HostCompletionProtocolError, HostRequestError, HostTrap, MigrationLimitError, RealmError,
-    ReloadError, RuntimeError, RuntimeHostCloseError, RuntimeMessage, StatefulError,
+    HostCompletionProtocolError, HostRequestError, HostTrap, InterpreterError, MigrationLimitError,
+    RealmError, ReloadError, RuntimeError, RuntimeHostCloseError, RuntimeMessage, ScopeError,
+    StatefulError, TaskError, Trap,
 };
 use nexa_verifier::{VerifyError, VerifyErrorKind};
 use serde::Serialize;
@@ -665,6 +666,7 @@ pub enum NexaError {
     Decode(DecodeError),
     Verify(VerifyError),
     Runtime(RuntimeError),
+    Trap(Trap),
     Host(HostError),
     Reload(ReloadError),
     Migration(MigrationError),
@@ -685,6 +687,41 @@ impl NexaError {
     pub fn context(&self) -> ErrorContext {
         self.metadata().context
     }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let metadata = self.metadata();
+        serde_json::to_string_pretty(&ClassifiedErrorOutput {
+            code: metadata.code.as_str(),
+            category: metadata.category.as_str(),
+            context: ClassifiedErrorContextOutput {
+                span: metadata
+                    .context
+                    .span
+                    .map(|span| (span.file.0, span.start, span.end)),
+                module: metadata.context.module_epoch.map(|module| module.module.0),
+                module_epoch: metadata.context.module_epoch.map(|module| module.epoch),
+                task: metadata
+                    .context
+                    .task
+                    .map(|task| format!("{}:{}:{}", task.realm_id, task.index, task.generation)),
+            },
+        })
+    }
+}
+
+#[derive(Serialize)]
+struct ClassifiedErrorOutput {
+    code: &'static str,
+    category: &'static str,
+    context: ClassifiedErrorContextOutput,
+}
+
+#[derive(Serialize)]
+struct ClassifiedErrorContextOutput {
+    span: Option<(u32, u32, u32)>,
+    module: Option<u32>,
+    module_epoch: Option<u64>,
+    task: Option<String>,
 }
 
 impl ClassifiedError for NexaError {
@@ -694,6 +731,7 @@ impl ClassifiedError for NexaError {
             Self::Decode(error) => error.metadata(),
             Self::Verify(error) => error.metadata(),
             Self::Runtime(error) => error.metadata(),
+            Self::Trap(error) => error.metadata(),
             Self::Host(error) => error.metadata(),
             Self::Reload(error) => error.metadata(),
             Self::Migration(error) => error.metadata(),
@@ -750,6 +788,12 @@ impl From<RuntimeError> for NexaError {
     }
 }
 
+impl From<Trap> for NexaError {
+    fn from(error: Trap) -> Self {
+        Self::Trap(error)
+    }
+}
+
 impl From<HostError> for NexaError {
     fn from(error: HostError) -> Self {
         Self::Host(error)
@@ -787,6 +831,9 @@ impl From<RealmError> for NexaError {
             RealmError::Host(error) => Self::Host(HostError::Request(error)),
             RealmError::Reload(error) => Self::Reload(error),
             RealmError::State(error) => Self::Migration(MigrationError::State(error)),
+            RealmError::Interpreter(InterpreterError::Migration(message)) => {
+                Self::Reload(ReloadError::Migration(message))
+            }
             error => Self::Host(HostError::Realm(error)),
         }
     }
@@ -851,11 +898,40 @@ impl ClassifiedError for RuntimeError {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
             code: match self {
-                Self::ResourceLimit(_) => ErrorCode::NX5004,
+                Self::ResourceLimit(_)
+                | Self::Scope(ScopeError::Allocation(_))
+                | Self::Task(TaskError::Allocation(_)) => ErrorCode::NX5004,
                 Self::Scope(_) | Self::Task(_) | Self::InjectedFailure(_) => ErrorCode::NX5001,
             },
             category: ErrorCategory::Runtime,
             context: ErrorContext::default(),
+        }
+    }
+}
+
+impl ClassifiedError for Trap {
+    fn metadata(&self) -> ErrorMetadata {
+        ErrorMetadata {
+            code: match self.diagnostic_code() {
+                "NX4001" => ErrorCode::NX4001,
+                "NX4003" => ErrorCode::NX4003,
+                "NX5002" => ErrorCode::NX5002,
+                "NX5003" => ErrorCode::NX5003,
+                "NX5004" => ErrorCode::NX5004,
+                _ => ErrorCode::NX5001,
+            },
+            category: ErrorCategory::Host,
+            context: ErrorContext {
+                span: self.source_span,
+                module_epoch: self
+                    .module
+                    .zip(self.epoch)
+                    .map(|(module, epoch)| ErrorModuleEpoch {
+                        module: ModuleId(module.index),
+                        epoch,
+                    }),
+                task: self.task,
+            },
         }
     }
 }
@@ -865,23 +941,33 @@ impl ClassifiedError for ReloadError {
         let code = match self {
             Self::CompletionBufferCapacity => ErrorCode::NX6004,
             Self::MigrationLimit(_) => ErrorCode::NX6001,
-            Self::GraphCheck | Self::MissingForwarding | Self::DuplicateForwarding => {
-                ErrorCode::NX6002
-            }
+            Self::GraphCheck
+            | Self::MissingForwarding
+            | Self::DuplicateForwarding
+            | Self::MigrationNoOutput
+            | Self::MigrationNotFinished
+            | Self::InvalidStateHandle
+            | Self::Migration(_) => ErrorCode::NX6002,
             Self::Activation(_) => ErrorCode::NX6003,
             Self::HostHashMismatch => ErrorCode::NX4001,
             Self::InvalidState
             | Self::EpochNotNewer
             | Self::StagingCapacity
-            | Self::MigrationNoOutput
-            | Self::MigrationNotFinished
-            | Self::InvalidStateHandle
-            | Self::Migration(_)
             | Self::QuiesceTimeout => ErrorCode::NX6005,
         };
         ErrorMetadata {
             code,
-            category: ErrorCategory::Reload,
+            category: match self {
+                Self::MigrationLimit(_)
+                | Self::GraphCheck
+                | Self::MissingForwarding
+                | Self::DuplicateForwarding
+                | Self::MigrationNoOutput
+                | Self::MigrationNotFinished
+                | Self::InvalidStateHandle
+                | Self::Migration(_) => ErrorCategory::Migration,
+                _ => ErrorCategory::Reload,
+            },
             context: ErrorContext::default(),
         }
     }
@@ -1058,6 +1144,7 @@ fn host_trap_code(error: &HostTrap) -> ErrorCode {
     match error {
         HostTrap::UnknownFunction(_) => ErrorCode::NX4001,
         HostTrap::Arity | HostTrap::Type => ErrorCode::NX4003,
+        HostTrap::ResourceCapacity => ErrorCode::NX5004,
         HostTrap::Panicked | HostTrap::Host(_) => ErrorCode::NX5001,
     }
 }

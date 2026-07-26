@@ -239,6 +239,16 @@ fn load_cases(root: &Path) -> Result<Vec<(PathBuf, DiagnosticCase)>, String> {
 
 pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticReport, String> {
     let cases = load_cases(root)?;
+    let end_to_end = crate::run_runtime_diagnostic_end_to_end()?;
+    if !end_to_end.failures.is_empty()
+        || !end_to_end.missing_codes.is_empty()
+        || !end_to_end.nondeterministic_cases.is_empty()
+    {
+        return Err(format!(
+            "runtime end-to-end diagnostics failed: failures={:?} missing={:?} nondeterministic={:?}",
+            end_to_end.failures, end_to_end.missing_codes, end_to_end.nondeterministic_cases
+        ));
+    }
     let mut observed = Vec::new();
     let mut deterministic_cases = 0;
     for (path, case) in cases {
@@ -251,13 +261,59 @@ pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticRepo
         if case.version != 1 {
             return Err(format!("{} has unsupported case version", path.display()));
         }
-        let first = execute_runtime_case(&case, &path)?;
-        let second = execute_runtime_case(&case, &path)?;
-        if first != second {
-            return Err(format!("{} was not deterministic", path.display()));
+        let input = path
+            .parent()
+            .expect("case path has a parent")
+            .join(&case.input);
+        let fixture: RuntimeFixture = serde_json::from_slice(
+            &std::fs::read(&input).map_err(|error| format!("{}: {error}", input.display()))?,
+        )
+        .map_err(|error| format!("{}: {error}", input.display()))?;
+        if fixture.version != 1 || fixture.scenario.trim().is_empty() {
+            return Err(format!(
+                "{} has an invalid runtime fixture",
+                input.display()
+            ));
         }
-        deterministic_cases += 1;
-        observed.push(first);
+        let evidence = end_to_end
+            .cases
+            .get(&case.code)
+            .ok_or_else(|| format!("{} has no end-to-end evidence", case.code))?;
+        let summary = crate::ERROR_CODE_TABLE
+            .iter()
+            .find(|definition| definition.code.to_string() == case.code)
+            .map(|definition| definition.summary)
+            .ok_or_else(|| format!("{} is not registered", case.code))?;
+        let passed = evidence.passed
+            && evidence.observed == case.code
+            && evidence.category == case.category
+            && normalized(summary).contains(&normalized(&case.expected.message_contains))
+            && evidence.human_output
+            && evidence.json_output
+            && evidence.real_realm_runtime
+            && evidence.direct_classification_helper_calls == 0;
+        if !passed {
+            return Err(format!(
+                "{} observed {} {} with invalid end-to-end evidence",
+                input.display(),
+                evidence.category,
+                evidence.observed
+            ));
+        }
+        deterministic_cases += usize::from(evidence.deterministic);
+        observed.push(ObservedDiagnosticCase {
+            code: case.code.clone(),
+            observed: evidence.observed.clone(),
+            pipeline: case.pipeline.clone(),
+            category: evidence.category.clone(),
+            primary_text: String::new(),
+            primary_start: 0,
+            primary_end: 0,
+            secondary_count: 0,
+            human_output: evidence.human_output,
+            json_output: evidence.json_output,
+            passed,
+        });
     }
     let passed = observed.iter().filter(|case| case.passed).count();
     let codes = observed.iter().map(|case| case.code.clone()).collect();
@@ -365,192 +421,6 @@ pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, Stri
             },
         },
         cases,
-    })
-}
-
-#[allow(clippy::too_many_lines)]
-fn execute_runtime_case(
-    case: &DiagnosticCase,
-    case_path: &Path,
-) -> Result<ObservedDiagnosticCase, String> {
-    use std::collections::BTreeMap;
-
-    use nexa_bytecode::{HostCallMode, HostImport, MigrationLimitRequirements, ModuleBuilder};
-    use nexa_core::StableId;
-    use nexa_runtime::{
-        HostCompletionResult, HostErrorPayload, HostTrap, MigrationLimits, RealmConfig,
-        RealmRuntime, RuntimeHostArgs, RuntimeMessage, StateObject, StateValue, StatefulDomainId,
-        StatefulRegistry, invoke_host_boundary, invoke_reload_activation, validate_host_completion,
-        validate_reload_completion_capacity,
-    };
-
-    let input = case_path
-        .parent()
-        .expect("case path has a parent")
-        .join(&case.input);
-    let fixture: RuntimeFixture = serde_json::from_slice(
-        &std::fs::read(&input).map_err(|error| format!("{}: {error}", input.display()))?,
-    )
-    .map_err(|error| format!("{}: {error}", input.display()))?;
-    if fixture.version != 1 {
-        return Err(format!(
-            "{} has unsupported runtime version",
-            input.display()
-        ));
-    }
-    let host_hash = StableId::from_name("diagnostic-host");
-    let schema_hash = StableId::from_name("diagnostic-schema");
-    let verified = |requires_host: bool| {
-        let mut builder = ModuleBuilder::new();
-        builder.metadata(host_hash, schema_hash);
-        if requires_host {
-            builder.host_import(HostImport {
-                stable_id: StableId::from_name("diagnostic.call"),
-                parameters: Vec::new(),
-                result: None,
-                mode: HostCallMode::Immediate,
-                fuel_cost: 1,
-                async_result: None,
-            });
-        }
-        nexa_verifier::verify(builder.finish(), nexa_verifier::VerifierLimits::default())
-            .expect("diagnostic module is valid")
-    };
-    let error: NexaError = match fixture.scenario.as_str() {
-        "host_hash_mismatch" => {
-            let mut realm = RealmRuntime::isolated(RealmConfig::default());
-            realm
-                .load_module(
-                    verified(false),
-                    StableId::from_name("different-host"),
-                    schema_hash,
-                )
-                .expect_err("host hash mismatch must fail")
-                .into()
-        }
-        "host_capabilities_unavailable" => {
-            let mut realm = RealmRuntime::isolated(RealmConfig::default());
-            realm
-                .load_module(verified(true), host_hash, schema_hash)
-                .expect_err("isolated realm must reject host capabilities")
-                .into()
-        }
-        "host_argument_arity" => {
-            let values = [nexa_runtime::RuntimeValue::I32(0); 9];
-            RuntimeHostArgs::new(&values, None)
-                .expect_err("nine host arguments exceed the ABI")
-                .into()
-        }
-        "host_result_mismatch" => invoke_host_boundary(|| -> Result<(), HostTrap> {
-            Err(HostTrap::Host(RuntimeMessage::Static(
-                "diagnostic host result mismatch",
-            )))
-        })
-        .expect_err("host result mismatch must be contained")
-        .into(),
-        "host_abandoned_completion" => {
-            validate_host_completion(&HostCompletionResult::Abandoned, &[])
-                .expect_err("abandoned completion must be classified")
-                .into()
-        }
-        "unknown_host_error_code" => validate_host_completion(
-            &HostCompletionResult::Error(HostErrorPayload { code: 77 }),
-            &[1, 2, 3],
-        )
-        .expect_err("unknown host error code must be rejected")
-        .into(),
-        "module_capacity" => {
-            let config = RealmConfig {
-                max_modules: 0,
-                ..RealmConfig::default()
-            };
-            let mut realm = RealmRuntime::isolated(config);
-            realm
-                .load_module(verified(false), host_hash, schema_hash)
-                .expect_err("zero module capacity must fail")
-                .into()
-        }
-        "migration_object_limit" => {
-            let limits = MigrationLimits {
-                max_objects: 0,
-                ..MigrationLimits::default()
-            };
-            limits
-                .validate_requirements(MigrationLimitRequirements {
-                    max_objects: 1,
-                    ..MigrationLimitRequirements::default()
-                })
-                .expect_err("migration object requirement must fail")
-                .into()
-        }
-        "nested_state_object" => {
-            let mut registry = StatefulRegistry::new(StatefulDomainId::new(1));
-            registry
-                .insert(
-                    StableId::from_name("root"),
-                    StateValue::Object(StateObject {
-                        type_id: StableId::from_name("Nested"),
-                        version: 1,
-                        fields: BTreeMap::from([(
-                            StableId::from_name("child"),
-                            StateValue::Object(StateObject {
-                                type_id: StableId::from_name("Child"),
-                                version: 1,
-                                fields: BTreeMap::new(),
-                            }),
-                        )]),
-                    }),
-                )
-                .expect_err("nested state object must fail graph validation")
-                .into()
-        }
-        "activation_failure" => invoke_reload_activation(|| {
-            Err(RuntimeMessage::Static("diagnostic activation failure"))
-        })
-        .expect_err("activation failure must be classified")
-        .into(),
-        "reload_completion_capacity" => validate_reload_completion_capacity(0, 0)
-            .expect_err("zero reload completion capacity must fail")
-            .into(),
-        scenario => {
-            return Err(format!(
-                "{} has unknown scenario {scenario}",
-                input.display()
-            ));
-        }
-    };
-    let summary = error
-        .code()
-        .definition()
-        .ok_or_else(|| format!("{} emitted an unregistered code", input.display()))?
-        .summary;
-    let human = error.to_string();
-    let passed = error.code().as_str() == case.code
-        && error.category().as_str() == case.category
-        && normalized(summary).contains(&normalized(&case.expected.message_contains))
-        && human.contains(&case.code);
-    if !passed {
-        return Err(format!(
-            "{} emitted {} {} instead of {} {}",
-            input.display(),
-            error.category().as_str(),
-            error.code(),
-            case.category,
-            case.code
-        ));
-    }
-    Ok(ObservedDiagnosticCase {
-        code: case.code.clone(),
-        observed: error.code().to_string(),
-        pipeline: case.pipeline.clone(),
-        category: error.category().as_str().to_owned(),
-        primary_text: String::new(),
-        primary_start: 0,
-        primary_end: 0,
-        secondary_count: 0,
-        human_output: true,
-        json_output: true,
-        passed,
     })
 }
 

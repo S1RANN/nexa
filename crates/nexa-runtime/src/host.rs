@@ -2044,6 +2044,7 @@ pub enum HostTrap {
     UnknownFunction(u32),
     Arity,
     Type,
+    ResourceCapacity,
     Panicked,
     Host(crate::RuntimeMessage),
 }

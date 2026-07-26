@@ -179,7 +179,9 @@ impl InterpreterHost for RealmHostBridge<'_> {
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
-        match self.registry.call_runtime(import, &mut context, values)? {
+        match crate::invoke_host_boundary(|| {
+            self.registry.call_runtime(import, &mut context, values)
+        })? {
             HostCallOutcome::Immediate(value) => {
                 Ok(InterpreterHostOutcome::Immediate(host_to_runtime_value(
                     value,
@@ -659,6 +661,7 @@ pub struct RealmConfig {
     pub max_collection_elements: usize,
     pub max_collection_ranges: usize,
     pub max_host_resources: u32,
+    pub reload_completion_capacity: usize,
     pub release_capacity: usize,
     pub tombstone_capacity: usize,
     pub cost_table: OpcodeCostTable,
@@ -676,6 +679,7 @@ impl Default for RealmConfig {
             max_collection_elements: 65_536,
             max_collection_ranges: 4_097,
             max_host_resources: 1_024,
+            reload_completion_capacity: 1_024,
             release_capacity: 2_048,
             tombstone_capacity: 1_024,
             cost_table: OpcodeCostTable::default(),
@@ -995,6 +999,10 @@ enum ResultWritebackAction {
     },
     Cancel,
     TrapFailure(u32),
+    TrapCode {
+        code: DiagnosticCode,
+        argument: u64,
+    },
     TrapMessage(&'static str),
 }
 
@@ -1343,7 +1351,7 @@ impl RealmRuntime {
             migration_limits: config.migration_limits,
             last_migration_usage_report: None,
             last_migration_hash: None,
-            reload_completion_capacity: config.max_host_resources as usize,
+            reload_completion_capacity: config.reload_completion_capacity,
             reload_completion_stats: ReloadCompletionStats::default(),
             host_registry: None,
             host_registry_hash: None,
@@ -1807,6 +1815,13 @@ impl RealmRuntime {
         match execution {
             InterpreterOutcome::Returned { value, .. } => {
                 let (migrated, hash, usage) = migration.finish()?.into_shared();
+                if migrated
+                    .gc_roots()
+                    .into_iter()
+                    .any(|reference| self.heap.resolve(reference).is_err())
+                {
+                    return Err(ReloadError::GraphCheck.into());
+                }
                 self.last_migration_usage_report = Some(usage);
                 self.last_migration_hash = Some(hash);
                 self.modules
@@ -3118,7 +3133,10 @@ impl RealmRuntime {
                         result,
                         result.abandon_error.ok_or(RealmError::TaskWaiting)?,
                     )?,
-                _ => ResultWritebackAction::TrapMessage("host request was abandoned"),
+                _ => ResultWritebackAction::TrapCode {
+                    code: DiagnosticCode::new("NX5002"),
+                    argument: 0,
+                },
             },
         };
         Ok(ResultWritebackPreflight { action })
@@ -3249,9 +3267,16 @@ impl RealmRuntime {
                     task,
                     snapshot,
                     RuntimeMessage::Code {
-                        code: DiagnosticCode::new("NX5001"),
+                        code: DiagnosticCode::new("NX5003"),
                         argument: u64::from(code),
                     },
+                );
+            }
+            ResultWritebackAction::TrapCode { code, argument } => {
+                return self.trap_host_task(
+                    task,
+                    snapshot,
+                    RuntimeMessage::Code { code, argument },
                 );
             }
             ResultWritebackAction::TrapMessage(message) => {
@@ -3708,6 +3733,7 @@ fn requires_host_capabilities(
     };
     if [
         StableId::from_name("HostRequest"),
+        StableId::from_name("HostError"),
         StableId::from_name("ResourceToken"),
         StableId::from_name("Buffer"),
     ]
@@ -3731,6 +3757,28 @@ fn requires_host_capabilities(
             .iter()
             .filter_map(|variant| variant.payload_type)
             .any(|payload| requires_host_capabilities(module, payload, visited))
+    {
+        return true;
+    }
+    if let Some(struct_type) = module
+        .struct_types
+        .iter()
+        .find(|struct_type| struct_type.type_id == type_id)
+        && struct_type
+            .fields
+            .iter()
+            .any(|field| requires_host_capabilities(module, field.ty, visited))
+    {
+        return true;
+    }
+    if let Some(class_type) = module
+        .class_types
+        .iter()
+        .find(|class_type| class_type.type_id == type_id)
+        && class_type
+            .fields
+            .iter()
+            .any(|field| requires_host_capabilities(module, field.ty, visited))
     {
         return true;
     }

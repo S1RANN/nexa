@@ -266,6 +266,9 @@ impl Trap {
     /// Stable facade diagnostic code for a runtime trap.
     #[must_use]
     pub const fn diagnostic_code(&self) -> &'static str {
+        if let crate::RuntimeMessage::Code { code, .. } = self.message {
+            return code.as_str();
+        }
         match self.kind {
             TrapKind::Host
             | TrapKind::BytecodeTrap
@@ -1274,25 +1277,65 @@ impl CheckedInterpreter {
                                 .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?,
                         )?;
                     }
-                    let outcome = host
+                    continuation.host_call_boundary = Some(HostCallBoundary {
+                        import,
+                        function: frame.function,
+                        pc: frame.pc,
+                        source_span: module.module().source_span(frame.function, frame.pc),
+                    });
+                    let outcome = match host
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
                         .call(
                             import,
                             &arguments[..usize::from(args_count)],
                             heap.as_deref_mut(),
-                        )
-                        .map_err(InterpreterError::Host)?;
+                        ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                            let (code, argument) = match error {
+                                crate::HostTrap::UnknownFunction(function) => {
+                                    ("NX4001", u64::from(function))
+                                }
+                                crate::HostTrap::Arity => ("NX4003", 0),
+                                crate::HostTrap::Type => ("NX4003", 1),
+                                crate::HostTrap::ResourceCapacity => ("NX5004", 0),
+                                crate::HostTrap::Panicked => ("NX5001", 0),
+                                crate::HostTrap::Host(_) => ("NX5001", 1),
+                            };
+                            return Ok(InterpreterOutcome::Trapped {
+                                trap: Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::Host,
+                                    crate::RuntimeMessage::Code {
+                                        code: crate::DiagnosticCode::new(code),
+                                        argument,
+                                    },
+                                ),
+                                charge,
+                                fuel,
+                            });
+                        }
+                    };
                     match outcome {
                         InterpreterHostOutcome::Immediate(value) => {
-                            continuation.host_call_boundary = Some(HostCallBoundary {
-                                import,
-                                function: frame.function,
-                                pc: frame.pc,
-                                source_span: module.module().source_span(frame.function, frame.pc),
-                            });
                             if metadata.result != runtime_value_type(value) {
-                                return Err(InterpreterError::TypeMismatch);
+                                settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                                return Ok(InterpreterOutcome::Trapped {
+                                    trap: Trap::from_continuation(
+                                        module,
+                                        &continuation,
+                                        TrapKind::Host,
+                                        crate::RuntimeMessage::Code {
+                                            code: crate::DiagnosticCode::new("NX5001"),
+                                            argument: 2,
+                                        },
+                                    ),
+                                    charge,
+                                    fuel,
+                                });
                             }
                             if metadata.result.is_some() {
                                 set_register(&mut continuation.arena, dst, value)?;
@@ -1301,14 +1344,21 @@ impl CheckedInterpreter {
                         }
                         InterpreterHostOutcome::Pending(request) => {
                             if metadata.mode != HostCallMode::Async {
-                                return Err(InterpreterError::TypeMismatch);
+                                settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                                return Ok(InterpreterOutcome::Trapped {
+                                    trap: Trap::from_continuation(
+                                        module,
+                                        &continuation,
+                                        TrapKind::Host,
+                                        crate::RuntimeMessage::Code {
+                                            code: crate::DiagnosticCode::new("NX5001"),
+                                            argument: 3,
+                                        },
+                                    ),
+                                    charge,
+                                    fuel,
+                                });
                             }
-                            continuation.host_call_boundary = Some(HostCallBoundary {
-                                import,
-                                function: frame.function,
-                                pc: frame.pc,
-                                source_span: module.module().source_span(frame.function, frame.pc),
-                            });
                             increment_pc(&mut continuation.arena)?;
                             continuation.suspend_reason = Some(SuspendReason::HostRequest);
                             continuation.pending_fuel = pending_cost;
