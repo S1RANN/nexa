@@ -1,9 +1,11 @@
 # Nexa Milestone 4.0 Full MVR Closure
 
-Status: **COMPLETE**
+Status: **INCOMPLETE**
 
-Milestone 4.0 的 56 个工作包均已完成。最终实现 SHA（不含本报告提交）为
-`1fda503394912cedeccaaa05d4b7ddd090d9695b`。
+Milestone 4.0 原计划的 56 个工作包均已提交，但 Milestone 4.0R 的事实复核确认了
+本报告末尾列出的真实契约缺口。在这些缺口关闭并由最终 release audit 绑定证据前，
+本报告不得恢复为 `COMPLETE`。旧实现 SHA（不含本报告提交）为
+`1fda503394912cedeccaaa05d4b7ddd090d9695b`，它不再作为最终完成证据。
 
 本报告是 WP56 的唯一产物。Git 提交不能包含自身 SHA，因此下表将 WP56 标为
 `SELF`；它表示包含本文件的提交，而不是缺失或待办。
@@ -318,6 +320,10 @@ on/off、HostCall on/off、complex types on/off。24,000 个 task 全部完成�
 
 ## 已知 MVR 内缺口
 
-无。
+- Realm v5 未驱动真实 `RealmRuntime`。
+- 复杂 Host thunk 仍动态物化。
+- 高价值诊断缺少精确 `SourceSpan`。
+- 多个稳定诊断代码没有真实发射点。
+- 最终门禁证据未绑定最终实现树。
 
-Milestone 4.0 = **COMPLETE**。
+Milestone 4.0 = **INCOMPLETE**。
