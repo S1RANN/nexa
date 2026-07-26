@@ -6,6 +6,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+nexa = { path = "../nexa" }
 nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-core = { path = "../nexa-core" }

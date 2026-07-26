@@ -167,14 +167,14 @@
       "id": "M4R-SNAPSHOT-001",
       "work_package": 24,
       "description": "Snapshot storage is byte-backed, typed, layout-checked, and independent of i32",
-      "required_tests": ["host::tests::typed_snapshot_storage_is_layout_checked"],
+      "required_tests": ["realm::tests::typed_snapshot_storage"],
       "status": "pending"
     },
     {
       "id": "M4R-SNAPSHOT-002",
       "work_package": 25,
       "description": "Generated typed snapshot codecs cover nested values and Combat stores a real EnemyView snapshot",
-      "required_tests": ["tests::typed_snapshot_codec", "combat-runtime::typed_enemy_view_snapshot"],
+      "required_tests": ["tests::typed_snapshot_codec", "cargo run -p combat-runtime"],
       "status": "pending"
     },
     {

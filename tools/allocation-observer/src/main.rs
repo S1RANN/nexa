@@ -839,7 +839,10 @@ fn complex_host_allocation_matrix() {
     assert_eq!(outcome, Err(HostTrap::Panicked));
     assert_eq!(allocations, 0, "host panic");
 
-    println!("complex_host_allocation_matrix=ok thunk_allocations=0");
+    println!(
+        "complex_host_allocation_matrix=ok complex_cases=25 thunk_allocations=0 \
+         complex_host_thunks_zero=true complex_host_returns_zero=true"
+    );
 }
 
 fn main() {

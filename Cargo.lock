@@ -64,6 +64,7 @@ dependencies = [
 name = "nexa-cli"
 version = "0.1.0"
 dependencies = [
+ "nexa",
  "nexa-bytecode",
  "nexa-compiler",
  "nexa-core",
@@ -143,6 +144,15 @@ dependencies = [
  "nexa-machine",
  "nexa-runtime",
  "nexa-verifier",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexa-release-audit"
+version = "0.1.0"
+dependencies = [
+ "nexa-model",
  "serde",
  "serde_json",
 ]

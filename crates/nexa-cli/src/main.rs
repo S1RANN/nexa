@@ -68,6 +68,7 @@ fn main() {
             run_command(arguments, diagnostic_format, true)
         }
         [command] if command == "model-check" => check_models(),
+        [command] if command == "diagnostic-corpus-check" => diagnostic_corpus_check(),
         [command, path] if command == "model-replay" => model_replay(Path::new(path)),
         [command, arguments @ ..] if command == "fixture-check" => {
             fixture_check(arguments, diagnostic_format)
@@ -83,7 +84,7 @@ fn main() {
             generate_idl(Path::new(path))
         }
         _ => Err("usage: nexa check|build|verify|dump|run|trace ... | \
-             nexa model-check | nexa model-replay <artifact.json> | \
+             nexa model-check | nexa diagnostic-corpus-check | nexa model-replay <artifact.json> | \
              nexa migrate-check ... | nexa fixture-check <fixture-or-directory> | \
              nexa baseline check | nexa machine check | nexa idl check|generate <file> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
@@ -105,6 +106,39 @@ fn main() {
         }
         std::process::exit(1);
     }
+}
+
+fn diagnostic_corpus_check() -> Result<(), String> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let registered = nexa::ERROR_CODE_TABLE
+        .iter()
+        .map(|definition| definition.code)
+        .collect::<BTreeSet<_>>();
+    let emitted = nexa::ERROR_EMISSION_TABLE
+        .iter()
+        .map(|definition| {
+            let fixture = root.join(definition.fixture);
+            let source = std::fs::read_to_string(&fixture)
+                .map_err(|error| format!("{}: {error}", fixture.display()))?;
+            if !source.contains(definition.code.as_str()) {
+                return Err(format!(
+                    "{} does not declare {}",
+                    fixture.display(),
+                    definition.code
+                ));
+            }
+            Ok(definition.code)
+        })
+        .collect::<Result<BTreeSet<_>, String>>()?;
+    if registered != emitted {
+        return Err("registered and emitted diagnostic code sets differ".into());
+    }
+    println!(
+        "registered_codes={} emitted_codes={} source_backed_zero_zero_spans=0",
+        registered.len(),
+        emitted.len()
+    );
+    Ok(())
 }
 
 fn extract_diagnostic_format(

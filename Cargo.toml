@@ -5,6 +5,7 @@ members = [
     "examples/combat-runtime",
     "tools/benchmark-v6",
     "tools/milestone4-experiments",
+    "tools/release-audit",
 ]
 exclude = [
     "tools/allocation-observer",
