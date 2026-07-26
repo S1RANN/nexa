@@ -1,0 +1,23 @@
+@stateful(2) class FixtureState {
+    value: i32;
+    total: i32;
+}
+
+migration fn migrate() -> bool {
+    let old_state: FixtureState = old.get<FixtureState>(fixture);
+    let value: i32 = old.field<i32>(old_state, FixtureState.value);
+    let state: FixtureState = new.create<FixtureState>(fixture);
+    new.set(state, FixtureState.value, value);
+    new.set(state, FixtureState.total, 1);
+    replace(fixture, state);
+    finish_migration();
+    return true;
+}
+
+task fn update(value: i32) -> i32 {
+    return value + 1;
+}
+
+@activation fn activate() -> bool {
+    return true;
+}

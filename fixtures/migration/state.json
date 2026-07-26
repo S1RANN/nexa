@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "stateful_domain": 1,
+  "objects": [
+    {
+      "stable_id": 11905869680066002802,
+      "type_id": 5317817069044028567,
+      "generation": 1,
+      "fields": [
+        {
+          "stable_id": 15386508582469527884,
+          "value": {
+            "type": "i32",
+            "value": 7
+          }
+        }
+      ]
+    }
+  ]
+}
