@@ -29,6 +29,18 @@ pub enum SectionKind {
     ReloadMetadata = 16,
 }
 
+pub const SECTION_FLAG_MANDATORY: u16 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SectionEntry {
+    pub kind: u16,
+    pub flags: u16,
+    pub offset: u32,
+    pub length: u32,
+    pub count: u32,
+    pub checksum: u32,
+}
+
 impl SectionKind {
     pub const ALL: [Self; 16] = [
         Self::Strings,
@@ -635,8 +647,14 @@ pub enum DecodeError {
     TrailingBytes,
     SizeOverflow,
     InvalidSectionDirectory,
+    OffsetOverflow,
+    LengthOverflow,
+    SectionOverlap,
+    DuplicateRequiredSection(u16),
+    UnknownMandatorySection(u16),
+    CountMismatch(u16),
     InvalidSourceMap,
-    ChecksumMismatch(u8),
+    ChecksumMismatch(u16),
     ResourceLimit(&'static str),
 }
 
@@ -697,6 +715,7 @@ impl Module {
     #[allow(clippy::too_many_lines)]
     pub fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
+        put_u32(&mut output, 1);
         put_optional_id(&mut output, self.host_interface_hash);
         put_optional_id(&mut output, self.schema_hash);
         put_optional_u32(&mut output, self.reload_metadata.migration_entry);
@@ -966,22 +985,22 @@ impl Module {
             section
         };
         encode_sections(&[
-            (SectionKind::Strings as u8, empty()),
-            (SectionKind::Types as u8, empty()),
-            (SectionKind::Constants as u8, empty()),
-            (SectionKind::Enums as u8, enums),
-            (SectionKind::Structs as u8, empty()),
-            (SectionKind::Classes as u8, empty()),
-            (SectionKind::HostImports as u8, host_imports),
-            (SectionKind::StateSchemas as u8, state_schemas),
-            (SectionKind::Exports as u8, exports),
-            (SectionKind::Functions as u8, functions),
-            (SectionKind::Code as u8, code),
-            (SectionKind::RootMaps as u8, root_maps),
-            (SectionKind::Safepoints as u8, safepoints),
-            (SectionKind::LoopBounds as u8, loop_bounds),
-            (SectionKind::SourceMap as u8, source_map),
-            (SectionKind::ReloadMetadata as u8, reload_metadata),
+            (SectionKind::Strings, empty()),
+            (SectionKind::Types, empty()),
+            (SectionKind::Constants, empty()),
+            (SectionKind::Enums, enums),
+            (SectionKind::Structs, empty()),
+            (SectionKind::Classes, empty()),
+            (SectionKind::HostImports, host_imports),
+            (SectionKind::StateSchemas, state_schemas),
+            (SectionKind::Exports, exports),
+            (SectionKind::Functions, functions),
+            (SectionKind::Code, code),
+            (SectionKind::RootMaps, root_maps),
+            (SectionKind::Safepoints, safepoints),
+            (SectionKind::LoopBounds, loop_bounds),
+            (SectionKind::SourceMap, source_map),
+            (SectionKind::ReloadMetadata, reload_metadata),
         ])
     }
 
@@ -1000,7 +1019,11 @@ impl Module {
             required_section(&sections, kind)?;
         }
         let mut metadata = Vec::new();
-        metadata.extend_from_slice(required_section(&sections, SectionKind::ReloadMetadata)?);
+        metadata.extend_from_slice(
+            required_section(&sections, SectionKind::ReloadMetadata)?
+                .get(4..)
+                .ok_or(DecodeError::Truncated)?,
+        );
         metadata.extend_from_slice(required_section(&sections, SectionKind::HostImports)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::Enums)?);
         metadata.extend_from_slice(required_section(&sections, SectionKind::StateSchemas)?);
@@ -1348,10 +1371,15 @@ impl Module {
     }
 }
 
-fn encode_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
-    const DIRECTORY_ENTRY_BYTES: usize = 13;
+fn encode_sections(sections: &[(SectionKind, Vec<u8>)]) -> Vec<u8> {
+    const DIRECTORY_ENTRY_BYTES: usize = 20;
     let header_bytes = 8_usize
-        .checked_add(sections.len().saturating_mul(DIRECTORY_ENTRY_BYTES))
+        .checked_add(
+            sections
+                .len()
+                .checked_mul(DIRECTORY_ENTRY_BYTES)
+                .expect("section directory size overflow"),
+        )
         .expect("section directory size overflow");
     let mut offset = header_bytes;
     let mut output = Vec::with_capacity(
@@ -1364,7 +1392,8 @@ fn encode_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
         u16::try_from(sections.len()).expect("section count exceeds wire format"),
     );
     for (kind, bytes) in sections {
-        output.push(*kind);
+        put_u16(&mut output, *kind as u16);
+        put_u16(&mut output, SECTION_FLAG_MANDATORY);
         put_u32(
             &mut output,
             u32::try_from(offset).expect("section offset exceeds wire format"),
@@ -1372,6 +1401,16 @@ fn encode_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
         put_u32(
             &mut output,
             u32::try_from(bytes.len()).expect("section length exceeds wire format"),
+        );
+        put_u32(
+            &mut output,
+            u32::from_le_bytes(
+                bytes
+                    .get(..4)
+                    .expect("every v4 section starts with a count")
+                    .try_into()
+                    .expect("section count occupies four bytes"),
+            ),
         );
         put_u32(&mut output, checksum(bytes));
         offset = offset
@@ -1384,7 +1423,9 @@ fn encode_sections(sections: &[(u8, Vec<u8>)]) -> Vec<u8> {
     output
 }
 
-fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u8, &[u8])>, DecodeError> {
+#[allow(clippy::too_many_lines)]
+fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u16, &[u8])>, DecodeError> {
+    const DIRECTORY_ENTRY_BYTES: usize = 20;
     let mut reader = Reader { bytes, cursor: 0 };
     if reader.take(4)? != MAGIC {
         return Err(DecodeError::InvalidMagic);
@@ -1397,35 +1438,89 @@ fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u8, &[u8])>
     if count == 0 || count > max_sections {
         return Err(DecodeError::InvalidSectionDirectory);
     }
+    let directory_bytes = count
+        .checked_mul(DIRECTORY_ENTRY_BYTES)
+        .ok_or(DecodeError::OffsetOverflow)?;
+    let directory_end = reader
+        .cursor
+        .checked_add(directory_bytes)
+        .ok_or(DecodeError::OffsetOverflow)?;
+    if directory_end > bytes.len() {
+        return Err(DecodeError::Truncated);
+    }
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
-        entries.push((reader.u8()?, reader.u32()?, reader.u32()?, reader.u32()?));
+        entries.push(SectionEntry {
+            kind: reader.u16()?,
+            flags: reader.u16()?,
+            offset: reader.u32()?,
+            length: reader.u32()?,
+            count: reader.u32()?,
+            checksum: reader.u32()?,
+        });
     }
-    let directory_end = reader.cursor;
-    entries.sort_by_key(|(_, offset, _, _)| *offset);
+    for entry in &entries {
+        let start = usize::try_from(entry.offset).map_err(|_| DecodeError::OffsetOverflow)?;
+        if start < directory_end || start > bytes.len() {
+            return Err(DecodeError::OffsetOverflow);
+        }
+        let end = start
+            .checked_add(usize::try_from(entry.length).map_err(|_| DecodeError::LengthOverflow)?)
+            .ok_or(DecodeError::LengthOverflow)?;
+        if end > bytes.len() {
+            return Err(DecodeError::LengthOverflow);
+        }
+    }
+    entries.sort_by_key(|entry| entry.offset);
     let mut previous_end = directory_end;
-    let mut kinds = 0_u32;
+    let mut kinds = BTreeSet::new();
     let mut sections = Vec::with_capacity(count);
-    for (kind, offset, length, expected_checksum) in entries {
-        let bit = 1_u32
-            .checked_shl(u32::from(kind))
-            .ok_or(DecodeError::InvalidSectionDirectory)?;
-        if kinds & bit != 0 {
+    for entry in entries {
+        if entry.flags & !SECTION_FLAG_MANDATORY != 0 {
             return Err(DecodeError::InvalidSectionDirectory);
         }
-        kinds |= bit;
-        let start = usize::try_from(offset).map_err(|_| DecodeError::SizeOverflow)?;
+        let known = SectionKind::ALL
+            .iter()
+            .any(|kind| *kind as u16 == entry.kind);
+        if !known && entry.flags & SECTION_FLAG_MANDATORY != 0 {
+            return Err(DecodeError::UnknownMandatorySection(entry.kind));
+        }
+        if !kinds.insert(entry.kind) {
+            return Err(DecodeError::DuplicateRequiredSection(entry.kind));
+        }
+        let start = usize::try_from(entry.offset).map_err(|_| DecodeError::OffsetOverflow)?;
         let end = start
-            .checked_add(usize::try_from(length).map_err(|_| DecodeError::SizeOverflow)?)
-            .ok_or(DecodeError::SizeOverflow)?;
-        if start < previous_end || end > bytes.len() {
-            return Err(DecodeError::InvalidSectionDirectory);
+            .checked_add(usize::try_from(entry.length).map_err(|_| DecodeError::LengthOverflow)?)
+            .ok_or(DecodeError::LengthOverflow)?;
+        if start < directory_end {
+            return Err(DecodeError::OffsetOverflow);
+        }
+        if start < previous_end {
+            return Err(DecodeError::SectionOverlap);
+        }
+        if start > previous_end {
+            return Err(DecodeError::TrailingBytes);
+        }
+        if end > bytes.len() {
+            return Err(DecodeError::LengthOverflow);
         }
         let section = &bytes[start..end];
-        if checksum(section) != expected_checksum {
-            return Err(DecodeError::ChecksumMismatch(kind));
+        if checksum(section) != entry.checksum {
+            return Err(DecodeError::ChecksumMismatch(entry.kind));
         }
-        sections.push((kind, section));
+        if known {
+            let actual_count = u32::from_le_bytes(
+                section
+                    .get(..4)
+                    .ok_or(DecodeError::CountMismatch(entry.kind))?
+                    .try_into()
+                    .map_err(|_| DecodeError::CountMismatch(entry.kind))?,
+            );
+            if actual_count != entry.count {
+                return Err(DecodeError::CountMismatch(entry.kind));
+            }
+            sections.push((entry.kind, section));
+        }
         previous_end = end;
     }
     if previous_end != bytes.len() {
@@ -1435,12 +1530,12 @@ fn decode_sections(bytes: &[u8], max_sections: usize) -> Result<Vec<(u8, &[u8])>
 }
 
 fn required_section<'a>(
-    sections: &[(u8, &'a [u8])],
+    sections: &[(u16, &'a [u8])],
     kind: SectionKind,
 ) -> Result<&'a [u8], DecodeError> {
     sections
         .iter()
-        .find_map(|(candidate, bytes)| (*candidate == kind as u8).then_some(*bytes))
+        .find_map(|(candidate, bytes)| (*candidate == kind as u16).then_some(*bytes))
         .ok_or(DecodeError::InvalidSectionDirectory)
 }
 
@@ -2305,11 +2400,13 @@ mod tests {
         assert_eq!(u16::from_le_bytes([encoded[6], encoded[7]]), 16);
         assert_eq!(
             (0..16)
-                .map(|index| encoded[8 + index * 13])
+                .map(|index| {
+                    u16::from_le_bytes([encoded[8 + index * 20], encoded[8 + index * 20 + 1]])
+                })
                 .collect::<Vec<_>>(),
             SectionKind::ALL
                 .into_iter()
-                .map(|kind| kind as u8)
+                .map(|kind| kind as u16)
                 .collect::<Vec<_>>()
         );
         assert_eq!(
@@ -2319,7 +2416,7 @@ mod tests {
         assert_eq!(Module::decode(&encoded), Ok(module));
         assert_eq!(
             Module::decode(&encoded[..encoded.len() - 1]),
-            Err(DecodeError::InvalidSectionDirectory)
+            Err(DecodeError::LengthOverflow)
         );
         let mut corrupt = encoded;
         let opcode = corrupt.len() - 3;
@@ -2327,9 +2424,79 @@ mod tests {
         assert_eq!(
             Module::decode(&corrupt),
             Err(DecodeError::ChecksumMismatch(
-                SectionKind::ReloadMetadata as u8
+                SectionKind::ReloadMetadata as u16
             ))
         );
+    }
+
+    #[test]
+    fn section_directory_rejects_every_structural_corruption_class() {
+        const ENTRY_BYTES: usize = 20;
+        const FIRST: usize = 8;
+        let encoded = Module::default().encode();
+        let write_u16 = |bytes: &mut [u8], offset: usize, value: u16| {
+            bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+        };
+        let write_u32 = |bytes: &mut [u8], offset: usize, value: u32| {
+            bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+        };
+
+        let mut offset_overflow = encoded.clone();
+        write_u32(&mut offset_overflow, FIRST + 4, u32::MAX);
+        assert_eq!(
+            Module::decode(&offset_overflow),
+            Err(DecodeError::OffsetOverflow)
+        );
+
+        let mut length_overflow = encoded.clone();
+        write_u32(&mut length_overflow, FIRST + 8, u32::MAX);
+        assert_eq!(
+            Module::decode(&length_overflow),
+            Err(DecodeError::LengthOverflow)
+        );
+
+        let first_offset = u32::from_le_bytes(encoded[FIRST + 4..FIRST + 8].try_into().unwrap());
+        let mut overlap = encoded.clone();
+        write_u32(&mut overlap, FIRST + ENTRY_BYTES + 4, first_offset);
+        assert_eq!(Module::decode(&overlap), Err(DecodeError::SectionOverlap));
+
+        let mut duplicate = encoded.clone();
+        write_u16(
+            &mut duplicate,
+            FIRST + ENTRY_BYTES,
+            SectionKind::Strings as u16,
+        );
+        assert_eq!(
+            Module::decode(&duplicate),
+            Err(DecodeError::DuplicateRequiredSection(
+                SectionKind::Strings as u16
+            ))
+        );
+
+        let mut unknown_mandatory = encoded.clone();
+        write_u16(&mut unknown_mandatory, FIRST, 999);
+        assert_eq!(
+            Module::decode(&unknown_mandatory),
+            Err(DecodeError::UnknownMandatorySection(999))
+        );
+
+        let mut count_mismatch = encoded.clone();
+        write_u32(&mut count_mismatch, FIRST + 12, 1);
+        assert_eq!(
+            Module::decode(&count_mismatch),
+            Err(DecodeError::CountMismatch(SectionKind::Strings as u16))
+        );
+
+        let mut checksum_mismatch = encoded.clone();
+        write_u32(&mut checksum_mismatch, FIRST + 16, 0);
+        assert_eq!(
+            Module::decode(&checksum_mismatch),
+            Err(DecodeError::ChecksumMismatch(SectionKind::Strings as u16))
+        );
+
+        let mut trailing = encoded;
+        trailing.push(0);
+        assert_eq!(Module::decode(&trailing), Err(DecodeError::TrailingBytes));
     }
 
     #[test]
