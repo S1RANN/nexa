@@ -1126,7 +1126,8 @@ mod tests {
     use crate::StableId;
 
     use super::{
-        RealmV5RuntimeAdapter, RealmV5RuntimeEvent, RealmV5RuntimeTaskState, realm_v5_modules,
+        REALM_V5_RETIRED_COUNT, RealmV5RuntimeAdapter, RealmV5RuntimeEvent,
+        RealmV5RuntimeTaskState, realm_v5_modules,
     };
 
     #[test]
@@ -1297,6 +1298,8 @@ mod tests {
                 .iter()
                 .all(|task| task.state == RealmV5RuntimeTaskState::Completed)
         );
+        adapter.apply(RealmV5RuntimeEvent::ReleaseDrain).unwrap();
+        adapter.apply(RealmV5RuntimeEvent::GcCollect).unwrap();
 
         adapter.apply(RealmV5RuntimeEvent::BeginReload).unwrap();
         adapter.apply(RealmV5RuntimeEvent::Quiesce).unwrap();
@@ -1308,16 +1311,28 @@ mod tests {
         resources.apply(RealmV5RuntimeEvent::TaskAdmission).unwrap();
         resources.apply(RealmV5RuntimeEvent::TokenAcquire).unwrap();
         resources.apply(RealmV5RuntimeEvent::TokenRelease).unwrap();
+        resources.apply(RealmV5RuntimeEvent::ReleaseDrain).unwrap();
         resources
             .apply(RealmV5RuntimeEvent::SnapshotAcquire)
             .unwrap();
         resources
             .apply(RealmV5RuntimeEvent::SnapshotRelease)
             .unwrap();
-        resources.apply(RealmV5RuntimeEvent::GcRootAttach).unwrap();
-        resources.apply(RealmV5RuntimeEvent::GcRootDrop).unwrap();
-        resources.apply(RealmV5RuntimeEvent::GcCollect).unwrap();
-        resources
+        resources.apply(RealmV5RuntimeEvent::ReleaseDrain).unwrap();
+
+        let mut roots = RealmV5RuntimeAdapter::new();
+        roots.apply(RealmV5RuntimeEvent::GcRootAttach).unwrap();
+        roots.apply(RealmV5RuntimeEvent::GcRootDrop).unwrap();
+        roots.apply(RealmV5RuntimeEvent::GcCollect).unwrap();
+
+        let mut closing = RealmV5RuntimeAdapter::new();
+        for _ in 0..REALM_V5_RETIRED_COUNT {
+            closing.apply(RealmV5RuntimeEvent::BeginReload).unwrap();
+            closing.apply(RealmV5RuntimeEvent::Quiesce).unwrap();
+            closing.apply(RealmV5RuntimeEvent::Migration).unwrap();
+            closing.apply(RealmV5RuntimeEvent::Commit).unwrap();
+        }
+        closing
             .apply(RealmV5RuntimeEvent::RuntimeHostBeginClose)
             .unwrap();
 
