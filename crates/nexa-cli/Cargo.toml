@@ -13,6 +13,7 @@ nexa-idl = { path = "../nexa-idl" }
 nexa-machine = { path = "../nexa-machine" }
 nexa-migrate = { path = "../nexa-migrate" }
 nexa-model = { path = "../nexa-model" }
+nexa-runtime = { path = "../nexa-runtime" }
 nexa-verifier = { path = "../nexa-verifier" }
 serde_json.workspace = true
 

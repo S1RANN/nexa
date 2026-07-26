@@ -1,11 +1,12 @@
 use std::io::Write;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const MODEL_FAILURE_ARTIFACT_VERSION: u32 = 1;
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelFailureArtifact {
     pub format_version: u32,
     pub commit_sha: String,

@@ -11,6 +11,7 @@ use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
 use nexa_model::realm_v4::{
     RealmV4Config, RealmV4Report, explore_realm_v4, explore_realm_v4_routing,
 };
+use nexa_model::realm_v5::{RealmV5Config, explore_realm_v5};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -35,46 +36,455 @@ const REQUIRED_BASELINE: &[&str] = &[
     "baseline/testing/GATE0_KILL_CRITERIA.md",
 ];
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticFormat {
+    Human,
+    Json,
+}
+
 fn main() {
-    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let raw_arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let (diagnostic_format, arguments) = match extract_diagnostic_format(&raw_arguments) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("nexa: {error}");
+            std::process::exit(1);
+        }
+    };
     let result = match arguments.as_slice() {
+        [command, arguments @ ..] if command == "check" => {
+            check_command(arguments, diagnostic_format)
+        }
+        [command, arguments @ ..] if command == "build" => {
+            build_command(arguments, diagnostic_format)
+        }
+        [command, arguments @ ..] if command == "verify" => {
+            verify_command(arguments, diagnostic_format)
+        }
+        [command, arguments @ ..] if command == "run" => {
+            run_command(arguments, diagnostic_format, false)
+        }
+        [command, arguments @ ..] if command == "trace" => {
+            run_command(arguments, diagnostic_format, true)
+        }
+        [command] if command == "model-check" => check_models(),
+        [command, path] if command == "model-replay" => model_replay(Path::new(path)),
+        [command, arguments @ ..] if command == "fixture-check" => {
+            fixture_check(arguments, diagnostic_format)
+        }
         [area, command] if area == "baseline" && command == "check" => check_baseline(),
         [area, command] if area == "machine" && command == "check" => check_machines(),
         [area, command] if area == "model" && command == "check" => check_models(),
         [command, arguments @ ..] if command == "migrate-check" => migrate_check(arguments),
         [command, arguments @ ..] if command == "dump" => dump_module(arguments),
-        [command, path] if command == "verify" => verify_module(Path::new(path)),
         [command, path] if command == "compile" => compile_file(Path::new(path)),
         [area, command, path] if area == "idl" && command == "check" => check_idl(Path::new(path)),
         [area, command, path] if area == "idl" && command == "generate" => {
             generate_idl(Path::new(path))
         }
-        _ => Err(
-            "usage: nexa baseline check | nexa machine check | nexa model check | \
-             nexa compile <file> | nexa idl check|generate <file> | \
-             nexa dump [--section NAME|--source-map] <module.nxb> | \
-             nexa verify <module.nxb> | \
+        _ => Err("usage: nexa check|build|verify|dump|run|trace ... | \
+             nexa model-check | nexa model-replay <artifact.json> | \
+             nexa migrate-check ... | nexa fixture-check <fixture-or-directory> | \
+             nexa baseline check | nexa machine check | nexa idl check|generate <file> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
              [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
-             [MigrationLimits]"
-                .to_owned(),
-        ),
+             [MigrationLimits] [--diagnostic-format human|json]"
+            .to_owned()),
     };
     if let Err(error) = result {
-        eprintln!("nexa: {error}");
+        match diagnostic_format {
+            DiagnosticFormat::Human => eprintln!("nexa: {error}"),
+            DiagnosticFormat::Json => eprintln!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "status": "error",
+                    "message": error,
+                }))
+                .expect("diagnostic JSON serialization does not fail")
+            ),
+        }
         std::process::exit(1);
     }
 }
 
-fn verify_module(path: &Path) -> Result<(), String> {
+fn extract_diagnostic_format(
+    arguments: &[String],
+) -> Result<(DiagnosticFormat, Vec<String>), String> {
+    let mut format = DiagnosticFormat::Human;
+    let mut filtered = Vec::with_capacity(arguments.len());
+    let mut index = 0;
+    while index < arguments.len() {
+        if arguments[index] == "--diagnostic-format" {
+            let value = arguments
+                .get(index + 1)
+                .ok_or("missing value for `--diagnostic-format`")?;
+            format = match value.as_str() {
+                "human" => DiagnosticFormat::Human,
+                "json" => DiagnosticFormat::Json,
+                _ => return Err("`--diagnostic-format` must be `human` or `json`".into()),
+            };
+            index += 2;
+        } else {
+            filtered.push(arguments[index].clone());
+            index += 1;
+        }
+    }
+    Ok((format, filtered))
+}
+
+fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+    let (path, limits) = parse_input_and_limits(arguments, "check")?;
+    let verified = compile_source(&path)?;
+    verify_with_limits(verified.module().clone(), limits)?;
+    print_success(
+        format,
+        "check",
+        &json!({
+            "source": path,
+            "functions": verified.module().functions.len(),
+        }),
+        &format!(
+            "checked {}: {} functions",
+            path.display(),
+            verified.module().functions.len()
+        ),
+    );
+    Ok(())
+}
+
+fn build_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+    let mut source = None;
+    let mut output = None;
+    let mut limits_file = None;
+    let mut dump_source_map = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "-o" | "--output" => {
+                output = Some(PathBuf::from(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("missing value for build output")?,
+                ));
+                index += 2;
+            }
+            "--limits-file" => {
+                limits_file = Some(PathBuf::from(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("missing value for `--limits-file`")?,
+                ));
+                index += 2;
+            }
+            "--dump-source-map" => {
+                dump_source_map = true;
+                index += 1;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown build option `{option}`"));
+            }
+            path if source.is_none() => {
+                source = Some(PathBuf::from(path));
+                index += 1;
+            }
+            path => return Err(format!("unexpected build argument `{path}`")),
+        }
+    }
+    let source = source.ok_or("usage: nexa build <source.nexa> [-o module.nxb]")?;
+    let verified = compile_source(&source)?;
+    let limits = load_verifier_limits(limits_file.as_deref())?;
+    verify_with_limits(verified.module().clone(), limits)?;
+    let output = output.unwrap_or_else(|| source.with_extension("nxb"));
+    std::fs::write(&output, verified.module().encode())
+        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    if dump_source_map {
+        let mut rendered = String::new();
+        render_source_map(&mut rendered, verified.module());
+        print!("{rendered}");
+    }
+    print_success(
+        format,
+        "build",
+        &json!({"source": source, "output": output}),
+        &format!("built {} -> {}", source.display(), output.display()),
+    );
+    Ok(())
+}
+
+fn verify_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+    let (path, limits) = parse_input_and_limits(arguments, "verify")?;
+    verify_module_with_limits(&path, limits)?;
+    print_success(
+        format,
+        "verify",
+        &json!({"module": path}),
+        &format!("verified {}", path.display()),
+    );
+    Ok(())
+}
+
+fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> Result<(), String> {
+    let mut input = None;
+    let mut limits_file = None;
+    let mut trace_output = None;
+    let mut fuel = 1_000_000_u64;
+    let mut function = 0_u32;
+    let mut runtime_arguments = Vec::new();
+    let mut index = 0;
+    while index < arguments.len() {
+        let option = arguments[index].as_str();
+        match option {
+            "--limits-file" | "--trace-output" | "--fuel" | "--function" | "--arg-i32" => {
+                let value = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| format!("missing value for `{option}`"))?;
+                match option {
+                    "--limits-file" => limits_file = Some(PathBuf::from(value)),
+                    "--trace-output" => trace_output = Some(PathBuf::from(value)),
+                    "--fuel" => fuel = parse_limit(option, value)?,
+                    "--function" => function = parse_limit(option, value)?,
+                    "--arg-i32" => {
+                        runtime_arguments
+                            .push(nexa_runtime::RuntimeValue::I32(parse_limit(option, value)?));
+                    }
+                    _ => unreachable!(),
+                }
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown run option `{option}`"));
+            }
+            path if input.is_none() => {
+                input = Some(PathBuf::from(path));
+                index += 1;
+            }
+            path => return Err(format!("unexpected run argument `{path}`")),
+        }
+    }
+    let input = input.ok_or("usage: nexa run|trace <source.nexa|module.nxb>")?;
+    let limits = load_verifier_limits(limits_file.as_deref())?;
+    let verified = load_verified(&input, limits)?;
+    let outcome =
+        nexa_runtime::CheckedInterpreter::run(&verified, function, &runtime_arguments, fuel)
+            .map_err(|error| format!("execution failed: {error}"))?;
+    let record = json!({
+        "input": input,
+        "function": function,
+        "arguments": runtime_arguments.len(),
+        "fuel_limit": fuel,
+        "outcome": format!("{outcome:?}"),
+    });
+    if trace {
+        let rendered = serde_json::to_string_pretty(&record)
+            .map_err(|error| format!("could not serialize trace: {error}"))?;
+        if let Some(path) = trace_output {
+            std::fs::write(&path, rendered)
+                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+        } else {
+            println!("{rendered}");
+        }
+    } else {
+        print_success(
+            format,
+            "run",
+            &record,
+            &format!("run completed: {outcome:?}"),
+        );
+    }
+    Ok(())
+}
+
+fn fixture_check(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+    let [path] = arguments else {
+        return Err("usage: nexa fixture-check <fixture.json|directory>".into());
+    };
+    let path = Path::new(path);
+    let paths = if path.is_dir() {
+        files_with_extension(path, "json")?
+    } else {
+        vec![path.to_path_buf()]
+    };
+    if paths.is_empty() {
+        return Err(format!("no JSON fixtures found under {}", path.display()));
+    }
+    for fixture in &paths {
+        let bytes = std::fs::read(fixture)
+            .map_err(|error| format!("could not read {}: {error}", fixture.display()))?;
+        nexa_migrate::parse_state_fixture(&bytes, nexa_migrate::StateFixtureLimits::default())
+            .map_err(|error| format!("{}: {error}", fixture.display()))?;
+    }
+    print_success(
+        format,
+        "fixture-check",
+        &json!({"path": path, "fixtures": paths.len()}),
+        &format!("validated {} migration fixtures", paths.len()),
+    );
+    Ok(())
+}
+
+fn model_replay(path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let artifact: ModelFailureArtifact = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid model artifact: {error}"))?;
+    if artifact.format_version != MODEL_FAILURE_ARTIFACT_VERSION {
+        return Err(format!(
+            "unsupported model artifact version {}",
+            artifact.format_version
+        ));
+    }
+    if artifact.path.last() != Some(&artifact.failure_event) {
+        return Err("model artifact failure_event is not the final path event".into());
+    }
+    let model = artifact
+        .model_config
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or("model artifact has no model name")?;
+    let visited = match model {
+        "realm-v3" => {
+            explore_realm_v3(RealmV3Config {
+                max_depth: 14,
+                max_worlds: 4_096,
+            })
+            .visited_worlds
+        }
+        "realm-v4" => {
+            explore_realm_v4(RealmV4Config {
+                max_depth: 16,
+                max_worlds: 4_096,
+            })
+            .visited_worlds
+        }
+        "realm-v5" => explore_realm_v5(RealmV5Config::default()).visited_worlds,
+        name => {
+            let (_, spec) = load_specs()?
+                .into_iter()
+                .find(|(_, spec)| spec.name == name)
+                .ok_or_else(|| format!("unknown replay model `{name}`"))?;
+            explore(&spec).visited_snapshots
+        }
+    };
+    println!(
+        "replayed {} against {model}: {} path events, {visited} explored states",
+        path.display(),
+        artifact.path.len()
+    );
+    Ok(())
+}
+
+fn parse_input_and_limits(
+    arguments: &[String],
+    command: &str,
+) -> Result<(PathBuf, nexa_verifier::VerifierLimits), String> {
+    let mut path = None;
+    let mut limits_file = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--limits-file" => {
+                limits_file = Some(PathBuf::from(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("missing value for `--limits-file`")?,
+                ));
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(format!("unknown {command} option `{option}`"));
+            }
+            value if path.is_none() => {
+                path = Some(PathBuf::from(value));
+                index += 1;
+            }
+            value => return Err(format!("unexpected {command} argument `{value}`")),
+        }
+    }
+    Ok((
+        path.ok_or_else(|| format!("usage: nexa {command} <path>"))?,
+        load_verifier_limits(limits_file.as_deref())?,
+    ))
+}
+
+fn load_verifier_limits(path: Option<&Path>) -> Result<nexa_verifier::VerifierLimits, String> {
+    let Some(path) = path else {
+        return Ok(nexa_verifier::VerifierLimits::default());
+    };
+    let bytes = std::fs::read(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid limits file {}: {error}", path.display()))?;
+    let number = |name: &str, fallback: u32| -> Result<u32, String> {
+        value.get(name).map_or(Ok(fallback), |value| {
+            value
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| format!("limits field `{name}` must be a u32"))
+        })
+    };
+    let defaults = nexa_verifier::VerifierLimits::default();
+    Ok(nexa_verifier::VerifierLimits {
+        max_frame_bytes: number("max_frame_bytes", defaults.max_frame_bytes)?,
+        max_immediate_cost: number("max_immediate_cost", defaults.max_immediate_cost)?,
+        max_wcet_states: number("max_wcet_states", defaults.max_wcet_states)?,
+    })
+}
+
+fn compile_source(path: &Path) -> Result<nexa_verifier::VerifiedModule, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    nexa_compiler::compile(&source).map_err(|error| error.to_string())
+}
+
+fn load_verified(
+    path: &Path,
+    limits: nexa_verifier::VerifierLimits,
+) -> Result<nexa_verifier::VerifiedModule, String> {
+    if path.extension().is_some_and(|extension| extension == "nxb") {
+        let bytes = std::fs::read(path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        let module = nexa_bytecode::Module::decode(&bytes)
+            .map_err(|error| format!("bytecode decode failed: {error}"))?;
+        verify_with_limits(module, limits)
+    } else {
+        let verified = compile_source(path)?;
+        verify_with_limits(verified.module().clone(), limits)
+    }
+}
+
+fn verify_with_limits(
+    module: nexa_bytecode::Module,
+    limits: nexa_verifier::VerifierLimits,
+) -> Result<nexa_verifier::VerifiedModule, String> {
+    nexa_verifier::verify(module, limits)
+        .map_err(|error| format!("bytecode verification failed: {error}"))
+}
+
+fn verify_module_with_limits(
+    path: &Path,
+    limits: nexa_verifier::VerifierLimits,
+) -> Result<(), String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
     let module = nexa_bytecode::Module::decode(&bytes)
         .map_err(|error| format!("bytecode decode failed: {error}"))?;
-    nexa_verifier::verify(module, nexa_verifier::VerifierLimits::default())
-        .map_err(|error| format!("bytecode verification failed: {error}"))?;
-    println!("verified {}", path.display());
+    verify_with_limits(module, limits)?;
     Ok(())
+}
+
+fn print_success(format: DiagnosticFormat, command: &str, data: &Value, human: &str) {
+    match format {
+        DiagnosticFormat::Human => println!("{human}"),
+        DiagnosticFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "status": "ok",
+                "command": command,
+                "data": data,
+            }))
+            .expect("diagnostic JSON serialization does not fail")
+        ),
+    }
 }
 
 fn dump_module(arguments: &[String]) -> Result<(), String> {
@@ -88,9 +498,13 @@ fn dump_module(arguments: &[String]) -> Result<(), String> {
             false,
             Path::new(path),
         ),
-        [option, path] if option == "--source-map" => (None, true, Path::new(path)),
+        [option, path] if option == "--source-map" || option == "--dump-source-map" => {
+            (None, true, Path::new(path))
+        }
         _ => {
-            return Err("usage: nexa dump [--section NAME|--source-map] <module.nxb>".to_owned());
+            return Err(
+                "usage: nexa dump [--section NAME|--dump-source-map] <module.nxb>".to_owned(),
+            );
         }
     };
     let bytes = std::fs::read(path)
@@ -957,6 +1371,7 @@ fn check_models() -> Result<(), String> {
     }
     let realm_v4 = check_realm_v4(artifact)?;
     let realm_v4_routing_worlds = check_realm_v4_routing(artifact)?;
+    let realm_v5 = check_realm_v5(artifact)?;
     let summary = std::fs::File::create("target/model-artifacts/model-check-summary.json")
         .map_err(|error| format!("could not create model summary: {error}"))?;
     serde_json::to_writer_pretty(
@@ -970,20 +1385,45 @@ fn check_models() -> Result<(), String> {
             "realm_worlds": realm_report.visited_worlds,
             "realm_v3_worlds": realm_v3.visited_worlds,
             "realm_v4_worlds": realm_v4.visited_worlds,
-            "realm_v4_routing_worlds": realm_v4_routing_worlds
+            "realm_v4_routing_worlds": realm_v4_routing_worlds,
+            "realm_v5_worlds": realm_v5.visited_worlds,
+            "realm_v5_paths": realm_v5.shortest_paths.len()
         }),
     )
     .map_err(|error| format!("could not write model summary: {error}"))?;
     println!(
-        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds, {} realm-v4 routing worlds",
+        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds, {} realm-v4 routing worlds, {} realm-v5 worlds",
         specs.len(),
         system_report.visited_worlds,
         realm_report.visited_worlds,
         realm_v3.visited_worlds,
         realm_v4.visited_worlds,
         realm_v4_routing_worlds,
+        realm_v5.visited_worlds,
     );
     Ok(())
+}
+
+fn check_realm_v5(artifact: &Path) -> Result<nexa_model::realm_v5::RealmV5Report, String> {
+    let report = explore_realm_v5(RealmV5Config::default());
+    if let Some((message, path)) = report.failures.first() {
+        write_exploration_failure(
+            artifact,
+            "realm-v5",
+            &json!({"max_depth": 32, "max_worlds": 32_768}),
+            &path
+                .iter()
+                .map(|event| format!("{event:?}"))
+                .collect::<Vec<_>>(),
+            message,
+            "NEXA_MODEL_REALM_V5_FAILURE",
+        )?;
+        return Err(format!("Realm v5 model failed: {:?}", report.failures));
+    }
+    if report.truncated {
+        return Err("Realm v5 model exploration was truncated".into());
+    }
+    Ok(report)
 }
 
 fn check_realm_v4(artifact: &Path) -> Result<RealmV4Report, String> {
@@ -1114,6 +1554,9 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use nexa_bytecode::{
         ArrayType, BufferType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder,
         SectionKind, Signature, SnapshotType, SourceMapEntry, StateField, StateHandleType,
@@ -1121,7 +1564,131 @@ mod tests {
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
-    use super::render_module_dump;
+    use nexa_model::artifact::{
+        MODEL_FAILURE_ARTIFACT_VERSION, ModelFailureArtifact, write_model_failure_artifact,
+    };
+    use serde_json::json;
+
+    use super::{
+        DiagnosticFormat, build_command, check_command, extract_diagnostic_format, fixture_check,
+        model_replay, render_module_dump, run_command, verify_command,
+    };
+
+    #[test]
+    fn complete_cli_command_paths_execute_real_components() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("nexa-cli-{nonce}-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("main.nexa");
+        let module = directory.join("main.nxb");
+        let trace = directory.join("trace.json");
+        let limits = directory.join("limits.json");
+        let fixture = directory.join("fixture.json");
+        fs::write(&source, "fn main() -> i32 { return 7; }").unwrap();
+        fs::write(
+            &limits,
+            r#"{"max_frame_bytes":65536,"max_immediate_cost":1024,"max_wcet_states":100000}"#,
+        )
+        .unwrap();
+        fs::write(
+            &fixture,
+            r#"{"format_version":1,"stateful_domain":7,"objects":[]}"#,
+        )
+        .unwrap();
+
+        check_command(
+            &[
+                source.display().to_string(),
+                "--limits-file".into(),
+                limits.display().to_string(),
+            ],
+            DiagnosticFormat::Json,
+        )
+        .unwrap();
+        build_command(
+            &[
+                source.display().to_string(),
+                "-o".into(),
+                module.display().to_string(),
+                "--dump-source-map".into(),
+            ],
+            DiagnosticFormat::Human,
+        )
+        .unwrap();
+        verify_command(
+            &[
+                module.display().to_string(),
+                "--limits-file".into(),
+                limits.display().to_string(),
+            ],
+            DiagnosticFormat::Human,
+        )
+        .unwrap();
+        run_command(
+            &[
+                module.display().to_string(),
+                "--trace-output".into(),
+                trace.display().to_string(),
+            ],
+            DiagnosticFormat::Human,
+            true,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(&trace).unwrap().contains("I32(7)"));
+        fixture_check(&[fixture.display().to_string()], DiagnosticFormat::Human).unwrap();
+
+        let artifact_path = directory.join("model.json");
+        let artifact = ModelFailureArtifact {
+            format_version: MODEL_FAILURE_ARTIFACT_VERSION,
+            commit_sha: "test".into(),
+            model_config: json!({"model": "realm-v5"}),
+            path: vec!["TaskAdmission".into()],
+            failure_event: "TaskAdmission".into(),
+            model_before: json!({}),
+            model_after: json!({}),
+            runtime_before: json!({}),
+            runtime_after: json!({}),
+            ledger: json!({}),
+            epochs: json!({}),
+            tasks: json!([]),
+            requests: json!([]),
+            completions: json!([]),
+            releases: json!([]),
+            heap: json!({}),
+            roots: json!([]),
+            trace: json!([]),
+            error_code: "NEXA_MODEL_TEST".into(),
+        };
+        let file = fs::File::create(&artifact_path).unwrap();
+        write_model_failure_artifact(file, &artifact).unwrap();
+        model_replay(&artifact_path).unwrap();
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_format_is_global_and_strict() {
+        let (format, arguments) = extract_diagnostic_format(&[
+            "check".into(),
+            "main.nexa".into(),
+            "--diagnostic-format".into(),
+            "json".into(),
+        ])
+        .unwrap();
+        assert_eq!(format, DiagnosticFormat::Json);
+        assert_eq!(arguments, ["check", "main.nexa"]);
+        assert!(
+            extract_diagnostic_format(&[
+                "check".into(),
+                "--diagnostic-format".into(),
+                "xml".into(),
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     #[allow(clippy::too_many_lines)]
