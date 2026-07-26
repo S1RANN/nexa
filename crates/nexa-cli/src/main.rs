@@ -179,6 +179,16 @@ fn render_module_dump(
             )
             .expect("String writes do not fail");
         }
+        let mut buffers = module.buffer_types.iter().collect::<Vec<_>>();
+        buffers.sort_by_key(|buffer| buffer.type_id);
+        for buffer in buffers {
+            writeln!(
+                output,
+                "buffer {:016x} element={:?} ownership=vm-copy",
+                buffer.type_id.0, buffer.element
+            )
+            .expect("String writes do not fail");
+        }
     }
     if render(nexa_bytecode::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
@@ -1095,9 +1105,9 @@ fn load_specs() -> Result<Vec<(PathBuf, MachineSpec)>, String> {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ArrayType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder, SectionKind,
-        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
-        StructField, StructType, ValueType,
+        ArrayType, BufferType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder,
+        SectionKind, Signature, SourceMapEntry, StateField, StateHandleType, StateSchema,
+        StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1135,6 +1145,7 @@ mod tests {
         builder.state_handle_type(StateHandleType::new(state_target));
         builder.array_type(ArrayType::new(ValueType::I32));
         builder.map_type(MapType::new(ValueType::String, ValueType::I32));
+        builder.buffer_type(BufferType::new(ValueType::I64));
         builder.state_schema(StateSchema {
             types: vec![StateType {
                 stable_id: StableId::from_name("Store"),
@@ -1180,6 +1191,8 @@ mod tests {
         assert!(full.contains("element=I32"));
         assert!(full.contains("map "));
         assert!(full.contains("key=String value=I32"));
+        assert!(full.contains("buffer "));
+        assert!(full.contains("element=I64 ownership=vm-copy"));
         assert!(full.contains("stateful-class "));
         assert!(full.contains("persistent=true"));
         assert!(
@@ -1195,6 +1208,7 @@ mod tests {
         assert!(types.contains("state-handle "));
         assert!(types.contains("array "));
         assert!(types.contains("map "));
+        assert!(types.contains("buffer "));
         assert!(!types.contains("code function="));
         let code = render_module_dump(&bytes, &module, Some(SectionKind::Code), false).unwrap();
         assert!(code.contains("section code"));

@@ -5,8 +5,8 @@ use std::fmt;
 use std::ops::{Deref, DerefMut};
 
 use nexa_bytecode::{
-    AbandonPolicy, ArrayType, AsyncResultType, CancelPolicy, ClassType, EnumType, EnumVariant,
-    Function, FunctionEffect, HostCallMode, HostImport, Instruction, MapType, Module,
+    AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
+    EnumVariant, Function, FunctionEffect, HostCallMode, HostImport, Instruction, MapType, Module,
     ModuleBuilder, RootMap, ScriptExport, Signature, SourceMapEntry, StateField, StateHandleType,
     StateSchema, StateType, StructField as BytecodeStructField, StructType, ValueType,
 };
@@ -508,6 +508,28 @@ fn map_method(function: &str) -> Option<(&str, MapMethod)> {
     Some((receiver, method))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BufferMethod {
+    Len,
+    Get,
+    Set,
+    Slice,
+    Copy,
+}
+
+fn buffer_method(function: &str) -> Option<(&str, BufferMethod)> {
+    let (receiver, method) = function.rsplit_once('.')?;
+    let method = match method {
+        "len" => BufferMethod::Len,
+        "get" => BufferMethod::Get,
+        "set" => BufferMethod::Set,
+        "slice" => BufferMethod::Slice,
+        "copy" => BufferMethod::Copy,
+        _ => return None,
+    };
+    Some((receiver, method))
+}
+
 fn array_method(function: &str) -> Option<(&str, ArrayMethod)> {
     let (receiver, method) = function.rsplit_once('.')?;
     let method = match method {
@@ -579,6 +601,7 @@ pub struct HirModule {
     state_handle_targets: BTreeMap<StableId, ValueType>,
     array_types: Vec<ArrayType>,
     map_types: Vec<MapType>,
+    buffer_types: Vec<BufferType>,
     span: SourceSpan,
 }
 
@@ -2094,6 +2117,43 @@ fn collect_collection_types(ast: &AstModule) -> (Vec<ArrayType>, Vec<MapType>) {
     (arrays.into_values().collect(), maps.into_values().collect())
 }
 
+fn collect_buffer_types(ast: &AstModule) -> Vec<BufferType> {
+    fn collect(ty: &AstType, buffers: &mut BTreeMap<StableId, BufferType>) {
+        let AstType::BuiltinGeneric { name, arguments } = ty.kind() else {
+            return;
+        };
+        for argument in arguments {
+            collect(argument, buffers);
+        }
+        if name == "Buffer" && arguments.len() == 1 {
+            let buffer = BufferType::new(lower_type(&arguments[0]));
+            buffers.insert(buffer.type_id, buffer);
+        }
+    }
+
+    let mut buffers = BTreeMap::new();
+    for declaration in &ast.types {
+        for field in &declaration.fields {
+            collect(&field.ty, &mut buffers);
+        }
+        for payload in declaration
+            .variants
+            .iter()
+            .filter_map(|variant| variant.payload.as_ref())
+        {
+            collect(payload, &mut buffers);
+        }
+    }
+    for function in &ast.functions {
+        for parameter in &function.parameters {
+            collect(&parameter.ty, &mut buffers);
+        }
+        collect(&function.result.ty, &mut buffers);
+        collect_statement_types(&function.body, &mut |ty| collect(ty, &mut buffers));
+    }
+    buffers.into_values().collect()
+}
+
 fn collect_statement_types(statements: &[AstStatement], collect: &mut impl FnMut(&AstType)) {
     for statement in statements {
         match statement.kind() {
@@ -2187,6 +2247,7 @@ fn resolve_and_typecheck_with_hosts(
     collect_builtin_enum_types(&ast, &mut enum_types);
     let state_handle_targets = collect_state_handle_targets(&ast);
     let (array_types, map_types) = collect_collection_types(&ast);
+    let buffer_types = collect_buffer_types(&ast);
     let declared_type_ids = ast
         .types
         .iter()
@@ -2470,6 +2531,7 @@ fn resolve_and_typecheck_with_hosts(
             state_handle_targets: &state_handle_targets,
             array_types: &array_types,
             map_types: &map_types,
+            buffer_types: &buffer_types,
         };
         let flow = check_statements(
             &function.body,
@@ -2505,6 +2567,7 @@ fn resolve_and_typecheck_with_hosts(
         state_handle_targets,
         array_types,
         map_types,
+        buffer_types,
         span: module_span,
     })
 }
@@ -2756,6 +2819,23 @@ fn resolve_expression(
                         StateHandleMethod::Hash => "hash",
                     }
                 );
+            } else if let Some((receiver, method)) = buffer_method(function) {
+                let resolved = scopes
+                    .iter()
+                    .rev()
+                    .find_map(|scope| scope.get(receiver))
+                    .cloned()
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                *function = format!(
+                    "{resolved}.{}",
+                    match method {
+                        BufferMethod::Len => "len",
+                        BufferMethod::Get => "get",
+                        BufferMethod::Set => "set",
+                        BufferMethod::Slice => "slice",
+                        BufferMethod::Copy => "copy",
+                    }
+                );
             } else if let Some((receiver, method)) = map_method(function) {
                 let resolved = scopes
                     .iter()
@@ -2883,7 +2963,7 @@ fn validate_type(ty: &AstType, known_types: &BTreeSet<String>) -> Result<(), Com
         }
         AstType::BuiltinGeneric { name, arguments } => {
             let expected = match name.as_str() {
-                "Option" | "StateHandle" | "Array" => 1,
+                "Option" | "StateHandle" | "Array" | "Buffer" => 1,
                 "Result" | "Map" => 2,
                 _ => return Err(CompileError::UnknownType(name.clone())),
             };
@@ -3094,6 +3174,7 @@ struct TypeContext<'a> {
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     array_types: &'a [ArrayType],
     map_types: &'a [MapType],
+    buffer_types: &'a [BufferType],
 }
 
 fn check_statements(
@@ -3612,6 +3693,99 @@ fn expression_type(
                 }
                 return Ok(result);
             }
+            if let Some((receiver, method)) = buffer_method(function)
+                && locals.get(receiver).is_some_and(|(_, ty)| {
+                    matches!(ty, ValueType::Named(type_id) if context
+                        .buffer_types
+                        .iter()
+                        .any(|buffer| buffer.type_id == *type_id))
+                })
+            {
+                let receiver_type = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.to_owned()))?;
+                let ValueType::Named(buffer_type) = receiver_type else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let element = context
+                    .buffer_types
+                    .iter()
+                    .find(|buffer| buffer.type_id == buffer_type)
+                    .map(|buffer| buffer.element)
+                    .ok_or(CompileError::TypeMismatch)?;
+                if matches!(
+                    context.effect,
+                    FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
+                ) {
+                    return Err(CompileError::InvalidEffect);
+                }
+                let index = |argument: &AstExpression,
+                             locals: &mut BTreeMap<String, (u16, ValueType)>,
+                             next_register: &mut u16| {
+                    expression_type(
+                        argument,
+                        locals,
+                        context,
+                        next_register,
+                        Some(ValueType::I32),
+                    )
+                };
+                let actual = match method {
+                    BufferMethod::Len if arguments.is_empty() => ValueType::I32,
+                    BufferMethod::Get if arguments.len() == 1 => {
+                        if index(&arguments[0], locals, next_register)? != ValueType::I32 {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        element
+                    }
+                    BufferMethod::Set if arguments.len() == 2 => {
+                        if index(&arguments[0], locals, next_register)? != ValueType::I32
+                            || expression_type(
+                                &arguments[1],
+                                locals,
+                                context,
+                                next_register,
+                                Some(element),
+                            )? != element
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        ValueType::Bool
+                    }
+                    BufferMethod::Slice if arguments.len() == 2 => {
+                        if index(&arguments[0], locals, next_register)? != ValueType::I32
+                            || index(&arguments[1], locals, next_register)? != ValueType::I32
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        receiver_type
+                    }
+                    BufferMethod::Copy if arguments.len() == 4 => {
+                        if expression_type(
+                            &arguments[0],
+                            locals,
+                            context,
+                            next_register,
+                            Some(receiver_type),
+                        )? != receiver_type
+                        {
+                            return Err(CompileError::TypeMismatch);
+                        }
+                        for argument in &arguments[1..] {
+                            if index(argument, locals, next_register)? != ValueType::I32 {
+                                return Err(CompileError::TypeMismatch);
+                            }
+                        }
+                        ValueType::Bool
+                    }
+                    _ => return Err(CompileError::TypeMismatch),
+                };
+                if expected.is_some_and(|expected| expected != actual) {
+                    return Err(CompileError::TypeMismatch);
+                }
+                return Ok(actual);
+            }
             if let Some((receiver, method)) = map_method(function)
                 && locals.get(receiver).is_some_and(|(_, ty)| {
                     matches!(ty, ValueType::Named(type_id) if context
@@ -4081,6 +4255,9 @@ fn lower_type(ty: &AstType) -> ValueType {
         AstType::BuiltinGeneric { name, arguments } if name == "Map" => ValueType::Named(
             nexa_bytecode::map_type(lower_type(&arguments[0]), lower_type(&arguments[1])),
         ),
+        AstType::BuiltinGeneric { name, arguments } if name == "Buffer" => {
+            ValueType::Named(nexa_bytecode::buffer_type(lower_type(&arguments[0])))
+        }
         AstType::BuiltinGeneric { .. } => unreachable!("generic types are validated"),
         AstType::Spanned { .. } => unreachable!("kind strips spans"),
     }
@@ -4430,6 +4607,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
             state_handle_targets: &hir.state_handle_targets,
             array_types: &hir.array_types,
             map_types: &hir.map_types,
+            buffer_types: &hir.buffer_types,
             string_indices: &string_indices,
         };
         emit_statements(
@@ -4469,6 +4647,11 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
     }
     module.source_map(source_map);
     let mut module = module.finish();
+    finalize_reload_metadata(hir, &mut module);
+    Ok(module)
+}
+
+fn finalize_reload_metadata(hir: &HirModule, module: &mut Module) {
     module.reload_metadata.migration_entry = hir
         .functions
         .iter()
@@ -4480,8 +4663,7 @@ pub fn emit_bytecode(hir: &HirModule) -> Result<Module, CompileError> {
         .position(|function| function.is_activation)
         .map(|entry| u32::try_from(entry).expect("function count is compiler bounded"));
     module.reload_metadata.minimum_migration_limits =
-        nexa_bytecode::minimum_migration_limits(&module, module.reload_metadata.migration_entry);
-    Ok(module)
+        nexa_bytecode::minimum_migration_limits(module, module.reload_metadata.migration_entry);
 }
 
 fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
@@ -4500,6 +4682,9 @@ fn emit_module_metadata(hir: &HirModule, module: &mut ModuleBuilder) {
     }
     for map_type in &hir.map_types {
         module.map_type(*map_type);
+    }
+    for buffer_type in &hir.buffer_types {
+        module.buffer_type(*buffer_type);
     }
     for enum_type in &hir.enum_types {
         module.enum_type(enum_type.clone());
@@ -4581,7 +4766,9 @@ fn exact_root_maps(
             | Instruction::StateHandleEqual { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::Bool);
             }
-            Instruction::Move { dst, source } | Instruction::StructWith { source, dst, .. } => {
+            Instruction::Move { dst, source }
+            | Instruction::StructWith { source, dst, .. }
+            | Instruction::BufferSlice { source, dst, .. } => {
                 state[usize::from(dst)] = state[usize::from(source)];
             }
             Instruction::Call {
@@ -4622,6 +4809,7 @@ fn exact_root_maps(
             | Instruction::StringByteLen { dst, .. }
             | Instruction::ArrayLen { dst, .. }
             | Instruction::MapLen { dst, .. }
+            | Instruction::BufferLen { dst, .. }
             | Instruction::EnumTag { dst, .. } => {
                 state[usize::from(dst)] = Some(ValueType::I32);
             }
@@ -4697,6 +4885,16 @@ fn exact_root_maps(
             } => {
                 state[usize::from(dst)] = Some(ValueType::Named(result_type));
             }
+            Instruction::BufferGet { source, dst, .. } => {
+                let Some(ValueType::Named(type_id)) = state[usize::from(source)] else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                state[usize::from(dst)] = module
+                    .buffer_types
+                    .iter()
+                    .find(|buffer| buffer.type_id == type_id)
+                    .map(|buffer| buffer.element);
+            }
             Instruction::Jump { target } => successors.push(target as usize),
             Instruction::JumpIfFalse { target, .. } => {
                 successors.push(target as usize);
@@ -4717,6 +4915,8 @@ fn exact_root_maps(
             | Instruction::ArrayClear { .. }
             | Instruction::MapSet { .. }
             | Instruction::MapClear { .. }
+            | Instruction::BufferSet { .. }
+            | Instruction::BufferCopy { .. }
             | Instruction::DeferPop
             | Instruction::CleanupReturn
             | Instruction::Return { .. }
@@ -4802,6 +5002,7 @@ struct EmitContext<'a> {
     state_handle_targets: &'a BTreeMap<StableId, ValueType>,
     array_types: &'a [ArrayType],
     map_types: &'a [MapType],
+    buffer_types: &'a [BufferType],
     string_indices: &'a BTreeMap<String, u32>,
 }
 
@@ -5059,6 +5260,23 @@ fn emit_expression(
         })
     {
         let result = emit_string_method(function, arguments, destination, locals, context, code);
+        code.replace_span(previous_span);
+        return result;
+    }
+    if let AstExpression::Call {
+        function,
+        arguments,
+    } = expression.kind()
+        && buffer_method(function).is_some_and(|(receiver, _)| {
+            locals.get(receiver).is_some_and(|(_, ty)| {
+                matches!(ty, ValueType::Named(type_id) if context
+                    .buffer_types
+                    .iter()
+                    .any(|buffer| buffer.type_id == *type_id))
+            })
+        })
+    {
+        let result = emit_buffer_method(function, arguments, destination, locals, context, code);
         code.replace_span(previous_span);
         return result;
     }
@@ -5721,6 +5939,150 @@ fn emit_string_method(
 }
 
 #[allow(clippy::too_many_lines)]
+fn emit_buffer_method(
+    function: &str,
+    arguments: &[AstExpression],
+    destination: u16,
+    locals: &BTreeMap<String, (u16, ValueType)>,
+    context: &EmitContext<'_>,
+    code: &mut TrackedCode,
+) -> Result<(), CompileError> {
+    let (receiver, method) =
+        buffer_method(function).ok_or_else(|| CompileError::UnknownName(function.into()))?;
+    let (buffer, receiver_type) = *locals
+        .get(receiver)
+        .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+    let ValueType::Named(buffer_type) = receiver_type else {
+        return Err(CompileError::TypeMismatch);
+    };
+    let element = context
+        .buffer_types
+        .iter()
+        .find(|candidate| candidate.type_id == buffer_type)
+        .map(|candidate| candidate.element)
+        .ok_or(CompileError::TypeMismatch)?;
+    let temporary = destination
+        .checked_add(1)
+        .ok_or(CompileError::TooManyRegisters)?;
+    match method {
+        BufferMethod::Len => code.push(Instruction::BufferLen {
+            source: buffer,
+            dst: destination,
+        }),
+        BufferMethod::Get => {
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::BufferGet {
+                source: buffer,
+                index: temporary,
+                dst: destination,
+            });
+        }
+        BufferMethod::Set => {
+            let value = temporary
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            emit_expression(&arguments[1], value, Some(element), locals, context, code)?;
+            code.push(Instruction::BufferSet {
+                source: buffer,
+                index: temporary,
+                value,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+        BufferMethod::Slice => {
+            let length = temporary
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            emit_expression(
+                &arguments[1],
+                length,
+                Some(ValueType::I32),
+                locals,
+                context,
+                code,
+            )?;
+            code.push(Instruction::BufferSlice {
+                source: buffer,
+                start: temporary,
+                length,
+                dst: destination,
+            });
+        }
+        BufferMethod::Copy => {
+            let source_start = temporary
+                .checked_add(1)
+                .ok_or(CompileError::TooManyRegisters)?;
+            let destination_start = temporary
+                .checked_add(2)
+                .ok_or(CompileError::TooManyRegisters)?;
+            let length = temporary
+                .checked_add(3)
+                .ok_or(CompileError::TooManyRegisters)?;
+            emit_expression(
+                &arguments[0],
+                temporary,
+                Some(receiver_type),
+                locals,
+                context,
+                code,
+            )?;
+            for (argument, register) in
+                arguments[1..]
+                    .iter()
+                    .zip([source_start, destination_start, length])
+            {
+                emit_expression(
+                    argument,
+                    register,
+                    Some(ValueType::I32),
+                    locals,
+                    context,
+                    code,
+                )?;
+            }
+            code.push(Instruction::BufferCopy {
+                destination: buffer,
+                source: temporary,
+                source_start,
+                destination_start,
+                length,
+            });
+            code.push(Instruction::LoadBool {
+                dst: destination,
+                value: true,
+            });
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
 fn emit_map_method(
     function: &str,
     arguments: &[AstExpression],
@@ -6174,6 +6536,33 @@ fn emitted_expression_type(
                     StateHandleMethod::IsAlive | StateHandleMethod::Equality => ValueType::Bool,
                     StateHandleMethod::StableId => nexa_bytecode::stable_id_type(),
                     StateHandleMethod::Generation | StateHandleMethod::Hash => ValueType::I32,
+                })
+            } else if let Some((receiver, method)) = buffer_method(function)
+                && locals.get(receiver).is_some_and(|(_, ty)| {
+                    matches!(ty, ValueType::Named(type_id) if context
+                        .buffer_types
+                        .iter()
+                        .any(|buffer| buffer.type_id == *type_id))
+                })
+            {
+                let receiver_type = locals
+                    .get(receiver)
+                    .map(|(_, ty)| *ty)
+                    .ok_or_else(|| CompileError::UnknownName(receiver.into()))?;
+                let ValueType::Named(buffer_type) = receiver_type else {
+                    return Err(CompileError::TypeMismatch);
+                };
+                let element = context
+                    .buffer_types
+                    .iter()
+                    .find(|buffer| buffer.type_id == buffer_type)
+                    .map(|buffer| buffer.element)
+                    .ok_or(CompileError::TypeMismatch)?;
+                Ok(match method {
+                    BufferMethod::Len => ValueType::I32,
+                    BufferMethod::Get => element,
+                    BufferMethod::Slice => receiver_type,
+                    BufferMethod::Set | BufferMethod::Copy => ValueType::Bool,
                 })
             } else if let Some((receiver, method)) = map_method(function)
                 && locals.get(receiver).is_some_and(|(_, ty)| {
@@ -6637,6 +7026,11 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::MapRemove { .. }
                     | Instruction::MapContains { .. }
                     | Instruction::MapClear { .. }
+                    | Instruction::BufferLen { .. }
+                    | Instruction::BufferGet { .. }
+                    | Instruction::BufferSet { .. }
+                    | Instruction::BufferSlice { .. }
+                    | Instruction::BufferCopy { .. }
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
@@ -7686,6 +8080,118 @@ migration fn migrate() -> bool {
         ] {
             assert_eq!(compile(source).unwrap_err(), CompileError::InvalidEffect);
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn buffers_compile_verify_execute_and_preserve_copy_ownership() {
+        let module = compile(
+            "fn buffer_ops(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
+                 destination.set(0, 7);
+                 destination.copy(source, 0, 1, 2);
+                 let part: Buffer<i32> = destination.slice(1, 2);
+                 return destination.get(0) + part.get(0) + part.len();
+             }
+             fn out_of_bounds(buffer: Buffer<i32>) -> i32 {
+                 return buffer.get(99);
+             }",
+        )
+        .unwrap();
+        let metadata = nexa_bytecode::BufferType::new(nexa_bytecode::ValueType::I32);
+        assert_eq!(module.module().buffer_types, vec![metadata]);
+        let function = &module.module().functions[0];
+        for required in [
+            "BufferLen",
+            "BufferGet",
+            "BufferSet",
+            "BufferSlice",
+            "BufferCopy",
+        ] {
+            assert!(
+                function
+                    .code
+                    .iter()
+                    .any(|instruction| format!("{instruction:?}").starts_with(required)),
+                "missing {required}"
+            );
+        }
+        for (pc, instruction) in function.code.iter().enumerate() {
+            if matches!(
+                instruction,
+                Instruction::BufferLen { .. }
+                    | Instruction::BufferGet { .. }
+                    | Instruction::BufferSet { .. }
+                    | Instruction::BufferSlice { .. }
+                    | Instruction::BufferCopy { .. }
+            ) {
+                let pc = u32::try_from(pc).unwrap();
+                assert!(function.safepoints.contains(&pc));
+                assert!(function.root_maps.iter().any(|root_map| root_map.pc == pc));
+            }
+        }
+
+        let mut heap = nexa_runtime::Heap::new_with_limits(8, usize::MAX, 8);
+        let destination = heap
+            .allocate_buffer(
+                metadata.type_id,
+                metadata.element,
+                &[
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3),
+                ],
+            )
+            .unwrap();
+        let source = heap
+            .allocate_buffer(
+                metadata.type_id,
+                metadata.element,
+                &[
+                    RuntimeValue::I32(9),
+                    RuntimeValue::I32(8),
+                    RuntimeValue::I32(7),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 0, &[destination, source], 500, &mut heap,)
+                .unwrap(),
+            InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::I32(18)),
+                ..
+            }
+        ));
+        assert_eq!(
+            heap.buffer_values(destination),
+            Ok(&[
+                RuntimeValue::I32(7),
+                RuntimeValue::I32(9),
+                RuntimeValue::I32(8),
+            ][..])
+        );
+        assert_eq!(
+            heap.buffer_values(source),
+            Ok(&[
+                RuntimeValue::I32(9),
+                RuntimeValue::I32(8),
+                RuntimeValue::I32(7),
+            ][..])
+        );
+        assert!(matches!(
+            CheckedInterpreter::run_with_heap(&module, 1, &[source], 100, &mut heap).unwrap(),
+            InterpreterOutcome::Trapped {
+                trap: nexa_runtime::Trap {
+                    kind: TrapKind::BufferIndexOutOfBounds,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            compile("immediate fn bad(buffer: Buffer<i32>) -> i32 { return buffer.len(); }")
+                .unwrap_err(),
+            CompileError::InvalidEffect
+        );
     }
 
     #[test]

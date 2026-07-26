@@ -15,15 +15,15 @@ use crate::scheduler::Scheduler;
 use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, StatefulRegistry};
 use crate::task::TaskExecution;
 use crate::{
-    CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
-    FuelState, GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome, HostCompletionDelivery,
-    HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
-    HostValue, InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
-    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
-    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostDomain, RuntimeHostState,
-    RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle,
-    SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime,
-    TaskState, Trap, TrapKind,
+    CheckedInterpreter, CollectionStats, ContinuationReservation, CopyBuffer, DiagnosticCode,
+    ExecutionCharge, FuelState, GcRef, GcRoots, Heap, HeapError, HostArgs, HostCallOutcome,
+    HostCompletionDelivery, HostCompletionResult, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostTrap, HostValue, InterpreterError, InterpreterHost,
+    InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object, OpcodeCostTable,
+    PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost,
+    RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources,
+    RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig,
+    SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,6 +152,7 @@ struct RealmHostBridge<'a> {
     imports: &'a [HostImport],
     enum_types: &'a [nexa_bytecode::EnumType],
     struct_types: &'a [nexa_bytecode::StructType],
+    buffer_types: &'a [nexa_bytecode::BufferType],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -177,6 +178,7 @@ impl InterpreterHost for RealmHostBridge<'_> {
                     heap,
                     self.enum_types,
                     self.struct_types,
+                    self.buffer_types,
                 )?))
             }
             HostCallOutcome::Pending(request) => {
@@ -215,10 +217,26 @@ fn host_to_runtime_value(
     heap: Option<&mut Heap>,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<RuntimeValue, HostTrap> {
-    let slots = validate_host_value(&value, expected, heap.as_deref(), enum_types, struct_types)?;
+    let slots = validate_host_value(
+        &value,
+        expected,
+        heap.as_deref(),
+        enum_types,
+        struct_types,
+        buffer_types,
+    )?;
     if slots == 0 {
-        return commit_host_value(value, expected, None, None, enum_types, struct_types);
+        return commit_host_value(
+            value,
+            expected,
+            None,
+            None,
+            enum_types,
+            struct_types,
+            buffer_types,
+        );
     }
     let heap = heap.ok_or(HostTrap::Type)?;
     let mut reservation = heap.preflight(slots).map_err(|_| HostTrap::Type)?;
@@ -229,6 +247,7 @@ fn host_to_runtime_value(
         Some(&mut reservation),
         enum_types,
         struct_types,
+        buffer_types,
     )
 }
 
@@ -238,6 +257,7 @@ fn validate_host_value(
     heap: Option<&Heap>,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<usize, HostTrap> {
     match (value, expected) {
         (HostValue::I32(_), Some(ValueType::I32))
@@ -286,6 +306,7 @@ fn validate_host_value(
                     heap,
                     enum_types,
                     struct_types,
+                    buffer_types,
                 )?,
                 (None, None) => 0,
                 _ => return Err(HostTrap::Type),
@@ -311,12 +332,49 @@ fn validate_host_value(
                             heap,
                             enum_types,
                             struct_types,
+                            buffer_types,
                         )?)
                         .ok_or(HostTrap::Type)
                 })
         }
+        (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => validate_host_buffer(
+            buffer,
+            type_id,
+            heap.ok_or(HostTrap::Type)?,
+            enum_types,
+            struct_types,
+            buffer_types,
+        ),
         _ => Err(HostTrap::Type),
     }
+}
+
+fn validate_host_buffer(
+    buffer: &CopyBuffer<HostValue>,
+    type_id: StableId,
+    heap: &Heap,
+    enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
+) -> Result<usize, HostTrap> {
+    let metadata = buffer_types
+        .iter()
+        .find(|buffer| buffer.type_id == type_id)
+        .ok_or(HostTrap::Type)?;
+    heap.validate_collection_length(buffer.len())
+        .map_err(|_| HostTrap::Type)?;
+    buffer.as_slice().iter().try_fold(1_usize, |slots, value| {
+        slots
+            .checked_add(validate_host_value(
+                value,
+                Some(metadata.element),
+                Some(heap),
+                enum_types,
+                struct_types,
+                buffer_types,
+            )?)
+            .ok_or(HostTrap::Type)
+    })
 }
 
 fn commit_host_value(
@@ -326,6 +384,7 @@ fn commit_host_value(
     mut reservation: Option<&mut HeapReservation>,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<RuntimeValue, HostTrap> {
     match (value, expected) {
         (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
@@ -370,6 +429,7 @@ fn commit_host_value(
                     reservation.as_deref_mut(),
                     enum_types,
                     struct_types,
+                    buffer_types,
                 )?),
                 (None, None) => None,
                 _ => return Err(HostTrap::Type),
@@ -393,6 +453,16 @@ fn commit_host_value(
             reservation.ok_or(HostTrap::Type)?,
             enum_types,
             struct_types,
+            buffer_types,
+        ),
+        (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => commit_host_buffer(
+            buffer,
+            type_id,
+            heap.ok_or(HostTrap::Type)?,
+            reservation.ok_or(HostTrap::Type)?,
+            enum_types,
+            struct_types,
+            buffer_types,
         ),
         (HostValue::Request(value), Some(ValueType::Named(_))) => {
             Ok(RuntimeValue::HostRequest(value))
@@ -411,6 +481,42 @@ fn commit_host_value(
     }
 }
 
+fn commit_host_buffer(
+    buffer: CopyBuffer<HostValue>,
+    type_id: StableId,
+    heap: &mut Heap,
+    reservation: &mut HeapReservation,
+    enum_types: &[nexa_bytecode::EnumType],
+    struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
+) -> Result<RuntimeValue, HostTrap> {
+    let metadata = buffer_types
+        .iter()
+        .find(|buffer| buffer.type_id == type_id)
+        .ok_or(HostTrap::Type)?;
+    let mut values = Vec::with_capacity(buffer.len());
+    for value in buffer.into_vec() {
+        values.push(commit_host_value(
+            value,
+            Some(metadata.element),
+            Some(&mut *heap),
+            Some(&mut *reservation),
+            enum_types,
+            struct_types,
+            buffer_types,
+        )?);
+    }
+    let reference = heap.commit(
+        reservation,
+        Object::Buffer {
+            type_id,
+            element_type: metadata.element,
+            values,
+        },
+    );
+    Ok(RuntimeValue::NamedRef { reference, type_id })
+}
+
 fn commit_host_struct(
     fields: Vec<HostValue>,
     type_id: StableId,
@@ -418,6 +524,7 @@ fn commit_host_struct(
     reservation: &mut HeapReservation,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<RuntimeValue, HostTrap> {
     let metadata = struct_types
         .iter()
@@ -435,6 +542,7 @@ fn commit_host_struct(
             Some(&mut *reservation),
             enum_types,
             struct_types,
+            buffer_types,
         )?;
     }
     heap.commit_struct(reservation, type_id, &values[..metadata.fields.len()])
@@ -530,6 +638,11 @@ enum PlannedResultPayload {
         tag: u32,
         payload: Option<Box<PlannedResultPayload>>,
     },
+    Buffer {
+        type_id: StableId,
+        element_type: ValueType,
+        values: Vec<PlannedResultPayload>,
+    },
 }
 
 fn plan_host_payload(
@@ -537,6 +650,7 @@ fn plan_host_payload(
     expected: ValueType,
     enum_types: &[nexa_bytecode::EnumType],
     struct_types: &[nexa_bytecode::StructType],
+    buffer_types: &[nexa_bytecode::BufferType],
 ) -> Result<PlannedResultPayload, InterpreterError> {
     if let HostPayload::String(value) = payload
         && expected == ValueType::String
@@ -570,6 +684,7 @@ fn plan_host_payload(
                 payload_type,
                 enum_types,
                 struct_types,
+                buffer_types,
             )?)),
             (None, None) => None,
             _ => return Err(InterpreterError::TypeMismatch),
@@ -592,9 +707,35 @@ fn plan_host_payload(
         let fields = fields
             .iter()
             .zip(&metadata.fields)
-            .map(|(value, field)| plan_host_payload(value, field.ty, enum_types, struct_types))
+            .map(|(value, field)| {
+                plan_host_payload(value, field.ty, enum_types, struct_types, buffer_types)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(PlannedResultPayload::Struct { type_id, fields });
+    }
+    if let (HostPayload::Buffer(buffer), ValueType::Named(type_id)) = (payload, expected) {
+        let metadata = buffer_types
+            .iter()
+            .find(|buffer| buffer.type_id == type_id)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let values = buffer
+            .as_slice()
+            .iter()
+            .map(|value| {
+                plan_host_payload(
+                    value,
+                    metadata.element,
+                    enum_types,
+                    struct_types,
+                    buffer_types,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(PlannedResultPayload::Buffer {
+            type_id,
+            element_type: metadata.element,
+            values,
+        });
     }
     Ok(PlannedResultPayload::Value(completion_to_runtime(
         payload.clone(),
@@ -618,6 +759,13 @@ fn planned_payload_slots(payload: &PlannedResultPayload) -> Result<usize, RealmE
                 .checked_add(1)
                 .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
         }),
+        PlannedResultPayload::Buffer { values, .. } => {
+            values.iter().try_fold(1_usize, |slots, value| {
+                slots
+                    .checked_add(planned_payload_slots(value)?)
+                    .ok_or(RealmError::Heap(HeapError::CapacityExhausted))
+            })
+        }
     }
 }
 
@@ -633,6 +781,12 @@ fn validate_planned_payload(heap: &Heap, payload: &PlannedResultPayload) -> Resu
         PlannedResultPayload::Struct { fields, .. } => {
             for field in fields {
                 validate_planned_payload(heap, field)?;
+            }
+        }
+        PlannedResultPayload::Buffer { values, .. } => {
+            heap.validate_collection_length(values.len())?;
+            for value in values {
+                validate_planned_payload(heap, value)?;
             }
         }
         PlannedResultPayload::Value(_) | PlannedResultPayload::Enum { payload: None, .. } => {}
@@ -677,6 +831,25 @@ fn commit_planned_payload(
                     variant,
                     tag,
                     payload,
+                },
+            );
+            Ok(RuntimeValue::NamedRef { reference, type_id })
+        }
+        PlannedResultPayload::Buffer {
+            type_id,
+            element_type,
+            values,
+        } => {
+            let values = values
+                .into_iter()
+                .map(|value| commit_planned_payload(heap, reservation, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let reference = heap.commit(
+                reservation,
+                Object::Buffer {
+                    type_id,
+                    element_type,
+                    values,
                 },
             );
             Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -1698,6 +1871,7 @@ impl RealmRuntime {
                 imports: &module.verified.module().host_imports,
                 enum_types: &module.verified.module().enum_types,
                 struct_types: &module.verified.module().struct_types,
+                buffer_types: &module.verified.module().buffer_types,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
                 &module.verified,
@@ -2297,7 +2471,18 @@ impl RealmRuntime {
                             .verified
                             .module()
                             .struct_types;
-                        plan_host_payload(payload, result.success, enum_types, struct_types)?
+                        let buffer_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .buffer_types;
+                        plan_host_payload(
+                            payload,
+                            result.success,
+                            enum_types,
+                            struct_types,
+                            buffer_types,
+                        )?
                     };
                     self.preflight_async_result(result, true, payload)?
                 } else if let Some(expected_type) = expected_type {
@@ -2309,7 +2494,18 @@ impl RealmRuntime {
                             .verified
                             .module()
                             .struct_types;
-                        plan_host_payload(payload, expected_type, enum_types, struct_types)?
+                        let buffer_types = &self
+                            .module_for_task(snapshot)?
+                            .verified
+                            .module()
+                            .buffer_types;
+                        plan_host_payload(
+                            payload,
+                            expected_type,
+                            enum_types,
+                            struct_types,
+                            buffer_types,
+                        )?
                     };
                     validate_planned_payload(&self.heap, &payload)?;
                     let slots = planned_payload_slots(&payload)?;
@@ -3015,9 +3211,9 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
-        EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
-        Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema,
-        StateType, StructField, StructType, ValueType,
+        BufferType, EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode,
+        HostImport, Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField,
+        StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -3028,8 +3224,8 @@ mod tests {
     };
     use crate::task::TaskExecution;
     use crate::{
-        HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry, HostTrap,
-        HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain,
+        CopyBuffer, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
+        HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostDomain,
         RuntimeValue, StepConfig, TaskLimits, TickBudget,
     };
 
@@ -3042,6 +3238,7 @@ mod tests {
             Some(&mut heap),
             &[],
             &[],
+            &[],
         )
         .unwrap();
         let RuntimeValue::String { reference, .. } = runtime else {
@@ -3050,6 +3247,69 @@ mod tests {
         assert_eq!(heap.string(reference), Ok("host-result"));
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
         assert_eq!(args.get(0), Ok(&HostValue::String("host-result".into())));
+    }
+
+    #[test]
+    fn host_buffers_cross_sync_and_async_boundaries_by_copy() {
+        let metadata = BufferType::new(ValueType::I32);
+        let buffers = [metadata];
+        let host = HostValue::Buffer(CopyBuffer::new(vec![
+            HostValue::I32(1),
+            HostValue::I32(2),
+            HostValue::I32(3),
+        ]));
+        let retained_host_copy = host.clone();
+        let mut heap = crate::Heap::new_with_limits(8, usize::MAX, 4);
+        let runtime = super::host_to_runtime_value(
+            host,
+            Some(ValueType::Named(metadata.type_id)),
+            Some(&mut heap),
+            &[],
+            &[],
+            &buffers,
+        )
+        .unwrap();
+        let outbound = HostArgs::from_runtime(&[runtime], Some(&heap))
+            .unwrap()
+            .get(0)
+            .unwrap()
+            .clone();
+        heap.buffer_set(runtime, 0, RuntimeValue::I32(9)).unwrap();
+        assert_eq!(
+            retained_host_copy,
+            HostValue::Buffer(CopyBuffer::new(vec![
+                HostValue::I32(1),
+                HostValue::I32(2),
+                HostValue::I32(3),
+            ]))
+        );
+        assert_eq!(outbound, retained_host_copy);
+        assert_eq!(heap.buffer_get(runtime, 0), Ok(RuntimeValue::I32(9)));
+
+        let completion = HostPayload::Buffer(CopyBuffer::new(vec![
+            HostPayload::I32(4),
+            HostPayload::I32(5),
+        ]));
+        let planned = super::plan_host_payload(
+            &completion,
+            ValueType::Named(metadata.type_id),
+            &[],
+            &[],
+            &buffers,
+        )
+        .unwrap();
+        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 1);
+        super::validate_planned_payload(&heap, &planned).unwrap();
+        let mut reservation = heap.preflight(1).unwrap();
+        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
+        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
+        assert_eq!(
+            args.get(0),
+            Ok(&HostValue::Buffer(CopyBuffer::new(vec![
+                HostValue::I32(4),
+                HostValue::I32(5),
+            ])))
+        );
     }
 
     #[test]
@@ -3077,6 +3337,7 @@ mod tests {
             Some(&mut heap),
             &enum_types,
             &[],
+            &[],
         )
         .unwrap();
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
@@ -3095,6 +3356,7 @@ mod tests {
                 Some(&mut heap),
                 &enum_types,
                 &[],
+                &[],
             ),
             Err(HostTrap::Type)
         );
@@ -3105,9 +3367,14 @@ mod tests {
             tag: 0,
             payload: Some(Box::new(HostPayload::String("async".into()))),
         };
-        let planned =
-            super::plan_host_payload(&completion, ValueType::Named(type_id), &enum_types, &[])
-                .unwrap();
+        let planned = super::plan_host_payload(
+            &completion,
+            ValueType::Named(type_id),
+            &enum_types,
+            &[],
+            &[],
+        )
+        .unwrap();
         assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
         super::validate_planned_payload(&heap, &planned).unwrap();
         let mut reservation = heap.preflight(2).unwrap();
@@ -3148,6 +3415,7 @@ mod tests {
             Some(&mut heap),
             &[],
             &struct_types,
+            &[],
         )
         .unwrap();
         let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
@@ -3159,6 +3427,7 @@ mod tests {
                 Some(&mut heap),
                 &[],
                 &struct_types,
+                &[],
             ),
             Err(HostTrap::Type)
         );
@@ -3167,9 +3436,14 @@ mod tests {
             HostPayload::I32(8),
             HostPayload::String("resume".into()),
         ]);
-        let planned =
-            super::plan_host_payload(&completion, ValueType::Named(type_id), &[], &struct_types)
-                .unwrap();
+        let planned = super::plan_host_payload(
+            &completion,
+            ValueType::Named(type_id),
+            &[],
+            &struct_types,
+            &[],
+        )
+        .unwrap();
         assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
         let mut reservation = heap.preflight(2).unwrap();
         let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();

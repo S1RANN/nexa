@@ -315,6 +315,7 @@ pub enum TrapKind {
     DivideByZero,
     StringIndexOutOfBounds,
     ArrayIndexOutOfBounds,
+    BufferIndexOutOfBounds,
     CleanupBudgetExceeded,
     Host,
 }
@@ -363,14 +364,14 @@ impl From<HeapError> for InterpreterError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 84],
+    costs: [u16; 89],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: 1,
-            costs: [1; 84],
+            costs: [1; 89],
         }
     }
 }
@@ -774,6 +775,47 @@ impl CheckedInterpreter {
                                 &continuation,
                                 TrapKind::ArrayIndexOutOfBounds,
                                 "array index out of bounds",
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    }
+                }
+            };
+        }
+        macro_rules! buffer_operation {
+            ($operation:expr) => {
+                match $operation {
+                    Ok(value) => value,
+                    Err(HeapError::IndexOutOfBounds { .. }) => {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::BufferIndexOutOfBounds,
+                                "buffer index out of bounds",
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    }
+                    Err(error) => return Err(InterpreterError::Heap(error)),
+                }
+            };
+        }
+        macro_rules! buffer_index {
+            ($value:expr) => {
+                match usize::try_from($value) {
+                    Ok(index) => index,
+                    Err(_) => {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::BufferIndexOutOfBounds,
+                                "buffer index out of bounds",
                             ),
                             charge,
                             fuel,
@@ -1896,6 +1938,112 @@ impl CheckedInterpreter {
                         .map_clear(map)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::BufferLen { source, dst } => {
+                    let buffer = register(&continuation.arena, source)?;
+                    let length = heap
+                        .as_deref()
+                        .ok_or(InterpreterError::HeapUnavailable)?
+                        .buffer_len(buffer)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::I32(
+                            i32::try_from(length)
+                                .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                        ),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::BufferGet { source, index, dst } => {
+                    let buffer = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = buffer_index!(index);
+                    let value = buffer_operation!(
+                        heap.as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .buffer_get(buffer, index)
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::BufferSet {
+                    source,
+                    index,
+                    value,
+                } => {
+                    let buffer = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let value = register(&continuation.arena, value)?;
+                    let index = buffer_index!(index);
+                    buffer_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .buffer_set(buffer, index, value)
+                    );
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::BufferSlice {
+                    source,
+                    start,
+                    length,
+                    dst,
+                } => {
+                    let buffer = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(start) = register(&continuation.arena, start)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::I32(length) = register(&continuation.arena, length)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let start = buffer_index!(start);
+                    let length = buffer_index!(length);
+                    let value = buffer_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .buffer_slice(buffer, start, length)
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::BufferCopy {
+                    destination,
+                    source,
+                    source_start,
+                    destination_start,
+                    length,
+                } => {
+                    let destination = register(&continuation.arena, destination)?;
+                    let source = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(source_start) =
+                        register(&continuation.arena, source_start)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::I32(destination_start) =
+                        register(&continuation.arena, destination_start)?
+                    else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let RuntimeValue::I32(length) = register(&continuation.arena, length)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    buffer_operation!(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .buffer_copy(
+                                destination,
+                                source,
+                                buffer_index!(source_start),
+                                buffer_index!(destination_start),
+                                buffer_index!(length),
+                            )
+                    );
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StateFinish => {
                     migration
                         .as_deref_mut()
@@ -2244,6 +2392,11 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::MapRemove { .. }
         | Instruction::MapContains { .. }
         | Instruction::MapClear { .. }
+        | Instruction::BufferLen { .. }
+        | Instruction::BufferGet { .. }
+        | Instruction::BufferSet { .. }
+        | Instruction::BufferSlice { .. }
+        | Instruction::BufferCopy { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
         | Instruction::StateHandleResolve { .. }
@@ -2342,6 +2495,11 @@ fn opcode_index(instruction: Instruction) -> usize {
         Instruction::MapRemove { .. } => 81,
         Instruction::MapContains { .. } => 82,
         Instruction::MapClear { .. } => 83,
+        Instruction::BufferLen { .. } => 84,
+        Instruction::BufferGet { .. } => 85,
+        Instruction::BufferSet { .. } => 86,
+        Instruction::BufferSlice { .. } => 87,
+        Instruction::BufferCopy { .. } => 88,
     }
 }
 

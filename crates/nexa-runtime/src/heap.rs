@@ -97,6 +97,11 @@ pub enum Object {
         element_type: nexa_bytecode::ValueType,
         values: Vec<RuntimeValue>,
     },
+    Buffer {
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        values: Vec<RuntimeValue>,
+    },
 }
 
 impl Object {
@@ -116,7 +121,7 @@ impl Object {
                     _ => None,
                 })
                 .collect(),
-            Self::Array { values, .. } => values
+            Self::Array { values, .. } | Self::Buffer { values, .. } => values
                 .iter()
                 .filter_map(|value| match value {
                     RuntimeValue::String { reference, .. }
@@ -327,6 +332,17 @@ impl Heap {
             Err(HeapError::StringTooLarge {
                 bytes,
                 max_bytes: self.max_string_bytes,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    pub(crate) fn validate_collection_length(&self, length: usize) -> Result<(), HeapError> {
+        if length > self.max_collection_length {
+            Err(HeapError::CollectionTooLarge {
+                length,
+                max_length: self.max_collection_length,
             })
         } else {
             Ok(())
@@ -863,6 +879,165 @@ impl Heap {
         }
     }
 
+    pub fn allocate_buffer(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        source: &[RuntimeValue],
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::buffer_type(element_type) {
+            return Err(invalid_value_reference());
+        }
+        if source.len() > self.max_collection_length {
+            return Err(HeapError::CollectionTooLarge {
+                length: source.len(),
+                max_length: self.max_collection_length,
+            });
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(source.len())
+            .map_err(|_| HeapError::CapacityExhausted)?;
+        values.extend_from_slice(source);
+        let reference = self.allocate(Object::Buffer {
+            type_id,
+            element_type,
+            values,
+        })?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    pub fn buffer_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve(reference)? {
+            Object::Buffer {
+                type_id: actual,
+                element_type,
+                values,
+            } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
+                Ok(values)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    pub fn buffer_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        Ok(self.buffer_values(value)?.len())
+    }
+
+    pub fn buffer_get(&self, value: RuntimeValue, index: usize) -> Result<RuntimeValue, HeapError> {
+        let values = self.buffer_values(value)?;
+        values
+            .get(index)
+            .copied()
+            .ok_or(HeapError::IndexOutOfBounds {
+                index,
+                length: values.len(),
+            })
+    }
+
+    pub fn buffer_set(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+        replacement: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        let values = self.buffer_values_mut(value)?;
+        let length = values.len();
+        let slot = values
+            .get_mut(index)
+            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+        *slot = replacement;
+        Ok(())
+    }
+
+    pub fn buffer_slice(
+        &mut self,
+        value: RuntimeValue,
+        start: usize,
+        length: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let (type_id, element_type) = self.buffer_metadata(value)?;
+        let values = self.buffer_values(value)?;
+        let end = checked_collection_end(start, length, values.len())?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(length)
+            .map_err(|_| HeapError::CapacityExhausted)?;
+        copy.extend_from_slice(&values[start..end]);
+        self.allocate_buffer(type_id, element_type, &copy)
+    }
+
+    pub fn buffer_copy(
+        &mut self,
+        destination: RuntimeValue,
+        source: RuntimeValue,
+        source_start: usize,
+        destination_start: usize,
+        length: usize,
+    ) -> Result<(), HeapError> {
+        let destination_metadata = self.buffer_metadata(destination)?;
+        if self.buffer_metadata(source)? != destination_metadata {
+            return Err(invalid_value_reference());
+        }
+        let source_values = self.buffer_values(source)?;
+        let source_end = checked_collection_end(source_start, length, source_values.len())?;
+        let destination_end = checked_collection_end(
+            destination_start,
+            length,
+            self.buffer_values(destination)?.len(),
+        )?;
+        let mut copy = Vec::new();
+        copy.try_reserve_exact(length)
+            .map_err(|_| HeapError::CapacityExhausted)?;
+        copy.extend_from_slice(&source_values[source_start..source_end]);
+        self.buffer_values_mut(destination)?[destination_start..destination_end]
+            .copy_from_slice(&copy);
+        Ok(())
+    }
+
+    fn buffer_metadata(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<(StableId, nexa_bytecode::ValueType), HeapError> {
+        let RuntimeValue::NamedRef { type_id, .. } = value else {
+            return Err(invalid_value_reference());
+        };
+        let RuntimeValue::NamedRef { reference, .. } = value else {
+            unreachable!("named reference checked")
+        };
+        match self.resolve(reference)? {
+            Object::Buffer {
+                type_id: actual,
+                element_type,
+                ..
+            } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
+                Ok((type_id, *element_type))
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn buffer_values_mut(
+        &mut self,
+        value: RuntimeValue,
+    ) -> Result<&mut Vec<RuntimeValue>, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        match self.resolve_mut(reference)? {
+            Object::Buffer {
+                type_id: actual,
+                element_type,
+                values,
+            } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
+                Ok(values)
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
     pub fn allocate_map(
         &mut self,
         type_id: StableId,
@@ -1111,7 +1286,7 @@ impl Heap {
                             );
                         }
                     }
-                    Object::Class { .. } | Object::Array { .. } => {
+                    Object::Class { .. } | Object::Array { .. } | Object::Buffer { .. } => {
                         write_hash(&mut hash, &reference.index.to_le_bytes());
                         write_hash(&mut hash, &reference.generation.to_le_bytes());
                     }
@@ -1210,7 +1385,8 @@ impl Heap {
                             }
                     }
                     (Object::Class { .. }, Object::Class { .. })
-                    | (Object::Array { .. }, Object::Array { .. }) => {
+                    | (Object::Array { .. }, Object::Array { .. })
+                    | (Object::Buffer { .. }, Object::Buffer { .. }) => {
                         lhs_reference == rhs_reference
                     }
                     _ => false,
@@ -1295,6 +1471,27 @@ impl Heap {
 
     fn validate_reference(&self, reference: GcRef) -> Result<(), HeapError> {
         self.resolve(reference).map(|_| ())
+    }
+}
+
+fn checked_collection_end(
+    start: usize,
+    length: usize,
+    collection_length: usize,
+) -> Result<usize, HeapError> {
+    let end = start
+        .checked_add(length)
+        .ok_or(HeapError::IndexOutOfBounds {
+            index: usize::MAX,
+            length: collection_length,
+        })?;
+    if end > collection_length {
+        Err(HeapError::IndexOutOfBounds {
+            index: end,
+            length: collection_length,
+        })
+    } else {
+        Ok(end)
     }
 }
 
@@ -1555,6 +1752,127 @@ mod tests {
         let stats = heap.collect(&GcRoots::default()).unwrap();
         assert_eq!(stats.reclaimed, 2);
         assert_eq!(stats.live, 0);
+    }
+
+    #[test]
+    fn buffers_copy_slice_and_enforce_bounds_without_partial_mutation() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 4);
+        let element = nexa_bytecode::ValueType::I32;
+        let type_id = nexa_bytecode::buffer_type(element);
+        let destination = heap
+            .allocate_buffer(
+                type_id,
+                element,
+                &[
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3),
+                    RuntimeValue::I32(4),
+                ],
+            )
+            .unwrap();
+        let source = heap
+            .allocate_buffer(
+                type_id,
+                element,
+                &[
+                    RuntimeValue::I32(9),
+                    RuntimeValue::I32(8),
+                    RuntimeValue::I32(7),
+                ],
+            )
+            .unwrap();
+
+        heap.buffer_set(destination, 0, RuntimeValue::I32(6))
+            .unwrap();
+        heap.buffer_copy(destination, source, 0, 1, 2).unwrap();
+        assert_eq!(
+            heap.buffer_values(destination),
+            Ok(&[
+                RuntimeValue::I32(6),
+                RuntimeValue::I32(9),
+                RuntimeValue::I32(8),
+                RuntimeValue::I32(4),
+            ][..])
+        );
+        assert_eq!(
+            heap.buffer_values(source),
+            Ok(&[
+                RuntimeValue::I32(9),
+                RuntimeValue::I32(8),
+                RuntimeValue::I32(7),
+            ][..])
+        );
+
+        let slice = heap.buffer_slice(destination, 1, 2).unwrap();
+        heap.buffer_set(slice, 0, RuntimeValue::I32(5)).unwrap();
+        assert_eq!(heap.buffer_get(slice, 0), Ok(RuntimeValue::I32(5)));
+        assert_eq!(heap.buffer_get(destination, 1), Ok(RuntimeValue::I32(9)));
+
+        let before = heap.buffer_values(destination).unwrap().to_vec();
+        assert_eq!(
+            heap.buffer_copy(destination, source, 2, 0, 2),
+            Err(HeapError::IndexOutOfBounds {
+                index: 4,
+                length: 3,
+            })
+        );
+        assert_eq!(heap.buffer_values(destination), Ok(before.as_slice()));
+        assert_eq!(
+            heap.buffer_get(destination, 4),
+            Err(HeapError::IndexOutOfBounds {
+                index: 4,
+                length: 4,
+            })
+        );
+        assert_eq!(
+            heap.allocate_buffer(
+                type_id,
+                element,
+                &[
+                    RuntimeValue::I32(0),
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3),
+                    RuntimeValue::I32(4),
+                ],
+            ),
+            Err(HeapError::CollectionTooLarge {
+                length: 5,
+                max_length: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn buffer_elements_are_traced_from_the_buffer_root() {
+        let mut heap = Heap::new_with_limits(4, usize::MAX, 4);
+        let string = heap.allocate_string("kept").unwrap();
+        let string_value = RuntimeValue::String {
+            reference: string,
+            hash: heap.string_hash(string).unwrap(),
+        };
+        let element = nexa_bytecode::ValueType::String;
+        let buffer = heap
+            .allocate_buffer(
+                nexa_bytecode::buffer_type(element),
+                element,
+                &[string_value],
+            )
+            .unwrap();
+        let RuntimeValue::NamedRef {
+            reference: buffer_reference,
+            ..
+        } = buffer
+        else {
+            unreachable!("buffer allocations are named references")
+        };
+        let roots = GcRoots {
+            running_frames: vec![buffer_reference],
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().marked, 2);
+        assert_eq!(heap.string(string), Ok("kept"));
     }
 
     #[test]

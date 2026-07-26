@@ -1008,6 +1008,7 @@ pub enum HostPayload {
     Bool(bool),
     Rune(u32),
     String(String),
+    Buffer(CopyBuffer<HostPayload>),
     Struct(Vec<HostPayload>),
     Enum {
         type_id: nexa_core::StableId,
@@ -1030,6 +1031,7 @@ pub enum HostValue {
     Bool(bool),
     Rune(char),
     String(String),
+    Buffer(CopyBuffer<HostValue>),
     Opaque(u64),
     Struct(Vec<HostValue>),
     Enum {
@@ -1124,6 +1126,18 @@ fn runtime_argument_to_host_value(
                 .map(|field| runtime_argument_to_host_value(*field, heap))
                 .collect::<Result<Vec<_>, _>>()?,
         ),
+        value @ crate::RuntimeValue::NamedRef { .. }
+            if heap.is_some_and(|heap| heap.buffer_values(value).is_ok()) =>
+        {
+            HostValue::Buffer(CopyBuffer::new(
+                heap.expect("buffer guard requires a heap")
+                    .buffer_values(value)
+                    .map_err(|_| HostTrap::Type)?
+                    .iter()
+                    .map(|element| runtime_argument_to_host_value(*element, heap))
+                    .collect::<Result<Vec<_>, _>>()?,
+            ))
+        }
         value @ crate::RuntimeValue::NamedRef { .. }
             if heap.is_some_and(|heap| heap.enum_parts(value).is_ok()) =>
         {
@@ -2726,7 +2740,7 @@ fn host_admission_error(error: HostAdmissionError) -> HostRequestError {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CopyBuffer<T> {
     data: Vec<T>,
 }
@@ -2740,6 +2754,16 @@ impl<T> CopyBuffer<T> {
     #[must_use]
     pub fn as_slice(&self) -> &[T] {
         &self.data
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
     }
 
     #[must_use]

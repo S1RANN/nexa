@@ -62,6 +62,7 @@ pub enum VerifyErrorKind {
     InvalidStateMetadata,
     InvalidArrayMetadata,
     InvalidMapMetadata,
+    InvalidBufferMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -71,6 +72,7 @@ pub enum VerifyErrorKind {
     ClassFieldOutOfRange(u64),
     ArrayTypeOutOfRange(u64),
     MapTypeOutOfRange(u64),
+    BufferTypeOutOfRange(u64),
     InvalidReloadMetadata,
     InvalidRune(u32),
     StringOutOfRange(u32),
@@ -249,7 +251,52 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
         }
     }
     verify_map_metadata(module)?;
+    verify_buffer_metadata(module)?;
     verify_state_storage_metadata(module)?;
+    Ok(())
+}
+
+fn verify_buffer_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut ids = BTreeSet::new();
+    if module.buffer_types.iter().any(|buffer| {
+        !ids.insert(buffer.type_id.0)
+            || buffer.type_id != nexa_bytecode::buffer_type(buffer.element)
+            || module
+                .enum_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == buffer.type_id)
+            || module
+                .state_handle_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .array_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+            || module
+                .map_types
+                .iter()
+                .any(|ty| ty.type_id == buffer.type_id)
+    }) {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidBufferMetadata,
+        });
+    }
     Ok(())
 }
 
@@ -585,6 +632,18 @@ fn verify_function(
                 .map(|map_type| (map_type.key, map_type.value))
                 .ok_or_else(|| error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0)))
         };
+        let buffer_element = |state: &[Option<ValueType>], source: u16| {
+            let source = register(source)?;
+            let Some(ValueType::Named(type_id)) = state[source] else {
+                return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+            };
+            module
+                .buffer_types
+                .iter()
+                .find(|buffer| buffer.type_id == type_id)
+                .map(|buffer| buffer.element)
+                .ok_or_else(|| error(Some(pc), VerifyErrorKind::BufferTypeOutOfRange(type_id.0)))
+        };
         let mut successors = Vec::with_capacity(2);
         if matches!(
             instruction,
@@ -604,6 +663,11 @@ fn verify_function(
                 | Instruction::MapRemove { .. }
                 | Instruction::MapContains { .. }
                 | Instruction::MapClear { .. }
+                | Instruction::BufferLen { .. }
+                | Instruction::BufferGet { .. }
+                | Instruction::BufferSet { .. }
+                | Instruction::BufferSlice { .. }
+                | Instruction::BufferCopy { .. }
         ) && matches!(
             function.effect,
             FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
@@ -1308,6 +1372,52 @@ fn verify_function(
             Instruction::MapClear { source } => {
                 map_types(&state, source)?;
             }
+            Instruction::BufferLen { source, dst } => {
+                buffer_element(&state, source)?;
+                state[register(dst)?] = Some(ValueType::I32);
+            }
+            Instruction::BufferGet { source, index, dst } => {
+                let element = buffer_element(&state, source)?;
+                require(&state, index, ValueType::I32)?;
+                state[register(dst)?] = Some(element);
+            }
+            Instruction::BufferSet {
+                source,
+                index,
+                value,
+            } => {
+                let element = buffer_element(&state, source)?;
+                require(&state, index, ValueType::I32)?;
+                require(&state, value, element)?;
+            }
+            Instruction::BufferSlice {
+                source,
+                start,
+                length,
+                dst,
+            } => {
+                buffer_element(&state, source)?;
+                require(&state, start, ValueType::I32)?;
+                require(&state, length, ValueType::I32)?;
+                let source = register(source)?;
+                state[register(dst)?] = state[source];
+            }
+            Instruction::BufferCopy {
+                destination,
+                source,
+                source_start,
+                destination_start,
+                length,
+            } => {
+                let element = buffer_element(&state, destination)?;
+                let source_element = buffer_element(&state, source)?;
+                if element != source_element {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                require(&state, source_start, ValueType::I32)?;
+                require(&state, destination_start, ValueType::I32)?;
+                require(&state, length, ValueType::I32)?;
+            }
             Instruction::Return { source } => {
                 let result = function
                     .signature
@@ -1475,47 +1585,7 @@ fn verify_safepoints(
     }
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
-        let required = pc == 0
-            || (pc > 0 && matches!(function.code[pc - 1], Instruction::HostCall { .. }))
-            || matches!(
-                instruction,
-                Instruction::Safepoint
-                    | Instruction::Yield
-                    | Instruction::LoadString { .. }
-                    | Instruction::StringConcat { .. }
-                    | Instruction::EnumNew { .. }
-                    | Instruction::StructNew { .. }
-                    | Instruction::StructWith { .. }
-                    | Instruction::ClassNew { .. }
-                    | Instruction::ArrayNew { .. }
-                    | Instruction::ArrayLen { .. }
-                    | Instruction::ArrayGet { .. }
-                    | Instruction::ArraySet { .. }
-                    | Instruction::ArrayPush { .. }
-                    | Instruction::ArrayPop { .. }
-                    | Instruction::ArrayInsert { .. }
-                    | Instruction::ArrayRemove { .. }
-                    | Instruction::ArrayClear { .. }
-                    | Instruction::MapNew { .. }
-                    | Instruction::MapLen { .. }
-                    | Instruction::MapGet { .. }
-                    | Instruction::MapSet { .. }
-                    | Instruction::MapRemove { .. }
-                    | Instruction::MapContains { .. }
-                    | Instruction::MapClear { .. }
-                    | Instruction::Call { .. }
-                    | Instruction::HostCall { .. }
-                    | Instruction::StateHandleResolve { .. }
-                    | Instruction::Return { .. }
-                    | Instruction::ReturnVoid
-                    | Instruction::Trap
-                    | Instruction::CleanupReturn
-            )
-            || matches!(instruction, Instruction::Jump { target } if target <= pc_u32)
-            || matches!(
-                instruction,
-                Instruction::JumpIfFalse { target, .. } if target <= pc_u32
-            );
+        let required = instruction_requires_safepoint(function, pc, instruction);
         if required && !function.safepoints.contains(&pc_u32) {
             return Err(VerifyError {
                 function: function_index,
@@ -1556,6 +1626,60 @@ fn verify_safepoints(
         }
     }
     Ok(())
+}
+
+fn instruction_requires_safepoint(
+    function: &Function,
+    pc: usize,
+    instruction: Instruction,
+) -> bool {
+    let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
+    pc == 0
+        || (pc > 0 && matches!(function.code[pc - 1], Instruction::HostCall { .. }))
+        || matches!(
+            instruction,
+            Instruction::Safepoint
+                | Instruction::Yield
+                | Instruction::LoadString { .. }
+                | Instruction::StringConcat { .. }
+                | Instruction::EnumNew { .. }
+                | Instruction::StructNew { .. }
+                | Instruction::StructWith { .. }
+                | Instruction::ClassNew { .. }
+                | Instruction::ArrayNew { .. }
+                | Instruction::ArrayLen { .. }
+                | Instruction::ArrayGet { .. }
+                | Instruction::ArraySet { .. }
+                | Instruction::ArrayPush { .. }
+                | Instruction::ArrayPop { .. }
+                | Instruction::ArrayInsert { .. }
+                | Instruction::ArrayRemove { .. }
+                | Instruction::ArrayClear { .. }
+                | Instruction::MapNew { .. }
+                | Instruction::MapLen { .. }
+                | Instruction::MapGet { .. }
+                | Instruction::MapSet { .. }
+                | Instruction::MapRemove { .. }
+                | Instruction::MapContains { .. }
+                | Instruction::MapClear { .. }
+                | Instruction::BufferLen { .. }
+                | Instruction::BufferGet { .. }
+                | Instruction::BufferSet { .. }
+                | Instruction::BufferSlice { .. }
+                | Instruction::BufferCopy { .. }
+                | Instruction::Call { .. }
+                | Instruction::HostCall { .. }
+                | Instruction::StateHandleResolve { .. }
+                | Instruction::Return { .. }
+                | Instruction::ReturnVoid
+                | Instruction::Trap
+                | Instruction::CleanupReturn
+        )
+        || matches!(instruction, Instruction::Jump { target } if target <= pc_u32)
+        || matches!(
+            instruction,
+            Instruction::JumpIfFalse { target, .. } if target <= pc_u32
+        )
 }
 
 fn target_index(
@@ -1758,9 +1882,9 @@ fn longest_path(
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ArrayType, ClassType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
-        Instruction, MapType, ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField,
-        StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
+        ArrayType, BufferType, ClassType, FunctionBuilder, FunctionEffect, HostCallMode,
+        HostImport, Instruction, MapType, ModuleBuilder, RootMap, Signature, SourceMapEntry,
+        StateField, StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -1867,6 +1991,81 @@ mod tests {
         let mut module = ModuleBuilder::new();
         module
             .array_type(array)
+            .function(immediate.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEffect
+        );
+    }
+
+    #[test]
+    fn buffer_metadata_instruction_types_and_effects_are_verified_independently() {
+        let buffer = BufferType::new(ValueType::I32);
+        let mut valid = ModuleBuilder::new();
+        valid.buffer_type(buffer);
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let mut forged = ModuleBuilder::new();
+        forged.buffer_type(BufferType {
+            type_id: StableId::from_name("forged-buffer"),
+            element: ValueType::I32,
+        });
+        assert_eq!(
+            verify(forged.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidBufferMetadata
+        );
+
+        let mut wrong_element = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::Named(buffer.type_id),
+                    ValueType::I32,
+                    ValueType::Bool,
+                ],
+                result: None,
+            },
+            3,
+        );
+        wrong_element
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::BufferSet {
+                source: 0,
+                index: 1,
+                value: 2,
+            })
+            .emit(Instruction::ReturnVoid);
+        let mut module = ModuleBuilder::new();
+        module
+            .buffer_type(buffer)
+            .function(wrong_element.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+
+        let mut immediate = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(buffer.type_id)],
+                result: Some(ValueType::I32),
+            },
+            2,
+        );
+        immediate
+            .effect(FunctionEffect::Immediate)
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::BufferLen { source: 0, dst: 1 })
+            .emit(Instruction::Return { source: 1 });
+        let mut module = ModuleBuilder::new();
+        module
+            .buffer_type(buffer)
             .function(immediate.finish().unwrap());
         assert_eq!(
             verify(module.finish(), VerifierLimits::default())

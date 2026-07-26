@@ -323,6 +323,27 @@ impl MapType {
 }
 
 #[must_use]
+pub fn buffer_type(element: ValueType) -> StableId {
+    parameterized_type_id("Buffer", &[element])
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BufferType {
+    pub type_id: StableId,
+    pub element: ValueType,
+}
+
+impl BufferType {
+    #[must_use]
+    pub fn new(element: ValueType) -> Self {
+        Self {
+            type_id: buffer_type(element),
+            element,
+        }
+    }
+}
+
+#[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
 }
@@ -776,6 +797,33 @@ pub enum Instruction {
     MapClear {
         source: u16,
     },
+    BufferLen {
+        source: u16,
+        dst: u16,
+    },
+    BufferGet {
+        source: u16,
+        index: u16,
+        dst: u16,
+    },
+    BufferSet {
+        source: u16,
+        index: u16,
+        value: u16,
+    },
+    BufferSlice {
+        source: u16,
+        start: u16,
+        length: u16,
+        dst: u16,
+    },
+    BufferCopy {
+        destination: u16,
+        source: u16,
+        source_start: u16,
+        destination_start: u16,
+        length: u16,
+    },
     StateFinish,
     StateOldFieldGet {
         object: u16,
@@ -852,6 +900,7 @@ pub struct Module {
     pub state_handle_types: Vec<StateHandleType>,
     pub array_types: Vec<ArrayType>,
     pub map_types: Vec<MapType>,
+    pub buffer_types: Vec<BufferType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -1439,7 +1488,8 @@ impl Module {
                 self.state_handle_types
                     .len()
                     .saturating_add(self.array_types.len())
-                    .saturating_add(self.map_types.len()),
+                    .saturating_add(self.map_types.len())
+                    .saturating_add(self.buffer_types.len()),
             )
             .expect("parameterized type count exceeds wire format"),
         );
@@ -1458,6 +1508,11 @@ impl Module {
             put_u64(&mut types, map.type_id.0);
             encode_type(&mut types, map.key);
             encode_type(&mut types, map.value);
+        }
+        for buffer in &self.buffer_types {
+            types.push(4);
+            put_u64(&mut types, buffer.type_id.0);
+            encode_type(&mut types, buffer.element);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -1566,6 +1621,7 @@ impl Module {
         let mut state_handle_types = Vec::with_capacity(state_handle_type_count);
         let mut array_types = Vec::new();
         let mut map_types = Vec::new();
+        let mut buffer_types = Vec::new();
         for _ in 0..state_handle_type_count {
             let kind = types_reader.u8()?;
             let type_id = StableId(types_reader.u64()?);
@@ -1582,6 +1638,10 @@ impl Module {
                     type_id,
                     key: decode_type(&mut types_reader)?,
                     value: decode_type(&mut types_reader)?,
+                }),
+                4 => buffer_types.push(BufferType {
+                    type_id,
+                    element: decode_type(&mut types_reader)?,
                 }),
                 _ => return Err(DecodeError::InvalidType(kind)),
             }
@@ -1999,6 +2059,7 @@ impl Module {
             state_handle_types,
             array_types,
             map_types,
+            buffer_types,
             enum_types,
             struct_types,
             class_types,
@@ -2565,6 +2626,53 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             output.push(83);
             put_u16(output, source);
         }
+        Instruction::BufferLen { source, dst } => {
+            output.push(84);
+            put_u16(output, source);
+            put_u16(output, dst);
+        }
+        Instruction::BufferGet { source, index, dst } => {
+            output.push(85);
+            put_u16(output, source);
+            put_u16(output, index);
+            put_u16(output, dst);
+        }
+        Instruction::BufferSet {
+            source,
+            index,
+            value,
+        } => {
+            output.push(86);
+            put_u16(output, source);
+            put_u16(output, index);
+            put_u16(output, value);
+        }
+        Instruction::BufferSlice {
+            source,
+            start,
+            length,
+            dst,
+        } => {
+            output.push(87);
+            put_u16(output, source);
+            put_u16(output, start);
+            put_u16(output, length);
+            put_u16(output, dst);
+        }
+        Instruction::BufferCopy {
+            destination,
+            source,
+            source_start,
+            destination_start,
+            length,
+        } => {
+            output.push(88);
+            put_u16(output, destination);
+            put_u16(output, source);
+            put_u16(output, source_start);
+            put_u16(output, destination_start);
+            put_u16(output, length);
+        }
         Instruction::Jump { target } => {
             output.push(7);
             put_u32(output, target);
@@ -3095,6 +3203,33 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         83 => Instruction::MapClear {
             source: reader.u16()?,
         },
+        84 => Instruction::BufferLen {
+            source: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        85 => Instruction::BufferGet {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        86 => Instruction::BufferSet {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            value: reader.u16()?,
+        },
+        87 => Instruction::BufferSlice {
+            source: reader.u16()?,
+            start: reader.u16()?,
+            length: reader.u16()?,
+            dst: reader.u16()?,
+        },
+        88 => Instruction::BufferCopy {
+            destination: reader.u16()?,
+            source: reader.u16()?,
+            source_start: reader.u16()?,
+            destination_start: reader.u16()?,
+            length: reader.u16()?,
+        },
         opcode => return Err(DecodeError::InvalidOpcode(opcode)),
     })
 }
@@ -3206,6 +3341,7 @@ pub struct ModuleBuilder {
     state_handle_types: Vec<StateHandleType>,
     array_types: Vec<ArrayType>,
     map_types: Vec<MapType>,
+    buffer_types: Vec<BufferType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -3227,6 +3363,7 @@ impl ModuleBuilder {
             state_handle_types: Vec::new(),
             array_types: Vec::new(),
             map_types: Vec::new(),
+            buffer_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -3311,6 +3448,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn buffer_type(&mut self, buffer_type: BufferType) -> &mut Self {
+        self.buffer_types.push(buffer_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -3349,6 +3491,7 @@ impl ModuleBuilder {
             state_handle_types: self.state_handle_types,
             array_types: self.array_types,
             map_types: self.map_types,
+            buffer_types: self.buffer_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
@@ -3484,6 +3627,11 @@ impl FunctionBuilder {
                         | Instruction::MapRemove { .. }
                         | Instruction::MapContains { .. }
                         | Instruction::MapClear { .. }
+                        | Instruction::BufferLen { .. }
+                        | Instruction::BufferGet { .. }
+                        | Instruction::BufferSet { .. }
+                        | Instruction::BufferSlice { .. }
+                        | Instruction::BufferCopy { .. }
                         | Instruction::Return { .. }
                         | Instruction::ReturnVoid
                         | Instruction::Trap
@@ -3539,10 +3687,10 @@ mod tests {
     use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{
-        ArrayType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant, FunctionBuilder,
-        FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind, Signature,
-        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
-        StructType, ValueType, option_type, result_type, state_handle_error_type,
+        ArrayType, BufferType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant,
+        FunctionBuilder, FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind,
+        Signature, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType,
+        StructField, StructType, ValueType, option_type, result_type, state_handle_error_type,
         state_handle_type,
     };
 
@@ -4039,6 +4187,55 @@ mod tests {
             .function(function.finish().unwrap());
         let module = builder.finish();
         assert_eq!(module.map_types, vec![map]);
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v4() {
+        let buffer = BufferType::new(ValueType::I32);
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::Named(buffer.type_id),
+                    ValueType::Named(buffer.type_id),
+                    ValueType::I32,
+                ],
+                result: Some(ValueType::I32),
+            },
+            7,
+        );
+        function
+            .emit(Instruction::BufferLen { source: 0, dst: 3 })
+            .emit(Instruction::BufferGet {
+                source: 0,
+                index: 2,
+                dst: 4,
+            })
+            .emit(Instruction::BufferSet {
+                source: 0,
+                index: 2,
+                value: 4,
+            })
+            .emit(Instruction::BufferSlice {
+                source: 0,
+                start: 2,
+                length: 2,
+                dst: 5,
+            })
+            .emit(Instruction::BufferCopy {
+                destination: 0,
+                source: 1,
+                source_start: 2,
+                destination_start: 2,
+                length: 2,
+            })
+            .emit(Instruction::Return { source: 3 });
+        let mut builder = ModuleBuilder::new();
+        builder
+            .buffer_type(buffer)
+            .function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(module.buffer_types, vec![buffer]);
         assert_eq!(Module::decode(&module.encode()), Ok(module));
     }
 
