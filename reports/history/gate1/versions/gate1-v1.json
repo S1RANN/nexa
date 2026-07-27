@@ -1,0 +1,10 @@
+{
+  "version": "gate1-v1",
+  "status": "INVALID_APPARATUS",
+  "decision_usable": false,
+  "implementation_sha": "e397bee",
+  "evidence_sha": "6224a9c",
+  "receipt_sha": null,
+  "canonical_record_hash": "36e73b0b514c4a4158e9fcdb76be4db16667b6cd",
+  "historical_record_immutable": true
+}

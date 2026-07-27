@@ -914,6 +914,11 @@ impl RealmV5RuntimeAdapter {
     }
 
     #[must_use]
+    pub const fn gate1_scope(&self) -> ScopeHandle {
+        self.fixtures.scope
+    }
+
+    #[must_use]
     pub fn host(&self) -> &RuntimeHost {
         &self.host
     }

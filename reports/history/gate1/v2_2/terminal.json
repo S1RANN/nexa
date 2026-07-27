@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.2",
+  "status": "NOT_TRUSTWORTHY",
+  "milestone": "5.0R2",
+  "milestone_status": "INCOMPLETE",
+  "formal_runs": {
+    "formal-run-1": "PASS",
+    "formal-run-2": "PASS",
+    "replay": "PASS"
+  },
+  "comparisons": "PASS",
+  "governance": "FAIL",
+  "contracts_recomputed": false,
+  "decision_generated": false,
+  "receipt_created": false,
+  "retry_count": 0,
+  "pushed": false,
+  "decision_usable": false,
+  "implementation_sha": "01dad377ad231a13b05626f1a4eb840a2fafdc89",
+  "evidence_sha": "d1b582dd9544b2f72a1260cbb023e04a4dbad5ff",
+  "receipt_sha": null,
+  "historical_record_immutable": true
+}

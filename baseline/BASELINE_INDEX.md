@@ -1,6 +1,6 @@
 # Nexa Architecture Baseline Index
 
-Version: **1.1.0**
+Version: **1.2.0**
 
 This is the only entry point for normative Nexa specifications. Historical design documents are
 non-normative rationale. When texts conflict, precedence is:
@@ -16,13 +16,26 @@ MVR Scope 1.0
 ## Current gate
 
 Milestone 4.0R3 is complete at receipt
-`reports/contracts/milestone4r3_verification_receipt.json`. The current gate is Gate 1. Its
-normative experiment entry points are:
+`reports/contracts/milestone4r3_verification_receipt.json`.
 
-- `testing/GATE1_ACCEPTANCE.md` — frozen acceptance semantics;
+<!-- gate1-v2.3-status:start -->
+Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is
+**NOT TRUSTWORTHY**. Gate 1 v2.3 is **FROZEN / INCOMPLETE**, its decision is **PENDING**, and
+Milestone 5.0R3 is **INCOMPLETE**.
+Gate 1 v2 is also **INVALID_APPARATUS** because its frozen normative inputs failed baseline
+validation; its evidence and Receipt are not decision-usable.
+<!-- gate1-v2.3-status:end -->
+
+The current normative experiment entry points are:
+
+- `testing/GATE1_ACCEPTANCE_V2_3.md` — unchanged outcome thresholds plus v2.3 apparatus rules;
+- `testing/GATE1_V2_3_AUTHORIZATION.md` — qualified-host execution authority and fixed budget;
 - `testing/GATE1_MACHINE.md` — experiment lifecycle;
-- `../experiments/gate1/manifest.json` — frozen input binding;
-- `../reports/gate1_final_decision.md` — generated terminal decision.
+- `../experiments/gate1-v2.3/manifest.json` — qualified frozen input binding;
+- `../reports/gate1_v1_invalidation.md` — v1 historical invalidation;
+- `../reports/gate1_v2_invalidation.md` — v2 historical invalidation;
+- `../reports/gate1_v2_1_final_decision.md` — v2.1 historical INVALID decision;
+- `../reports/gate1_v2_3_final_decision.md` — v2.3 generated terminal decision after Evidence.
 
 `../ROADMAP.md` provides navigation only and cannot change normative semantics.
 

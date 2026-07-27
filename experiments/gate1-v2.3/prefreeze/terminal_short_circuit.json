@@ -1,0 +1,332 @@
+{
+  "core_fail_frozen_rule": {
+    "decision": "STOP",
+    "fixture": "synthetic-h1-fail",
+    "formal_evidence_usable": false,
+    "gates": {
+      "budget": {
+        "approved": false,
+        "failures": [],
+        "status": "PASS"
+      },
+      "comparison": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "environment": {
+        "failures": [],
+        "metrics": {
+          "qualification_status": {
+            "value": "QUALIFIED"
+          }
+        },
+        "status": "PASS"
+      },
+      "governance": {
+        "failures": [],
+        "metrics": {
+          "frozen_inputs_valid": {
+            "value": true
+          },
+          "invalid_evidence_absent_from_ancestry": {
+            "value": true
+          },
+          "negative_matrix_passed": {
+            "value": true
+          },
+          "thresholds_equivalent": {
+            "value": true
+          },
+          "unique_authorization": {
+            "value": true
+          }
+        },
+        "status": "PASS"
+      },
+      "h1": {
+        "failures": [],
+        "metrics": {
+          "real_measurements": {
+            "value": true
+          }
+        },
+        "status": "FAIL"
+      },
+      "h2_allocations": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "h2_performance": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "h2_semantic": {
+        "failures": [],
+        "metrics": {
+          "per_run_scenario_count": {
+            "value": 32
+          },
+          "scenario_count": {
+            "value": 96
+          }
+        },
+        "status": "PASS"
+      },
+      "h3_completion": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "h3_migration": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "h3_transaction": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "history": {
+        "failures": [],
+        "metrics": {
+          "all_historical_nodes_reach_current": {
+            "value": true
+          },
+          "v2_2_sealed": {
+            "value": true
+          },
+          "version_count": {
+            "value": 5
+          }
+        },
+        "status": "PASS"
+      },
+      "pilot": {
+        "commitment": "ABSENT",
+        "failures": [],
+        "status": "PASS"
+      },
+      "process_provenance": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "replay": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "validity": {
+        "failures": [],
+        "metrics": {
+          "strict_clean_checks": {
+            "value": true
+          }
+        },
+        "status": "PASS"
+      },
+      "workspace": {
+        "failures": [],
+        "metrics": {
+          "contract_count": {
+            "value": 36
+          },
+          "contract_satisfiability_passed": {
+            "value": true
+          },
+          "dual_contract_layers": {
+            "value": true
+          },
+          "implementation_commit_valid": {
+            "value": true
+          },
+          "milestone_semantics_valid": {
+            "value": true
+          },
+          "output_isolation": {
+            "value": true
+          },
+          "prefreeze_closure_passed": {
+            "value": true
+          },
+          "synthetic_git_chain_passed": {
+            "value": true
+          }
+        },
+        "status": "PASS"
+      }
+    },
+    "receipt_recomputable": true,
+    "runs": {
+      "formal-run-1": "PASS",
+      "formal-run-2": "PASS",
+      "replay": "PASS"
+    },
+    "schema_version": 1,
+    "structural_gaps": [],
+    "synthetic": true
+  },
+  "core_fail_rule_valid": true,
+  "invalid_short_circuit": {
+    "decision": "INVALID",
+    "fixture": "synthetic-terminal-short-circuit",
+    "formal_evidence_usable": false,
+    "gates": {
+      "budget": {
+        "approved": false,
+        "failures": [],
+        "status": "PASS"
+      },
+      "comparison": {
+        "failures": [],
+        "status": "NOT_APPLICABLE"
+      },
+      "environment": {
+        "failures": [],
+        "metrics": {
+          "qualification_status": {
+            "value": "QUALIFIED"
+          }
+        },
+        "status": "PASS"
+      },
+      "governance": {
+        "failures": [],
+        "metrics": {
+          "frozen_inputs_valid": {
+            "value": true
+          },
+          "invalid_evidence_absent_from_ancestry": {
+            "value": true
+          },
+          "negative_matrix_passed": {
+            "value": true
+          },
+          "thresholds_equivalent": {
+            "value": true
+          },
+          "unique_authorization": {
+            "value": true
+          }
+        },
+        "status": "PASS"
+      },
+      "h1": {
+        "failures": [],
+        "metrics": {
+          "real_measurements": {
+            "value": true
+          }
+        },
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_allocations": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_performance": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_semantic": {
+        "failures": [],
+        "metrics": {
+          "per_run_scenario_count": {
+            "value": 32
+          },
+          "scenario_count": {
+            "value": 96
+          }
+        },
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_completion": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_migration": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_transaction": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "history": {
+        "failures": [],
+        "metrics": {
+          "all_historical_nodes_reach_current": {
+            "value": true
+          },
+          "v2_2_sealed": {
+            "value": true
+          },
+          "version_count": {
+            "value": 5
+          }
+        },
+        "status": "PASS"
+      },
+      "pilot": {
+        "commitment": "ABSENT",
+        "failures": [],
+        "status": "PASS"
+      },
+      "process_provenance": {
+        "failures": [],
+        "status": "PASS"
+      },
+      "replay": {
+        "failures": [],
+        "status": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "validity": {
+        "failures": [],
+        "metrics": {
+          "strict_clean_checks": {
+            "value": true
+          }
+        },
+        "status": "INVALID"
+      },
+      "workspace": {
+        "failures": [],
+        "metrics": {
+          "contract_count": {
+            "value": 36
+          },
+          "contract_satisfiability_passed": {
+            "value": true
+          },
+          "dual_contract_layers": {
+            "value": true
+          },
+          "implementation_commit_valid": {
+            "value": true
+          },
+          "milestone_semantics_valid": {
+            "value": true
+          },
+          "output_isolation": {
+            "value": true
+          },
+          "prefreeze_closure_passed": {
+            "value": true
+          },
+          "synthetic_git_chain_passed": {
+            "value": true
+          }
+        },
+        "status": "PASS"
+      }
+    },
+    "receipt_recomputable": true,
+    "runs": {
+      "formal-run-1": "INVALID",
+      "formal-run-2": "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+      "replay": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+    },
+    "schema_version": 1,
+    "structural_gaps": [],
+    "synthetic": true
+  },
+  "invalid_short_circuit_valid": true,
+  "schema_version": 1,
+  "status": "PASS"
+}

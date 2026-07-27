@@ -1,0 +1,54 @@
+{
+  "current_exists": true,
+  "current_has_outgoing_edge": false,
+  "cycle": [],
+  "duplicate_nodes": false,
+  "invalid_edges": [],
+  "metrics": {
+    "all_historical_nodes_reach_current": {
+      "measurement": "DerivedCalculation",
+      "run_id": "prefreeze",
+      "sample_count": 1,
+      "source_artifact": "prefreeze",
+      "source_pointer": "/",
+      "value": true
+    },
+    "historical_records_immutable": {
+      "measurement": "DerivedCalculation",
+      "run_id": "prefreeze",
+      "sample_count": 1,
+      "source_artifact": "prefreeze",
+      "source_pointer": "/",
+      "value": true
+    },
+    "invalid_evidence_absent_from_ancestry": {
+      "measurement": "DerivedCalculation",
+      "run_id": "prefreeze",
+      "sample_count": 1,
+      "source_artifact": "prefreeze",
+      "source_pointer": "/",
+      "value": true
+    },
+    "v2_2_sealed": {
+      "measurement": "DerivedCalculation",
+      "run_id": "prefreeze",
+      "sample_count": 1,
+      "source_artifact": "prefreeze",
+      "source_pointer": "/",
+      "value": true
+    },
+    "version_count": {
+      "measurement": "DerivedCalculation",
+      "run_id": "prefreeze",
+      "sample_count": 1,
+      "source_artifact": "prefreeze",
+      "source_pointer": "/",
+      "value": 5
+    }
+  },
+  "multiple_current_nodes": [],
+  "old_evidence_in_ancestry": false,
+  "status": "PASS",
+  "unreachable_nodes": [],
+  "usable_historical_decisions": []
+}

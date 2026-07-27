@@ -1057,6 +1057,7 @@ pub struct TaskTerminalRecord {
     pub state: TaskState,
     pub reason: TaskTerminalReason,
     pub module_epoch: u64,
+    pub continuation_resume_count: u32,
     pub final_charge: ExecutionCharge,
     pub trace_range: std::ops::Range<usize>,
 }
@@ -1153,6 +1154,18 @@ pub struct TaskInspection {
 }
 
 #[cfg(any(test, feature = "model-adapter"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Gate1TaskInspection {
+    pub task: TaskHandle,
+    pub state: TaskState,
+    pub continuation_id: Option<u64>,
+    pub continuation_resume_count: u32,
+    pub scheduler_token: Option<u64>,
+    pub request: Option<HostRequestHandle>,
+    pub terminal_record_count: u32,
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ReloadInspectionState {
     #[default]
@@ -1204,6 +1217,7 @@ pub struct RealmInspectionSnapshot {
     pub modules: Vec<ModuleInspection>,
     pub retired_epochs: Vec<RetiredEpochSnapshot>,
     pub tasks: Vec<TaskInspection>,
+    pub gate1_tasks: Vec<Gate1TaskInspection>,
     pub resources: crate::RuntimeResourceLedger,
     pub completion_accounting: crate::CompletionAccounting,
     pub reload: ReloadInspection,
@@ -1397,6 +1411,11 @@ impl RealmRuntime {
 
     pub fn create_scope(&mut self, parent: Option<ScopeHandle>) -> Result<ScopeHandle, RealmError> {
         Ok(self.tasks.create_scope(parent)?)
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    pub fn destroy_empty_scope(&mut self, scope: ScopeHandle) -> Result<(), RealmError> {
+        Ok(self.tasks.destroy_scope(scope)?)
     }
 
     #[must_use]
@@ -2703,6 +2722,7 @@ impl RealmRuntime {
             modules,
             retired_epochs: self.retired_epochs.entries.iter().copied().collect(),
             tasks,
+            gate1_tasks: self.gate1_task_inspections(),
             resources: self.resource_ledger(),
             completion_accounting: self.completion_accounting(),
             reload,
@@ -2774,6 +2794,59 @@ impl RealmRuntime {
             epoch: task.module_epoch,
             ownership: self.resources.ownership(handle).unwrap_or_default(),
         })
+    }
+
+    #[cfg(any(test, feature = "model-adapter"))]
+    fn gate1_task_inspections(&self) -> Vec<Gate1TaskInspection> {
+        let mut inspections = self
+            .tasks
+            .task_handles_iter()
+            .filter_map(|task| {
+                let snapshot = self.tasks.task_snapshot(task).ok()?;
+                let execution = self.tasks.execution(task).ok()?;
+                let checkpoint = self.scheduler.checkpoint(task);
+                let scheduler_token = match checkpoint {
+                    crate::scheduler::SchedulerCheckpoint::Ready { sequence, .. } => Some(sequence),
+                    crate::scheduler::SchedulerCheckpoint::Waiting { request } => {
+                        Some(handle_identity(request.raw()))
+                    }
+                    crate::scheduler::SchedulerCheckpoint::Detached => None,
+                };
+                let request = match execution {
+                    TaskExecution::Waiting { request, .. } => Some(*request),
+                    _ => None,
+                };
+                Some(Gate1TaskInspection {
+                    task,
+                    state: snapshot.state,
+                    continuation_id: snapshot.continuation_id,
+                    continuation_resume_count: snapshot.continuation_resume_count,
+                    scheduler_token,
+                    request,
+                    terminal_record_count: u32::try_from(
+                        self.tombstones
+                            .iter()
+                            .filter(|(terminal, _)| *terminal == task)
+                            .count(),
+                    )
+                    .unwrap_or(u32::MAX),
+                })
+            })
+            .collect::<Vec<_>>();
+        inspections.extend(
+            self.tombstones
+                .iter()
+                .map(|(task, record)| Gate1TaskInspection {
+                    task: *task,
+                    state: record.state,
+                    continuation_id: None,
+                    continuation_resume_count: record.continuation_resume_count,
+                    scheduler_token: None,
+                    request: None,
+                    terminal_record_count: 1,
+                }),
+        );
+        inspections
     }
 
     #[cfg(any(test, feature = "model-adapter"))]
@@ -3369,6 +3442,7 @@ impl RealmRuntime {
         value: Option<RuntimeValue>,
     ) -> Result<(), RealmError> {
         crate::allocation::record(crate::allocation::AllocationPhase::TerminalCleanup, 0);
+        let continuation_resume_count = self.tasks.task_snapshot(task)?.continuation_resume_count;
         self.scheduler.cancel_task(task);
         self.resources.cleanup_task(task, false)?;
         self.tasks.finish_task(task)?;
@@ -3378,6 +3452,7 @@ impl RealmRuntime {
                 state: TaskState::Completed,
                 reason: TaskTerminalReason::Completed(value),
                 module_epoch: epoch,
+                continuation_resume_count,
                 final_charge: charge,
                 trace_range: trace_start..self.trace_cursor(),
             },
@@ -3393,6 +3468,7 @@ impl RealmRuntime {
         charge: ExecutionCharge,
         trap: Trap,
     ) -> Result<(), RealmError> {
+        let continuation_resume_count = self.tasks.task_snapshot(task)?.continuation_resume_count;
         self.scheduler.cancel_task(task);
         self.resources.cleanup_task(task, false)?;
         self.tasks.trap_task(task)?;
@@ -3402,6 +3478,7 @@ impl RealmRuntime {
                 state: TaskState::Trapped,
                 reason: TaskTerminalReason::Trapped(trap),
                 module_epoch: epoch,
+                continuation_resume_count,
                 final_charge: charge,
                 trace_range: trace_start..self.trace_cursor(),
             },
@@ -3486,6 +3563,7 @@ impl RealmRuntime {
                         state: TaskState::Trapped,
                         reason: TaskTerminalReason::Trapped(trap.clone()),
                         module_epoch: epoch,
+                        continuation_resume_count: snapshot.continuation_resume_count,
                         final_charge: charge,
                         trace_range: trace_start..self.trace_cursor(),
                     },
@@ -3508,6 +3586,7 @@ impl RealmRuntime {
                 state: TaskState::Cancelled,
                 reason: TaskTerminalReason::Cancelled(reason),
                 module_epoch: epoch,
+                continuation_resume_count: snapshot.continuation_resume_count,
                 final_charge: charge,
                 trace_range: trace_start..self.trace_cursor(),
             },
@@ -3650,6 +3729,13 @@ impl RealmRuntime {
             }
         }
     }
+}
+
+#[cfg(any(test, feature = "model-adapter"))]
+fn handle_identity(raw: RawHandle) -> u64 {
+    u64::from(raw.realm_id).rotate_left(41)
+        ^ u64::from(raw.index).rotate_left(19)
+        ^ u64::from(raw.generation)
 }
 
 fn resolve_task_module(

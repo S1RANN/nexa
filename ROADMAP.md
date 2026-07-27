@@ -15,17 +15,27 @@ Gate -1
 → Gate 0
 → MVR Implementation
 → Milestone 4.0R3
-→ Gate 1 Experiments
-→ Gate 1 Decision
+→ Gate 1 v1 INVALID_APPARATUS
+→ Gate 1 v2 INVALID_APPARATUS
+→ Gate 1 v2.1 INVALID
+→ Gate 1 v2.2 NOT TRUSTWORTHY
+→ Gate 1 v2.3
+→ Gate 1 v2.3 Decision
 → Pilot / Gate 2 RFC / Pivot / Stop
 ```
 
 Current implementation milestone: **4.0R3 complete**.
 
-Current project gate: **Gate 1 experiment preparation/execution**.
+<!-- gate1-v2.3-status:start -->
+Current project gate: **Gate 1 v2.3 frozen / incomplete**.
 
-The current milestone is **5.0 — Gate 1 Decision and Pilot Admission**. Completion means that the
-experiments and decision are complete; it does not predetermine a continuation decision.
+Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is
+**NOT TRUSTWORTHY**. None of their historical outcomes is a current decision.
+
+Current decision: **PENDING**.
+
+Current milestone: **5.0R3 — INCOMPLETE**.
+<!-- gate1-v2.3-status:end -->
 
 ## Gates
 
@@ -35,8 +45,12 @@ experiments and decision are complete; it does not predetermine a continuation d
 | Gate 0 | MVR scope and experiment protocol are normative | H1a/H2a/H3a implementation paths are executable | Complete |
 | MVR Implementation | Gate 0 baseline is frozen | Exact-build IDL, Fast Task, and single-module reload close end to end | Complete |
 | Milestone 4.0R3 | Runtime is executable | Diagnostics and evidence provenance are independently verifiable | Complete |
-| Gate 1 Experiments | 4.0R3 is complete and criteria/inputs are frozen | Two valid runs and an independent replay exist | Current |
-| Gate 1 Decision | Valid evidence is available | One legal terminal decision is recorded | Pending |
+| Gate 1 v1 | 4.0R3 complete | Historical apparatus review | Invalid apparatus |
+| Gate 1 v2 | v1 apparatus invalidated | Historical baseline-integrity review | Invalid apparatus |
+| Gate 1 v2.1 | Qualified provenance unavailable | Historical terminal validity review | Invalid |
+| Gate 1 v2.2 | Qualified technical runs | Historical governance review | Not trustworthy |
+| Gate 1 v2.3 | Qualified environment and unchanged thresholds | Two valid runs, replay, computed contracts | Frozen |
+| Gate 1 v2.3 Decision | Valid v2.3 evidence is available | One legal terminal decision is recorded | Pending |
 | Pilot | Gate 1 permits Pilot and a team commits | Pilot exit review accepts, pivots, or stops | Conditional |
 | Gate 2 RFC | H1/H2 pass, H3 is acceptable, Pilot commits, budget is approved | RFC decision only; no implementation is implied | Conditional |
 

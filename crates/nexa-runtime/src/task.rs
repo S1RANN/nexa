@@ -52,6 +52,8 @@ struct Task {
     priority: u32,
     fuel: FuelState,
     execution: Option<TaskExecution>,
+    continuation_id: Option<u64>,
+    continuation_resume_count: u32,
     limits: crate::TaskLimits,
     charge: crate::ExecutionCharge,
 }
@@ -114,6 +116,8 @@ pub struct TaskSnapshot {
     pub task_slots: i64,
     pub priority: u32,
     pub fuel: FuelState,
+    pub continuation_id: Option<u64>,
+    pub continuation_resume_count: u32,
     pub limits: crate::TaskLimits,
     pub charge: crate::ExecutionCharge,
 }
@@ -166,6 +170,7 @@ pub(crate) struct TaskManager {
     realm_id: u32,
     tasks: SlotPool<Task>,
     epoch_counts: BTreeMap<(u32, u32, u64), usize>,
+    next_continuation_id: u64,
 }
 
 impl TaskManager {
@@ -175,6 +180,7 @@ impl TaskManager {
             realm_id,
             tasks: SlotPool::with_capacity_limit(realm_id, max_tasks),
             epoch_counts: BTreeMap::new(),
+            next_continuation_id: 1,
         }
     }
 
@@ -207,6 +213,8 @@ impl TaskManager {
             priority: 0,
             fuel: FuelState::new(0, 0, u64::MAX),
             execution: None,
+            continuation_id: None,
+            continuation_resume_count: 0,
             limits: crate::TaskLimits::default(),
             charge: crate::ExecutionCharge::default(),
         })?;
@@ -303,12 +311,12 @@ impl TaskManager {
         })
         .map_err(|_| TaskError::Invariant("task machine invariant failed"))?;
 
-        let promotes = child_kind == ChildKind::Transient
-            && old_state == TaskState::Running
+        let suspends = old_state == TaskState::Running
             && matches!(
                 event,
                 TaskEvent::YieldFuel | TaskEvent::YieldExplicit | TaskEvent::AwaitHost
             );
+        let promotes = child_kind == ChildKind::Transient && suspends;
         let terminal = is_terminal(outcome.state);
         if promotes {
             scopes.promote_child(trace, owner)?;
@@ -329,11 +337,24 @@ impl TaskManager {
         } else {
             child_kind
         };
+        let next_continuation_id = if suspends {
+            let identity = self.next_continuation_id;
+            self.next_continuation_id = self.next_continuation_id.saturating_add(1);
+            Some(identity)
+        } else {
+            None
+        };
         {
             let task = self.tasks.resolve_mut(handle.raw())?;
             task.state = outcome.state;
             task.child_kind = next_child_kind;
             task.reserved_slots = next_task_slots;
+            if let Some(identity) = next_continuation_id {
+                task.continuation_id = Some(identity);
+                task.continuation_resume_count = 0;
+            } else if matches!(event, TaskEvent::Resume | TaskEvent::ResumeExplicit) {
+                task.continuation_resume_count = task.continuation_resume_count.saturating_add(1);
+            }
         }
 
         trace.record_with(|| TraceRecord {
@@ -393,6 +414,8 @@ impl TaskManager {
             task_slots: task.reserved_slots,
             priority: task.priority,
             fuel: task.fuel,
+            continuation_id: task.continuation_id,
+            continuation_resume_count: task.continuation_resume_count,
             limits: task.limits,
             charge: task.charge,
         })
@@ -500,6 +523,8 @@ impl TaskManager {
         task.reserved_slots = snapshot.task_slots;
         task.priority = snapshot.priority;
         task.fuel = snapshot.fuel;
+        task.continuation_id = snapshot.continuation_id;
+        task.continuation_resume_count = snapshot.continuation_resume_count;
         task.execution = Some(execution);
         task.limits = snapshot.limits;
         task.charge = snapshot.charge;

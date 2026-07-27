@@ -80,9 +80,9 @@ pub use realm::{
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{
-    HeapInspection, ModuleInspection, RealmInspectionSnapshot, ReloadInspection,
-    ReloadInspectionState, RootInspection, SchedulerInspection, TaskExecutionInspection,
-    TaskInspection,
+    Gate1TaskInspection, HeapInspection, ModuleInspection, RealmInspectionSnapshot,
+    ReloadInspection, ReloadInspectionState, RootInspection, SchedulerInspection,
+    TaskExecutionInspection, TaskInspection,
 };
 pub use reload::{ReloadError, invoke_reload_activation, validate_reload_completion_capacity};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};

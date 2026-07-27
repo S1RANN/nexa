@@ -1,0 +1,16 @@
+{
+  "artifact_hash_recomputed": true,
+  "contracts_recomputed": true,
+  "decision_recomputed": true,
+  "evidence_paths_valid": true,
+  "evidence_sha": "25fb25d41322c3ce0dd36b7337828b9e04677377",
+  "formal_evidence_usable": false,
+  "implementation_sha": "15f6b802e86cf10e4991085e9fed53de07f079da",
+  "markdown_rebuilt": true,
+  "parent_chain_valid": true,
+  "receipt_sha": "70bd782edc241f08c821f04bf066343153fa00e4",
+  "schema_version": 1,
+  "status": "PASS",
+  "status_blocks_rebuilt": true,
+  "synthetic": true
+}

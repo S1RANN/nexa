@@ -136,6 +136,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-gate1-v2-3"
+version = "0.1.0"
+dependencies = [
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-gate1-v2-3-fixtures",
+ "nexa-idl",
+ "nexa-migrate",
+ "nexa-runtime",
+ "nexa-verifier",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexa-gate1-v2-3-decision"
+version = "0.1.0"
+dependencies = [
+ "nexa-gate1-v2-3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexa-gate1-v2-3-fixtures"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "nexa-gate1-v2-3-gates"
+version = "0.1.0"
+dependencies = [
+ "nexa-gate1-v2-3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-idl"
 version = "0.1.0"
 dependencies = [

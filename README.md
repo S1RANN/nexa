@@ -22,7 +22,15 @@ The current minimum supported Rust toolchain is **1.97.1**.
 
 ```text
 Current implementation milestone: 4.0R3 complete
-Current project gate: Gate 1 experiment preparation/execution
+<!-- gate1-v2.3-status:start -->
+Gate 1 v1: INVALID_APPARATUS
+Gate 1 v2: INVALID_APPARATUS / NOT AUTHORIZED FOR DECISION
+Gate 1 v2.1: INVALID / NOT AUTHORIZED FOR DECISION
+Gate 1 v2.2: NOT TRUSTWORTHY / NOT AUTHORIZED FOR DECISION
+Gate 1 v2.3: FROZEN / INCOMPLETE
+Current decision: PENDING
+Milestone 5.0R3: INCOMPLETE
+<!-- gate1-v2.3-status:end -->
 ```
 
 The implemented MVR execution path is:
@@ -57,11 +65,15 @@ cargo run --release -p nexa-runtime --example fast_task_bench --features allocat
 The reproducible real-path benchmark result is recorded in
 [`reports/fast_task_benchmark_v1.md`](reports/fast_task_benchmark_v1.md).
 
-Gate 1 is governed by the
+Gate 1 v2.3 is governed by the
 [`MVR Scope`](baseline/mvr/MVR_SCOPE.md),
-[`Gate 1 acceptance criteria`](baseline/testing/GATE1_ACCEPTANCE.md),
-[`frozen experiment manifest`](experiments/gate1/manifest.json), and
-[`final decision`](reports/gate1_final_decision.md). The
+[`Gate 1 v2.3 acceptance criteria`](baseline/testing/GATE1_ACCEPTANCE_V2_3.md),
+[`authorization`](baseline/testing/GATE1_V2_3_AUTHORIZATION.md), and the qualified frozen manifest
+under `experiments/gate1-v2.3/`. Gate 1 v1, v2, v2.1, and v2.2 remain available through the
+unified history graph under `reports/history/gate1/` and their
+[`v1 invalidation record`](reports/gate1_v1_invalidation.md) and
+[`v2 invalidation record`](reports/gate1_v2_invalidation.md), plus the
+[`v2.1 invalid decision`](reports/gate1_v2_1_final_decision.md); none is current. The
 [`Baseline Index`](baseline/BASELINE_INDEX.md) defines their precedence. `ROADMAP.md` is the only
 roadmap; this README deliberately does not duplicate it.
 

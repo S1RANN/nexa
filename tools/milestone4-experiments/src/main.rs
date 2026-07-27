@@ -436,10 +436,13 @@ fn run_h3() -> Result<H3Report, Box<dyn std::error::Error>> {
     let scope = realm.create_scope(None)?;
 
     let rollback_task = call_h3(&mut realm, v1_handle, 0, scope, 1)?;
-    assert!(matches!(
+    let waiting_request = matches!(
         realm.poll_task(rollback_task, 256)?,
         PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
-    ));
+    );
+    if !waiting_request {
+        return Err("H3 rollback task did not enter a real host wait".into());
+    }
     let mut rollback_request = take_request(&queue)?;
     let rollback_candidate = realm.prepare_reload(v1_handle, v2.clone(), host_hash)?;
     realm.quiesce_reload()?;
@@ -461,7 +464,9 @@ fn run_h3() -> Result<H3Report, Box<dyn std::error::Error>> {
     let v2_handle = realm.prepare_reload(v1_handle, v2.clone(), host_hash)?;
     realm.quiesce_reload()?;
     realm.stage_reload(&[])?;
+    let mut commit_count = 0_u32;
     realm.commit_reload(&[], 4_096)?;
+    commit_count = commit_count.saturating_add(1);
 
     let handles = realm.state_handles(v2_handle)?;
     let primary = handles
@@ -490,6 +495,7 @@ fn run_h3() -> Result<H3Report, Box<dyn std::error::Error>> {
     realm.quiesce_reload()?;
     realm.stage_reload(&[])?;
     realm.commit_reload(&[], 4_096)?;
+    commit_count = commit_count.saturating_add(1);
     let multiple_retired_epochs = realm
         .retired_epochs()
         .iter()
@@ -531,10 +537,10 @@ fn run_h3() -> Result<H3Report, Box<dyn std::error::Error>> {
         preserve,
         replace,
         delete,
-        waiting_request: true,
+        waiting_request,
         completion_during_quiesce,
         rollback,
-        commit_count: 2,
+        commit_count,
         activation_fault,
         multiple_retired_epochs,
         migration_limit_rejected,
