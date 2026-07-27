@@ -1,0 +1,1060 @@
+{
+  "contract_count": 50,
+  "contracts": [
+    {
+      "artifact": "history.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Seal the v2.5 terminal state as STRUCTURAL_CLOSURE_FAILED and decision-ineligible.",
+      "gate": "history",
+      "id": "G1V26-WP-001",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 1
+    },
+    {
+      "artifact": "history.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Bind the v2.5 I/E commits and exactly 331 archived Raw/Gate artifacts without copying their bodies.",
+      "gate": "history",
+      "id": "G1V26-WP-002",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 2
+    },
+    {
+      "artifact": "history.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Extend the acyclic supersession graph through v2.6 and make v2.6 the unique current experiment.",
+      "gate": "history",
+      "id": "G1V26-WP-003",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 3
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Establish v2.6 from origin/main without E2.5 ancestry or v2.5 formal evidence in I2.6.",
+      "gate": "workspace",
+      "id": "G1V26-WP-004",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 4
+    },
+    {
+      "artifact": "history.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Publish the frozen v2.6 current-status registry with no decision, receipt, or finalization claimed early.",
+      "gate": "history",
+      "id": "G1V26-WP-005",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 5
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Define and enforce the independent Apparatus Status layer.",
+      "gate": "workspace",
+      "id": "G1V26-WP-006",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 6
+    },
+    {
+      "artifact": "validity.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Define and enforce the Hypothesis Outcome layer for H1, H2, and H3 workers.",
+      "gate": "validity",
+      "id": "G1V26-WP-007",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 7
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Define and enforce the Comparison Outcome layer independently of contracts and decisions.",
+      "gate": "comparison",
+      "id": "G1V26-WP-008",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 8
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Define and enforce Contract Evaluation Status independently of observed outcomes.",
+      "gate": "workspace",
+      "id": "G1V26-WP-009",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 9
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Define and enforce the Product Decision layer and its terminal decisions.",
+      "gate": "governance",
+      "id": "G1V26-WP-010",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 10
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Define and enforce Finalization Status independently of product decision.",
+      "gate": "governance",
+      "id": "G1V26-WP-011",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 11
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Represent H2 comparison as separate semantic, allocation, and performance components.",
+      "gate": "comparison",
+      "id": "G1V26-WP-012",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 12
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Derive H2 semantic comparison only from the frozen semantic projection.",
+      "gate": "comparison",
+      "id": "G1V26-WP-013",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 13
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Derive H2 allocation comparison independently and exactly.",
+      "gate": "comparison",
+      "id": "G1V26-WP-014",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 14
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Derive H2 performance comparison with unchanged cross-run tolerances and legal INCONCLUSIVE.",
+      "gate": "comparison",
+      "id": "G1V26-WP-015",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 15
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Derive the total Formal Comparison from H1, three-layer H2, and H3 status.",
+      "gate": "comparison",
+      "id": "G1V26-WP-016",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 16
+    },
+    {
+      "artifact": "replay.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Apply the same comparison derivation rules to Replay.",
+      "gate": "replay",
+      "id": "G1V26-WP-017",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 17
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Prove equal FAIL outcomes are reproducible through equal semantic failure signatures.",
+      "gate": "comparison",
+      "id": "G1V26-WP-018",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 18
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "OUTCOME",
+      "description": "Emit structured comparison gates with distinct outcome, component, failure, and contract fields.",
+      "gate": "comparison",
+      "id": "G1V26-WP-019",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 19
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Evaluate the complete Formal Comparison outcome-to-contract truth table.",
+      "gate": "comparison",
+      "id": "G1V26-WP-020",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 20
+    },
+    {
+      "artifact": "replay.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Evaluate Replay with the same complete outcome-to-contract truth table.",
+      "gate": "replay",
+      "id": "G1V26-WP-021",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 21
+    },
+    {
+      "artifact": "comparison.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Regress a correctly derived legal INCONCLUSIVE to Contract PASS.",
+      "gate": "comparison",
+      "id": "G1V26-WP-022",
+      "observed_outcome": "INCONCLUSIVE",
+      "status": "SATISFIED",
+      "work_package": 22
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Reject every malformed or incorrectly derived INCONCLUSIVE as Contract FAIL.",
+      "gate": "workspace",
+      "id": "G1V26-WP-023",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 23
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Define Stable Core Failure from three apparatus-valid executions and equal failure signatures.",
+      "gate": "governance",
+      "id": "G1V26-WP-024",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 24
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Freeze decision priority so stable core failure dominates comparison INCONCLUSIVE.",
+      "gate": "governance",
+      "id": "G1V26-WP-025",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 25
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Freeze the current critical combination to Product Decision STOP.",
+      "gate": "governance",
+      "id": "G1V26-WP-026",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 26
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Require structured approval before stable failure may produce PIVOT instead of STOP.",
+      "gate": "governance",
+      "id": "G1V26-WP-027",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 27
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Guard the decision generator against invalid topology, evidence, contracts, and state mixing.",
+      "gate": "workspace",
+      "id": "G1V26-WP-028",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 28
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Keep Product Decision separate from Gate 1 and milestone finalization status.",
+      "gate": "governance",
+      "id": "G1V26-WP-029",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 29
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Reject VERIFIED, COMPLETE, receipt_verified, or finalization_verified before F2.6.",
+      "gate": "governance",
+      "id": "G1V26-WP-030",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 30
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Classify known gaps without converting legitimate product failure into apparatus failure.",
+      "gate": "governance",
+      "id": "G1V26-WP-031",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 31
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Enforce the I2.6 frozen-implementation and apparatus-input path rules.",
+      "gate": "workspace",
+      "id": "G1V26-WP-032",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 32
+    },
+    {
+      "artifact": "artifact_hygiene.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Enforce the E2.6 raw-evidence-only path rule.",
+      "gate": "artifact_hygiene",
+      "id": "G1V26-WP-033",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 33
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Enforce the exact D2.6 pending-decision path whitelist.",
+      "gate": "workspace",
+      "id": "G1V26-WP-034",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 34
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Enforce the Receipt-only R2.6 path rule.",
+      "gate": "workspace",
+      "id": "G1V26-WP-035",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 35
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Enforce the exact eight-file F2.6 finalization whitelist.",
+      "gate": "workspace",
+      "id": "G1V26-WP-036",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 36
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Keep WP50 PENDING_FINALIZATION through D2.6 and R2.6.",
+      "gate": "workspace",
+      "id": "G1V26-WP-037",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 37
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Make Receipt precompute the exact stable hashes of all eight F2.6 files.",
+      "gate": "workspace",
+      "id": "G1V26-WP-038",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 38
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Verify F2.6 parentage, paths, reconstructed evidence, contracts, decision, and expected hashes.",
+      "gate": "workspace",
+      "id": "G1V26-WP-039",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 39
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Evaluate WP50 only after F2.6 matches the Receipt and all final checks pass.",
+      "gate": "workspace",
+      "id": "G1V26-WP-040",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 40
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Regenerate all 21 substantive gates from E2.6 Raw evidence.",
+      "gate": "workspace",
+      "id": "G1V26-WP-041",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 41
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Regenerate Formal Comparison and Replay Comparison from E2.6 Raw evidence.",
+      "gate": "workspace",
+      "id": "G1V26-WP-042",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 42
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Re-execute the plan-aligned WP1 through WP49 contracts from rebuilt gates.",
+      "gate": "workspace",
+      "id": "G1V26-WP-043",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 43
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Recompute Product Decision only from rebuilt evidence and contract evaluation.",
+      "gate": "governance",
+      "id": "G1V26-WP-044",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 44
+    },
+    {
+      "artifact": "artifact_hygiene.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Reject forbidden build products, locks, target trees, executables, and undeclared artifacts from Evidence.",
+      "gate": "artifact_hygiene",
+      "id": "G1V26-WP-045",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 45
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Exhaust the Comparison outcome and Contract Status truth table, including legal and illegal INCONCLUSIVE.",
+      "gate": "workspace",
+      "id": "G1V26-WP-046",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 46
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Exhaust all Product Decision branches and stable-failure priority combinations.",
+      "gate": "workspace",
+      "id": "G1V26-WP-047",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 47
+    },
+    {
+      "artifact": "workspace.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Rehearse synthetic I/E/D/R/F topology and reject wrong parents, paths, and hashes.",
+      "gate": "workspace",
+      "id": "G1V26-WP-048",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 48
+    },
+    {
+      "artifact": "governance.json",
+      "checks": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/contract_status",
+          "reason": "assertion matched",
+          "satisfied": true
+        }
+      ],
+      "contract_status": "PASS",
+      "contract_type": "APPARATUS",
+      "description": "Close prefreeze history, status, comparison, decision, regeneration, topology, and qualification checks before I2.6.",
+      "gate": "governance",
+      "id": "G1V26-WP-049",
+      "observed_outcome": "PASS",
+      "status": "SATISFIED",
+      "work_package": 49
+    },
+    {
+      "artifact": "__finalization__.json",
+      "checks": [
+        {
+          "actual": false,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/candidate_finalization",
+          "reason": "WP50 requires committed I/E/D/R/F topology",
+          "satisfied": false
+        }
+      ],
+      "contract_status": "PENDING_FINALIZATION",
+      "contract_type": "APPARATUS",
+      "description": "F2.6 closes I/E/D/R/F, matches Receipt expected hashes, satisfies all 50 contracts, and authorizes push.",
+      "gate": "finalization",
+      "id": "G1V26-WP-050",
+      "observed_outcome": "NOT_APPLICABLE",
+      "status": "PENDING_FINALIZATION",
+      "work_package": 50
+    }
+  ],
+  "contracts_satisfied": 49,
+  "experiment_version": "gate1-v2.6",
+  "known_structural_gaps": [],
+  "phase": "D2.6",
+  "schema_version": 1
+}
