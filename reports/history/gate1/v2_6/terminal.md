@@ -1,0 +1,3 @@
+# Gate 1 v2.6 Terminal Record
+
+Gate 1 v2.6 is `STRUCTURAL_CLOSURE_FAILED`, `INCOMPLETE`, and not decision-usable. Its Raw H2 results contain the required 32 snapshot scenarios, 12 cleanup cases, zero invariant violations, three absolute allocator-observer repeats, and three benchmark processes. The frozen Gate generator read obsolete root-level paths, emitted zero, null, and sentinel measurements, and failed to compare each derived component outcome with its recorded component outcome. The Contract Manifest then trusted Gate self-status instead of directly asserting the Raw facts. Consequently D2.6 `STOP`, R2.6, and F2.6 exist as files but have no decision authority; v2.6 is superseded by Gate 1 v2.7.

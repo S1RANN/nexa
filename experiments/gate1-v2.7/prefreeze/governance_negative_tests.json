@@ -1,0 +1,231 @@
+{
+  "cases": [
+    {
+      "actual": "PASS",
+      "expected": "PASS",
+      "matched": true,
+      "name": "correct-chain",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "PASS",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "PASS",
+      "expected": "PASS",
+      "matched": true,
+      "name": "legacy-direct-pointer-irrelevant-regression",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "PASS",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "cycle",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": true,
+        "cycle": [
+          "gate1-v1",
+          "gate1-v2",
+          "gate1-v2.1",
+          "gate1-v2.2",
+          "gate1-v2.3",
+          "gate1-v2.4",
+          "gate1-v2.5",
+          "gate1-v2.6",
+          "gate1-v2.7"
+        ],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "unreachable-history",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [
+          "gate1-v1"
+        ],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "two-current",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [
+          "gate1-v2.7",
+          "gate1-v2.2"
+        ],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "current-has-outgoing-edge",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": true,
+        "cycle": [
+          "gate1-v2.2",
+          "gate1-v2.3",
+          "gate1-v2.4",
+          "gate1-v2.5",
+          "gate1-v2.6",
+          "gate1-v2.7"
+        ],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "historical-decision-usable",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": [
+          "gate1-v2.3"
+        ]
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "node-missing",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [
+          [
+            "gate1-v2",
+            "gate1-v2.1"
+          ],
+          [
+            "gate1-v2.1",
+            "gate1-v2.2"
+          ]
+        ],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "unknown-edge-node",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [
+          [
+            "gate1-unknown",
+            "gate1-v2.7"
+          ]
+        ],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": false,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    },
+    {
+      "actual": "FAIL",
+      "expected": "FAIL",
+      "matched": true,
+      "name": "v2.3-history-missing",
+      "result": {
+        "current_exists": true,
+        "current_has_outgoing_edge": false,
+        "cycle": [],
+        "duplicate_nodes": false,
+        "invalid_edges": [],
+        "multiple_current_nodes": [],
+        "required_v2_3_history_missing": true,
+        "status": "FAIL",
+        "unreachable_nodes": [],
+        "usable_historical_decisions": []
+      }
+    }
+  ],
+  "experiment_version": "gate1-v2.7",
+  "regression": {
+    "current": "gate1-v2.7",
+    "expected": "PASS",
+    "reachability": true,
+    "v2_superseded_by": "gate1-v2.1"
+  },
+  "schema_version": 1,
+  "status": "PASS"
+}

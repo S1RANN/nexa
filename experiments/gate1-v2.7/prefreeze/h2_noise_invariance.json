@@ -1,0 +1,22 @@
+{
+  "check": "h2_noise_invariance",
+  "experiment_version": "gate1-v2.7",
+  "failures": [],
+  "metrics": {
+    "fixture_signatures": [
+      "2282f035dd214cbc",
+      "2282f035dd214cbc",
+      "2282f035dd214cbc"
+    ],
+    "performance_projections_differ": true,
+    "recorded_v2_5_signatures": [
+      "0874c141d8a2b5b2",
+      "0874c141d8a2b5b2",
+      "0874c141d8a2b5b2"
+    ],
+    "synthetic_noise_performance_changed": true,
+    "synthetic_noise_semantic_invariant": true
+  },
+  "schema_version": 1,
+  "status": "PASS"
+}

@@ -1,0 +1,12 @@
+{
+  "calls_per_frame_effective": true,
+  "execution_fingerprint_count": 32,
+  "failures": [],
+  "first_slice_ratio_effective": true,
+  "host_call_effective": true,
+  "production_case_count": 32,
+  "schema_version": 1,
+  "status": "PASS",
+  "trace_effective": true,
+  "value_shape_effective": true
+}

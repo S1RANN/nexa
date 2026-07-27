@@ -1,0 +1,59 @@
+{
+  "check": "h2_semantic_sensitivity",
+  "experiment_version": "gate1-v2.7",
+  "failures": [],
+  "metrics": [
+    {
+      "mutation": "observed-task-count",
+      "pointer": "/semantic/snapshot_scenarios/0/observed_calls",
+      "signature_changed": true
+    },
+    {
+      "mutation": "observed-promotion-count",
+      "pointer": "/semantic/snapshot_scenarios/0/observed_promotions",
+      "signature_changed": true
+    },
+    {
+      "mutation": "host-call-count",
+      "pointer": "/semantic/snapshot_scenarios/0/host_call_count",
+      "signature_changed": true
+    },
+    {
+      "mutation": "trace-enabled",
+      "pointer": "/semantic/snapshot_scenarios/0/dimensions/trace",
+      "signature_changed": true
+    },
+    {
+      "mutation": "value-shape",
+      "pointer": "/semantic/snapshot_scenarios/0/dimensions/value_shape",
+      "signature_changed": true
+    },
+    {
+      "mutation": "final-ledger",
+      "pointer": "/semantic/snapshot_scenarios/0/cohorts/0/after/resources/tasks",
+      "signature_changed": true
+    },
+    {
+      "mutation": "cleanup-trigger",
+      "pointer": "/semantic/cleanup_matrix/0/id",
+      "signature_changed": true
+    },
+    {
+      "mutation": "cleanup-outcome",
+      "pointer": "/semantic/cleanup_matrix/0/status",
+      "signature_changed": true
+    },
+    {
+      "mutation": "cohort-outcome",
+      "pointer": "/semantic/snapshot_scenarios/0/cohorts/0/operation_results/0/result",
+      "signature_changed": true
+    },
+    {
+      "mutation": "invariant-violations",
+      "pointer": "/semantic/snapshot_scenarios/0/violations",
+      "signature_changed": true
+    }
+  ],
+  "schema_version": 1,
+  "status": "PASS"
+}
