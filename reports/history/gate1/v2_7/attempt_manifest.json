@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "version": "gate1-v2.7",
+  "implementation": {
+    "sha": "6e65ab62e592536609ebe7de30a9f753a5df3b39",
+    "tree": "53a5a6f6c64300397dae0a6ec7c4ab8fe404df5f"
+  },
+  "run_id": "formal-run-1",
+  "status": "INVALID",
+  "formal_evidence_usable": false,
+  "artifacts": [
+    {
+      "path": "target/gate1-v2.7/formal-run-1/result.json",
+      "content_hash": "302decddb0695d5df76a917ef14697cc1161485a"
+    },
+    {
+      "path": "target/gate1-v2.7/formal-run-1/worker/result.json",
+      "content_hash": "75cec458d2b3f7f6f844700347194537c78b8945"
+    },
+    {
+      "path": "target/gate1-v2.7/formal-run-1/h2/result.json",
+      "content_hash": "caad7bbc28a2c8bbb1f8c90545317d76b4764e48"
+    },
+    {
+      "path": "target/gate1-v2.7/formal-run-1/h3/result.json",
+      "content_hash": "5fd07aabff749ab552a549b03c557455d27d488f"
+    },
+    {
+      "path": "target/gate1-v2.7/formal-run-1/validity_run1.json",
+      "content_hash": "5ebf8a3c7de838bf0d0a9e36ddc728560f42b5f4"
+    }
+  ],
+  "note": "Hashes bind the invalid attempt for audit; artifact bodies are not imported as formal evidence."
+}
