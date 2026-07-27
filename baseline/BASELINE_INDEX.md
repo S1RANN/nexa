@@ -19,11 +19,7 @@ Milestone 4.0R3 is complete at receipt
 `reports/contracts/milestone4r3_verification_receipt.json`.
 
 <!-- gate1-v2.6-status:start -->
-Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID**, Gate 1 v2.2 is
-**NOT TRUSTWORTHY**, and Gate 1 v2.3 is **SEMANTICALLY_INSUFFICIENT**. Gate 1 v2.4 is
-**STRUCTURAL_CLOSURE_FAILED**. Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not
-decision-usable. Gate 1 v2.6 is **FROZEN / INCOMPLETE**, its decision is
-**NOT_COMPUTED**, and Milestone 5.0R6 is **INCOMPLETE**.
+Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is **VERIFIED_TERMINAL_DECISION**, its decision is **STOP**, and Milestone 5.0R6 is **COMPLETE**.
 <!-- gate1-v2.6-status:end -->
 
 The current normative experiment entry points are:

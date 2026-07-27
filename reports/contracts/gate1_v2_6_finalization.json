@@ -1,0 +1,14 @@
+{
+  "contract_count": 50,
+  "contracts_failed": 0,
+  "contracts_pending": 0,
+  "contracts_satisfied": 50,
+  "experiment_version": "gate1-v2.6",
+  "finalization_verified": true,
+  "known_structural_gaps": [],
+  "receipt_verified": true,
+  "schema_version": 1,
+  "status": "FINALIZED",
+  "topology": "I2.6 -> E2.6 -> D2.6 -> R2.6 -> F2.6",
+  "wp_050_status": "PASS"
+}

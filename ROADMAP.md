@@ -30,13 +30,13 @@ Gate -1
 Current implementation milestone: **4.0R3 complete**.
 
 <!-- gate1-v2.6-status:start -->
-Current project gate: **Gate 1 v2.6 frozen / incomplete**.
+Current project gate: **Gate 1 v2.6 verified terminal decision**.
 
 Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable.
 
-Current Gate 1 v2.6 decision: **NOT_COMPUTED**.
+Current Gate 1 v2.6 decision: **STOP**.
 
-Current milestone: **5.0R6 — INCOMPLETE**.
+Current milestone: **5.0R6 — COMPLETE**.
 <!-- gate1-v2.6-status:end -->
 
 ## Gates
@@ -54,8 +54,8 @@ Current milestone: **5.0R6 — INCOMPLETE**.
 | Gate 1 v2.3 | Qualified environment and unchanged thresholds | Historical semantic review | Semantically insufficient |
 | Gate 1 v2.4 | Three formal executions completed | Structural closure and Receipt are valid | Structural closure failed |
 | Gate 1 v2.5 | Three formal executions completed | Structural closure and Receipt are valid | Structural closure failed |
-| Gate 1 v2.6 | Stable projection and finalization apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |
-| Gate 1 v2.6 Decision | Valid v2.6 evidence is available | One legal terminal decision and verified F2.6 are recorded | Pending |
+| Gate 1 v2.6 | Stable semantic projection and explicit finalization | I/E/D/R/F chain and Raw-derived Receipt | Verified terminal decision |
+| Gate 1 v2.6 Decision | Valid v2.6 evidence and 50/50 contracts | Verified I/E/D/R/F and empty structural gaps | STOP |
 | Pilot | Gate 1 permits Pilot and a team commits | Pilot exit review accepts, pivots, or stops | Conditional |
 | Gate 2 RFC | H1/H2 pass, H3 is acceptable, Pilot commits, budget is approved | RFC decision only; no implementation is implied | Conditional |
 

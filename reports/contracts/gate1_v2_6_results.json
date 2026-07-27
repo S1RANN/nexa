@@ -1,0 +1,34 @@
+{
+  "apparatus_status": "PASS",
+  "comparison_outcomes": {
+    "formal": "INCONCLUSIVE",
+    "replay": "INCONCLUSIVE"
+  },
+  "contract_count": 50,
+  "contracts_satisfied": 50,
+  "evidence_status": "VERIFIED",
+  "experiment_version": "gate1-v2.6",
+  "finalization_status": "FINALIZED",
+  "finalization_verified": true,
+  "gate1_status": "VERIFIED_TERMINAL_DECISION",
+  "gate_count": 21,
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229",
+  "known_structural_gaps": [],
+  "milestone_status": "COMPLETE",
+  "product_decision": "STOP",
+  "product_outcomes": {
+    "H1": "FAIL",
+    "H2": "FAIL",
+    "H3": "FAIL"
+  },
+  "push_status": "AUTHORIZED",
+  "receipt_verified": true,
+  "schema_version": 1,
+  "stable_core_failures": [
+    "H1",
+    "H2",
+    "H3"
+  ],
+  "wp_050_status": "PASS"
+}
