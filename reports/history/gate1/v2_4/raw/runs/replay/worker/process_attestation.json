@@ -1,0 +1,13 @@
+{
+  "executable_hash": "fab8585144b81451e47adb670b6b969120be8355",
+  "expected_output_path": "/Users/orokane/projects/nexa/target/gate1-v2.4/replay/worker",
+  "monotonic_clock": "std::time::Instant process-relative",
+  "one_time_token_hash": "997d171fad05fc4f",
+  "parent_nonce": "portable-parent-12583-1785136005128527000",
+  "protocol": "gate1-process-handshake-v1",
+  "role": "top-level-worker",
+  "run_id": "replay",
+  "started_at_monotonic_ns": 54888167,
+  "worker_nonce": "top-worker-12583-1785136005128463000",
+  "worker_pid": 13722
+}

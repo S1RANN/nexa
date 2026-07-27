@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "required_fields": [
+    "id",
+    "group",
+    "description",
+    "fixture",
+    "executor",
+    "expected_operations",
+    "expected_observations",
+    "forbidden_operations"
+  ],
+  "observation_rule_fields": ["pointer", "operator", "expected"],
+  "identity_rules": {
+    "scenario_id_unique": true,
+    "executor_id_unique_within_group": true,
+    "spec_hash_unique_within_group": true,
+    "distinct_input_or_operation_path": true
+  }
+}

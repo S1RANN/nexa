@@ -1,0 +1,40 @@
+{
+  "artifact_hashes": {
+    "target/gate1-v2.4-dryrun/contract_satisfiability.json": "3020ca7be164e00ef47eb82be68180944764df48",
+    "target/gate1-v2.4-dryrun/decision_branches.json": "743d2e4fbf7dd3cae80168d82eaf4bcffc229876",
+    "target/gate1-v2.4-dryrun/governance_negative_tests.json": "7d2cf112f89d16dfc6bf2db6afed047b3ea94842",
+    "target/gate1-v2.4-dryrun/h1_transformer_equivalence.json": "ca0201e95760eab3ca67876f65547e21cd1f8e7e",
+    "target/gate1-v2.4-dryrun/h2_cleanup_independence.json": "fb11c7f76239a3aa4e42a74193af75e60b2cee16",
+    "target/gate1-v2.4-dryrun/h2_dimension_effectiveness.json": "b4f68d4fbeb0e7a033f1e2dcd944c611ef5aa7fe",
+    "target/gate1-v2.4-dryrun/h3_execution_independence.json": "06ef75f56c591fdc265387e058365dea3ec48de2",
+    "target/gate1-v2.4-dryrun/history_check.json": "7dae58f6e0da4896d2e26c905796fb37cd263bc4",
+    "target/gate1-v2.4-dryrun/outcome_transport.json": "58355719ebedf50e993e1f5d8be9f677e0ae4bf9",
+    "target/gate1-v2.4-dryrun/raw_regeneration_exercise.json": "dc0acc7262c125772045d6f786b61d9509c69349",
+    "target/gate1-v2.4-dryrun/scenario_independence.json": "1d92e060a5fa8d6344361c3a2ff69fe4ec142ecb",
+    "target/gate1-v2.4-dryrun/status_lint.json": "9e676651960735e172cae2db479abaf39520e136",
+    "target/gate1-v2.4-dryrun/synthetic_git_chain.json": "c8e506d4d3be5efb937cc7196f9eeb4a92f006b3",
+    "target/gate1-v2.4-dryrun/terminal_short_circuit.json": "761865df7d8ed371f3e05d89147c6c84f9c2bc4b"
+  },
+  "checks": {
+    "contract_satisfiability": "PASS",
+    "decision_branches": "PASS",
+    "governance_negative_tests": "PASS",
+    "h1_transformer_equivalence": "PASS",
+    "h2_cleanup_independence": "PASS",
+    "h2_dimension_effectiveness": "PASS",
+    "h3_execution_independence": "PASS",
+    "history": "PASS",
+    "outcome_transport": "PASS",
+    "raw_regeneration": "PASS",
+    "scenario_independence": "PASS",
+    "static_evidence": "PASS",
+    "status_lint": "PASS",
+    "synthetic_git_chain": "PASS",
+    "terminal_short_circuit": "PASS"
+  },
+  "experiment_version": "gate1-v2.4",
+  "failures": [],
+  "schema_version": 1,
+  "status": "PASS",
+  "synthetic_artifacts_formal_evidence_usable": false
+}

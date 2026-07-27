@@ -1,0 +1,2810 @@
+{
+  "archive_root": "reports/history/gate1/v2_4/raw",
+  "artifact_count": 311,
+  "artifacts": [
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/comparisons/formal-run-1__formal-run-2.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "95840a3ad642f7953451c3743e5ba699e628203a",
+      "original_path": "reports/raw/gate1_v2_4/comparisons/formal-run-1__formal-run-2.json",
+      "run": null,
+      "size_bytes": 517
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/comparisons/formal-run-1__replay.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1b28b0df6aa50479e21b00e56ff145c3258c0b39",
+      "original_path": "reports/raw/gate1_v2_4/comparisons/formal-run-1__replay.json",
+      "run": null,
+      "size_bytes": 505
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/artifact_hygiene.json",
+      "artifact_type": "json",
+      "gate": "artifact_hygiene",
+      "git_blob_hash": "36a7b6b3b19d8e7147640deeb4a4c508739192a4",
+      "original_path": "reports/raw/gate1_v2_4/gates/artifact_hygiene.json",
+      "run": null,
+      "size_bytes": 633
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/budget.json",
+      "artifact_type": "json",
+      "gate": "budget",
+      "git_blob_hash": "138ac7ec8521474c26fa46b8d02be34689f8e0c8",
+      "original_path": "reports/raw/gate1_v2_4/gates/budget.json",
+      "run": null,
+      "size_bytes": 575
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/comparison.json",
+      "artifact_type": "json",
+      "gate": "comparison",
+      "git_blob_hash": "0306872f43df2663cf259295fe1e13d56fe1d23c",
+      "original_path": "reports/raw/gate1_v2_4/gates/comparison.json",
+      "run": null,
+      "size_bytes": 1056
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/environment.json",
+      "artifact_type": "json",
+      "gate": "environment",
+      "git_blob_hash": "4dc094ec875a1bfd2e6e48df211472d02e8a77c2",
+      "original_path": "reports/raw/gate1_v2_4/gates/environment.json",
+      "run": null,
+      "size_bytes": 498
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/governance.json",
+      "artifact_type": "json",
+      "gate": "governance",
+      "git_blob_hash": "a626d97280a90059b73ae0771bb96e84ecb73498",
+      "original_path": "reports/raw/gate1_v2_4/gates/governance.json",
+      "run": null,
+      "size_bytes": 515
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h1_equivalence.json",
+      "artifact_type": "json",
+      "gate": "h1_equivalence",
+      "git_blob_hash": "9912040f0e96956dba11dd6ffffb03c826ef2e8b",
+      "original_path": "reports/raw/gate1_v2_4/gates/h1_equivalence.json",
+      "run": null,
+      "size_bytes": 835
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h1_metrics.json",
+      "artifact_type": "json",
+      "gate": "h1_metrics",
+      "git_blob_hash": "26b7dfca51e253ff7115d50e8cbecd3a170001f0",
+      "original_path": "reports/raw/gate1_v2_4/gates/h1_metrics.json",
+      "run": null,
+      "size_bytes": 836
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h2_allocations.json",
+      "artifact_type": "json",
+      "gate": "h2_allocations",
+      "git_blob_hash": "e2908a9f6134bef1f83ee1d89aff40104cf3e773",
+      "original_path": "reports/raw/gate1_v2_4/gates/h2_allocations.json",
+      "run": null,
+      "size_bytes": 715
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h2_cleanup.json",
+      "artifact_type": "json",
+      "gate": "h2_cleanup",
+      "git_blob_hash": "8a4c575b3d9f505687db7caff08f96e96408bad1",
+      "original_path": "reports/raw/gate1_v2_4/gates/h2_cleanup.json",
+      "run": null,
+      "size_bytes": 704
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h2_configuration.json",
+      "artifact_type": "json",
+      "gate": "h2_configuration",
+      "git_blob_hash": "713132545cfb3e0dc7b72a107bcb98fe6cdcd4be",
+      "original_path": "reports/raw/gate1_v2_4/gates/h2_configuration.json",
+      "run": null,
+      "size_bytes": 841
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h2_invariants.json",
+      "artifact_type": "json",
+      "gate": "h2_invariants",
+      "git_blob_hash": "411c7b03ad63bedd45c729961b344f1606163d71",
+      "original_path": "reports/raw/gate1_v2_4/gates/h2_invariants.json",
+      "run": null,
+      "size_bytes": 687
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h2_performance.json",
+      "artifact_type": "json",
+      "gate": "h2_performance",
+      "git_blob_hash": "4db6af09950709d20191b8c484dcba950a3ad3a0",
+      "original_path": "reports/raw/gate1_v2_4/gates/h2_performance.json",
+      "run": null,
+      "size_bytes": 710
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h3_completion.json",
+      "artifact_type": "json",
+      "gate": "h3_completion",
+      "git_blob_hash": "0b0f834f850ea9366d244886b292dc0fc30203c6",
+      "original_path": "reports/raw/gate1_v2_4/gates/h3_completion.json",
+      "run": null,
+      "size_bytes": 967
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h3_migration.json",
+      "artifact_type": "json",
+      "gate": "h3_migration",
+      "git_blob_hash": "d464b3f462f436fa036766527274736b75349daf",
+      "original_path": "reports/raw/gate1_v2_4/gates/h3_migration.json",
+      "run": null,
+      "size_bytes": 965
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/h3_transaction.json",
+      "artifact_type": "json",
+      "gate": "h3_transaction",
+      "git_blob_hash": "e027dd75ff0ec5b1beb146b7ec33cfb36325dd8c",
+      "original_path": "reports/raw/gate1_v2_4/gates/h3_transaction.json",
+      "run": null,
+      "size_bytes": 959
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/history.json",
+      "artifact_type": "json",
+      "gate": "history",
+      "git_blob_hash": "a49b0af7f513b34a1601144c3320e64f14aafc04",
+      "original_path": "reports/raw/gate1_v2_4/gates/history.json",
+      "run": null,
+      "size_bytes": 539
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/manifest.json",
+      "artifact_type": "json",
+      "gate": "manifest",
+      "git_blob_hash": "f8403cd2b513e1533ff10f5374555725775ac7b7",
+      "original_path": "reports/raw/gate1_v2_4/gates/manifest.json",
+      "run": null,
+      "size_bytes": 631
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/pilot.json",
+      "artifact_type": "json",
+      "gate": "pilot",
+      "git_blob_hash": "03f8b1a5eba2ad960c4aea3f3bb67dc010e4b707",
+      "original_path": "reports/raw/gate1_v2_4/gates/pilot.json",
+      "run": null,
+      "size_bytes": 632
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/process.json",
+      "artifact_type": "json",
+      "gate": "process",
+      "git_blob_hash": "88ac746c7d5643b5ada25180c70322295bbb2323",
+      "original_path": "reports/raw/gate1_v2_4/gates/process.json",
+      "run": null,
+      "size_bytes": 592
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/replay.json",
+      "artifact_type": "json",
+      "gate": "replay",
+      "git_blob_hash": "7cac94a66f905596570cc506658e632a54563e9e",
+      "original_path": "reports/raw/gate1_v2_4/gates/replay.json",
+      "run": null,
+      "size_bytes": 1014
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/validity.json",
+      "artifact_type": "json",
+      "gate": "validity",
+      "git_blob_hash": "c2935bdf77fab885cde5b280327b4cb909b1bb49",
+      "original_path": "reports/raw/gate1_v2_4/gates/validity.json",
+      "run": null,
+      "size_bytes": 480
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/gates/workspace.json",
+      "artifact_type": "json",
+      "gate": "workspace",
+      "git_blob_hash": "4f6edcdbc2c4a86161c88daf632b35b7047d3842",
+      "original_path": "reports/raw/gate1_v2_4/gates/workspace.json",
+      "run": null,
+      "size_bytes": 549
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/environment.json",
+      "run": "formal-run-1",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "76df25f99ba80e220b27f12b8531eb29d558ad56",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/events.ndjson",
+      "run": "formal-run-1",
+      "size_bytes": 530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/environment.json",
+      "run": "formal-run-1",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "cad77832528e0d150d68a4ba1ef0856134c46fdd",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/events.ndjson",
+      "run": "formal-run-1",
+      "size_bytes": 5019
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/input_manifest.json",
+      "run": "formal-run-1",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/01/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4f02169073cabaf450405bb076c7b0e67871b51c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/01/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 15511
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/02/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3e30dd61cea790f5bd7074698f84d02fbde5393b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/02/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 15080
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/03/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d44407975342e6b3eedefb0e123a47364fc148e5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/03/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 17475
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/04/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "2079bfcfcb96b54240d9c35de5ca75d1f942b7c0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/04/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 14189
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/05/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7ee2abfbd7ec40ef9beea99cfffeb27610d793d2",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/05/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 13451
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/06/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3b16a8cbcc807f4d33a730e5dea8286454a47a9b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/06/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 14131
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/07/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e62cfa3d52a9875139569057ec212df81de5842d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/07/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 9279
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/08/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "02be39d46ed975d075fd5bc414ffd358d2803b0b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/08/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 9349
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/09/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3b62f3a2ed2daa6d0474a4d1b16b5776323401dc",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/09/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 9284
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/10/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5616a58315b863d83dd0e3ae10a18ae35c30c155",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/10/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 29636
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/11/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4e256272e828c5161abd76cbf171bdb37552946a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/11/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 18971
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/12/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3e047b8decde804d68b4b54c7e8924429b44c8fe",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/12/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 18919
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/13/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "da2824587f267c4291c64e29af502f42ff8930d2",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/13/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 16305
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/14/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "77dc36b04bf98ea41102e737269f12054b2e36c6",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/14/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 18905
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/15/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f95b5108c029a54f7f71e5a795397d76b2c51e71",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/15/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 13530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/16/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "17106bb11051c70253febcb663f4294ca89dfbce",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/16/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 12280
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/17/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5c72b95a20cf0046b045bdda1519bd09a764f7d5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/17/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 12239
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/18/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "70ddf20ecb990e9b8015234ba70c0ffc4a161c80",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/18/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 11847
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/19/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c4f3b70e63e73e1d83c08997037b7a4f99105d53",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/19/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 9176
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/mutations/20/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "35bfe23649fe50cc2243cfcc8dec4729242d5179",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/mutations/20/artifact.json",
+      "run": "formal-run-1",
+      "size_bytes": 13939
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "13599e1f669a768891fb3eec44d1fdb8bb082d30",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/parent_verification.json",
+      "run": "formal-run-1",
+      "size_bytes": 411
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f421b017c1bcb74dbc5eb04b7afb02f1a6244b36",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/process.json",
+      "run": "formal-run-1",
+      "size_bytes": 639
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8b343f700c61d70f78e6398ec808be2feda1672b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/process_attestation.json",
+      "run": "formal-run-1",
+      "size_bytes": 542
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h1/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c348b1ad75f7ec5a24b071d5f76700e49866603b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h1/result.json",
+      "run": "formal-run-1",
+      "size_bytes": 302637
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/allocation-observer.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e779594bf80e4b91d50e94335058ffd521c43c2d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/allocation-observer.json",
+      "run": "formal-run-1",
+      "size_bytes": 3552
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/benchmark-process-1.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "03fbfecfd46afdd70413e80132d18aad956769c7",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/benchmark-process-1.json",
+      "run": "formal-run-1",
+      "size_bytes": 13073
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/benchmark-process-2.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "311a4881834d923d69bbdf9c9dd10c14fd4e81c0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/benchmark-process-2.json",
+      "run": "formal-run-1",
+      "size_bytes": 13054
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/benchmark-process-3.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "37d2f5dab6a727e9f72dcc30f274ab8a776ce203",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/benchmark-process-3.json",
+      "run": "formal-run-1",
+      "size_bytes": 13060
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/environment.json",
+      "run": "formal-run-1",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "00c8aec6ecf9825f5b6e4ecd761d4ebf0d3f1ba7",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/events.ndjson",
+      "run": "formal-run-1",
+      "size_bytes": 265717
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/input_manifest.json",
+      "run": "formal-run-1",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f61b104ebe65b7c47f9ab9a4a81934954fb1958d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/parent_verification.json",
+      "run": "formal-run-1",
+      "size_bytes": 407
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c89a3851fa1328716451b1264bfdfcd659b351e4",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/process.json",
+      "run": "formal-run-1",
+      "size_bytes": 635
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e667220b16f6f9d63eb89d89d832591c64ec3ac5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/process_attestation.json",
+      "run": "formal-run-1",
+      "size_bytes": 540
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h2/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "177935a94612dc37b53fdfdd5f621a136f5e9b2d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h2/result.json",
+      "run": "formal-run-1",
+      "size_bytes": 1765907
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/environment.json",
+      "run": "formal-run-1",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "441da751baf129e1abf672278e100500afaa3090",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/events.ndjson",
+      "run": "formal-run-1",
+      "size_bytes": 52544
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/input_manifest.json",
+      "run": "formal-run-1",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "0054d3e2312cbc5b0567bfbffb8b6f835051c16a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/parent_verification.json",
+      "run": "formal-run-1",
+      "size_bytes": 409
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a4880a858f4ef9cc61ee0ff34ed4b2e91fb57ffe",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/process.json",
+      "run": "formal-run-1",
+      "size_bytes": 635
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9f4192cc5dd53cd605f4affa54253d8dfd878fb3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/process_attestation.json",
+      "run": "formal-run-1",
+      "size_bytes": 541
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c09c8eb451093a3385f621dc7b40db07a68b6a04",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/result.json",
+      "run": "formal-run-1",
+      "size_bytes": 264312
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-after-activation-fault.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b4213c180cf9bb2e82132d5a6c5353234ad3800a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-after-activation-fault.json",
+      "run": "formal-run-1",
+      "size_bytes": 9259
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-after-commit.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fbda37c0e21471bbd10fddf9c965b8b3eadd1ceb",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-after-commit.json",
+      "run": "formal-run-1",
+      "size_bytes": 9132
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-before-prepare.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "773f080b2581d3fc5d9cce9771aee62e4b0c4db8",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-before-prepare.json",
+      "run": "formal-run-1",
+      "size_bytes": 7982
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-during-migration.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "34a29cebe05242c30a7a3998075934bc0f5b4c74",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-during-migration.json",
+      "run": "formal-run-1",
+      "size_bytes": 8003
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-during-quiesce.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "06c45cab0c658a1e551b6c57224327082ef86e75",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-during-quiesce.json",
+      "run": "formal-run-1",
+      "size_bytes": 7795
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-explicityielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7b8479c29c28ad4c7f743b9a9a609b436a9d8210",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-explicityielded-task.json",
+      "run": "formal-run-1",
+      "size_bytes": 7224
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "2718dca8191f165d727d87999514d00d18922b09",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "run": "formal-run-1",
+      "size_bytes": 6946
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-ready-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a50834e34beac84fcf268980aa69e7195f88cc50",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-ready-task.json",
+      "run": "formal-run-1",
+      "size_bytes": 6732
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-unrelated-module.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "491c3fd9e3cf6da2ee71643561f6dfbad75b362f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-unrelated-module.json",
+      "run": "formal-run-1",
+      "size_bytes": 8121
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/completion/completion-waiting-request.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1483c400b659373042c2f6bd82d8fd7399ed3918",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/completion/completion-waiting-request.json",
+      "run": "formal-run-1",
+      "size_bytes": 8214
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "474eaafc948e857057f2cabba345fc494c76ff45",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "run": "formal-run-1",
+      "size_bytes": 6375
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-delete.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d549509d6f87880cee51b99f98dc04f8d1a613f0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-delete.json",
+      "run": "formal-run-1",
+      "size_bytes": 7036
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-field-addition.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "68a17058ece427f080567cc0aee1842c62885cb3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-field-addition.json",
+      "run": "formal-run-1",
+      "size_bytes": 7070
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-field-deletion.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "0e00127e0e057682ef92bab6310ea4ed3348ebf9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-field-deletion.json",
+      "run": "formal-run-1",
+      "size_bytes": 7068
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-field-type-replacement.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5a6c2ca5d7388023e67f802ed31b394b928c973b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-field-type-replacement.json",
+      "run": "formal-run-1",
+      "size_bytes": 7127
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-generation-increment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9d6d7f92cf7bcdea96202bbb0214524a291714ff",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-generation-increment.json",
+      "run": "formal-run-1",
+      "size_bytes": 7144
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-preserve.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a0c35bcc3abd67b2e300c17300ace08cba8ae50a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-preserve.json",
+      "run": "formal-run-1",
+      "size_bytes": 7054
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-replace.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "168bb3a90f446c11a53c0205a3a476c1a0edea63",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-replace.json",
+      "run": "formal-run-1",
+      "size_bytes": 7044
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-schema-unchanged.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d046d9318c02d63bdc33e65680afbce88f40eb23",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-schema-unchanged.json",
+      "run": "formal-run-1",
+      "size_bytes": 7086
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e31c224f3d5af00f3d0672fe4e06ceea1d81d4ac",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "run": "formal-run-1",
+      "size_bytes": 7150
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/migration/migration-statehandle-remap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a9a5b266089569801700f557d7fb2425733cd38b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/migration/migration-statehandle-remap.json",
+      "run": "formal-run-1",
+      "size_bytes": 7136
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-activation-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "10895fa0956c230f1016df9a85658d11e67508fa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-activation-success.json",
+      "run": "formal-run-1",
+      "size_bytes": 7110
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-activation-trap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ff1b3bb650a07e108f93bcaf59ea9c73e0d6308b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-activation-trap.json",
+      "run": "formal-run-1",
+      "size_bytes": 7174
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c40546af3a8ef45a29991bf1cabea9d8c68dad62",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "run": "formal-run-1",
+      "size_bytes": 6456
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-commit-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "47506b069c2e81673fbcf724f8f799b28030be4a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-commit-success.json",
+      "run": "formal-run-1",
+      "size_bytes": 7066
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "763ad5f012060e52c38334247ce221c3fc3b2f44",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "run": "formal-run-1",
+      "size_bytes": 8257
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ca906443163d0fb69fd3b689eda08de41c24834e",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "run": "formal-run-1",
+      "size_bytes": 6484
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "287d0a7cb100cbefa83d25ac636b3fe55c25855d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "run": "formal-run-1",
+      "size_bytes": 6328
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6ef4d57a4b240e8b278f89a79e270ee304eb7b8b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "run": "formal-run-1",
+      "size_bytes": 6395
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8f65ec161939c3e85776445c522caee55e2216cd",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "run": "formal-run-1",
+      "size_bytes": 8602
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/input_manifest.json",
+      "run": "formal-run-1",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a51caee09c6c821c01b9ea6d9f9bfb324a750db0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/process.json",
+      "run": "formal-run-1",
+      "size_bytes": 570
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "46e08b83312bc1bd7517f34a518d115d98909125",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/result.json",
+      "run": "formal-run-1",
+      "size_bytes": 2538067
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/validity_run1.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4e729b4a077e91a7a3e937f441a1cf3a566ca8cd",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/validity_run1.json",
+      "run": "formal-run-1",
+      "size_bytes": 20703
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/environment.json",
+      "run": "formal-run-1",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "9c1d2491992dafb0494d2f01fcfab93a501932d9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/events.ndjson",
+      "run": "formal-run-1",
+      "size_bytes": 792
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/input_manifest.json",
+      "run": "formal-run-1",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5b7a578997bc2f85ee949b701f6d410ff441057c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/parent_verification.json",
+      "run": "formal-run-1",
+      "size_bytes": 422
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d7765a2580b22f9c2ce850712bacdde7e5921261",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/process.json",
+      "run": "formal-run-1",
+      "size_bytes": 645
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "41cae9659dd65835fce4a69d9836bc3e3f3fc3d5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/process_attestation.json",
+      "run": "formal-run-1",
+      "size_bytes": 554
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-1/worker/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "195f76d1744a5ada4c0f9f3503c47301ed9d6890",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-1/worker/result.json",
+      "run": "formal-run-1",
+      "size_bytes": 2435607
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/environment.json",
+      "run": "formal-run-2",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "38bad9617dd45f5e1f5b3710a79d9c0ec7495ad3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/events.ndjson",
+      "run": "formal-run-2",
+      "size_bytes": 528
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/environment.json",
+      "run": "formal-run-2",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "91a4d79a68ed4422bec2f4f2353d1669257a433b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/events.ndjson",
+      "run": "formal-run-2",
+      "size_bytes": 4999
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/input_manifest.json",
+      "run": "formal-run-2",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/01/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fb843677ee704e8d4c5ab9a9e5447f864ab429e3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/01/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 15511
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/02/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3d50b708867e0d4f7a6044301fd3889767dd6d2e",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/02/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 15080
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/03/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "80b24c7d0758cc4252cf9c859d1cd41b47553e54",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/03/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 17475
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/04/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8d8dea1cf30dd3012f3ae428462fdb6b2ffa5c1f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/04/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 14189
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/05/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7d5f4641b99137e966b5b60066aed5c91feeb63f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/05/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 13451
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/06/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9bfa16b62e474dfd5b19795bc22340fa173ccd24",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/06/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 14131
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/07/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ea519bec51a28802f802ab9a5ef56a6dd6291062",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/07/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 9279
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/08/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a8554422dfbb8060bec4822e6442dbc218dae348",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/08/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 9349
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/09/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b770a38a44e90b247ae7f55e90594213d87e1404",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/09/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 9284
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/10/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "391c9ce51e9b14dc19d42b21983e22ed8bf4a738",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/10/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 29636
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/11/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "db4588c423f8e09f156bbe9b565b431abfe1d88b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/11/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 18971
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/12/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8202d330661b3383a7931f53083e8b05efddbf33",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/12/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 18919
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/13/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7f7f5c1e35af8f601b8cbb1e8c667515b07f44f8",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/13/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 16305
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/14/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f3fc81c967696ef09ccf400b2c09c78856bba9da",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/14/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 18905
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/15/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "0345428717b99610bf1ad3f14d0ccb09778d66a7",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/15/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 13530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/16/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3eb40797ee26058235de6a4885f4e9beac09df5f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/16/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 12280
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/17/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "2ebbbfa218b8da52e170d0e33656aedc3dbc69a0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/17/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 12239
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/18/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "47af851d15d0cebcf14a6bdf2a73fc7c04904c42",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/18/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 11847
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/19/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ac053769506e7f5f3e6e96d4e0587217e2a815cf",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/19/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 9176
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/mutations/20/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "798f531aeecc075b6acbb344656ad15959fd49a5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/mutations/20/artifact.json",
+      "run": "formal-run-2",
+      "size_bytes": 13939
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "71202691df9d9242e60b99511f0b7685de84537c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/parent_verification.json",
+      "run": "formal-run-2",
+      "size_bytes": 409
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "653b8cdc4d49e60f78cdfde15b4a2b1539d4eadc",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/process.json",
+      "run": "formal-run-2",
+      "size_bytes": 636
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "773a0dbc10d3793008187df144bff61cbbf8e08c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/process_attestation.json",
+      "run": "formal-run-2",
+      "size_bytes": 539
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h1/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5e022a72d8893ce8534e13093f9be0691042b531",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h1/result.json",
+      "run": "formal-run-2",
+      "size_bytes": 302632
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/allocation-observer.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e779594bf80e4b91d50e94335058ffd521c43c2d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/allocation-observer.json",
+      "run": "formal-run-2",
+      "size_bytes": 3552
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/benchmark-process-1.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e80293034283bd2f1eb8a889076548b938ad7e3b",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/benchmark-process-1.json",
+      "run": "formal-run-2",
+      "size_bytes": 13068
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/benchmark-process-2.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "48f521a8661bb5e712657e12b6731cb3eace1062",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/benchmark-process-2.json",
+      "run": "formal-run-2",
+      "size_bytes": 13052
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/benchmark-process-3.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "10f2d5346f67b968e0348dd47141dec9f2473d11",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/benchmark-process-3.json",
+      "run": "formal-run-2",
+      "size_bytes": 13059
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/environment.json",
+      "run": "formal-run-2",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "77565c4dcd35b5d9a38cbbeec62e742202f6eb70",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/events.ndjson",
+      "run": "formal-run-2",
+      "size_bytes": 264713
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/input_manifest.json",
+      "run": "formal-run-2",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "af9dd3711aae38fbc3386e747bf4d22c31939667",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/parent_verification.json",
+      "run": "formal-run-2",
+      "size_bytes": 411
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9801d4b5409d523341c8873bd1eed3d3a978cb1c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/process.json",
+      "run": "formal-run-2",
+      "size_bytes": 635
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "63165b835ad750d1ae40125afd7dad3d4caf039e",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/process_attestation.json",
+      "run": "formal-run-2",
+      "size_bytes": 540
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h2/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b76c863f16f292f9aabf2ff60d08cf42ee91a513",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h2/result.json",
+      "run": "formal-run-2",
+      "size_bytes": 1765902
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/environment.json",
+      "run": "formal-run-2",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "ddc20b394f651480e558c70e10f8ddeb1e73a822",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/events.ndjson",
+      "run": "formal-run-2",
+      "size_bytes": 52356
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/input_manifest.json",
+      "run": "formal-run-2",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ce8de19565b4050a54b7020145c9684151ee7ee9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/parent_verification.json",
+      "run": "formal-run-2",
+      "size_bytes": 411
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f7c012e80f447e97cdf80ee0cabc6e6e9c0a1bd9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/process.json",
+      "run": "formal-run-2",
+      "size_bytes": 634
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "325518ab98f048f1131df3148f907aded5e7e56c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/process_attestation.json",
+      "run": "formal-run-2",
+      "size_bytes": 540
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e4bf9afb68df44761ebddc265041b9d05ff6067c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/result.json",
+      "run": "formal-run-2",
+      "size_bytes": 264311
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-after-activation-fault.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ac793adf27dbd3cd5cabe8e03c4b0b4f78038115",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-after-activation-fault.json",
+      "run": "formal-run-2",
+      "size_bytes": 9259
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-after-commit.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d7e051870ac77caac8ec2a0d950b02813947abad",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-after-commit.json",
+      "run": "formal-run-2",
+      "size_bytes": 9132
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-before-prepare.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a440189cf1353ac4a8dbf880e65975e3495b333a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-before-prepare.json",
+      "run": "formal-run-2",
+      "size_bytes": 7982
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-during-migration.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6ccefb00c2213350bf5e5e1da4a20d7e139617f9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-during-migration.json",
+      "run": "formal-run-2",
+      "size_bytes": 8003
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-during-quiesce.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c0e496d88ce128aa5b52d79ad96f670a405ebdcb",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-during-quiesce.json",
+      "run": "formal-run-2",
+      "size_bytes": 7795
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-explicityielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "627a8ddf5959fef3a587cd87b18c401ba95dab40",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-explicityielded-task.json",
+      "run": "formal-run-2",
+      "size_bytes": 7224
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "bd1677fd6d8fee77b35e7d87d44f4b12ca55b5e2",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "run": "formal-run-2",
+      "size_bytes": 6946
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-ready-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b9a1cdaae9fcb44cc906c4dfcfac8dd10452f272",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-ready-task.json",
+      "run": "formal-run-2",
+      "size_bytes": 6732
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-unrelated-module.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e5bc95055e3b3c54b4563487b5963abc34ada8b9",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-unrelated-module.json",
+      "run": "formal-run-2",
+      "size_bytes": 8121
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/completion/completion-waiting-request.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d24681175d6d06ccf256964aecb32c618fbec2e3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/completion/completion-waiting-request.json",
+      "run": "formal-run-2",
+      "size_bytes": 8214
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fce1916f906a19f4b951160e0f45e3d2100a0575",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "run": "formal-run-2",
+      "size_bytes": 6375
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-delete.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a3cf96d17f68405b3f159608550f15708293238",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-delete.json",
+      "run": "formal-run-2",
+      "size_bytes": 7036
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-field-addition.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8f58fb63bed143bc52da876a609407658e9ff209",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-field-addition.json",
+      "run": "formal-run-2",
+      "size_bytes": 7070
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-field-deletion.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9e873dea6308bd51a8e48d385b341c6d49676e38",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-field-deletion.json",
+      "run": "formal-run-2",
+      "size_bytes": 7068
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-field-type-replacement.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "52c925c403b2732328973b5d0e22c70e22d5f717",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-field-type-replacement.json",
+      "run": "formal-run-2",
+      "size_bytes": 7127
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-generation-increment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a79f4639cf2fefb3c5435c7af34df7d881efbdf2",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-generation-increment.json",
+      "run": "formal-run-2",
+      "size_bytes": 7144
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-preserve.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e8ecfdd7d8b072d4a15134c26b00df2dfacd00ed",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-preserve.json",
+      "run": "formal-run-2",
+      "size_bytes": 7054
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-replace.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1b379105242b2cd94136e5be9f563a496d7d0450",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-replace.json",
+      "run": "formal-run-2",
+      "size_bytes": 7044
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-schema-unchanged.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "750dc3b978b4b3eaacf26bbef02a2dfbcd5f3f25",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-schema-unchanged.json",
+      "run": "formal-run-2",
+      "size_bytes": 7086
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d6172e0f95d19f87b8dc59cd391b607e3c327afd",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "run": "formal-run-2",
+      "size_bytes": 7150
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/migration/migration-statehandle-remap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "171ee40a0862cf61cd26066b50b4f034f8acf66f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/migration/migration-statehandle-remap.json",
+      "run": "formal-run-2",
+      "size_bytes": 7136
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-activation-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "518cba4d68f79a2c906324a4cba0645440520756",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-activation-success.json",
+      "run": "formal-run-2",
+      "size_bytes": 7110
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-activation-trap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "705041844682c1842c0cffe37070894433e63f1d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-activation-trap.json",
+      "run": "formal-run-2",
+      "size_bytes": 7174
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "871357cea56ba67f879c3b37bfd227624433efb6",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "run": "formal-run-2",
+      "size_bytes": 6456
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-commit-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "70a137ea5767347bcf1afc2f78e96a61e96b737d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-commit-success.json",
+      "run": "formal-run-2",
+      "size_bytes": 7066
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5d7a9f3e8dd6c7570a7be791af60155f876bb6dc",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "run": "formal-run-2",
+      "size_bytes": 8257
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "18ad5485e8d5552a907727d3b60fe88cb21c1d9c",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "run": "formal-run-2",
+      "size_bytes": 6484
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "2009c3d4aef464dfa5e86ed805a8777427c4d4a0",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "run": "formal-run-2",
+      "size_bytes": 6328
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c9d263f04b01fd39ae20d7cdd366c5c44192db24",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "run": "formal-run-2",
+      "size_bytes": 6395
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e14c51a8dfa75dac9e2841c436e4896a15908db1",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "run": "formal-run-2",
+      "size_bytes": 8602
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/input_manifest.json",
+      "run": "formal-run-2",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3d7082c06ab361db63e8c306d187ae87e4694f2f",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/process.json",
+      "run": "formal-run-2",
+      "size_bytes": 568
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8f42574db4cb798e229a8478266c37931d344b5a",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/result.json",
+      "run": "formal-run-2",
+      "size_bytes": 2538049
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/validity_run2.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9b76372e1bd02c4a5754b1d429f74a04e0759be3",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/validity_run2.json",
+      "run": "formal-run-2",
+      "size_bytes": 20703
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/environment.json",
+      "run": "formal-run-2",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "2d981c9a72a130a1720582af72feb098fe088147",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/events.ndjson",
+      "run": "formal-run-2",
+      "size_bytes": 789
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/input_manifest.json",
+      "run": "formal-run-2",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "469c5d4fa24a6f7cc0d36c15187ee2cdc92d8b0d",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/parent_verification.json",
+      "run": "formal-run-2",
+      "size_bytes": 420
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5d689627dd4b303ae914b33eb7e61385e3471c37",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/process.json",
+      "run": "formal-run-2",
+      "size_bytes": 642
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "aded7027580112bcc216d536fda49ce557ec0c14",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/process_attestation.json",
+      "run": "formal-run-2",
+      "size_bytes": 551
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/formal-run-2/worker/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8d7372da2ee789c73dd594f67bfef571888f2462",
+      "original_path": "reports/raw/gate1_v2_4/runs/formal-run-2/worker/result.json",
+      "run": "formal-run-2",
+      "size_bytes": 2435591
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/environment.json",
+      "run": "replay",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "acd7043618caa1f7ecf7542357fc920bf9cc27ea",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/events.ndjson",
+      "run": "replay",
+      "size_bytes": 518
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/environment.json",
+      "run": "replay",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "7bf4f09f7dd66cae7b67511cdca41fd4b0f63de4",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/events.ndjson",
+      "run": "replay",
+      "size_bytes": 4899
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/input_manifest.json",
+      "run": "replay",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/01/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "882496039e8e899419b8abcd25042f6b0016663d",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/01/artifact.json",
+      "run": "replay",
+      "size_bytes": 15445
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/02/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "966215b60df9eabd3914e46059ababa5a733e160",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/02/artifact.json",
+      "run": "replay",
+      "size_bytes": 15020
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/03/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4df938003dd9484f700cafccfaf3294cfa43915c",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/03/artifact.json",
+      "run": "replay",
+      "size_bytes": 17403
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/04/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "dfebeb792de9fb0bd6e44a022997bf0929d3d596",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/04/artifact.json",
+      "run": "replay",
+      "size_bytes": 14123
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/05/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "488f47e0d913b1411f25620dbc0aad4a3b3d7e87",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/05/artifact.json",
+      "run": "replay",
+      "size_bytes": 13385
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/06/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6031533b4cb6caa61f53e6a447257500315789b7",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/06/artifact.json",
+      "run": "replay",
+      "size_bytes": 14071
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/07/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4675e645680a8341891c84806311e27e2e7e9931",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/07/artifact.json",
+      "run": "replay",
+      "size_bytes": 9213
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/08/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "50ee2b4da5019411a8530dec4f462dc2ae7ff28c",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/08/artifact.json",
+      "run": "replay",
+      "size_bytes": 9283
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/09/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8ffb3d1871c35b6fcb51f775b210f40860e558b9",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/09/artifact.json",
+      "run": "replay",
+      "size_bytes": 9218
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/10/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "937831ac4512f141adee4f5452578f349361194a",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/10/artifact.json",
+      "run": "replay",
+      "size_bytes": 29570
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/11/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d85d5cf436d609927ccb1acab3495d526fedecfc",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/11/artifact.json",
+      "run": "replay",
+      "size_bytes": 18905
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/12/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1809c07c2ec0ccdedb5eed35df70004b2b34bb51",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/12/artifact.json",
+      "run": "replay",
+      "size_bytes": 18853
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/13/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "46ebde9757fdf3925ad7ed2f6a93da92fa650d47",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/13/artifact.json",
+      "run": "replay",
+      "size_bytes": 16239
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/14/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "17259e0dcb83449443e5cd5d55fc2ec34dd1d878",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/14/artifact.json",
+      "run": "replay",
+      "size_bytes": 18839
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/15/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fa606ee959ca37502231f6df78a6fe64d5676ee7",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/15/artifact.json",
+      "run": "replay",
+      "size_bytes": 13464
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/16/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "125cc8d168c2828218c8d3b05d0e6b05562efe60",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/16/artifact.json",
+      "run": "replay",
+      "size_bytes": 12214
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/17/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "86517c5a44691aacf02c017b073916722553c9eb",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/17/artifact.json",
+      "run": "replay",
+      "size_bytes": 12173
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/18/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "0cd08f8c1748bddb4a731ba26c6ecb36d7780eda",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/18/artifact.json",
+      "run": "replay",
+      "size_bytes": 11781
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/19/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6c9c1969c683a567293f6c2e1a0b855e34a3c048",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/19/artifact.json",
+      "run": "replay",
+      "size_bytes": 9110
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/mutations/20/artifact.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c6b10d2bd60a2bc54e87eb5bd42780781e2691df",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/mutations/20/artifact.json",
+      "run": "replay",
+      "size_bytes": 13873
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "bc296d5c04a5a83c589c187f4c78eb6508ef1707",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/parent_verification.json",
+      "run": "replay",
+      "size_bytes": 399
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "dc32c16aed130cf33eba12875df20dde291b14ae",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/process.json",
+      "run": "replay",
+      "size_bytes": 627
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "73c06ab4224515faf384bf583030c527ffe6a889",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/process_attestation.json",
+      "run": "replay",
+      "size_bytes": 530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h1/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f97ff147959ca3c6029e9f8676bdc6272abc92cb",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h1/result.json",
+      "run": "replay",
+      "size_bytes": 301263
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/allocation-observer.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "e779594bf80e4b91d50e94335058ffd521c43c2d",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/allocation-observer.json",
+      "run": "replay",
+      "size_bytes": 3552
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/benchmark-process-1.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7460639e1605535862ca85309e95d5946fef08dc",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/benchmark-process-1.json",
+      "run": "replay",
+      "size_bytes": 13069
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/benchmark-process-2.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "cbdeb55abb660a758d1c29f745ed8482ea35135f",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/benchmark-process-2.json",
+      "run": "replay",
+      "size_bytes": 13062
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/benchmark-process-3.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "323ca6bed7054b9ea042db22c83a67744e66973a",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/benchmark-process-3.json",
+      "run": "replay",
+      "size_bytes": 13061
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/environment.json",
+      "run": "replay",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "e2b986465d9526c43c0ffd9ef3d3bd3a99e7f8e6",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/events.ndjson",
+      "run": "replay",
+      "size_bytes": 259693
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/input_manifest.json",
+      "run": "replay",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "09de3a28aff73400f784f0d65ba2fb3b2192c2a6",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/parent_verification.json",
+      "run": "replay",
+      "size_bytes": 399
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5dd00599a5ddbe430bf0eec00142a14992ca6fd0",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/process.json",
+      "run": "replay",
+      "size_bytes": 625
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9c952f04e9052d80b2e642cf4ea80faf3746f435",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/process_attestation.json",
+      "run": "replay",
+      "size_bytes": 530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h2/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ee8178e42cfc0c71e6670f090f3d1ce5daa6d8f5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h2/result.json",
+      "run": "replay",
+      "size_bytes": 1765400
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/environment.json",
+      "run": "replay",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "cee8245c1f3389bb67fc5bee09cd7ebe60316e0a",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/events.ndjson",
+      "run": "replay",
+      "size_bytes": 51416
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/input_manifest.json",
+      "run": "replay",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fc4490dec07a11e214b586e1805501609b268d63",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/parent_verification.json",
+      "run": "replay",
+      "size_bytes": 399
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1b43d9ce6e00ebf02e51f87df4821761b5b3239f",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/process.json",
+      "run": "replay",
+      "size_bytes": 624
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c975f5d18392d6f5beec14184b371ef963c9d2bc",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/process_attestation.json",
+      "run": "replay",
+      "size_bytes": 530
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "140d5502fc1d122cc82de17fcdbacbbcd79d0571",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/result.json",
+      "run": "replay",
+      "size_bytes": 264086
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-after-activation-fault.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "aa9e094716ab0b6ff83c123ac0180ea47d869d07",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-after-activation-fault.json",
+      "run": "replay",
+      "size_bytes": 9253
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-after-commit.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "15744b31fddd44b1378e7f28cbf104b836e6bb29",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-after-commit.json",
+      "run": "replay",
+      "size_bytes": 9126
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-before-prepare.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c0d4a26418af7ae86fa45e351bc96bf22c62aec1",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-before-prepare.json",
+      "run": "replay",
+      "size_bytes": 7976
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-during-migration.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "21957082590c2b99cf73bfca07df4ca9ed668ea8",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-during-migration.json",
+      "run": "replay",
+      "size_bytes": 7997
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-during-quiesce.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c573d77d22bb10a9b8d47753f09156f4b1ecd14a",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-during-quiesce.json",
+      "run": "replay",
+      "size_bytes": 7789
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-explicityielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a2357c04f7300d1c8a7962a96e5d1d3248c8ab0",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-explicityielded-task.json",
+      "run": "replay",
+      "size_bytes": 7218
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "32415a0ac0c961ae8c98ee27b653ee924f5771f4",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-fuelyielded-task.json",
+      "run": "replay",
+      "size_bytes": 6940
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-ready-task.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "03cb31e787c0be89168540fbb0e5a4d11cf86b3b",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-ready-task.json",
+      "run": "replay",
+      "size_bytes": 6726
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-unrelated-module.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d5e22482b7135c6dc60aa0d9f7a1a2d150b0fdfc",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-unrelated-module.json",
+      "run": "replay",
+      "size_bytes": 8115
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/completion/completion-waiting-request.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f8b708921bec120ff52e192117b219ecb0c7131c",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/completion/completion-waiting-request.json",
+      "run": "replay",
+      "size_bytes": 8208
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "c69e5ae0aa44f71024332313cae7cfa1a7c28a48",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-cross-domain-handle-rejection.json",
+      "run": "replay",
+      "size_bytes": 6369
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-delete.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "98ad99561b7006c91d8efb6d0cc0a578de2ee07f",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-delete.json",
+      "run": "replay",
+      "size_bytes": 7030
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-field-addition.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6260cf4edecc1b26b6858f4bfc596a8dc005dac7",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-field-addition.json",
+      "run": "replay",
+      "size_bytes": 7064
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-field-deletion.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "37a9b2ec888d37edc2f8d84f0c9405819f6692b6",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-field-deletion.json",
+      "run": "replay",
+      "size_bytes": 7062
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-field-type-replacement.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8b8a5145bcba6253b8c5a57a5adfa2f1001f0462",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-field-type-replacement.json",
+      "run": "replay",
+      "size_bytes": 7121
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-generation-increment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1d73be5c1d2fa3652f9693dc3fdf42a0ee10750e",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-generation-increment.json",
+      "run": "replay",
+      "size_bytes": 7138
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-preserve.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "6ba1f7100710afba53c3624431926d0b16e2f1f6",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-preserve.json",
+      "run": "replay",
+      "size_bytes": 7048
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-replace.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5fc020fae1375b1a37863ccc3c2e89e08c6aa74a",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-replace.json",
+      "run": "replay",
+      "size_bytes": 7038
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-schema-unchanged.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "725266eb7524f73a426052e465f15755f745c2f6",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-schema-unchanged.json",
+      "run": "replay",
+      "size_bytes": 7080
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "63046bfd3f9ff28f0face72f8a3b2f512fbc4022",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-stale-handle-rejection.json",
+      "run": "replay",
+      "size_bytes": 7144
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/migration/migration-statehandle-remap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9eeac38090ec9cfdb456886bbf2efd56cc8f4855",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/migration/migration-statehandle-remap.json",
+      "run": "replay",
+      "size_bytes": 7130
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-activation-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "aa4654922c315360c6de1871defc30058ccaa887",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-activation-success.json",
+      "run": "replay",
+      "size_bytes": 7104
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-activation-trap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "5c99fcf747ed5fe93b6288325e73c092bd41f666",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-activation-trap.json",
+      "run": "replay",
+      "size_bytes": 7168
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "f4eed9abe1202c9ac6dc99f20e8c7ee7d052cfa8",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-capacity-failure-rollback.json",
+      "run": "replay",
+      "size_bytes": 6450
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-commit-success.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "9b6e6aa8b91e8cd035e7afca26bfd682ce4fbbd4",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-commit-success.json",
+      "run": "replay",
+      "size_bytes": 7060
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "47f6b744913babe85c071ed5a0c29b08474d8ceb",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-independent-epoch-reap.json",
+      "run": "replay",
+      "size_bytes": 8251
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "219594c86393e1b4bb06be96536859ac78ddca9d",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-migration-limit-atomic-failure.json",
+      "run": "replay",
+      "size_bytes": 6478
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "16a8095ce8c48a304476706f460dcf15c07f4d36",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-migration-success-rollback.json",
+      "run": "replay",
+      "size_bytes": 6322
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "d9567cb39b639d0a5fdae0df32b0f041dcc42c24",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-migration-trap-rollback.json",
+      "run": "replay",
+      "size_bytes": 6389
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4684ff0ba6b0deafaa554dca35f92ac64b0d33a1",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/h3/scenarios/transaction/transaction-multiple-retired-epoch.json",
+      "run": "replay",
+      "size_bytes": 8596
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/input_manifest.json",
+      "run": "replay",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "77ff71be56375942523acd4b1192a3eecf3816c7",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/process.json",
+      "run": "replay",
+      "size_bytes": 558
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "127912666740a7b90793e9b9e828deb85f73cf4c",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/result.json",
+      "run": "replay",
+      "size_bytes": 2535924
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/validity_replay.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b2f830bc34abed1efd94ff39f143df455db38aea",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/validity_replay.json",
+      "run": "replay",
+      "size_bytes": 20703
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/environment.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8a0cfc6f1b5ed858ac4b1192f37bef1f7bfb48aa",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/environment.json",
+      "run": "replay",
+      "size_bytes": 1823
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/events.ndjson",
+      "artifact_type": "ndjson",
+      "gate": null,
+      "git_blob_hash": "19e54ce11504c716a6a3f732ed20c79d43924ab9",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/events.ndjson",
+      "run": "replay",
+      "size_bytes": 774
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/input_manifest.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "182f96a45b4db6c682e92dea67cef825ba111aa5",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/input_manifest.json",
+      "run": "replay",
+      "size_bytes": 12232
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/parent_verification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "cd7c3d3bca4cb1ba7768633dbc626f9a75433568",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/parent_verification.json",
+      "run": "replay",
+      "size_bytes": 410
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/process.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a1245a4afa6d5a2530e88a9572260b56b8016336",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/process.json",
+      "run": "replay",
+      "size_bytes": 633
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/process_attestation.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3485b1e55a2f54d00db2de0e8a43901368366894",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/process_attestation.json",
+      "run": "replay",
+      "size_bytes": 542
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/runs/replay/worker/result.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fb18e797863620af7c29249a6ce69bb980411d01",
+      "original_path": "reports/raw/gate1_v2_4/runs/replay/worker/result.json",
+      "run": "replay",
+      "size_bytes": 2433482
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/authorization.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "8864a1091cdeebd87519903a54052ff56d0695f4",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/authorization.json",
+      "run": null,
+      "size_bytes": 2413
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/budget.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4ba194cf87032d23d426656979f0bf94c1964856",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/budget.json",
+      "run": null,
+      "size_bytes": 139
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/h1_mutations.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "36ca81420d0ce58918b9e8470e6bb52d5b9ba575",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/h1_mutations.json",
+      "run": null,
+      "size_bytes": 6310
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/h2_cleanup_matrix.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "507c39048cb48bfc8e6f6b3b2d6d55cc1e0ea91d",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/h2_cleanup_matrix.json",
+      "run": null,
+      "size_bytes": 4412
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/h2_matrix.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "a6c9617608ea4d3c366e6a07e37fd5c443d3dd54",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/h2_matrix.json",
+      "run": null,
+      "size_bytes": 5208
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/h3_scenarios.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "75dc40eb9a3d59b4d1c7363dab1dbe64429d6f65",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/h3_scenarios.json",
+      "run": null,
+      "size_bytes": 13091
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/pilot.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "71648d33ecd20396e8c6d3d0e319e7a5b985d13d",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/pilot.json",
+      "run": null,
+      "size_bytes": 161
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/contract_satisfiability.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "3020ca7be164e00ef47eb82be68180944764df48",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/contract_satisfiability.json",
+      "run": null,
+      "size_bytes": 963
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/governance_negative_tests.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7d2cf112f89d16dfc6bf2db6afed047b3ea94842",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/governance_negative_tests.json",
+      "run": null,
+      "size_bytes": 5789
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/h1_transformer_equivalence.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ca0201e95760eab3ca67876f65547e21cd1f8e7e",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/h1_transformer_equivalence.json",
+      "run": null,
+      "size_bytes": 9942
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/h2_cleanup_independence.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "fb11c7f76239a3aa4e42a74193af75e60b2cee16",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/h2_cleanup_independence.json",
+      "run": null,
+      "size_bytes": 252
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/h2_dimension_effectiveness.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "b4f68d4fbeb0e7a033f1e2dcd944c611ef5aa7fe",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/h2_dimension_effectiveness.json",
+      "run": null,
+      "size_bytes": 299
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/h3_execution_independence.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "06ef75f56c591fdc265387e058365dea3ec48de2",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/h3_execution_independence.json",
+      "run": null,
+      "size_bytes": 367
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/history_check.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "7dae58f6e0da4896d2e26c905796fb37cd263bc4",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/history_check.json",
+      "run": null,
+      "size_bytes": 1431
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/outcome_transport.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "58355719ebedf50e993e1f5d8be9f677e0ae4bf9",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/outcome_transport.json",
+      "run": null,
+      "size_bytes": 1980
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/prefreeze_closure.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "4607289c5711eb999f989af6ed89d1d0513f398b",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/prefreeze_closure.json",
+      "run": null,
+      "size_bytes": 2176
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/raw_regeneration_exercise.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "dc0acc7262c125772045d6f786b61d9509c69349",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/raw_regeneration_exercise.json",
+      "run": null,
+      "size_bytes": 5052
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/prefreeze/scenario_independence.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "1d92e060a5fa8d6344361c3a2ff69fe4ec142ecb",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/prefreeze/scenario_independence.json",
+      "run": null,
+      "size_bytes": 363
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/qualification/environment_qualification.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "07401fa8e42460ff3ecda611a34d71615b3d3b60",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/qualification/environment_qualification.json",
+      "run": null,
+      "size_bytes": 15090
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/scenario_schema.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "0f61faef4a989931277d05c3bddb2bc38864f568",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/scenario_schema.json",
+      "run": null,
+      "size_bytes": 468
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/experiments/gate1-v2.4/threshold_equivalence.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ea0f6ad270a707a0b89548024edc25a5bd990f97",
+      "original_path": "reports/raw/gate1_v2_4/static/experiments/gate1-v2.4/threshold_equivalence.json",
+      "run": null,
+      "size_bytes": 1426
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/reports/history/gate1/current_status.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "42a95848bf188c0bdbef3b41d37e8ee240c24d27",
+      "original_path": "reports/raw/gate1_v2_4/static/reports/history/gate1/current_status.json",
+      "run": null,
+      "size_bytes": 182
+    },
+    {
+      "archived_path": "reports/history/gate1/v2_4/raw/static/reports/history/gate1/versions/gate1-v2.3.json",
+      "artifact_type": "json",
+      "gate": null,
+      "git_blob_hash": "ec229bc98f3460496e6c6188c951aa78bfcb9ff9",
+      "original_path": "reports/raw/gate1_v2_4/static/reports/history/gate1/versions/gate1-v2.3.json",
+      "run": null,
+      "size_bytes": 806
+    }
+  ],
+  "formal_evidence_usable": false,
+  "original_root": "reports/raw/gate1_v2_4",
+  "schema_version": 1,
+  "status": "STRUCTURAL_CLOSURE_FAILED",
+  "version": "gate1-v2.4"
+}

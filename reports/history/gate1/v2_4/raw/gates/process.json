@@ -1,0 +1,26 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.4",
+  "failures": [],
+  "gate": "process",
+  "generator": "nexa-gate1-v2-4-gates/raw-v1",
+  "implementation_sha": "b31ab22149253248beed3dca8217392673420f73",
+  "implementation_tree": "7ab2147091c750e5a33f5c6a0c19f43197df7b59",
+  "layer": "APPARATUS",
+  "metrics": {
+    "apparatus_statuses": [
+      "PASS",
+      "PASS",
+      "PASS"
+    ],
+    "independent_supervisor_nonces": 0,
+    "supervisor_count": 3,
+    "worker_topologies": [
+      null,
+      null,
+      null
+    ]
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}

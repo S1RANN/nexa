@@ -22,16 +22,17 @@ The current minimum supported Rust toolchain is **1.97.1**.
 
 ```text
 Current implementation milestone: 4.0R3 complete
-<!-- gate1-v2.4-status:start -->
+<!-- gate1-v2.5-status:start -->
 Gate 1 v1: INVALID_APPARATUS
 Gate 1 v2: INVALID_APPARATUS / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.1: INVALID / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.2: NOT TRUSTWORTHY / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.3: SEMANTICALLY_INSUFFICIENT / NOT AUTHORIZED FOR DECISION
-Gate 1 v2.4: FROZEN / INCOMPLETE
-Current decision: PENDING
-Milestone 5.0R4: INCOMPLETE
-<!-- gate1-v2.4-status:end -->
+Gate 1 v2.4: STRUCTURAL_CLOSURE_FAILED / NOT AUTHORIZED FOR DECISION
+Gate 1 v2.5: FROZEN / INCOMPLETE
+Current decision: PENDING_FORMAL_EXECUTION
+Milestone 5.0R5: INCOMPLETE
+<!-- gate1-v2.5-status:end -->
 ```
 
 The implemented MVR execution path is:
@@ -66,10 +67,10 @@ cargo run --release -p nexa-runtime --example fast_task_bench --features allocat
 The reproducible real-path benchmark result is recorded in
 [`reports/fast_task_benchmark_v1.md`](reports/fast_task_benchmark_v1.md).
 
-Gate 1 v2.4 is governed by the
+Gate 1 v2.5 is governed by the
 [`MVR Scope`](baseline/mvr/MVR_SCOPE.md),
-the Gate 1 v2.4 acceptance criteria and authorization produced after prefreeze closure, and the
-qualified frozen manifest under `experiments/gate1-v2.4/`. Gate 1 v1 through v2.3 remain available through the
+the Gate 1 v2.5 acceptance criteria and authorization produced after prefreeze closure, and the
+qualified frozen manifest under `experiments/gate1-v2.5/`. Gate 1 v1 through v2.4 remain available through the
 unified history graph under `reports/history/gate1/` and their
 [`v1 invalidation record`](reports/gate1_v1_invalidation.md) and
 [`v2 invalidation record`](reports/gate1_v2_invalidation.md), plus the

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.5",
+  "status": "AUTHORIZED",
+  "approved_by": "repository owner",
+  "approved_at": "2026-07-27T16:19:03+08:00",
+  "approval_basis": "Nexa Milestone 5.0R5 Gate 1 v2.5 plan",
+  "previous_experiment": {
+    "experiment_version": "gate1-v2.4",
+    "status": "STRUCTURAL_CLOSURE_FAILED",
+    "decision_usable": false
+  },
+  "prefreeze_closure": {
+    "path": "experiments/gate1-v2.5/prefreeze/prefreeze_closure.json",
+    "hash": "56afb6fac5dc7da2efb052f178d52bd4bc4b277c",
+    "status": "PASS"
+  },
+  "environment_qualification": {
+    "path": "experiments/gate1-v2.5/qualification/environment_qualification.json",
+    "hash": "f781d9fbb8a5d1867388f62237b4e18e61629ce5",
+    "status": "QUALIFIED"
+  },
+  "acceptance_equivalence": {
+    "path": "experiments/gate1-v2.5/threshold_equivalence.json",
+    "hash": "e93370ac638b9c54cce89f3ce06e136c9b687eac",
+    "status": "PASS"
+  },
+  "scenario_manifests": {
+    "experiments/gate1-v2.5/fixtures/h1_handwritten.rs": "0d256f45aa54cc22dbe929b1ade2f4618324ff7f",
+    "experiments/gate1-v2.5/h1_mutations.json": "36ca81420d0ce58918b9e8470e6bb52d5b9ba575",
+    "experiments/gate1-v2.5/h2_cleanup_matrix.json": "507c39048cb48bfc8e6f6b3b2d6d55cc1e0ea91d",
+    "experiments/gate1-v2.5/h2_matrix.json": "a6c9617608ea4d3c366e6a07e37fd5c443d3dd54",
+    "experiments/gate1-v2.5/h3_scenarios.json": "75dc40eb9a3d59b4d1c7363dab1dbe64429d6f65",
+    "experiments/gate1-v2.5/scenario_schema.json": "0f61faef4a989931277d05c3bddb2bc38864f568"
+  },
+  "provenance_protocol": {
+    "name": "gate1-process-handshake-v1",
+    "hash": "58355719ebedf50e993e1f5d8be9f677e0ae4bf9",
+    "source": "experiments/gate1-v2.5/prefreeze/outcome_transport.json"
+  },
+  "execution_budget": {
+    "formal_run_1": 1,
+    "formal_run_2": 1,
+    "replay": 1,
+    "retry": 0
+  },
+  "worker_topology": {
+    "supervisors_per_run": 1,
+    "top_workers_per_run": 1,
+    "h1_h2_h3_workers_per_run": 3,
+    "benchmark_processes_per_h2_worker": 3
+  },
+  "output_policy": "target/gate1-v2.5 with immutable per-run directories",
+  "outcome_thresholds": "UNCHANGED_FROM_GATE1_V2_4",
+  "authorized_apparatus_changes": [
+    "H2 semantic projection and stable signature",
+    "H2 performance and allocation projection separation",
+    "phase-aware comparison and decision state machines",
+    "I2.5 E2.5 D2.5 F2.5 finalization protocol",
+    "Raw regeneration of Gates Contracts Decision documents and Receipt"
+  ],
+  "production_feature_changes_authorized": false
+}

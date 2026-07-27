@@ -1,0 +1,32 @@
+{
+  "contract_count": 44,
+  "contracts_satisfied": 42,
+  "decision_usable": false,
+  "evidence_commit_created": false,
+  "formal_execution_complete": true,
+  "formal_execution_count": 3,
+  "h2_signature_contaminated_by_timing_noise": true,
+  "h2_signatures": [
+    "0869939cb3bd4cc3",
+    "5c47d5d73d0816a9",
+    "513efea3163b5acd"
+  ],
+  "implementation_sha": "b31ab22149253248beed3dca8217392673420f73",
+  "implementation_tree": "7ab2147091c750e5a33f5c6a0c19f43197df7b59",
+  "product_outcomes": {
+    "H1": "FAIL",
+    "H2": "FAIL",
+    "H3": "FAIL"
+  },
+  "pushed": false,
+  "receipt_created": false,
+  "retries_used": 0,
+  "schema_version": 1,
+  "stable_signatures": {
+    "H1": "af6600462d0eb4df",
+    "H3": "98cf6409b1e2e084"
+  },
+  "status": "STRUCTURAL_CLOSURE_FAILED",
+  "superseded_by": "gate1-v2.5",
+  "version": "gate1-v2.4"
+}

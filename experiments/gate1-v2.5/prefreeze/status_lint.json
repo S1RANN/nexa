@@ -1,0 +1,33 @@
+{
+  "failures": [],
+  "negative_cases": [
+    {
+      "detected": true,
+      "name": "roadmap-table-conflict"
+    },
+    {
+      "detected": true,
+      "name": "readme-decision-conflict"
+    },
+    {
+      "detected": true,
+      "name": "baseline-milestone-conflict"
+    }
+  ],
+  "registry": {
+    "apparatus_status": "PENDING",
+    "current_experiment": "gate1-v2.5",
+    "decision": null,
+    "decision_state": "PENDING_FORMAL_EXECUTION",
+    "evidence_status": "PENDING",
+    "experiment_status": "FROZEN",
+    "finalization_status": "PENDING",
+    "milestone": "5.0R5",
+    "milestone_status": "INCOMPLETE",
+    "push_status": "FORBIDDEN",
+    "receipt_verified": false,
+    "schema_version": 1
+  },
+  "schema_version": 1,
+  "status": "PASS"
+}
