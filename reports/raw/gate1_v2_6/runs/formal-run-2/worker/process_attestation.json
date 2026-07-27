@@ -1,0 +1,13 @@
+{
+  "executable_hash": "99eb97506fab4bd9c8d7a10fcdcc065f0dc4c314",
+  "expected_output_path": "/Users/orokane/projects/nexa/target/gate1-v2.6/formal-run-2/worker",
+  "monotonic_clock": "std::time::Instant process-relative",
+  "one_time_token_hash": "809b4ad14e8ad829",
+  "parent_nonce": "portable-parent-49181-1785151263151484000",
+  "protocol": "gate1-process-handshake-v1",
+  "role": "top-level-worker",
+  "run_id": "formal-run-2",
+  "started_at_monotonic_ns": 61000958,
+  "worker_nonce": "top-worker-49181-1785151263151409000",
+  "worker_pid": 50521
+}

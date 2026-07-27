@@ -1,0 +1,13 @@
+{
+  "version": "gate1-v2.6",
+  "status": "FROZEN",
+  "decision_usable": false,
+  "implementation_sha": null,
+  "evidence_sha": null,
+  "decision_sha": null,
+  "receipt_sha": null,
+  "finalization_sha": null,
+  "canonical_record_hash": null,
+  "historical_record_immutable": false,
+  "supersedes": "gate1-v2.5"
+}

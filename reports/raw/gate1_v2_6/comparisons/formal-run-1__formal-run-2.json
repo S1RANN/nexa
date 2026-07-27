@@ -1,0 +1,1300 @@
+{
+  "failures": [
+    "h2 comparison is INCONCLUSIVE"
+  ],
+  "h1": {
+    "left_outcome": "FAIL",
+    "left_signature": "af6600462d0eb4df",
+    "mutation_count": 20,
+    "outcome_equal": true,
+    "right_outcome": "FAIL",
+    "right_signature": "af6600462d0eb4df",
+    "schema_valid": true,
+    "semantic_equal": true,
+    "status": "PASS"
+  },
+  "h2": {
+    "allocation": {
+      "failures": [],
+      "observations": {
+        "equal": true,
+        "left": {
+          "baseline_subtracted": true,
+          "observer_run_count": 3,
+          "projection": "gate1-v2.6-h2-allocation-v1",
+          "runs": [
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            },
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            },
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            }
+          ],
+          "schema_version": 1
+        },
+        "right": {
+          "baseline_subtracted": true,
+          "observer_run_count": 3,
+          "projection": "gate1-v2.6-h2-allocation-v1",
+          "runs": [
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            },
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            },
+            {
+              "explicit_resume": 0,
+              "fuel_resume": 0,
+              "host_resume": 0,
+              "promotion": 0,
+              "trace_off": 0
+            }
+          ],
+          "schema_version": 1
+        }
+      },
+      "rule": "equal allocation projection and equal absolute zero-allocation conditions",
+      "status": "PASS"
+    },
+    "performance": {
+      "failures": [
+        "enum_construction_match:p50_ns",
+        "enum_construction_match:p90_ns",
+        "enum_construction_match:p95_ns",
+        "migration:p99_ns",
+        "realm_drop:p99_ns",
+        "string_concat:mean_ns",
+        "string_concat:p50_ns",
+        "string_concat:p90_ns",
+        "string_concat:p95_ns",
+        "string_concat:p99_ns",
+        "string_concat:throughput_ops_per_second",
+        "string_concat:frame_1000_calls_ns",
+        "struct_construction:mean_ns",
+        "struct_construction:p90_ns",
+        "struct_construction:p95_ns",
+        "struct_construction:p99_ns",
+        "struct_construction:throughput_ops_per_second",
+        "struct_construction:frame_1000_calls_ns"
+      ],
+      "observations": {
+        "aggregation": "median-of-three-independent-process-values-per-case",
+        "comparisons": [
+          {
+            "case": "array_operations",
+            "delta": 0.039780521262002745,
+            "left": 729.0,
+            "metric": "mean_ns",
+            "right": 758.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.05782792665726375,
+            "left": 709.0,
+            "metric": "p50_ns",
+            "right": 750.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.05303030303030303,
+            "left": 792.0,
+            "metric": "p90_ns",
+            "right": 834.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.09832134292565947,
+            "left": 834.0,
+            "metric": "p95_ns",
+            "right": 916.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.04275286757038582,
+            "left": 959.0,
+            "metric": "p99_ns",
+            "right": 1000.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.038803971901330184,
+            "left": 1370251.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1319066.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.039780521262002745,
+            "left": 729000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 758000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "array_operations",
+            "delta": 0.2472214860421068,
+            "left": 0.1661424513011484,
+            "metric": "coefficient_of_variation",
+            "right": 0.4133639373432552,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.0361739902352419,
+            "left": 4506.0,
+            "metric": "mean_ns",
+            "right": 4669.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.0,
+            "left": 4375.0,
+            "metric": "p50_ns",
+            "right": 4375.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.0,
+            "left": 5708.0,
+            "metric": "p90_ns",
+            "right": 5708.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.006811547194291274,
+            "left": 6208.0,
+            "metric": "p95_ns",
+            "right": 6166.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.009693053311793215,
+            "left": 8666.0,
+            "metric": "p99_ns",
+            "right": 8750.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.0361148727527434,
+            "left": 221884.0,
+            "metric": "throughput_ops_per_second",
+            "right": 214150.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.0361739902352419,
+            "left": 4506000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 4669000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "async_admission",
+            "delta": 0.11434505966022274,
+            "left": 0.5098473703239981,
+            "metric": "coefficient_of_variation",
+            "right": 0.39550231066377534,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.1134020618556701,
+            "left": 582.0,
+            "metric": "mean_ns",
+            "right": 648.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.07204116638078903,
+            "left": 583.0,
+            "metric": "p50_ns",
+            "right": 625.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.1344,
+            "left": 625.0,
+            "metric": "p90_ns",
+            "right": 709.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.18768768768768768,
+            "left": 666.0,
+            "metric": "p95_ns",
+            "right": 791.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.16666666666666666,
+            "left": 750.0,
+            "metric": "p99_ns",
+            "right": 875.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.11443848116767792,
+            "left": 1718083.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1541658.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.1134020618556701,
+            "left": 582000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 648000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "buffer_copy",
+            "delta": 0.18605296469469676,
+            "left": 0.07302706410816798,
+            "metric": "coefficient_of_variation",
+            "right": 0.25908002880286474,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.15692307692307692,
+            "left": 650.0,
+            "metric": "mean_ns",
+            "right": 752.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.1328,
+            "left": 625.0,
+            "metric": "p50_ns",
+            "right": 708.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.11864406779661017,
+            "left": 708.0,
+            "metric": "p90_ns",
+            "right": 792.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.1763046544428773,
+            "left": 709.0,
+            "metric": "p95_ns",
+            "right": 834.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.20959595959595959,
+            "left": 792.0,
+            "metric": "p99_ns",
+            "right": 958.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.15669990467240638,
+            "left": 1537371.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1329101.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.15692307692307692,
+            "left": 650000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 752000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "class_allocation",
+            "delta": 0.22496713768527268,
+            "left": 0.30290132325329644,
+            "metric": "coefficient_of_variation",
+            "right": 0.07793418556802376,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.1753155680224404,
+            "left": 713.0,
+            "metric": "mean_ns",
+            "right": 838.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.4672,
+            "left": 625.0,
+            "metric": "p50_ns",
+            "right": 917.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.3893333333333333,
+            "left": 750.0,
+            "metric": "p90_ns",
+            "right": 1042.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.30012004801920766,
+            "left": 833.0,
+            "metric": "p95_ns",
+            "right": 1083.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.07564575645756458,
+            "left": 1084.0,
+            "metric": "p99_ns",
+            "right": 1166.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.17630787682578555,
+            "left": 1402506.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1192295.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.1753155680224404,
+            "left": 713000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 838000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "enum_construction_match",
+            "delta": 0.01698641881447671,
+            "left": 0.24360513770113987,
+            "metric": "coefficient_of_variation",
+            "right": 0.22661871888666316,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.013029315960912053,
+            "left": 307.0,
+            "metric": "mean_ns",
+            "right": 311.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.0,
+            "left": 292.0,
+            "metric": "p50_ns",
+            "right": 292.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.0,
+            "left": 334.0,
+            "metric": "p90_ns",
+            "right": 334.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.12275449101796407,
+            "left": 334.0,
+            "metric": "p95_ns",
+            "right": 375.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.10071942446043165,
+            "left": 417.0,
+            "metric": "p99_ns",
+            "right": 459.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.012621923017466962,
+            "left": 3255621.0,
+            "metric": "throughput_ops_per_second",
+            "right": 3215041.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.013029315960912053,
+            "left": 307000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 311000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "explicit_resume",
+            "delta": 0.017065722569501868,
+            "left": 0.09780891708244684,
+            "metric": "coefficient_of_variation",
+            "right": 0.1148746396519487,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.037783375314861464,
+            "left": 412.0,
+            "metric": "mean_ns",
+            "right": 397.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.0,
+            "left": 375.0,
+            "metric": "p50_ns",
+            "right": 375.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.0,
+            "left": 417.0,
+            "metric": "p90_ns",
+            "right": 417.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.09832134292565947,
+            "left": 458.0,
+            "metric": "p95_ns",
+            "right": 417.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.084,
+            "left": 500.0,
+            "metric": "p99_ns",
+            "right": 542.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.03941634294270757,
+            "left": 2421559.0,
+            "metric": "throughput_ops_per_second",
+            "right": 2517008.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.037783375314861464,
+            "left": 412000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 397000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "fuel_resume",
+            "delta": 0.016306416686740086,
+            "left": 0.10005450842627626,
+            "metric": "coefficient_of_variation",
+            "right": 0.08374809173953618,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.001953125,
+            "left": 512.0,
+            "metric": "mean_ns",
+            "right": 513.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.0,
+            "left": 500.0,
+            "metric": "p50_ns",
+            "right": 500.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.0,
+            "left": 542.0,
+            "metric": "p90_ns",
+            "right": 542.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.0,
+            "left": 583.0,
+            "metric": "p95_ns",
+            "right": 583.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.0015015015015015015,
+            "left": 667.0,
+            "metric": "p99_ns",
+            "right": 666.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.0023713794987899133,
+            "left": 1951585.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1946968.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.001953125,
+            "left": 512000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 513000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "immediate_call",
+            "delta": 0.20471780674814566,
+            "left": 1.0156092809781163,
+            "metric": "coefficient_of_variation",
+            "right": 0.8108914742299707,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.006936416184971098,
+            "left": 865.0,
+            "metric": "mean_ns",
+            "right": 871.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.049160671462829736,
+            "left": 834.0,
+            "metric": "p50_ns",
+            "right": 875.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.04471101417666303,
+            "left": 958.0,
+            "metric": "p90_ns",
+            "right": 917.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.0,
+            "left": 959.0,
+            "metric": "p95_ns",
+            "right": 959.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.04030710172744722,
+            "left": 1042.0,
+            "metric": "p99_ns",
+            "right": 1084.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.007425610947850731,
+            "left": 1155629.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1147111.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.006936416184971098,
+            "left": 865000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 871000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "map_operations",
+            "delta": 0.04547066815776295,
+            "left": 0.06825203141836081,
+            "metric": "coefficient_of_variation",
+            "right": 0.11372269957612376,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.0,
+            "left": 31251.0,
+            "metric": "mean_ns",
+            "right": 31251.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.025713991840093257,
+            "left": 29167.0,
+            "metric": "p50_ns",
+            "right": 29917.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.0885896527285613,
+            "left": 31042.0,
+            "metric": "p90_ns",
+            "right": 33792.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.011871886120996442,
+            "left": 35125.0,
+            "metric": "p95_ns",
+            "right": 35542.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.5318627450980392,
+            "left": 78125.0,
+            "metric": "p99_ns",
+            "right": 51000.0,
+            "tolerance": 0.35,
+            "within_tolerance": false
+          },
+          {
+            "case": "migration",
+            "delta": 0.0,
+            "left": 31998.0,
+            "metric": "throughput_ops_per_second",
+            "right": 31998.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.0,
+            "left": 31251000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 31251000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "migration",
+            "delta": 0.13625554579787186,
+            "left": 0.3953351952655844,
+            "metric": "coefficient_of_variation",
+            "right": 0.25907964946771256,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.03233830845771144,
+            "left": 1608.0,
+            "metric": "mean_ns",
+            "right": 1660.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.02880658436213992,
+            "left": 1458.0,
+            "metric": "p50_ns",
+            "right": 1500.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.022913256955810146,
+            "left": 1833.0,
+            "metric": "p90_ns",
+            "right": 1875.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.0205,
+            "left": 2000.0,
+            "metric": "p95_ns",
+            "right": 2041.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.62656,
+            "left": 5083.0,
+            "metric": "p99_ns",
+            "right": 3125.0,
+            "tolerance": 0.35,
+            "within_tolerance": false
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.03189204085156115,
+            "left": 621587.0,
+            "metric": "throughput_ops_per_second",
+            "right": 602376.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.03233830845771144,
+            "left": 1608000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 1660000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "realm_drop",
+            "delta": 0.4409148354728246,
+            "left": 0.6534577642356546,
+            "metric": "coefficient_of_variation",
+            "right": 1.0943725997084792,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.025606828487596694,
+            "left": 3749.0,
+            "metric": "mean_ns",
+            "right": 3845.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.04686617730095991,
+            "left": 3542.0,
+            "metric": "p50_ns",
+            "right": 3708.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.010181818181818183,
+            "left": 4125.0,
+            "metric": "p90_ns",
+            "right": 4167.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.047992616520535304,
+            "left": 4334.0,
+            "metric": "p95_ns",
+            "right": 4542.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.10619469026548672,
+            "left": 7375.0,
+            "metric": "p99_ns",
+            "right": 6667.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.02571804378259465,
+            "left": 266699.0,
+            "metric": "throughput_ops_per_second",
+            "right": 260012.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.025606828487596694,
+            "left": 3749000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 3845000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "reload_commit",
+            "delta": 0.012741890306720904,
+            "left": 0.34855994152471753,
+            "metric": "coefficient_of_variation",
+            "right": 0.3358180512179966,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.0352035203520352,
+            "left": 909.0,
+            "metric": "mean_ns",
+            "right": 941.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.001091703056768559,
+            "left": 916.0,
+            "metric": "p50_ns",
+            "right": 917.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.0,
+            "left": 1000.0,
+            "metric": "p90_ns",
+            "right": 1000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.04030710172744722,
+            "left": 1084.0,
+            "metric": "p95_ns",
+            "right": 1042.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.07756232686980609,
+            "left": 1167.0,
+            "metric": "p99_ns",
+            "right": 1083.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.03576834072836424,
+            "left": 1099726.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1061749.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.0352035203520352,
+            "left": 909000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 941000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "result_ok_err",
+            "delta": 0.023771789986207076,
+            "left": 0.0884940760276437,
+            "metric": "coefficient_of_variation",
+            "right": 0.06472228604143662,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.04452690166975881,
+            "left": 539.0,
+            "metric": "mean_ns",
+            "right": 563.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.0,
+            "left": 542.0,
+            "metric": "p50_ns",
+            "right": 542.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.07749077490774908,
+            "left": 542.0,
+            "metric": "p90_ns",
+            "right": 584.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.1421232876712329,
+            "left": 584.0,
+            "metric": "p95_ns",
+            "right": 667.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.06296851574212893,
+            "left": 667.0,
+            "metric": "p99_ns",
+            "right": 709.0,
+            "tolerance": 0.35,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.04517390566247372,
+            "left": 1853155.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1773059.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.04452690166975881,
+            "left": 539000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 563000.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "snapshot_access",
+            "delta": 0.020624204223364834,
+            "left": 0.05861129164166888,
+            "metric": "coefficient_of_variation",
+            "right": 0.07923549586503371,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.7308823529411764,
+            "left": 680.0,
+            "metric": "mean_ns",
+            "right": 1177.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.8110944527736131,
+            "left": 667.0,
+            "metric": "p50_ns",
+            "right": 1208.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.6830808080808081,
+            "left": 792.0,
+            "metric": "p90_ns",
+            "right": 1333.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.6486810551558753,
+            "left": 834.0,
+            "metric": "p95_ns",
+            "right": 1375.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.7828810020876826,
+            "left": 958.0,
+            "metric": "p99_ns",
+            "right": 1708.0,
+            "tolerance": 0.35,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.7304135662835322,
+            "left": 1469507.0,
+            "metric": "throughput_ops_per_second",
+            "right": 849223.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.7308823529411764,
+            "left": 680000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 1177000.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "string_concat",
+            "delta": 0.022965665833919097,
+            "left": 0.12557101411064214,
+            "metric": "coefficient_of_variation",
+            "right": 0.14853667994456124,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.2237442922374429,
+            "left": 657.0,
+            "metric": "mean_ns",
+            "right": 804.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.06306306306306306,
+            "left": 666.0,
+            "metric": "p50_ns",
+            "right": 708.0,
+            "tolerance": 0.2,
+            "within_tolerance": true
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.3333333333333333,
+            "left": 750.0,
+            "metric": "p90_ns",
+            "right": 1000.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.31565656565656564,
+            "left": 792.0,
+            "metric": "p95_ns",
+            "right": 1042.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.42857142857142855,
+            "left": 875.0,
+            "metric": "p99_ns",
+            "right": 1250.0,
+            "tolerance": 0.35,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.22258619317208722,
+            "left": 1520517.0,
+            "metric": "throughput_ops_per_second",
+            "right": 1243689.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.2237442922374429,
+            "left": 657000.0,
+            "metric": "frame_1000_calls_ns",
+            "right": 804000.0,
+            "tolerance": 0.2,
+            "within_tolerance": false
+          },
+          {
+            "case": "struct_construction",
+            "delta": 0.24846215005657468,
+            "left": 0.09005069282927754,
+            "metric": "coefficient_of_variation",
+            "right": 0.3385128428858522,
+            "tolerance": 1.0,
+            "within_tolerance": true
+          }
+        ]
+      },
+      "rule": "absolute performance budgets are hypothesis outcomes; valid cross-run excess is INCONCLUSIVE",
+      "status": "INCONCLUSIVE"
+    },
+    "semantic": {
+      "failures": [],
+      "observations": {
+        "equal": true,
+        "left_signature": "b4d8236b46529373",
+        "right_signature": "b4d8236b46529373"
+      },
+      "rule": "equal outcomes, semantic signatures, 32 scenario projections, 12 cleanup projections, and runtime invariant classes",
+      "status": "PASS"
+    },
+    "status": "INCONCLUSIVE"
+  },
+  "h3": {
+    "left_outcome": "FAIL",
+    "left_signature": "98cf6409b1e2e084",
+    "outcome_equal": true,
+    "right_outcome": "FAIL",
+    "right_signature": "98cf6409b1e2e084",
+    "scenario_count": 30,
+    "schema_valid": true,
+    "semantic_equal": true,
+    "status": "PASS"
+  },
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229",
+  "left": "formal-run-1",
+  "right": "formal-run-2",
+  "semantic_match": {
+    "measurement": "DerivedCalculation",
+    "run_id": "formal-run-1__formal-run-2",
+    "sample_count": 3,
+    "source_artifact": "worker/result.json",
+    "source_pointer": "/h1|h2|h3",
+    "value": false
+  },
+  "status": "INCONCLUSIVE"
+}

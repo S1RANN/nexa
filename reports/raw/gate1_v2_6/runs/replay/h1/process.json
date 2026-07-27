@@ -1,0 +1,19 @@
+{
+  "role": "h1-worker",
+  "pid": 60496,
+  "parent_pid": null,
+  "process_nonce": "h1-worker-60449-1785151501996944000",
+  "start_unix_ns": 1785151502118834000,
+  "end_unix_ns": 1785151680912856000,
+  "elapsed_monotonic_ns": 178708167500,
+  "executable_hash": "99eb97506fab4bd9c8d7a10fcdcc065f0dc4c314",
+  "command_line": [
+    "/Users/orokane/projects/nexa/target/debug/nexa-gate1-v2-6",
+    "h1-worker",
+    "replay",
+    "h1-worker-60449-1785151501996944000"
+  ],
+  "run_id": "replay",
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229"
+}

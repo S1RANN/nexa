@@ -1,0 +1,30 @@
+{
+  "experiment_version": "gate1-v2.6",
+  "gate_count": 21,
+  "gates": [
+    "history",
+    "governance",
+    "environment",
+    "process",
+    "validity",
+    "h1_equivalence",
+    "h1_metrics",
+    "h2_configuration",
+    "h2_cleanup",
+    "h2_invariants",
+    "h2_allocations",
+    "h2_performance",
+    "h3_migration",
+    "h3_completion",
+    "h3_transaction",
+    "comparison",
+    "replay",
+    "pilot",
+    "budget",
+    "workspace",
+    "artifact_hygiene"
+  ],
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229",
+  "schema_version": 1
+}

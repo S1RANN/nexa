@@ -1,0 +1,41 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.6",
+  "failures": [],
+  "gate": "h2_configuration",
+  "generator": "nexa-gate1-v2-6-gates/raw-v1",
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229",
+  "layer": "OUTCOME",
+  "metrics": {
+    "derived_outcomes": [
+      "FAIL",
+      "FAIL",
+      "FAIL"
+    ],
+    "measurements": {
+      "configuration_counts": [
+        0,
+        0,
+        0
+      ],
+      "execution_fingerprint_counts": [
+        0,
+        0,
+        0
+      ],
+      "semantic_signatures": [
+        "b4d8236b46529373",
+        "b4d8236b46529373",
+        "b4d8236b46529373"
+      ]
+    },
+    "recorded_outcomes": [
+      "FAIL",
+      "FAIL",
+      "FAIL"
+    ]
+  },
+  "outcome": "FAIL",
+  "schema_version": 1
+}

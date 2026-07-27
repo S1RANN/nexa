@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "projection": "gate1-v2.6-h2-performance-v1",
+  "aggregation": "median-of-three-independent-process-values-per-case",
+  "minimum_processes": 3,
+  "warmup_samples_per_process": 100,
+  "timed_samples_per_process": 1000,
+  "missing_or_non_finite_value": "INVALID",
+  "relative_delta_formula": "abs(left-right)/min(left,right)",
+  "zero_pair_policy": "both-zero-is-zero-delta; one-zero-is-infinite-delta",
+  "cross_run_tolerance": {
+    "mean_ns": 0.20,
+    "p50_ns": 0.20,
+    "p90_ns": 0.20,
+    "p95_ns": 0.20,
+    "p99_ns": 0.35,
+    "throughput_ops_per_second": 0.20,
+    "frame_1000_calls_ns": 0.20,
+    "coefficient_of_variation_absolute_delta": 1.0
+  },
+  "classification": {
+    "semantic_or_allocation_difference": "FAIL",
+    "performance_only_outside_tolerance": "INCONCLUSIVE",
+    "missing_or_invalid_performance_data": "INVALID",
+    "all_within_tolerance": "PASS"
+  },
+  "calibration": {
+    "source": "gate1-v2.4-three-run-non-formal-fixtures",
+    "formal_evidence_usable": false,
+    "largest_observed_relative_delta_excluding_cv": 0.239,
+    "largest_observed_cv_absolute_delta": 0.783
+  }
+}

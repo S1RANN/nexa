@@ -1,0 +1,18 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.6",
+  "failures": [],
+  "gate": "governance",
+  "generator": "nexa-gate1-v2-6-gates/raw-v1",
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "implementation_tree": "368eac5443586952e0a9da04ed080df59a3d1229",
+  "layer": "APPARATUS",
+  "metrics": {
+    "authorization": "AUTHORIZED",
+    "negative_tests": "PASS",
+    "prefreeze_closure": "PASS",
+    "thresholds_weakened": false
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}
