@@ -8,7 +8,7 @@ members = [
     "tools/contract-gates",
     "tools/gate1-decision",
     "tools/gate1-v2",
-    "tools/gate1-v2-3-fixtures",
+    "tools/gate1-v2-4-fixtures",
     "tools/gate1-v2-decision",
     "tools/gate1-v2-gates",
     "tools/gate1-experiments",

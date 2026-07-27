@@ -11,9 +11,9 @@ use serde_json::Value;
 pub type AnyError = Box<dyn std::error::Error>;
 
 pub const ROOT: &str = env!("CARGO_MANIFEST_DIR");
-pub const V2_ROOT: &str = "experiments/gate1-v2.3";
-pub const MANIFEST: &str = "experiments/gate1-v2.3/manifest.json";
-pub const TARGET_ROOT: &str = "target/gate1-v2.3";
+pub const V2_ROOT: &str = "experiments/gate1-v2.4";
+pub const MANIFEST: &str = "experiments/gate1-v2.4/manifest.json";
+pub const TARGET_ROOT: &str = "target/gate1-v2.4";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]

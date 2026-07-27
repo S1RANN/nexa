@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.4",
+  "status": "AUTHORIZED",
+  "approved_by": "repository owner",
+  "approved_at": "2026-07-27T00:00:00+08:00",
+  "approval_basis": "Nexa Milestone 5.0R4 Gate 1 v2.4 plan",
+  "previous_experiment": {
+    "experiment_version": "gate1-v2.3",
+    "status": "SEMANTICALLY_INSUFFICIENT",
+    "decision_usable": false
+  },
+  "prefreeze_closure": {
+    "path": "experiments/gate1-v2.4/prefreeze/prefreeze_closure.json",
+    "hash": "4607289c5711eb999f989af6ed89d1d0513f398b",
+    "status": "PASS"
+  },
+  "environment_qualification": {
+    "path": "experiments/gate1-v2.4/qualification/environment_qualification.json",
+    "hash": "07401fa8e42460ff3ecda611a34d71615b3d3b60",
+    "status": "QUALIFIED"
+  },
+  "acceptance_equivalence": {
+    "path": "experiments/gate1-v2.4/threshold_equivalence.json",
+    "hash": "ea0f6ad270a707a0b89548024edc25a5bd990f97",
+    "status": "PASS"
+  },
+  "scenario_manifests": {
+    "experiments/gate1-v2.4/fixtures/h1_handwritten.rs": "0d256f45aa54cc22dbe929b1ade2f4618324ff7f",
+    "experiments/gate1-v2.4/h1_mutations.json": "36ca81420d0ce58918b9e8470e6bb52d5b9ba575",
+    "experiments/gate1-v2.4/h2_cleanup_matrix.json": "507c39048cb48bfc8e6f6b3b2d6d55cc1e0ea91d",
+    "experiments/gate1-v2.4/h2_matrix.json": "a6c9617608ea4d3c366e6a07e37fd5c443d3dd54",
+    "experiments/gate1-v2.4/h3_scenarios.json": "75dc40eb9a3d59b4d1c7363dab1dbe64429d6f65",
+    "experiments/gate1-v2.4/scenario_schema.json": "0f61faef4a989931277d05c3bddb2bc38864f568"
+  },
+  "provenance_protocol": {
+    "name": "gate1-process-handshake-v1",
+    "hash": "58355719ebedf50e993e1f5d8be9f677e0ae4bf9",
+    "source": "experiments/gate1-v2.4/prefreeze/outcome_transport.json"
+  },
+  "execution_budget": {
+    "formal_run_1": 1,
+    "formal_run_2": 1,
+    "replay": 1,
+    "retry": 0
+  },
+  "worker_topology": {
+    "supervisors_per_run": 1,
+    "top_workers_per_run": 1,
+    "h1_h2_h3_workers_per_run": 3,
+    "benchmark_processes_per_h2_worker": 3
+  },
+  "output_policy": "target/gate1-v2.4 with immutable per-run directories",
+  "outcome_thresholds": "UNCHANGED_FROM_GATE1_V2_3",
+  "authorized_apparatus_changes": [
+    "mutation semantic equivalence",
+    "dimension effectiveness",
+    "scenario execution independence",
+    "outcome transport",
+    "raw-to-gate regeneration",
+    "artifact hygiene"
+  ],
+  "production_feature_changes_authorized": false
+}

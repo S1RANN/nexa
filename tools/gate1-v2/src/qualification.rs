@@ -9,11 +9,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use nexa_gate1_v2_3::{
+use nexa_gate1_v2_4::{
     AnyError, hash_file, nonce, observed_parent_pid, repository_root, stable_bytes_hash, write_json,
 };
 
-const QUALIFICATION_ROOT: &str = "target/gate1-v2.3-qualification";
+const QUALIFICATION_ROOT: &str = "target/gate1-v2.4-qualification";
 const PROTOCOL: &str = "portable-handshake-v1";
 
 pub fn spawn_minimal() -> Result<(), AnyError> {
@@ -378,7 +378,7 @@ pub fn qualify_environment(output: &Path) -> Result<(), AnyError> {
     };
     let qualification = json!({
         "schema_version": 1,
-        "experiment_version": "gate1-v2.3",
+        "experiment_version": "gate1-v2.4",
         "status": status,
         "failures": failures,
         "provenance_protocol": PROTOCOL,
@@ -412,6 +412,31 @@ pub fn qualify_environment(output: &Path) -> Result<(), AnyError> {
     )?;
     println!("{}", serde_json::to_string_pretty(&qualification)?);
     if status == "QUALIFIED" {
+        let frozen = Path::new("experiments/gate1-v2.4/qualification");
+        std::fs::create_dir_all(frozen)?;
+        for (source, name) in [
+            (&json_path, "environment_qualification.json"),
+            (&md_path, "environment_qualification.md"),
+            (
+                &output.join("environment_qualification_hashes.json"),
+                "environment_qualification_hashes.json",
+            ),
+            (&root_cause_source, "root-cause.json"),
+        ] {
+            std::fs::copy(source, frozen.join(name))?;
+        }
+        let frozen_handshake = frozen.join("formal-handshake");
+        std::fs::create_dir_all(&frozen_handshake)?;
+        for name in [
+            "process_attestation.json",
+            "parent_verification.json",
+            "probe.json",
+        ] {
+            std::fs::copy(
+                Path::new("target/gate1-v2.4-qualification/formal-handshake").join(name),
+                frozen_handshake.join(name),
+            )?;
+        }
         Ok(())
     } else {
         Err("candidate environment is not qualified".into())
@@ -666,8 +691,8 @@ fn worktree_cycle(root: PathBuf, index: usize) -> Result<Value, AnyError> {
 }
 
 fn release_binary_probe(output: &Path) -> Result<Value, AnyError> {
-    let build = run_command("cargo", &["build", "--release", "-p", "nexa-gate1-v2-3"])?;
-    let binary = repository_root().join("target/release/nexa-gate1-v2-3");
+    let build = run_command("cargo", &["build", "--release", "-p", "nexa-gate1-v2-4"])?;
+    let binary = repository_root().join("target/release/nexa-gate1-v2-4");
     let path = output.join("release-child.json");
     let token = nonce("release-child")?;
     let result = Command::new(&binary)
@@ -888,7 +913,7 @@ fn command_text(program: &str, arguments: &[&str]) -> Result<String, AnyError> {
 
 fn qualification_markdown(qualification: &Value) -> String {
     format!(
-        "# Gate 1 v2.3 Environment Qualification\n\n\
+        "# Gate 1 v2.4 Environment Qualification\n\n\
          Status: **{}**\n\n\
          Provenance protocol: `{}`\n\n\
          Atomic checks: {}\n\n\

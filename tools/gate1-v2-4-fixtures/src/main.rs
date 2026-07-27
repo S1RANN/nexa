@@ -1,11 +1,11 @@
 use std::path::Path;
 
-use nexa_gate1_v2_3_fixtures::{AnyError, FixtureCase, artifact_bundle};
+use nexa_gate1_v2_4_fixtures::{AnyError, FixtureCase, artifact_bundle};
 
 fn main() -> Result<(), AnyError> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let [case, output] = arguments.as_slice() else {
-        return Err("usage: nexa-gate1-v2-3-fixtures <case> <output>".into());
+        return Err("usage: nexa-gate1-v2-4-fixtures <case> <output>".into());
     };
     let fixture = artifact_bundle(FixtureCase::parse(case)?);
     let output = Path::new(output);

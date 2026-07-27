@@ -1,0 +1,8 @@
+{
+  "schema_version": 1,
+  "current_experiment": "gate1-v2.4",
+  "experiment_status": "FROZEN",
+  "decision": "PENDING",
+  "milestone": "5.0R4",
+  "milestone_status": "INCOMPLETE"
+}

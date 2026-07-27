@@ -144,118 +144,64 @@ fn gate_artifacts(
     pilot: bool,
     budget: bool,
 ) -> BTreeMap<&'static str, Value> {
-    let apparatus = json!({"status":"PASS","failures":[]});
-    let outcome = |status: &str| json!({"status":status,"failures":[]});
+    let apparatus =
+        |name: &str| json!({"gate":name,"contract_status":"PASS","outcome":"PASS","failures":[]});
+    let outcome = |name: &str, status: &str| json!({"gate":name,"contract_status":"PASS","outcome":status,"failures":[]});
     BTreeMap::from([
-        (
-            "governance",
-            json!({
-                "status":"PASS",
-                "failures":[],
-                "metrics":{
-                    "invalid_evidence_absent_from_ancestry":{"value":true},
-                    "negative_matrix_passed":{"value":true},
-                    "unique_authorization":{"value":true},
-                    "thresholds_equivalent":{"value":true},
-                    "frozen_inputs_valid":{"value":true}
-                }
-            }),
-        ),
-        (
-            "history",
-            json!({
-                "status":"PASS",
-                "failures":[],
-                "metrics":{
-                    "v2_2_sealed":{"value":true},
-                    "version_count":{"value":5},
-                    "all_historical_nodes_reach_current":{"value":true}
-                }
-            }),
-        ),
-        (
-            "environment",
-            json!({
-                "status":"PASS",
-                "failures":[],
-                "metrics":{"qualification_status":{"value":"QUALIFIED"}}
-            }),
-        ),
-        ("process_provenance", apparatus.clone()),
+        ("history", apparatus("history")),
+        ("governance", apparatus("governance")),
+        ("environment", apparatus("environment")),
+        ("process", apparatus("process")),
         (
             "validity",
-            json!({
-                "status": if invalid {
+            outcome(
+                "validity",
+                if invalid {
                     "INVALID"
                 } else if inconclusive {
                     "INCONCLUSIVE"
                 } else {
                     "PASS"
                 },
-                "failures":[],
-                "metrics":{"strict_clean_checks":{"value":true}}
-            }),
+            ),
         ),
-        (
-            "h1",
-            json!({
-                "status":h1,
-                "failures":[],
-                "metrics":{"real_measurements":{"value":true}}
-            }),
-        ),
-        (
-            "h2_semantic",
-            json!({
-                "status":h2,
-                "failures":[],
-                "metrics":{
-                    "scenario_count":{"value":96},
-                    "per_run_scenario_count":{"value":32}
-                }
-            }),
-        ),
-        ("h2_allocations", outcome(h2)),
-        ("h2_performance", outcome(h2)),
-        ("h3_migration", outcome(h3)),
-        ("h3_completion", outcome(h3)),
-        ("h3_transaction", outcome(h3)),
+        ("h1_equivalence", outcome("h1_equivalence", h1)),
+        ("h1_metrics", outcome("h1_metrics", h1)),
+        ("h2_configuration", outcome("h2_configuration", h2)),
+        ("h2_cleanup", outcome("h2_cleanup", h2)),
+        ("h2_invariants", outcome("h2_invariants", h2)),
+        ("h2_allocations", outcome("h2_allocations", h2)),
+        ("h2_performance", outcome("h2_performance", h2)),
+        ("h3_migration", outcome("h3_migration", h3)),
+        ("h3_completion", outcome("h3_completion", h3)),
+        ("h3_transaction", outcome("h3_transaction", h3)),
         (
             "comparison",
-            outcome(if invalid { "NOT_APPLICABLE" } else { "PASS" }),
+            outcome(
+                "comparison",
+                if invalid { "NOT_APPLICABLE" } else { "PASS" },
+            ),
         ),
         (
             "replay",
-            outcome(if invalid {
-                "NOT_RUN_DUE_TO_TERMINAL_DECISION"
-            } else {
-                "PASS"
-            }),
+            outcome(
+                "replay",
+                if invalid {
+                    "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+                } else {
+                    "PASS"
+                },
+            ),
         ),
         (
             "pilot",
-            json!({"status":"PASS","commitment":if pilot {"COMMITTED"} else {"ABSENT"},"failures":[]}),
+            json!({"gate":"pilot","contract_status":"PASS","outcome":"PASS","metrics":{"committed":pilot},"failures":[]}),
         ),
         (
             "budget",
-            json!({"status":"PASS","approved":budget,"failures":[]}),
+            json!({"gate":"budget","contract_status":"PASS","outcome":"PASS","metrics":{"approved":budget},"failures":[]}),
         ),
-        (
-            "workspace",
-            json!({
-                "status":"PASS",
-                "failures":[],
-                "metrics":{
-                    "dual_contract_layers":{"value":true},
-                    "milestone_semantics_valid":{"value":true},
-                    "contract_satisfiability_passed":{"value":true},
-                    "synthetic_git_chain_passed":{"value":true},
-                    "prefreeze_closure_passed":{"value":true},
-                    "output_isolation":{"value":true},
-                    "contract_count":{"value":36},
-                    "implementation_commit_valid":{"value":true}
-                }
-            }),
-        ),
+        ("workspace", apparatus("workspace")),
+        ("artifact_hygiene", apparatus("artifact_hygiene")),
     ])
 }
