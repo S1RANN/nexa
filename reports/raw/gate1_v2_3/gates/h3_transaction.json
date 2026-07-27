@@ -1,0 +1,24 @@
+{
+  "failures": [],
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "metrics": {
+    "per_run_scenario_count": {
+      "measurement": "RuntimeSnapshot",
+      "run_id": "packaging",
+      "sample_count": 3,
+      "source_artifact": "runs",
+      "source_pointer": "/h3/matrices/transaction",
+      "value": 9
+    },
+    "scenario_count": {
+      "measurement": "RuntimeSnapshot",
+      "run_id": "packaging",
+      "sample_count": 27,
+      "source_artifact": "runs",
+      "source_pointer": "/h3/matrices/transaction",
+      "value": 27
+    }
+  },
+  "status": "PASS"
+}

@@ -1,0 +1,16 @@
+{
+  "failures": [],
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "left": "formal-run-1",
+  "right": "replay",
+  "semantic_match": {
+    "measurement": "DerivedCalculation",
+    "run_id": "formal-run-1__replay",
+    "sample_count": 3,
+    "source_artifact": "worker/result.json",
+    "source_pointer": "/semantic_signature",
+    "value": true
+  },
+  "status": "PASS"
+}

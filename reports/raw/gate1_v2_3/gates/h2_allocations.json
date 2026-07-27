@@ -1,0 +1,48 @@
+{
+  "failures": [],
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "metrics": {
+    "explicit_resume": {
+      "measurement": "AllocatorCounter",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/h2/allocation_observer/runs/*/explicit_resume",
+      "value": 0
+    },
+    "fuel_resume": {
+      "measurement": "AllocatorCounter",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/h2/allocation_observer/runs/*/fuel_resume",
+      "value": 0
+    },
+    "host_resume": {
+      "measurement": "AllocatorCounter",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/h2/allocation_observer/runs/*/host_resume",
+      "value": 0
+    },
+    "promotion": {
+      "measurement": "AllocatorCounter",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/h2/allocation_observer/runs/*/promotion",
+      "value": 0
+    },
+    "trace_off_completion": {
+      "measurement": "AllocatorCounter",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/h2/allocation_observer/runs/*/trace_off_completion",
+      "value": 0
+    }
+  },
+  "status": "PASS"
+}

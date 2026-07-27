@@ -19,11 +19,8 @@ Milestone 4.0R3 is complete at receipt
 `reports/contracts/milestone4r3_verification_receipt.json`.
 
 <!-- gate1-v2.3-status:start -->
-Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is
-**NOT TRUSTWORTHY**. Gate 1 v2.3 is **FROZEN / INCOMPLETE**, its decision is **PENDING**, and
-Milestone 5.0R3 is **INCOMPLETE**.
-Gate 1 v2 is also **INVALID_APPARATUS** because its frozen normative inputs failed baseline
-validation; its evidence and Receipt are not decision-usable.
+Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is **NOT TRUSTWORTHY**. Gate 1 v2.3 is
+**VERIFIED_TERMINAL_DECISION** with decision **HOLD**, and Milestone 5.0R3 is **COMPLETE**.
 <!-- gate1-v2.3-status:end -->
 
 The current normative experiment entry points are:

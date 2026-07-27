@@ -1,0 +1,1091 @@
+{
+  "contract_summary": {
+    "apparatus_passed": true,
+    "failed": 0,
+    "outcomes_recomputed": true,
+    "passed": 36,
+    "total": 36
+  },
+  "contracts": [
+    {
+      "affected_paths": [
+        "reports/history/gate1/v2_2"
+      ],
+      "artifact": "history.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/v2_2_sealed/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "v2.2 terminal history is sealed and decision-unusable.",
+      "forbidden_patterns": [
+        "formal_result_import"
+      ],
+      "gate": "history",
+      "id": "G1V23-WP-001",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 1
+    },
+    {
+      "affected_paths": [
+        "reports/history/gate1/index.json",
+        "reports/history/gate1/versions"
+      ],
+      "artifact": "history.json",
+      "assertions": [
+        {
+          "actual": 5,
+          "expected": 5,
+          "operator": "eq",
+          "pointer": "/metrics/version_count/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "The unified version index contains v1 through v2.3 exactly once.",
+      "forbidden_patterns": [
+        "duplicate version"
+      ],
+      "gate": "history",
+      "id": "G1V23-WP-002",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 2
+    },
+    {
+      "affected_paths": [
+        "reports/history/gate1/supersession_graph.json"
+      ],
+      "artifact": "history.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/all_historical_nodes_reach_current/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Supersession is represented by graph reachability without rewriting old records.",
+      "forbidden_patterns": [
+        "v2.superseded_by == gate1-v2.3"
+      ],
+      "gate": "history",
+      "id": "G1V23-WP-003",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 3
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2/src/prefreeze.rs"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Graph invariants and unique current authorization hold.",
+      "forbidden_patterns": [
+        "direct-current-pointer"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-004",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 4
+    },
+    {
+      "affected_paths": [
+        ".git"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/invalid_evidence_absent_from_ancestry/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Invalid Evidence commits are absent from v2.3 ancestry.",
+      "forbidden_patterns": [
+        "branch-name-only"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-005",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 5
+    },
+    {
+      "affected_paths": [
+        "reports/contracts/gate1_v2_3_contracts.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/dual_contract_layers/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Apparatus and Outcome contracts are independently typed.",
+      "forbidden_patterns": [
+        "outcome PASS required"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-006",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 6
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2/src/main.rs"
+      ],
+      "artifact": "validity.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_APPLICABLE"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "All execution states use the frozen unified enumeration.",
+      "forbidden_patterns": [
+        "default passed"
+      ],
+      "gate": "validity",
+      "id": "G1V23-WP-007",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 7
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2-decision/src/main.rs"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/milestone_semantics_valid/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Milestone completion depends on structural closure rather than hypothesis PASS.",
+      "forbidden_patterns": [
+        "hypothesis_fail => incomplete"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-008",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 8
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2-3-fixtures"
+      ],
+      "artifact": "pilot.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Synthetic artifacts are explicitly non-formal.",
+      "forbidden_patterns": [
+        "formal_evidence_usable:true"
+      ],
+      "gate": "pilot",
+      "id": "G1V23-WP-009",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 9
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2/src/prefreeze.rs"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/negative_matrix_passed/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Governance negative matrix includes the v2.2 regression case.",
+      "forbidden_patterns": [
+        "superseded_by current"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-010",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 10
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3-dryrun/contract_satisfiability.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/contract_satisfiability_passed/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Contract manifest schema and satisfiability were checked before freeze.",
+      "forbidden_patterns": [
+        "missing pointer"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-011",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 11
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3-dryrun/decision_branches.json"
+      ],
+      "artifact": "budget.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Every legal decision branch was exercised synthetically.",
+      "forbidden_patterns": [
+        "unexercised branch"
+      ],
+      "gate": "budget",
+      "id": "G1V23-WP-012",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 12
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3-dryrun/terminal_short_circuit.json"
+      ],
+      "artifact": "replay.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "Terminal short-circuit remains fully contract and receipt recomputable.",
+      "forbidden_patterns": [
+        "fake PASS"
+      ],
+      "gate": "replay",
+      "id": "G1V23-WP-013",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 13
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3-dryrun/synthetic_git_chain.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/synthetic_git_chain_passed/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Synthetic I/E/R Git chain passes parent and path checks.",
+      "forbidden_patterns": [
+        "formal SHA"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-014",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 14
+    },
+    {
+      "affected_paths": [
+        "experiments/gate1-v2.3/prefreeze_closure.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/prefreeze_closure_passed/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "The complete prefreeze closure passed before authorization.",
+      "forbidden_patterns": [
+        "authorization-before-closure"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-015",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 15
+    },
+    {
+      "affected_paths": [
+        "experiments/gate1-v2.3/qualification"
+      ],
+      "artifact": "environment.json",
+      "assertions": [
+        {
+          "actual": "QUALIFIED",
+          "expected": "QUALIFIED",
+          "operator": "eq",
+          "pointer": "/metrics/qualification_status/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "The selected host passed the complete renewed qualification stress matrix.",
+      "forbidden_patterns": [
+        "v2.2 qualification reuse"
+      ],
+      "gate": "environment",
+      "id": "G1V23-WP-016",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 16
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2/src/lib.rs",
+        "tools/gate1-v2/src/main.rs"
+      ],
+      "artifact": "process_provenance.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Every worker uses the portable bidirectional handshake.",
+      "forbidden_patterns": [
+        "system process table"
+      ],
+      "gate": "process_provenance",
+      "id": "G1V23-WP-017",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 17
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/output_isolation/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Formal outputs are isolated outside tracked paths.",
+      "forbidden_patterns": [
+        "formal write reports"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-018",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 18
+    },
+    {
+      "affected_paths": [
+        "tools/gate1-v2/src/main.rs"
+      ],
+      "artifact": "validity.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/strict_clean_checks/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Every formal run passes strict clean preflight and postflight.",
+      "forbidden_patterns": [
+        "relaxed postflight"
+      ],
+      "gate": "validity",
+      "id": "G1V23-WP-019",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 19
+    },
+    {
+      "affected_paths": [
+        "baseline/testing/GATE1_V2_3_AUTHORIZATION.md",
+        "experiments/gate1-v2.3/authorization.json"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/unique_authorization/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Authorization uniquely binds all preconditions and exact zero-retry budget.",
+      "forbidden_patterns": [
+        "multiple authorization"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-020",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 20
+    },
+    {
+      "affected_paths": [
+        "baseline/testing/GATE1_ACCEPTANCE_V2_3.md",
+        "experiments/gate1-v2.3/threshold_equivalence.json"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/thresholds_equivalent/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Outcome thresholds are unchanged from v2, v2.1, and v2.2.",
+      "forbidden_patterns": [
+        "weakened threshold"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-021",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 21
+    },
+    {
+      "affected_paths": [
+        "experiments/gate1-v2.3/manifest.json"
+      ],
+      "artifact": "governance.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/frozen_inputs_valid/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "All formal inputs and tools are frozen without v2.2 result hashes.",
+      "forbidden_patterns": [
+        "gate1_v2_2/runs"
+      ],
+      "gate": "governance",
+      "id": "G1V23-WP-022",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 22
+    },
+    {
+      "affected_paths": [
+        "reports/contracts/gate1_v2_3_contracts.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": 36,
+          "expected": 36,
+          "operator": "eq",
+          "pointer": "/metrics/contract_count/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "The manifest covers all 36 work packages with complete fields.",
+      "forbidden_patterns": [
+        "duplicate contract ID"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-023",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 23
+    },
+    {
+      "affected_paths": [
+        ".git"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/implementation_commit_valid/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "I2.3 is frozen, clean, and contains no formal evidence.",
+      "forbidden_patterns": [
+        "reports/raw/gate1_v2_3"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-024",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 24
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h1"
+      ],
+      "artifact": "h1.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "Twenty H1 mutations use isolated real worktrees.",
+      "forbidden_patterns": [
+        "shared mutation state"
+      ],
+      "gate": "h1",
+      "id": "G1V23-WP-025",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 25
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h1"
+      ],
+      "artifact": "h1.json",
+      "assertions": [
+        {
+          "actual": true,
+          "expected": true,
+          "operator": "eq",
+          "pointer": "/metrics/real_measurements/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H1 metrics and detection phases originate in real commands.",
+      "forbidden_patterns": [
+        "fixed metric"
+      ],
+      "gate": "h1",
+      "id": "G1V23-WP-026",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ONLY_IF_RUN",
+      "work_package": 26
+    },
+    {
+      "affected_paths": [
+        "reports/raw/gate1_v2_3/gates/h1.json"
+      ],
+      "artifact": "h1.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H1 gate derives and records one valid Outcome.",
+      "forbidden_patterns": [
+        "unconditional PASS"
+      ],
+      "gate": "h1",
+      "id": "G1V23-WP-027",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 27
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h2"
+      ],
+      "artifact": "h2_semantic.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H2 invariants come from production Runtime snapshots.",
+      "forbidden_patterns": [
+        "inferred snapshot"
+      ],
+      "gate": "h2_semantic",
+      "id": "G1V23-WP-028",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 28
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h2"
+      ],
+      "artifact": "h2_semantic.json",
+      "assertions": [
+        {
+          "actual": 32,
+          "expected": 32,
+          "operator": "eq_if_run",
+          "pointer": "/metrics/per_run_scenario_count/value",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "All 32 H2 scenarios execute with snapshots and event ranges.",
+      "forbidden_patterns": [
+        "missing scenario"
+      ],
+      "gate": "h2_semantic",
+      "id": "G1V23-WP-029",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ONLY_IF_RUN",
+      "work_package": 29
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h2"
+      ],
+      "artifact": "h2_performance.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H2 performance uses three independent 1000-sample processes.",
+      "forbidden_patterns": [
+        "baseline subtraction"
+      ],
+      "gate": "h2_performance",
+      "id": "G1V23-WP-030",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 30
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h2/allocation-observer.json"
+      ],
+      "artifact": "h2_allocations.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H2 allocation gate uses raw absolute allocator events.",
+      "forbidden_patterns": [
+        "fixed zero"
+      ],
+      "gate": "h2_allocations",
+      "id": "G1V23-WP-031",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 31
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h3/scenarios/migration"
+      ],
+      "artifact": "h3_migration.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "All H3 migration scenarios are independently observed.",
+      "forbidden_patterns": [
+        "filled matrix"
+      ],
+      "gate": "h3_migration",
+      "id": "G1V23-WP-032",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 32
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3/*/h3/scenarios"
+      ],
+      "artifact": "h3_completion.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "Completion and transaction scenarios are independently observed.",
+      "forbidden_patterns": [
+        "filled true"
+      ],
+      "gate": "h3_completion",
+      "id": "G1V23-WP-033",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 33
+    },
+    {
+      "affected_paths": [
+        "reports/raw/gate1_v2_3/gates/h3_transaction.json"
+      ],
+      "artifact": "h3_transaction.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "H3 transaction gate derives an Outcome and final state hashes.",
+      "forbidden_patterns": [
+        "unconditional PASS"
+      ],
+      "gate": "h3_transaction",
+      "id": "G1V23-WP-034",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 34
+    },
+    {
+      "affected_paths": [
+        "target/gate1-v2.3"
+      ],
+      "artifact": "comparison.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": [
+            "PASS",
+            "FAIL",
+            "INVALID",
+            "INCONCLUSIVE",
+            "NOT_APPLICABLE"
+          ],
+          "operator": "in",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "OUTCOME",
+      "description": "Formal execution and replay obey the frozen budget or legal short-circuit.",
+      "forbidden_patterns": [
+        "retry"
+      ],
+      "gate": "comparison",
+      "id": "G1V23-WP-035",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALLOW_STRUCTURED_SHORT_CIRCUIT",
+      "work_package": 35
+    },
+    {
+      "affected_paths": [
+        "reports/contracts/gate1_v2_3_verification_receipt.json"
+      ],
+      "artifact": "workspace.json",
+      "assertions": [
+        {
+          "actual": "PASS",
+          "expected": "PASS",
+          "operator": "eq",
+          "pointer": "/status",
+          "reason": "assertion satisfied",
+          "satisfied": true
+        }
+      ],
+      "contract_type": "APPARATUS",
+      "description": "Gates, Contracts, Decision, Evidence, and Receipt form a verified chain.",
+      "forbidden_patterns": [
+        "production file in Evidence",
+        "non-Receipt file in Receipt"
+      ],
+      "gate": "workspace",
+      "id": "G1V23-WP-036",
+      "implementation_commit": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+      "status": "passed",
+      "terminal_applicability_rule": "ALWAYS",
+      "work_package": 36
+    }
+  ],
+  "decision": "HOLD",
+  "decision_inputs": {
+    "gate2_budget_approved": false,
+    "h1": "PASS",
+    "h2": "PASS",
+    "h3": "PASS",
+    "pilot_committed": false,
+    "replay": "PASS",
+    "validity": "PASS"
+  },
+  "evidence_sha": "SELF",
+  "experiment_version": "gate1-v2.3",
+  "formal_comparison": "PASS",
+  "gate1_status": "VERIFIED_TERMINAL_DECISION",
+  "gate2_budget": {
+    "approved": false,
+    "decision_source": "repository owner",
+    "experiment_version": "gate1-v2.3",
+    "scope": "Gate 2 implementation"
+  },
+  "hypotheses": {
+    "H1a": "PASS",
+    "H2a": "PASS",
+    "H3a": "PASS"
+  },
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "known_gaps": [],
+  "milestone": "5.0R3",
+  "milestone_status": "COMPLETE",
+  "pilot": {
+    "commitment": "NO_PILOT_TEAM",
+    "decision_source": "repository owner",
+    "experiment_version": "gate1-v2.3",
+    "recorded_at": "2026-07-27T00:00:00+08:00"
+  },
+  "replay": "PASS",
+  "schema_version": 3,
+  "validity": "PASS"
+}

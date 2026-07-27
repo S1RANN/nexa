@@ -1,0 +1,236 @@
+{
+  "after_registry": {
+    "activation_fault": true,
+    "buffered_completions": 1,
+    "commit_count": 2,
+    "completion_during_quiesce": true,
+    "delete": true,
+    "experiment": "H3 Stateful Reload",
+    "migration_limit_rejected": true,
+    "multiple_retired_epochs": 2,
+    "preserve": true,
+    "replace": true,
+    "replayed_completions": 1,
+    "rollback": true,
+    "schema_path": [
+      "v1",
+      "v2",
+      "v3"
+    ],
+    "waiting_request": true
+  },
+  "api_trace": [
+    "compile v1/v2/v3/faulted",
+    "load v1",
+    "prepare",
+    "quiesce",
+    "migrate",
+    "commit/rollback"
+  ],
+  "before_registry": {
+    "fresh_runtime": "not-started"
+  },
+  "forwarding_map": {
+    "delete": true,
+    "preserve": true,
+    "replace": true
+  },
+  "fresh_realm_runtime": true,
+  "fresh_runtime_host": true,
+  "gc_roots": 2,
+  "generation": [
+    "v1",
+    "v2",
+    "v3"
+  ],
+  "handle_resolution": true,
+  "migration_hash": "c883e9c3bf66bfaa",
+  "name": "Completion after activation fault",
+  "object_field_count": {
+    "delete": true,
+    "preserve": true,
+    "replace": true
+  },
+  "production_evidence": {
+    "activation_fault": true,
+    "buffered_completions": 1,
+    "commit_count": 2,
+    "completion_during_quiesce": true,
+    "delete": true,
+    "experiment": "H3 Stateful Reload",
+    "migration_limit_rejected": true,
+    "multiple_retired_epochs": 2,
+    "preserve": true,
+    "replace": true,
+    "replayed_completions": 1,
+    "rollback": true,
+    "schema_path": [
+      "v1",
+      "v2",
+      "v3"
+    ],
+    "waiting_request": true
+  },
+  "provenance": {
+    "measurement": "RuntimeSnapshot",
+    "run_id": "formal-run-2",
+    "sample_count": 1,
+    "source_artifact": "events.ndjson",
+    "source_pointer": "/",
+    "value": "Completion after activation fault"
+  },
+  "runtime_probe": {
+    "after": {
+      "completion_accounting": {
+        "abandoned": 0,
+        "cancelled": 0,
+        "delivered": 0,
+        "late_discarded": 2,
+        "queued": 0,
+        "reload_discarded": 0,
+        "reserved": 2
+      },
+      "continuation_arena": 0,
+      "release_queue": [
+        "ReleaseRecord { realm_id: 83, module_id: 0, epoch: 1, kind: HostRequest, object_id: 0, domain: Io }",
+        "ReleaseRecord { realm_id: 83, module_id: 0, epoch: 1, kind: HostRequest, object_id: 1, domain: Io }"
+      ],
+      "request_slots": [],
+      "resources": {
+        "completion_reservations": 0,
+        "continuations": 0,
+        "heap_objects": 0,
+        "queued_releases": 0,
+        "release_reservations": 0,
+        "requests": 0,
+        "retired_epochs": 0,
+        "scheduler_tokens": 0,
+        "scopes": 1,
+        "snapshots": 0,
+        "state_objects": 1,
+        "tasks": 0,
+        "tokens": 0
+      },
+      "scheduler": [],
+      "tasks": [
+        {
+          "continuation_id": null,
+          "continuation_resume_count": 0,
+          "request": null,
+          "scheduler_token": null,
+          "state": "Cancelled",
+          "task": "RawHandle { realm_id: 83, index: 0, generation: 0 }",
+          "terminal_record_count": 1
+        },
+        {
+          "continuation_id": null,
+          "continuation_resume_count": 0,
+          "request": null,
+          "scheduler_token": null,
+          "state": "Cancelled",
+          "task": "RawHandle { realm_id: 83, index: 1, generation: 0 }",
+          "terminal_record_count": 1
+        }
+      ],
+      "terminal_records": [
+        {
+          "record": "TaskTerminalRecord { state: Cancelled, reason: Cancelled(ReloadCommit), module_epoch: 1, continuation_resume_count: 0, final_charge: ExecutionCharge { instructions: 33, fuel_used: 34 }, trace_range: 21..24 }",
+          "task": "RawHandle { realm_id: 83, index: 0, generation: 0 }"
+        },
+        {
+          "record": "TaskTerminalRecord { state: Cancelled, reason: Cancelled(ReloadCommit), module_epoch: 1, continuation_resume_count: 0, final_charge: ExecutionCharge { instructions: 33, fuel_used: 34 }, trace_range: 24..27 }",
+          "task": "RawHandle { realm_id: 83, index: 1, generation: 0 }"
+        }
+      ]
+    },
+    "before": {
+      "completion_accounting": {
+        "abandoned": 0,
+        "cancelled": 0,
+        "delivered": 0,
+        "late_discarded": 0,
+        "queued": 0,
+        "reload_discarded": 0,
+        "reserved": 0
+      },
+      "continuation_arena": 0,
+      "release_queue": [],
+      "request_slots": [],
+      "resources": {
+        "completion_reservations": 0,
+        "continuations": 0,
+        "heap_objects": 0,
+        "queued_releases": 0,
+        "release_reservations": 0,
+        "requests": 0,
+        "retired_epochs": 0,
+        "scheduler_tokens": 0,
+        "scopes": 1,
+        "snapshots": 0,
+        "state_objects": 0,
+        "tasks": 0,
+        "tokens": 0
+      },
+      "scheduler": [],
+      "tasks": [],
+      "terminal_records": []
+    },
+    "failures": [],
+    "trace": [
+      {
+        "after_hash": "5d3c739d2be782d3",
+        "before_hash": "e3f0bfd4aa42b7f3",
+        "event": "TaskAdmission",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "8cdb446c61317ed6",
+        "before_hash": "5d3c739d2be782d3",
+        "event": "FuelYield",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "bf906aa2246f6ede",
+        "before_hash": "8cdb446c61317ed6",
+        "event": "ExplicitYield",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "4581d8fa8df28ad0",
+        "before_hash": "bf906aa2246f6ede",
+        "event": "HostWait",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "4581d8fa8df28ad0",
+        "before_hash": "4581d8fa8df28ad0",
+        "event": "BeginReload",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "2d05c7a560126b27",
+        "before_hash": "4581d8fa8df28ad0",
+        "event": "Quiesce",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "34cca1373f9fc57a",
+        "before_hash": "2d05c7a560126b27",
+        "event": "Migration",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "50be61e7ce9f4b9b",
+        "before_hash": "34cca1373f9fc57a",
+        "event": "ActivationFault",
+        "result": "Ok(())"
+      },
+      {
+        "after_hash": "a3e6d08c20214819",
+        "before_hash": "50be61e7ce9f4b9b",
+        "event": "LateCompletion",
+        "result": "Ok(())"
+      }
+    ]
+  }
+}

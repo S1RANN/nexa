@@ -1,0 +1,13 @@
+{
+  "attestation_hash": "c3fdcd03856f14a5269366539a60c82869807d18",
+  "child_id": 46567,
+  "failures": [],
+  "output_status": 0,
+  "protocol": "gate1-process-handshake-v1",
+  "result_not_before_handshake": true,
+  "result_path": "/Users/orokane/projects/nexa/target/gate1-v2.3/replay/h2/result.json",
+  "role": "h2-worker",
+  "run_id": "replay",
+  "status": "PASS",
+  "worker_reported_pid": 46567
+}

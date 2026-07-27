@@ -27,14 +27,13 @@ Gate -1
 Current implementation milestone: **4.0R3 complete**.
 
 <!-- gate1-v2.3-status:start -->
-Current project gate: **Gate 1 v2.3 frozen / incomplete**.
+Current project gate: **Gate 1 v2.3 verified terminal decision**.
 
-Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is
-**NOT TRUSTWORTHY**. None of their historical outcomes is a current decision.
+Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is **NOT TRUSTWORTHY**. None is a current decision.
 
-Current decision: **PENDING**.
+Current Gate 1 v2.3 decision: **HOLD**.
 
-Current milestone: **5.0R3 — INCOMPLETE**.
+Current milestone: **5.0R3 — COMPLETE**.
 <!-- gate1-v2.3-status:end -->
 
 ## Gates

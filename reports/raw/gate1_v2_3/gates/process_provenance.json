@@ -1,0 +1,56 @@
+{
+  "failures": [],
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "metrics": {
+    "hypothesis_attestation_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/worker/h*/process_attestation_hash",
+      "value": 9
+    },
+    "hypothesis_worker_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 9,
+      "source_artifact": "runs",
+      "source_pointer": "/worker/h*/process/process_nonce",
+      "value": 9
+    },
+    "output_directory_count": {
+      "measurement": "FileHash",
+      "run_id": "packaging",
+      "sample_count": 3,
+      "source_artifact": "runs",
+      "source_pointer": "/",
+      "value": 3
+    },
+    "supervisor_process_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 3,
+      "source_artifact": "runs",
+      "source_pointer": "/process/process_nonce",
+      "value": 3
+    },
+    "top_level_attestation_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 3,
+      "source_artifact": "runs",
+      "source_pointer": "/worker/process_attestation_hash",
+      "value": 3
+    },
+    "top_level_worker_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 3,
+      "source_artifact": "runs",
+      "source_pointer": "/worker/process/process_nonce",
+      "value": 3
+    }
+  },
+  "status": "PASS"
+}

@@ -1,0 +1,56 @@
+{
+  "failures": [],
+  "implementation_sha": "a0bb7329e3691eff138c2d9b17538e0dc9634018",
+  "implementation_tree": "2cede56c89ec3171ddadafca995506ee3a893d5f",
+  "metrics": {
+    "failing_atomic_check": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/root_cause/failing_atomic_check",
+      "value": "parent_process_id"
+    },
+    "provenance_protocol": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/provenance_protocol",
+      "value": "portable-handshake-v1"
+    },
+    "qualification_status": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/status",
+      "value": "QUALIFIED"
+    },
+    "spawn_itself_supported": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/root_cause/spawn_itself_supported",
+      "value": true
+    },
+    "stress_failure_count": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/stress_test/failures",
+      "value": 0
+    },
+    "v2_1_failure_reproduced": {
+      "measurement": "ProcessResult",
+      "run_id": "packaging",
+      "sample_count": 1,
+      "source_artifact": "experiments/gate1-v2.3/qualification/environment_qualification.json",
+      "source_pointer": "/root_cause/v2_1_failure_reproduced",
+      "value": true
+    }
+  },
+  "status": "PASS"
+}
