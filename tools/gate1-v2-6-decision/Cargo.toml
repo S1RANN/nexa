@@ -1,0 +1,15 @@
+[package]
+name = "nexa-gate1-v2-6-decision"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nexa-gate1-v2-6 = { path = "../gate1-v2-6" }
+nexa-gate1-v2-6-gates = { path = "../gate1-v2-6-gates" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
