@@ -19,22 +19,23 @@ Gate -1
 → Gate 1 v2 INVALID_APPARATUS
 → Gate 1 v2.1 INVALID
 → Gate 1 v2.2 NOT TRUSTWORTHY
-→ Gate 1 v2.3
-→ Gate 1 v2.3 Decision
+→ Gate 1 v2.3 SEMANTICALLY_INSUFFICIENT
+→ Gate 1 v2.4
+→ Gate 1 v2.4 Decision
 → Pilot / Gate 2 RFC / Pivot / Stop
 ```
 
 Current implementation milestone: **4.0R3 complete**.
 
-<!-- gate1-v2.3-status:start -->
-Current project gate: **Gate 1 v2.3 verified terminal decision**.
+<!-- gate1-v2.4-status:start -->
+Current project gate: **Gate 1 v2.4 frozen / incomplete**.
 
-Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is **NOT TRUSTWORTHY**. None is a current decision.
+Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID**, Gate 1 v2.2 is **NOT TRUSTWORTHY**, and Gate 1 v2.3 is **SEMANTICALLY_INSUFFICIENT**. None is a current decision.
 
-Current Gate 1 v2.3 decision: **HOLD**.
+Current Gate 1 v2.4 decision: **PENDING**.
 
-Current milestone: **5.0R3 — COMPLETE**.
-<!-- gate1-v2.3-status:end -->
+Current milestone: **5.0R4 — INCOMPLETE**.
+<!-- gate1-v2.4-status:end -->
 
 ## Gates
 
@@ -48,8 +49,9 @@ Current milestone: **5.0R3 — COMPLETE**.
 | Gate 1 v2 | v1 apparatus invalidated | Historical baseline-integrity review | Invalid apparatus |
 | Gate 1 v2.1 | Qualified provenance unavailable | Historical terminal validity review | Invalid |
 | Gate 1 v2.2 | Qualified technical runs | Historical governance review | Not trustworthy |
-| Gate 1 v2.3 | Qualified environment and unchanged thresholds | Two valid runs, replay, computed contracts | Frozen |
-| Gate 1 v2.3 Decision | Valid v2.3 evidence is available | One legal terminal decision is recorded | Pending |
+| Gate 1 v2.3 | Qualified environment and unchanged thresholds | Historical semantic review | Semantically insufficient |
+| Gate 1 v2.4 | Scenario-real apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |
+| Gate 1 v2.4 Decision | Valid v2.4 evidence is available | One legal terminal decision and receipt are recorded | Pending |
 | Pilot | Gate 1 permits Pilot and a team commits | Pilot exit review accepts, pivots, or stops | Conditional |
 | Gate 2 RFC | H1/H2 pass, H3 is acceptable, Pilot commits, budget is approved | RFC decision only; no implementation is implied | Conditional |
 

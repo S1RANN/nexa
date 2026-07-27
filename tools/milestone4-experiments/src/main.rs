@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::hint::black_box;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Instant;
 
 use nexa_core::StableId;
@@ -190,11 +193,18 @@ struct H2Report {
 #[derive(Debug, Serialize)]
 struct H2Case {
     calls_per_frame: usize,
+    expected_calls: usize,
+    observed_calls: usize,
     first_slice_target_percent: u32,
     promotion_target_percent: u32,
+    expected_promotions: usize,
     trace: bool,
+    trace_event_count: usize,
     host_call: bool,
+    host_call_count: usize,
     complex_types: bool,
+    complex_value_count: usize,
+    module_fingerprint: u64,
     completed: usize,
     observed_first_slice: usize,
     observed_promotions: usize,
@@ -262,6 +272,7 @@ fn run_h2_case(
     module: nexa_verifier::VerifiedModule,
     host_hash: StableId,
 ) -> Result<H2Case, Box<dyn std::error::Error>> {
+    let module_fingerprint = stable_bytes_fingerprint(&module.module().encode());
     let mut config = RealmConfig::default();
     let capacity = u32::try_from(calls).unwrap_or(u32::MAX).saturating_add(8);
     config.runtime_limits.max_tasks = capacity;
@@ -270,11 +281,15 @@ fn run_h2_case(
     config.tombstone_capacity = calls.saturating_add(8);
     config.max_heap_objects = capacity.saturating_mul(4);
     let runtime_host = RuntimeHost::new(calls.saturating_mul(2));
+    let host_call_counter = Arc::new(AtomicUsize::new(0));
     let mut realm = if host_call {
         RealmRuntime::hosted(
             config,
             runtime_host.clone(),
-            Box::new(H2Registry { hash: host_hash }),
+            Box::new(H2Registry {
+                hash: host_hash,
+                call_count: Arc::clone(&host_call_counter),
+            }),
         )?
     } else {
         RealmRuntime::isolated(config)
@@ -308,6 +323,8 @@ fn run_h2_case(
         completed += 1;
     }
     let elapsed = started.elapsed().as_nanos().max(1);
+    let trace_event_count = realm.trace().records().len();
+    let host_call_count = host_call_counter.load(Ordering::SeqCst);
     let ledger = realm.resource_ledger();
     black_box(ledger);
     drop(realm);
@@ -316,11 +333,18 @@ fn run_h2_case(
     }
     Ok(H2Case {
         calls_per_frame: calls,
+        expected_calls: calls,
+        observed_calls: completed,
         first_slice_target_percent: first_slice_target,
         promotion_target_percent: promotion_target,
+        expected_promotions: promoted,
         trace,
+        trace_event_count,
         host_call,
+        host_call_count,
         complex_types,
+        complex_value_count: if complex_types { completed } else { 0 },
+        module_fingerprint,
         completed,
         observed_first_slice: calls.saturating_sub(promoted),
         observed_promotions: promoted,
@@ -367,6 +391,7 @@ task fn run(value: i32) -> i32 {
 
 struct H2Registry {
     hash: StableId,
+    call_count: Arc<AtomicUsize>,
 }
 
 impl HostRegistry for H2Registry {
@@ -380,6 +405,7 @@ impl HostRegistry for H2Registry {
         _: &mut ResourceContext<'_>,
         args: HostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
+        self.call_count.fetch_add(1, Ordering::SeqCst);
         if id != 0 || args.len() != 2 {
             return Err(HostTrap::UnknownFunction(id));
         }
@@ -393,6 +419,12 @@ impl HostRegistry for H2Registry {
             value + delta,
         )))
     }
+}
+
+fn stable_bytes_fingerprint(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
 }
 
 #[derive(Debug, Serialize)]

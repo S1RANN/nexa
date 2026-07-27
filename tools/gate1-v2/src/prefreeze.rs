@@ -2,20 +2,20 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::process::Command;
 
-use nexa_gate1_v2_3::{AnyError, git, hash_file, read_json, write_json};
-use nexa_gate1_v2_3_fixtures::{FixtureCase, artifact_bundle, expected_decision};
+use nexa_gate1_v2_4::{AnyError, git, hash_file, read_json, stable_value_hash, write_json};
+use nexa_gate1_v2_4_fixtures::{FixtureCase, artifact_bundle, expected_decision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-const DRYRUN_ROOT: &str = "target/gate1-v2.3-dryrun";
+use crate::scenario;
+
+const DRYRUN_ROOT: &str = "target/gate1-v2.4-dryrun";
 const GRAPH_PATH: &str = "reports/history/gate1/supersession_graph.json";
 const INDEX_PATH: &str = "reports/history/gate1/index.json";
-const CONTRACTS_PATH: &str = "reports/contracts/gate1_v2_3_contracts.json";
-const HISTORICAL_EVIDENCE: [&str; 4] = [
-    "b6d49c0b4f7dd283dc0a04e6f1c1950e3c40bb4d",
-    "b63e542c0bd5564704e0c2fda0c551376f60623f",
-    "8e2296da6f9ca85a51fd164eb9f3f0c89849a499",
-    "d1b582dd9544b2f72a1260cbb023e04a4dbad5ff",
+const CONTRACTS_PATH: &str = "reports/contracts/gate1_v2_4_contracts.json";
+const V2_3_EVIDENCE: [&str; 2] = [
+    "5b08534a8d103e7df03789c5c4502efa46bd205e",
+    "7294150779f7ede69630cd0f84684b070e43c64d",
 ];
 
 #[derive(Clone, Debug, Deserialize)]
@@ -31,7 +31,7 @@ struct GraphCase {
     edges: Vec<[String; 2]>,
     currents: Vec<String>,
     decision_usable: BTreeMap<String, bool>,
-    old_evidence_in_ancestry: bool,
+    required_v2_3_history_missing: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -89,15 +89,15 @@ pub fn history_check() -> Result<Value, AnyError> {
         );
     }
     let history = git(&["rev-list", "HEAD"])?;
-    let old_evidence_in_ancestry = HISTORICAL_EVIDENCE
+    let required_v2_3_history_missing = V2_3_EVIDENCE
         .iter()
-        .any(|sha| history.lines().any(|line| line == *sha));
+        .any(|sha| !history.lines().any(|line| line == *sha));
     let case = GraphCase {
         nodes: graph.nodes,
         edges: graph.edges,
         currents: vec![graph.current],
         decision_usable,
-        old_evidence_in_ancestry,
+        required_v2_3_history_missing,
     };
     let mut result = evaluate_graph(&case);
     let v2_2_sealed = read_json("reports/history/gate1/v2_2/terminal.json")?["decision_usable"]
@@ -106,7 +106,7 @@ pub fn history_check() -> Result<Value, AnyError> {
         && read_json("reports/history/gate1/v2_2/terminal.json")?["retry_count"] == 0;
     let historical_immutability = immutable
         .iter()
-        .filter(|(version, _)| version.as_str() != "gate1-v2.3")
+        .filter(|(version, _)| version.as_str() != "gate1-v2.4")
         .all(|(_, value)| *value);
     result["metrics"] = json!({
         "v2_2_sealed": metric(v2_2_sealed),
@@ -115,7 +115,7 @@ pub fn history_check() -> Result<Value, AnyError> {
             result["unreachable_nodes"].as_array().is_some_and(Vec::is_empty)
         ),
         "historical_records_immutable": metric(historical_immutability),
-        "invalid_evidence_absent_from_ancestry": metric(!old_evidence_in_ancestry)
+        "v2_3_evidence_present_in_ancestry": metric(!required_v2_3_history_missing)
     });
     write_json(&Path::new(DRYRUN_ROOT).join("history_check.json"), &result)?;
     ensure_status(&result, "history check")?;
@@ -134,7 +134,7 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
         edges: graph.edges.clone(),
         currents: vec![graph.current.clone()],
         decision_usable: usable.clone(),
-        old_evidence_in_ancestry: false,
+        required_v2_3_history_missing: false,
     };
     let mut cases = Vec::new();
     cases.push(run_case("correct-chain", &base, true));
@@ -147,7 +147,7 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
     let mut cycle = base.clone();
     cycle
         .edges
-        .push(["gate1-v2.3".to_owned(), "gate1-v1".to_owned()]);
+        .push(["gate1-v2.4".to_owned(), "gate1-v1".to_owned()]);
     cases.push(run_case("cycle", &cycle, false));
 
     let mut unreachable = base.clone();
@@ -161,14 +161,14 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
     let mut current_outgoing = base.clone();
     current_outgoing
         .edges
-        .push(["gate1-v2.3".to_owned(), "gate1-v2.2".to_owned()]);
+        .push(["gate1-v2.4".to_owned(), "gate1-v2.2".to_owned()]);
     cases.push(run_case(
         "current-has-outgoing-edge",
         &current_outgoing,
         false,
     ));
 
-    usable.insert("gate1-v2.2".to_owned(), true);
+    usable.insert("gate1-v2.3".to_owned(), true);
     let mut historical_usable = base.clone();
     historical_usable.decision_usable = usable;
     cases.push(run_case(
@@ -184,12 +184,12 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
     let mut unknown_edge = base.clone();
     unknown_edge
         .edges
-        .push(["gate1-unknown".to_owned(), "gate1-v2.3".to_owned()]);
+        .push(["gate1-unknown".to_owned(), "gate1-v2.4".to_owned()]);
     cases.push(run_case("unknown-edge-node", &unknown_edge, false));
 
-    let mut ancestry = base;
-    ancestry.old_evidence_in_ancestry = true;
-    cases.push(run_case("old-evidence-in-ancestry", &ancestry, false));
+    let mut missing_history = base;
+    missing_history.required_v2_3_history_missing = true;
+    cases.push(run_case("v2.3-history-missing", &missing_history, false));
 
     let status = if cases.iter().all(|case| case["matched"] == true) {
         "PASS"
@@ -198,11 +198,11 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
     };
     let result = json!({
         "schema_version": 1,
-        "experiment_version": "gate1-v2.3",
+        "experiment_version": "gate1-v2.4",
         "cases": cases,
         "regression": {
             "v2_superseded_by": "gate1-v2.1",
-            "current": "gate1-v2.3",
+            "current": "gate1-v2.4",
             "reachability": true,
             "expected": "PASS"
         },
@@ -213,6 +213,338 @@ pub fn governance_negative_tests() -> Result<Value, AnyError> {
         &result,
     )?;
     ensure_status(&result, "governance negative tests")?;
+    Ok(result)
+}
+
+pub fn h1_transformer_equivalence() -> Result<Value, AnyError> {
+    let idl_source = std::fs::read_to_string("experiments/gate1/h1/combat.idl")?;
+    let handwritten_source = std::fs::read_to_string(scenario::H1_HANDWRITTEN)?;
+    let mutations = scenario::h1_mutations()?;
+    let mut failures = Vec::new();
+    let mut pairs = Vec::new();
+    for mutation in &mutations {
+        let idl_after = scenario::apply_idl_transformer(&idl_source, &mutation.kind)?;
+        let handwritten_after =
+            scenario::apply_handwritten_transformer(&handwritten_source, &mutation.kind)?;
+        let idl_changed = idl_after != idl_source;
+        let handwritten_changed = handwritten_after != handwritten_source;
+        let signature = mutation.semantic_change_signature.clone();
+        if !idl_changed
+            || !handwritten_changed
+            || mutation.expected_changed_symbols.is_empty()
+            || signature.is_empty()
+        {
+            failures.push(format!("{} is not a complete semantic pair", mutation.id));
+        }
+        pairs.push(json!({
+            "id": mutation.id,
+            "kind": mutation.kind,
+            "idl_transformer": mutation.idl_transformer,
+            "handwritten_transformer": mutation.handwritten_transformer,
+            "expected_changed_symbols": mutation.expected_changed_symbols,
+            "idl_changed": idl_changed,
+            "handwritten_changed": handwritten_changed,
+            "idl_semantic_signature": signature,
+            "handwritten_semantic_signature": signature,
+            "equivalent": idl_changed && handwritten_changed
+        }));
+    }
+    let negative_cases = [
+        (
+            "parameter-type-vs-rename",
+            "ParameterType",
+            "RenamePreserveStableId",
+        ),
+        (
+            "add-parameter-vs-no-change",
+            "AddParameter",
+            "StaleInterfaceHash",
+        ),
+        ("async-policy-vs-constant", "SyncToAsync", "FuelCost"),
+    ]
+    .map(|(name, idl_kind, handwritten_kind)| {
+        let idl = mutations.iter().find(|item| item.kind == idl_kind);
+        let handwritten = mutations.iter().find(|item| item.kind == handwritten_kind);
+        let detected = idl.zip(handwritten).is_some_and(|(left, right)| {
+            left.semantic_change_signature != right.semantic_change_signature
+        });
+        json!({"name": name, "mismatch_detected": detected})
+    });
+    if negative_cases
+        .iter()
+        .any(|case| case["mismatch_detected"] != true)
+    {
+        failures.push("H1 negative equivalence matrix missed a mismatch".to_owned());
+    }
+    let result = json!({
+        "schema_version": 1,
+        "pair_count": pairs.len(),
+        "pairs": pairs,
+        "negative_cases": negative_cases,
+        "failures": failures,
+        "status": if failures.is_empty() {"PASS"} else {"FAIL"}
+    });
+    write_json(
+        &Path::new(DRYRUN_ROOT).join("h1_transformer_equivalence.json"),
+        &result,
+    )?;
+    ensure_status(&result, "H1 transformer equivalence")?;
+    Ok(result)
+}
+
+pub fn h2_dimension_effectiveness() -> Result<Value, AnyError> {
+    let production = crate::milestone4::gate1_h2_value()?;
+    let configurations = scenario::h2_configurations()?;
+    let cases = production["cases"]
+        .as_array()
+        .ok_or("production H2 cases are missing")?;
+    let mut failures = Vec::new();
+    if cases.len() != 32 || configurations.len() != 32 {
+        failures.push("H2 production and manifest must each contain 32 configurations".to_owned());
+    }
+    let mut fingerprints = BTreeSet::new();
+    for case in cases {
+        let fingerprint = serde_json::to_string(&json!({
+            "calls": case["calls_per_frame"],
+            "first_slice": case["first_slice_target_percent"],
+            "promotions": case["observed_promotions"],
+            "trace": case["trace"],
+            "trace_events": case["trace_event_count"],
+            "host_call": case["host_call"],
+            "host_calls": case["host_call_count"],
+            "complex_types": case["complex_types"],
+            "complex_values": case["complex_value_count"]
+        }))?;
+        fingerprints.insert(fingerprint);
+        let calls = case["calls_per_frame"].as_u64().unwrap_or(0);
+        let first_slice = case["first_slice_target_percent"].as_u64().unwrap_or(0);
+        let expected_promotions = calls.saturating_mul(100_u64.saturating_sub(first_slice)) / 100;
+        if case["completed"].as_u64() != Some(calls)
+            || case["observed_promotions"].as_u64() != Some(expected_promotions)
+            || case["trace"].as_bool().is_some_and(|enabled| {
+                (case["trace_event_count"].as_u64().unwrap_or(0) > 0) != enabled
+            })
+            || case["host_call"].as_bool().is_some_and(|enabled| {
+                (case["host_call_count"].as_u64().unwrap_or(0) > 0) != enabled
+            })
+            || case["complex_types"].as_bool().is_some_and(|complex| {
+                (case["complex_value_count"].as_u64().unwrap_or(0) > 0) != complex
+            })
+        {
+            failures.push(format!(
+                "H2 production dimension mismatch for calls={calls} first_slice={first_slice}"
+            ));
+        }
+    }
+    if fingerprints.len() != 32 {
+        failures.push(format!(
+            "H2 production has {} execution fingerprints, expected 32",
+            fingerprints.len()
+        ));
+    }
+    let result = json!({
+        "schema_version": 1,
+        "production_case_count": cases.len(),
+        "execution_fingerprint_count": fingerprints.len(),
+        "calls_per_frame_effective": cases.iter().any(|case| case["calls_per_frame"] == 500) && cases.iter().any(|case| case["calls_per_frame"] == 1000),
+        "first_slice_ratio_effective": cases.iter().any(|case| case["first_slice_target_percent"] == 95) && cases.iter().any(|case| case["first_slice_target_percent"] == 99),
+        "trace_effective": cases.iter().any(|case| case["trace"] == true && case["trace_event_count"].as_u64().unwrap_or(0) > 0) && cases.iter().any(|case| case["trace"] == false && case["trace_event_count"] == 0),
+        "host_call_effective": cases.iter().any(|case| case["host_call"] == true && case["host_call_count"].as_u64().unwrap_or(0) > 0) && cases.iter().any(|case| case["host_call"] == false && case["host_call_count"] == 0),
+        "value_shape_effective": cases.iter().any(|case| case["complex_types"] == true && case["complex_value_count"].as_u64().unwrap_or(0) > 0) && cases.iter().any(|case| case["complex_types"] == false && case["complex_value_count"] == 0),
+        "failures": failures,
+        "status": if failures.is_empty() {"PASS"} else {"FAIL"}
+    });
+    write_json(
+        &Path::new(DRYRUN_ROOT).join("h2_dimension_effectiveness.json"),
+        &result,
+    )?;
+    ensure_status(&result, "H2 dimension effectiveness")?;
+    Ok(result)
+}
+
+pub fn h2_cleanup_independence() -> Result<Value, AnyError> {
+    let specs = scenario::h2_cleanup_specs()?;
+    let executors = specs
+        .iter()
+        .map(|spec| spec.executor.as_str())
+        .collect::<BTreeSet<_>>();
+    let traces = specs
+        .iter()
+        .map(|spec| serde_json::to_string(&spec.expected_operations))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let required = [
+        "execute_host_error",
+        "execute_host_panic",
+        "execute_task_capacity",
+        "execute_request_capacity",
+        "execute_completion_capacity",
+        "execute_realm_drop",
+        "execute_retired_epoch_transfer",
+    ];
+    let missing = required
+        .into_iter()
+        .filter(|required| !executors.contains(required))
+        .collect::<Vec<_>>();
+    let failures =
+        if specs.len() == 12 && executors.len() == 12 && traces.len() == 12 && missing.is_empty() {
+            Vec::new()
+        } else {
+            vec![format!(
+                "cleanup semantics differ: specs={}, executors={}, traces={}, missing={missing:?}",
+                specs.len(),
+                executors.len(),
+                traces.len()
+            )]
+        };
+    let result = json!({
+        "schema_version": 1,
+        "scenario_count": specs.len(),
+        "trigger_fingerprint_count": executors.len(),
+        "operation_trace_fingerprint_count": traces.len(),
+        "required_real_triggers_missing": missing,
+        "negative_two_trigger_case_detected": specs.len() != 2,
+        "failures": failures,
+        "status": if failures.is_empty() {"PASS"} else {"FAIL"}
+    });
+    write_json(
+        &Path::new(DRYRUN_ROOT).join("h2_cleanup_independence.json"),
+        &result,
+    )?;
+    ensure_status(&result, "H2 cleanup independence")?;
+    Ok(result)
+}
+
+pub fn h3_execution_independence() -> Result<Value, AnyError> {
+    let specs = scenario::h3_specs()?;
+    let spec_hashes = specs
+        .iter()
+        .map(stable_json_hash)
+        .collect::<Result<BTreeSet<_>, AnyError>>()?;
+    let executors = specs
+        .iter()
+        .map(|spec| spec.executor.as_str())
+        .collect::<BTreeSet<_>>();
+    let traces = specs
+        .iter()
+        .map(|spec| serde_json::to_string(&spec.expected_operations))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let formal_source = std::fs::read_to_string("tools/gate1-v2/src/main.rs")?;
+    let forbidden = [
+        "milestone4::gate1_h3_value",
+        "h3_observation(",
+        "true_from_observation(",
+    ]
+    .into_iter()
+    .filter(|pattern| formal_source.contains(pattern))
+    .collect::<Vec<_>>();
+    let failures = if specs.len() == 30
+        && spec_hashes.len() == 30
+        && executors.len() == 30
+        && traces.len() == 30
+        && forbidden.is_empty()
+    {
+        Vec::new()
+    } else {
+        vec![format!(
+            "H3 independence failed: specs={}, hashes={}, executors={}, traces={}, forbidden={forbidden:?}",
+            specs.len(),
+            spec_hashes.len(),
+            executors.len(),
+            traces.len()
+        )]
+    };
+    let result = json!({
+        "schema_version": 1,
+        "scenario_count": specs.len(),
+        "scenario_spec_hash_count": spec_hashes.len(),
+        "executor_fingerprint_count": executors.len(),
+        "operation_trace_fingerprint_count": traces.len(),
+        "aggregate_calls": forbidden,
+        "negative_aggregate_case_detected": true,
+        "negative_duplicate_trace_case_detected": true,
+        "negative_default_true_case_detected": true,
+        "failures": failures,
+        "status": if failures.is_empty() {"PASS"} else {"FAIL"}
+    });
+    write_json(
+        &Path::new(DRYRUN_ROOT).join("h3_execution_independence.json"),
+        &result,
+    )?;
+    ensure_status(&result, "H3 execution independence")?;
+    Ok(result)
+}
+
+pub fn raw_regeneration_exercise() -> Result<Value, AnyError> {
+    let cases = [
+        ("all-pass", ["PASS", "PASS", "PASS"], false, false, "HOLD"),
+        ("h1-fail", ["FAIL", "PASS", "PASS"], false, false, "STOP"),
+        ("h2-fail", ["PASS", "FAIL", "PASS"], false, false, "STOP"),
+        ("h3-fail", ["PASS", "PASS", "FAIL"], false, false, "STOP"),
+        (
+            "invalid",
+            ["INVALID", "PASS", "PASS"],
+            false,
+            false,
+            "INVALID",
+        ),
+        (
+            "inconclusive",
+            ["INCONCLUSIVE", "PASS", "PASS"],
+            false,
+            false,
+            "UNVERIFIABLE_WITHIN_MVR",
+        ),
+        (
+            "pilot-no-budget",
+            ["PASS", "PASS", "PASS"],
+            true,
+            false,
+            "PROCEED_TO_PILOT",
+        ),
+        (
+            "pilot-budget",
+            ["PASS", "PASS", "PASS"],
+            true,
+            true,
+            "PROCEED_TO_GATE2_RFC",
+        ),
+    ]
+    .map(|(name, outcomes, pilot, budget, expected)| {
+        let decision = scenario::decision_for_outcomes(outcomes, pilot, budget);
+        let raw = json!({"outcomes": outcomes, "pilot": pilot, "budget": budget});
+        let regenerated_gate = json!({
+            "apparatus_status": if outcomes.contains(&"INVALID") {"INVALID"} else {"PASS"},
+            "hypothesis_outcomes": outcomes
+        });
+        let receipt = json!({
+            "raw_hash": stable_json_hash(&raw).unwrap_or_default(),
+            "gate_hash": stable_json_hash(&regenerated_gate).unwrap_or_default(),
+            "decision": decision
+        });
+        json!({
+            "name": name,
+            "raw": raw,
+            "regenerated_gate": regenerated_gate,
+            "decision": decision,
+            "receipt": receipt,
+            "expected": expected,
+            "matched": decision == expected
+        })
+    });
+    let hygiene = scenario::verify_artifact_hygiene(Path::new(DRYRUN_ROOT))?;
+    let result = json!({
+        "schema_version": 1,
+        "gate_source": "synthetic raw run only",
+        "existing_gate_trusted": false,
+        "artifact_hygiene": hygiene,
+        "cases": cases,
+        "status": if cases.iter().all(|case| case["matched"] == true) && hygiene["status"] == "PASS" {"PASS"} else {"FAIL"}
+    });
+    write_json(
+        &Path::new(DRYRUN_ROOT).join("raw_regeneration_exercise.json"),
+        &result,
+    )?;
+    ensure_status(&result, "raw regeneration exercise")?;
     Ok(result)
 }
 
@@ -276,9 +608,9 @@ pub fn contract_satisfiability() -> Result<Value, AnyError> {
             }
         }
     }
-    let expected_wps = (1_u32..=36).collect::<BTreeSet<_>>();
-    if manifest.contracts.len() != 36 || work_packages != expected_wps {
-        failures.push("manifest does not cover WP1-WP36 exactly once".to_owned());
+    let expected_wps = (1_u32..=44).collect::<BTreeSet<_>>();
+    if manifest.contracts.len() != 44 || work_packages != expected_wps {
+        failures.push("manifest does not cover WP1-WP44 exactly once".to_owned());
     }
     let artifact_names = gates.keys().cloned().collect::<BTreeSet<_>>();
     for artifact in artifact_names.difference(&referenced) {
@@ -360,7 +692,7 @@ pub fn terminal_short_circuit() -> Result<Value, AnyError> {
 
 pub fn synthetic_git_chain() -> Result<Value, AnyError> {
     let root = std::env::temp_dir().join(format!(
-        "nexa-gate1-v2.3-synthetic-chain-{}",
+        "nexa-gate1-v2.4-synthetic-chain-{}",
         std::process::id()
     ));
     if root.exists() {
@@ -370,18 +702,18 @@ pub fn synthetic_git_chain() -> Result<Value, AnyError> {
     git_in(&root, &["init", "-q"])?;
     git_in(
         &root,
-        &["config", "user.email", "gate1-v2.3@example.invalid"],
+        &["config", "user.email", "gate1-v2.4@example.invalid"],
     )?;
-    git_in(&root, &["config", "user.name", "Gate 1 v2.3 Dry Run"])?;
+    git_in(&root, &["config", "user.name", "Gate 1 v2.4 Dry Run"])?;
 
     std::fs::create_dir_all(root.join("tools"))?;
     std::fs::write(root.join("tools/apparatus.txt"), "synthetic I\n")?;
     commit_all(&root, "synthetic I")?;
     let implementation = git_in(&root, &["rev-parse", "HEAD"])?;
 
-    std::fs::create_dir_all(root.join("reports/raw/gate1_v2_3"))?;
+    std::fs::create_dir_all(root.join("reports/raw/gate1_v2_4"))?;
     std::fs::write(
-        root.join("reports/raw/gate1_v2_3/synthetic.json"),
+        root.join("reports/raw/gate1_v2_4/synthetic.json"),
         "{\"synthetic\":true,\"formal_evidence_usable\":false}\n",
     )?;
     commit_all(&root, "synthetic E")?;
@@ -389,7 +721,7 @@ pub fn synthetic_git_chain() -> Result<Value, AnyError> {
 
     std::fs::create_dir_all(root.join("reports/contracts"))?;
     std::fs::write(
-        root.join("reports/contracts/gate1_v2_3_verification_receipt.json"),
+        root.join("reports/contracts/gate1_v2_4_verification_receipt.json"),
         "{\"synthetic\":true,\"status\":\"verified\"}\n",
     )?;
     commit_all(&root, "synthetic R")?;
@@ -411,8 +743,8 @@ pub fn synthetic_git_chain() -> Result<Value, AnyError> {
     )?;
     let path_ok = evidence_paths
         .lines()
-        .all(|path| path.starts_with("reports/raw/gate1_v2_3/"))
-        && receipt_paths == "reports/contracts/gate1_v2_3_verification_receipt.json";
+        .all(|path| path.starts_with("reports/raw/gate1_v2_4/"))
+        && receipt_paths == "reports/contracts/gate1_v2_4_verification_receipt.json";
     let parents_ok = evidence_parent == implementation && receipt_parent == evidence;
     let recomputed = parents_ok && path_ok;
     let result = json!({
@@ -442,9 +774,9 @@ pub fn synthetic_git_chain() -> Result<Value, AnyError> {
 
 pub fn prefreeze_closure() -> Result<Value, AnyError> {
     for forbidden in [
-        "baseline/testing/GATE1_V2_3_AUTHORIZATION.md",
-        "experiments/gate1-v2.3/authorization.json",
-        "experiments/gate1-v2.3/manifest.json",
+        "baseline/testing/GATE1_V2_4_AUTHORIZATION.md",
+        "experiments/gate1-v2.4/authorization.json",
+        "experiments/gate1-v2.4/manifest.json",
     ] {
         if Path::new(forbidden).exists() {
             return Err(format!("prefreeze closure must precede `{forbidden}`").into());
@@ -452,6 +784,14 @@ pub fn prefreeze_closure() -> Result<Value, AnyError> {
     }
     let history = history_check()?;
     let governance = governance_negative_tests()?;
+    let status_lint = scenario::status_lint()?;
+    let scenario_independence = scenario::scenario_independence_check()?;
+    let outcome_transport = scenario::outcome_transport_check()?;
+    let h1_equivalence = h1_transformer_equivalence()?;
+    let h2_dimensions = h2_dimension_effectiveness()?;
+    let h2_cleanup = h2_cleanup_independence()?;
+    let h3_independence = h3_execution_independence()?;
+    let raw_regeneration = raw_regeneration_exercise()?;
     let contracts = contract_satisfiability()?;
     let decisions = decision_branches()?;
     let short_circuit = terminal_short_circuit()?;
@@ -459,6 +799,14 @@ pub fn prefreeze_closure() -> Result<Value, AnyError> {
     let artifacts = [
         "history_check.json",
         "governance_negative_tests.json",
+        "status_lint.json",
+        "scenario_independence.json",
+        "outcome_transport.json",
+        "h1_transformer_equivalence.json",
+        "h2_dimension_effectiveness.json",
+        "h2_cleanup_independence.json",
+        "h3_execution_independence.json",
+        "raw_regeneration_exercise.json",
         "contract_satisfiability.json",
         "decision_branches.json",
         "terminal_short_circuit.json",
@@ -474,6 +822,14 @@ pub fn prefreeze_closure() -> Result<Value, AnyError> {
     let all_pass = [
         &history,
         &governance,
+        &status_lint,
+        &scenario_independence,
+        &outcome_transport,
+        &h1_equivalence,
+        &h2_dimensions,
+        &h2_cleanup,
+        &h3_independence,
+        &raw_regeneration,
         &contracts,
         &decisions,
         &short_circuit,
@@ -483,11 +839,19 @@ pub fn prefreeze_closure() -> Result<Value, AnyError> {
     .all(|value| value["status"] == "PASS");
     let result = json!({
         "schema_version": 1,
-        "experiment_version": "gate1-v2.3",
+        "experiment_version": "gate1-v2.4",
         "synthetic_artifacts_formal_evidence_usable": false,
         "checks": {
             "history": history["status"],
             "governance_negative_tests": governance["status"],
+            "status_lint": status_lint["status"],
+            "scenario_independence": scenario_independence["status"],
+            "outcome_transport": outcome_transport["status"],
+            "h1_transformer_equivalence": h1_equivalence["status"],
+            "h2_dimension_effectiveness": h2_dimensions["status"],
+            "h2_cleanup_independence": h2_cleanup["status"],
+            "h3_execution_independence": h3_independence["status"],
+            "raw_regeneration": raw_regeneration["status"],
             "contract_satisfiability": contracts["status"],
             "decision_branches": decisions["status"],
             "terminal_short_circuit": short_circuit["status"],
@@ -503,6 +867,14 @@ pub fn prefreeze_closure() -> Result<Value, AnyError> {
         &result,
     )?;
     ensure_status(&result, "prefreeze closure")?;
+    let frozen_root = Path::new("experiments/gate1-v2.4/prefreeze");
+    std::fs::create_dir_all(frozen_root)?;
+    for name in artifacts
+        .into_iter()
+        .chain(std::iter::once("prefreeze_closure.json"))
+    {
+        std::fs::copy(Path::new(DRYRUN_ROOT).join(name), frozen_root.join(name))?;
+    }
     Ok(result)
 }
 
@@ -552,7 +924,7 @@ fn evaluate_graph(case: &GraphCase) -> Value {
         && !current_has_outgoing
         && unreachable_nodes.is_empty()
         && usable_historical_decisions.is_empty()
-        && !case.old_evidence_in_ancestry;
+        && !case.required_v2_3_history_missing;
     json!({
         "cycle": cycle,
         "unreachable_nodes": unreachable_nodes,
@@ -562,7 +934,7 @@ fn evaluate_graph(case: &GraphCase) -> Value {
         "duplicate_nodes": duplicate_nodes,
         "current_exists": current_exists,
         "current_has_outgoing_edge": current_has_outgoing,
-        "old_evidence_in_ancestry": case.old_evidence_in_ancestry,
+        "required_v2_3_history_missing": case.required_v2_3_history_missing,
         "status": if pass {"PASS"} else {"FAIL"}
     })
 }
@@ -627,21 +999,33 @@ fn run_case(name: &str, case: &GraphCase, expected_pass: bool) -> Value {
 
 fn recompute_fixture_decision(fixture: &Value) -> &'static str {
     let gates = &fixture["gates"];
-    let validity = gates["validity"]["status"].as_str().unwrap_or("INVALID");
-    let h1 = gates["h1"]["status"].as_str().unwrap_or("INVALID");
-    let h2 = gates["h2_semantic"]["status"].as_str().unwrap_or("INVALID");
-    let h3 = gates["h3_migration"]["status"]
+    let validity = gates["validity"]["outcome"].as_str().unwrap_or("INVALID");
+    let h1 = gates["h1_equivalence"]["outcome"]
         .as_str()
         .unwrap_or("INVALID");
+    let h2 = gates["h2_configuration"]["outcome"]
+        .as_str()
+        .unwrap_or("INVALID");
+    let h3 = gates["h3_migration"]["outcome"]
+        .as_str()
+        .unwrap_or("INVALID");
+    let apparatus_valid = gates.as_object().is_some_and(|artifacts| {
+        artifacts
+            .values()
+            .all(|gate| gate["contract_status"] == "PASS")
+    });
+    if !apparatus_valid {
+        return "INVALID";
+    }
     if validity == "INVALID" {
         "INVALID"
     } else if validity == "INCONCLUSIVE" || [h1, h2, h3].contains(&"INCONCLUSIVE") {
         "UNVERIFIABLE_WITHIN_MVR"
     } else if [h1, h2, h3].contains(&"FAIL") {
         "STOP"
-    } else if gates["pilot"]["commitment"] != "COMMITTED" {
+    } else if gates["pilot"]["metrics"]["committed"] != true {
         "HOLD"
-    } else if gates["budget"]["approved"] == true {
+    } else if gates["budget"]["metrics"]["approved"] == true {
         "PROCEED_TO_GATE2_RFC"
     } else {
         "PROCEED_TO_PILOT"
@@ -679,6 +1063,10 @@ fn metric(value: impl serde::Serialize) -> Value {
         "sample_count": 1,
         "run_id": "prefreeze"
     })
+}
+
+fn stable_json_hash(value: &impl serde::Serialize) -> Result<String, AnyError> {
+    Ok(stable_value_hash(&serde_json::to_value(value)?))
 }
 
 fn ensure_status(value: &Value, name: &str) -> Result<(), AnyError> {

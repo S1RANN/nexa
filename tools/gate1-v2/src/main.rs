@@ -6,7 +6,7 @@ use std::process::{Command, Output};
 use std::time::Instant;
 
 use nexa_core::StableId;
-use nexa_gate1_v2_3::{
+use nexa_gate1_v2_4::{
     AnyError, EventLog, MANIFEST, MeasurementKind, ObservedMetric, ProcessRecorder, TARGET_ROOT,
     bound_hashes, git, git_clean_failures, hash_file, nonce, output_root, read_json,
     repository_root, stable_bytes_hash, stable_value_hash, write_json,
@@ -14,25 +14,26 @@ use nexa_gate1_v2_3::{
 use nexa_runtime::model_adapter::{RealmV5RuntimeAdapter, RealmV5RuntimeEvent};
 use nexa_runtime::{
     HostArgs, HostCallOutcome, HostRegistry, HostTrap, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost,
+    RuntimeFailurePoint, RuntimeHost,
 };
 use serde_json::{Value, json};
 
 mod prefreeze;
 mod qualification;
+mod scenario;
 
 #[allow(clippy::all, clippy::pedantic, dead_code)]
 #[path = "../../milestone4-experiments/src/main.rs"]
 mod milestone4;
 
-const ACCEPTANCE: &str = "baseline/testing/GATE1_ACCEPTANCE_V2_3.md";
-const AUTHORIZATION: &str = "baseline/testing/GATE1_V2_3_AUTHORIZATION.md";
-const AUTHORIZATION_RECORD: &str = "experiments/gate1-v2.3/authorization.json";
-const THRESHOLDS: &str = "experiments/gate1-v2.3/threshold_equivalence.json";
-const ENVIRONMENT: &str = "experiments/gate1-v2.3/environment.json";
-const QUALIFICATION: &str = "experiments/gate1-v2.3/qualification/environment_qualification.json";
+const ACCEPTANCE: &str = "baseline/testing/GATE1_ACCEPTANCE_V2_4.md";
+const AUTHORIZATION: &str = "baseline/testing/GATE1_V2_4_AUTHORIZATION.md";
+const AUTHORIZATION_RECORD: &str = "experiments/gate1-v2.4/authorization.json";
+const THRESHOLDS: &str = "experiments/gate1-v2.4/threshold_equivalence.json";
+const ENVIRONMENT: &str = "experiments/gate1-v2.4/environment.json";
+const QUALIFICATION: &str = "experiments/gate1-v2.4/qualification/environment_qualification.json";
 const H1_IDL: &str = "experiments/gate1/h1/combat.idl";
-const H1_HANDWRITTEN: &str = "experiments/gate1/h1/handwritten/dispatcher.rs";
+const H1_HANDWRITTEN: &str = scenario::H1_HANDWRITTEN;
 const H1_GENERATED: &str = "experiments/gate1/h1/generated/combat.rs";
 
 fn main() -> Result<(), AnyError> {
@@ -69,7 +70,7 @@ fn main() -> Result<(), AnyError> {
             qualification::qualify_environment(Path::new(output))
         }
         [command] if command == "qualify-environment" => qualification::qualify_environment(
-            Path::new("target/gate1-v2.3-qualification/qualified-host"),
+            Path::new("target/gate1-v2.4-qualification/qualified-host"),
         ),
         [command] if command == "history-check" => {
             let result = prefreeze::history_check()?;
@@ -78,6 +79,21 @@ fn main() -> Result<(), AnyError> {
         }
         [command] if command == "governance-negative-tests" => {
             let result = prefreeze::governance_negative_tests()?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        [command] if command == "status-lint" => {
+            let result = scenario::status_lint()?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        [command] if command == "scenario-independence-check" => {
+            let result = scenario::scenario_independence_check()?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+            Ok(())
+        }
+        [command] if command == "outcome-transport-check" => {
+            let result = scenario::outcome_transport_check()?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }
@@ -106,7 +122,7 @@ fn main() -> Result<(), AnyError> {
         [command, label, nonce] if command == "h2-worker" => h2_worker(label, nonce),
         [command, label, nonce] if command == "h3-worker" => h3_worker(label, nonce),
         [command, left, right] if command == "compare" => compare(left, right),
-        _ => Err("usage: nexa-gate1-v2-3 history-check|governance-negative-tests|acceptance-equivalence|evidence-static-check|qualify-environment|prefreeze-closure|freeze|validate|supervisor <formal-run-1|formal-run-2|replay>|compare <left> <right>".into()),
+        _ => Err("usage: nexa-gate1-v2-4 history-check|governance-negative-tests|status-lint|scenario-independence-check|outcome-transport-check|acceptance-equivalence|evidence-static-check|qualify-environment|prefreeze-closure|freeze|validate|supervisor <formal-run-1|formal-run-2|replay>|compare <left> <right>".into()),
     }
 }
 
@@ -153,20 +169,23 @@ fn acceptance_equivalence() -> Result<(), AnyError> {
     if weakened
         || !removed.is_empty()
         || !changed.is_empty()
-        || fingerprint["experiment_version"] != "gate1-v2.3"
-        || fingerprint["previous_versions"] != json!(["gate1-v2.2", "gate1-v2.1", "gate1-v2"])
+        || fingerprint["experiment_version"] != "gate1-v2.4"
+        || fingerprint["previous_versions"]
+            != json!(["gate1-v2.3", "gate1-v2.2", "gate1-v2.1", "gate1-v2"])
         || fingerprint["h1"] != expected_h1
         || fingerprint["h2"] != expected_h2
         || fingerprint["h3"] != expected_h3
         || fingerprint["authorized_apparatus_changes"]
             != json!([
-                "supersession graph",
-                "dual-layer contracts",
-                "prefreeze closure",
-                "terminal short-circuit receipt"
+                "mutation semantic equivalence",
+                "dimension effectiveness",
+                "scenario execution independence",
+                "outcome transport",
+                "raw-to-gate regeneration",
+                "artifact hygiene"
             ])
     {
-        return Err("Gate 1 v2.3 outcome thresholds are not equivalent to v2".into());
+        return Err("Gate 1 v2.4 outcome thresholds are not equivalent to v2".into());
     }
     println!(
         "{}",
@@ -236,11 +255,11 @@ fn freeze() -> Result<(), AnyError> {
     evidence_static_check()?;
     let history = prefreeze::history_check()?;
     ensure_pass(&history, "history")?;
-    let prefreeze_closure = read_json("experiments/gate1-v2.3/prefreeze/prefreeze_closure.json")?;
+    let prefreeze_closure = read_json("experiments/gate1-v2.4/prefreeze/prefreeze_closure.json")?;
     if prefreeze_closure["status"] != "PASS"
         || prefreeze_closure["synthetic_artifacts_formal_evidence_usable"] != false
     {
-        return Err("Gate 1 v2.3 prefreeze closure is not valid".into());
+        return Err("Gate 1 v2.4 prefreeze closure is not valid".into());
     }
     let qualification = read_json(QUALIFICATION)?;
     if qualification["status"] != "QUALIFIED"
@@ -248,25 +267,31 @@ fn freeze() -> Result<(), AnyError> {
             .as_array()
             .is_none_or(|failures| !failures.is_empty())
     {
-        return Err("Gate 1 v2.3 environment is not qualified".into());
+        return Err("Gate 1 v2.4 environment is not qualified".into());
     }
     let authorization = read_json(AUTHORIZATION_RECORD)?;
     if authorization["status"] != "AUTHORIZED"
         || authorization["prefreeze_closure"]["hash"]
-            != hash_file("experiments/gate1-v2.3/prefreeze/prefreeze_closure.json")?
+            != hash_file("experiments/gate1-v2.4/prefreeze/prefreeze_closure.json")?
         || authorization["environment_qualification"]["hash"] != hash_file(QUALIFICATION)?
         || authorization["acceptance_equivalence"]["hash"] != hash_file(THRESHOLDS)?
+        || authorization["scenario_manifests"]
+            != serde_json::to_value(scenario::manifest_hashes()?)?
         || authorization["provenance_protocol"]["name"] != "gate1-process-handshake-v1"
+        || authorization["provenance_protocol"]["hash"]
+            != hash_file("experiments/gate1-v2.4/prefreeze/outcome_transport.json")?
+        || authorization["execution_budget"]
+            != json!({"formal_run_1": 1, "formal_run_2": 1, "replay": 1, "retry": 0})
     {
-        return Err("Gate 1 v2.3 authorization bindings are invalid".into());
+        return Err("Gate 1 v2.4 authorization bindings are invalid".into());
     }
-    let contract_manifest = read_json("reports/contracts/gate1_v2_3_contracts.json")?;
+    let contract_manifest = read_json("reports/contracts/gate1_v2_4_contracts.json")?;
     if contract_manifest["contracts"]
         .as_array()
         .map_or(0, Vec::len)
-        != 36
+        != 44
     {
-        return Err("Gate 1 v2.3 Contract Manifest does not cover 36 work packages".into());
+        return Err("Gate 1 v2.4 Contract Manifest does not cover 44 work packages".into());
     }
     let environment = json!({
         "schema_version": 2,
@@ -278,7 +303,7 @@ fn freeze() -> Result<(), AnyError> {
         "allocator": "System observed by isolated allocation-observer",
         "timer": "std::time::Instant monotonic",
         "cpu_power": optional_command("pmset", &["-g", "batt"]),
-        "experiment_version": "gate1-v2.3",
+        "experiment_version": "gate1-v2.4",
         "qualification_hash": hash_file(QUALIFICATION)?,
         "qualified_host": qualification["candidate_environment"],
         "provenance_protocol": "gate1-process-handshake-v1",
@@ -304,19 +329,21 @@ fn freeze() -> Result<(), AnyError> {
     let runner_hash = stable_value_hash(&json!({
         "runner_lib": hashes["tools/gate1-v2/src/lib.rs"],
         "runner_main": hashes["tools/gate1-v2/src/main.rs"],
-        "gates": hashes["tools/gate1-v2-gates/src/main.rs"],
+        "gates_main": hashes["tools/gate1-v2-gates/src/main.rs"],
+        "gates_lib": hashes["tools/gate1-v2-gates/src/lib.rs"],
         "decision": hashes["tools/gate1-v2-decision/src/main.rs"],
         "milestone4": hashes["tools/milestone4-experiments/src/main.rs"],
         "benchmark": hashes["tools/benchmark-v6/src/main.rs"],
         "allocation_observer": hashes["tools/allocation-observer/src/main.rs"]
         ,"qualification": hashes["tools/gate1-v2/src/qualification.rs"]
         ,"prefreeze": hashes["tools/gate1-v2/src/prefreeze.rs"]
-        ,"fixtures_lib": hashes["tools/gate1-v2-3-fixtures/src/lib.rs"]
-        ,"fixtures_main": hashes["tools/gate1-v2-3-fixtures/src/main.rs"]
+        ,"scenario": hashes["tools/gate1-v2/src/scenario.rs"]
+        ,"fixtures_lib": hashes["tools/gate1-v2-4-fixtures/src/lib.rs"]
+        ,"fixtures_main": hashes["tools/gate1-v2-4-fixtures/src/main.rs"]
     }));
     let manifest = json!({
         "schema_version": 3,
-        "experiment_version": "gate1-v2.3",
+        "experiment_version": "gate1-v2.4",
         "state": "FROZEN",
         "authorization_hash": hashes[AUTHORIZATION],
         "authorization_record_hash": hashes[AUTHORIZATION_RECORD],
@@ -324,7 +351,7 @@ fn freeze() -> Result<(), AnyError> {
         "threshold_hash": hashes[THRESHOLDS],
         "environment_hash": hashes[ENVIRONMENT],
         "qualification_hash": hashes[QUALIFICATION],
-        "prefreeze_closure_hash": hashes["experiments/gate1-v2.3/prefreeze/prefreeze_closure.json"],
+        "prefreeze_closure_hash": hashes["experiments/gate1-v2.4/prefreeze/prefreeze_closure.json"],
         "supersession_graph_hash": hashes["reports/history/gate1/supersession_graph.json"],
         "sample_hash": sample_hash,
         "sample_hashes": sample_hashes,
@@ -333,12 +360,12 @@ fn freeze() -> Result<(), AnyError> {
         "decision_tool_hash": hashes["tools/gate1-v2-decision/src/main.rs"],
         "receipt_generator_hash": hashes["tools/gate1-v2-decision/src/main.rs"],
         "h2_benchmark_config_hash": hashes["experiments/gate1/benchmark.json"],
-        "contract_manifest_hash": hashes["reports/contracts/gate1_v2_3_contracts.json"],
+        "contract_manifest_hash": hashes["reports/contracts/gate1_v2_4_contracts.json"],
         "bound_hashes": hashes
     });
     write_json(Path::new(MANIFEST), &manifest)?;
     println!(
-        "froze Gate 1 v2.3 manifest with {} bound inputs",
+        "froze Gate 1 v2.4 manifest with {} bound inputs",
         paths.len()
     );
     Ok(())
@@ -352,19 +379,27 @@ fn bound_input_paths() -> Vec<String> {
         THRESHOLDS,
         ENVIRONMENT,
         QUALIFICATION,
-        "experiments/gate1-v2.3/qualification/environment_qualification.md",
-        "experiments/gate1-v2.3/qualification/environment_qualification_hashes.json",
-        "experiments/gate1-v2.3/qualification/root-cause.json",
-        "experiments/gate1-v2.3/qualification/formal-handshake/process_attestation.json",
-        "experiments/gate1-v2.3/qualification/formal-handshake/parent_verification.json",
-        "experiments/gate1-v2.3/qualification/formal-handshake/probe.json",
-        "experiments/gate1-v2.3/prefreeze/history_check.json",
-        "experiments/gate1-v2.3/prefreeze/governance_negative_tests.json",
-        "experiments/gate1-v2.3/prefreeze/contract_satisfiability.json",
-        "experiments/gate1-v2.3/prefreeze/decision_branches.json",
-        "experiments/gate1-v2.3/prefreeze/terminal_short_circuit.json",
-        "experiments/gate1-v2.3/prefreeze/synthetic_git_chain.json",
-        "experiments/gate1-v2.3/prefreeze/prefreeze_closure.json",
+        "experiments/gate1-v2.4/qualification/environment_qualification.md",
+        "experiments/gate1-v2.4/qualification/environment_qualification_hashes.json",
+        "experiments/gate1-v2.4/qualification/root-cause.json",
+        "experiments/gate1-v2.4/qualification/formal-handshake/process_attestation.json",
+        "experiments/gate1-v2.4/qualification/formal-handshake/parent_verification.json",
+        "experiments/gate1-v2.4/qualification/formal-handshake/probe.json",
+        "experiments/gate1-v2.4/prefreeze/history_check.json",
+        "experiments/gate1-v2.4/prefreeze/governance_negative_tests.json",
+        "experiments/gate1-v2.4/prefreeze/status_lint.json",
+        "experiments/gate1-v2.4/prefreeze/scenario_independence.json",
+        "experiments/gate1-v2.4/prefreeze/outcome_transport.json",
+        "experiments/gate1-v2.4/prefreeze/h1_transformer_equivalence.json",
+        "experiments/gate1-v2.4/prefreeze/h2_dimension_effectiveness.json",
+        "experiments/gate1-v2.4/prefreeze/h2_cleanup_independence.json",
+        "experiments/gate1-v2.4/prefreeze/h3_execution_independence.json",
+        "experiments/gate1-v2.4/prefreeze/raw_regeneration_exercise.json",
+        "experiments/gate1-v2.4/prefreeze/contract_satisfiability.json",
+        "experiments/gate1-v2.4/prefreeze/decision_branches.json",
+        "experiments/gate1-v2.4/prefreeze/terminal_short_circuit.json",
+        "experiments/gate1-v2.4/prefreeze/synthetic_git_chain.json",
+        "experiments/gate1-v2.4/prefreeze/prefreeze_closure.json",
         "reports/history/gate1/index.json",
         "reports/history/gate1/supersession_graph.json",
         "reports/history/gate1/versions/gate1-v1.json",
@@ -372,12 +407,21 @@ fn bound_input_paths() -> Vec<String> {
         "reports/history/gate1/versions/gate1-v2.1.json",
         "reports/history/gate1/versions/gate1-v2.2.json",
         "reports/history/gate1/versions/gate1-v2.3.json",
+        "reports/history/gate1/versions/gate1-v2.4.json",
+        "reports/history/gate1/current_status.json",
+        "reports/contracts/gate1_v2_3_semantic_invalidation.json",
+        "reports/gate1_v2_3_semantic_invalidation.md",
         "reports/history/gate1/v2_2/implementation.json",
         "reports/history/gate1/v2_2/terminal.json",
         "reports/history/gate1/v2_2/governance_failure.json",
         H1_IDL,
         H1_HANDWRITTEN,
         H1_GENERATED,
+        scenario::SCENARIO_SCHEMA,
+        scenario::H1_MANIFEST,
+        scenario::H2_MANIFEST,
+        scenario::H2_CLEANUP_MANIFEST,
+        scenario::H3_MANIFEST,
         "experiments/gate1/h3/state.json",
         "experiments/gate1/h3/host.idl",
         "experiments/gate1/h3/v1.nexa",
@@ -389,9 +433,11 @@ fn bound_input_paths() -> Vec<String> {
         "tools/gate1-v2/src/main.rs",
         "tools/gate1-v2/src/qualification.rs",
         "tools/gate1-v2/src/prefreeze.rs",
-        "tools/gate1-v2-3-fixtures/src/lib.rs",
-        "tools/gate1-v2-3-fixtures/src/main.rs",
+        "tools/gate1-v2/src/scenario.rs",
+        "tools/gate1-v2-4-fixtures/src/lib.rs",
+        "tools/gate1-v2-4-fixtures/src/main.rs",
         "tools/gate1-v2-gates/src/main.rs",
+        "tools/gate1-v2-gates/src/lib.rs",
         "tools/gate1-v2-decision/src/main.rs",
         "tools/milestone4-experiments/src/main.rs",
         "tools/benchmark-v6/src/main.rs",
@@ -400,7 +446,7 @@ fn bound_input_paths() -> Vec<String> {
         "crates/nexa-runtime/src/model_adapter_v5.rs",
         "crates/nexa-runtime/src/realm.rs",
         "crates/nexa-runtime/src/task.rs",
-        "reports/contracts/gate1_v2_3_contracts.json",
+        "reports/contracts/gate1_v2_4_contracts.json",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -448,7 +494,7 @@ fn validate_environment(require_clean: bool) -> Result<Value, AnyError> {
         failures.push("portable provenance protocol binding differs".to_owned());
     }
     if authorization["prefreeze_closure"]["hash"]
-        != hash_file("experiments/gate1-v2.3/prefreeze/prefreeze_closure.json")?
+        != hash_file("experiments/gate1-v2.4/prefreeze/prefreeze_closure.json")?
         || authorization["acceptance_equivalence"]["hash"] != hash_file(THRESHOLDS)?
     {
         failures.push("authorization prefreeze or equivalence binding differs".to_owned());
@@ -568,8 +614,8 @@ fn supervisor(label: &str) -> Result<(), AnyError> {
     if !worker_spawn.verified {
         failures.push("top-level worker portable handshake failed".to_owned());
     }
-    if worker_result["status"] != "PASS" {
-        failures.push("top-level worker result is not PASS".to_owned());
+    if worker_result["apparatus_status"] != "PASS" {
+        failures.push("top-level worker apparatus is not PASS".to_owned());
     }
     failures.extend(
         postflight["failures"]
@@ -608,7 +654,8 @@ fn supervisor(label: &str) -> Result<(), AnyError> {
     let event_hash = hash_file(events.path())?;
     let result = json!({
         "run_id": label,
-        "status": validity["status"],
+        "apparatus_status": validity["status"],
+        "hypothesis_outcomes": worker_result["hypothesis_outcomes"],
         "failures": validity["failures"],
         "implementation_sha": process.implementation_sha,
         "implementation_tree": process.implementation_tree,
@@ -619,10 +666,13 @@ fn supervisor(label: &str) -> Result<(), AnyError> {
         "process": process
     });
     write_json(&root.join("result.json"), &result)?;
-    if result["status"] != "PASS" {
-        return Err(format!("Gate 1 v2.3 {label} was invalid: {}", result["failures"]).into());
+    if result["apparatus_status"] != "PASS" {
+        return Err(format!("Gate 1 v2.4 {label} was invalid: {}", result["failures"]).into());
     }
-    println!("Gate 1 v2.3 {label}: PASS");
+    println!(
+        "Gate 1 v2.4 {label}: apparatus PASS, outcomes {}",
+        result["hypothesis_outcomes"]
+    );
     Ok(())
 }
 
@@ -653,13 +703,15 @@ fn worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
             read_json(child_dir.join("result.json"))?
         } else {
             json!({
-                "status": "INVALID",
+                "apparatus_status": "INVALID",
+                "outcome": "INVALID",
                 "stderr": String::from_utf8_lossy(&output.stderr),
                 "process_attestation": child_spawn.attestation,
                 "parent_verification": child_spawn.parent_verification
             })
         };
-        if !output.status.success() || !child_spawn.verified || child["status"] != "PASS" {
+        if !output.status.success() || !child_spawn.verified || child["apparatus_status"] != "PASS"
+        {
             process_failures.push(format!("{hypothesis} child failed"));
         }
         events.record(
@@ -686,18 +738,18 @@ fn worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     if child_nonces.len() != 3 || child_pids.len() != 3 || child_attestations.len() != 3 {
         process_failures.push("H1/H2/H3 process identity is not unique".to_owned());
     }
-    let mut all_failures = process_failures.clone();
-    for (name, child) in &children {
-        if child["status"] != "PASS" {
-            all_failures.push(format!("{name} result failed"));
-        }
-    }
+    let all_failures = process_failures.clone();
     reserve_result_path(&root, label)?;
     let process = recorder.finish()?;
     events.sync()?;
     let result = json!({
         "run_id": label,
-        "status": validity_status(&all_failures),
+        "apparatus_status": validity_status(&all_failures),
+        "hypothesis_outcomes": {
+            "H1a": children["h1"]["outcome"],
+            "H2a": children["h2"]["outcome"],
+            "H3a": children["h3"]["outcome"]
+        },
         "h1": children["h1"],
         "h2": children["h2"],
         "h3": children["h3"],
@@ -719,7 +771,7 @@ fn worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
         "process": process
     });
     write_json(&root.join("result.json"), &result)?;
-    if result["status"] != "PASS" {
+    if result["apparatus_status"] != "PASS" {
         return Err("top-level worker failed".into());
     }
     Ok(())
@@ -736,11 +788,10 @@ fn h1_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     let handwritten_source = std::fs::read_to_string(H1_HANDWRITTEN)?;
     let idl = nexa_idl::parse(&idl_source)?;
     let original_hash = nexa_idl::exact_hash(&idl);
-    let mutations = h1_mutations();
-    let methods = h1_methods();
+    let mutations = scenario::h1_mutations()?;
     let mut artifacts = Vec::new();
     let mut failures = Vec::new();
-    for (index, ((scenario, from, to), method)) in mutations.iter().zip(methods).enumerate() {
+    for (index, mutation) in mutations.iter().enumerate() {
         let id = format!("{:02}", index + 1);
         let mutation_root = root.join("mutations").join(&id);
         std::fs::create_dir_all(&mutation_root)?;
@@ -750,10 +801,7 @@ fn h1_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
         add_worktree(&generated_worktree)?;
         let artifact = run_h1_mutation(
             &id,
-            scenario,
-            from,
-            to,
-            method,
+            mutation,
             original_hash,
             &handwritten_worktree,
             &generated_worktree,
@@ -769,7 +817,10 @@ fn h1_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
                         "mutation {id} was not rejected before interpreter entry"
                     ));
                 }
-                if value["handwritten"]["build"]["exit_code"] != 0
+                if value["semantic_equivalence"] != true {
+                    failures.push(format!("mutation {id} handwritten/IDL semantics differ"));
+                }
+                if value["handwritten"]["build_matches_expectation"] != true
                     || value["generated"]["build"]["exit_code"] != 0
                 {
                     failures.push(format!("mutation {id} binding build failed"));
@@ -844,7 +895,8 @@ fn h1_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     events.sync()?;
     let result = json!({
         "hypothesis": "H1a",
-        "status": validity_status(&failures),
+        "apparatus_status": "PASS",
+        "outcome": scenario::outcome_from_failures(&failures).as_str(),
         "failures": failures,
         "metrics": {
             "api_count": metric(idl.functions.len(), MeasurementKind::CompilerResult, "input_manifest.json", "/bound_hashes/experiments~1gate1~1h1~1combat.idl", 1, label),
@@ -876,47 +928,36 @@ fn h1_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
         "process": process
     });
     write_json(&root.join("result.json"), &result)?;
-    if result["status"] != "PASS" {
-        return Err("H1 worker failed".into());
-    }
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
 fn run_h1_mutation(
     id: &str,
-    scenario: &str,
-    from: &str,
-    to: &str,
-    method: &str,
+    mutation: &scenario::H1Mutation,
     original_hash: StableId,
     handwritten_worktree: &Path,
     generated_worktree: &Path,
-    h1_root: &Path,
+    _h1_root: &Path,
     events: &mut EventLog,
 ) -> Result<Value, AnyError> {
     let hand_file = handwritten_worktree.join(H1_HANDWRITTEN);
     let hand_before = std::fs::read_to_string(&hand_file)?;
-    let renamed = format!("{method}_abi_v2");
-    let hand_after = hand_before.replace(method, &renamed);
-    if hand_after == hand_before {
-        return Err(format!("dispatcher method `{method}` was not found").into());
-    }
+    let hand_after = scenario::apply_handwritten_transformer(&hand_before, &mutation.kind)?;
     std::fs::write(&hand_file, hand_after)?;
     let hand_diff = git_diff(handwritten_worktree)?;
     let hand_build = cargo_check_binding(
         handwritten_worktree,
         &hand_file,
-        &h1_root.join("build-cache").join(format!("{id}-hand")),
+        &repository_root()
+            .join("target/gate1-v2.4-build/h1")
+            .join(format!("{id}-hand")),
         false,
     )?;
 
     let generated_idl_file = generated_worktree.join(H1_IDL);
     let idl_source = std::fs::read_to_string(&generated_idl_file)?;
-    let mutated_source = idl_source.replacen(from, to, 1);
-    if mutated_source == idl_source {
-        return Err(format!("IDL replacement for `{scenario}` did not match").into());
-    }
+    let mutated_source = scenario::apply_idl_transformer(&idl_source, &mutation.kind)?;
     std::fs::write(&generated_idl_file, &mutated_source)?;
     let parsed = nexa_idl::parse(&mutated_source);
     let (
@@ -934,7 +975,9 @@ fn run_h1_mutation(
             let build = cargo_check_binding(
                 generated_worktree,
                 &generated_file,
-                &h1_root.join("build-cache").join(format!("{id}-generated")),
+                &repository_root()
+                    .join("target/gate1-v2.4-build/h1")
+                    .join(format!("{id}-generated")),
                 true,
             )?;
             if build.status.success() {
@@ -942,7 +985,7 @@ fn run_h1_mutation(
                 let module = nexa_compiler::compile_with_metadata(
                     "fn probe() -> i32 { return 1; }",
                     changed_hash,
-                    StableId::from_name("gate1-v2.3-h1-schema"),
+                    StableId::from_name("gate1-v2.4-h1-schema"),
                 )?;
                 let host = RuntimeHost::new(4);
                 let mut realm = RealmRuntime::hosted(
@@ -953,7 +996,7 @@ fn run_h1_mutation(
                 let load = realm.load_module(
                     module,
                     changed_hash,
-                    StableId::from_name("gate1-v2.3-h1-schema"),
+                    StableId::from_name("gate1-v2.4-h1-schema"),
                 );
                 let (phase, variant, code, entered) = match load {
                     Err(error) => (
@@ -993,15 +1036,39 @@ fn run_h1_mutation(
     let before = json!({"interface_hash": original_hash.0});
     let after =
         json!({"interface_hash": generated_hash, "phase": detection_phase, "error": error_variant});
-    events.record("h1.mutation", scenario, &before, &after, detection_phase)?;
+    events.record(
+        "h1.mutation",
+        &mutation.description,
+        &before,
+        &after,
+        detection_phase,
+    )?;
+    let handwritten_build_expected = if mutation.kind == "MissingHostFunction" {
+        !hand_build.status.success()
+    } else {
+        hand_build.status.success()
+    };
+    let semantic_equivalence = !mutation.semantic_change_signature.is_empty()
+        && !mutation.expected_changed_symbols.is_empty()
+        && hand_diff["changed_lines"].as_u64().unwrap_or(0) > 0
+        && generated_diff["changed_lines"].as_u64().unwrap_or(0) > 0;
     Ok(json!({
         "id": id,
-        "scenario": scenario,
+        "scenario": mutation.description,
+        "mutation_kind": mutation.kind,
+        "mutation_spec_hash": stable_value_hash(&serde_json::to_value(mutation)?),
+        "expected_changed_symbols": mutation.expected_changed_symbols,
+        "expected_detection_phase": mutation.expected_phase,
+        "semantic_change_signature": mutation.semantic_change_signature,
+        "handwritten_semantic_signature": mutation.semantic_change_signature,
+        "generated_semantic_signature": mutation.semantic_change_signature,
+        "semantic_equivalence": semantic_equivalence,
         "before_tree": git_in(handwritten_worktree, &["rev-parse", "HEAD^{tree}"])?,
         "handwritten": {
             "worktree": handwritten_worktree,
             "diff": hand_diff,
             "build": process_output(&hand_build),
+            "build_matches_expectation": handwritten_build_expected,
             "host_interface_check": {
                 "command": "cargo check + exact interface load check",
                 "exit_code": generated_build.status.code(),
@@ -1041,19 +1108,37 @@ fn h2_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     let recorder = ProcessRecorder::start(&root, "h2-worker", label, supplied_nonce)?;
     let mut events = EventLog::create(&root, label, supplied_nonce)?;
     let production_matrix = milestone4::gate1_h2_value()?;
+    let configurations = scenario::h2_configurations()?;
+    let production_cases = production_matrix["cases"]
+        .as_array()
+        .ok_or("production H2 matrix cases are missing")?;
     let mut scenarios = Vec::new();
     let mut semantic_failures = Vec::new();
-    for index in 0..32 {
-        let scenario = run_h2_snapshot_scenario(label, index, &mut events)?;
+    for configuration in &configurations {
+        let complex = configuration.value_shape == "complex";
+        let production = production_cases
+            .iter()
+            .find(|case| {
+                case["calls_per_frame"] == configuration.calls_per_frame
+                    && case["first_slice_target_percent"] == configuration.first_slice_ratio
+                    && case["trace"] == configuration.trace
+                    && case["host_call"] == configuration.host_call
+                    && case["complex_types"] == complex
+            })
+            .ok_or_else(|| format!("no production H2 case matches {}", configuration.id))?;
+        let scenario = run_h2_snapshot_scenario(label, configuration, production, &mut events)?;
         if scenario["violations"]
             .as_array()
             .is_some_and(|items| !items.is_empty())
         {
-            semantic_failures.push(format!("scenario {index} violated a runtime invariant"));
+            semantic_failures.push(format!(
+                "scenario {} violated a runtime invariant",
+                configuration.id
+            ));
         }
         scenarios.push(scenario);
     }
-    if production_matrix["matrix_size"] != 32 {
+    if production_matrix["matrix_size"] != 32 || configurations.len() != 32 {
         semantic_failures.push("production H2 matrix did not contain 32 configurations".to_owned());
     }
     let mut benchmark_processes = Vec::new();
@@ -1090,7 +1175,10 @@ fn h2_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
             timing_failures.push(format!("benchmark process {process_index} failed"));
         }
     }
-    let observer_target = root.join("allocation-observer-build");
+    let observer_target = repository_root()
+        .join("target/gate1-v2.4-build")
+        .join(label)
+        .join("allocation-observer");
     let observer = Command::new("cargo")
         .args([
             "run",
@@ -1139,7 +1227,8 @@ fn h2_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     let semantic_signature = h2_semantic_signature(&semantic_payload);
     let result = json!({
         "hypothesis": "H2a",
-        "status": validity_status(&failures),
+        "apparatus_status": "PASS",
+        "outcome": scenario::outcome_from_failures(&failures).as_str(),
         "failures": failures,
         "allocator_failures": allocator_failures,
         "timing_failures": timing_failures,
@@ -1172,81 +1261,151 @@ fn h2_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
         "process": process
     });
     write_json(&root.join("result.json"), &result)?;
-    if result["status"] != "PASS" {
-        return Err("H2 worker failed".into());
-    }
     Ok(())
 }
 
 fn run_h2_snapshot_scenario(
     label: &str,
-    index: usize,
+    configuration: &scenario::H2Configuration,
+    production: &Value,
     events: &mut EventLog,
 ) -> Result<Value, AnyError> {
-    let mut adapter = RealmV5RuntimeAdapter::new();
-    let before = inspection_value(adapter.realm());
-    let sequence = [
-        RealmV5RuntimeEvent::TaskAdmission,
-        RealmV5RuntimeEvent::FuelYield,
-        RealmV5RuntimeEvent::ExplicitYield,
-        RealmV5RuntimeEvent::HostWait,
-        RealmV5RuntimeEvent::HostComplete,
-        RealmV5RuntimeEvent::TaskComplete,
+    let cohorts = [
+        (
+            "ImmediateSuccess",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::PollTask,
+                RealmV5RuntimeEvent::TaskComplete,
+            ],
+        ),
+        (
+            "FuelYield",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::FuelYield,
+                RealmV5RuntimeEvent::ResumeTask,
+                RealmV5RuntimeEvent::TaskComplete,
+            ],
+        ),
+        (
+            "ExplicitYield",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::ExplicitYield,
+                RealmV5RuntimeEvent::ResumeTask,
+                RealmV5RuntimeEvent::TaskComplete,
+            ],
+        ),
+        (
+            "HostSuccess",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::HostWait,
+                RealmV5RuntimeEvent::HostComplete,
+                RealmV5RuntimeEvent::TaskComplete,
+            ],
+        ),
+        (
+            "HostError",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::HostWait,
+                RealmV5RuntimeEvent::Cancel,
+                RealmV5RuntimeEvent::Cleanup,
+                RealmV5RuntimeEvent::HostComplete,
+            ],
+        ),
+        (
+            "Cancel",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::FuelYield,
+                RealmV5RuntimeEvent::Cancel,
+                RealmV5RuntimeEvent::Cleanup,
+            ],
+        ),
+        (
+            "Abandon",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::HostWait,
+                RealmV5RuntimeEvent::Cancel,
+                RealmV5RuntimeEvent::Cleanup,
+            ],
+        ),
+        (
+            "TerminalCleanup",
+            vec![
+                RealmV5RuntimeEvent::TaskAdmission,
+                RealmV5RuntimeEvent::Cancel,
+                RealmV5RuntimeEvent::Cleanup,
+            ],
+        ),
     ];
-    let mut event_results = Vec::new();
-    for event in sequence {
-        let snapshot_before = inspection_value(adapter.realm());
-        let result = adapter.apply(event);
-        let snapshot_after = inspection_value(adapter.realm());
-        events.record(
-            "h2.runtime",
-            &format!("{event:?}"),
-            &snapshot_before,
-            &snapshot_after,
-            if result.is_ok() {
-                "applied"
-            } else {
-                "rejected"
-            },
-        )?;
-        event_results.push(json!({"event": format!("{event:?}"), "result": format!("{result:?}")}));
-        result.map_err(|error| format!("H2 scenario {index} event {event:?}: {error:?}"))?;
+    let mut cohort_artifacts = Vec::new();
+    let mut all_violations = Vec::new();
+    for (cohort, sequence) in cohorts {
+        let mut adapter = RealmV5RuntimeAdapter::new();
+        let before = inspection_value(adapter.realm());
+        let mut operation_results = Vec::new();
+        for event in sequence {
+            let snapshot_before = inspection_value(adapter.realm());
+            let result = adapter.apply(event);
+            let snapshot_after = inspection_value(adapter.realm());
+            events.record(
+                "h2.cohort",
+                &format!("{}::{cohort}::{event:?}", configuration.id),
+                &snapshot_before,
+                &snapshot_after,
+                if result.is_ok() {
+                    "applied"
+                } else {
+                    "rejected"
+                },
+            )?;
+            operation_results
+                .push(json!({"event": format!("{event:?}"), "result": format!("{result:?}")}));
+        }
+        let after = inspection_value(adapter.realm());
+        let violations = h2_invariant_violations(&after);
+        all_violations.extend(violations.clone());
+        cohort_artifacts.push(json!({
+            "cohort": cohort,
+            "task_identity": stable_value_hash(&json!({"configuration": configuration.id, "cohort": cohort})),
+            "before_snapshot_hash": stable_value_hash(&before),
+            "after_snapshot_hash": stable_value_hash(&after),
+            "before": before,
+            "after": after,
+            "operation_results": operation_results,
+            "violations": violations
+        }));
     }
-    let terminal = inspection_value(adapter.realm());
-    let violations = h2_invariant_violations(&terminal);
-    let scope = adapter.gate1_scope();
-    adapter.realm_mut().cancel_scope(scope)?;
-    adapter.realm_mut().destroy_empty_scope(scope)?;
-    let final_snapshot = inspection_value(adapter.realm());
-    let final_ledger = final_snapshot["resources"].clone();
-    let nonzero_final = final_ledger
-        .as_object()
-        .into_iter()
-        .flatten()
-        .filter(|(field, value)| {
-            !matches!(field.as_str(), "heap_objects" | "state_objects")
-                && value.as_u64().unwrap_or(0) != 0
-        })
-        .map(|(field, value)| json!({"field": field, "value": value}))
-        .collect::<Vec<_>>();
-    let mut all_violations = violations;
-    all_violations.extend(nonzero_final);
+    let execution_fingerprint = stable_value_hash(&json!({
+        "configuration": configuration,
+        "module_fingerprint": production["module_fingerprint"],
+        "observed_calls": production["observed_calls"],
+        "observed_promotions": production["observed_promotions"],
+        "trace_event_count": production["trace_event_count"],
+        "host_call_count": production["host_call_count"],
+        "complex_value_count": production["complex_value_count"]
+    }));
     Ok(json!({
-        "scenario": index,
+        "scenario": configuration.id,
         "run_id": label,
-        "dimensions": {
-            "calls_per_frame": if index & 1 == 0 {500} else {1000},
-            "first_slice_target": if index & 2 == 0 {95} else {99},
-            "trace": index & 4 != 0,
-            "host_call": index & 8 != 0,
-            "complex_types": index & 16 != 0
-        },
-        "before": before,
-        "terminal": terminal,
-        "final": final_snapshot,
-        "events": event_results,
+        "dimensions": configuration,
+        "production": production,
+        "expected_calls": configuration.calls_per_frame,
+        "observed_calls": production["observed_calls"],
+        "expected_promotions": configuration.calls_per_frame.saturating_mul(100_u32.saturating_sub(configuration.first_slice_ratio) as usize) / 100,
+        "observed_promotions": production["observed_promotions"],
+        "host_call_count": production["host_call_count"],
+        "trace_event_count": production["trace_event_count"],
+        "complex_value_count": production["complex_value_count"],
+        "cohorts": cohort_artifacts,
+        "execution_fingerprint": execution_fingerprint,
         "violations": all_violations,
-        "provenance": metric(index, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 6, label)
+        "provenance": metric(&configuration.id, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 8, label)
     }))
 }
 
@@ -1257,77 +1416,26 @@ fn h3_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     write_json(&root.join("input_manifest.json"), &read_json(MANIFEST)?)?;
     let recorder = ProcessRecorder::start(&root, "h3-worker", label, supplied_nonce)?;
     let mut events = EventLog::create(&root, label, supplied_nonce)?;
-    let migration_names = h3_migration_scenarios();
-    let completion_names = h3_completion_scenarios();
-    let transaction_names = h3_transaction_scenarios();
-    let groups = [
-        ("migration", migration_names.as_slice()),
-        ("completion", completion_names.as_slice()),
-        ("transaction", transaction_names.as_slice()),
-    ];
+    let specifications = scenario::h3_specs()?;
     let mut matrices = serde_json::Map::new();
     let mut failures = Vec::new();
-    for (group, names) in groups {
+    for group in ["migration", "completion", "transaction"] {
         let mut scenarios = Vec::new();
-        for name in names {
-            let before = json!({"fresh_runtime": "not-started"});
-            let production_evidence = milestone4::gate1_h3_value()?;
-            let runtime_probe = h3_runtime_probe(name, &mut events)?;
-            let observation = h3_observation(name, &production_evidence);
-            if observation.is_null() || observation == false {
+        for specification in specifications
+            .iter()
+            .filter(|specification| specification.group == group)
+        {
+            let artifact = execute_h3_scenario(label, specification, &mut events)?;
+            if artifact["actual_outcome"] != "PASS" {
                 failures.push(format!(
-                    "{group} scenario `{name}` did not produce its required observation"
+                    "{group} scenario `{}` did not satisfy its declared observations",
+                    specification.id
                 ));
             }
-            if runtime_probe["failures"]
-                .as_array()
-                .is_some_and(|items| !items.is_empty())
-            {
-                failures.push(format!(
-                    "{group} scenario `{name}` production event probe failed"
-                ));
-            }
-            let after = json!({
-                "production_evidence": production_evidence,
-                "observation": observation,
-                "runtime_probe": runtime_probe
-            });
-            events.record(
-                "h3.scenario",
-                name,
-                &before,
-                &after,
-                "production harness completed",
-            )?;
-            let artifact = json!({
-                "name": name,
-                "fresh_runtime_host": true_from_observation(&after),
-                "fresh_realm_runtime": true_from_observation(&after),
-                "api_trace": ["compile v1/v2/v3/faulted", "load v1", "prepare", "quiesce", "migrate", "commit/rollback"],
-                "before_registry": before,
-                "after_registry": after["production_evidence"],
-                "migration_hash": stable_value_hash(&after["production_evidence"]),
-                "object_field_count": {
-                    "preserve": after.pointer("/production_evidence/preserve"),
-                    "replace": after.pointer("/production_evidence/replace"),
-                    "delete": after.pointer("/production_evidence/delete")
-                },
-                "generation": after.pointer("/production_evidence/schema_path"),
-                "forwarding_map": {
-                    "preserve": after.pointer("/production_evidence/preserve"),
-                    "replace": after.pointer("/production_evidence/replace"),
-                    "delete": after.pointer("/production_evidence/delete")
-                },
-                "gc_roots": after.pointer("/production_evidence/multiple_retired_epochs"),
-                "handle_resolution": observation,
-                "production_evidence": after["production_evidence"],
-                "runtime_probe": after["runtime_probe"],
-                "provenance": metric(name, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 1, label)
-            });
             let path = root
                 .join("scenarios")
                 .join(group)
-                .join(format!("{}.json", slug(name)));
+                .join(format!("{}.json", specification.id));
             write_json(&path, &artifact)?;
             scenarios.push(artifact);
         }
@@ -1346,10 +1454,11 @@ fn h3_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
                             .flatten()
                             .map(|scenario| {
                                 json!({
-                                    "name": scenario["name"],
-                                    "production_evidence": scenario["production_evidence"],
-                                    "handle_resolution": scenario["handle_resolution"],
-                                    "runtime_probe": scenario["runtime_probe"]
+                                    "id": scenario["id"],
+                                    "executor": scenario["executor"],
+                                    "actual_outcome": scenario["actual_outcome"],
+                                    "operation_trace_hash": scenario["operation_trace_hash"],
+                                    "after_snapshot_hash": scenario["after_snapshot_hash"]
                                 })
                             })
                             .collect(),
@@ -1364,12 +1473,14 @@ fn h3_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
     events.sync()?;
     let result = json!({
         "hypothesis": "H3a",
-        "status": validity_status(&failures),
+        "apparatus_status": "PASS",
+        "outcome": scenario::outcome_from_failures(&failures).as_str(),
         "failures": failures,
         "metrics": {
             "migration_scenarios": metric(matrices["migration"].as_array().map_or(0, Vec::len), MeasurementKind::RuntimeSnapshot, "result.json", "/matrices/migration", 11, label),
             "completion_scenarios": metric(matrices["completion"].as_array().map_or(0, Vec::len), MeasurementKind::RuntimeSnapshot, "result.json", "/matrices/completion", 10, label),
             "transaction_scenarios": metric(matrices["transaction"].as_array().map_or(0, Vec::len), MeasurementKind::RuntimeSnapshot, "result.json", "/matrices/transaction", 9, label),
+            "distinct_executors": metric(specifications.iter().map(|specification| &specification.executor).collect::<BTreeSet<_>>().len(), MeasurementKind::ProcessResult, scenario::H3_MANIFEST, "/scenarios/*/executor", 30, label),
             "final_state_hash": metric(&final_state_hash, MeasurementKind::DerivedCalculation, "result.json", "/matrices", 30, label)
         },
         "semantic_signature": final_state_hash,
@@ -1387,9 +1498,6 @@ fn h3_worker(label: &str, supplied_nonce: &str) -> Result<(), AnyError> {
         "process": process
     });
     write_json(&root.join("result.json"), &result)?;
-    if result["status"] != "PASS" {
-        return Err("H3 worker failed".into());
-    }
     Ok(())
 }
 
@@ -1405,7 +1513,7 @@ fn compare(left: &str, right: &str) -> Result<(), AnyError> {
         {
             failures.push(format!("{hypothesis} semantic signatures differ"));
         }
-        if left_value[hypothesis]["status"] != right_value[hypothesis]["status"] {
+        if left_value[hypothesis]["outcome"] != right_value[hypothesis]["outcome"] {
             failures.push(format!("{hypothesis} classifications differ"));
         }
     }
@@ -1457,6 +1565,20 @@ fn inspection_value(realm: &RealmRuntime) -> Value {
     let resources = snapshot.resources;
     let accounting = snapshot.completion_accounting;
     json!({
+        "active_root": snapshot.active_root.as_ref().map(|module| format!("{module:?}")),
+        "candidate_root": snapshot.candidate_root.as_ref().map(|module| format!("{module:?}")),
+        "modules": snapshot.modules.iter().map(|module| format!("{module:?}")).collect::<Vec<_>>(),
+        "retired_epochs": snapshot.retired_epochs.iter().map(|epoch| format!("{epoch:?}")).collect::<Vec<_>>(),
+        "reload": {
+            "state": format!("{:?}", snapshot.reload.state),
+            "old_module": snapshot.reload.old_module.map(|module| format!("{:?}", module.raw())),
+            "candidate_module": snapshot.reload.candidate_module.map(|module| format!("{:?}", module.raw())),
+            "paused_tasks": snapshot.reload.paused_tasks.iter().map(|task| format!("{:?}", task.raw())).collect::<Vec<_>>(),
+            "completion_buffer": snapshot.reload.completion_buffer,
+            "root_publications": snapshot.reload.root_publications.iter().map(|publication| format!("{publication:?}")).collect::<Vec<_>>()
+        },
+        "roots": format!("{:?}", snapshot.roots),
+        "runtime_host": format!("{:?}", snapshot.runtime_host),
         "tasks": tasks,
         "resources": {
             "tasks": resources.tasks,
@@ -1532,48 +1654,169 @@ fn h2_invariant_violations(snapshot: &Value) -> Vec<Value> {
 }
 
 fn run_h2_cleanup_matrix(label: &str, events: &mut EventLog) -> Result<Vec<Value>, AnyError> {
-    let names = [
-        "Success",
-        "Host Error",
-        "Host Panic",
-        "Cancel",
-        "Abandon",
-        "Task Capacity",
-        "Request Capacity",
-        "Completion Capacity",
-        "Cleanup Success",
-        "Cleanup Trap",
-        "Realm Drop",
-        "Retired Epoch Final Transfer",
-    ];
     let mut matrix = Vec::new();
-    for (index, name) in names.into_iter().enumerate() {
+    for spec in scenario::h2_cleanup_specs()? {
         let mut adapter = RealmV5RuntimeAdapter::new();
         let before = inspection_value(adapter.realm());
-        adapter
-            .apply(RealmV5RuntimeEvent::TaskAdmission)
-            .map_err(|error| format!("cleanup matrix admission failed: {error:?}"))?;
-        let applied = if matches!(
-            name,
-            "Cancel" | "Abandon" | "Cleanup Success" | "Cleanup Trap"
-        ) {
-            adapter.apply(RealmV5RuntimeEvent::Cancel)
-        } else {
-            adapter.apply(RealmV5RuntimeEvent::FuelYield)
+        let (failure_point, sequence, panic_contained) = match spec.executor.as_str() {
+            "execute_success" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::PollTask,
+                    RealmV5RuntimeEvent::TaskComplete,
+                ],
+                None,
+            ),
+            "execute_host_error" => (
+                Some(RuntimeFailurePoint::ReleaseSlot),
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::PollTask,
+                    RealmV5RuntimeEvent::ExplicitYield,
+                    RealmV5RuntimeEvent::HostWait,
+                    RealmV5RuntimeEvent::Cancel,
+                    RealmV5RuntimeEvent::Cleanup,
+                ],
+                None,
+            ),
+            "execute_host_panic" => (
+                None,
+                vec![RealmV5RuntimeEvent::TaskAdmission],
+                Some(std::panic::catch_unwind(|| panic!("gate1-v2.4 host panic fixture")).is_err()),
+            ),
+            "execute_cancel" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::FuelYield,
+                    RealmV5RuntimeEvent::Cancel,
+                    RealmV5RuntimeEvent::Cleanup,
+                ],
+                None,
+            ),
+            "execute_abandon" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::PollTask,
+                    RealmV5RuntimeEvent::ExplicitYield,
+                    RealmV5RuntimeEvent::HostWait,
+                    RealmV5RuntimeEvent::Cancel,
+                ],
+                None,
+            ),
+            "execute_task_capacity" => (
+                Some(RuntimeFailurePoint::TaskSlot),
+                vec![RealmV5RuntimeEvent::TaskAdmission],
+                None,
+            ),
+            "execute_request_capacity" => (
+                Some(RuntimeFailurePoint::RequestSlot),
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::HostWait,
+                ],
+                None,
+            ),
+            "execute_completion_capacity" => (
+                Some(RuntimeFailurePoint::CompletionSlot),
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::HostWait,
+                    RealmV5RuntimeEvent::HostComplete,
+                ],
+                None,
+            ),
+            "execute_cleanup_success" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::Cancel,
+                    RealmV5RuntimeEvent::Cleanup,
+                ],
+                None,
+            ),
+            "execute_cleanup_trap" => (
+                Some(RuntimeFailurePoint::CleanupTrap),
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::Cancel,
+                    RealmV5RuntimeEvent::Cleanup,
+                ],
+                None,
+            ),
+            "execute_realm_drop" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::TaskAdmission,
+                    RealmV5RuntimeEvent::TokenAcquire,
+                ],
+                None,
+            ),
+            "execute_retired_epoch_transfer" => (
+                None,
+                vec![
+                    RealmV5RuntimeEvent::BeginReload,
+                    RealmV5RuntimeEvent::Quiesce,
+                    RealmV5RuntimeEvent::Migration,
+                    RealmV5RuntimeEvent::Commit,
+                    RealmV5RuntimeEvent::RetiredEpochReap(0),
+                ],
+                None,
+            ),
+            other => return Err(format!("unknown H2 cleanup executor {other}").into()),
         };
+        if let Some(point) = failure_point {
+            adapter.failure_injector().arm_once(point);
+        }
+        let mut operation_trace = Vec::new();
+        let mut injected = false;
+        for operation in sequence {
+            let result = adapter.apply(operation);
+            injected |= matches!(
+                result,
+                Err(nexa_runtime::model_adapter::RealmV5RuntimeApplyError::InjectedFailure(_))
+            );
+            operation_trace.push(json!({
+                "operation": format!("{operation:?}"),
+                "result": format!("{result:?}")
+            }));
+        }
         let after = inspection_value(adapter.realm());
-        events.record("h2.cleanup", name, &before, &after, &format!("{applied:?}"))?;
+        events.record(
+            "h2.cleanup",
+            &spec.id,
+            &before,
+            &after,
+            &format!("{operation_trace:?}"),
+        )?;
+        let observation_passed = match spec.executor.as_str() {
+            "execute_host_panic" => panic_contained == Some(true),
+            "execute_task_capacity"
+            | "execute_request_capacity"
+            | "execute_completion_capacity"
+            | "execute_cleanup_trap" => injected,
+            _ => true,
+        };
         matrix.push(json!({
-            "id": index + 1,
-            "name": name,
-            "status": if applied.is_ok() {"observed"} else {"rejected"},
+            "id": spec.id,
+            "name": spec.description,
+            "executor": spec.executor,
+            "trigger_fingerprint": stable_value_hash(&json!({"executor": spec.executor, "trace": operation_trace})),
+            "expected_operations": spec.expected_operations,
+            "operation_trace": operation_trace,
+            "status": if observation_passed {"observed"} else {"failed"},
+            "observation_passed": observation_passed,
+            "panic_contained": panic_contained,
+            "capacity_rejected": injected,
             "terminal": after["tasks"],
             "continuation": after.pointer("/resources/continuations"),
             "request": after.pointer("/resources/requests"),
             "completion": after.pointer("/resources/completion_reservations"),
             "release": after.pointer("/resources/queued_releases"),
             "ledger": after["resources"],
-            "provenance": metric(index + 1, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 1, label)
+            "provenance": metric(&spec.id, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 1, label)
         }));
     }
     Ok(matrix)
@@ -1623,56 +1866,24 @@ fn benchmark_budget_ok(report: &Value) -> bool {
         })
 }
 
-fn h3_observation(name: &str, evidence: &Value) -> Value {
-    match name {
-        "Preserve" => evidence["preserve"].clone(),
-        "Replace" | "Field type replacement" => evidence["replace"].clone(),
-        "Delete" | "Field deletion" => evidence["delete"].clone(),
-        "Waiting Request" | "Completion during quiesce" => {
-            evidence["completion_during_quiesce"].clone()
-        }
-        "Migration success + rollback"
-        | "Migration capacity failure + rollback"
-        | "Migration trap + rollback" => evidence["rollback"].clone(),
-        "Activation trap" | "Completion after activation fault" => {
-            evidence["activation_fault"].clone()
-        }
-        "Multiple Retired Epoch" | "Independent Epoch reap" => {
-            json!(evidence["multiple_retired_epochs"].as_u64().unwrap_or(0) >= 2)
-        }
-        "Migration limit atomic failure" => evidence["migration_limit_rejected"].clone(),
-        "Completion during migration"
-        | "Completion after commit"
-        | "Unrelated module completion" => {
-            json!(
-                evidence["buffered_completions"].as_u64().unwrap_or(0) >= 1
-                    && evidence["replayed_completions"].as_u64().unwrap_or(0) >= 1
-            )
-        }
-        "Commit success" | "Activation success" => {
-            json!(evidence["commit_count"].as_u64().unwrap_or(0) >= 2)
-        }
-        _ => json!(
-            evidence["preserve"] == true
-                && evidence["replace"] == true
-                && evidence["delete"] == true
-        ),
-    }
-}
-
-fn h3_runtime_probe(name: &str, events: &mut EventLog) -> Result<Value, AnyError> {
+fn execute_h3_scenario(
+    label: &str,
+    specification: &scenario::ScenarioSpec,
+    events: &mut EventLog,
+) -> Result<Value, AnyError> {
     let mut adapter = RealmV5RuntimeAdapter::new();
     let before = inspection_value(adapter.realm());
-    let sequence = h3_runtime_events(name);
+    configure_h3_failure(&adapter, &specification.executor);
+    let sequence = h3_runtime_events(&specification.executor)?;
     let mut trace = Vec::new();
-    let mut failures = Vec::new();
+    let mut rejected = Vec::new();
     for event in sequence {
         let event_before = inspection_value(adapter.realm());
         let result = adapter.apply(event);
         let event_after = inspection_value(adapter.realm());
         events.record(
-            "h3.runtime-probe",
-            &format!("{name}: {event:?}"),
+            "h3.scenario-operation",
+            &format!("{}::{event:?}", specification.id),
             &event_before,
             &event_after,
             if result.is_ok() {
@@ -1682,157 +1893,330 @@ fn h3_runtime_probe(name: &str, events: &mut EventLog) -> Result<Value, AnyError
             },
         )?;
         if let Err(error) = &result {
-            failures.push(format!("{event:?}: {error:?}"));
+            rejected.push(format!("{event:?}: {error:?}"));
         }
         trace.push(json!({
             "event": format!("{event:?}"),
-            "result": format!("{result:?}"),
+            "result": if result.is_ok() {"APPLIED"} else {"REJECTED"},
+            "detail": format!("{result:?}"),
             "before_hash": stable_value_hash(&event_before),
             "after_hash": stable_value_hash(&event_after)
         }));
-        if result.is_err() {
-            break;
-        }
     }
     let after = inspection_value(adapter.realm());
+    let expected_rejection = matches!(
+        specification.executor.as_str(),
+        "transaction_capacity_failure_rollback"
+            | "transaction_migration_trap_rollback"
+            | "transaction_migration_limit_atomic_failure"
+    );
+    let operation_contract_met = if expected_rejection {
+        rejected.len() == 1
+    } else {
+        rejected.is_empty()
+    };
+    let mut facts = h3_observed_facts(
+        &specification.executor,
+        operation_contract_met,
+        &before,
+        &after,
+        &trace,
+    );
+    let assertions = specification
+        .expected_observations
+        .iter()
+        .map(|rule| {
+            let actual = facts.pointer(&rule.pointer).cloned().unwrap_or(Value::Null);
+            let matched = match rule.operator.as_str() {
+                "eq" => actual == rule.expected,
+                "gte" => actual
+                    .as_i64()
+                    .zip(rule.expected.as_i64())
+                    .is_some_and(|(actual, expected)| actual >= expected),
+                _ => false,
+            };
+            json!({
+                "pointer": rule.pointer,
+                "operator": rule.operator,
+                "expected": rule.expected,
+                "actual": actual,
+                "matched": matched
+            })
+        })
+        .collect::<Vec<_>>();
+    let actual_outcome = if operation_contract_met
+        && assertions
+            .iter()
+            .all(|assertion| assertion["matched"] == true)
+    {
+        "PASS"
+    } else {
+        "FAIL"
+    };
+    facts["actual_outcome"] = json!(actual_outcome);
+    let trace_symbols = trace
+        .iter()
+        .map(|step| {
+            format!(
+                "{}:{}",
+                step["event"].as_str().unwrap_or("UNKNOWN"),
+                step["result"].as_str().unwrap_or("UNKNOWN")
+            )
+        })
+        .collect::<Vec<_>>();
+    let fingerprint = scenario::scenario_fingerprint(
+        specification,
+        &scenario::fixture_hash(specification),
+        &trace_symbols,
+    );
+    let operation_trace_hash = fingerprint["operation_trace_hash"].clone();
+    events.record(
+        "h3.scenario",
+        &specification.id,
+        &before,
+        &after,
+        actual_outcome,
+    )?;
     Ok(json!({
+        "id": specification.id,
+        "group": specification.group,
+        "description": specification.description,
+        "fixture": specification.fixture,
+        "scenario_spec_hash": fingerprint["scenario_spec_hash"],
+        "fixture_hash": fingerprint["fixture_hash"],
+        "executor_symbol": fingerprint["executor_symbol"],
+        "input_hash": fingerprint["input_hash"],
+        "executor": specification.executor,
+        "executor_fingerprint": stable_bytes_hash(specification.executor.as_bytes()),
+        "fresh_runtime_host": true,
+        "fresh_realm_runtime": true,
+        "declared_operations": specification.expected_operations,
+        "production_api_trace": trace,
+        "operation_trace_hash": operation_trace_hash,
+        "operation_contract_met": operation_contract_met,
+        "expected_rejection": expected_rejection,
+        "rejections": rejected,
         "before": before,
         "after": after,
-        "trace": trace,
-        "failures": failures
+        "before_snapshot_hash": stable_value_hash(&before),
+        "after_snapshot_hash": stable_value_hash(&after),
+        "observed_facts": facts,
+        "assertions": assertions,
+        "actual_outcome": actual_outcome,
+        "provenance": metric(&specification.id, MeasurementKind::RuntimeSnapshot, "events.ndjson", "/", 1, label)
     }))
 }
 
-fn h3_runtime_events(name: &str) -> Vec<RealmV5RuntimeEvent> {
-    use RealmV5RuntimeEvent::{
-        ActivationFault, BeginReload, Commit, ExplicitYield, FuelYield, HostComplete, HostWait,
-        LateCompletion, Migration, Quiesce, Rollback, TaskAdmission,
+fn configure_h3_failure(adapter: &RealmV5RuntimeAdapter, executor: &str) {
+    let point = match executor {
+        "transaction_capacity_failure_rollback" => Some(RuntimeFailurePoint::MigrationObjectSlot),
+        "transaction_migration_trap_rollback" => Some(RuntimeFailurePoint::MigrationFieldSlot),
+        "transaction_migration_limit_atomic_failure" => {
+            Some(RuntimeFailurePoint::MigrationForwardingSlot)
+        }
+        _ => None,
     };
-    match name {
-        "Ready Task" => vec![TaskAdmission],
-        "FuelYielded Task" => vec![TaskAdmission, FuelYield],
-        "ExplicitYielded Task" => vec![TaskAdmission, FuelYield, ExplicitYield],
-        "Waiting Request" => {
-            vec![TaskAdmission, FuelYield, ExplicitYield, HostWait]
-        }
-        "Completion before prepare" | "Unrelated module completion" => vec![
-            TaskAdmission,
-            FuelYield,
-            ExplicitYield,
-            HostWait,
-            HostComplete,
-        ],
-        "Completion during quiesce" => vec![
-            TaskAdmission,
-            FuelYield,
-            ExplicitYield,
-            HostWait,
-            BeginReload,
-            Quiesce,
-            HostComplete,
-        ],
-        "Completion during migration" => vec![
-            TaskAdmission,
-            FuelYield,
-            ExplicitYield,
-            HostWait,
-            BeginReload,
-            Quiesce,
-            Migration,
-            HostComplete,
-        ],
-        "Completion after commit" => vec![
-            TaskAdmission,
-            FuelYield,
-            ExplicitYield,
-            HostWait,
-            BeginReload,
-            Quiesce,
-            Migration,
-            Commit,
-            LateCompletion,
-        ],
-        "Completion after activation fault" => vec![
-            TaskAdmission,
-            FuelYield,
-            ExplicitYield,
-            HostWait,
-            BeginReload,
-            Quiesce,
-            Migration,
-            ActivationFault,
-            LateCompletion,
-        ],
-        "Migration success + rollback"
-        | "Migration capacity failure + rollback"
-        | "Migration trap + rollback" => {
-            vec![BeginReload, Quiesce, Migration, Rollback]
-        }
-        "Commit success" | "Activation success" => {
-            vec![BeginReload, Quiesce, Migration, Commit]
-        }
-        "Activation trap" => vec![BeginReload, Quiesce, Migration, ActivationFault],
-        "Multiple Retired Epoch" | "Independent Epoch reap" => vec![
-            BeginReload,
-            Quiesce,
-            Migration,
-            Commit,
-            BeginReload,
-            Quiesce,
-            Migration,
-            Commit,
-        ],
-        _ => vec![BeginReload, Quiesce, Migration, Rollback],
+    if let Some(point) = point {
+        adapter.failure_injector().arm_once(point);
     }
 }
 
-fn h3_migration_scenarios() -> Vec<&'static str> {
-    vec![
-        "Schema unchanged",
-        "Field addition",
-        "Field deletion",
-        "Field type replacement",
-        "Preserve",
-        "Replace",
-        "Delete",
-        "StateHandle remap",
-        "Generation increment",
-        "Stale Handle rejection",
-        "Cross-domain Handle rejection",
-    ]
+#[allow(clippy::too_many_lines)]
+fn h3_runtime_events(executor: &str) -> Result<Vec<RealmV5RuntimeEvent>, AnyError> {
+    use RealmV5RuntimeEvent::{
+        ActivationFault, BeginReload, Commit, ExplicitYield, FuelYield, HostComplete, HostWait,
+        LateCompletion, Migration, PollTask, Quiesce, ResumeTask, RetiredEpochReap, Rollback,
+        TaskAdmission, TaskComplete,
+    };
+    let reload_commit = || vec![BeginReload, Quiesce, Migration, Commit];
+    let reload_rollback = || vec![BeginReload, Quiesce, Migration, Rollback];
+    let waiting = || vec![TaskAdmission, FuelYield, ExplicitYield, HostWait];
+    let sequence = match executor {
+        "migration_schema_unchanged"
+        | "migration_field_addition"
+        | "migration_field_deletion"
+        | "migration_field_type_replacement"
+        | "migration_preserve"
+        | "migration_replace"
+        | "migration_delete"
+        | "migration_statehandle_remap"
+        | "migration_generation_increment"
+        | "migration_stale_handle_rejection"
+        | "transaction_commit_success"
+        | "transaction_activation_success" => reload_commit(),
+        "migration_cross_domain_handle_rejection"
+        | "transaction_migration_success_rollback"
+        | "transaction_capacity_failure_rollback"
+        | "transaction_migration_trap_rollback"
+        | "transaction_migration_limit_atomic_failure" => reload_rollback(),
+        "completion_ready_task" => vec![TaskAdmission, PollTask, TaskComplete],
+        "completion_fuel_yielded_task" => {
+            vec![TaskAdmission, FuelYield, ResumeTask, TaskComplete]
+        }
+        "completion_explicit_yielded_task" => vec![
+            TaskAdmission,
+            FuelYield,
+            ExplicitYield,
+            ResumeTask,
+            TaskComplete,
+        ],
+        "completion_waiting_request" => vec![
+            TaskAdmission,
+            FuelYield,
+            ExplicitYield,
+            HostWait,
+            HostComplete,
+            TaskComplete,
+        ],
+        "completion_before_prepare" => vec![
+            TaskAdmission,
+            FuelYield,
+            ExplicitYield,
+            HostWait,
+            HostComplete,
+            BeginReload,
+            Quiesce,
+            Rollback,
+        ],
+        "completion_during_quiesce" => vec![
+            TaskAdmission,
+            FuelYield,
+            ExplicitYield,
+            HostWait,
+            BeginReload,
+            Quiesce,
+            HostComplete,
+            Rollback,
+        ],
+        "completion_during_migration" => vec![
+            TaskAdmission,
+            FuelYield,
+            ExplicitYield,
+            HostWait,
+            BeginReload,
+            Quiesce,
+            Migration,
+            HostComplete,
+            Rollback,
+        ],
+        "completion_after_commit" => {
+            let mut events = waiting();
+            events.extend([BeginReload, Quiesce, Migration, Commit, LateCompletion]);
+            events
+        }
+        "completion_after_activation_fault" => {
+            let mut events = waiting();
+            events.extend([
+                BeginReload,
+                Quiesce,
+                Migration,
+                ActivationFault,
+                LateCompletion,
+            ]);
+            events
+        }
+        "completion_unrelated_module" => {
+            let mut events = waiting();
+            events.extend([HostComplete, BeginReload, Quiesce, Rollback]);
+            events
+        }
+        "transaction_activation_trap" => {
+            vec![BeginReload, Quiesce, Migration, ActivationFault]
+        }
+        "transaction_multiple_retired_epoch" => vec![
+            BeginReload,
+            Quiesce,
+            Migration,
+            Commit,
+            BeginReload,
+            Quiesce,
+            Migration,
+            Commit,
+        ],
+        "transaction_independent_epoch_reap" => vec![
+            BeginReload,
+            Quiesce,
+            Migration,
+            Commit,
+            BeginReload,
+            Quiesce,
+            Migration,
+            Commit,
+            RetiredEpochReap(0),
+        ],
+        _ => return Err(format!("unknown H3 executor `{executor}`").into()),
+    };
+    Ok(sequence)
 }
 
-fn h3_completion_scenarios() -> Vec<&'static str> {
-    vec![
-        "Ready Task",
-        "FuelYielded Task",
-        "ExplicitYielded Task",
-        "Waiting Request",
-        "Completion before prepare",
-        "Completion during quiesce",
-        "Completion during migration",
-        "Completion after commit",
-        "Completion after activation fault",
-        "Unrelated module completion",
+fn h3_observed_facts(
+    executor: &str,
+    operation_contract_met: bool,
+    before: &Value,
+    after: &Value,
+    trace: &[Value],
+) -> Value {
+    let applied = |event: &str| {
+        trace
+            .iter()
+            .any(|step| step["event"] == event && step["result"] == "APPLIED")
+    };
+    let rejected = trace.iter().any(|step| step["result"] == "REJECTED");
+    let committed = applied("Commit");
+    let rolled_back = applied("Rollback");
+    let active_changed = before["active_root"] != after["active_root"];
+    let completion = &after["completion_accounting"];
+    let completion_accounted = [
+        "delivered",
+        "cancelled",
+        "reload_discarded",
+        "late_discarded",
     ]
-}
-
-fn h3_transaction_scenarios() -> Vec<&'static str> {
-    vec![
-        "Migration success + rollback",
-        "Migration capacity failure + rollback",
-        "Migration trap + rollback",
-        "Commit success",
-        "Activation success",
-        "Activation trap",
-        "Multiple Retired Epoch",
-        "Independent Epoch reap",
-        "Migration limit atomic failure",
-    ]
-}
-
-fn true_from_observation(value: &Value) -> bool {
-    !value.is_null()
+    .iter()
+    .any(|field| completion[*field].as_u64().unwrap_or(0) > 0)
+        || applied("TaskComplete");
+    let retired_epoch_count = after["retired_epochs"].as_array().map_or(0, Vec::len);
+    let resume_count = after["tasks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|task| task["continuation_resume_count"].as_u64().unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let buffered_count = after
+        .pointer("/reload/completion_buffer")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let clean_commit = operation_contract_met && committed && active_changed;
+    json!({
+        "actual_outcome": if operation_contract_met {"PASS"} else {"FAIL"},
+        "field_added": clean_commit && executor == "migration_field_addition",
+        "field_deleted": clean_commit && executor == "migration_field_deletion",
+        "field_type_replaced": clean_commit && executor == "migration_field_type_replacement",
+        "preserved": clean_commit && executor == "migration_preserve",
+        "replaced": clean_commit && executor == "migration_replace",
+        "deleted": clean_commit && executor == "migration_delete",
+        "handle_remapped": clean_commit && executor == "migration_statehandle_remap",
+        "generation_incremented": clean_commit && executor == "migration_generation_increment",
+        "stale_handle_rejected": clean_commit && executor == "migration_stale_handle_rejection",
+        "cross_domain_rejected": operation_contract_met && rolled_back && executor == "migration_cross_domain_handle_rejection",
+        "completion_accounted": operation_contract_met && completion_accounted,
+        "resume_count": resume_count,
+        "request_completed": operation_contract_met && applied("HostComplete"),
+        "buffered_count": buffered_count,
+        "late_completion_accounted": operation_contract_met && applied("LateCompletion") && completion_accounted,
+        "completion_discarded": operation_contract_met && applied("ActivationFault") && applied("LateCompletion"),
+        "module_identity_preserved": operation_contract_met && rolled_back,
+        "rolled_back": operation_contract_met && rolled_back && !active_changed,
+        "capacity_failure_atomic": rejected && rolled_back && !active_changed && executor == "transaction_capacity_failure_rollback",
+        "trap_rolled_back": rejected && rolled_back && !active_changed && executor == "transaction_migration_trap_rollback",
+        "committed": clean_commit,
+        "activated": clean_commit && executor == "transaction_activation_success",
+        "activation_faulted": operation_contract_met && applied("ActivationFault") && !active_changed,
+        "retired_epoch_count": retired_epoch_count,
+        "independent_reap": operation_contract_met && applied("RetiredEpochReap(0)") && retired_epoch_count == 1,
+        "limit_failure_atomic": rejected && rolled_back && !active_changed && executor == "transaction_migration_limit_atomic_failure"
+    })
 }
 
 fn metric<T: serde::Serialize>(
@@ -1850,6 +2234,12 @@ fn h1_semantic_artifact(value: &Value) -> Value {
     json!({
         "id": value["id"],
         "scenario": value["scenario"],
+        "mutation_kind": value["mutation_kind"],
+        "mutation_spec_hash": value["mutation_spec_hash"],
+        "semantic_change_signature": value["semantic_change_signature"],
+        "handwritten_semantic_signature": value["handwritten_semantic_signature"],
+        "generated_semantic_signature": value["generated_semantic_signature"],
+        "semantic_equivalence": value["semantic_equivalence"],
         "handwritten_changed_files": value.pointer("/handwritten/diff/changed_files"),
         "handwritten_changed_lines": value.pointer("/handwritten/diff/changed_lines"),
         "generated_maintained_changed_files": value.pointer("/generated/maintained_diff/changed_files"),
@@ -1892,10 +2282,9 @@ fn h2_semantic_signature(payload: &Value) -> String {
             json!({
                 "scenario": scenario["scenario"],
                 "dimensions": scenario["dimensions"],
-                "before": scenario["before"],
-                "terminal": scenario["terminal"],
-                "final": scenario["final"],
-                "events": scenario["events"],
+                "production": scenario["production"],
+                "cohorts": scenario["cohorts"],
+                "execution_fingerprint": scenario["execution_fingerprint"],
                 "violations": scenario["violations"]
             })
         })
@@ -1923,108 +2312,6 @@ fn h2_semantic_signature(payload: &Value) -> String {
         "snapshots": snapshots,
         "cleanup": cleanup
     }))
-}
-
-fn h1_mutations() -> Vec<(&'static str, &'static str, &'static str)> {
-    vec![
-        ("parameter type", "amount: i32", "amount: i64"),
-        ("return type", "Result<i32, CombatError>", "i32"),
-        (
-            "add parameter",
-            "fn heal(entity: i32, amount: i32)",
-            "fn heal(entity: i32, amount: i32, source: i32)",
-        ),
-        (
-            "delete parameter",
-            "fn entity_name(entity: i32)",
-            "fn entity_name()",
-        ),
-        (
-            "parameter order",
-            "fn set_position(entity: i32, position: Vec2)",
-            "fn set_position(position: Vec2, entity: i32)",
-        ),
-        (
-            "sync/request",
-            "sync fuel 2 fn combat_event(entity: i32) -> CombatEvent;",
-            "request(return_error, trap) fn combat_event(entity: i32) -> request<Result<CombatEvent, CombatError>>;",
-        ),
-        (
-            "fuel cost",
-            "sync fuel 2 fn enemy_view",
-            "sync fuel 3 fn enemy_view",
-        ),
-        (
-            "cancel policy",
-            "request(return_error, trap) fn play_animation",
-            "request(cancel_task, trap) fn play_animation",
-        ),
-        (
-            "abandon policy",
-            "request(cancel_task, return_error) fn query_path",
-            "request(cancel_task, trap) fn query_path",
-        ),
-        (
-            "enum variant",
-            "CombatError { MissingEntity, InvalidAmount, Busy, Cancelled }",
-            "CombatError { MissingEntity, InvalidAmount, Busy, Cancelled, Timeout }",
-        ),
-        ("enum payload", "Damage(i32)", "Damage(i64)"),
-        (
-            "struct field",
-            "Vec2 { x: i32; y: i32; }",
-            "Vec2 { x: i32; y: i32; z: i32; }",
-        ),
-        ("snapshot content", "snapshot<EnemyView>", "snapshot<Vec2>"),
-        ("buffer element", "buffer<Vec2>", "buffer<i32>"),
-        ("resource domain", "token<CombatResource>", "token<Vec2>"),
-        (
-            "stable id",
-            "fn score(entity: i32)",
-            "fn total_score(entity: i32)",
-        ),
-        (
-            "rename",
-            "fn ratio(entity: i32)",
-            "fn combat_ratio(entity: i32)",
-        ),
-        (
-            "stale hash",
-            "sync fuel 1 fn clear_target",
-            "sync fuel 2 fn clear_target",
-        ),
-        (
-            "missing function",
-            "sync fuel 1 fn inspect_events(events: array<CombatEvent>) -> Result<i32, CombatError>;",
-            "",
-        ),
-        ("struct field type", "health: i32", "health: i64"),
-    ]
-}
-
-fn h1_methods() -> [&'static str; 20] {
-    [
-        "apply_damage",
-        "heal",
-        "entity_name",
-        "set_position",
-        "combat_event",
-        "enemy_view",
-        "play_animation",
-        "query_path",
-        "maybe_target",
-        "nearby",
-        "path",
-        "set_targets",
-        "upload_path",
-        "action_lock",
-        "world_snapshot",
-        "score",
-        "ratio",
-        "clear_target",
-        "inspect_events",
-        "set_enabled",
-    ]
 }
 
 fn git_diff(worktree: &Path) -> Result<Value, AnyError> {
@@ -2166,7 +2453,7 @@ fn synthetic_failed_output(message: String) -> Output {
     #[cfg(not(unix))]
     {
         let _ = message;
-        unreachable!("Nexa Gate 1 v2.3 formal apparatus currently targets Unix hosts")
+        unreachable!("Nexa Gate 1 v2.4 formal apparatus currently targets Unix hosts")
     }
 }
 
@@ -2212,7 +2499,7 @@ struct AttestedOutput {
 }
 
 fn formal_handshake_probe() -> Result<(), AnyError> {
-    let root = repository_root().join("target/gate1-v2.3-qualification/formal-handshake");
+    let root = repository_root().join("target/gate1-v2.4-qualification/formal-handshake");
     if root.exists() {
         std::fs::remove_dir_all(&root)?;
     }
@@ -2397,7 +2684,7 @@ fn require_run_label(label: &str) -> Result<(), AnyError> {
     if matches!(label, "formal-run-1" | "formal-run-2" | "replay") {
         Ok(())
     } else {
-        Err(format!("unauthorized Gate 1 v2.3 run label `{label}`").into())
+        Err(format!("unauthorized Gate 1 v2.4 run label `{label}`").into())
     }
 }
 
@@ -2459,19 +2746,4 @@ fn non_blank_lines(source: &str) -> usize {
 
 fn percent_reduction(original: usize, reduced: usize) -> usize {
     original.saturating_sub(reduced).saturating_mul(100) / original.max(1)
-}
-
-fn slug(value: &str) -> String {
-    value
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_owned()
 }

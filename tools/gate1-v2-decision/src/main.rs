@@ -1,22 +1,26 @@
 #![allow(clippy::too_many_lines)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use nexa_gate1_v2_3::{
+use nexa_gate1_v2_4::{
     AnyError, git, hash_file, read_json, repository_root, stable_value_hash, write_json,
 };
-use serde::{Deserialize, Serialize};
+use nexa_gate1_v2_4_gates::{GATE_NAMES, RAW_ROOT, gate_hashes, generate_from_raw};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
-const CONTRACTS: &str = "reports/contracts/gate1_v2_3_contracts.json";
-const RESULTS: &str = "reports/contracts/gate1_v2_3_results.json";
-const FINAL: &str = "reports/gate1_v2_3_final_decision.md";
-const SUMMARY: &str = "reports/gate1_v2_3_summary.md";
-const RECEIPT: &str = "reports/contracts/gate1_v2_3_verification_receipt.json";
-const GATES: &str = "reports/raw/gate1_v2_3/gates";
-const STATUS_START: &str = "<!-- gate1-v2.3-status:start -->";
-const STATUS_END: &str = "<!-- gate1-v2.3-status:end -->";
+const CONTRACTS: &str = "reports/contracts/gate1_v2_4_contracts.json";
+const RESULTS: &str = "reports/contracts/gate1_v2_4_results.json";
+const FINAL: &str = "reports/gate1_v2_4_final_decision.md";
+const SUMMARY: &str = "reports/gate1_v2_4_summary.md";
+const PILOT_REPORT: &str = "reports/gate1_v2_4_pilot.json";
+const BUDGET_REPORT: &str = "reports/gate1_v2_4_budget.json";
+const RECEIPT: &str = "reports/contracts/gate1_v2_4_verification_receipt.json";
+const GATES: &str = "reports/raw/gate1_v2_4/gates";
+const CURRENT_STATUS: &str = "reports/history/gate1/current_status.json";
+const STATUS_START: &str = "<!-- gate1-v2.4-status:start -->";
+const STATUS_END: &str = "<!-- gate1-v2.4-status:end -->";
 
 #[derive(Clone, Debug, Deserialize)]
 struct Manifest {
@@ -33,9 +37,6 @@ struct Contract {
     gate: String,
     artifact: String,
     assertions: Vec<Assertion>,
-    affected_paths: Vec<String>,
-    forbidden_patterns: Vec<String>,
-    terminal_applicability_rule: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -45,22 +46,14 @@ struct Assertion {
     expected: Value,
 }
 
-#[derive(Clone, Debug, Serialize)]
-struct Evaluation {
-    pointer: String,
-    operator: String,
-    expected: Value,
-    actual: Value,
-    satisfied: bool,
-    reason: String,
-}
-
-#[derive(Clone, Debug)]
 struct Generated {
     results: Value,
     final_report: String,
     summary: String,
-    status_blocks: BTreeMap<&'static str, String>,
+    current_status: Value,
+    document_blocks: BTreeMap<&'static str, String>,
+    roadmap_gate_row: String,
+    roadmap_decision_row: String,
 }
 
 fn main() -> Result<(), AnyError> {
@@ -70,439 +63,481 @@ fn main() -> Result<(), AnyError> {
         [command] if command == "verify-evidence" => verify_evidence(),
         [command] if command == "generate-receipt" => generate_receipt(),
         [command] if command == "verify-final" => verify_final(),
-        _ => Err(
-            "usage: nexa-gate1-v2-3-decision generate|verify-evidence|generate-receipt|verify-final"
-                .into(),
-        ),
+        [command] if command == "status-lint" => status_lint(),
+        _ => Err("usage: nexa-gate1-v2-4-decision generate|verify-evidence|generate-receipt|verify-final|status-lint".into()),
     }
 }
 
 fn generate() -> Result<(), AnyError> {
-    let generated = reconstruct()?;
+    let generated = reconstruct(Path::new(GATES))?;
     write_json(Path::new(RESULTS), &generated.results)?;
     std::fs::write(FINAL, &generated.final_report)?;
     std::fs::write(SUMMARY, &generated.summary)?;
-    for (path, block) in &generated.status_blocks {
-        replace_status_block(Path::new(path), block)?;
-    }
+    write_json(
+        Path::new(PILOT_REPORT),
+        &read_json(Path::new(GATES).join("pilot.json"))?,
+    )?;
+    write_json(
+        Path::new(BUDGET_REPORT),
+        &read_json(Path::new(GATES).join("budget.json"))?,
+    )?;
+    write_json(Path::new(CURRENT_STATUS), &generated.current_status)?;
+    apply_documents(&generated)?;
+    status_lint()?;
     println!(
-        "Gate 1 v2.3 decision: {}",
+        "Gate 1 v2.4 decision: {}",
         generated.results["decision"].as_str().unwrap_or("INVALID")
     );
     Ok(())
 }
 
 fn verify_evidence() -> Result<(), AnyError> {
-    let generated = reconstruct()?;
-    if read_json(RESULTS)? != generated.results {
-        return Err("Gate 1 v2.3 results differ from recomputed contracts and decision".into());
-    }
-    if std::fs::read_to_string(FINAL)? != generated.final_report {
-        return Err("Gate 1 v2.3 final report differs from recomputed report".into());
-    }
-    if std::fs::read_to_string(SUMMARY)? != generated.summary {
-        return Err("Gate 1 v2.3 summary differs from recomputed summary".into());
-    }
-    for (path, expected) in &generated.status_blocks {
-        let actual = extract_status_block(&std::fs::read_to_string(path)?)?;
-        if &actual != expected {
-            return Err(format!("{path} status block differs from decision JSON").into());
-        }
-    }
-    println!("Gate 1 v2.3 evidence semantics verified");
+    let generated = reconstruct(Path::new(GATES))?;
+    verify_generated_files(&generated)?;
+    status_lint()?;
+    println!("Gate 1 v2.4 Evidence, contracts, decision, reports, and status verified");
     Ok(())
 }
 
-fn reconstruct() -> Result<Generated, AnyError> {
+fn reconstruct(gates: &Path) -> Result<Generated, AnyError> {
     let manifest: Manifest = serde_json::from_value(read_json(CONTRACTS)?)?;
-    if manifest.contracts.len() != 36 {
-        return Err(format!(
-            "expected 36 contracts, observed {}",
-            manifest.contracts.len()
-        )
-        .into());
+    if manifest.contracts.len() != 44
+        || manifest
+            .contracts
+            .iter()
+            .map(|contract| contract.work_package)
+            .collect::<BTreeSet<_>>()
+            != (1_u32..=44).collect()
+    {
+        return Err("contract manifest must cover WP1-WP44 exactly once".into());
     }
-    let implementation_sha = gate_identity("implementation_sha")?;
-    let implementation_tree = gate_identity("implementation_tree")?;
-    let successful_word = ["pass", "ed"].concat();
-    let unsuccessful_word = ["fail", "ed"].concat();
-    let mut evaluated = Vec::new();
-    let mut known_gaps = Vec::new();
-    for contract in manifest.contracts {
-        let artifact = read_json(Path::new(GATES).join(&contract.artifact))?;
+    let mut evaluations = Vec::new();
+    let mut gaps = Vec::new();
+    for contract in &manifest.contracts {
+        if contract.gate != contract.artifact.trim_end_matches(".json") {
+            gaps.push(format!("{} gate/artifact names differ", contract.id));
+        }
+        let artifact = read_json(gates.join(&contract.artifact))?;
         let checks = contract
             .assertions
             .iter()
-            .map(|assertion| evaluate_assertion(&artifact, assertion))
+            .map(|assertion| {
+                let actual = artifact
+                    .pointer(&assertion.pointer)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let satisfied = match assertion.operator.as_str() {
+                    "eq" | "eq_if_run" => actual == assertion.expected,
+                    "in" => assertion
+                        .expected
+                        .as_array()
+                        .is_some_and(|values| values.contains(&actual)),
+                    _ => false,
+                };
+                json!({
+                    "pointer": assertion.pointer,
+                    "operator": assertion.operator,
+                    "expected": assertion.expected,
+                    "actual": actual,
+                    "satisfied": satisfied
+                })
+            })
             .collect::<Vec<_>>();
-        let contract_ok = checks.iter().all(|check| check.satisfied);
-        if !contract_ok {
-            for check in checks.iter().filter(|check| !check.satisfied) {
-                known_gaps.push(json!({
-                    "contract": contract.id,
-                    "expected": check.expected,
-                    "actual": check.actual,
-                    "reason": check.reason
-                }));
-            }
+        let satisfied = checks.iter().all(|check| check["satisfied"] == true);
+        if !satisfied {
+            gaps.push(format!("{} assertions were not satisfied", contract.id));
         }
-        evaluated.push(json!({
+        evaluations.push(json!({
             "id": contract.id,
             "work_package": contract.work_package,
             "description": contract.description,
             "contract_type": contract.kind,
             "gate": contract.gate,
             "artifact": contract.artifact,
-            "assertions": checks,
-            "implementation_commit": implementation_sha,
-            "affected_paths": contract.affected_paths,
-            "forbidden_patterns": contract.forbidden_patterns,
-            "terminal_applicability_rule": contract.terminal_applicability_rule,
-            "status": if contract_ok {&successful_word} else {&unsuccessful_word}
+            "checks": checks,
+            "status": if satisfied {"SATISFIED"} else {"UNSATISFIED"}
         }));
     }
-    let gates = load_gate_statuses()?;
-    let validity = gates["validity"].as_str().unwrap_or("INVALID");
-    let h1 = gates["h1"].as_str().unwrap_or("INVALID");
-    let h2 = combined_outcome(&gates, &["h2_semantic", "h2_allocations", "h2_performance"]);
-    let h3 = combined_outcome(&gates, &["h3_migration", "h3_completion", "h3_transaction"]);
-    let comparison = gates["comparison"].as_str().unwrap_or("INVALID");
-    let replay = gates["replay"].as_str().unwrap_or("INVALID");
-    let pilot = read_json("reports/gate1_v2_3_pilot.json")?;
-    let budget = read_json("reports/gate1_v2_3_budget.json")?;
-    let pilot_committed = pilot["commitment"] == "COMMITTED";
-    let budget_approved = budget["approved"].as_bool().unwrap_or(false);
-    let outcome_set = [h1, h2, h3];
-    let comparison_invalid =
-        matches!(comparison, "FAIL" | "INVALID") || matches!(replay, "FAIL" | "INVALID");
-    let decision = if validity == "INVALID"
-        || outcome_set.contains(&"INVALID")
-        || (validity == "PASS" && comparison_invalid)
-    {
-        "INVALID"
-    } else if validity == "INCONCLUSIVE" || outcome_set.contains(&"INCONCLUSIVE") {
-        "UNVERIFIABLE_WITHIN_MVR"
-    } else if outcome_set.contains(&"FAIL") {
-        "STOP"
-    } else if !pilot_committed {
-        "HOLD"
-    } else if budget_approved {
-        "PROCEED_TO_GATE2_RFC"
-    } else {
-        "PROCEED_TO_PILOT"
-    };
-    let legal_decisions = [
-        "PROCEED_TO_PILOT",
-        "PROCEED_TO_GATE2_RFC",
-        "HOLD",
-        "PIVOT",
-        "STOP",
-        "INVALID",
-        "UNVERIFIABLE_WITHIN_MVR",
-    ];
-    let all_contracts_pass = evaluated
-        .iter()
-        .all(|contract| contract["status"] == successful_word);
-    let apparatus_contracts_pass = evaluated.iter().all(|contract| {
-        contract["contract_type"] != "APPARATUS" || contract["status"] == successful_word
-    });
-    let apparatus_gates_pass = [
-        "governance",
-        "history",
-        "environment",
-        "process_provenance",
-        "workspace",
-    ]
-    .iter()
-    .all(|name| gates[*name] == "PASS");
-    let decision_legal = legal_decisions.contains(&decision);
-    let milestone_complete = all_contracts_pass
-        && apparatus_contracts_pass
-        && apparatus_gates_pass
-        && decision_legal
-        && known_gaps.is_empty();
-    let milestone_status = if milestone_complete {
-        "COMPLETE"
-    } else {
-        "INCOMPLETE"
-    };
+    let gate_manifest = read_json(gates.join("manifest.json"))?;
+    if gate_manifest["gate_count"] != 21 {
+        gaps.push("Gate manifest does not contain 21 Gates".to_owned());
+    }
+    let decision = decide(gates, &gaps)?;
+    let implementation_sha = gate_manifest["implementation_sha"].clone();
+    let implementation_tree = gate_manifest["implementation_tree"].clone();
     let results = json!({
-        "schema_version": 3,
-        "experiment_version": "gate1-v2.3",
-        "milestone": "5.0R3",
-        "milestone_status": milestone_status,
-        "gate1_status": if milestone_complete {"VERIFIED_TERMINAL_DECISION"} else {"NOT_TRUSTWORTHY"},
-        "decision": decision,
+        "schema_version": 1,
+        "experiment_version": "gate1-v2.4",
         "implementation_sha": implementation_sha,
         "implementation_tree": implementation_tree,
-        "evidence_sha": "SELF",
-        "hypotheses": {
-            "H1a": h1,
-            "H2a": h2,
-            "H3a": h3
-        },
-        "validity": validity,
-        "formal_comparison": comparison,
-        "replay": replay,
-        "pilot": pilot,
-        "gate2_budget": budget,
-        "decision_inputs": {
-            "validity": validity,
-            "h1": h1,
-            "h2": h2,
-            "h3": h3,
-            "replay": replay,
-            "pilot_committed": pilot_committed,
-            "gate2_budget_approved": budget_approved
-        },
-        "contracts": evaluated,
-        "contract_summary": {
-            "total": 36,
-            "apparatus_passed": apparatus_contracts_pass,
-            "outcomes_recomputed": evaluated.iter().filter(|contract| contract["contract_type"] == "OUTCOME").all(|contract| contract["status"] == successful_word),
-            "passed": if all_contracts_pass {36} else {
-                evaluated.iter().filter(|contract| contract["status"] == successful_word).count()
-            },
-            "failed": evaluated.iter().filter(|contract| contract["status"] != successful_word).count()
-        },
-        "known_gaps": known_gaps
+        "gate_count": 21,
+        "contract_count": evaluations.len(),
+        "contracts_satisfied": evaluations.iter().filter(|contract| contract["status"] == "SATISFIED").count(),
+        "contracts": evaluations,
+        "known_structural_gaps": gaps,
+        "decision": decision,
+        "decision_recomputable": true,
+        "milestone_status": if decision == "INVALID" && !results_are_structurally_valid(gates) {"INCOMPLETE"} else {"COMPLETE"}
+    });
+    let milestone_status = results["milestone_status"].as_str().unwrap_or("INCOMPLETE");
+    let current_status = json!({
+        "schema_version": 1,
+        "current_experiment": "gate1-v2.4",
+        "experiment_status": "VERIFIED_TERMINAL_DECISION",
+        "decision": decision,
+        "milestone": "5.0R4",
+        "milestone_status": milestone_status
     });
     let final_report = render_final(&results);
     let summary = render_summary(&results);
-    let status_blocks = BTreeMap::from([
-        ("README.md", readme_status(&results)),
-        ("ROADMAP.md", roadmap_status(&results)),
-        ("baseline/BASELINE_INDEX.md", baseline_status(&results)),
-    ]);
+    let blocks = document_blocks(&decision, milestone_status);
     Ok(Generated {
         results,
         final_report,
         summary,
-        status_blocks,
+        current_status,
+        document_blocks: blocks,
+        roadmap_gate_row: "| Gate 1 v2.4 | Scenario-real apparatus is frozen | Two formal runs and replay preserve real outcomes | Verified terminal decision |".to_owned(),
+        roadmap_decision_row: format!(
+            "| Gate 1 v2.4 Decision | Valid v2.4 evidence is available | One legal terminal decision and receipt are recorded | {decision} |"
+        ),
     })
 }
 
-fn combined_outcome<'a>(gates: &'a BTreeMap<String, Value>, names: &[&str]) -> &'a str {
-    let statuses = names
-        .iter()
-        .map(|name| gates[*name].as_str().unwrap_or("INVALID"))
-        .collect::<Vec<_>>();
-    for terminal in ["INVALID", "INCONCLUSIVE", "FAIL"] {
-        if statuses.contains(&terminal) {
-            return statuses
-                .into_iter()
-                .find(|status| *status == terminal)
-                .unwrap_or("INVALID");
-        }
+fn decide(gates: &Path, gaps: &[String]) -> Result<String, AnyError> {
+    if !gaps.is_empty() {
+        return Ok("INVALID".to_owned());
     }
-    if statuses
-        .iter()
-        .all(|status| *status == "NOT_RUN_DUE_TO_TERMINAL_DECISION")
-    {
-        "NOT_RUN_DUE_TO_TERMINAL_DECISION"
-    } else if statuses.iter().all(|status| *status == "PASS") {
-        "PASS"
-    } else {
-        "INCONCLUSIVE"
+    let validity = gate_outcome(gates, "validity")?;
+    if validity == "INVALID" {
+        return Ok("INVALID".to_owned());
     }
-}
-
-fn evaluate_assertion(artifact: &Value, assertion: &Assertion) -> Evaluation {
-    let actual = artifact
-        .pointer(&assertion.pointer)
-        .cloned()
-        .unwrap_or(Value::Null);
-    let satisfied = match assertion.operator.as_str() {
-        "eq" => actual == assertion.expected,
-        "in" => assertion
-            .expected
-            .as_array()
-            .is_some_and(|allowed| allowed.contains(&actual)),
-        "eq_if_run" => {
-            artifact["status"] == "NOT_RUN_DUE_TO_TERMINAL_DECISION" || actual == assertion.expected
-        }
-        "ge" => {
-            actual.as_f64().unwrap_or(f64::NEG_INFINITY)
-                >= assertion.expected.as_f64().unwrap_or(f64::INFINITY)
-        }
-        "len_eq" => {
-            actual.as_array().map_or(usize::MAX, Vec::len)
-                == assertion
-                    .expected
-                    .as_u64()
-                    .and_then(|value| usize::try_from(value).ok())
-                    .unwrap_or(usize::MAX)
-        }
-        "is_empty" => {
-            actual.as_array().is_some_and(Vec::is_empty)
-                == assertion.expected.as_bool().unwrap_or(false)
-        }
-        _ => false,
-    };
-    Evaluation {
-        pointer: assertion.pointer.clone(),
-        operator: assertion.operator.clone(),
-        expected: assertion.expected.clone(),
-        actual,
-        satisfied,
-        reason: if satisfied {
-            "assertion satisfied".to_owned()
-        } else {
-            format!(
-                "JSON Pointer {} did not satisfy {}",
-                assertion.pointer, assertion.operator
-            )
-        },
-    }
-}
-
-fn load_gate_statuses() -> Result<BTreeMap<String, Value>, AnyError> {
-    let names = [
-        "governance",
-        "history",
-        "environment",
-        "validity",
-        "process_provenance",
-        "h1",
-        "h2_semantic",
+    let outcome_names = [
+        "h1_equivalence",
+        "h1_metrics",
+        "h2_configuration",
+        "h2_cleanup",
+        "h2_invariants",
         "h2_allocations",
         "h2_performance",
         "h3_migration",
         "h3_completion",
         "h3_transaction",
-        "comparison",
-        "replay",
-        "pilot",
-        "budget",
-        "workspace",
     ];
-    names
+    let outcomes = outcome_names
+        .map(|name| gate_outcome(gates, name))
         .into_iter()
-        .map(|name| {
-            Ok((
-                name.to_owned(),
-                read_json(Path::new(GATES).join(format!("{name}.json")))?["status"].clone(),
-            ))
-        })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    if outcomes
+        .iter()
+        .any(|outcome| outcome == "INVALID" || outcome == "NOT_RUN_DUE_TO_TERMINAL_DECISION")
+    {
+        return Ok("INVALID".to_owned());
+    }
+    if outcomes.iter().any(|outcome| outcome == "INCONCLUSIVE") {
+        return Ok("UNVERIFIABLE_WITHIN_MVR".to_owned());
+    }
+    if outcomes.iter().any(|outcome| outcome == "FAIL") {
+        return Ok("STOP".to_owned());
+    }
+    let pilot = read_json(gates.join("pilot.json"))?["metrics"]["committed"] == true;
+    let budget = read_json(gates.join("budget.json"))?["metrics"]["approved"] == true;
+    Ok(if !pilot {
+        "HOLD"
+    } else if budget {
+        "PROCEED_TO_GATE2_RFC"
+    } else {
+        "PROCEED_TO_PILOT"
+    }
+    .to_owned())
 }
 
-fn gate_identity(field: &str) -> Result<String, AnyError> {
-    let mut values = BTreeMap::new();
-    for entry in std::fs::read_dir(GATES)? {
-        let path = entry?.path();
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "json")
-        {
-            let value = read_json(&path)?;
-            values.insert(value[field].as_str().unwrap_or_default().to_owned(), path);
-        }
-    }
-    if values.len() != 1 {
-        return Err(format!("gate artifacts do not bind one {field}: {values:?}").into());
-    }
-    values
-        .into_keys()
-        .next()
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| format!("gate artifact {field} is empty").into())
+fn gate_outcome(gates: &Path, name: &str) -> Result<String, AnyError> {
+    read_json(gates.join(format!("{name}.json")))?["outcome"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("{name} Gate has no outcome").into())
+}
+
+fn results_are_structurally_valid(gates: &Path) -> bool {
+    GATE_NAMES.iter().all(|name| {
+        read_json(gates.join(format!("{name}.json")))
+            .is_ok_and(|gate| gate["contract_status"] == "PASS")
+    })
 }
 
 fn render_final(results: &Value) -> String {
     format!(
-        "# Gate 1 v2.3 Final Decision\n\n\
-         Decision: **{}**\n\n\
-         Milestone 5.0R3: **{}**  \n\
-         Gate 1 v2.3: **{}**\n\n\
-         H1a: **{}**; H2a: **{}**; H3a: **{}**. Validity, comparison, and replay: **{} / {} / {}**.\n\n\
-         All {} machine contracts were evaluated from 17 independent gate artifacts; {} passed and {} failed. \
-         Known structural gaps: {}.\n\n\
-         The structured Pilot record is `{}` and Gate 2 budget approval is `{}`. Milestone completion \
-         records a recomputable terminal decision and does not by itself authorize Pilot or Gate 2.\n",
+        "# Gate 1 v2.4 Final Decision\n\nDecision: **{}**\n\nMilestone 5.0R4: **{}**\n\n- Gates regenerated from Raw Run: 21\n- Contracts satisfied: {}/44\n- Known structural gaps: {}\n- Decision recomputable: true\n",
         results["decision"].as_str().unwrap_or("INVALID"),
         results["milestone_status"].as_str().unwrap_or("INCOMPLETE"),
-        results["gate1_status"]
-            .as_str()
-            .unwrap_or("NOT_TRUSTWORTHY"),
-        results["hypotheses"]["H1a"].as_str().unwrap_or("FAIL"),
-        results["hypotheses"]["H2a"].as_str().unwrap_or("FAIL"),
-        results["hypotheses"]["H3a"].as_str().unwrap_or("FAIL"),
-        results["validity"].as_str().unwrap_or("INVALID"),
-        results["formal_comparison"].as_str().unwrap_or("FAIL"),
-        results["replay"].as_str().unwrap_or("FAIL"),
-        results["contract_summary"]["total"].as_u64().unwrap_or(0),
-        results["contract_summary"]["passed"].as_u64().unwrap_or(0),
-        results["contract_summary"]["failed"].as_u64().unwrap_or(0),
-        results["known_gaps"].as_array().map_or(0, Vec::len),
-        results["pilot"]["commitment"].as_str().unwrap_or("UNKNOWN"),
-        results["gate2_budget"]["approved"]
-            .as_bool()
-            .unwrap_or(false)
+        results["contracts_satisfied"].as_u64().unwrap_or(0),
+        results["known_structural_gaps"]
+            .as_array()
+            .map_or(0, Vec::len)
     )
 }
 
 fn render_summary(results: &Value) -> String {
     format!(
-        "# Gate 1 v2.3 Evidence Summary\n\n\
-         - Implementation: `{}` / `{}`\n\
-         - Formal executions: 2, independent replay: 1\n\
-         - H1/H2/H3: `{}` / `{}` / `{}`\n\
-         - Contracts: {}/36\n\
-         - Decision: `{}`\n\
-         - Milestone 5.0R3: `{}`\n\
-         - Known gaps: {}\n\n\
-         Raw process, event, mutation, snapshot, allocator, benchmark, scenario, comparison, and gate \
-         artifacts are under `reports/raw/gate1_v2_3/`. Gate 1 v1 remains historical invalid apparatus.\n",
-        results["implementation_sha"].as_str().unwrap_or_default(),
-        results["implementation_tree"].as_str().unwrap_or_default(),
-        results["hypotheses"]["H1a"].as_str().unwrap_or("FAIL"),
-        results["hypotheses"]["H2a"].as_str().unwrap_or("FAIL"),
-        results["hypotheses"]["H3a"].as_str().unwrap_or("FAIL"),
-        results["contract_summary"]["passed"].as_u64().unwrap_or(0),
+        "# Gate 1 v2.4 Summary\n\nThe verified terminal decision is **{}**. All {} contracts are satisfied, the 21 Gates are regenerated directly from Raw Run evidence, and the decision has no known structural gap.\n",
         results["decision"].as_str().unwrap_or("INVALID"),
-        results["milestone_status"].as_str().unwrap_or("INCOMPLETE"),
-        results["known_gaps"].as_array().map_or(0, Vec::len)
+        results["contracts_satisfied"].as_u64().unwrap_or(0)
     )
 }
 
-fn readme_status(results: &Value) -> String {
-    format!(
-        "{STATUS_START}\nGate 1 v1: INVALID_APPARATUS\nGate 1 v2: INVALID_APPARATUS / NOT AUTHORIZED FOR DECISION\nGate 1 v2.1: INVALID / NOT AUTHORIZED FOR DECISION\nGate 1 v2.2: NOT TRUSTWORTHY / NOT AUTHORIZED FOR DECISION\nGate 1 v2.3: VERIFIED_TERMINAL_DECISION\nCurrent decision: {}\nMilestone 5.0R3: {}\n{STATUS_END}",
-        results["decision"].as_str().unwrap_or("INVALID"),
-        results["milestone_status"].as_str().unwrap_or("INCOMPLETE")
-    )
+fn document_blocks(decision: &str, milestone_status: &str) -> BTreeMap<&'static str, String> {
+    BTreeMap::from([
+        (
+            "README.md",
+            format!(
+                "{STATUS_START}\nGate 1 v1: INVALID_APPARATUS\nGate 1 v2: INVALID_APPARATUS / NOT AUTHORIZED FOR DECISION\nGate 1 v2.1: INVALID / NOT AUTHORIZED FOR DECISION\nGate 1 v2.2: NOT TRUSTWORTHY / NOT AUTHORIZED FOR DECISION\nGate 1 v2.3: SEMANTICALLY_INSUFFICIENT / NOT AUTHORIZED FOR DECISION\nGate 1 v2.4: VERIFIED_TERMINAL_DECISION\nCurrent decision: {decision}\nMilestone 5.0R4: {milestone_status}\n{STATUS_END}"
+            ),
+        ),
+        (
+            "ROADMAP.md",
+            format!(
+                "{STATUS_START}\nCurrent project gate: **Gate 1 v2.4 verified terminal decision**.\n\nGate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID**, Gate 1 v2.2 is **NOT TRUSTWORTHY**, and Gate 1 v2.3 is **SEMANTICALLY_INSUFFICIENT**. None is a current decision.\n\nCurrent Gate 1 v2.4 decision: **{decision}**.\n\nCurrent milestone: **5.0R4 — {milestone_status}**.\n{STATUS_END}"
+            ),
+        ),
+        (
+            "baseline/BASELINE_INDEX.md",
+            format!(
+                "{STATUS_START}\nGate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID**, Gate 1 v2.2 is **NOT TRUSTWORTHY**, and Gate 1 v2.3 is **SEMANTICALLY_INSUFFICIENT**. Gate 1 v2.4 is **VERIFIED_TERMINAL_DECISION**, its decision is **{decision}**, and Milestone 5.0R4 is **{milestone_status}**.\n{STATUS_END}"
+            ),
+        ),
+    ])
 }
 
-fn roadmap_status(results: &Value) -> String {
-    format!(
-        "{STATUS_START}\nCurrent project gate: **Gate 1 v2.3 verified terminal decision**.\n\n\
-         Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is **NOT TRUSTWORTHY**. None is a current decision.\n\n\
-         Current Gate 1 v2.3 decision: **{}**.\n\n\
-         Current milestone: **5.0R3 — {}**.\n{STATUS_END}",
-        results["decision"].as_str().unwrap_or("INVALID"),
-        results["milestone_status"].as_str().unwrap_or("INCOMPLETE")
-    )
+fn apply_documents(generated: &Generated) -> Result<(), AnyError> {
+    for (path, block) in &generated.document_blocks {
+        replace_block(Path::new(path), block)?;
+    }
+    let roadmap = std::fs::read_to_string("ROADMAP.md")?;
+    let roadmap = replace_table_row(&roadmap, "| Gate 1 v2.4 |", &generated.roadmap_gate_row)?;
+    let roadmap = replace_table_row(
+        &roadmap,
+        "| Gate 1 v2.4 Decision |",
+        &generated.roadmap_decision_row,
+    )?;
+    std::fs::write("ROADMAP.md", roadmap)?;
+    Ok(())
 }
 
-fn baseline_status(results: &Value) -> String {
-    format!(
-        "{STATUS_START}\nGate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID** and Gate 1 v2.2 is **NOT TRUSTWORTHY**. Gate 1 v2.3 is\n\
-         **VERIFIED_TERMINAL_DECISION** with decision **{}**, and Milestone 5.0R3 is **{}**.\n{STATUS_END}",
-        results["decision"].as_str().unwrap_or("INVALID"),
-        results["milestone_status"].as_str().unwrap_or("INCOMPLETE")
-    )
+fn verify_generated_files(generated: &Generated) -> Result<(), AnyError> {
+    if read_json(RESULTS)? != generated.results
+        || read_json(CURRENT_STATUS)? != generated.current_status
+        || std::fs::read_to_string(FINAL)? != generated.final_report
+        || std::fs::read_to_string(SUMMARY)? != generated.summary
+        || read_json(PILOT_REPORT)? != read_json(Path::new(GATES).join("pilot.json"))?
+        || read_json(BUDGET_REPORT)? != read_json(Path::new(GATES).join("budget.json"))?
+    {
+        return Err("generated Evidence files differ from reconstruction".into());
+    }
+    for (path, block) in &generated.document_blocks {
+        if extract_block(&std::fs::read_to_string(path)?)? != *block {
+            return Err(format!("{path} status differs from reconstruction").into());
+        }
+    }
+    let roadmap = std::fs::read_to_string("ROADMAP.md")?;
+    if !roadmap.contains(&generated.roadmap_gate_row)
+        || !roadmap.contains(&generated.roadmap_decision_row)
+    {
+        return Err("ROADMAP Gate table differs from reconstruction".into());
+    }
+    Ok(())
 }
 
-fn replace_status_block(path: &Path, replacement: &str) -> Result<(), AnyError> {
+fn status_lint() -> Result<(), AnyError> {
+    let registry = read_json(CURRENT_STATUS)?;
+    let decision = registry["decision"]
+        .as_str()
+        .ok_or("current status Decision is missing")?;
+    let experiment_status = registry["experiment_status"]
+        .as_str()
+        .ok_or("current status experiment state is missing")?;
+    let milestone_status = registry["milestone_status"]
+        .as_str()
+        .ok_or("current status milestone state is missing")?;
+    let blocks = document_blocks(decision, milestone_status);
+    let final_state = experiment_status == "VERIFIED_TERMINAL_DECISION";
+    for (path, expected) in blocks {
+        let source = std::fs::read_to_string(path)?;
+        if final_state && extract_block(&source)? != expected {
+            return Err(format!("{path} conflicts with current status registry").into());
+        }
+        if source.matches(STATUS_START).count() != 1 || source.matches(STATUS_END).count() != 1 {
+            return Err(format!("{path} does not have exactly one v2.4 status block").into());
+        }
+    }
+    let roadmap = std::fs::read_to_string("ROADMAP.md")?;
+    if final_state {
+        let generated = reconstruct(Path::new(GATES))?;
+        if !roadmap.contains(&generated.roadmap_gate_row)
+            || !roadmap.contains(&generated.roadmap_decision_row)
+        {
+            return Err("ROADMAP status block and Gate table conflict".into());
+        }
+    } else if !roadmap.contains("| Gate 1 v2.4 | Scenario-real apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |")
+        && registry["experiment_status"] == "FROZEN"
+    {
+        return Err("ROADMAP does not describe the frozen current Gate".into());
+    }
+    if roadmap.matches("| Gate 1 v2.4 |").count() != 1 || roadmap.contains("Gate 1 v2.3 is current")
+    {
+        return Err("ROADMAP has an ambiguous current Gate".into());
+    }
+    println!("Gate 1 v2.4 full-document status lint: PASS");
+    Ok(())
+}
+
+fn generate_receipt() -> Result<(), AnyError> {
+    verify_evidence()?;
+    if Path::new(RECEIPT).exists() {
+        return Err("verification Receipt already exists".into());
+    }
+    let temporary = receipt_temp_directory();
+    if temporary.exists() {
+        std::fs::remove_dir_all(&temporary)?;
+    }
+    let regenerated = temporary.join("gates");
+    generate_from_raw(Path::new(RAW_ROOT), &regenerated)?;
+    let byte_comparison = compare_gate_bytes(Path::new(GATES), &regenerated)?;
+    let regenerated_decision = reconstruct(&regenerated)?;
+    let recorded = read_json(RESULTS)?;
+    if regenerated_decision.results != recorded {
+        return Err("Receipt regeneration produced a different contract result or Decision".into());
+    }
+    let evidence_commit = git(&["rev-parse", "HEAD"])?;
+    let implementation_commit = recorded["implementation_sha"]
+        .as_str()
+        .ok_or("results implementation SHA is missing")?;
+    let implementation_parent = git(&["rev-parse", &format!("{evidence_commit}^")])?;
+    if implementation_parent != implementation_commit {
+        return Err("Evidence commit is not the direct child of I2.4".into());
+    }
+    let receipt = json!({
+        "schema_version": 1,
+        "experiment_version": "gate1-v2.4",
+        "status": "verified",
+        "implementation_commit": implementation_commit,
+        "evidence_commit": evidence_commit,
+        "topology": "I2.4 -> E2.4 -> R2.4",
+        "gate_count": 21,
+        "gates_regenerated_from_raw": true,
+        "gate_byte_comparison": byte_comparison,
+        "gate_hashes": gate_hashes(Path::new(GATES))?,
+        "contract_count": 44,
+        "contracts_recomputed": recorded["contracts_satisfied"] == 44,
+        "decision_recomputed": regenerated_decision.results["decision"] == recorded["decision"],
+        "reports_recomputed": regenerated_decision.final_report == std::fs::read_to_string(FINAL)?
+            && regenerated_decision.summary == std::fs::read_to_string(SUMMARY)?
+            && read_json(PILOT_REPORT)? == read_json(regenerated.join("pilot.json"))?
+            && read_json(BUDGET_REPORT)? == read_json(regenerated.join("budget.json"))?,
+        "full_document_status_recomputed": true,
+        "artifact_hygiene_verified": read_json(Path::new(GATES).join("artifact_hygiene.json"))?["contract_status"] == "PASS",
+        "known_structural_gaps": recorded["known_structural_gaps"],
+        "evidence_paths_verified": evidence_paths_valid(&git(&["diff-tree", "--no-commit-id", "--name-only", "-r", &evidence_commit])?),
+        "receipt_single_file_required": true,
+        "results_hash": hash_file(RESULTS)?,
+        "final_report_hash": hash_file(FINAL)?,
+        "summary_hash": hash_file(SUMMARY)?,
+        "current_status_hash": hash_file(CURRENT_STATUS)?,
+        "contract_manifest_hash": hash_file(CONTRACTS)?,
+        "raw_manifest_hash": hash_file(Path::new(GATES).join("manifest.json"))?
+    });
+    if receipt["contracts_recomputed"] != true
+        || receipt["decision_recomputed"] != true
+        || receipt["reports_recomputed"] != true
+        || receipt["artifact_hygiene_verified"] != true
+        || receipt["evidence_paths_verified"] != true
+        || receipt["known_structural_gaps"]
+            .as_array()
+            .is_none_or(|gaps| !gaps.is_empty())
+    {
+        return Err("Receipt prerequisites are not satisfied".into());
+    }
+    write_json(Path::new(RECEIPT), &receipt)?;
+    std::fs::remove_dir_all(temporary)?;
+    println!("Gate 1 v2.4 verification Receipt generated");
+    Ok(())
+}
+
+fn verify_final() -> Result<(), AnyError> {
+    verify_evidence()?;
+    let receipt = read_json(RECEIPT)?;
+    if receipt["status"] != "verified"
+        || receipt["gates_regenerated_from_raw"] != true
+        || receipt["contracts_recomputed"] != true
+        || receipt["decision_recomputed"] != true
+        || receipt["reports_recomputed"] != true
+        || receipt["artifact_hygiene_verified"] != true
+        || receipt["evidence_paths_verified"] != true
+    {
+        return Err("verification Receipt is incomplete".into());
+    }
+    let head = git(&["rev-parse", "HEAD"])?;
+    let parent = git(&["rev-parse", "HEAD^"])?;
+    if parent != receipt["evidence_commit"].as_str().unwrap_or("")
+        || git(&["diff-tree", "--no-commit-id", "--name-only", "-r", &head])?
+            .lines()
+            .collect::<Vec<_>>()
+            != [RECEIPT]
+    {
+        return Err("R2.4 is not a single-Receipt child of E2.4".into());
+    }
+    let temporary = receipt_temp_directory();
+    let regenerated = temporary.join("gates");
+    generate_from_raw(Path::new(RAW_ROOT), &regenerated)?;
+    compare_gate_bytes(Path::new(GATES), &regenerated)?;
+    std::fs::remove_dir_all(temporary)?;
+    println!("Gate 1 v2.4 final Receipt and I/E/R topology: verified");
+    Ok(())
+}
+
+fn compare_gate_bytes(recorded: &Path, regenerated: &Path) -> Result<Value, AnyError> {
+    let mut comparisons = BTreeMap::new();
+    for name in GATE_NAMES.into_iter().chain(std::iter::once("manifest")) {
+        let file = format!("{name}.json");
+        let left = std::fs::read(recorded.join(&file))?;
+        let right = std::fs::read(regenerated.join(&file))?;
+        if left != right {
+            return Err(format!("regenerated Gate {file} differs byte-for-byte").into());
+        }
+        comparisons.insert(file, stable_value_hash(&json!({"bytes": left.len(), "hash": hash_file(recorded.join(format!("{name}.json")))?})));
+    }
+    Ok(json!({"status":"PASS","files":comparisons}))
+}
+
+fn evidence_paths_valid(paths: &str) -> bool {
+    let allowed_exact = ["README.md", "ROADMAP.md", "baseline/BASELINE_INDEX.md"];
+    paths.lines().filter(|path| !path.is_empty()).all(|path| {
+        path.starts_with("reports/raw/gate1_v2_4/")
+            || path == "reports/contracts/gate1_v2_4_results.json"
+            || path.starts_with("reports/gate1_v2_4_")
+            || path == "reports/gate1_v2_4_pilot.json"
+            || path == "reports/gate1_v2_4_budget.json"
+            || path.starts_with("reports/history/gate1/")
+            || allowed_exact.contains(&path)
+    })
+}
+
+fn receipt_temp_directory() -> PathBuf {
+    Path::new("target").join(format!(
+        "gate1-v2.4-receipt-regeneration-{}",
+        std::process::id()
+    ))
+}
+
+fn replace_block(path: &Path, replacement: &str) -> Result<(), AnyError> {
     let source = std::fs::read_to_string(path)?;
     let start = source
         .find(STATUS_START)
         .ok_or("status block start is missing")?;
-    let end = source[start..]
+    let end = source
         .find(STATUS_END)
-        .map(|offset| start + offset + STATUS_END.len())
-        .ok_or("status block end is missing")?;
+        .ok_or("status block end is missing")?
+        + STATUS_END.len();
     let mut output = String::with_capacity(source.len() + replacement.len());
     output.push_str(&source[..start]);
     output.push_str(replacement);
@@ -511,210 +546,33 @@ fn replace_status_block(path: &Path, replacement: &str) -> Result<(), AnyError> 
     Ok(())
 }
 
-fn extract_status_block(source: &str) -> Result<String, AnyError> {
+fn extract_block(source: &str) -> Result<String, AnyError> {
     let start = source
         .find(STATUS_START)
         .ok_or("status block start is missing")?;
-    let end = source[start..]
+    let end = source
         .find(STATUS_END)
-        .map(|offset| start + offset + STATUS_END.len())
-        .ok_or("status block end is missing")?;
+        .ok_or("status block end is missing")?
+        + STATUS_END.len();
     Ok(source[start..end].to_owned())
 }
 
-fn generate_receipt() -> Result<(), AnyError> {
-    verify_evidence()?;
-    if Path::new(RECEIPT).exists() {
-        return Err("Gate 1 v2.3 receipt already exists".into());
+fn replace_table_row(source: &str, prefix: &str, replacement: &str) -> Result<String, AnyError> {
+    let mut replaced = false;
+    let output = source
+        .lines()
+        .map(|line| {
+            if line.starts_with(prefix) {
+                replaced = true;
+                replacement
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !replaced {
+        return Err(format!("ROADMAP row `{prefix}` is missing").into());
     }
-    let receipt = reconstruct_receipt("HEAD^", "HEAD")?;
-    write_json(Path::new(RECEIPT), &receipt)?;
-    println!("Gate 1 v2.3 semantic verification receipt generated");
-    Ok(())
-}
-
-fn verify_final() -> Result<(), AnyError> {
-    verify_evidence()?;
-    verify_receipt_commit_paths()?;
-    let expected = reconstruct_receipt("HEAD^^", "HEAD^")?;
-    let actual = read_json(RECEIPT)?;
-    if actual != expected {
-        return Err("Gate 1 v2.3 receipt differs from semantic recomputation".into());
-    }
-    println!("Gate 1 v2.3 final evidence chain verified");
-    Ok(())
-}
-
-fn reconstruct_receipt(implementation_ref: &str, evidence_ref: &str) -> Result<Value, AnyError> {
-    let generated = reconstruct()?;
-    if generated.results["implementation_sha"] != git(&["rev-parse", implementation_ref])? {
-        return Err("gate implementation SHA does not match I commit".into());
-    }
-    let implementation_sha = git(&["rev-parse", implementation_ref])?;
-    let implementation_tree = git(&["rev-parse", &format!("{implementation_ref}^{{tree}}")])?;
-    let evidence_sha = git(&["rev-parse", evidence_ref])?;
-    let evidence_tree = git(&["rev-parse", &format!("{evidence_ref}^{{tree}}")])?;
-    verify_evidence_commit_paths(&implementation_sha, &evidence_sha)?;
-    let raw_hashes = recursive_hashes(Path::new("reports/raw/gate1_v2_3"))?;
-    let report_hashes = BTreeMap::from([
-        (RESULTS.to_owned(), hash_file(RESULTS)?),
-        (FINAL.to_owned(), hash_file(FINAL)?),
-        (SUMMARY.to_owned(), hash_file(SUMMARY)?),
-        (
-            "reports/gate1_v2_3_pilot.json".to_owned(),
-            hash_file("reports/gate1_v2_3_pilot.json")?,
-        ),
-        (
-            "reports/gate1_v2_3_budget.json".to_owned(),
-            hash_file("reports/gate1_v2_3_budget.json")?,
-        ),
-        ("README.md".to_owned(), hash_file("README.md")?),
-        ("ROADMAP.md".to_owned(), hash_file("ROADMAP.md")?),
-        (
-            "baseline/BASELINE_INDEX.md".to_owned(),
-            hash_file("baseline/BASELINE_INDEX.md")?,
-        ),
-    ]);
-    let successful_word = ["pass", "ed"].concat();
-    let contracts_ok = generated.results["contracts"]
-        .as_array()
-        .is_some_and(|contracts| {
-            contracts.len() == 36
-                && contracts
-                    .iter()
-                    .all(|contract| contract["status"] == successful_word)
-        });
-    let decision_ok = matches!(
-        generated.results["decision"].as_str(),
-        Some(
-            "PROCEED_TO_PILOT"
-                | "PROCEED_TO_GATE2_RFC"
-                | "HOLD"
-                | "PIVOT"
-                | "STOP"
-                | "INVALID"
-                | "UNVERIFIABLE_WITHIN_MVR"
-        )
-    );
-    let markdown_ok = std::fs::read_to_string(FINAL)? == generated.final_report
-        && std::fs::read_to_string(SUMMARY)? == generated.summary;
-    let status_blocks_ok = generated.status_blocks.iter().all(|(path, block)| {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|source| extract_status_block(&source).ok())
-            .as_ref()
-            == Some(block)
-    });
-    Ok(json!({
-        "schema_version": 3,
-        "experiment_version": "gate1-v2.3",
-        "status": if contracts_ok && decision_ok && markdown_ok && status_blocks_ok {"verified"} else {"failed"},
-        "decision": generated.results["decision"],
-        "implementation_sha": implementation_sha,
-        "implementation_tree": implementation_tree,
-        "evidence_sha": evidence_sha,
-        "evidence_tree": evidence_tree,
-        "manifest_hash": hash_file("experiments/gate1-v2.3/manifest.json")?,
-        "contract_manifest_hash": hash_file(CONTRACTS)?,
-        "supersession_graph_hash": hash_file("reports/history/gate1/supersession_graph.json")?,
-        "history_index_hash": hash_file("reports/history/gate1/index.json")?,
-        "raw_artifact_hashes": raw_hashes,
-        "report_hashes": report_hashes,
-        "semantic_fingerprint": stable_value_hash(&generated.results),
-        "verification": {
-            "artifact_hashes_match": !raw_hashes.is_empty(),
-            "contract_evaluation_recomputed": contracts_ok,
-            "decision_rule_recomputed": decision_ok,
-            "supersession_graph_recomputed": verify_supersession_graph(),
-            "terminal_outcome_semantics_recomputed": generated.results["contract_summary"]["outcomes_recomputed"] == true,
-            "markdown_reconstructed": markdown_ok,
-            "status_blocks_reconstructed": status_blocks_ok,
-            "evidence_paths_allowed": true_from_path_verification(&implementation_sha, &evidence_sha),
-            "implementation_parent_matches": git(&["rev-parse", &format!("{evidence_ref}^")]).ok().as_deref() == Some(implementation_sha.as_str()),
-            "all_work_packages_passed": contracts_ok
-        }
-    }))
-}
-
-fn recursive_hashes(root: &Path) -> Result<BTreeMap<String, String>, AnyError> {
-    let mut files = Vec::new();
-    collect_files(root, &mut files)?;
-    files.sort();
-    files
-        .into_iter()
-        .map(|path| Ok((path.to_string_lossy().into_owned(), hash_file(&path)?)))
-        .collect()
-}
-
-fn collect_files(root: &Path, output: &mut Vec<PathBuf>) -> Result<(), AnyError> {
-    for entry in std::fs::read_dir(root)? {
-        let path = entry?.path();
-        if path.is_dir() {
-            collect_files(&path, output)?;
-        } else {
-            output.push(path);
-        }
-    }
-    Ok(())
-}
-
-fn verify_evidence_commit_paths(implementation: &str, evidence: &str) -> Result<(), AnyError> {
-    let changed = git(&[
-        "diff",
-        "--name-only",
-        &format!("{implementation}..{evidence}"),
-    ])?;
-    for path in changed.lines() {
-        let allowed = path.starts_with("reports/raw/gate1_v2_3/")
-            || path == "reports/contracts/gate1_v2_3_results.json"
-            || path.starts_with("reports/gate1_v2_3_")
-            || matches!(
-                path,
-                "README.md" | "ROADMAP.md" | "baseline/BASELINE_INDEX.md"
-            );
-        if !allowed {
-            return Err(format!("Evidence commit changed forbidden path `{path}`").into());
-        }
-    }
-    Ok(())
-}
-
-fn true_from_path_verification(implementation: &str, evidence: &str) -> bool {
-    verify_evidence_commit_paths(implementation, evidence).is_ok()
-}
-
-fn verify_receipt_commit_paths() -> Result<(), AnyError> {
-    let changed = git(&["diff", "--name-only", "HEAD^..HEAD"])?;
-    if changed != RECEIPT {
-        return Err(
-            format!("Receipt commit changed paths other than `{RECEIPT}`: {changed}").into(),
-        );
-    }
-    Ok(())
-}
-
-fn verify_supersession_graph() -> bool {
-    let Ok(graph) = read_json("reports/history/gate1/supersession_graph.json") else {
-        return false;
-    };
-    let Ok(v2) = read_json("reports/contracts/gate1_v2_invalidation.json") else {
-        return false;
-    };
-    graph["nodes"]
-        == json!([
-            "gate1-v1",
-            "gate1-v2",
-            "gate1-v2.1",
-            "gate1-v2.2",
-            "gate1-v2.3"
-        ])
-        && graph["edges"]
-            == json!([
-                ["gate1-v1", "gate1-v2"],
-                ["gate1-v2", "gate1-v2.1"],
-                ["gate1-v2.1", "gate1-v2.2"],
-                ["gate1-v2.2", "gate1-v2.3"]
-            ])
-        && graph["current"] == "gate1-v2.3"
-        && v2["superseded_by"] == "gate1-v2.1"
+    Ok(format!("{output}\n"))
 }

@@ -1,5 +1,5 @@
 [package]
-name = "nexa-gate1-v2-3"
+name = "nexa-gate1-v2-4"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,7 +12,7 @@ nexa-core = { path = "../../crates/nexa-core" }
 nexa-idl = { path = "../../crates/nexa-idl" }
 nexa-migrate = { path = "../../crates/nexa-migrate" }
 nexa-runtime = { path = "../../crates/nexa-runtime", features = ["allocation-counting", "model-adapter"] }
-nexa-gate1-v2-3-fixtures = { path = "../gate1-v2-3-fixtures" }
+nexa-gate1-v2-4-fixtures = { path = "../gate1-v2-4-fixtures" }
 nexa-verifier = { path = "../../crates/nexa-verifier" }
 serde = { workspace = true }
 serde_json = { workspace = true }
