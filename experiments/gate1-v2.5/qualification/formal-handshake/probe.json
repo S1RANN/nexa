@@ -1,0 +1,31 @@
+{
+  "attestation": {
+    "executable_hash": "eca48d6cf798182b2eb9b1ae7da97a67de555ff9",
+    "expected_output_path": "/Users/orokane/projects/nexa/target/gate1-v2.5-qualification/formal-handshake",
+    "monotonic_clock": "std::time::Instant process-relative",
+    "one_time_token_hash": "4b66f0d24000a293",
+    "parent_nonce": "portable-parent-56013-1785139892328220000",
+    "protocol": "gate1-process-handshake-v1",
+    "role": "formal-probe-worker",
+    "run_id": "environment-qualification",
+    "started_at_monotonic_ns": 59573167,
+    "worker_nonce": "formal-probe-worker-56013-1785139892327902000",
+    "worker_pid": 56037
+  },
+  "child_exit_success": true,
+  "parent_verification": {
+    "attestation_hash": "22ea3d780ecf5fea4b88d0cf09ec25b8c2ee9e50",
+    "child_id": 56037,
+    "failures": [],
+    "output_status": 0,
+    "protocol": "gate1-process-handshake-v1",
+    "result_not_before_handshake": true,
+    "result_path": "/Users/orokane/projects/nexa/target/gate1-v2.5-qualification/formal-handshake/result.json",
+    "role": "formal-probe-worker",
+    "run_id": "environment-qualification",
+    "status": "PASS",
+    "worker_reported_pid": 56037
+  },
+  "probe": "formal-handshake",
+  "status": "PASS"
+}

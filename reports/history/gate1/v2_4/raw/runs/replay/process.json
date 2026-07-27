@@ -1,0 +1,18 @@
+{
+  "role": "supervisor",
+  "pid": 12583,
+  "parent_pid": null,
+  "process_nonce": "supervisor-12583-1785136005041376000",
+  "start_unix_ns": 1785136005041425000,
+  "end_unix_ns": 1785136205897742000,
+  "elapsed_monotonic_ns": 200767956083,
+  "executable_hash": "fab8585144b81451e47adb670b6b969120be8355",
+  "command_line": [
+    "target/debug/nexa-gate1-v2-4",
+    "supervisor",
+    "replay"
+  ],
+  "run_id": "replay",
+  "implementation_sha": "b31ab22149253248beed3dca8217392673420f73",
+  "implementation_tree": "7ab2147091c750e5a33f5c6a0c19f43197df7b59"
+}

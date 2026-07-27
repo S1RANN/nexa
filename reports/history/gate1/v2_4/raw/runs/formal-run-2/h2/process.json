@@ -1,0 +1,19 @@
+{
+  "role": "h2-worker",
+  "pid": 10694,
+  "parent_pid": null,
+  "process_nonce": "h2-worker-3833-1785135939263516000",
+  "start_unix_ns": 1785135939390004000,
+  "end_unix_ns": 1785135945576706000,
+  "elapsed_monotonic_ns": 6082186916,
+  "executable_hash": "fab8585144b81451e47adb670b6b969120be8355",
+  "command_line": [
+    "/Users/orokane/projects/nexa/target/debug/nexa-gate1-v2-4",
+    "h2-worker",
+    "formal-run-2",
+    "h2-worker-3833-1785135939263516000"
+  ],
+  "run_id": "formal-run-2",
+  "implementation_sha": "b31ab22149253248beed3dca8217392673420f73",
+  "implementation_tree": "7ab2147091c750e5a33f5c6a0c19f43197df7b59"
+}

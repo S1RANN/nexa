@@ -1,0 +1,2 @@
+{"sequence":0,"run_id":"replay","process_nonce":"supervisor-12583-1785136005041376000","phase":"supervisor.worker","operation":"spawn independent worker","before_snapshot_hash":"ae1d5d3d32165ff4","after_snapshot_hash":"65fdf9fe4447694a","result":"process completed"}
+{"sequence":1,"run_id":"replay","process_nonce":"supervisor-12583-1785136005041376000","phase":"supervisor.postflight","operation":"strict postflight","before_snapshot_hash":"65fdf9fe4447694a","after_snapshot_hash":"2b1d3c085e6e2ddb","result":"PASS"}

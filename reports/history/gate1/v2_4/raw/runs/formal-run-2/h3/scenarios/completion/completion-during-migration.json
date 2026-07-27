@@ -1,0 +1,263 @@
+{
+  "actual_outcome": "FAIL",
+  "after": {
+    "active_root": "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }",
+    "candidate_root": null,
+    "completion_accounting": {
+      "abandoned": 0,
+      "cancelled": 0,
+      "delivered": 2,
+      "late_discarded": 0,
+      "queued": 0,
+      "reload_discarded": 0,
+      "reserved": 2
+    },
+    "continuation_arena": 2,
+    "modules": [
+      "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }"
+    ],
+    "release_queue": [
+      "ReleaseRecord { realm_id: 83, module_id: 0, epoch: 1, kind: HostRequest, object_id: 0, domain: Io }",
+      "ReleaseRecord { realm_id: 83, module_id: 0, epoch: 1, kind: HostRequest, object_id: 1, domain: Io }"
+    ],
+    "reload": {
+      "candidate_module": null,
+      "completion_buffer": 0,
+      "old_module": null,
+      "paused_tasks": [],
+      "root_publications": [],
+      "state": "Idle"
+    },
+    "request_slots": [],
+    "resources": {
+      "completion_reservations": 0,
+      "continuations": 2,
+      "heap_objects": 2,
+      "queued_releases": 0,
+      "release_reservations": 0,
+      "requests": 0,
+      "retired_epochs": 0,
+      "scheduler_tokens": 2,
+      "scopes": 1,
+      "snapshots": 0,
+      "state_objects": 0,
+      "tasks": 2,
+      "tokens": 0
+    },
+    "retired_epochs": [],
+    "roots": "RootInspection { module_globals: 0, stateful_registry: 0, staging_heap: 0, suspended_tasks: 2, published_roots: 0 }",
+    "runtime_host": "Some(Open)",
+    "scheduler": [
+      "Ready",
+      "Ready"
+    ],
+    "tasks": [
+      {
+        "continuation_id": 5,
+        "continuation_resume_count": 1,
+        "request": null,
+        "scheduler_token": 6,
+        "state": "Running",
+        "task": "RawHandle { realm_id: 83, index: 0, generation: 0 }",
+        "terminal_record_count": 0
+      },
+      {
+        "continuation_id": 6,
+        "continuation_resume_count": 1,
+        "request": null,
+        "scheduler_token": 7,
+        "state": "Running",
+        "task": "RawHandle { realm_id: 83, index: 1, generation: 0 }",
+        "terminal_record_count": 0
+      }
+    ],
+    "terminal_records": []
+  },
+  "after_snapshot_hash": "25f14c411e9a51fc",
+  "assertions": [
+    {
+      "actual": 0,
+      "expected": 1,
+      "matched": false,
+      "operator": "eq",
+      "pointer": "/buffered_count"
+    }
+  ],
+  "before": {
+    "active_root": "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }",
+    "candidate_root": null,
+    "completion_accounting": {
+      "abandoned": 0,
+      "cancelled": 0,
+      "delivered": 0,
+      "late_discarded": 0,
+      "queued": 0,
+      "reload_discarded": 0,
+      "reserved": 0
+    },
+    "continuation_arena": 0,
+    "modules": [
+      "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }"
+    ],
+    "release_queue": [],
+    "reload": {
+      "candidate_module": null,
+      "completion_buffer": 0,
+      "old_module": null,
+      "paused_tasks": [],
+      "root_publications": [],
+      "state": "Idle"
+    },
+    "request_slots": [],
+    "resources": {
+      "completion_reservations": 0,
+      "continuations": 0,
+      "heap_objects": 0,
+      "queued_releases": 0,
+      "release_reservations": 0,
+      "requests": 0,
+      "retired_epochs": 0,
+      "scheduler_tokens": 0,
+      "scopes": 1,
+      "snapshots": 0,
+      "state_objects": 0,
+      "tasks": 0,
+      "tokens": 0
+    },
+    "retired_epochs": [],
+    "roots": "RootInspection { module_globals: 0, stateful_registry: 0, staging_heap: 0, suspended_tasks: 0, published_roots: 0 }",
+    "runtime_host": "Some(Open)",
+    "scheduler": [],
+    "tasks": [],
+    "terminal_records": []
+  },
+  "before_snapshot_hash": "d7801bddec568e48",
+  "declared_operations": [
+    "LoadOld",
+    "HostWait",
+    "Prepare",
+    "Quiesce",
+    "StageMigration",
+    "HostComplete",
+    "InspectCompletionBuffer",
+    "Rollback"
+  ],
+  "description": "completion during migration",
+  "executor": "completion_during_migration",
+  "executor_fingerprint": "e5413f41987a5d3e",
+  "executor_symbol": "completion_during_migration",
+  "expected_rejection": false,
+  "fixture": "h3://completion/during-migration",
+  "fixture_hash": "9068d68eca711fb3",
+  "fresh_realm_runtime": true,
+  "fresh_runtime_host": true,
+  "group": "completion",
+  "id": "completion-during-migration",
+  "input_hash": "0f3bf6518a26c80b",
+  "observed_facts": {
+    "activated": false,
+    "activation_faulted": false,
+    "actual_outcome": "FAIL",
+    "buffered_count": 0,
+    "capacity_failure_atomic": false,
+    "committed": false,
+    "completion_accounted": true,
+    "completion_discarded": false,
+    "cross_domain_rejected": false,
+    "deleted": false,
+    "field_added": false,
+    "field_deleted": false,
+    "field_type_replaced": false,
+    "generation_incremented": false,
+    "handle_remapped": false,
+    "independent_reap": false,
+    "late_completion_accounted": false,
+    "limit_failure_atomic": false,
+    "module_identity_preserved": true,
+    "preserved": false,
+    "replaced": false,
+    "request_completed": true,
+    "resume_count": 1,
+    "retired_epoch_count": 0,
+    "rolled_back": true,
+    "stale_handle_rejected": false,
+    "trap_rolled_back": false
+  },
+  "operation_contract_met": true,
+  "operation_trace_hash": "01733d0fc2d00729",
+  "production_api_trace": [
+    {
+      "after_hash": "be362ff6e63461c4",
+      "before_hash": "d7801bddec568e48",
+      "detail": "Ok(())",
+      "event": "TaskAdmission",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "f818ba3897a7e591",
+      "before_hash": "be362ff6e63461c4",
+      "detail": "Ok(())",
+      "event": "FuelYield",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "11be2df2d96a2ca1",
+      "before_hash": "f818ba3897a7e591",
+      "detail": "Ok(())",
+      "event": "ExplicitYield",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "39b29d2c1038d37d",
+      "before_hash": "11be2df2d96a2ca1",
+      "detail": "Ok(())",
+      "event": "HostWait",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "64b9a06684e7c60d",
+      "before_hash": "39b29d2c1038d37d",
+      "detail": "Ok(())",
+      "event": "BeginReload",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "e1e85e3c90526398",
+      "before_hash": "64b9a06684e7c60d",
+      "detail": "Ok(())",
+      "event": "Quiesce",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "e1b8168350125f8f",
+      "before_hash": "e1e85e3c90526398",
+      "detail": "Ok(())",
+      "event": "Migration",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "bee202c4737f3e80",
+      "before_hash": "e1b8168350125f8f",
+      "detail": "Ok(())",
+      "event": "HostComplete",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "25f14c411e9a51fc",
+      "before_hash": "bee202c4737f3e80",
+      "detail": "Ok(())",
+      "event": "Rollback",
+      "result": "APPLIED"
+    }
+  ],
+  "provenance": {
+    "measurement": "RuntimeSnapshot",
+    "run_id": "formal-run-2",
+    "sample_count": 1,
+    "source_artifact": "events.ndjson",
+    "source_pointer": "/",
+    "value": "completion-during-migration"
+  },
+  "rejections": [],
+  "scenario_spec_hash": "2b7cc577fdae15d2"
+}

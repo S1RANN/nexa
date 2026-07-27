@@ -1,0 +1,13 @@
+{
+  "executable_hash": "eca48d6cf798182b2eb9b1ae7da97a67de555ff9",
+  "expected_output_path": "/Users/orokane/projects/nexa/target/gate1-v2.5-qualification/formal-handshake",
+  "monotonic_clock": "std::time::Instant process-relative",
+  "one_time_token_hash": "4b66f0d24000a293",
+  "parent_nonce": "portable-parent-56013-1785139892328220000",
+  "protocol": "gate1-process-handshake-v1",
+  "role": "formal-probe-worker",
+  "run_id": "environment-qualification",
+  "started_at_monotonic_ns": 59573167,
+  "worker_nonce": "formal-probe-worker-56013-1785139892327902000",
+  "worker_pid": 56037
+}

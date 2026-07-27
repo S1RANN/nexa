@@ -18,18 +18,19 @@ MVR Scope 1.0
 Milestone 4.0R3 is complete at receipt
 `reports/contracts/milestone4r3_verification_receipt.json`.
 
-<!-- gate1-v2.4-status:start -->
+<!-- gate1-v2.5-status:start -->
 Gate 1 v1 and Gate 1 v2 are **INVALID_APPARATUS**. Gate 1 v2.1 is **INVALID**, Gate 1 v2.2 is
 **NOT TRUSTWORTHY**, and Gate 1 v2.3 is **SEMANTICALLY_INSUFFICIENT**. Gate 1 v2.4 is
-**FROZEN / INCOMPLETE**, its decision is **PENDING**, and Milestone 5.0R4 is **INCOMPLETE**.
-<!-- gate1-v2.4-status:end -->
+**STRUCTURAL_CLOSURE_FAILED**. Gate 1 v2.5 is **FROZEN / INCOMPLETE**, its decision is
+**PENDING_FORMAL_EXECUTION**, and Milestone 5.0R5 is **INCOMPLETE**.
+<!-- gate1-v2.5-status:end -->
 
 The current normative experiment entry points are:
 
-- `testing/GATE1_ACCEPTANCE_V2_4.md` — unchanged outcome thresholds plus v2.4 semantic apparatus rules;
-- `testing/GATE1_V2_4_AUTHORIZATION.md` — qualified-host execution authority and fixed budget after prefreeze;
+- `testing/GATE1_ACCEPTANCE_V2_5.md` — unchanged outcome thresholds plus stable projection and finalization rules;
+- `testing/GATE1_V2_5_AUTHORIZATION.md` — qualified-host execution authority and fixed zero-retry budget;
 - `testing/GATE1_MACHINE.md` — experiment lifecycle;
-- `../experiments/gate1-v2.4/manifest.json` — qualified frozen input binding after authorization;
+- `../experiments/gate1-v2.5/manifest.json` — qualified frozen input binding after authorization;
 - `../reports/gate1_v1_invalidation.md` — v1 historical invalidation;
 - `../reports/gate1_v2_invalidation.md` — v2 historical invalidation;
 - `../reports/gate1_v2_1_final_decision.md` — v2.1 historical INVALID decision;

@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "cohort_sets": {
+    "runtime-lifecycle-v1": ["ImmediateSuccess","FuelYield","ExplicitYield","HostSuccess","HostError","Cancel","Abandon","TerminalCleanup"]
+  },
+  "configurations": [
+    {"id":"h2-01","calls_per_frame":500,"first_slice_ratio":95,"trace":false,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-02","calls_per_frame":500,"first_slice_ratio":95,"trace":false,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-03","calls_per_frame":500,"first_slice_ratio":95,"trace":false,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-04","calls_per_frame":500,"first_slice_ratio":95,"trace":false,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-05","calls_per_frame":500,"first_slice_ratio":95,"trace":true,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-06","calls_per_frame":500,"first_slice_ratio":95,"trace":true,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-07","calls_per_frame":500,"first_slice_ratio":95,"trace":true,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-08","calls_per_frame":500,"first_slice_ratio":95,"trace":true,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-09","calls_per_frame":500,"first_slice_ratio":99,"trace":false,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-10","calls_per_frame":500,"first_slice_ratio":99,"trace":false,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-11","calls_per_frame":500,"first_slice_ratio":99,"trace":false,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-12","calls_per_frame":500,"first_slice_ratio":99,"trace":false,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-13","calls_per_frame":500,"first_slice_ratio":99,"trace":true,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-14","calls_per_frame":500,"first_slice_ratio":99,"trace":true,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-15","calls_per_frame":500,"first_slice_ratio":99,"trace":true,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-16","calls_per_frame":500,"first_slice_ratio":99,"trace":true,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-17","calls_per_frame":1000,"first_slice_ratio":95,"trace":false,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-18","calls_per_frame":1000,"first_slice_ratio":95,"trace":false,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-19","calls_per_frame":1000,"first_slice_ratio":95,"trace":false,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-20","calls_per_frame":1000,"first_slice_ratio":95,"trace":false,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-21","calls_per_frame":1000,"first_slice_ratio":95,"trace":true,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-22","calls_per_frame":1000,"first_slice_ratio":95,"trace":true,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-23","calls_per_frame":1000,"first_slice_ratio":95,"trace":true,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-24","calls_per_frame":1000,"first_slice_ratio":95,"trace":true,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-25","calls_per_frame":1000,"first_slice_ratio":99,"trace":false,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-26","calls_per_frame":1000,"first_slice_ratio":99,"trace":false,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-27","calls_per_frame":1000,"first_slice_ratio":99,"trace":false,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-28","calls_per_frame":1000,"first_slice_ratio":99,"trace":false,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-29","calls_per_frame":1000,"first_slice_ratio":99,"trace":true,"host_call":false,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-30","calls_per_frame":1000,"first_slice_ratio":99,"trace":true,"host_call":false,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-31","calls_per_frame":1000,"first_slice_ratio":99,"trace":true,"host_call":true,"value_shape":"scalar","cohort_set":"runtime-lifecycle-v1"},
+    {"id":"h2-32","calls_per_frame":1000,"first_slice_ratio":99,"trace":true,"host_call":true,"value_shape":"complex","cohort_set":"runtime-lifecycle-v1"}
+  ]
+}

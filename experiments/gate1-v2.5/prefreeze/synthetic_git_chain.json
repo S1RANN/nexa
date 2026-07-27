@@ -1,0 +1,22 @@
+{
+  "artifact_hash_recomputed": true,
+  "contracts_recomputed": true,
+  "decision_paths_valid": true,
+  "decision_recomputed": true,
+  "decision_sha": "8a1f21ce4daa33fb50762c64b20164b1726a4dbf",
+  "evidence_paths_valid": true,
+  "evidence_sha": "8b99edfce40a6d12af87c1580c14fa85bdc203a2",
+  "finalization_paths_valid": true,
+  "finalization_sha": "724e18bcac05a772b84cfa43e5511e73b4e01508",
+  "formal_evidence_usable": false,
+  "implementation_sha": "2fa41ee8abcd79997914b498f24fe78686071091",
+  "markdown_rebuilt": true,
+  "parent_chain_valid": true,
+  "push_is_contract_prerequisite": false,
+  "schema_version": 1,
+  "status": "PASS",
+  "status_blocks_rebuilt": true,
+  "synthetic": true,
+  "wp_048_pass_after_candidate_finalization": true,
+  "wp_048_pending_before_finalization": true
+}

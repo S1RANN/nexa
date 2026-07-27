@@ -1,8 +1,14 @@
 {
   "schema_version": 1,
-  "current_experiment": "gate1-v2.4",
+  "current_experiment": "gate1-v2.5",
   "experiment_status": "FROZEN",
-  "decision": "PENDING",
-  "milestone": "5.0R4",
-  "milestone_status": "INCOMPLETE"
+  "apparatus_status": "PENDING",
+  "evidence_status": "PENDING",
+  "decision_state": "PENDING_FORMAL_EXECUTION",
+  "decision": null,
+  "milestone": "5.0R5",
+  "milestone_status": "INCOMPLETE",
+  "finalization_status": "PENDING",
+  "receipt_verified": false,
+  "push_status": "FORBIDDEN"
 }
