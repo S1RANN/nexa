@@ -22,17 +22,18 @@ The current minimum supported Rust toolchain is **1.97.1**.
 
 ```text
 Current implementation milestone: 4.0R3 complete
-<!-- gate1-v2.5-status:start -->
+<!-- gate1-v2.6-status:start -->
 Gate 1 v1: INVALID_APPARATUS
 Gate 1 v2: INVALID_APPARATUS / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.1: INVALID / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.2: NOT TRUSTWORTHY / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.3: SEMANTICALLY_INSUFFICIENT / NOT AUTHORIZED FOR DECISION
 Gate 1 v2.4: STRUCTURAL_CLOSURE_FAILED / NOT AUTHORIZED FOR DECISION
-Gate 1 v2.5: FROZEN / INCOMPLETE
-Current decision: PENDING_FORMAL_EXECUTION
-Milestone 5.0R5: INCOMPLETE
-<!-- gate1-v2.5-status:end -->
+Gate 1 v2.5: STRUCTURAL_CLOSURE_FAILED / NOT AUTHORIZED FOR DECISION
+Gate 1 v2.6: FROZEN / INCOMPLETE
+Current decision: NOT_COMPUTED
+Milestone 5.0R6: INCOMPLETE
+<!-- gate1-v2.6-status:end -->
 ```
 
 The implemented MVR execution path is:

@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.6",
+  "status": "AUTHORIZED",
+  "approved_by": "repository owner",
+  "approved_at": "2026-07-27T17:39:44+08:00",
+  "approval_basis": "Nexa Milestone 5.0R6 Gate 1 v2.6 plan",
+  "previous_experiment": {
+    "experiment_version": "gate1-v2.5",
+    "status": "STRUCTURAL_CLOSURE_FAILED",
+    "decision_usable": false
+  },
+  "prefreeze_closure": {
+    "path": "experiments/gate1-v2.6/prefreeze/prefreeze_closure.json",
+    "hash": "b0010e3845557a61f33dd4b7fb056eeecb8f6846",
+    "status": "PASS"
+  },
+  "environment_qualification": {
+    "path": "experiments/gate1-v2.6/qualification/environment_qualification.json",
+    "hash": "0ba6a635ce5924d1fe7e7927692eb4162a4f0ed3",
+    "status": "QUALIFIED"
+  },
+  "acceptance_equivalence": {
+    "path": "experiments/gate1-v2.6/threshold_equivalence.json",
+    "hash": "46b28ac322567b51a626c588cb1debbb06151539",
+    "status": "PASS"
+  },
+  "scenario_manifests": {
+    "experiments/gate1-v2.6/fixtures/h1_handwritten.rs": "0d256f45aa54cc22dbe929b1ade2f4618324ff7f",
+    "experiments/gate1-v2.6/h1_mutations.json": "36ca81420d0ce58918b9e8470e6bb52d5b9ba575",
+    "experiments/gate1-v2.6/h2_cleanup_matrix.json": "507c39048cb48bfc8e6f6b3b2d6d55cc1e0ea91d",
+    "experiments/gate1-v2.6/h2_matrix.json": "a6c9617608ea4d3c366e6a07e37fd5c443d3dd54",
+    "experiments/gate1-v2.6/h3_scenarios.json": "75dc40eb9a3d59b4d1c7363dab1dbe64429d6f65",
+    "experiments/gate1-v2.6/scenario_schema.json": "0f61faef4a989931277d05c3bddb2bc38864f568"
+  },
+  "provenance_protocol": {
+    "name": "gate1-process-handshake-v1",
+    "hash": "58355719ebedf50e993e1f5d8be9f677e0ae4bf9",
+    "source": "experiments/gate1-v2.6/prefreeze/outcome_transport.json"
+  },
+  "execution_budget": {
+    "formal_run_1": 1,
+    "formal_run_2": 1,
+    "replay": 1,
+    "retry": 0
+  },
+  "worker_topology": {
+    "supervisors_per_run": 1,
+    "top_workers_per_run": 1,
+    "h1_h2_h3_workers_per_run": 3,
+    "benchmark_processes_per_h2_worker": 3
+  },
+  "output_policy": "target/gate1-v2.6 with immutable per-run directories",
+  "outcome_thresholds": "UNCHANGED_FROM_GATE1_V2_5",
+  "authorized_apparatus_changes": [
+    "legal INCONCLUSIVE to Contract PASS mapping",
+    "stable core failure decision priority",
+    "I2.6 E2.6 D2.6 R2.6 F2.6 finalization protocol",
+    "Receipt precomputation of eight finalization file hashes"
+  ],
+  "production_feature_changes_authorized": false
+}
