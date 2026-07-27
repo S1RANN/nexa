@@ -1,0 +1,13 @@
+{
+  "attestation_hash": "29d9f473d54ad8c108380a3126dcf848adc79375",
+  "child_id": 6940,
+  "failures": [],
+  "output_status": 0,
+  "protocol": "gate1-process-handshake-v1",
+  "result_not_before_handshake": true,
+  "result_path": "/Users/orokane/projects/nexa/target/gate1-v2.8-qualification/formal-handshake/result.json",
+  "role": "formal-probe-worker",
+  "run_id": "environment-qualification",
+  "status": "PASS",
+  "worker_reported_pid": 6940
+}

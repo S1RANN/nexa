@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "current": "gate1-v2.7",
+  "current": "gate1-v2.8",
   "graph": "reports/history/gate1/supersession_graph.json",
   "versions": [
     "reports/history/gate1/versions/gate1-v1.json",
@@ -11,8 +11,9 @@
     "reports/history/gate1/versions/gate1-v2.4.json",
     "reports/history/gate1/versions/gate1-v2.5.json",
     "reports/history/gate1/versions/gate1-v2.6.json",
-    "reports/history/gate1/versions/gate1-v2.7.json"
+    "reports/history/gate1/versions/gate1-v2.7.json",
+    "reports/history/gate1/versions/gate1-v2.8.json"
   ],
-  "active_authorization": "baseline/testing/GATE1_V2_7_AUTHORIZATION.md",
+  "active_authorization": "baseline/testing/GATE1_V2_8_AUTHORIZATION.md",
   "historical_evidence_imported_as_formal_result": false
 }

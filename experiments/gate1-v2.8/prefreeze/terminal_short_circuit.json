@@ -1,0 +1,652 @@
+{
+  "core_fail_frozen_rule": {
+    "decision": "STOP",
+    "fixture": "synthetic-h1-fail",
+    "formal_evidence_usable": false,
+    "gates": {
+      "artifact_hygiene": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "artifact_hygiene",
+        "outcome": "PASS"
+      },
+      "budget": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "budget",
+        "metrics": {
+          "approved": false
+        },
+        "outcome": "PASS"
+      },
+      "comparison": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "comparison",
+        "outcome": "PASS"
+      },
+      "environment": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "environment",
+        "outcome": "PASS"
+      },
+      "governance": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "governance",
+        "outcome": "PASS"
+      },
+      "h1_equivalence": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h1_equivalence",
+        "outcome": "FAIL"
+      },
+      "h1_metrics": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h1_metrics",
+        "outcome": "FAIL"
+      },
+      "h2_allocations": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_allocations",
+        "metrics": {
+          "derived_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "absolute_zero_verified": [
+              true,
+              true,
+              true
+            ],
+            "baseline_subtracted": [
+              false,
+              false,
+              false
+            ],
+            "count_semantics": "ABSOLUTE_GLOBAL_ALLOCATOR_DELTAS",
+            "observer_run_counts": [
+              3,
+              3,
+              3
+            ]
+          },
+          "recorded_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ]
+        },
+        "outcome": "PASS"
+      },
+      "h2_cleanup": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_cleanup",
+        "metrics": {
+          "derived_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "cleanup_counts": [
+              12,
+              12,
+              12
+            ],
+            "trigger_fingerprint_counts": [
+              12,
+              12,
+              12
+            ]
+          },
+          "recorded_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ]
+        },
+        "outcome": "PASS"
+      },
+      "h2_configuration": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_configuration",
+        "metrics": {
+          "derived_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "configuration_counts": [
+              32,
+              32,
+              32
+            ],
+            "execution_fingerprint_counts": [
+              32,
+              32,
+              32
+            ]
+          },
+          "recorded_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ]
+        },
+        "outcome": "PASS"
+      },
+      "h2_invariants": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_invariants",
+        "metrics": {
+          "derived_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "violation_counts": [
+              0,
+              0,
+              0
+            ]
+          },
+          "recorded_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ]
+        },
+        "outcome": "PASS"
+      },
+      "h2_performance": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_performance",
+        "metrics": {
+          "derived_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "benchmark_process_counts": [
+              3,
+              3,
+              3
+            ],
+            "process_sample_counts": [
+              [
+                1000,
+                1000,
+                1000
+              ],
+              [
+                1000,
+                1000,
+                1000
+              ],
+              [
+                1000,
+                1000,
+                1000
+              ]
+            ],
+            "timed_samples": [
+              1000,
+              1000,
+              1000
+            ],
+            "warmup_samples": [
+              100,
+              100,
+              100
+            ]
+          },
+          "recorded_outcomes": [
+            "PASS",
+            "PASS",
+            "PASS"
+          ]
+        },
+        "outcome": "PASS"
+      },
+      "h3_completion": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_completion",
+        "outcome": "PASS"
+      },
+      "h3_migration": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_migration",
+        "outcome": "PASS"
+      },
+      "h3_transaction": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_transaction",
+        "outcome": "PASS"
+      },
+      "history": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "history",
+        "metrics": {
+          "v2_6_archive_artifact_count": 337,
+          "v2_6_recorded_decision_authorized": false,
+          "v2_7_bound_invalid_artifact_count": 5,
+          "v2_7_decision_usable": false,
+          "v2_7_formal_run_1_status": "INVALID"
+        },
+        "outcome": "PASS"
+      },
+      "pilot": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "pilot",
+        "metrics": {
+          "committed": false
+        },
+        "outcome": "PASS"
+      },
+      "process": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "process",
+        "outcome": "PASS"
+      },
+      "replay": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "replay",
+        "outcome": "PASS"
+      },
+      "validity": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "validity",
+        "outcome": "PASS"
+      },
+      "workspace": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "workspace",
+        "outcome": "PASS"
+      }
+    },
+    "receipt_recomputable": true,
+    "runs": {
+      "formal-run-1": "PASS",
+      "formal-run-2": "PASS",
+      "replay": "PASS"
+    },
+    "schema_version": 1,
+    "structural_gaps": [],
+    "synthetic": true
+  },
+  "core_fail_rule_valid": true,
+  "invalid_short_circuit": {
+    "decision": "INVALID",
+    "fixture": "synthetic-terminal-short-circuit",
+    "formal_evidence_usable": false,
+    "gates": {
+      "artifact_hygiene": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "artifact_hygiene",
+        "outcome": "PASS"
+      },
+      "budget": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "budget",
+        "metrics": {
+          "approved": false
+        },
+        "outcome": "PASS"
+      },
+      "comparison": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "comparison",
+        "outcome": "NOT_APPLICABLE"
+      },
+      "environment": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "environment",
+        "outcome": "PASS"
+      },
+      "governance": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "governance",
+        "outcome": "PASS"
+      },
+      "h1_equivalence": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h1_equivalence",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h1_metrics": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h1_metrics",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_allocations": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_allocations",
+        "metrics": {
+          "derived_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "absolute_zero_verified": [
+              true,
+              true,
+              true
+            ],
+            "baseline_subtracted": [
+              false,
+              false,
+              false
+            ],
+            "count_semantics": "ABSOLUTE_GLOBAL_ALLOCATOR_DELTAS",
+            "observer_run_counts": [
+              3,
+              3,
+              3
+            ]
+          },
+          "recorded_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ]
+        },
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_cleanup": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_cleanup",
+        "metrics": {
+          "derived_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "cleanup_counts": [
+              12,
+              12,
+              12
+            ],
+            "trigger_fingerprint_counts": [
+              12,
+              12,
+              12
+            ]
+          },
+          "recorded_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ]
+        },
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_configuration": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_configuration",
+        "metrics": {
+          "derived_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "configuration_counts": [
+              32,
+              32,
+              32
+            ],
+            "execution_fingerprint_counts": [
+              32,
+              32,
+              32
+            ]
+          },
+          "recorded_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ]
+        },
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_invariants": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_invariants",
+        "metrics": {
+          "derived_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "violation_counts": [
+              0,
+              0,
+              0
+            ]
+          },
+          "recorded_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ]
+        },
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h2_performance": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h2_performance",
+        "metrics": {
+          "derived_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ],
+          "direct_contract_assertions": [
+            true,
+            true,
+            true
+          ],
+          "measurements": {
+            "benchmark_process_counts": [
+              3,
+              3,
+              3
+            ],
+            "process_sample_counts": [
+              [
+                1000,
+                1000,
+                1000
+              ],
+              [
+                1000,
+                1000,
+                1000
+              ],
+              [
+                1000,
+                1000,
+                1000
+              ]
+            ],
+            "timed_samples": [
+              1000,
+              1000,
+              1000
+            ],
+            "warmup_samples": [
+              100,
+              100,
+              100
+            ]
+          },
+          "recorded_outcomes": [
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+            "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+          ]
+        },
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_completion": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_completion",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_migration": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_migration",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "h3_transaction": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "h3_transaction",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "history": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "history",
+        "metrics": {
+          "v2_6_archive_artifact_count": 337,
+          "v2_6_recorded_decision_authorized": false,
+          "v2_7_bound_invalid_artifact_count": 5,
+          "v2_7_decision_usable": false,
+          "v2_7_formal_run_1_status": "INVALID"
+        },
+        "outcome": "PASS"
+      },
+      "pilot": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "pilot",
+        "metrics": {
+          "committed": false
+        },
+        "outcome": "PASS"
+      },
+      "process": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "process",
+        "outcome": "PASS"
+      },
+      "replay": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "replay",
+        "outcome": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+      },
+      "validity": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "validity",
+        "outcome": "INVALID"
+      },
+      "workspace": {
+        "contract_status": "PASS",
+        "failures": [],
+        "gate": "workspace",
+        "outcome": "PASS"
+      }
+    },
+    "receipt_recomputable": true,
+    "runs": {
+      "formal-run-1": "INVALID",
+      "formal-run-2": "NOT_RUN_DUE_TO_TERMINAL_DECISION",
+      "replay": "NOT_RUN_DUE_TO_TERMINAL_DECISION"
+    },
+    "schema_version": 1,
+    "structural_gaps": [],
+    "synthetic": true
+  },
+  "invalid_short_circuit_valid": true,
+  "schema_version": 1,
+  "status": "PASS"
+}

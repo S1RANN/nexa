@@ -23,23 +23,25 @@ Gate -1
 → Gate 1 v2.4 STRUCTURAL_CLOSURE_FAILED
 → Gate 1 v2.5 STRUCTURAL_CLOSURE_FAILED
 → Gate 1 v2.6 STRUCTURAL_CLOSURE_FAILED / INCOMPLETE
-→ Gate 1 v2.7
-→ Gate 1 v2.7 Decision
+→ Gate 1 v2.7 INVALID_ENVIRONMENT_EXECUTION
+→ Gate 1 v2.8
+→ Gate 1 v2.8 Decision
 → Pilot / Gate 2 RFC / Pivot / Stop
 ```
 
 Current implementation milestone: **4.0R3 complete**.
 
-<!-- gate1-v2.7-status:start -->
-Current project gate: **Gate 1 v2.7 frozen / incomplete**.
+<!-- gate1-v2.8-status:start -->
+Current project gate: **Gate 1 v2.8 frozen / incomplete**.
 
 Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is
 **STRUCTURAL_CLOSURE_FAILED / INCOMPLETE**; its recorded STOP is not authorized.
+Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable.
 
-Current Gate 1 v2.7 decision: **NOT_COMPUTED**.
+Current Gate 1 v2.8 decision: **NOT_COMPUTED**.
 
-Current milestone: **5.0R7 — INCOMPLETE**.
-<!-- gate1-v2.7-status:end -->
+Current milestone: **5.0R8 — INCOMPLETE**.
+<!-- gate1-v2.8-status:end -->
 
 ## Gates
 
@@ -57,8 +59,9 @@ Current milestone: **5.0R7 — INCOMPLETE**.
 | Gate 1 v2.4 | Three formal executions completed | Structural closure and Receipt are valid | Structural closure failed |
 | Gate 1 v2.5 | Three formal executions completed | Structural closure and Receipt are valid | Structural closure failed |
 | Gate 1 v2.6 | Three formal executions and finalization were recorded | Raw-to-Gate semantics and direct Contracts are trustworthy | Structural closure failed |
-| Gate 1 v2.7 | Stable projection and finalization apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |
-| Gate 1 v2.7 Decision | Valid v2.7 evidence is available | One legal terminal decision and verified F2.7 are recorded | Pending |
+| Gate 1 v2.7 | Qualified environment and frozen apparatus | Formal Run 1 executes in qualified unrestricted environment | Invalid environment execution |
+| Gate 1 v2.8 | Stable projection and finalization apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |
+| Gate 1 v2.8 Decision | Valid v2.8 evidence is available | One legal terminal decision and verified F2.8 are recorded | Pending |
 | Pilot | Gate 1 permits Pilot and a team commits | Pilot exit review accepts, pivots, or stops | Conditional |
 | Gate 2 RFC | H1/H2 pass, H3 is acceptable, Pilot commits, budget is approved | RFC decision only; no implementation is implied | Conditional |
 

@@ -9,7 +9,8 @@
     "gate1-v2.4",
     "gate1-v2.5",
     "gate1-v2.6",
-    "gate1-v2.7"
+    "gate1-v2.7",
+    "gate1-v2.8"
   ],
   "edges": [
     ["gate1-v1", "gate1-v2"],
@@ -19,7 +20,8 @@
     ["gate1-v2.3", "gate1-v2.4"],
     ["gate1-v2.4", "gate1-v2.5"],
     ["gate1-v2.5", "gate1-v2.6"],
-    ["gate1-v2.6", "gate1-v2.7"]
+    ["gate1-v2.6", "gate1-v2.7"],
+    ["gate1-v2.7", "gate1-v2.8"]
   ],
-  "current": "gate1-v2.7"
+  "current": "gate1-v2.8"
 }

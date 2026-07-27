@@ -1,0 +1,302 @@
+{
+  "failures": [],
+  "negative_cases": [
+    {
+      "mismatch_detected": true,
+      "name": "parameter-type-vs-rename"
+    },
+    {
+      "mismatch_detected": true,
+      "name": "add-parameter-vs-no-change"
+    },
+    {
+      "mismatch_detected": true,
+      "name": "async-policy-vs-constant"
+    }
+  ],
+  "pair_count": 20,
+  "pairs": [
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::apply_damage"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "parameter:apply_damage.amount:i32->i64",
+      "handwritten_transformer": "parameter_type_i32_to_i64",
+      "id": "h1-01",
+      "idl_changed": true,
+      "idl_semantic_signature": "parameter:apply_damage.amount:i32->i64",
+      "idl_transformer": "parameter_type_i32_to_i64",
+      "kind": "ParameterType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::heal"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "return:heal:result->i32",
+      "handwritten_transformer": "return_i32_to_i64",
+      "id": "h1-02",
+      "idl_changed": true,
+      "idl_semantic_signature": "return:heal:result->i32",
+      "idl_transformer": "return_result_to_i32",
+      "kind": "ReturnType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::heal"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "parameter:heal:add-source",
+      "handwritten_transformer": "add_parameter_source",
+      "id": "h1-03",
+      "idl_changed": true,
+      "idl_semantic_signature": "parameter:heal:add-source",
+      "idl_transformer": "add_heal_source",
+      "kind": "AddParameter"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::entity_name"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "parameter:entity_name:delete-entity",
+      "handwritten_transformer": "delete_parameter_value",
+      "id": "h1-04",
+      "idl_changed": true,
+      "idl_semantic_signature": "parameter:entity_name:delete-entity",
+      "idl_transformer": "delete_entity_name_parameter",
+      "kind": "DeleteParameter"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::set_position"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "parameter:set_position:reorder",
+      "handwritten_transformer": "swap_parameter_order",
+      "id": "h1-05",
+      "idl_changed": true,
+      "idl_semantic_signature": "parameter:set_position:reorder",
+      "idl_transformer": "swap_set_position_parameters",
+      "kind": "ParameterOrder"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::combat_event"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "mode:combat_event:sync->request",
+      "handwritten_transformer": "sync_to_async_pending",
+      "id": "h1-06",
+      "idl_changed": true,
+      "idl_semantic_signature": "mode:combat_event:sync->request",
+      "idl_transformer": "combat_event_request",
+      "kind": "SyncToAsync"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::enemy_view"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "policy:enemy_view:fuel-2->3",
+      "handwritten_transformer": "fuel_cost_1_to_3",
+      "id": "h1-07",
+      "idl_changed": true,
+      "idl_semantic_signature": "policy:enemy_view:fuel-2->3",
+      "idl_transformer": "enemy_view_fuel_2_to_3",
+      "kind": "FuelCost"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::play_animation"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "policy:play_animation:cancel-task",
+      "handwritten_transformer": "cancel_policy_return_error_to_cancel_task",
+      "id": "h1-08",
+      "idl_changed": true,
+      "idl_semantic_signature": "policy:play_animation:cancel-task",
+      "idl_transformer": "play_animation_cancel_task",
+      "kind": "CancelPolicy"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::query_path"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "policy:query_path:abandon-trap",
+      "handwritten_transformer": "abandon_policy_return_error_to_trap",
+      "id": "h1-09",
+      "idl_changed": true,
+      "idl_semantic_signature": "policy:query_path:abandon-trap",
+      "idl_transformer": "query_path_abandon_trap",
+      "kind": "AbandonPolicy"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatError"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "enum:CombatError:add-Timeout",
+      "handwritten_transformer": "add_timeout_variant",
+      "id": "h1-10",
+      "idl_changed": true,
+      "idl_semantic_signature": "enum:CombatError:add-Timeout",
+      "idl_transformer": "add_timeout_variant",
+      "kind": "EnumVariantAdd"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatEvent::Damage"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "enum:CombatEvent.Damage:i32->i64",
+      "handwritten_transformer": "damage_i32_to_i64",
+      "id": "h1-11",
+      "idl_changed": true,
+      "idl_semantic_signature": "enum:CombatEvent.Damage:i32->i64",
+      "idl_transformer": "damage_i32_to_i64",
+      "kind": "EnumPayloadType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "Vec2"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "struct:Vec2:add-z",
+      "handwritten_transformer": "mutation_vec_add_z",
+      "id": "h1-12",
+      "idl_changed": true,
+      "idl_semantic_signature": "struct:Vec2:add-z",
+      "idl_transformer": "vec2_add_z",
+      "kind": "StructFieldAdd"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "EnemyView::health"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "struct:EnemyView.health:i32->i64",
+      "handwritten_transformer": "mutation_view_health_i32_to_i64",
+      "id": "h1-13",
+      "idl_changed": true,
+      "idl_semantic_signature": "struct:EnemyView.health:i32->i64",
+      "idl_transformer": "enemy_health_i32_to_i64",
+      "kind": "StructFieldType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::world_snapshot"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "snapshot:world_snapshot:EnemyView->Vec2",
+      "handwritten_transformer": "snapshot_view_to_vec",
+      "id": "h1-14",
+      "idl_changed": true,
+      "idl_semantic_signature": "snapshot:world_snapshot:EnemyView->Vec2",
+      "idl_transformer": "snapshot_enemy_to_vec2",
+      "kind": "SnapshotContentType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::path"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "buffer:path:Vec2->i32",
+      "handwritten_transformer": "buffer_vec_to_i32",
+      "id": "h1-15",
+      "idl_changed": true,
+      "idl_semantic_signature": "buffer:path:Vec2->i32",
+      "idl_transformer": "path_vec2_to_i32",
+      "kind": "BufferElementType"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::action_lock"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "resource:action_lock:domain-change",
+      "handwritten_transformer": "token_combat_to_alternate",
+      "id": "h1-16",
+      "idl_changed": true,
+      "idl_semantic_signature": "resource:action_lock:domain-change",
+      "idl_transformer": "token_resource_to_vec2",
+      "kind": "ResourceDomain"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::score"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "stable-id:score:changed",
+      "handwritten_transformer": "stable_score_to_total_score",
+      "id": "h1-17",
+      "idl_changed": true,
+      "idl_semantic_signature": "stable-id:score:changed",
+      "idl_transformer": "score_to_total_score",
+      "kind": "StableId"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::ratio"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "rename:ratio:preserve-stable-id",
+      "handwritten_transformer": "ratio_rename_preserve_id",
+      "id": "h1-18",
+      "idl_changed": true,
+      "idl_semantic_signature": "rename:ratio:preserve-stable-id",
+      "idl_transformer": "ratio_rename_preserve_id",
+      "kind": "RenamePreserveStableId"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::clear_target"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "hash:clear_target:stale",
+      "handwritten_transformer": "interface_hash_stale",
+      "id": "h1-19",
+      "idl_changed": true,
+      "idl_semantic_signature": "hash:clear_target:stale",
+      "idl_transformer": "clear_target_fuel_hash_change",
+      "kind": "StaleInterfaceHash"
+    },
+    {
+      "equivalent": true,
+      "expected_changed_symbols": [
+        "CombatHost::inspect_events"
+      ],
+      "handwritten_changed": true,
+      "handwritten_semantic_signature": "host:inspect_events:missing",
+      "handwritten_transformer": "remove_required_host_function",
+      "id": "h1-20",
+      "idl_changed": true,
+      "idl_semantic_signature": "host:inspect_events:missing",
+      "idl_transformer": "remove_inspect_events",
+      "kind": "MissingHostFunction"
+    }
+  ],
+  "schema_version": 1,
+  "status": "PASS"
+}
