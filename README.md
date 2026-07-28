@@ -9,12 +9,12 @@ Reload.
 ```text
 Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
-Nexa Internal Pivot M1 = COMPLETE
+Nexa Internal Pivot M1 = FINALIZING
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = COMPLETE
-Task Runtime Stabilization = COMPLETE
+Rust Host Binding v1 = FINALIZING
+Task Runtime Stabilization = FINALIZING
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = COMPLETE
+Combat Dogfood Loop = FINALIZING
 Current target = Rust-only dogfood Gameplay Language
 Seamless advanced Reload = REMOVED
 ```

@@ -1,12 +1,12 @@
 # Nexa Roadmap
 
 ```text
-Nexa Internal Pivot M1 = COMPLETE
+Nexa Internal Pivot M1 = FINALIZING
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = COMPLETE
-Task Runtime Stabilization = COMPLETE
+Rust Host Binding v1 = FINALIZING
+Task Runtime Stabilization = FINALIZING
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = COMPLETE
+Combat Dogfood Loop = FINALIZING
 ```
 
 ## Current position
