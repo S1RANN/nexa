@@ -22,5 +22,6 @@ fuzz_target!(|bytes: &[u8]| {
         };
         let _ = runtime.apply(event);
         let _ = runtime.snapshot();
+        assert!(runtime.invariants_hold());
     }
 });
