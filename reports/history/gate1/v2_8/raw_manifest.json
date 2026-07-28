@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.8",
+  "raw_root": "reports/raw/gate1_v2_8",
+  "raw_hash_manifest": "reports/raw/gate1_v2_8/raw_hash_manifest.json",
+  "raw_hash_manifest_file_sha1": "1a39d0b5f05b336f7f15c1caac41473ca2589339",
+  "artifact_count": 343,
+  "formal_evidence_usable": true,
+  "decision_usable": false,
+  "reason": "Formal evidence remains valid, but the v2.8 stable-core-failure extraction and product decision are unauthorized."
+}

@@ -1,0 +1,37 @@
+{
+  "failures": [],
+  "i_f_path_disjoint": true,
+  "negative_cases": [
+    {
+      "detected": true,
+      "name": "early-v2.9-readme-publication"
+    },
+    {
+      "detected": true,
+      "name": "early-v2.9-roadmap-publication"
+    },
+    {
+      "detected": true,
+      "name": "early-v2.9-baseline-publication"
+    }
+  ],
+  "publication_deferred_to": "F2.9",
+  "registry": {
+    "apparatus_status": "PASS",
+    "current_experiment": "gate1-v2.8",
+    "evidence_status": "VERIFIED",
+    "experiment_status": "VERIFIED_TERMINAL_DECISION",
+    "finalization_status": "FINALIZED",
+    "finalization_verified": true,
+    "gate1_status": "VERIFIED_TERMINAL_DECISION",
+    "milestone": "5.0R8",
+    "milestone_status": "COMPLETE",
+    "product_decision": "UNVERIFIABLE_WITHIN_MVR",
+    "push_status": "AUTHORIZED",
+    "receipt_verified": true,
+    "schema_version": 1
+  },
+  "schema_version": 1,
+  "status": "PASS",
+  "supersession_current": "gate1-v2.9"
+}
