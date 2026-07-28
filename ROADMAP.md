@@ -38,6 +38,18 @@ working tree.
 - Stop-the-module Restart Reload with late-completion discard by epoch.
 - Differential models, fuzz smoke, absolute allocation and latency budgets.
 
+## M1 finalization scope
+
+Finalization changes are limited to real Business Host binding validation,
+closing Task lifecycle bypasses, driving differential and fuzz checks through
+the real Runtime, exact Host resource release, and local completion gates.
+
+This milestone does not add new syntax, user generics, `dynamic` or
+`interface`, C++ or C# bindings, JIT/AOT, LSP/DAP, UGC or untrusted bytecode,
+seamless old-Task migration, completion replay queues, multi-version business
+execution, cross-module stateful reload, or a new Gate/Contract/Receipt evidence
+system.
+
 ## Deliberately removed
 
 - Gate-version-specific runners, decision tools, fixtures, contracts, and Raw
