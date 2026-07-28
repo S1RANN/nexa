@@ -28,3 +28,9 @@ runs three independent 1000-sample processes and enforces only the absolute
 budgets: p95 at most 100 microseconds and 1000 calls at most 100 milliseconds.
 
 Generated artifacts belong in `target/nexa-artifacts/`.
+
+`test-binding` includes all 20 textual IDL mutation crates and Combat binding
+generation. `test-task` runs the public lifecycle/resource suite.
+`test-reload` runs 16 restart outcomes, including pre-commit rollback without
+Task revival, late-result discard, immediate old-module release, and
+post-publication activation failure.

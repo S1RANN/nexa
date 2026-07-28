@@ -30,7 +30,7 @@ fn nested_call() {
     let (host, schema) = super::support::hashes();
     let mut realm = nexa_runtime::RealmRuntime::isolated(nexa_runtime::RealmConfig::default());
     let module = realm.load_module(verified, host, schema).unwrap();
-    let (scope, task) = super::support::spawn(&mut realm, module);
+    let (scope, task) = super::support::spawn_test_task(&mut realm, module);
     let result = realm.poll_task(task, 16).unwrap();
     super::support::assert_snapshot(
         "nested_call",

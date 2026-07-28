@@ -1,6 +1,13 @@
 # Nexa Roadmap
 
-Nexa Internal Pivot M1 = **FINALIZING**
+```text
+Nexa Internal Pivot M1 = COMPLETE
+Repository Slimming = COMPLETE
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
+Restart Reload v1 = COMPLETE
+Combat Dogfood Loop = COMPLETE
+```
 
 ## Current position
 
@@ -18,8 +25,8 @@ Gate 1 v2.9 STOP (historical tag)
    → Combat dogfood loop
 ```
 
-Internal Pivot M1 is complete only when every Cargo and xtask gate passes and
-the working tree is clean.
+Internal Pivot M1 passed every Cargo and xtask gate on one commit with a clean
+working tree.
 
 ## Active product
 
@@ -36,8 +43,8 @@ the working tree is clean.
 - Gate-version-specific runners, decision tools, fixtures, contracts, and Raw
   evidence in the active tree.
 - Seamless old-continuation migration and old-Task resume.
-- Public Completion Buffer controls, retired-epoch business routing, and
-  concurrent old/new code execution.
+- Intermediate completion replay, old-module business routing, and concurrent
+  old/new code execution.
 - Cross-run micro-delta performance decision systems.
 
 ## Next review

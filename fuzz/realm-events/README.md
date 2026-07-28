@@ -21,7 +21,6 @@ verifier
 register_planner
 enum_match_lowering
 try_operator_lowering
-completion_routing
 completion_ticket_terminal_race
 release_intrusive_list
 stateful_registry

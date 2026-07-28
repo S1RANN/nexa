@@ -2,7 +2,7 @@
 fn resource_token() {
     let (mut realm, module, _, _) =
         super::support::realm_with([nexa_bytecode::Instruction::Return { source: 0 }]);
-    let (scope, task) = super::support::spawn(&mut realm, module);
+    let (scope, task) = super::support::spawn_test_task(&mut realm, module);
     let token = realm
         .create_resource_token(task, nexa_runtime::RuntimeHostDomain::Render)
         .unwrap();

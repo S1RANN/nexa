@@ -4,7 +4,7 @@ fn scope_cancel() {
         nexa_bytecode::Instruction::Yield,
         nexa_bytecode::Instruction::Return { source: 0 },
     ]);
-    let (scope, task) = super::support::spawn(&mut realm, module);
+    let (scope, task) = super::support::spawn_test_task(&mut realm, module);
     let first = realm.poll_task(task, 16).unwrap();
     realm.cancel_scope(scope).unwrap();
     let result = nexa_runtime::TaskPoll::Cancelled(nexa_runtime::CancelReason::ScopeCancelled);

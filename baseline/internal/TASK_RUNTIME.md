@@ -15,7 +15,9 @@ completed or abandoned once. Resume happens by polling the Task again; callers
 never manufacture state-machine events or a Task-complete transition.
 
 Terminal polls are immutable. Polling a terminal Task returns
-`RealmError::TerminalTask`; cross-Realm and stale handles have distinct errors.
+`RuntimeError::TerminalTask`; cross-Realm and stale Task handles have distinct
+errors. Request completion distinguishes stale, cross-Realm, already-completed,
+and restart-detached handles.
 
 After every terminal transition:
 
@@ -23,6 +25,10 @@ After every terminal transition:
   reservation counts are zero;
 - one terminal record remains observable;
 - Host resources are released exactly once.
+
+The raw poll result and its pending reason are crate-private implementation
+details. Product code, examples, integration tests, diagnostics, and benchmark
+tools use only the public lifecycle above.
 
 Failure injection returns a probe. A scenario is valid only when the probe was
 consumed; otherwise its result is `SCENARIO_NOT_REACHED`.

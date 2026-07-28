@@ -21,3 +21,9 @@ slots, stable ID tables, or interface hash tables.
 Loading a module compares its embedded Exact Interface Hash with the generated
 Host Registry before interpreter execution. Any incompatible `.nidl` change
 therefore rejects old bytecode before gameplay code runs.
+
+The binding gate applies 20 legal textual schema mutations. Every mutation is
+parsed, validated, generated three times byte-for-byte, compiled in an
+independent Host crate, and checked against old bytecode before interpreter
+admission. A Host implementation is patched only when its generated Trait
+contract actually changes.

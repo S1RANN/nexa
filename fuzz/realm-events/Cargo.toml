@@ -51,13 +51,6 @@ doc = false
 bench = false
 
 [[bin]]
-name = "completion_routing"
-path = "fuzz_targets/completion_routing.rs"
-test = false
-doc = false
-bench = false
-
-[[bin]]
 name = "completion_ticket_terminal_race"
 path = "fuzz_targets/completion_ticket_terminal_race.rs"
 test = false

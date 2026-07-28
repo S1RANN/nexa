@@ -7,8 +7,6 @@ Created → Ready → Running
 Running --YieldFuel--> FuelYielded --Resume--> Running
 Running --YieldExplicit--> ExplicitYielded --ResumeExplicit--> Running
 Running ⇄ Waiting
-Running → ReloadPauseRequested → ReloadPaused
-Waiting/FuelYielded/ExplicitYielded → ReloadPaused
 Running/Waiting/FuelYielded/ExplicitYielded → CancelRequested → Cancelling
 Cancelling --BeginCleanup--> Cleanup --Clean--> Cancelled
 Cancelling --Clean--> Cancelled
@@ -16,9 +14,8 @@ Running → Completed
 Running/Cancelling/Cleanup → Trapped
 ```
 
-`TaskExecution` mirrors non-terminal ownership with distinct `FuelYielded`, `ExplicitYielded`,
-`ReloadPaused`, `Cancelling`, and `Cleanup` variants. Checkpoint restore reinstates both the prior
-machine state and its matching execution variant.
+`TaskExecution` mirrors non-terminal ownership with distinct `FuelYielded`,
+`ExplicitYielded`, `Waiting`, `Cancelling`, and `Cleanup` variants.
 
 ## Admission invariants
 
@@ -35,11 +32,13 @@ Detached physical host operations belong to the host-resource domain.
 
 ## Reload commit cancellation
 
-`ReloadCommitCancel` takes the direct `Cancelling --Clean--> Cancelled` path and does not run user
-script `defer`. It releases only VM-managed resources and registered host-resource tokens.
+Restart cancellation takes the direct `Cancelling --Clean--> Cancelled` path
+and does not run user script `defer`. It releases only VM-managed resources and
+registered Host resources.
 Ordinary cancellation with user `defer` must enter `Cleanup`; cleanup success ends in `Cancelled`
 and cleanup trap ends in `Trapped`.
 
-Realm Model v4 independently explores Fuel and Explicit Yield resume paths, waiting-request
-ownership, reload pause/rollback, ordinary bounded cleanup, reload-commit cancellation, and
-terminal scheduler-token cleanup.
+The current Realm model independently explores Fuel and Explicit Yield resume
+paths, waiting-request ownership, restart cancellation, pre-commit rollback,
+late-result discard, ordinary bounded cleanup, and terminal scheduler-token
+cleanup.

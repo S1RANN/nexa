@@ -16,8 +16,9 @@ after every hosted realm is dropped, every completion reservation is released, a
 transferred release is drained. Closed hosts reject new realms. In debug builds, dropping the final
 host handle without an explicit close prints the live realm, completion, and release counts.
 
-The HostCall bridge accepts at most eight arguments in an inline `HostArgs` buffer. Scalar and
-handle arguments are decoded without constructing an intermediate `Vec<HostValue>`.
+The HostCall bridge accepts at most eight arguments through `RuntimeHostArgs`. Scalar and handle
+arguments are decoded directly into generated binding types without constructing an intermediate
+value vector.
 
 Host panics must be contained and converted to structured host traps. Runtime internals, GC
 pointers, frames, and mutable epoch roots are never exposed.

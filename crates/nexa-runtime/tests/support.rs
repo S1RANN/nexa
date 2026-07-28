@@ -85,7 +85,10 @@ pub fn task_config(owner: ScopeHandle) -> StepConfig {
     }
 }
 
-pub fn spawn(realm: &mut RealmRuntime, module: ModuleHandle) -> (ScopeHandle, TaskHandle) {
+pub fn spawn_test_task(
+    realm: &mut RealmRuntime,
+    module: ModuleHandle,
+) -> (ScopeHandle, TaskHandle) {
     let scope = realm.create_scope(None).unwrap();
     let task = realm
         .spawn_task(module, 0, &[RuntimeValue::I32(7)], task_config(scope))

@@ -21,14 +21,20 @@ stop new Task admission
 
 - `Committed`: migration, root commit, and activation succeeded;
 - `RolledBackBeforeCommit`: migration failed; the old root and state remain;
+  Tasks and Requests cancelled during quiesce do not return;
 - `ActivationFaulted`: the new root committed, activation failed, and the Host
   may reload again or reset.
 
 Old Requests become detached. Physical completion may arrive later, but its
 module epoch is stale: the result is discarded and its Host resource is
-released exactly once. It never enters a Completion Buffer and never resumes an
-old Task.
+released exactly once. It never enters an intermediate replay queue and never
+resumes an old Task.
 
 Nexa does not preserve old continuations, resume old Tasks, run old and new
-business code concurrently, expose retired-epoch routing, or support seamless
-multi-epoch reload.
+business code concurrently, route work through released modules, or support
+seamless multi-version reload.
+
+Inspection reports the count of cancelled Tasks, detached Requests, and
+discarded late completions. Released-module records are fixed-capacity,
+read-only diagnostics and never participate in Task, Request, completion, or
+resource routing.

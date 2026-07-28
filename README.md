@@ -9,7 +9,12 @@ Reload.
 ```text
 Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
-Nexa Internal Pivot M1 = FINALIZING
+Nexa Internal Pivot M1 = COMPLETE
+Repository Slimming = COMPLETE
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
+Restart Reload v1 = COMPLETE
+Combat Dogfood Loop = COMPLETE
 Current target = Rust-only dogfood Gameplay Language
 Seamless advanced Reload = REMOVED
 ```
@@ -40,7 +45,7 @@ function IDs, Exact Interface Hash, Nexa declaration, and test Stub into
 Restart Reload stops admission, cancels old Tasks, detaches old Requests,
 migrates state on staging, commits the new root, then activates it. Migration
 failure rolls back before commit; activation failure remains observable after
-commit. Old continuations and Completion Buffers are not supported.
+commit. Old continuations and intermediate completion queues are not supported.
 
 ## Run
 

@@ -27,7 +27,24 @@ struct RepoHealth {
     duplicate_versioned_fixtures: usize,
     gate1_test_tool_loc_reduction_percent: u64,
     low_level_event_violations: Vec<String>,
+    public_api_violations: Vec<String>,
+    public_raw_task_api_violations: usize,
+    legacy_host_abi_violations: usize,
+    completion_buffer_symbol_violations: usize,
+    reload_pause_symbol_violations: usize,
+    retired_epoch_business_api_violations: usize,
+    deprecated_allow_violations: usize,
+    versioned_model_file_count: usize,
+    historical_tag_type: String,
+    historical_tag_target: String,
     status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct FinalizationInventory {
+    schema_version: u32,
+    counts: BTreeMap<String, usize>,
+    internal_whitelist: Vec<String>,
 }
 
 fn main() -> Result<(), DynError> {
@@ -260,15 +277,65 @@ fn repo_audit() -> Result<(), DynError> {
         )
     };
     let low_level_event_violations = low_level_event_violations(&root, &tracked);
+    let audit_sources = audit_sources(&root, &tracked);
+    let public_api_violations = public_api_violations(&audit_sources);
+    let public_raw_task_api_violations = count_occurrences(
+        &audit_sources,
+        &["pub fn poll_task_raw", "pub fn call(", "pub fn spawn("],
+    );
+    let legacy_host_abi_violations = count_identifier(&audit_sources, "HostArgs")
+        + count_identifier(&audit_sources, "HostValue")
+        + count_occurrences(
+            &audit_sources,
+            &["HostRegistry::call", "HostCallOutcome::Immediate"],
+        );
+    let completion_buffer_symbol_violations = count_occurrences(
+        &audit_sources,
+        &[
+            "ReloadCompletionBuffer",
+            "ReloadCompletionStats",
+            "BufferedForReload",
+            "reload_completion",
+            "completion_buffer",
+        ],
+    );
+    let reload_pause_symbol_violations =
+        count_occurrences(&audit_sources, &["ReloadPaused", "ReloadPause"]);
+    let retired_epoch_business_api_violations =
+        count_occurrences(&audit_sources, &["RetiredEpoch", "retired_epoch"]);
+    let deprecated_allow_violations = count_occurrences(&audit_sources, &["#![allow(deprecated)]"]);
+    let versioned_model_file_count = tracked
+        .iter()
+        .filter(|path| {
+            (path.starts_with("crates/nexa-model/") || path.starts_with("crates/nexa-runtime/"))
+                && Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension == "rs")
+                && (path.contains("realm_v") || path.contains("model_adapter_v"))
+        })
+        .count();
+    let historical_tag_type = git_output(&["cat-file", "-t", "gate1-v2.9-stop"])?;
+    let historical_tag_target = git_output(&["rev-parse", "gate1-v2.9-stop^{}"])?;
+    let tag_valid = historical_tag_type == "tag"
+        && historical_tag_target == "8552064ec01b3191467633717de7b77c97cb24f1";
     let passed = active_gate1_tool_crates == 0
         && versioned_gate_experiment_directories == 0
         && tracked_raw_evidence_files == 0
         && duplicate_versioned_fixtures == 0
         && reduction >= 80
         && tracked_files_over_512_kib.is_empty()
-        && low_level_event_violations.is_empty();
+        && low_level_event_violations.is_empty()
+        && public_api_violations.is_empty()
+        && public_raw_task_api_violations == 0
+        && legacy_host_abi_violations == 0
+        && completion_buffer_symbol_violations == 0
+        && reload_pause_symbol_violations == 0
+        && retired_epoch_business_api_violations == 0
+        && deprecated_allow_violations == 0
+        && versioned_model_file_count == 0
+        && tag_valid;
     let report = RepoHealth {
-        schema_version: 1,
+        schema_version: 2,
         product_rust_loc,
         unit_test_loc,
         integration_test_loc,
@@ -284,6 +351,16 @@ fn repo_audit() -> Result<(), DynError> {
         duplicate_versioned_fixtures,
         gate1_test_tool_loc_reduction_percent: reduction,
         low_level_event_violations,
+        public_api_violations,
+        public_raw_task_api_violations,
+        legacy_host_abi_violations,
+        completion_buffer_symbol_violations,
+        reload_pause_symbol_violations,
+        retired_epoch_business_api_violations,
+        deprecated_allow_violations,
+        versioned_model_file_count,
+        historical_tag_type,
+        historical_tag_target,
         status: if passed { "PASS" } else { "FAIL" },
     };
     let output = root.join("target/nexa-artifacts/repo-health.json");
@@ -291,6 +368,17 @@ fn repo_audit() -> Result<(), DynError> {
     fs::write(
         &output,
         format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    let inventory = finalization_inventory(&audit_sources);
+    let inventory_output = root.join("target/nexa-artifacts/m1-finalize/inventory.json");
+    fs::create_dir_all(
+        inventory_output
+            .parent()
+            .ok_or("inventory path has no parent")?,
+    )?;
+    fs::write(
+        inventory_output,
+        format!("{}\n", serde_json::to_string_pretty(&inventory)?),
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     if passed {
@@ -333,6 +421,122 @@ fn git_lines(arguments: &[&str]) -> Result<Vec<String>, DynError> {
         .lines()
         .map(str::to_owned)
         .collect())
+}
+
+fn git_output(arguments: &[&str]) -> Result<String, DynError> {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(workspace_root())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!("git {} failed", arguments.join(" ")).into());
+    }
+    Ok(String::from_utf8(output.stdout)?.trim().to_owned())
+}
+
+fn audit_sources(root: &Path, tracked: &[String]) -> BTreeMap<String, String> {
+    tracked
+        .iter()
+        .filter(|path| {
+            path.as_str() != "tools/xtask/src/main.rs"
+                && Path::new(path).extension().is_some_and(|extension| {
+                    matches!(extension.to_str(), Some("rs" | "md" | "spec"))
+                })
+        })
+        .filter_map(|path| {
+            fs::read_to_string(root.join(path))
+                .ok()
+                .map(|source| (path.clone(), source))
+        })
+        .collect()
+}
+
+fn count_occurrences(sources: &BTreeMap<String, String>, needles: &[&str]) -> usize {
+    sources
+        .values()
+        .map(|source| {
+            needles
+                .iter()
+                .map(|needle| source.matches(needle).count())
+                .sum::<usize>()
+        })
+        .sum()
+}
+
+fn count_identifier(sources: &BTreeMap<String, String>, identifier: &str) -> usize {
+    sources
+        .values()
+        .map(|source| {
+            source
+                .split(|character: char| !(character.is_ascii_alphanumeric() || character == '_'))
+                .filter(|token| *token == identifier)
+                .count()
+        })
+        .sum()
+}
+
+fn public_api_violations(sources: &BTreeMap<String, String>) -> Vec<String> {
+    const FORBIDDEN: [&str; 6] = [
+        "pub fn poll_task_raw",
+        "pub fn call(",
+        "pub fn spawn(",
+        "HostRegistry::call",
+        "HostCallOutcome::Immediate",
+        "#![allow(deprecated)]",
+    ];
+    sources
+        .iter()
+        .filter(|(path, _)| path.starts_with("crates/nexa-runtime/"))
+        .flat_map(|(path, source)| {
+            FORBIDDEN
+                .iter()
+                .filter(|needle| source.contains(**needle))
+                .map(|needle| format!("{path}: {needle}"))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn finalization_inventory(sources: &BTreeMap<String, String>) -> FinalizationInventory {
+    let mut counts = BTreeMap::new();
+    for symbol in [
+        "pub fn poll_task_raw",
+        "pub fn call(",
+        "pub fn spawn(",
+        "HostRegistry::call",
+        "HostArgs",
+        "HostValue",
+        "HostCallOutcome::Immediate",
+        "PendingReason",
+        "PollResult",
+        "ReloadCompletionBuffer",
+        "ReloadPaused",
+        "BufferedForReload",
+        "ReloadCompletionStats",
+        "RetiredEpochReap",
+        "model_adapter_v5",
+        "realm_v4",
+        "realm_v5",
+        "#![allow(deprecated)]",
+    ] {
+        let count = if matches!(
+            symbol,
+            "HostArgs" | "HostValue" | "PendingReason" | "PollResult"
+        ) {
+            count_identifier(sources, symbol)
+        } else {
+            count_occurrences(sources, &[symbol])
+        };
+        counts.insert(symbol.to_owned(), count);
+    }
+    FinalizationInventory {
+        schema_version: 1,
+        counts,
+        internal_whitelist: vec![
+            "PendingReason: crate-private task polling implementation".into(),
+            "PollResult: crate-private task polling implementation".into(),
+        ],
+    }
 }
 
 fn loc_matching(root: &Path, tracked: &[String], predicate: impl Fn(&str) -> bool) -> usize {
