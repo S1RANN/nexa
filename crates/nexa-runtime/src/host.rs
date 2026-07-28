@@ -1975,7 +1975,6 @@ pub struct CompletionAccounting {
     pub delivered: u64,
     pub cancelled: u64,
     pub abandoned: u64,
-    pub reload_discarded: u64,
     pub late_discarded: u64,
 }
 
@@ -1985,7 +1984,6 @@ impl CompletionAccounting {
         self.delivered
             .saturating_add(self.cancelled)
             .saturating_add(self.abandoned)
-            .saturating_add(self.reload_discarded)
             .saturating_add(self.late_discarded)
     }
 
@@ -2624,25 +2622,6 @@ impl HostRequestManager {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .accounting
-    }
-
-    fn account_reload_discarded(&self, result: &HostCompletionResult) {
-        let mut queue = self
-            .completions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let source = match result {
-            HostCompletionResult::Success(_) | HostCompletionResult::Error(_) => {
-                &mut queue.accounting.delivered
-            }
-            HostCompletionResult::Cancelled => &mut queue.accounting.cancelled,
-            HostCompletionResult::Abandoned => &mut queue.accounting.abandoned,
-        };
-        *source = source
-            .checked_sub(1)
-            .expect("reload discard reclassifies one accepted completion");
-        queue.accounting.reload_discarded = queue.accounting.reload_discarded.saturating_add(1);
-        assert_completion_invariant(&queue);
     }
 
     fn completion_count_for_epoch(&self, module_id: u32, epoch: u64) -> usize {
@@ -3459,10 +3438,6 @@ impl RuntimeResources {
     #[must_use]
     pub fn completion_accounting(&self) -> CompletionAccounting {
         self.requests.completion_accounting()
-    }
-
-    pub(crate) fn account_reload_discarded(&self, delivery: &HostCompletionDelivery) {
-        self.requests.account_reload_discarded(&delivery.result);
     }
 
     #[must_use]

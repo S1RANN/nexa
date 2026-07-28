@@ -14,7 +14,6 @@ pub enum SuspendReason {
     Fuel,
     ExplicitYield,
     HostRequest,
-    ReloadPause,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

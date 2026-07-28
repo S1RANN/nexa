@@ -77,7 +77,7 @@ struct PeakResources {
     tokens: u64,
     snapshots: u64,
     state_objects: u64,
-    retired_epochs: u64,
+    retired_modules: u64,
     total: u64,
 }
 
@@ -89,7 +89,7 @@ impl PeakResources {
             tokens: ledger.tokens,
             snapshots: ledger.snapshots,
             state_objects: ledger.state_objects,
-            retired_epochs: ledger.retired_epochs,
+            retired_modules: ledger.retired_modules,
             total: ledger
                 .tasks
                 .saturating_add(ledger.scopes)
@@ -103,7 +103,7 @@ impl PeakResources {
                 .saturating_add(ledger.queued_releases)
                 .saturating_add(ledger.heap_objects)
                 .saturating_add(ledger.state_objects)
-                .saturating_add(ledger.retired_epochs),
+                .saturating_add(ledger.retired_modules),
         }
     }
 
@@ -113,7 +113,7 @@ impl PeakResources {
         self.tokens = self.tokens.max(other.tokens);
         self.snapshots = self.snapshots.max(other.snapshots);
         self.state_objects = self.state_objects.max(other.state_objects);
-        self.retired_epochs = self.retired_epochs.max(other.retired_epochs);
+        self.retired_modules = self.retired_modules.max(other.retired_modules);
         self.total = self.total.max(other.total);
     }
 }

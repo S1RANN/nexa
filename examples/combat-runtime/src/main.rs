@@ -3,9 +3,9 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostPayload, ModuleLifecycle, RealmConfig, RealmRuntime, ResourceContext, RestartReloadOutcome,
-    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostDomain, RuntimeValue,
-    ScriptFunction, StepConfig, TaskLimits, TaskPoll, TickBudget,
+    HostPayload, ModuleLifecycle, RealmConfig, RealmRuntime, ReleaseKind, ResourceContext,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostDomain,
+    RuntimeValue, ScriptFunction, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 
 #[allow(dead_code)]
@@ -71,6 +71,12 @@ impl generated::GameHost for EngineHost {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let declared_idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
+    assert_eq!(
+        include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
+        nexa_idl::generate_rust(&declared_idl),
+        "Combat bindings must be generated without manual edits"
+    );
     assert_eq!(generated::Update::EXPORT_NAME, "Update");
     let _typed_export_id = generated::Update::FUNCTION_ID;
     let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
@@ -390,6 +396,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     );
 
+    let rollback_task = realm.spawn_task(
+        v2,
+        2,
+        &[RuntimeValue::I32(4)],
+        StepConfig {
+            owner: scope,
+            priority: 1,
+            fuel_slice: 32,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    let failing_source = include_str!("../reload/activation_fault.nexa").replace(
+        "finish_migration();\n    return value;",
+        "let failure: i32 = 1 / 0;\n    finish_migration();\n    return value + failure;",
+    );
+    let failing = nexa_compiler::compile_with_metadata(&failing_source, host_hash, schema_hash_v2)?;
+    assert!(matches!(
+        realm.restart_reload(
+            v2,
+            failing,
+            RestartReloadPolicy {
+                migration_arguments: vec![RuntimeValue::I32(1)],
+                activation_arguments: vec![RuntimeValue::I32(1)],
+                activation_fuel: 4_096,
+            },
+        )?,
+        RestartReloadOutcome::RolledBackBeforeCommit { .. }
+    ));
+    assert_eq!(realm.active_root(), Some(v2));
+    assert!(matches!(
+        realm
+            .terminal_record(rollback_task)
+            .map(|record| &record.reason),
+        Some(nexa_runtime::TaskTerminalReason::Cancelled(
+            nexa_runtime::CancelReason::ReloadCommit
+        ))
+    ));
+
     let cancelled_scope = realm.create_scope(None)?;
     let cancelled_task = realm.spawn_task(
         v2,
@@ -481,15 +526,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             nexa_runtime::CancelReason::ReloadCommit
         ))
     ));
+    let discarded_before = realm.discarded_late_host_results();
     late_pending.ticket.complete(HostPayload::I32(99))?;
     realm.tick(TickBudget {
         max_tasks: 0,
         frame_fuel_budget: 0,
         collect_garbage: false,
     })?;
-    assert_eq!(realm.discarded_late_host_results(), 1);
+    assert_eq!(realm.discarded_late_host_results(), discarded_before + 1);
     drop(realm);
-    let _releases = runtime_host.drain_releases();
+    let releases = runtime_host.drain_releases();
+    assert_eq!(
+        releases
+            .iter()
+            .filter(|release| release.kind == ReleaseKind::HostRequest)
+            .count(),
+        4
+    );
+    assert!(runtime_host.drain_releases().is_empty());
     let _ = runtime_host.begin_close();
     runtime_host.try_finish_close()?;
     println!("combat-runtime completed with deterministic reload activation fault");

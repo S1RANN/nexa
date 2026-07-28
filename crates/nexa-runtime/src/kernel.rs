@@ -287,34 +287,6 @@ impl TaskRuntime {
         self.apply_terminal_task(task, TaskEvent::Clean)
     }
 
-    pub fn request_reload_pause(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
-        self.apply_task(task, TaskEvent::RequestReloadPause)
-    }
-
-    pub fn pause_task_for_reload(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
-        self.request_reload_pause(task)?;
-        if self.tasks.snapshot(task)?.state == crate::TaskState::ReloadPauseRequested {
-            self.reach_task_safepoint(task)?;
-        }
-        Ok(())
-    }
-
-    pub fn rollback_reload(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
-        self.apply_task(task, TaskEvent::RollbackReload)
-    }
-
-    pub fn commit_reload_cancel(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
-        self.begin_reload_commit_cancel(task)?;
-        self.finish_cancel_without_cleanup(task)
-    }
-
-    pub(crate) fn begin_reload_commit_cancel(
-        &mut self,
-        task: TaskHandle,
-    ) -> Result<(), RuntimeError> {
-        self.apply_task(task, TaskEvent::CommitReload)
-    }
-
     pub fn trap_task(&mut self, task: TaskHandle) -> Result<(), RuntimeError> {
         self.apply_terminal_task(task, TaskEvent::Trap)
     }
@@ -337,22 +309,6 @@ impl TaskRuntime {
 
     pub fn task_snapshot(&self, task: TaskHandle) -> Result<TaskSnapshot, RuntimeError> {
         Ok(self.tasks.snapshot(task)?)
-    }
-
-    pub(crate) fn execution_checkpoint(
-        &self,
-        task: TaskHandle,
-    ) -> Result<TaskExecution, RuntimeError> {
-        Ok(self.tasks.execution(task)?.clone())
-    }
-
-    pub(crate) fn restore_task_checkpoint(
-        &mut self,
-        task: TaskHandle,
-        snapshot: TaskSnapshot,
-        execution: TaskExecution,
-    ) -> Result<(), RuntimeError> {
-        Ok(self.tasks.restore_checkpoint(task, snapshot, execution)?)
     }
 
     pub fn scope_snapshot(&self, scope: ScopeHandle) -> Result<ScopeSnapshot, RuntimeError> {
@@ -433,17 +389,6 @@ impl TaskRuntime {
         Ok(self.tasks.execution(task)?)
     }
 
-    pub(crate) fn mark_execution_reload_paused(
-        &mut self,
-        task: TaskHandle,
-    ) -> Result<(), RuntimeError> {
-        let fuel = self.tasks.snapshot(task)?.fuel;
-        let continuation = self.tasks.take_execution(task)?.into_continuation();
-        Ok(self
-            .tasks
-            .put_execution(task, TaskExecution::ReloadPaused(continuation), fuel)?)
-    }
-
     pub(crate) fn mark_execution_cancelling(
         &mut self,
         task: TaskHandle,
@@ -469,16 +414,6 @@ impl TaskRuntime {
 
     pub(crate) fn task_handles_iter(&self) -> impl Iterator<Item = TaskHandle> + '_ {
         self.tasks.handles_iter()
-    }
-
-    pub(crate) fn count_for_epoch(
-        &self,
-        module_generation: u32,
-        module_id: u32,
-        epoch: u64,
-    ) -> usize {
-        self.tasks
-            .count_for_epoch(module_generation, module_id, epoch)
     }
 
     pub(crate) fn record_charge(

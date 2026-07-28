@@ -1423,9 +1423,12 @@ fn main() {
         let reload_scope = task_runtime.create_scope(None).unwrap();
         let reload_task = task_runtime.admit_task(reload_scope, 1, true).unwrap();
         task_runtime.poll_task(reload_task).unwrap();
-        task_runtime.pause_task_for_reload(reload_task).unwrap();
         let reload_commit_cancel = observed(|| {
-            task_runtime.commit_reload_cancel(reload_task).unwrap();
+            task_runtime.request_task_cancel(reload_task).unwrap();
+            task_runtime.reach_task_safepoint(reload_task).unwrap();
+            task_runtime
+                .finish_cancel_without_cleanup(reload_task)
+                .unwrap();
         });
 
         let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
@@ -1837,7 +1840,7 @@ fn main() {
         .unwrap();
         let old = realm
             .load_module(
-                build_retired_epoch_module(retired_host_hash, retired_schema),
+                build_released_module_fixture(retired_host_hash, retired_schema),
                 retired_host_hash,
                 retired_schema,
             )
@@ -1868,7 +1871,7 @@ fn main() {
             realm
                 .restart_reload(
                     old,
-                    build_retired_epoch_module(retired_host_hash, retired_schema),
+                    build_released_module_fixture(retired_host_hash, retired_schema),
                     RestartReloadPolicy {
                         migration_arguments: vec![RuntimeValue::I32(1)],
                         activation_arguments: Vec::new(),
@@ -1878,7 +1881,7 @@ fn main() {
                 .unwrap(),
             RestartReloadOutcome::Committed(_)
         ));
-        let retired_epoch_final_transfer = observed(|| {
+        let released_module_final_transfer = observed(|| {
             realm
                 .tick(TickBudget {
                     max_tasks: 0,
@@ -1946,7 +1949,7 @@ fn main() {
             snapshot_release,
             detached_request_release,
             runtime_host_drain,
-            retired_epoch_final_transfer,
+            released_module_final_transfer,
             realm_drop_transfer,
         ));
     }
@@ -1979,7 +1982,7 @@ fn main() {
             snapshot_release,
             detached_request_release,
             runtime_host_drain,
-            retired_epoch_final_transfer,
+            released_module_final_transfer,
             realm_drop_transfer,
         )| {
             *promotion
@@ -2007,7 +2010,7 @@ fn main() {
                 + *snapshot_release
                 + *detached_request_release
                 + *runtime_host_drain
-                + *retired_epoch_final_transfer
+                + *released_module_final_transfer
                 + *realm_drop_transfer
                 == 0
         },
@@ -2040,7 +2043,7 @@ fn main() {
             snapshot_release,
             detached_request_release,
             runtime_host_drain,
-            retired_epoch_final_transfer,
+            released_module_final_transfer,
             realm_drop_transfer,
         )| {
             *promotion
@@ -2068,7 +2071,7 @@ fn main() {
                 + *snapshot_release
                 + *detached_request_release
                 + *runtime_host_drain
-                + *retired_epoch_final_transfer
+                + *released_module_final_transfer
                 + *realm_drop_transfer
                 == 0
         },
@@ -2103,8 +2106,8 @@ fn main() {
     println!(
         "{{\"observer\":\"global_allocator\",\"toolchain\":\"rustc-1.97.1\",\"runs\":[{}],\"migration_runs\":[{}],\"allocation_free_contract_paths_zero\":{required_paths_zero},\"all_measured_paths_zero\":{all_measured_paths_zero},\"migration_hot_paths_zero\":{migration_hot_paths_zero}}}",
         runs.iter()
-            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, token_release, snapshot_release, detached_request_release, runtime_host_drain, retired_epoch_final_transfer, realm_drop_transfer)| format!(
-                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"token_release\":{token_release},\"snapshot_release\":{snapshot_release},\"detached_request_release\":{detached_request_release},\"runtime_host_drain\":{runtime_host_drain},\"retired_epoch_final_transfer\":{retired_epoch_final_transfer},\"realm_drop_transfer\":{realm_drop_transfer}}}"
+            .map(|(repeat, promotion, explicit_resume, fuel_resume, host_resume, cleanup_success, cleanup_trap, task_completed, task_cancelled, task_trapped, reload_commit_cancel, trace_off, immediate_host_call, async_admission, async_admission_capacity_failure, async_admission_cancellation, success_result_writeback, error_result_writeback, error_enum_writeback, cancel_return_error, abandon_return_error, heap_full_writeback, token_release, snapshot_release, detached_request_release, runtime_host_drain, released_module_final_transfer, realm_drop_transfer)| format!(
+                "{{\"repeat\":{repeat},\"promotion\":{promotion},\"explicit_resume\":{explicit_resume},\"fuel_resume\":{fuel_resume},\"host_resume\":{host_resume},\"cleanup_success\":{cleanup_success},\"cleanup_trap\":{cleanup_trap},\"task_completed\":{task_completed},\"task_cancelled\":{task_cancelled},\"task_trapped\":{task_trapped},\"reload_commit_cancel\":{reload_commit_cancel},\"trace_off\":{trace_off},\"immediate_host_call\":{immediate_host_call},\"async_admission\":{async_admission},\"async_admission_capacity_failure\":{async_admission_capacity_failure},\"async_admission_cancellation\":{async_admission_cancellation},\"success_result_writeback\":{success_result_writeback},\"error_result_writeback\":{error_result_writeback},\"error_enum_writeback\":{error_enum_writeback},\"cancel_return_error\":{cancel_return_error},\"abandon_return_error\":{abandon_return_error},\"heap_full_writeback\":{heap_full_writeback},\"token_release\":{token_release},\"snapshot_release\":{snapshot_release},\"detached_request_release\":{detached_request_release},\"runtime_host_drain\":{runtime_host_drain},\"released_module_final_transfer\":{released_module_final_transfer},\"realm_drop_transfer\":{realm_drop_transfer}}}"
             ))
             .collect::<Vec<_>>()
             .join(","),
@@ -2456,7 +2459,7 @@ fn build_module(
     verify(builder.finish(), VerifierLimits::default()).unwrap()
 }
 
-fn build_retired_epoch_module(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
+fn build_released_module_fixture(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
     let mut migration = FunctionBuilder::new(
         Signature {
             parameters: vec![ValueType::I32],

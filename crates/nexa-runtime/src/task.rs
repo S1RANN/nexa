@@ -72,7 +72,6 @@ pub(crate) enum TaskExecution {
         expected_type: Option<ValueType>,
         async_result: Option<AsyncResultType>,
     },
-    ReloadPaused(InterpreterContinuation),
     Cancelling(InterpreterContinuation),
     Cleanup(InterpreterContinuation),
 }
@@ -85,7 +84,6 @@ impl TaskExecution {
             | Self::FuelYielded(continuation)
             | Self::ExplicitYielded(continuation)
             | Self::Waiting { continuation, .. }
-            | Self::ReloadPaused(continuation)
             | Self::Cancelling(continuation)
             | Self::Cleanup(continuation) => continuation,
         }
@@ -98,7 +96,6 @@ impl TaskExecution {
             | Self::FuelYielded(continuation)
             | Self::ExplicitYielded(continuation)
             | Self::Waiting { continuation, .. }
-            | Self::ReloadPaused(continuation)
             | Self::Cancelling(continuation)
             | Self::Cleanup(continuation) => continuation,
         }
@@ -503,34 +500,6 @@ impl TaskManager {
             .ok_or(TaskError::Invariant("task has no continuation"))
     }
 
-    pub(crate) fn restore_checkpoint(
-        &mut self,
-        handle: TaskHandle,
-        snapshot: TaskSnapshot,
-        execution: TaskExecution,
-    ) -> Result<(), TaskError> {
-        let task = self.tasks.resolve_mut(handle.raw())?;
-        task.state = snapshot.state;
-        task.owner = snapshot.owner;
-        task.module_epoch = snapshot.module_epoch;
-        task.module_id = snapshot.module_id;
-        task.module_generation = snapshot.module_generation;
-        task.child_kind = if snapshot.persistent {
-            ChildKind::Persistent
-        } else {
-            ChildKind::Transient
-        };
-        task.reserved_slots = snapshot.task_slots;
-        task.priority = snapshot.priority;
-        task.fuel = snapshot.fuel;
-        task.continuation_id = snapshot.continuation_id;
-        task.continuation_resume_count = snapshot.continuation_resume_count;
-        task.execution = Some(execution);
-        task.limits = snapshot.limits;
-        task.charge = snapshot.charge;
-        Ok(())
-    }
-
     pub(crate) fn handles(&self) -> Vec<TaskHandle> {
         self.tasks
             .occupied_handles()
@@ -559,18 +528,6 @@ impl TaskManager {
             })
             .count();
         (tasks, continuations)
-    }
-
-    pub(crate) fn count_for_epoch(
-        &self,
-        module_generation: u32,
-        module_id: u32,
-        epoch: u64,
-    ) -> usize {
-        self.epoch_counts
-            .get(&(module_generation, module_id, epoch))
-            .copied()
-            .unwrap_or(0)
     }
 
     pub(crate) fn record_charge(

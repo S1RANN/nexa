@@ -7,8 +7,6 @@ state Running
 state FuelYielded
 state ExplicitYielded
 state Waiting
-state ReloadPauseRequested
-state ReloadPaused
 state CancelRequested
 state Cancelling
 state Cleanup
@@ -23,10 +21,7 @@ event YieldExplicit
 event AwaitHost
 event Resume
 event ResumeExplicit
-event RequestReloadPause
 event ReachSafepoint
-event RollbackReload
-event CommitReload
 event RequestCancel
 event BeginCleanup
 event Clean
@@ -50,13 +45,6 @@ transition TASK_EXPLICIT_YIELDED_RESUME_RUNNING ExplicitYielded ResumeExplicit R
 transition TASK_RUNNING_EXPLICIT_YIELDED Running YieldExplicit ExplicitYielded
 transition TASK_RUNNING_AWAIT_WAITING Running AwaitHost Waiting
 transition TASK_WAITING_RESUME_RUNNING Waiting Resume Running
-transition TASK_RUNNING_RELOAD_PAUSE_REQUESTED Running RequestReloadPause ReloadPauseRequested
-transition TASK_WAITING_RELOAD_PAUSED Waiting RequestReloadPause ReloadPaused
-transition TASK_FUEL_YIELDED_RELOAD_PAUSED FuelYielded RequestReloadPause ReloadPaused
-transition TASK_EXPLICIT_YIELDED_RELOAD_PAUSED ExplicitYielded RequestReloadPause ReloadPaused
-transition TASK_RELOAD_REQUEST_REACH_PAUSED ReloadPauseRequested ReachSafepoint ReloadPaused
-transition TASK_RELOAD_PAUSED_ROLLBACK_RUNNING ReloadPaused RollbackReload Running
-transition TASK_RELOAD_PAUSED_COMMIT_CANCELLING ReloadPaused CommitReload Cancelling
 transition TASK_RUNNING_CANCEL_REQUESTED Running RequestCancel CancelRequested
 transition TASK_WAITING_CANCEL_REQUESTED Waiting RequestCancel CancelRequested
 transition TASK_FUEL_YIELDED_CANCEL_REQUESTED FuelYielded RequestCancel CancelRequested

@@ -16,7 +16,6 @@ pub enum RuntimeFailurePoint {
     MigrationObjectSlot,
     MigrationFieldSlot,
     MigrationForwardingSlot,
-    ReloadCompletionSlot,
     ActivationTrap,
     CleanupTrap,
     HostReturnObjectReservation,
@@ -28,7 +27,7 @@ pub enum RuntimeFailurePoint {
 }
 
 impl RuntimeFailurePoint {
-    pub const REALM_PRODUCTION: [Self; 15] = [
+    pub const REALM_PRODUCTION: [Self; 14] = [
         Self::TaskSlot,
         Self::ScopeSlot,
         Self::SchedulerSlot,
@@ -41,7 +40,6 @@ impl RuntimeFailurePoint {
         Self::MigrationObjectSlot,
         Self::MigrationFieldSlot,
         Self::MigrationForwardingSlot,
-        Self::ReloadCompletionSlot,
         Self::ActivationTrap,
         Self::CleanupTrap,
     ];
@@ -53,7 +51,7 @@ impl RuntimeFailurePoint {
         Self::HostReturnCollectionWrite,
         Self::HostReturnCommit,
     ];
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 20] = [
         Self::TaskSlot,
         Self::ScopeSlot,
         Self::SchedulerSlot,
@@ -66,7 +64,6 @@ impl RuntimeFailurePoint {
         Self::MigrationObjectSlot,
         Self::MigrationFieldSlot,
         Self::MigrationForwardingSlot,
-        Self::ReloadCompletionSlot,
         Self::ActivationTrap,
         Self::CleanupTrap,
         Self::HostReturnObjectReservation,
@@ -95,7 +92,6 @@ impl RuntimeFailurePoint {
             Self::MigrationObjectSlot => "migration object reservation",
             Self::MigrationFieldSlot => "migration field reservation",
             Self::MigrationForwardingSlot => "migration forwarding reservation",
-            Self::ReloadCompletionSlot => "reload completion admission",
             Self::ActivationTrap => "reload activation",
             Self::CleanupTrap => "task cleanup",
             Self::HostReturnObjectReservation => "host return object reservation",

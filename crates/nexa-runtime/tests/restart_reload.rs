@@ -490,3 +490,137 @@ fn old_request_releases_once_and_new_entry_starts() {
         .cancel_task(new_task, CancelReason::RuntimeShutdown)
         .expect("cleanup");
 }
+
+#[test]
+fn migration_rollback_does_not_restore_cancelled_old_tasks() {
+    let old_definition = simple_yielding(SCHEMA_V1);
+    let (mut realm, old) = realm(old_definition, SCHEMA_V1);
+    let scope = realm.create_scope(None).expect("scope");
+    let task = realm
+        .spawn_task(old, 0, &[RuntimeValue::I32(1)], config(scope))
+        .expect("old task");
+    assert!(matches!(
+        realm.poll_task(task, 64),
+        Ok(TaskPoll::Yielded(_))
+    ));
+    let failing = compile(
+        "migration fn migrate(value: i32) -> i32 {
+             let failure: i32 = 1 / 0;
+             finish_migration();
+             return value + failure;
+         }
+         task fn update(value: i32) -> i32 { return value; }",
+        SCHEMA_V1,
+    );
+    assert!(matches!(
+        realm
+            .restart_reload(old, failing, policy())
+            .expect("rollback"),
+        RestartReloadOutcome::RolledBackBeforeCommit { .. }
+    ));
+    assert_eq!(realm.active_root(), Some(old));
+    assert!(matches!(
+        realm.terminal_record(task).map(|record| &record.reason),
+        Some(TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
+    ));
+}
+
+#[test]
+fn migration_rollback_discards_late_old_request_completion() {
+    let (mut realm, old, _, pending) = async_realm();
+    let scope = realm.create_scope(None).expect("scope");
+    let task = realm.spawn_task(old, 0, &[], config(scope)).expect("task");
+    assert!(matches!(
+        realm.poll_task(task, 64),
+        Ok(TaskPoll::Waiting(_))
+    ));
+    let failing = compile(
+        "migration fn migrate(value: i32) -> i32 {
+             let failure: i32 = 1 / 0;
+             finish_migration();
+             return value + failure;
+         }
+         task fn update(value: i32) -> i32 { return value; }",
+        SCHEMA_V1,
+    );
+    assert!(matches!(
+        realm
+            .restart_reload(old, failing, policy())
+            .expect("rollback"),
+        RestartReloadOutcome::RolledBackBeforeCommit { .. }
+    ));
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("physical request")
+        .ticket
+        .complete(HostPayload::I32(11))
+        .expect("late completion");
+    realm.tick(TickBudget::default()).expect("discard");
+    assert_eq!(realm.discarded_late_host_results(), 1);
+    assert!(matches!(
+        realm.terminal_record(task).map(|record| &record.reason),
+        Some(TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
+    ));
+}
+
+#[test]
+fn restart_implementation_has_no_intermediate_completion_queue() {
+    let source = include_str!("../src/reload.rs");
+    let removed_type = ["Reload", "Completion", "Buffer"].concat();
+    let removed_route = ["Buffered", "For", "Reload"].concat();
+    assert!(!source.contains(&removed_type));
+    assert!(!source.contains(&removed_route));
+}
+
+#[test]
+fn old_module_slot_is_released_after_publication() {
+    let definition = simple_yielding(SCHEMA_V1);
+    let (mut realm, old) = realm(definition.clone(), SCHEMA_V1);
+    assert!(matches!(
+        realm
+            .restart_reload(old, definition, RestartReloadPolicy::default())
+            .expect("commit"),
+        RestartReloadOutcome::Committed(_)
+    ));
+    assert!(realm.module_lifecycle(old).is_err());
+}
+
+#[test]
+fn late_completion_cannot_resume_cancelled_old_task() {
+    let (mut realm, old, _, pending) = async_realm();
+    let scope = realm.create_scope(None).expect("scope");
+    let task = realm.spawn_task(old, 0, &[], config(scope)).expect("task");
+    assert!(matches!(
+        realm.poll_task(task, 64),
+        Ok(TaskPoll::Waiting(_))
+    ));
+    realm
+        .restart_reload(old, async_module(), RestartReloadPolicy::default())
+        .expect("restart");
+    pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("physical request")
+        .ticket
+        .complete(HostPayload::I32(12))
+        .expect("late completion");
+    realm.tick(TickBudget::default()).expect("discard");
+    assert!(matches!(
+        realm.terminal_record(task).map(|record| &record.reason),
+        Some(TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
+    ));
+    assert_eq!(
+        realm.poll_task(task, 64),
+        Err(nexa_runtime::RuntimeError::TerminalTask)
+    );
+}
+
+#[test]
+fn restart_task_machine_contains_no_pause_state() {
+    let source = include_str!("../src/generated/machines.rs");
+    let removed_state = ["Reload", "Paused"].concat();
+    assert!(!source.contains(&removed_state));
+}

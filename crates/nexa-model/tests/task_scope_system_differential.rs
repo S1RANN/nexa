@@ -390,8 +390,6 @@ fn task_state_name(state: TaskState) -> &'static str {
         TaskState::FuelYielded => "FuelYielded",
         TaskState::ExplicitYielded => "ExplicitYielded",
         TaskState::Waiting => "Waiting",
-        TaskState::ReloadPauseRequested => "ReloadPauseRequested",
-        TaskState::ReloadPaused => "ReloadPaused",
         TaskState::CancelRequested => "CancelRequested",
         TaskState::Cancelling => "Cancelling",
         TaskState::Cleanup => "Cleanup",

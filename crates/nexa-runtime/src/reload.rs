@@ -1,11 +1,8 @@
-use std::collections::VecDeque;
 use std::fmt;
 
 use crate::machines::reload;
-use crate::scheduler::SchedulerCheckpoint;
 use crate::stateful::MigrationLimitError;
-use crate::task::TaskExecution;
-use crate::{HostCompletionDelivery, ModuleHandle, RuntimeMessage, TaskHandle, TaskSnapshot};
+use crate::{ModuleHandle, RuntimeMessage};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReloadError {
@@ -35,53 +32,10 @@ pub fn invoke_reload_activation(
 pub(crate) struct ReloadTransaction {
     pub(crate) old_module: ModuleHandle,
     pub(crate) candidate: ModuleHandle,
-    pub(crate) paused_tasks: Vec<PausedTask>,
-    pub(crate) completions: ReloadCompletionBuffer,
-}
-
-#[derive(Debug)]
-pub(crate) struct ReloadCompletionBuffer {
-    entries: VecDeque<HostCompletionDelivery>,
-    capacity: usize,
-}
-
-impl ReloadCompletionBuffer {
-    #[must_use]
-    pub(crate) fn new(capacity: usize) -> Self {
-        Self {
-            entries: VecDeque::with_capacity(capacity),
-            capacity,
-        }
-    }
-
-    pub(crate) fn push(&mut self, delivery: HostCompletionDelivery) -> Result<(), ReloadError> {
-        if self.entries.len() >= self.capacity {
-            return Err(ReloadError::StagingCapacity);
-        }
-        self.entries.push_back(delivery);
-        Ok(())
-    }
-
-    #[cfg(any(test, feature = "model-adapter"))]
-    #[must_use]
-    pub(crate) fn len(&self) -> usize {
-        self.entries.len()
-    }
-
-    pub(crate) fn drain_ordered(&mut self) -> impl Iterator<Item = HostCompletionDelivery> + '_ {
-        self.entries
-            .make_contiguous()
-            .sort_by_key(|delivery| delivery.terminal_sequence);
-        self.entries.drain(..)
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(crate) struct PausedTask {
-    pub(crate) handle: TaskHandle,
-    pub(crate) snapshot: TaskSnapshot,
-    pub(crate) execution: TaskExecution,
-    pub(crate) scheduler: SchedulerCheckpoint,
+    pub(crate) old_module_id: u32,
+    pub(crate) old_epoch: u64,
+    pub(crate) cancelled_task_count: usize,
+    pub(crate) detached_request_count: usize,
 }
 
 #[derive(Debug, Default)]

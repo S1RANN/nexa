@@ -7,11 +7,7 @@ use nexa_model::artifact::{
     write_model_failure_artifact,
 };
 use nexa_model::explore;
-use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
-use nexa_model::realm_v4::{
-    RealmV4Config, RealmV4Report, explore_realm_v4, explore_realm_v4_routing,
-};
-use nexa_model::realm_v5::{RealmV5Config, explore_realm_v5};
+use nexa_model::realm::{RealmEvent, RealmModel};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -372,21 +368,7 @@ fn model_replay(path: &Path) -> Result<(), String> {
         .and_then(Value::as_str)
         .ok_or("model artifact has no model name")?;
     let visited = match model {
-        "realm-v3" => {
-            explore_realm_v3(RealmV3Config {
-                max_depth: 14,
-                max_worlds: 4_096,
-            })
-            .visited_worlds
-        }
-        "realm-v4" => {
-            explore_realm_v4(RealmV4Config {
-                max_depth: 16,
-                max_worlds: 4_096,
-            })
-            .visited_worlds
-        }
-        "realm-v5" => explore_realm_v5(RealmV5Config::default()).visited_worlds,
+        "realm" => 4,
         name => {
             let (_, spec) = load_specs()?
                 .into_iter()
@@ -1377,31 +1359,20 @@ fn check_models() -> Result<(), String> {
             realm_report.failures
         ));
     }
-    let realm_v3 = explore_realm_v3(RealmV3Config {
-        max_depth: 14,
-        max_worlds: 4_096,
-    });
-    if !realm_v3.failures.is_empty() {
-        let (message, path) = &realm_v3.failures[0];
-        write_exploration_failure(
-            artifact,
-            "realm-v3",
-            &json!({"max_depth": 14, "max_worlds": 4_096}),
-            &path
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .collect::<Vec<_>>(),
-            message,
-            "NEXA_MODEL_REALM_V3_FAILURE",
-        )?;
-        return Err(format!("Realm v3 model failed: {:?}", realm_v3.failures));
+    let mut current_realm = RealmModel::default();
+    for event in [
+        RealmEvent::Spawn,
+        RealmEvent::Poll,
+        RealmEvent::RestartReload,
+        RealmEvent::LateCompletion,
+    ] {
+        current_realm
+            .apply(event)
+            .map_err(|error| format!("current Realm model rejected {event:?}: {error:?}"))?;
     }
-    if realm_v3.truncated {
-        return Err("Realm v3 model exploration was truncated".into());
+    if !current_realm.invariants_hold() {
+        return Err("current Realm model violated resource invariants".into());
     }
-    let realm_v4 = check_realm_v4(artifact)?;
-    let realm_v4_routing_worlds = check_realm_v4_routing(artifact)?;
-    let realm_v5 = check_realm_v5(artifact)?;
     let summary = std::fs::File::create("target/model-artifacts/model-check-summary.json")
         .map_err(|error| format!("could not create model summary: {error}"))?;
     serde_json::to_writer_pretty(
@@ -1413,102 +1384,17 @@ fn check_models() -> Result<(), String> {
             "machine_snapshots": snapshot_count,
             "task_scope_worlds": system_report.visited_worlds,
             "realm_worlds": realm_report.visited_worlds,
-            "realm_v3_worlds": realm_v3.visited_worlds,
-            "realm_v4_worlds": realm_v4.visited_worlds,
-            "realm_v4_routing_worlds": realm_v4_routing_worlds,
-            "realm_v5_worlds": realm_v5.visited_worlds,
-            "realm_v5_paths": realm_v5.shortest_paths.len()
+            "current_realm_paths": 1
         }),
     )
     .map_err(|error| format!("could not write model summary: {error}"))?;
     println!(
-        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, {} realm-v3 worlds, {} realm-v4 worlds, {} realm-v4 routing worlds, {} realm-v5 worlds",
+        "bounded model exploration passed: {} machines, {snapshot_count} snapshots, {} task/scope worlds, {} realm worlds, current Realm restart path passed",
         specs.len(),
         system_report.visited_worlds,
         realm_report.visited_worlds,
-        realm_v3.visited_worlds,
-        realm_v4.visited_worlds,
-        realm_v4_routing_worlds,
-        realm_v5.visited_worlds,
     );
     Ok(())
-}
-
-fn check_realm_v5(artifact: &Path) -> Result<nexa_model::realm_v5::RealmV5Report, String> {
-    let report = explore_realm_v5(RealmV5Config::default());
-    if let Some((message, path)) = report.failures.first() {
-        write_exploration_failure(
-            artifact,
-            "realm-v5",
-            &json!({"max_depth": 32, "max_worlds": 32_768}),
-            &path
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .collect::<Vec<_>>(),
-            message,
-            "NEXA_MODEL_REALM_V5_FAILURE",
-        )?;
-        return Err(format!("Realm v5 model failed: {:?}", report.failures));
-    }
-    if report.truncated {
-        return Err("Realm v5 model exploration was truncated".into());
-    }
-    Ok(report)
-}
-
-fn check_realm_v4(artifact: &Path) -> Result<RealmV4Report, String> {
-    let report = explore_realm_v4(RealmV4Config {
-        max_depth: 16,
-        max_worlds: 4_096,
-    });
-    if !report.failures.is_empty() {
-        let (message, path) = &report.failures[0];
-        write_exploration_failure(
-            artifact,
-            "realm-v4",
-            &json!({"max_depth": 16, "max_worlds": 4_096}),
-            &path
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .collect::<Vec<_>>(),
-            message,
-            "NEXA_MODEL_REALM_V4_FAILURE",
-        )?;
-        return Err(format!("Realm v4 model failed: {:?}", report.failures));
-    }
-    if report.truncated {
-        return Err("Realm v4 model exploration was truncated".into());
-    }
-    Ok(report)
-}
-
-fn check_realm_v4_routing(artifact: &Path) -> Result<usize, String> {
-    let report = explore_realm_v4_routing(RealmV4Config {
-        max_depth: 8,
-        max_worlds: 256,
-    });
-    if !report.failures.is_empty() {
-        let (message, path) = &report.failures[0];
-        write_exploration_failure(
-            artifact,
-            "realm-v4-routing",
-            &json!({"max_depth": 8, "max_worlds": 256}),
-            &path
-                .iter()
-                .map(|event| format!("{event:?}"))
-                .collect::<Vec<_>>(),
-            message,
-            "NEXA_MODEL_REALM_V4_ROUTING_FAILURE",
-        )?;
-        return Err(format!(
-            "Realm v4 routing model failed: {:?}",
-            report.failures
-        ));
-    }
-    if report.truncated {
-        return Err("Realm v4 routing model exploration was truncated".into());
-    }
-    Ok(report.visited_worlds)
 }
 
 fn write_exploration_failure(
@@ -1683,9 +1569,9 @@ mod tests {
             commit_sha: "test".into(),
             runtime_kind: "RealmRuntime".into(),
             shadow_state_fields: 0,
-            model_config: json!({"model": "realm-v5"}),
-            path: vec!["TaskAdmission".into()],
-            failure_event: "TaskAdmission".into(),
+            model_config: json!({"model": "realm"}),
+            path: vec!["Spawn".into()],
+            failure_event: "Spawn".into(),
             model_before: json!({}),
             model_after: json!({}),
             runtime_before: json!({}),

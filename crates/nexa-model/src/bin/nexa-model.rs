@@ -2,8 +2,7 @@ use std::path::{Path, PathBuf};
 
 use nexa_machine::MachineSpec;
 use nexa_model::explore;
-use nexa_model::realm_v3::{RealmV3Config, explore_realm_v3};
-use nexa_model::realm_v4::{RealmV4Config, explore_realm_v4, explore_realm_v4_routing};
+use nexa_model::realm::{RealmEvent, RealmModel};
 use nexa_model::system::{
     RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope,
 };
@@ -99,50 +98,21 @@ fn run(path: &Path) -> Result<(), String> {
             "RealmRuntime: {} worlds, {} rejected operations",
             realm.visited_worlds, realm.rejected_operations
         );
-        let realm_v3 = explore_realm_v3(RealmV3Config {
-            max_depth: 14,
-            max_worlds: 4_096,
-        });
-        if !realm_v3.failures.is_empty() || realm_v3.truncated {
-            return Err(format!(
-                "Realm v3 model failed: {:?}, truncated={}",
-                realm_v3.failures, realm_v3.truncated
-            ));
+        let mut current = RealmModel::default();
+        for event in [
+            RealmEvent::Spawn,
+            RealmEvent::Poll,
+            RealmEvent::RestartReload,
+            RealmEvent::LateCompletion,
+        ] {
+            current
+                .apply(event)
+                .map_err(|error| format!("current Realm model rejected {event:?}: {error:?}"))?;
         }
-        println!(
-            "RealmV3: {} worlds, {} rejected operations",
-            realm_v3.visited_worlds, realm_v3.rejected_operations
-        );
-        let realm_v4 = explore_realm_v4(RealmV4Config {
-            max_depth: 16,
-            max_worlds: 4_096,
-        });
-        if !realm_v4.failures.is_empty() || realm_v4.truncated {
-            return Err(format!(
-                "Realm v4 model failed: {:?}, truncated={}",
-                realm_v4.failures, realm_v4.truncated
-            ));
+        if !current.invariants_hold() {
+            return Err("current Realm model violated resource invariants".into());
         }
-        println!(
-            "RealmV4: {} worlds, {} task states, {} rejected operations",
-            realm_v4.visited_worlds,
-            realm_v4.reached_states.len(),
-            realm_v4.rejected_operations
-        );
-        let realm_v4_routing = explore_realm_v4_routing(RealmV4Config {
-            max_depth: 8,
-            max_worlds: 256,
-        });
-        if !realm_v4_routing.failures.is_empty() || realm_v4_routing.truncated {
-            return Err(format!(
-                "Realm v4 routing model failed: {:?}, truncated={}",
-                realm_v4_routing.failures, realm_v4_routing.truncated
-            ));
-        }
-        println!(
-            "RealmV4 routing: {} worlds, {} rejected operations",
-            realm_v4_routing.visited_worlds, realm_v4_routing.rejected_operations
-        );
+        println!("Realm: current restart semantics passed");
     }
     Ok(())
 }

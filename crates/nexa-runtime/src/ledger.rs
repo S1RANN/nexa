@@ -13,7 +13,7 @@ pub struct RuntimeResourceLedger {
     pub queued_releases: u64,
     pub heap_objects: u64,
     pub state_objects: u64,
-    pub retired_epochs: u64,
+    pub retired_modules: u64,
 }
 
 impl RuntimeResourceLedger {
@@ -31,7 +31,7 @@ impl RuntimeResourceLedger {
             && self.queued_releases == 0
             && self.heap_objects == 0
             && self.state_objects == 0
-            && self.retired_epochs == 0
+            && self.retired_modules == 0
     }
 }
 

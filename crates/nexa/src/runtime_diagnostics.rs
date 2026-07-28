@@ -135,7 +135,9 @@ impl RuntimeDiagnosticHarness {
             "completion_accounting": format!("{:?}", snapshot.completion_accounting),
             "reload": {
                 "state": format!("{:?}", snapshot.reload.state),
-                "completion_buffer": snapshot.reload.completion_buffer,
+                "cancelled_tasks": snapshot.reload.cancelled_tasks,
+                "detached_requests": snapshot.reload.detached_requests,
+                "late_completions_discarded": snapshot.reload.late_completions_discarded,
                 "root_publications": snapshot.reload.root_publications.len(),
             },
             "host_state": format!("{:?}", snapshot.runtime_host),
