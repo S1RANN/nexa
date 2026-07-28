@@ -29,6 +29,7 @@ struct RepoHealth {
     low_level_event_violations: Vec<String>,
     public_api_violations: Vec<String>,
     public_raw_task_api_violations: usize,
+    public_task_lifecycle_bypass_violations: usize,
     legacy_host_abi_violations: usize,
     completion_buffer_symbol_violations: usize,
     reload_pause_symbol_violations: usize,
@@ -53,7 +54,7 @@ fn main() -> Result<(), DynError> {
         "check" => check(),
         "test-core" => test_core(),
         "test-binding" => test_binding(),
-        "test-task" => cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"]),
+        "test-task" => test_task(),
         "test-reload" => cargo(&["test", "-p", "nexa-runtime", "--test", "restart_reload"]),
         "test-model" => cargo(&["test", "-p", "nexa-model"]),
         "fuzz-smoke" => fuzz_smoke(),
@@ -87,10 +88,16 @@ fn check() -> Result<(), DynError> {
     test_core()?;
     test_binding()?;
     cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"])?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "public_api_compile"])?;
     cargo(&["test", "-p", "nexa-runtime", "--test", "restart_reload"])?;
     cargo(&["test", "-p", "nexa-model"])?;
     fuzz_smoke()?;
     bench_smoke()
+}
+
+fn test_task() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"])?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "public_api_compile"])
 }
 
 fn test_core() -> Result<(), DynError> {
@@ -283,6 +290,22 @@ fn repo_audit() -> Result<(), DynError> {
         &audit_sources,
         &["pub fn poll_task_raw", "pub fn call(", "pub fn spawn("],
     );
+    let public_task_lifecycle_bypass_violations = count_occurrences(
+        &audit_sources,
+        &["pub fn create_host_request", "pub fn wait_for_request"],
+    ) + audit_sources
+        .iter()
+        .filter(|(path, _)| {
+            path.as_str() != "crates/nexa-runtime/tests/public_api_compile.rs"
+                && !path.starts_with("crates/nexa-runtime/src/")
+        })
+        .map(|(_, source)| {
+            [".create_host_request(", ".wait_for_request("]
+                .iter()
+                .map(|needle| source.matches(needle).count())
+                .sum::<usize>()
+        })
+        .sum::<usize>();
     let legacy_host_abi_violations = count_identifier(&audit_sources, "HostArgs")
         + count_identifier(&audit_sources, "HostValue")
         + count_occurrences(
@@ -327,6 +350,7 @@ fn repo_audit() -> Result<(), DynError> {
         && low_level_event_violations.is_empty()
         && public_api_violations.is_empty()
         && public_raw_task_api_violations == 0
+        && public_task_lifecycle_bypass_violations == 0
         && legacy_host_abi_violations == 0
         && completion_buffer_symbol_violations == 0
         && reload_pause_symbol_violations == 0
@@ -353,6 +377,7 @@ fn repo_audit() -> Result<(), DynError> {
         low_level_event_violations,
         public_api_violations,
         public_raw_task_api_violations,
+        public_task_lifecycle_bypass_violations,
         legacy_host_abi_violations,
         completion_buffer_symbol_violations,
         reload_pause_symbol_violations,
@@ -476,8 +501,10 @@ fn count_identifier(sources: &BTreeMap<String, String>, identifier: &str) -> usi
 }
 
 fn public_api_violations(sources: &BTreeMap<String, String>) -> Vec<String> {
-    const FORBIDDEN: [&str; 6] = [
+    const FORBIDDEN: [&str; 8] = [
         "pub fn poll_task_raw",
+        "pub fn create_host_request",
+        "pub fn wait_for_request",
         "pub fn call(",
         "pub fn spawn(",
         "HostRegistry::call",
@@ -501,6 +528,8 @@ fn finalization_inventory(sources: &BTreeMap<String, String>) -> FinalizationInv
     let mut counts = BTreeMap::new();
     for symbol in [
         "pub fn poll_task_raw",
+        "pub fn create_host_request",
+        "pub fn wait_for_request",
         "pub fn call(",
         "pub fn spawn(",
         "HostRegistry::call",

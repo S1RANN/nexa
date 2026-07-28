@@ -2029,7 +2029,8 @@ impl RealmRuntime {
         Ok(self.heap.resolve(reference)?)
     }
 
-    pub fn create_host_request(
+    #[allow(dead_code)]
+    pub(crate) fn create_host_request_for_runtime(
         &mut self,
         task: TaskHandle,
     ) -> Result<PendingHostRequest, RealmError> {
@@ -2042,7 +2043,8 @@ impl RealmRuntime {
             .create_request()?)
     }
 
-    pub fn wait_for_request(
+    #[allow(dead_code)]
+    pub(crate) fn wait_for_request(
         &mut self,
         task: TaskHandle,
         request: HostRequestHandle,

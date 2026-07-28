@@ -1666,9 +1666,7 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
-        let pending = Arc::new(Mutex::new(None));
-        let (mut realm, module) =
-            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
+        let (mut realm, module) = make_realm_with_host(host.clone());
         drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
@@ -1701,7 +1699,9 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
-        let (mut realm, module) = make_realm_with_host(host.clone());
+        let pending = Arc::new(Mutex::new(None));
+        let (mut realm, module) =
+            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
         let scope = realm.create_scope(None).unwrap();
         let task = realm
             .spawn_task(
@@ -1720,8 +1720,11 @@ fn main() {
         realm
             .create_resource_token(task, RuntimeHostDomain::Render)
             .unwrap();
-        let pending = realm.create_host_request(task).unwrap();
-        realm.wait_for_request(task, pending.request).unwrap();
+        assert!(matches!(
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
+        let pending = pending.lock().unwrap().take().unwrap();
         let realm_drop_transfer = observed(|| drop(realm));
         assert_eq!(host.pending_releases(), 2);
         drop(pending);
@@ -1804,7 +1807,9 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
-        let (mut realm, module) = make_realm_with_host(host.clone());
+        let pending = Arc::new(Mutex::new(None));
+        let (mut realm, module) =
+            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
         let scope = realm.create_scope(None).unwrap();
         let task = realm
             .spawn_task(
@@ -1820,8 +1825,11 @@ fn main() {
                 },
             )
             .unwrap();
-        let detached = realm.create_host_request(task).unwrap();
-        realm.wait_for_request(task, detached.request).unwrap();
+        assert!(matches!(
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
+        let detached = pending.lock().unwrap().take().unwrap();
         let detached_request_release = observed(|| drop(realm));
         drop(detached);
         let mut drain_records = release_buffer::<2>();
