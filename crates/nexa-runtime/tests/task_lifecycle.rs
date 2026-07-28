@@ -188,11 +188,30 @@ fn spawn(
         .expect("task")
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ExpectedReleases {
+    requests: usize,
+    tokens: usize,
+    snapshots: usize,
+}
+
+impl ExpectedReleases {
+    const NONE: Self = Self {
+        requests: 0,
+        tokens: 0,
+        snapshots: 0,
+    };
+    const ONE_REQUEST: Self = Self {
+        requests: 1,
+        ..Self::NONE
+    };
+}
+
 fn assert_terminal_invariants(
     realm: &mut RealmRuntime,
     runtime_host: &RuntimeHost,
     task: TaskHandle,
-    expected_release_counts: &[(ReleaseKind, usize)],
+    expected: ExpectedReleases,
 ) {
     realm
         .tick(TickBudget {
@@ -205,28 +224,29 @@ fn assert_terminal_invariants(
     let ledger = realm.resource_ledger();
     assert_eq!(ledger.continuations, 0);
     assert_eq!(ledger.requests, 0);
+    assert_eq!(ledger.tokens, 0);
+    assert_eq!(ledger.snapshots, 0);
     assert_eq!(ledger.scheduler_tokens, 0);
     assert_eq!(ledger.completion_reservations, 0);
     assert_eq!(ledger.release_reservations, 0);
     assert!(realm.terminal_record(task).is_some());
-    for (kind, expected) in expected_release_counts {
+    for (kind, expected_count) in [
+        (ReleaseKind::HostRequest, expected.requests),
+        (ReleaseKind::ResourceToken, expected.tokens),
+        (ReleaseKind::Snapshot, expected.snapshots),
+    ] {
         assert_eq!(
-            releases
-                .iter()
-                .filter(|record| record.kind == *kind)
-                .count(),
-            *expected,
+            releases.iter().filter(|record| record.kind == kind).count(),
+            expected_count,
             "wrong release count for {kind:?}"
         );
     }
     assert_eq!(
         releases.len(),
-        expected_release_counts
-            .iter()
-            .map(|(_, expected)| expected)
-            .sum(),
+        expected.requests + expected.tokens + expected.snapshots,
         "unexpected release kind"
     );
+    assert!(runtime_host.drain_releases().is_empty());
     assert!(runtime_host.drain_releases().is_empty());
 }
 
@@ -250,7 +270,7 @@ fn normal_completion() {
         realm.poll_task(task, 64).expect("poll"),
         TaskPoll::Completed(RuntimeValue::I32(7))
     );
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -273,7 +293,7 @@ fn host_error_is_a_typed_completion() {
         realm.poll_task(task, 64),
         Ok(TaskPoll::Completed(_))
     ));
-    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
 #[test]
@@ -303,7 +323,7 @@ fn completion_is_idempotent_and_releases_once() {
         realm.poll_task(task, 64),
         Ok(TaskPoll::Completed(_))
     ));
-    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
 #[test]
@@ -433,7 +453,7 @@ fn reload_detached_request_is_reported_distinctly() {
             collect_garbage: false,
         })
         .expect("discard late completion");
-    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
 #[test]
@@ -444,7 +464,7 @@ fn host_panic_is_isolated_as_a_trap() {
         realm.poll_task(task, 64),
         Ok(TaskPoll::Trapped(_))
     ));
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -461,7 +481,7 @@ fn task_cancel_returns_terminal_poll() {
             .expect("cancel"),
         TaskPoll::Cancelled(CancelReason::HostCancelled)
     );
-    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
 #[test]
@@ -476,7 +496,7 @@ fn request_abandon_traps_without_invalid_task_state() {
         realm.terminal_record(task).map(|record| &record.reason),
         Some(TaskTerminalReason::Trapped(_))
     ));
-    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
 #[test]
@@ -504,7 +524,7 @@ fn task_capacity_is_reported_at_admission() {
     realm
         .cancel_task(first, CancelReason::RuntimeShutdown)
         .expect("cleanup first");
-    assert_terminal_invariants(&mut realm, &host, first, &[]);
+    assert_terminal_invariants(&mut realm, &host, first, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -519,7 +539,7 @@ fn request_capacity_probe_is_consumed() {
         Ok(TaskPoll::Trapped(_))
     ));
     probe.require_consumed().expect("request scenario reached");
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -536,7 +556,7 @@ fn completion_capacity_probe_is_consumed() {
     probe
         .require_consumed()
         .expect("completion scenario reached");
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle, RuntimeHost) {
@@ -571,7 +591,7 @@ fn cleanup_succeeds_and_balances_resources() {
         realm.cancel_task(task, CancelReason::HostCancelled),
         Ok(TaskPoll::Cancelled(_))
     ));
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -594,7 +614,7 @@ fn cleanup_trap_probe_is_consumed() {
         Ok(TaskPoll::Trapped(_))
     ));
     probe.require_consumed().expect("cleanup scenario reached");
-    assert_terminal_invariants(&mut realm, &host, task, &[]);
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
 #[test]
@@ -657,7 +677,7 @@ fn module_restart_cancels_old_task_and_starts_new_module() {
     realm
         .cancel_task(new_task, CancelReason::RuntimeShutdown)
         .expect("new task cleanup");
-    assert_terminal_invariants(&mut realm, &host, new_task, &[]);
+    assert_terminal_invariants(&mut realm, &host, new_task, ExpectedReleases::NONE);
 }
 
 #[test]

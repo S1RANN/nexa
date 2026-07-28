@@ -125,7 +125,7 @@ fn test_binding() -> Result<(), DynError> {
         "check",
         "examples/combat-runtime/combat_api.nidl",
     ])?;
-    cargo(&["check", "-p", "combat-runtime"])
+    cargo(&["test", "-p", "combat-runtime"])
 }
 
 fn fuzz_smoke() -> Result<(), DynError> {

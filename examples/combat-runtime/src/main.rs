@@ -15,6 +15,8 @@ mod generated {
 
 struct EngineHost {
     last_request: Arc<Mutex<Option<nexa_runtime::PendingHostRequest>>>,
+    last_token: Arc<Mutex<Option<nexa_runtime::ResourceTokenHandle>>>,
+    last_snapshot: Arc<Mutex<Option<nexa_runtime::SnapshotHandle>>>,
 }
 
 impl generated::GameHost for EngineHost {
@@ -48,10 +50,14 @@ impl generated::GameHost for EngineHost {
         context: &mut ResourceContext<'_>,
         _: i32,
     ) -> Result<generated::ActionLockToken, generated::HostError> {
-        context
+        let token = context
             .create_token(RuntimeHostDomain::Render)
-            .map(generated::ActionLockToken::from_raw)
-            .map_err(|error| generated::HostError(error.to_string()))
+            .map_err(|error| generated::HostError(error.to_string()))?;
+        *self
+            .last_token
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
+        Ok(generated::ActionLockToken::from_raw(token))
     }
 
     fn world_snapshot(
@@ -60,17 +66,111 @@ impl generated::GameHost for EngineHost {
     ) -> Result<generated::EnemyViewSnapshot, generated::HostError> {
         let value = generated::EnemyView { health: 10 };
         let encoded = generated::EnemyViewSnapshotEncoder::encode(&value)?;
-        context
+        let snapshot = context
             .create_typed_snapshot(encoded)
-            .map(|handle| {
-                generated::EnemyViewSnapshot::try_from_raw(handle)
-                    .expect("snapshot was created with the generated content type")
-            })
-            .map_err(|error| generated::HostError(error.to_string()))
+            .map_err(|error| generated::HostError(error.to_string()))?;
+        *self
+            .last_snapshot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(snapshot);
+        Ok(generated::EnemyViewSnapshot::try_from_raw(snapshot)
+            .expect("snapshot was created with the generated content type"))
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExpectedReleases {
+    requests: usize,
+    tokens: usize,
+    snapshots: usize,
+}
+
+fn assert_release_batch(runtime_host: &RuntimeHost, expected: ExpectedReleases) {
+    let releases = runtime_host.drain_releases();
+    for (kind, expected_count) in [
+        (ReleaseKind::HostRequest, expected.requests),
+        (ReleaseKind::ResourceToken, expected.tokens),
+        (ReleaseKind::Snapshot, expected.snapshots),
+    ] {
+        assert_eq!(
+            releases
+                .iter()
+                .filter(|release| release.kind == kind)
+                .count(),
+            expected_count,
+            "unexpected {kind:?} release count"
+        );
+    }
+    assert_eq!(
+        releases.len(),
+        expected.requests + expected.tokens + expected.snapshots,
+        "unexpected release kind"
+    );
+    assert!(runtime_host.drain_releases().is_empty());
+    assert!(runtime_host.drain_releases().is_empty());
+}
+
+fn assert_terminal_resources(
+    realm: &mut RealmRuntime,
+    runtime_host: &RuntimeHost,
+    task: nexa_runtime::TaskHandle,
+    expected: ExpectedReleases,
+) -> Result<(), nexa_runtime::RuntimeError> {
+    realm.tick(TickBudget {
+        max_tasks: 0,
+        frame_fuel_budget: 0,
+        collect_garbage: false,
+    })?;
+    assert!(realm.terminal_record(task).is_some());
+    let ledger = realm.resource_ledger();
+    assert_eq!(ledger.requests, 0);
+    assert_eq!(ledger.tokens, 0);
+    assert_eq!(ledger.snapshots, 0);
+    assert_eq!(ledger.completion_reservations, 0);
+    assert_eq!(ledger.release_reservations, 0);
+    assert_release_batch(runtime_host, expected);
+    Ok(())
+}
+
+fn assert_generated_resources(
+    realm: &RealmRuntime,
+    last_token: &Arc<Mutex<Option<nexa_runtime::ResourceTokenHandle>>>,
+    last_snapshot: &Arc<Mutex<Option<nexa_runtime::SnapshotHandle>>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    last_token
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("generated action_lock returned a token");
+    let snapshot = last_snapshot
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("generated world_snapshot returned a typed snapshot");
+    assert_eq!(
+        realm.snapshot_content_type(snapshot)?,
+        generated::EnemyViewSnapshotEncoder::CONTENT_TYPE
+    );
+    let layout = realm.snapshot_layout(snapshot)?;
+    assert_eq!(
+        layout.schema_hash,
+        generated::EnemyViewSnapshotEncoder::SCHEMA_HASH
+    );
+    assert_eq!(layout.alignment, 1);
+    assert_eq!(layout.size, 4);
+    let decoded = realm
+        .snapshot_view::<generated::EnemyViewSnapshotRef<'_>>(snapshot)?
+        .decode_owned()
+        .map_err(|_| HostFailure("generated snapshot payload did not decode"))?;
+    assert_eq!(decoded.health, 10);
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    run()
+}
+
+fn run() -> Result<(), Box<dyn std::error::Error>> {
     let declared_idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
@@ -97,9 +197,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         StableId::from_name("EnemyBrain"),
     ));
     let last_request = Arc::new(Mutex::new(None));
+    let last_token = Arc::new(Mutex::new(None));
+    let last_snapshot = Arc::new(Mutex::new(None));
     let runtime_host = RuntimeHost::new(4_096);
     let registry = generated::GeneratedHostRegistry::new(EngineHost {
         last_request: Arc::clone(&last_request),
+        last_token: Arc::clone(&last_token),
+        last_snapshot: Arc::clone(&last_snapshot),
     });
     let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
@@ -289,6 +393,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
 
     assert!(matches!(realm.poll_task(task, 32)?, TaskPoll::Waiting(_)));
+    assert_generated_resources(&realm, &last_token, &last_snapshot)?;
     let pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -307,6 +412,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RuntimeValue::I32(42)
         )))
     ));
+    assert_terminal_resources(
+        &mut realm,
+        &runtime_host,
+        task,
+        ExpectedReleases {
+            requests: 3,
+            tokens: 1,
+            snapshots: 1,
+        },
+    )?;
+
+    let cancelled = realm.spawn_task(
+        module,
+        4,
+        &[RuntimeValue::I32(12)],
+        StepConfig {
+            owner: scope,
+            priority: 1,
+            fuel_slice: 32,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert!(matches!(
+        realm.poll_task(cancelled, 32)?,
+        TaskPoll::Waiting(_)
+    ));
+    assert_generated_resources(&realm, &last_token, &last_snapshot)?;
+    let mut cancelled_pending = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("cancelled animation request was captured by the host");
+    assert!(matches!(
+        realm.cancel_task(cancelled, nexa_runtime::CancelReason::HostCancelled)?,
+        TaskPoll::Cancelled(nexa_runtime::CancelReason::HostCancelled)
+    ));
+    assert!(cancelled_pending.ticket.cancelled().is_err());
+    assert_terminal_resources(
+        &mut realm,
+        &runtime_host,
+        cancelled,
+        ExpectedReleases {
+            requests: 1,
+            tokens: 1,
+            snapshots: 1,
+        },
+    )?;
 
     let live = realm.spawn_task(
         module,
@@ -321,6 +474,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
     assert!(matches!(realm.poll_task(live, 32)?, TaskPoll::Waiting(_)));
+    assert_generated_resources(&realm, &last_token, &last_snapshot)?;
     let mut late_pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -535,15 +689,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     assert_eq!(realm.discarded_late_host_results(), discarded_before + 1);
     drop(realm);
-    let releases = runtime_host.drain_releases();
-    assert_eq!(
-        releases
-            .iter()
-            .filter(|release| release.kind == ReleaseKind::HostRequest)
-            .count(),
-        4
+    assert_release_batch(
+        &runtime_host,
+        ExpectedReleases {
+            requests: 1,
+            tokens: 1,
+            snapshots: 1,
+        },
     );
-    assert!(runtime_host.drain_releases().is_empty());
     let _ = runtime_host.begin_close();
     runtime_host.try_finish_close()?;
     println!("combat-runtime completed with deterministic reload activation fault");
@@ -560,3 +713,11 @@ impl std::fmt::Display for HostFailure {
 }
 
 impl std::error::Error for HostFailure {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn generated_host_binding_releases_request_token_and_snapshot_exactly_once() {
+        super::run().expect("Combat generated Host Binding lifecycle");
+    }
+}
