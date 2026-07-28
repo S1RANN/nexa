@@ -1,1 +1,0 @@
-{"id":"G1-S10","input":{"fuel":0},"expected":{"state":"FuelYielded"},"language":["task"],"runtime_path":"H2/promotion-resume","resource_limit":128,"hash":"bound-by-manifest"}

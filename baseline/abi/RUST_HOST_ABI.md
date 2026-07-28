@@ -1,6 +1,6 @@
 # Rust Host ABI Specification 1.0
 
-Generated Rust bindings are the sole supported MVR host integration.
+Generated Rust bindings are the sole supported internal-language host integration.
 
 The generated layer provides:
 
@@ -16,7 +16,7 @@ after every hosted realm is dropped, every completion reservation is released, a
 transferred release is drained. Closed hosts reject new realms. In debug builds, dropping the final
 host handle without an explicit close prints the live realm, completion, and release counts.
 
-The MVR HostCall bridge accepts at most eight arguments in an inline `HostArgs` buffer. Scalar and
+The HostCall bridge accepts at most eight arguments in an inline `HostArgs` buffer. Scalar and
 handle arguments are decoded without constructing an intermediate `Vec<HostValue>`.
 
 Host panics must be contained and converted to structured host traps. Runtime internals, GC

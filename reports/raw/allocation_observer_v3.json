@@ -1,1 +1,0 @@
-{"observer":"global_allocator","toolchain":"rustc-1.97.1","runs":[{"repeat":1,"promotion":0,"resume":0,"trace_off":0,"realm_drop_transfer":0},{"repeat":2,"promotion":0,"resume":0,"trace_off":0,"realm_drop_transfer":0},{"repeat":3,"promotion":0,"resume":0,"trace_off":0,"realm_drop_transfer":0}],"all_hot_paths_zero":true}

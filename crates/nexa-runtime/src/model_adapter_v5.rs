@@ -621,7 +621,7 @@ impl RealmV5RuntimeAdapter {
     fn poll_tasks(&mut self, fuel: u64) -> Result<(), String> {
         for task in self.tasks.iter().flatten().copied() {
             if self.realm.task_snapshot(task).is_ok() {
-                self.realm.poll_task(task, fuel).map_err(debug)?;
+                self.realm.poll_task_raw(task, fuel).map_err(debug)?;
             }
         }
         self.capture_requests();
@@ -743,8 +743,12 @@ impl RealmV5RuntimeAdapter {
         {
             let epoch = normalize_epoch(retired.epoch)?;
             retired_epochs[index] = match retired.state {
-                crate::RetiredEpochState::Retired => RealmV5RuntimeRetiredEpoch::Retired(epoch),
-                crate::RetiredEpochState::Drained => RealmV5RuntimeRetiredEpoch::Drained(epoch),
+                crate::realm::RetiredEpochState::Retired => {
+                    RealmV5RuntimeRetiredEpoch::Retired(epoch)
+                }
+                crate::realm::RetiredEpochState::Drained => {
+                    RealmV5RuntimeRetiredEpoch::Drained(epoch)
+                }
             };
         }
         let mut release_backlog = [0; REALM_V5_EPOCH_COUNT];
@@ -914,7 +918,7 @@ impl RealmV5RuntimeAdapter {
     }
 
     #[must_use]
-    pub const fn gate1_scope(&self) -> ScopeHandle {
+    pub const fn driver_scope(&self) -> ScopeHandle {
         self.fixtures.scope
     }
 

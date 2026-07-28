@@ -15,11 +15,11 @@ use nexa_core::StableId;
 use nexa_runtime::{
     CancelReason, CopyBuffer, Heap, HeapError, HostArgs, HostCallOutcome, HostErrorPayload,
     HostPayload, HostRegistry, HostReturnRequirements, HostTrap, HostValue,
-    MigrationAllocationPhase, PendingHostRequest, PendingReason, PollResult, RealmConfig,
+    MigrationAllocationPhase, ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig,
     RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint,
-    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeValue,
-    StateObject, StateValue, StepConfig, TaskLimits, TaskRuntime, TaskState, TickBudget,
-    set_migration_allocation_observer,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
+    RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
+    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -253,7 +253,7 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
         )
         .unwrap();
     assert_eq!(
-        realm.poll_task(task, 64).unwrap(),
+        realm.poll_task_raw(task, 64).unwrap(),
         PollResult::Pending(PendingReason::HostRequest)
     );
     let mut ticket = pending.lock().unwrap().take().unwrap().ticket;
@@ -359,7 +359,7 @@ fn observe_cleanup(cleanup_traps: bool) -> u64 {
         )
         .unwrap();
     assert_eq!(
-        realm.poll_task(task, 64).unwrap(),
+        realm.poll_task_raw(task, 64).unwrap(),
         PollResult::Pending(PendingReason::ExplicitYield)
     );
     let allocations = observed(|| {
@@ -1217,7 +1217,7 @@ fn complex_host_allocation_matrix() {
     for (point, id) in injected_cases {
         let mut injected_heap = Heap::new_with_arena_limits(32, 256, 16, 64, 33);
         let before = injected_heap.collection_inspection();
-        injected_heap.failure_injector().arm_once(point);
+        let _probe = injected_heap.failure_injector().arm_once(point);
         let (outcome, counts) = observed_host_split(|| {
             registry.call_runtime(
                 id,
@@ -1309,13 +1309,13 @@ fn main() {
             .unwrap();
         let promotion = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Pending(PendingReason::ExplicitYield)
             ));
         });
         let explicit_resume = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1337,12 +1337,12 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 0).unwrap(),
+            realm.poll_task_raw(task, 0).unwrap(),
             PollResult::Pending(PendingReason::Fuel)
         );
         let fuel_resume = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1365,7 +1365,7 @@ fn main() {
             .unwrap();
         let task_completed = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1388,7 +1388,7 @@ fn main() {
             .unwrap();
         let task_trapped = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Trapped(_)
             ));
         });
@@ -1411,7 +1411,7 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 64).unwrap(),
+            realm.poll_task_raw(task, 64).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         let task_cancelled = observed(|| {
@@ -1449,7 +1449,7 @@ fn main() {
             .unwrap();
         let trace_off = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1482,7 +1482,7 @@ fn main() {
             .unwrap();
         let immediate_host_call = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(Some(RuntimeValue::I32(36)))
             ));
         });
@@ -1512,7 +1512,7 @@ fn main() {
             .unwrap();
         let async_admission = observed(|| {
             assert_eq!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Pending(PendingReason::HostRequest)
             );
         });
@@ -1548,7 +1548,7 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(failed, 64).unwrap(),
+            realm.poll_task_raw(failed, 64).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         pending
@@ -1635,7 +1635,7 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(first, 64).unwrap(),
+            realm.poll_task_raw(first, 64).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let rejected = realm
@@ -1654,7 +1654,7 @@ fn main() {
             .unwrap();
         let async_admission_capacity_failure = observed(|| {
             assert!(matches!(
-                realm.poll_task(rejected, 64),
+                realm.poll_task_raw(rejected, 64),
                 Ok(PollResult::Trapped(_))
             ));
         });
@@ -1685,7 +1685,7 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 64).unwrap(),
+            realm.poll_task_raw(task, 64).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let async_admission_cancellation = observed(|| {
@@ -1750,7 +1750,7 @@ fn main() {
             .unwrap();
         let token_release = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1792,7 +1792,7 @@ fn main() {
             .unwrap();
         let snapshot_release = observed(|| {
             assert!(matches!(
-                realm.poll_task(task, 64).unwrap(),
+                realm.poll_task_raw(task, 64).unwrap(),
                 PollResult::Completed(_)
             ));
         });
@@ -1860,22 +1860,26 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 64).unwrap(),
+            realm.poll_task_raw(task, 64).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         realm
             .create_resource_token(task, RuntimeHostDomain::Io)
             .unwrap();
-        realm
-            .prepare_reload(
-                old,
-                build_retired_epoch_module(retired_host_hash, retired_schema),
-                retired_host_hash,
-            )
-            .unwrap();
-        realm.quiesce_reload().unwrap();
-        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
-        realm.commit_reload(&[], 32).unwrap();
+        assert!(matches!(
+            realm
+                .restart_reload(
+                    old,
+                    build_retired_epoch_module(retired_host_hash, retired_schema),
+                    RestartReloadPolicy {
+                        migration_arguments: vec![RuntimeValue::I32(1)],
+                        activation_arguments: Vec::new(),
+                        activation_fuel: 32,
+                    },
+                )
+                .unwrap(),
+            RestartReloadOutcome::Committed(_)
+        ));
         let retired_epoch_final_transfer = observed(|| {
             realm
                 .tick(TickBudget {
@@ -1895,12 +1899,14 @@ fn main() {
         for count in &MIGRATION_COUNTS {
             count.store(0, Ordering::SeqCst);
         }
-        let mut migration_realm = make_migration_realm();
+        let (mut migration_realm, old, candidate) = make_migration_realm();
         set_migration_allocation_observer(Some(migration_observer));
-        assert_eq!(
-            migration_realm.stage_reload(&[]).unwrap(),
-            Some(RuntimeValue::I32(7))
-        );
+        assert!(matches!(
+            migration_realm
+                .restart_reload(old, candidate, RestartReloadPolicy::default())
+                .unwrap(),
+            RestartReloadOutcome::Committed(_)
+        ));
         set_migration_allocation_observer(None);
         migration_runs.push((
             repeat,
@@ -2136,7 +2142,7 @@ fn main() {
     );
 }
 
-fn make_migration_realm() -> RealmRuntime {
+fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::VerifiedModule) {
     let host = StableId::from_name("allocation-observer-migration-host");
     let old_schema_hash = StableId::from_name("allocation-observer-state-v1");
     let new_schema_hash = StableId::from_name("allocation-observer-state-v2");
@@ -2264,9 +2270,7 @@ fn make_migration_realm() -> RealmRuntime {
     realm
         .insert_state(old, deleted_id, StateValue::I32(9))
         .unwrap();
-    realm.prepare_reload(old, candidate, host).unwrap();
-    realm.quiesce_reload().unwrap();
-    realm
+    (realm, old, candidate)
 }
 
 #[derive(Clone)]

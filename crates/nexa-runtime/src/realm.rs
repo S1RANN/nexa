@@ -52,7 +52,6 @@ pub struct ModuleEpochRoot {
     pub epoch: u64,
     pub verified: Arc<VerifiedModule>,
     pub host_hash: StableId,
-    pub schema_hash: StableId,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
     state: Arc<StatefulRegistry>,
@@ -89,6 +88,7 @@ pub struct RetiredEpochSnapshot {
     pub pending_completions: usize,
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ModuleEpochKey {
     pub module: ModuleHandle,
@@ -98,6 +98,7 @@ pub struct ModuleEpochKey {
 }
 
 impl RetiredEpochSnapshot {
+    #[cfg(test)]
     #[must_use]
     pub const fn key(self) -> ModuleEpochKey {
         ModuleEpochKey {
@@ -138,6 +139,7 @@ impl RetiredEpochRegistry {
         self.entries.push_back(entry);
     }
 
+    #[cfg(test)]
     fn get(&self, key: ModuleEpochKey) -> Option<&RetiredEpochSnapshot> {
         self.entries.iter().find(|entry| entry.key() == key)
     }
@@ -661,7 +663,6 @@ pub struct RealmConfig {
     pub max_collection_elements: usize,
     pub max_collection_ranges: usize,
     pub max_host_resources: u32,
-    pub reload_completion_capacity: usize,
     pub release_capacity: usize,
     pub tombstone_capacity: usize,
     pub cost_table: OpcodeCostTable,
@@ -679,7 +680,6 @@ impl Default for RealmConfig {
             max_collection_elements: 65_536,
             max_collection_ranges: 4_097,
             max_host_resources: 1_024,
-            reload_completion_capacity: 1_024,
             release_capacity: 2_048,
             tombstone_capacity: 1_024,
             cost_table: OpcodeCostTable::default(),
@@ -694,6 +694,61 @@ pub enum PendingReason {
     ExplicitYield,
     HostRequest,
     ReloadPause,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YieldReason {
+    Fuel,
+    Explicit,
+    RestartReload,
+}
+
+pub type NexaValue = RuntimeValue;
+pub type HostResult = HostCompletionResult;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TaskPoll {
+    Completed(NexaValue),
+    Yielded(YieldReason),
+    Waiting(HostRequestHandle),
+    Cancelled(CancelReason),
+    Trapped(RuntimeError),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompletionDisposition {
+    Delivered,
+    Discarded,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartReloadPolicy {
+    pub migration_arguments: Vec<RuntimeValue>,
+    pub activation_arguments: Vec<RuntimeValue>,
+    pub activation_fuel: u64,
+}
+
+impl Default for RestartReloadPolicy {
+    fn default() -> Self {
+        Self {
+            migration_arguments: Vec::new(),
+            activation_arguments: Vec::new(),
+            activation_fuel: 4_096,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestartReloadOutcome {
+    Committed(ModuleHandle),
+    RolledBackBeforeCommit {
+        candidate: ModuleHandle,
+        reason: ReloadError,
+    },
+    ActivationFaulted {
+        candidate: ModuleHandle,
+        error: ReloadError,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1155,7 +1210,7 @@ pub struct TaskInspection {
 
 #[cfg(any(test, feature = "model-adapter"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Gate1TaskInspection {
+pub struct TerminalTaskInspection {
     pub task: TaskHandle,
     pub state: TaskState,
     pub continuation_id: Option<u64>,
@@ -1217,7 +1272,7 @@ pub struct RealmInspectionSnapshot {
     pub modules: Vec<ModuleInspection>,
     pub retired_epochs: Vec<RetiredEpochSnapshot>,
     pub tasks: Vec<TaskInspection>,
-    pub gate1_tasks: Vec<Gate1TaskInspection>,
+    pub terminal_tasks: Vec<TerminalTaskInspection>,
     pub resources: crate::RuntimeResourceLedger,
     pub completion_accounting: crate::CompletionAccounting,
     pub reload: ReloadInspection,
@@ -1246,6 +1301,8 @@ pub enum RealmError {
     EpochExhausted,
     ModuleNotCallable,
     TerminalTask,
+    StaleTaskHandle,
+    CrossRealmTaskHandle,
     TaskWaiting,
     Reload(ReloadError),
     State(crate::StatefulError),
@@ -1263,6 +1320,18 @@ impl std::error::Error for RealmError {}
 impl From<RuntimeError> for RealmError {
     fn from(error: RuntimeError) -> Self {
         Self::Runtime(error)
+    }
+}
+
+impl From<RealmError> for RuntimeError {
+    fn from(error: RealmError) -> Self {
+        match error {
+            RealmError::Runtime(error) => error,
+            RealmError::TerminalTask => Self::TerminalTask,
+            RealmError::StaleTaskHandle => Self::StaleTaskHandle,
+            RealmError::CrossRealmTaskHandle => Self::CrossRealmTaskHandle,
+            error => Self::Realm(Box::new(error)),
+        }
     }
 }
 
@@ -1365,7 +1434,7 @@ impl RealmRuntime {
             migration_limits: config.migration_limits,
             last_migration_usage_report: None,
             last_migration_hash: None,
-            reload_completion_capacity: config.reload_completion_capacity,
+            reload_completion_capacity: 1_024,
             reload_completion_stats: ReloadCompletionStats::default(),
             host_registry: None,
             host_registry_hash: None,
@@ -1424,7 +1493,7 @@ impl RealmRuntime {
     }
 
     #[cfg(any(test, feature = "model-adapter"))]
-    pub fn preflight_reload_completion_admission(&self) -> Result<(), RealmError> {
+    pub(crate) fn preflight_reload_completion_admission(&self) -> Result<(), RealmError> {
         if self.reload.active() {
             self.fail_if_injected(crate::RuntimeFailurePoint::ReloadCompletionSlot)?;
         }
@@ -1469,7 +1538,7 @@ impl RealmRuntime {
         }
     }
 
-    pub fn module_epoch(&self, module: ModuleHandle) -> Result<u64, RealmError> {
+    pub(crate) fn module_epoch(&self, module: ModuleHandle) -> Result<u64, RealmError> {
         Ok(self
             .modules
             .resolve(module.raw())
@@ -1501,18 +1570,21 @@ impl RealmRuntime {
             .lifecycle)
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn root_publications(&self) -> &VecDeque<RootPublicationRecord> {
+    pub(crate) fn root_publications(&self) -> &VecDeque<RootPublicationRecord> {
         &self.root_publications
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn retired_epochs(&self) -> &VecDeque<RetiredEpochSnapshot> {
+    pub(crate) fn retired_epochs(&self) -> &VecDeque<RetiredEpochSnapshot> {
         &self.retired_epochs.entries
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub fn retired_epoch(&self, key: ModuleEpochKey) -> Option<&RetiredEpochSnapshot> {
+    pub(crate) fn retired_epoch(&self, key: ModuleEpochKey) -> Option<&RetiredEpochSnapshot> {
         self.retired_epochs.get(key)
     }
 
@@ -1634,7 +1706,6 @@ impl RealmRuntime {
                 epoch,
                 verified: Arc::new(verified),
                 host_hash,
-                schema_hash,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
                 state: Arc::new(StatefulRegistry::new(stateful_domain)),
@@ -1653,7 +1724,7 @@ impl RealmRuntime {
         Ok(handle)
     }
 
-    pub fn prepare_reload(
+    pub(crate) fn prepare_reload(
         &mut self,
         old_module: ModuleHandle,
         candidate: VerifiedModule,
@@ -1702,7 +1773,64 @@ impl RealmRuntime {
         Ok(candidate)
     }
 
-    pub fn quiesce_reload(&mut self) -> Result<usize, RealmError> {
+    pub fn restart_reload(
+        &mut self,
+        module: ModuleHandle,
+        candidate: VerifiedModule,
+        policy: RestartReloadPolicy,
+    ) -> Result<RestartReloadOutcome, ReloadError> {
+        let RestartReloadPolicy {
+            migration_arguments,
+            activation_arguments,
+            activation_fuel,
+        } = policy;
+        let host_hash = self
+            .modules
+            .resolve(module.raw())
+            .map_err(|error| ReloadError::Migration(RuntimeMessage::inline(&error.to_string())))?
+            .host_hash;
+        let candidate = self
+            .prepare_reload(module, candidate, host_hash)
+            .map_err(restart_reload_error)?;
+        self.quiesce_reload().map_err(restart_reload_error)?;
+
+        let paused = std::mem::take(&mut self.reload.transaction_mut()?.paused_tasks);
+        for task in paused.into_iter().map(|paused| paused.handle) {
+            self.cancel_task(task, CancelReason::ReloadCommit)
+                .map_err(RealmError::from)
+                .map_err(restart_reload_error)?;
+        }
+
+        if let Err(error) = self.stage_reload(&migration_arguments) {
+            let reason = restart_reload_error(error);
+            self.rollback_reload().map_err(restart_reload_error)?;
+            self.flush_releases();
+            self.reap_retired_epochs();
+            return Ok(RestartReloadOutcome::RolledBackBeforeCommit { candidate, reason });
+        }
+
+        match self.commit_reload(&activation_arguments, activation_fuel) {
+            Ok(committed) => {
+                self.flush_releases();
+                self.reap_retired_epochs();
+                Ok(RestartReloadOutcome::Committed(committed))
+            }
+            Err(error)
+                if self.active_root == Some(candidate)
+                    && self
+                        .module_lifecycle(candidate)
+                        .is_ok_and(|state| state == ModuleLifecycle::ActivationFaulted) =>
+            {
+                let error = restart_reload_error(error);
+                self.flush_releases();
+                self.reap_retired_epochs();
+                Ok(RestartReloadOutcome::ActivationFaulted { candidate, error })
+            }
+            Err(error) => Err(restart_reload_error(error)),
+        }
+    }
+
+    pub(crate) fn quiesce_reload(&mut self) -> Result<usize, RealmError> {
         let old_module = self.reload.transaction()?.old_module;
         let old_id = self
             .modules
@@ -1756,7 +1884,7 @@ impl RealmRuntime {
         Ok(tasks.len())
     }
 
-    pub fn stage_reload(
+    pub(crate) fn stage_reload(
         &mut self,
         arguments: &[RuntimeValue],
     ) -> Result<Option<RuntimeValue>, RealmError> {
@@ -1862,7 +1990,7 @@ impl RealmRuntime {
         }
     }
 
-    pub fn commit_reload(
+    pub(crate) fn commit_reload(
         &mut self,
         activation_arguments: &[RuntimeValue],
         activation_fuel: u64,
@@ -1949,7 +2077,7 @@ impl RealmRuntime {
         }
     }
 
-    pub fn rollback_reload(&mut self) -> Result<(), RealmError> {
+    pub(crate) fn rollback_reload(&mut self) -> Result<(), RealmError> {
         self.buffer_reload_completions()?;
         self.reload.rollback()?;
         let mut transaction = self.reload.finish()?;
@@ -1972,15 +2100,17 @@ impl RealmRuntime {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
     #[must_use]
-    pub fn reload_buffered_completions(&self) -> usize {
+    pub(crate) fn reload_buffered_completions(&self) -> usize {
         self.reload
             .transaction()
             .map_or(0, |transaction| transaction.completions.len())
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
     #[must_use]
-    pub const fn reload_completion_stats(&self) -> ReloadCompletionStats {
+    pub(crate) const fn reload_completion_stats(&self) -> ReloadCompletionStats {
         self.reload_completion_stats
     }
 
@@ -2007,7 +2137,7 @@ impl RealmRuntime {
             .reload_completion_stats
             .discarded_after_commit
             .saturating_add(discarded);
-        usize::try_from(discarded).map_err(|_| ReloadError::CompletionBufferCapacity.into())
+        usize::try_from(discarded).map_err(|_| ReloadError::StagingCapacity.into())
     }
 
     fn publish_reload_root(&mut self) -> Result<(), RealmError> {
@@ -2116,8 +2246,20 @@ impl RealmRuntime {
         self.call(module, function, arguments, config)
     }
 
+    pub fn spawn_task(
+        &mut self,
+        module: ModuleHandle,
+        function: u32,
+        arguments: &[RuntimeValue],
+        config: StepConfig,
+    ) -> Result<TaskHandle, RuntimeError> {
+        self.call(module, function, arguments, config)
+            .map_err(RuntimeError::from)
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub fn poll_task(
+    #[doc(hidden)]
+    pub fn poll_task_raw(
         &mut self,
         task: TaskHandle,
         fuel_slice: u64,
@@ -2337,6 +2479,40 @@ impl RealmRuntime {
         }
     }
 
+    pub fn poll_task(
+        &mut self,
+        task: TaskHandle,
+        fuel_slice: u64,
+    ) -> Result<TaskPoll, RuntimeError> {
+        let result = self
+            .poll_task_raw(task, fuel_slice)
+            .map_err(classify_task_handle_error)
+            .map_err(RuntimeError::from)?;
+        Ok(match result {
+            PollResult::Completed(value) => {
+                TaskPoll::Completed(value.unwrap_or(RuntimeValue::Unit))
+            }
+            PollResult::Pending(PendingReason::Fuel) => TaskPoll::Yielded(YieldReason::Fuel),
+            PollResult::Pending(PendingReason::ExplicitYield) => {
+                TaskPoll::Yielded(YieldReason::Explicit)
+            }
+            PollResult::Pending(PendingReason::ReloadPause) => {
+                TaskPoll::Yielded(YieldReason::RestartReload)
+            }
+            PollResult::Pending(PendingReason::HostRequest) => {
+                let request = match self.tasks.execution(task)? {
+                    TaskExecution::Waiting { request, .. } => *request,
+                    _ => return Err(RuntimeError::from(RealmError::TaskWaiting)),
+                };
+                TaskPoll::Waiting(request)
+            }
+            PollResult::Cancelled(reason) => TaskPoll::Cancelled(reason),
+            PollResult::Trapped(trap) => {
+                TaskPoll::Trapped(RuntimeError::Trap(crate::RuntimeTrap::from(&trap)))
+            }
+        })
+    }
+
     pub fn cancel_scope(&mut self, scope: ScopeHandle) -> Result<usize, RealmError> {
         self.tasks.cancel_scope(scope)?;
         self.tasks.begin_scope_cancellation(scope)?;
@@ -2361,19 +2537,54 @@ impl RealmRuntime {
         &mut self,
         task: TaskHandle,
         reason: CancelReason,
-    ) -> Result<(), RealmError> {
-        let snapshot = self.tasks.task_snapshot(task)?;
+    ) -> Result<TaskPoll, RuntimeError> {
+        let snapshot = self
+            .tasks
+            .task_snapshot(task)
+            .map_err(RealmError::from)
+            .map_err(classify_task_handle_error)
+            .map_err(RuntimeError::from)?;
         if snapshot.state == TaskState::Ready {
             self.tasks.poll_task(task)?;
         }
         let trace_start = self.trace_cursor();
-        let _ = self.cancel_task_internal(
-            task,
-            reason,
-            snapshot.module_epoch,
-            trace_start,
-            snapshot.charge,
-        )?;
+        let trap = self
+            .cancel_task_internal(
+                task,
+                reason,
+                snapshot.module_epoch,
+                trace_start,
+                snapshot.charge,
+            )
+            .map_err(RuntimeError::from)?;
+        Ok(trap.map_or(TaskPoll::Cancelled(reason), |trap| {
+            TaskPoll::Trapped(RuntimeError::Trap(crate::RuntimeTrap::from(&trap)))
+        }))
+    }
+
+    pub fn complete_request(
+        &mut self,
+        request: HostRequestHandle,
+        result: HostResult,
+    ) -> Result<CompletionDisposition, RuntimeError> {
+        self.resources
+            .complete_request(request, result)
+            .map_err(RealmError::from)
+            .map_err(RuntimeError::from)?;
+        let delivered = self.drain_host_completions().map_err(RuntimeError::from)? != 0;
+        Ok(if delivered {
+            CompletionDisposition::Delivered
+        } else {
+            CompletionDisposition::Discarded
+        })
+    }
+
+    pub fn abandon_request(&mut self, request: HostRequestHandle) -> Result<(), RuntimeError> {
+        self.resources
+            .complete_request(request, HostCompletionResult::Abandoned)
+            .map_err(RealmError::from)
+            .map_err(RuntimeError::from)?;
+        let _ = self.drain_host_completions().map_err(RuntimeError::from)?;
         Ok(())
     }
 
@@ -2384,7 +2595,7 @@ impl RealmRuntime {
             let Some(task) = self.scheduler.pop_ready() else {
                 break;
             };
-            match self.poll_task(task, budget.frame_fuel_budget) {
+            match self.poll_task_raw(task, budget.frame_fuel_budget) {
                 Ok(PollResult::Completed(_)) => report.completed += 1,
                 Ok(PollResult::Cancelled(_)) => report.cancelled += 1,
                 Ok(PollResult::Trapped(_)) => report.trapped += 1,
@@ -2722,7 +2933,7 @@ impl RealmRuntime {
             modules,
             retired_epochs: self.retired_epochs.entries.iter().copied().collect(),
             tasks,
-            gate1_tasks: self.gate1_task_inspections(),
+            terminal_tasks: self.terminal_task_inspections(),
             resources: self.resource_ledger(),
             completion_accounting: self.completion_accounting(),
             reload,
@@ -2797,7 +3008,7 @@ impl RealmRuntime {
     }
 
     #[cfg(any(test, feature = "model-adapter"))]
-    fn gate1_task_inspections(&self) -> Vec<Gate1TaskInspection> {
+    fn terminal_task_inspections(&self) -> Vec<TerminalTaskInspection> {
         let mut inspections = self
             .tasks
             .task_handles_iter()
@@ -2816,7 +3027,7 @@ impl RealmRuntime {
                     TaskExecution::Waiting { request, .. } => Some(*request),
                     _ => None,
                 };
-                Some(Gate1TaskInspection {
+                Some(TerminalTaskInspection {
                     task,
                     state: snapshot.state,
                     continuation_id: snapshot.continuation_id,
@@ -2836,7 +3047,7 @@ impl RealmRuntime {
         inspections.extend(
             self.tombstones
                 .iter()
-                .map(|(task, record)| Gate1TaskInspection {
+                .map(|(task, record)| TerminalTaskInspection {
                     task: *task,
                     state: record.state,
                     continuation_id: None,
@@ -3520,10 +3731,11 @@ impl RealmRuntime {
         let cleanup = if run_user_cleanup {
             let verified = Arc::clone(&self.module_for_task(snapshot)?.verified);
             let continuation = self.tasks.take_execution(task)?.into_continuation();
-            if self
-                .failure_injector
-                .trigger(crate::RuntimeFailurePoint::CleanupTrap)
-            {
+            if self.failure_injector.trigger_with_context(
+                crate::RuntimeFailurePoint::CleanupTrap,
+                Some(task),
+                None,
+            ) {
                 Err(crate::Trap::from_continuation(
                     &verified,
                     &continuation,
@@ -3918,6 +4130,29 @@ fn reservation_for_module(
         .unwrap_or(u32::MAX)
         .min(max_registers.saturating_mul(reserved_depth)),
         defer_capacity: limits.max_defer_records,
+    }
+}
+
+fn classify_task_handle_error(error: RealmError) -> RealmError {
+    match error {
+        RealmError::Runtime(RuntimeError::Task(crate::TaskError::Handle(
+            crate::HandleError::WrongRealm { .. },
+        ))) => RealmError::CrossRealmTaskHandle,
+        RealmError::Runtime(RuntimeError::Task(crate::TaskError::Handle(
+            crate::HandleError::StaleGeneration { .. }
+            | crate::HandleError::Vacant { .. }
+            | crate::HandleError::Retired { .. }
+            | crate::HandleError::OutOfRange { .. },
+        ))) => RealmError::StaleTaskHandle,
+        error => error,
+    }
+}
+
+fn restart_reload_error(error: RealmError) -> ReloadError {
+    match error {
+        RealmError::Reload(error) => error,
+        RealmError::HostHashMismatch => ReloadError::HostHashMismatch,
+        error => ReloadError::Migration(RuntimeMessage::inline(&error.to_string())),
     }
 }
 
@@ -4635,7 +4870,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 10).unwrap(),
+            realm.poll_task_raw(task, 10).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         assert_eq!(
@@ -4647,11 +4882,11 @@ mod tests {
             TaskExecution::ExplicitYielded(_)
         ));
         assert_eq!(
-            realm.poll_task(task, 10).unwrap(),
+            realm.poll_task_raw(task, 10).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(7)))
         );
         assert!(realm.terminal_record(task).is_some());
-        assert_eq!(realm.poll_task(task, 10), Err(RealmError::TerminalTask));
+        assert_eq!(realm.poll_task_raw(task, 10), Err(RealmError::TerminalTask));
     }
 
     #[test]
@@ -4664,7 +4899,7 @@ mod tests {
             .call(fuel_module, 0, &[RuntimeValue::I32(7)], task_config(scope))
             .unwrap();
         assert_eq!(
-            realm.poll_task(fuel_task, 0).unwrap(),
+            realm.poll_task_raw(fuel_task, 0).unwrap(),
             PollResult::Pending(PendingReason::Fuel)
         );
         assert_eq!(
@@ -4676,7 +4911,7 @@ mod tests {
             TaskExecution::FuelYielded(_)
         ));
         assert_eq!(
-            realm.poll_task(fuel_task, 32).unwrap(),
+            realm.poll_task_raw(fuel_task, 32).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(7)))
         );
 
@@ -4692,7 +4927,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(explicit_task, 32).unwrap(),
+            realm.poll_task_raw(explicit_task, 32).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         realm
@@ -4717,7 +4952,7 @@ mod tests {
             TaskExecution::ExplicitYielded(_)
         ));
         assert_eq!(
-            realm.poll_task(explicit_task, 32).unwrap(),
+            realm.poll_task_raw(explicit_task, 32).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(9)))
         );
     }
@@ -4740,7 +4975,7 @@ mod tests {
                 .call(module, 1, &[RuntimeValue::I32(3)], task_config(scope))
                 .unwrap();
             assert_eq!(
-                realm.poll_task(task, 32).unwrap(),
+                realm.poll_task_raw(task, 32).unwrap(),
                 PollResult::Pending(PendingReason::ExplicitYield)
             );
             realm
@@ -4794,7 +5029,7 @@ mod tests {
             .call(old, 1, &[RuntimeValue::I32(3)], task_config(scope))
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         );
         realm
@@ -4943,7 +5178,7 @@ mod tests {
         let module = realm.load_module(module, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm.call(module, 0, &[], task_config(scope)).unwrap();
-        realm.poll_task(task, 32).unwrap()
+        realm.poll_task_raw(task, 32).unwrap()
     }
 
     #[test]
@@ -5127,11 +5362,11 @@ mod tests {
         let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
         let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
         assert_eq!(
-            realm.poll_task(task_a, 32).unwrap(),
+            realm.poll_task_raw(task_a, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         assert_eq!(
-            realm.poll_task(task_b, 32).unwrap(),
+            realm.poll_task_raw(task_b, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let (mut pending_a, mut pending_b) = {
@@ -5229,7 +5464,7 @@ mod tests {
         let scope = realm.create_scope(None).unwrap();
         let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let mut pending = requests
@@ -5332,7 +5567,7 @@ mod tests {
         let scope = realm.create_scope(None).unwrap();
         let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let mut pending = requests
@@ -5417,11 +5652,11 @@ mod tests {
             let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
             let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
             assert!(matches!(
-                realm.poll_task(task_a, 32).unwrap(),
+                realm.poll_task_raw(task_a, 32).unwrap(),
                 PollResult::Pending(PendingReason::HostRequest)
             ));
             assert!(matches!(
-                realm.poll_task(task_b, 32).unwrap(),
+                realm.poll_task_raw(task_b, 32).unwrap(),
                 PollResult::Pending(PendingReason::HostRequest)
             ));
             let (mut pending_a, mut pending_b) = {
@@ -5571,7 +5806,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         let waiting_ledger = realm.resource_ledger();
@@ -5690,7 +5925,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            realm.poll_task(waiting, 32).unwrap(),
+            realm.poll_task_raw(waiting, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         ));
         let mut late = request
@@ -5725,7 +5960,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            realm.poll_task(token_owner, 32).unwrap(),
+            realm.poll_task_raw(token_owner, 32).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         ));
         realm
@@ -5810,7 +6045,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            realm.poll_task(waiting, 32).unwrap(),
+            realm.poll_task_raw(waiting, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         ));
         let _late_completion = request
@@ -5856,7 +6091,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            realm.poll_task(token_owner, 32).unwrap(),
+            realm.poll_task_raw(token_owner, 32).unwrap(),
             PollResult::Pending(PendingReason::ExplicitYield)
         ));
         realm
@@ -6035,7 +6270,7 @@ mod tests {
         assert_eq!(live.state_objects, 1);
 
         assert!(matches!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(7)))
         ));
         let terminal = realm.resource_ledger();
@@ -6166,7 +6401,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         ));
         let mut pending = request
@@ -6544,7 +6779,7 @@ mod tests {
             .unwrap();
         let expected_hash = handle.deterministic_hash().to_le_bytes();
         assert_eq!(
-            realm.poll_task(task, 64).unwrap(),
+            realm.poll_task_raw(task, 64).unwrap(),
             PollResult::Completed(Some(RuntimeValue::I32(i32::from_le_bytes([
                 expected_hash[0],
                 expected_hash[1],
@@ -6583,7 +6818,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let PollResult::Completed(Some(stale_result)) = realm.poll_task(task, 64).unwrap() else {
+        let PollResult::Completed(Some(stale_result)) = realm.poll_task_raw(task, 64).unwrap()
+        else {
             panic!("stale resolve returns a Result");
         };
         assert_eq!(realm.heap.enum_tag(stale_result).unwrap(), 1);
@@ -6623,7 +6859,8 @@ mod tests {
                 },
             )
             .unwrap();
-        let PollResult::Completed(Some(foreign_result)) = realm.poll_task(task, 64).unwrap() else {
+        let PollResult::Completed(Some(foreign_result)) = realm.poll_task_raw(task, 64).unwrap()
+        else {
             panic!("foreign resolve returns a Result");
         };
         assert_eq!(realm.heap.enum_tag(foreign_result).unwrap(), 1);
@@ -6723,7 +6960,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         request
@@ -6788,7 +7025,7 @@ mod tests {
         let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
         let snapshot = realm.task_snapshot(task).unwrap();
         assert_eq!(
-            realm.poll_task(task, 32).unwrap(),
+            realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
         );
         request
@@ -6879,7 +7116,7 @@ task fn entry() -> i32 {
         let scope = realm.create_scope(None).unwrap();
         let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
         let task_epoch = realm.task_snapshot(task).unwrap().module_epoch;
-        let PollResult::Trapped(trap) = realm.poll_task(task, 128).unwrap() else {
+        let PollResult::Trapped(trap) = realm.poll_task_raw(task, 128).unwrap() else {
             panic!("source-compiled nested call must trap");
         };
 

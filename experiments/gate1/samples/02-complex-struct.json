@@ -1,1 +1,0 @@
-{"id":"G1-S02","input":{"left":7,"right":5},"expected":{"value":12},"language":["struct"],"runtime_path":"H2/complex_local","resource_limit":64,"hash":"bound-by-manifest"}

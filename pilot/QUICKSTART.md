@@ -4,8 +4,8 @@ Prerequisites: Rust 1.97.1, a clean checkout, and the exact repository revision 
 Pilot.
 
 ```sh
-cargo run -p nexa-cli -- idl check examples/combat-runtime/engine.idl
-cargo run -p nexa-cli -- idl generate examples/combat-runtime/engine.idl
+cargo run -p nexa-cli -- idl check examples/combat-runtime/combat_api.nidl
+cargo run -p nexa-cli -- idl generate examples/combat-runtime/combat_api.nidl
 cargo run -p nexa-cli -- build examples/combat-runtime/gameplay.nexa -o /tmp/gameplay.nxb
 cargo run -p nexa-cli -- verify /tmp/gameplay.nxb
 cargo run -p combat-runtime

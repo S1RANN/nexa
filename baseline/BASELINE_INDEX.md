@@ -1,83 +1,54 @@
-# Nexa Architecture Baseline Index
+# Nexa Baseline Index
 
-Version: **1.2.0**
+Version: **2.0.0**
 
-This is the only entry point for normative Nexa specifications. Historical design documents are
-non-normative rationale. When texts conflict, precedence is:
+This is the only normative entry point for the active Internal Language Pivot.
+Precedence is:
 
 ```text
-MVR Scope 1.0
-> Gate 1 Acceptance
-> current Architecture Baseline snapshot
+Internal Language Scope
+> Host Binding
+> Task Runtime
+> Restart Reload
+> ABI and machine details
 > Roadmap
-> historical rationale
 ```
 
-## Current gate
+## Active specifications
 
-Milestone 4.0R3 is complete at receipt
-`reports/contracts/milestone4r3_verification_receipt.json`.
-
-<!-- gate1-v2.9-status:start -->
-Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is **STRUCTURAL_CLOSURE_FAILED / INCOMPLETE** and its recorded STOP is unauthorized. Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable. Gate 1 v2.8 is **SEMANTICALLY_INSUFFICIENT / INCOMPLETE** and its recorded decision is unauthorized. Gate 1 v2.9 is **VERIFIED_TERMINAL_DECISION**, its decision is **STOP**, and Milestone 5.0R9 is **COMPLETE**.
-<!-- gate1-v2.9-status:end -->
-
-The current normative experiment entry points are:
-
-- `testing/GATE1_ACCEPTANCE_V2_8.md` — unchanged outcome thresholds plus repaired Raw-to-Gate and direct Contract rules;
-- `testing/GATE1_V2_8_AUTHORIZATION.md` — qualified-host execution authority and fixed zero-retry budget;
-- `testing/GATE1_MACHINE.md` — experiment lifecycle;
-- `../experiments/gate1-v2.8/manifest.json` — qualified frozen input binding after authorization;
-- `../reports/gate1_v1_invalidation.md` — v1 historical invalidation;
-- `../reports/gate1_v2_invalidation.md` — v2 historical invalidation;
-- `../reports/gate1_v2_1_final_decision.md` — v2.1 historical INVALID decision;
-- `../reports/gate1_v2_3_semantic_invalidation.md` — v2.3 historical semantic invalidation.
-
-`../ROADMAP.md` provides navigation only and cannot change normative semantics.
+- [`internal/INTERNAL_LANGUAGE_SCOPE.md`](internal/INTERNAL_LANGUAGE_SCOPE.md)
+- [`internal/HOST_BINDING.md`](internal/HOST_BINDING.md)
+- [`internal/TASK_RUNTIME.md`](internal/TASK_RUNTIME.md)
+- [`internal/RESTART_RELOAD.md`](internal/RESTART_RELOAD.md)
+- [`abi/IDL.md`](abi/IDL.md)
+- [`abi/BYTECODE.md`](abi/BYTECODE.md)
+- [`runtime/HANDLES.md`](runtime/HANDLES.md)
+- [`runtime/RESOURCE_MACHINE.md`](runtime/RESOURCE_MACHINE.md)
+- [`runtime/SCOPE_MACHINE.md`](runtime/SCOPE_MACHINE.md)
+- [`runtime/TASK_MACHINE.md`](runtime/TASK_MACHINE.md)
 
 ## Active decisions
 
 | ID | Status | Scope | Normative location | Supersedes |
 |---|---|---|---|---|
-| D44 | Active | MVR | `reload/RELOAD_TRANSACTION.md` | reload-time user defer |
-| D45 | Active | MVR | `reload/RELOAD_TRANSACTION.md` | multi-field epoch publication |
-| D46 | Active | MVR | `runtime/TASK_MACHINE.md` | ownerless fast-task admission |
-| D47 | Active | MVR | `runtime/MODULE_MACHINE.md` | conflated active/retired faults |
-| D48 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | isolate-owned release queue |
-| D49 | Active | MVR | `testing/EXPERIMENT_PROTOCOL.md` | separately handwritten models |
-| D51 | Active | Governance | this file | historical-chain normativity |
-| D52 | Active | MVR | `reload/RELOAD_TRANSACTION.md` | cross-thread epoch-root refcount |
-| D53 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | untracked host business resources |
-| D54 | Active | MVR | `runtime/MODULE_MACHINE.md` | post-commit rollback claim |
-| D55 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | fallible release enqueue |
-| D56 | Active | Experiment | `testing/EXPERIMENT_PROTOCOL.md` | binary experiment outcomes |
-| D57 | Active | Experiment | `testing/GATE0_KILL_CRITERIA.md` | unbounded inconclusive retesting |
-| D58 | Active | MVR | `runtime/HOST_REQUEST_MACHINE.md` | sender-wide completion reservation |
-| D59 | Active | MVR | `runtime/RESOURCE_MACHINE.md` | allocating Realm release transfer |
-| D60 | Active | MVR | `runtime/RETIRED_EPOCH.md` | per-frame retired-module scan |
-| D61 | Active | Gate 1 | `testing/GATE1_ACCEPTANCE.md` | post-result threshold selection |
-| D62 | Active | Gate 1 | `testing/GATE1_MACHINE.md` | informal experiment lifecycle |
+| D63 | Active | Internal language | `internal/INTERNAL_LANGUAGE_SCOPE.md` | old general-product MVR |
+| D64 | Active | Host binding | `internal/HOST_BINDING.md` | handwritten host dispatch and ABI tables |
+| D65 | Active | Task runtime | `internal/TASK_RUNTIME.md` | caller-authored low-level task events |
+| D66 | Active | Reload | `internal/RESTART_RELOAD.md` | seamless multi-epoch reload |
 
-## Deferred decisions
+## Historical boundary
 
-| Capability | Status | Earliest review |
-|---|---|---|
-| Dynamic values | Deferred | Gate 2 RFC |
-| Interfaces | Deferred | Gate 2 RFC |
-| User-defined generics | Deferred | 1.x RFC |
-| Cross-module state handles | Deferred | Gate 2 RFC |
-| Reload groups | Deferred | Gate 2 RFC |
-| Read/write leases | Deferred | Experimental RFC |
-| Compatible ABI adapters | Deferred | Gate 2 RFC |
-| Strict deterministic scheduling | Deferred | Gate 2 RFC |
-| Untrusted bytecode security verifier | Deferred | Gate 2 RFC |
-| AOT/JIT | Deferred | Data-driven RFC |
+The old general-product MVR is not normative. Its final decision is:
 
-## Superseded decisions
+```text
+Gate 1 v2.9 = STOP
+H1/H2/H3 = FAIL
+```
 
-| Item | Status | Replacement |
-|---|---|---|
-| Gate 1 read lease | Superseded | Copy + immutable snapshot only |
-| Cross-thread root acquire + refcount | Superseded | VM-thread-only root access |
-| Cancel old tasks before reload staging | Superseded | Pause, stage, then commit |
-| Run user defer after reload commit | Superseded | VM-managed cleanup only |
+The active tree stores only
+[`docs/history/GATE1_V2_9_STOP.md`](../docs/history/GATE1_V2_9_STOP.md).
+All old experiment inputs, Raw evidence, contracts, receipts, tools, and
+acceptance/authorization documents are recoverable from the immutable
+annotated tag `gate1-v2.9-stop`.
+
+`ROADMAP.md` provides navigation and cannot override these specifications.

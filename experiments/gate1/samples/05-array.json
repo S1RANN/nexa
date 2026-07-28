@@ -1,1 +1,0 @@
-{"id":"G1-S05","input":{"values":[1,2,3]},"expected":{"sum":6},"language":["Array"],"runtime_path":"H2/array_operations","resource_limit":64,"hash":"bound-by-manifest"}

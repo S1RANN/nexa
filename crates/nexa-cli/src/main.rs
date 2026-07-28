@@ -19,21 +19,21 @@ use serde_json::{Value, json};
 
 const REQUIRED_BASELINE: &[&str] = &[
     "baseline/BASELINE_INDEX.md",
-    "baseline/mvr/MVR_SCOPE.md",
-    "baseline/mvr/MVR_NON_GOALS.md",
+    "baseline/internal/INTERNAL_LANGUAGE_SCOPE.md",
+    "baseline/internal/HOST_BINDING.md",
+    "baseline/internal/TASK_RUNTIME.md",
+    "baseline/internal/RESTART_RELOAD.md",
     "baseline/runtime/TASK_MACHINE.md",
     "baseline/runtime/SCOPE_MACHINE.md",
     "baseline/runtime/MODULE_MACHINE.md",
     "baseline/runtime/HOST_REQUEST_MACHINE.md",
     "baseline/runtime/RESOURCE_MACHINE.md",
     "baseline/runtime/HANDLES.md",
-    "baseline/reload/RELOAD_TRANSACTION.md",
     "baseline/abi/BYTECODE.md",
     "baseline/abi/IDL.md",
     "baseline/abi/RUST_HOST_ABI.md",
-    "baseline/testing/EXPERIMENT_PROTOCOL.md",
-    "baseline/testing/GATE0_BENCHMARKS.md",
-    "baseline/testing/GATE0_KILL_CRITERIA.md",
+    "docs/TESTING.md",
+    "docs/ARTIFACT_POLICY.md",
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

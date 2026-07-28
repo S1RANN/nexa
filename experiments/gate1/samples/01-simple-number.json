@@ -1,1 +1,0 @@
-{"id":"G1-S01","input":{"value":41},"expected":{"value":42},"language":["i32","function"],"runtime_path":"H2/immediate_call","resource_limit":64,"hash":"bound-by-manifest"}

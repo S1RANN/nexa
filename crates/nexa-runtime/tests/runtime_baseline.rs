@@ -6,12 +6,8 @@ mod fast_complete;
 mod fuel_yield;
 #[path = "runtime-baseline/gc_suspended_root.rs"]
 mod gc_suspended_root;
-#[path = "runtime-baseline/host_request.rs"]
-mod host_request;
 #[path = "runtime-baseline/nested_call.rs"]
 mod nested_call;
-#[path = "runtime-baseline/reload_activation_fault.rs"]
-mod reload_activation_fault;
 #[path = "runtime-baseline/resource_token.rs"]
 mod resource_token;
 #[path = "runtime-baseline/scope_cancel.rs"]

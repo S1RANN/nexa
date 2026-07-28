@@ -1,4 +1,4 @@
-# Nexa MVR task lifecycle.
+# Nexa internal-language task lifecycle.
 machine Task
 
 state Created initial

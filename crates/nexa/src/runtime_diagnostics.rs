@@ -12,8 +12,9 @@ use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_runtime::{
     GcRef, HostArgs, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
     ModuleHandle, PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeValue, StatefulDomainId, StepConfig,
-    TaskHandle, TaskLimits, TaskTerminalReason, TickBudget,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeLimits,
+    RuntimeValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
+    TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits};
 use serde::Serialize;
@@ -21,9 +22,9 @@ use serde_json::{Value, json};
 
 use crate::NexaError;
 
-const RUNTIME_CODES: [&str; 11] = [
+const RUNTIME_CODES: [&str; 10] = [
     "NX4001", "NX4002", "NX4003", "NX5001", "NX5002", "NX5003", "NX5004", "NX6001", "NX6002",
-    "NX6003", "NX6004",
+    "NX6003",
 ];
 
 type PendingRequestSlot = Arc<Mutex<Option<PendingHostRequest>>>;
@@ -328,7 +329,6 @@ fn execute_case(code: &str) -> Result<RuntimeDiagnosticCaseEvidence, String> {
         "NX6001" => migration_limit_case(),
         "NX6002" => migration_graph_case(),
         "NX6003" => activation_failure_case(),
-        "NX6004" => reload_completion_capacity_case(),
         _ => Err(format!("unknown runtime diagnostic {code}")),
     }
 }
@@ -465,7 +465,7 @@ fn host_argument_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let task = harness.call(module, 0)?;
     let result = harness
         .realm
-        .poll_task(task, 128)
+        .poll_task_raw(task, 128)
         .map_err(|error| error.to_string())?;
     let PollResult::Trapped(trap) = result else {
         return Err("host argument mismatch did not trap".into());
@@ -511,7 +511,7 @@ fn host_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let panic_task = panic_harness.call(panic_module, 0)?;
     let panic_result = panic_harness
         .realm
-        .poll_task(panic_task, 128)
+        .poll_task_raw(panic_task, 128)
         .map_err(|error| error.to_string())?;
     let PollResult::Trapped(panic_trap) = panic_result else {
         return Err("host panic did not trap".into());
@@ -523,7 +523,7 @@ fn host_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let mismatch_task = mismatch_harness.call(mismatch_module, 0)?;
     let mismatch_result = mismatch_harness
         .realm
-        .poll_task(mismatch_task, 128)
+        .poll_task_raw(mismatch_task, 128)
         .map_err(|error| error.to_string())?;
     let PollResult::Trapped(mismatch_trap) = mismatch_result else {
         return Err("host result mismatch did not trap".into());
@@ -564,7 +564,7 @@ fn host_abandoned_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     assert!(matches!(
         harness
             .realm
-            .poll_task(task, 128)
+            .poll_task_raw(task, 128)
             .map_err(|error| error.to_string())?,
         PollResult::Pending(_)
     ));
@@ -622,7 +622,7 @@ fn unknown_host_error_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     assert!(matches!(
         harness
             .realm
-            .poll_task(task, 128)
+            .poll_task_raw(task, 128)
             .map_err(|error| error.to_string())?,
         PollResult::Pending(_)
     ));
@@ -723,7 +723,7 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let request_task = request_harness.call(request_module, 0)?;
     let PollResult::Trapped(request_trap) = request_harness
         .realm
-        .poll_task(request_task, 128)
+        .poll_task_raw(request_task, 128)
         .map_err(|error| error.to_string())?
     else {
         return Err("request capacity did not trap".into());
@@ -781,10 +781,11 @@ fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         let old = harness
             .load(simple_module(host, schema), host, schema)
             .map_err(|error| error.to_string())?;
-        let error = harness
-            .realm
-            .prepare_reload(old, migration_module(host, schema, false, required), host)
-            .expect_err("minimum migration requirement must fail");
+        let error = expected_restart_failure(harness.realm.restart_reload(
+            old,
+            migration_module(host, schema, false, required),
+            RestartReloadPolicy::default(),
+        ))?;
         observed.push((kind, NexaError::from(error).code().as_str()));
     }
     let fuel_candidate = migration_fuel_module(host, schema);
@@ -803,20 +804,12 @@ fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let old = harness
         .load(simple_module(host, schema), host, schema)
         .map_err(|error| error.to_string())?;
-    let candidate = harness
-        .realm
-        .prepare_reload(old, fuel_candidate, host)
-        .map_err(|error| error.to_string())?;
-    harness.modules.push(candidate);
-    harness
-        .realm
-        .quiesce_reload()
-        .map_err(|error| error.to_string())?;
     let before = harness.snapshot();
-    let error = harness
-        .realm
-        .stage_reload(&[])
-        .expect_err("zero migration fuel must fail during stage");
+    let error = expected_restart_failure(harness.realm.restart_reload(
+        old,
+        fuel_candidate,
+        RestartReloadPolicy::default(),
+    ))?;
     let after = harness.snapshot();
     observed.push(("fuel", NexaError::from(error.clone()).code().as_str()));
     let unexpected = observed
@@ -825,21 +818,21 @@ fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         .map(|(kind, code)| format!("{kind} emitted {code}"))
         .collect::<Vec<_>>();
     Ok(evidence(
-        "realm_stage_reload_migration_limit",
+        "restart_reload_migration_limit",
         error.into(),
         before,
         after,
         &["migration usage report"],
         unexpected,
         "",
-        "Staging",
+        "Active",
         BTreeMap::from([
             ("migration_limit_subcases".into(), json!(observed.len())),
             (
                 "limit_kinds".into(),
                 json!(observed.iter().map(|(kind, _)| *kind).collect::<Vec<_>>()),
             ),
-            ("stage_reload_executed".into(), json!(true)),
+            ("restart_reload_executed".into(), json!(true)),
         ]),
     ))
 }
@@ -922,20 +915,15 @@ fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
             .realm
             .module_stateful_domain(old)
             .map_err(|error| error.to_string())?;
-        let candidate = harness
-            .realm
-            .prepare_reload(old, migration_graph_module(host, schema, fault), host)
-            .map_err(|error| error.to_string())?;
-        harness.modules.push(candidate);
-        harness
-            .realm
-            .quiesce_reload()
-            .map_err(|error| error.to_string())?;
         let before = harness.snapshot();
-        let error = harness
-            .realm
-            .stage_reload(&[fault.argument(domain)])
-            .expect_err("invalid migration graph must fail");
+        let error = expected_restart_failure(harness.realm.restart_reload(
+            old,
+            migration_graph_module(host, schema, fault),
+            RestartReloadPolicy {
+                migration_arguments: vec![fault.argument(domain)],
+                ..RestartReloadPolicy::default()
+            },
+        ))?;
         let after = harness.snapshot();
         let code = NexaError::from(error.clone()).code().as_str();
         observed.push((fault.name(), code));
@@ -958,7 +946,7 @@ fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         &["migration context usage"],
         unexpected,
         "",
-        "Staging",
+        "Active",
         BTreeMap::from([
             ("graph_subcases".into(), json!(observed.len())),
             (
@@ -977,24 +965,22 @@ fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let old = harness
         .load(simple_module(host, schema), host, schema)
         .map_err(|error| error.to_string())?;
-    let candidate = harness
-        .realm
-        .prepare_reload(old, activation_trap_module(host, schema), host)
-        .map_err(|error| error.to_string())?;
-    harness.modules.push(candidate);
-    harness
-        .realm
-        .quiesce_reload()
-        .map_err(|error| error.to_string())?;
-    harness
-        .realm
-        .stage_reload(&[])
-        .map_err(|error| error.to_string())?;
     let before = harness.snapshot();
-    let error = harness
+    let outcome = harness
         .realm
-        .commit_reload(&[], 128)
-        .expect_err("activation trap must fail after publication");
+        .restart_reload(
+            old,
+            activation_trap_module(host, schema),
+            RestartReloadPolicy {
+                activation_fuel: 128,
+                ..RestartReloadPolicy::default()
+            },
+        )
+        .map_err(|error| error.to_string())?;
+    let RestartReloadOutcome::ActivationFaulted { candidate, error } = outcome else {
+        return Err("activation trap did not produce ActivationFaulted".into());
+    };
+    harness.modules.push(candidate);
     let after = harness.snapshot();
     let lifecycle = format!(
         "{:?}",
@@ -1003,7 +989,7 @@ fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
             .module_lifecycle(candidate)
             .map_err(|error| error.to_string())?
     );
-    let publications = harness.realm.root_publications().len();
+    let publications = after["reload"]["root_publications"].as_u64().unwrap_or(0);
     let mut unexpected = Vec::new();
     if lifecycle != "ActivationFaulted" {
         unexpected.push("candidate did not become ActivationFaulted".into());
@@ -1033,81 +1019,16 @@ fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     ))
 }
 
-fn reload_completion_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
-    let config = RealmConfig {
-        max_host_resources: 2,
-        reload_completion_capacity: 0,
-        ..RealmConfig::default()
-    };
-    let (mut harness, old, pending) =
-        hosted_host_call_with_config(RegistryMode::Async, true, false, config)?;
-    let host = StableId::from_name("r3-diagnostic-host");
-    let schema = StableId::from_name("r3-diagnostic-schema");
-    let task = harness.call(old, 0)?;
-    assert!(matches!(
-        harness
-            .realm
-            .poll_task(task, 128)
-            .map_err(|error| error.to_string())?,
-        PollResult::Pending(_)
-    ));
-    let mut request = pending
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
-        .ok_or("reload capacity case did not create request")?;
-    harness.observed_requests.push(request.request);
-    let candidate = harness
-        .realm
-        .prepare_reload(old, async_module(host, schema, false), host)
-        .map_err(|error| error.to_string())?;
-    harness.modules.push(candidate);
-    harness
-        .realm
-        .quiesce_reload()
-        .map_err(|error| error.to_string())?;
-    request
-        .ticket
-        .complete(nexa_runtime::HostPayload::I32(9))
-        .map_err(|error| error.to_string())?;
-    let before = harness.snapshot();
-    let error = harness
-        .realm
-        .tick(TickBudget {
-            max_tasks: 1,
-            frame_fuel_budget: 128,
-            collect_garbage: false,
-        })
-        .expect_err("zero reload completion buffer must reject completion");
-    let after = harness.snapshot();
-    let observed = NexaError::from(error.clone()).code().as_str();
-    let mut unexpected = Vec::new();
-    if observed != "NX6004" {
-        unexpected.push(format!("reload completion emitted {observed}"));
+fn expected_restart_failure(
+    result: Result<RestartReloadOutcome, nexa_runtime::ReloadError>,
+) -> Result<nexa_runtime::ReloadError, String> {
+    match result {
+        Err(error) => Ok(error),
+        Ok(RestartReloadOutcome::RolledBackBeforeCommit { reason, .. }) => Ok(reason),
+        Ok(outcome) => Err(format!(
+            "restart reload unexpectedly succeeded: {outcome:?}"
+        )),
     }
-    if before["reload"]["completion_buffer"] != after["reload"]["completion_buffer"] {
-        unexpected.push("reload buffer partially mutated".into());
-    }
-    harness
-        .realm
-        .rollback_reload()
-        .map_err(|error| error.to_string())?;
-    Ok(evidence(
-        "realm_reload_completion_buffer_capacity",
-        error.into(),
-        before,
-        after,
-        &[],
-        unexpected,
-        "ReloadPaused",
-        "Staging",
-        BTreeMap::from([
-            ("real_reload_buffer".into(), json!(true)),
-            ("partial_buffer_write".into(), json!(false)),
-            ("rollback_recovery".into(), json!(true)),
-            ("accounting_consistent".into(), json!(true)),
-        ]),
-    ))
 }
 
 fn atomic_snapshot_failures(before: &Value, after: &Value) -> Vec<String> {

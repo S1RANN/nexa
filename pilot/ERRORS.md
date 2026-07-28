@@ -12,7 +12,6 @@
 | NX6001 | Migration limit exceeded | Roll back pre-commit; inspect dry-run consumption |
 | NX6002 | Invalid migration graph | Fix preserve/replace/delete/forwarding graph |
 | NX6003 | Activation failed after commit | Candidate remains published/faulted; do not roll back |
-| NX6004 | Reload completion buffer capacity | Abort before mutation and increase bounded capacity |
 
 Diagnostic JSON follows `pilot/diagnostic.schema.json`. Preserve the full structured error,
 source span, task/module/request identity, runtime snapshot, and exact build hashes.

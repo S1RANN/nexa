@@ -31,10 +31,10 @@ pub use allocation::{
     set_migration_allocation_observer,
 };
 pub use failure::{
-    FailurePointStats, RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode,
-    RuntimeFailurePoint,
+    FailureObservation, FailurePointStats, FailureProbe, FailureProbeState,
+    RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint,
 };
-pub use kernel::{RuntimeError, RuntimeLimits, StepConfig, TaskLimits, TaskRuntime};
+pub use kernel::{RuntimeError, RuntimeLimits, RuntimeTrap, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
 pub use nexa_bytecode::ValueType;
@@ -73,18 +73,18 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
-    CancelReason, CompletionRoute, ModuleEpochKey, ModuleEpochRoot, ModuleHandle, ModuleLifecycle,
-    PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime, ReloadCompletionStats,
-    RetiredEpochSnapshot, RetiredEpochState, RootPublicationRecord, RuntimeCapacityReport,
-    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport,
+    CancelReason, CompletionDisposition, HostResult, ModuleHandle, ModuleLifecycle, NexaValue,
+    PendingReason, PollResult, RealmConfig, RealmError, RealmRuntime, RestartReloadOutcome,
+    RestartReloadPolicy, RuntimeCapacityReport, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
+    TickBudget, TickReport, YieldReason,
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{
-    Gate1TaskInspection, HeapInspection, ModuleInspection, RealmInspectionSnapshot,
-    ReloadInspection, ReloadInspectionState, RootInspection, SchedulerInspection,
-    TaskExecutionInspection, TaskInspection,
+    HeapInspection, ModuleInspection, RealmInspectionSnapshot, ReloadInspection,
+    ReloadInspectionState, RootInspection, SchedulerInspection, TaskExecutionInspection,
+    TaskInspection, TerminalTaskInspection,
 };
-pub use reload::{ReloadError, invoke_reload_activation, validate_reload_completion_capacity};
+pub use reload::{ReloadError, invoke_reload_activation};
 pub use scope::{ScopeError, ScopeHandle, ScopeSnapshot, ScopeState};
 pub use slot_pool::{HandleError, SlotAllocError, SlotPool};
 pub use stateful::{

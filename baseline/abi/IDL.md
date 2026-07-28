@@ -1,6 +1,6 @@
-# Nexa IDL MVR 1.0
+# Nexa Internal Language IDL 1.0
 
-The MVR uses an IDL-first, exact-build Rust host interface.
+The internal gameplay language uses an IDL-first, exact-build Rust host interface.
 
 Supported forms:
 
@@ -15,7 +15,7 @@ Supported forms:
 
 The normalized schema produces an exact interface hash. A hash mismatch rejects module loading and
 requires binding regeneration and rebuild. Compatible adapters and independent release windows are
-not part of the MVR.
+not part of the current internal-language contract.
 
 Asynchronous functions use:
 

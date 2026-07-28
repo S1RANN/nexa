@@ -714,10 +714,10 @@ impl RealmV4RoutingRuntimeAdapter {
             .call(module_b, 0, &[], config)
             .expect("module B task starts");
         realm
-            .poll_task(task_a, 32)
+            .poll_task_raw(task_a, 32)
             .expect("module A reaches request");
         realm
-            .poll_task(task_b, 32)
+            .poll_task_raw(task_b, 32)
             .expect("module B reaches request");
         let (pending_a, pending_b) = {
             let mut requests = requests

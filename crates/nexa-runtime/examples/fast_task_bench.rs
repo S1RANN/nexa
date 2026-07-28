@@ -80,13 +80,13 @@ fn main() {
     let (mut realm, module, scope) = loaded(fast.clone());
     results.push(bench("nexa_fast_complete", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task(task, 64).unwrap());
+        black_box(realm.poll_task_raw(task, 64).unwrap());
     }));
     let (mut realm, module, scope) = loaded(fast.clone());
     realm.set_trace_enabled(false);
     results.push(bench("nexa_fast_complete_trace_off", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task(task, 64).unwrap());
+        black_box(realm.poll_task_raw(task, 64).unwrap());
     }));
 
     let yielded = build_module(
@@ -99,17 +99,17 @@ fn main() {
     results.push(bench("nexa_fuel_promotion_resume", samples, || {
         let task = call(&mut realm, module, scope, 7);
         assert!(matches!(
-            realm.poll_task(task, 0).unwrap(),
+            realm.poll_task_raw(task, 0).unwrap(),
             PollResult::Pending(_)
         ));
-        black_box(realm.poll_task(task, 64).unwrap());
+        black_box(realm.poll_task_raw(task, 64).unwrap());
     }));
 
     let nested = nested_module();
     let (mut realm, module, scope) = loaded(nested);
     results.push(bench("nexa_nested_calls", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task(task, 64).unwrap());
+        black_box(realm.poll_task_raw(task, 64).unwrap());
     }));
 
     let (mut realm, module, scope, generated_host) = loaded_hosted(yielded.clone());
@@ -158,7 +158,7 @@ fn main() {
                 },
             )
             .unwrap();
-        black_box(host_realm.poll_task(task, 64).unwrap());
+        black_box(host_realm.poll_task_raw(task, 64).unwrap());
     }));
     drop(host_realm);
     let _ = immediate_host.drain_releases();
@@ -184,7 +184,7 @@ fn main() {
         let scope = realm.create_scope(None).unwrap();
         let task = call(&mut realm, module, scope, 1);
         assert_eq!(
-            realm.poll_task(task, 64).unwrap(),
+            realm.poll_task_raw(task, 64).unwrap(),
             PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
         );
         let mut pending = pending
@@ -209,7 +209,7 @@ fn main() {
                 .create_resource_token(task, RuntimeHostDomain::Render)
                 .unwrap(),
         );
-        black_box(realm.poll_task(task, 64).unwrap());
+        black_box(realm.poll_task_raw(task, 64).unwrap());
         drop(realm);
         let _ = host.drain_releases();
         let _ = host.begin_close();
@@ -252,10 +252,22 @@ fn main() {
     results.push(bench("nexa_reload", host_samples, || {
         let (mut realm, old, scope) = loaded(yielded.clone());
         let task = call(&mut realm, old, scope, 1);
-        let candidate = realm.prepare_reload(old, reload_module(), HOST).unwrap();
-        realm.quiesce_reload().unwrap();
-        realm.stage_reload(&[RuntimeValue::I32(1)]).unwrap();
-        black_box(realm.commit_reload(&[], 64).unwrap());
+        let outcome = black_box(
+            realm
+                .restart_reload(
+                    old,
+                    reload_module(),
+                    nexa_runtime::RestartReloadPolicy {
+                        migration_arguments: vec![RuntimeValue::I32(1)],
+                        activation_arguments: Vec::new(),
+                        activation_fuel: 64,
+                    },
+                )
+                .unwrap(),
+        );
+        let nexa_runtime::RestartReloadOutcome::Committed(candidate) = outcome else {
+            panic!("benchmark reload must commit");
+        };
         assert_eq!(realm.active_root(), Some(candidate));
         assert!(realm.terminal_record(task).is_some());
     }));

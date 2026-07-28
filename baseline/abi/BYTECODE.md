@@ -1,6 +1,6 @@
-# Nexa Bytecode MVR 1.0
+# Nexa Internal Language Bytecode 1.0
 
-The MVR bytecode is a fixed-endian, sectioned, versioned typed-register format. Runtime execution
+The bytecode is a fixed-endian, sectioned, versioned typed-register format. Runtime execution
 accepts only a `VerifiedModule`.
 
 Required sections:

@@ -1,4 +1,0 @@
-interface ReloadHost {
-    enum ReloadError { Failed, Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, ReloadError>>;
-}

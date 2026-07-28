@@ -3,8 +3,10 @@ use crate::RuntimeTrace;
 use crate::scope::{ScopeError, ScopeHandle, ScopeManager, ScopeSnapshot};
 use crate::task::TaskExecution;
 use crate::task::{TaskError, TaskEvent, TaskHandle, TaskManager, TaskSnapshot};
-use crate::{FuelState, InterpreterContinuation, RuntimeFailureInjector, RuntimeFailurePoint};
-use nexa_core::RawHandle;
+use crate::{
+    FailureProbe, FuelState, InterpreterContinuation, RuntimeFailureInjector, RuntimeFailurePoint,
+};
+use nexa_core::{RawHandle, SourceSpan};
 use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,10 +67,42 @@ impl Default for RuntimeLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeTrap {
+    pub kind: crate::TrapKind,
+    pub diagnostic_code: &'static str,
+    pub module: Option<RawHandle>,
+    pub epoch: Option<u64>,
+    pub function: u32,
+    pub pc: u32,
+    pub source_span: Option<SourceSpan>,
+    pub task: Option<RawHandle>,
+}
+
+impl From<&crate::Trap> for RuntimeTrap {
+    fn from(trap: &crate::Trap) -> Self {
+        Self {
+            kind: trap.kind,
+            diagnostic_code: trap.diagnostic_code(),
+            module: trap.module,
+            epoch: trap.epoch,
+            function: trap.function,
+            pc: trap.pc,
+            source_span: trap.source_span,
+            task: trap.task,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeError {
     Scope(ScopeError),
     Task(TaskError),
+    Trap(RuntimeTrap),
+    Realm(Box<crate::RealmError>),
+    TerminalTask,
+    StaleTaskHandle,
+    CrossRealmTaskHandle,
     ResourceLimit(&'static str),
     InjectedFailure(RuntimeFailurePoint),
 }
@@ -78,6 +112,11 @@ impl fmt::Display for RuntimeError {
         match self {
             Self::Scope(error) => error.fmt(formatter),
             Self::Task(error) => error.fmt(formatter),
+            Self::Trap(trap) => write!(formatter, "{trap:?}"),
+            Self::Realm(error) => error.fmt(formatter),
+            Self::TerminalTask => formatter.write_str("task is already terminal"),
+            Self::StaleTaskHandle => formatter.write_str("stale task handle"),
+            Self::CrossRealmTaskHandle => formatter.write_str("cross-realm task handle"),
             Self::ResourceLimit(limit) => write!(formatter, "runtime resource limit: {limit}"),
             Self::InjectedFailure(point) => write!(formatter, "injected failure at {point:?}"),
         }
@@ -350,8 +389,9 @@ impl TaskRuntime {
         self.failure_injector = injector;
     }
 
-    pub fn inject_failure_once(&mut self, point: RuntimeFailurePoint) {
-        self.failure_injector.arm_once(point);
+    #[must_use = "retain the probe and require that the injected scenario was consumed"]
+    pub fn inject_failure_once(&mut self, point: RuntimeFailurePoint) -> FailureProbe {
+        self.failure_injector.arm_once(point)
     }
 
     pub(crate) fn attach_continuation(
@@ -522,11 +562,12 @@ mod tests {
             RuntimeFailurePoint::FrameSlot,
             RuntimeFailurePoint::SchedulerSlot,
         ] {
-            runtime.inject_failure_once(point);
+            let probe = runtime.inject_failure_once(point);
             assert_eq!(
                 runtime.admit_task(scope, 1, true),
                 Err(RuntimeError::InjectedFailure(point))
             );
+            probe.require_consumed().unwrap();
             assert_eq!(runtime.scope_snapshot(scope).unwrap().transient_children, 0);
         }
     }

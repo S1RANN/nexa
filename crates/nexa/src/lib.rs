@@ -70,14 +70,15 @@ pub mod prelude {
         CancelReason, CompletionAccounting, HostArgs, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
         HostTrap, HostValue, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
-        MigrationUsageReport, ModuleEpochKey, ModuleHandle, PendingHostRequest, PendingReason,
-        PollResult, RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle,
-        RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint,
-        RuntimeHost, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
-        RuntimeHostState, RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot,
-        ScriptFunction, SnapshotHandle, StateHandle, StateHandleError, StateValue,
-        StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
-        TaskTerminalRecord, TickBudget, TickReport,
+        MigrationUsageReport, ModuleHandle, PendingHostRequest, PendingReason, PollResult,
+        RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle,
+        RestartReloadOutcome, RestartReloadPolicy, RuntimeFailureConfigError,
+        RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint, RuntimeHost,
+        RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
+        RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
+        SnapshotHandle, StateHandle, StateHandleError, StateValue, StatefulDomainId, StepConfig,
+        TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget,
+        TickReport, YieldReason,
     };
     pub use nexa_verifier::VerifierLimits;
 
@@ -120,9 +121,9 @@ mod tests {
     fn runtime_diagnostic_corpus_calls_real_runtime_host_and_reload_apis() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let report = crate::run_runtime_diagnostic_cases(&root).unwrap();
-        assert_eq!(report.case_count, 11);
-        assert_eq!(report.passed, 11);
-        assert_eq!(report.deterministic_cases, 11);
+        assert_eq!(report.case_count, 10);
+        assert_eq!(report.passed, 10);
+        assert_eq!(report.deterministic_cases, 10);
         assert!(!report.direct_nexa_error_construction);
     }
 
@@ -130,11 +131,11 @@ mod tests {
     fn complete_diagnostic_corpus_observes_the_registered_set_twice() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let report = crate::run_diagnostic_corpus(&root).unwrap();
-        assert_eq!(report.registered_codes, 34);
-        assert_eq!(report.emission_definitions, 34);
-        assert_eq!(report.fixture_codes, 34);
-        assert_eq!(report.observed_codes, 34);
-        assert_eq!(report.deterministic_cases, 34);
+        assert_eq!(report.registered_codes, 33);
+        assert_eq!(report.emission_definitions, 33);
+        assert_eq!(report.fixture_codes, 33);
+        assert_eq!(report.observed_codes, 33);
+        assert_eq!(report.deterministic_cases, 33);
         assert!(report.missing_codes.is_empty());
         assert!(report.unexpected_codes.is_empty());
         assert!(report.case_format.invalid_pipelines.is_empty());

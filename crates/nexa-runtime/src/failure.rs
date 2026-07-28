@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -79,6 +80,32 @@ impl RuntimeFailurePoint {
     const fn index(self) -> usize {
         self as usize
     }
+
+    const fn operation(self) -> &'static str {
+        match self {
+            Self::TaskSlot => "task admission",
+            Self::ScopeSlot => "scope admission",
+            Self::SchedulerSlot => "scheduler reservation",
+            Self::FrameSlot => "continuation reservation",
+            Self::HeapSlot => "heap reservation",
+            Self::RequestSlot => "request reservation",
+            Self::CompletionSlot => "completion reservation",
+            Self::ReleaseSlot => "release reservation",
+            Self::SnapshotSlot => "snapshot reservation",
+            Self::MigrationObjectSlot => "migration object reservation",
+            Self::MigrationFieldSlot => "migration field reservation",
+            Self::MigrationForwardingSlot => "migration forwarding reservation",
+            Self::ReloadCompletionSlot => "reload completion admission",
+            Self::ActivationTrap => "reload activation",
+            Self::CleanupTrap => "task cleanup",
+            Self::HostReturnObjectReservation => "host return object reservation",
+            Self::HostReturnCollectionReservation => "host return collection reservation",
+            Self::HostReturnStringReservation => "host return string reservation",
+            Self::HostReturnStructWrite => "host return struct write",
+            Self::HostReturnCollectionWrite => "host return collection write",
+            Self::HostReturnCommit => "host return commit",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -96,6 +123,23 @@ pub struct FailurePointStats {
     pub injected: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailureProbeState {
+    Armed,
+    Consumed,
+    ScenarioNotReached,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailureObservation {
+    pub point: RuntimeFailurePoint,
+    pub state: FailureProbeState,
+    pub operation: &'static str,
+    pub task_handle: Option<crate::TaskHandle>,
+    pub request_handle: Option<crate::HostRequestHandle>,
+    pub result: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RuntimeFailureRule {
     mode: RuntimeFailureMode,
@@ -111,6 +155,7 @@ pub enum RuntimeFailureConfigError {
 #[derive(Clone, Debug)]
 pub struct RuntimeFailureInjector {
     rules: Arc<Mutex<[RuntimeFailureRule; RuntimeFailurePoint::ALL.len()]>>,
+    observations: Arc<Mutex<VecDeque<FailureObservation>>>,
 }
 
 impl Default for RuntimeFailureInjector {
@@ -119,6 +164,7 @@ impl Default for RuntimeFailureInjector {
             rules: Arc::new(Mutex::new(
                 [RuntimeFailureRule::default(); RuntimeFailurePoint::ALL.len()],
             )),
+            observations: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
         }
     }
 }
@@ -131,9 +177,55 @@ impl PartialEq for RuntimeFailureInjector {
 
 impl Eq for RuntimeFailureInjector {}
 
+#[derive(Clone, Debug)]
+pub struct FailureProbe {
+    injector: RuntimeFailureInjector,
+    point: RuntimeFailurePoint,
+    injected_before: u64,
+}
+
+impl FailureProbe {
+    #[must_use]
+    pub fn was_consumed(&self) -> bool {
+        self.injector.stats(self.point).injected > self.injected_before
+    }
+
+    #[must_use]
+    pub fn state(&self) -> FailureProbeState {
+        if self.was_consumed() {
+            FailureProbeState::Consumed
+        } else {
+            FailureProbeState::ScenarioNotReached
+        }
+    }
+
+    pub fn require_consumed(&self) -> Result<(), &'static str> {
+        if self.was_consumed() {
+            Ok(())
+        } else {
+            Err("SCENARIO_NOT_REACHED")
+        }
+    }
+}
+
 impl RuntimeFailureInjector {
-    pub fn arm_once(&self, point: RuntimeFailurePoint) {
+    #[must_use = "retain the probe and require that the injected scenario was consumed"]
+    pub fn arm_once(&self, point: RuntimeFailurePoint) -> FailureProbe {
+        let injected_before = self.stats(point).injected;
         self.configure(point, RuntimeFailureMode::Once);
+        self.record(FailureObservation {
+            point,
+            state: FailureProbeState::Armed,
+            operation: point.operation(),
+            task_handle: None,
+            request_handle: None,
+            result: "ARMED",
+        });
+        FailureProbe {
+            injector: self.clone(),
+            point,
+            injected_before,
+        }
     }
 
     pub fn arm_at(
@@ -158,6 +250,7 @@ impl RuntimeFailureInjector {
 
     pub fn clear(&self) {
         self.rules().fill(RuntimeFailureRule::default());
+        self.observation_log().clear();
     }
 
     #[must_use]
@@ -179,7 +272,22 @@ impl RuntimeFailureInjector {
     }
 
     #[must_use]
+    pub fn observations(&self) -> Vec<FailureObservation> {
+        self.observation_log().iter().cloned().collect()
+    }
+
+    #[must_use]
     pub fn trigger(&self, point: RuntimeFailurePoint) -> bool {
+        self.trigger_with_context(point, None, None)
+    }
+
+    #[must_use]
+    pub(crate) fn trigger_with_context(
+        &self,
+        point: RuntimeFailurePoint,
+        task_handle: Option<crate::TaskHandle>,
+        request_handle: Option<crate::HostRequestHandle>,
+    ) -> bool {
         let mut rules = self.rules();
         let rule = &mut rules[point.index()];
         rule.stats.attempted = rule.stats.attempted.saturating_add(1);
@@ -202,6 +310,26 @@ impl RuntimeFailureInjector {
         if injected {
             rule.stats.injected = rule.stats.injected.saturating_add(1);
         }
+        let armed = rule.mode != RuntimeFailureMode::Off || injected;
+        drop(rules);
+        if armed {
+            self.record(FailureObservation {
+                point,
+                state: if injected {
+                    FailureProbeState::Consumed
+                } else {
+                    FailureProbeState::Armed
+                },
+                operation: point.operation(),
+                task_handle,
+                request_handle,
+                result: if injected {
+                    "INJECTED"
+                } else {
+                    "NOT_REACHED_YET"
+                },
+            });
+        }
         injected
     }
 
@@ -223,6 +351,21 @@ impl RuntimeFailureInjector {
     fn rules_snapshot(&self) -> [RuntimeFailureRule; RuntimeFailurePoint::ALL.len()] {
         *self.rules()
     }
+
+    fn observation_log(&self) -> std::sync::MutexGuard<'_, VecDeque<FailureObservation>> {
+        self.observations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn record(&self, observation: FailureObservation) {
+        const CAPACITY: usize = 64;
+        let mut observations = self.observation_log();
+        if observations.len() == CAPACITY {
+            observations.pop_front();
+        }
+        observations.push_back(observation);
+    }
 }
 
 #[cfg(test)]
@@ -241,9 +384,10 @@ mod tests {
         assert_eq!(classified, RuntimeFailurePoint::ALL.into_iter().collect());
         let injector = RuntimeFailureInjector::default();
         for point in RuntimeFailurePoint::ALL {
-            injector.arm_once(point);
+            let probe = injector.arm_once(point);
             assert!(injector.trigger(point));
             assert!(!injector.trigger(point));
+            probe.require_consumed().unwrap();
             assert_eq!(
                 injector.stats(point),
                 FailurePointStats {
@@ -296,8 +440,9 @@ mod tests {
     fn clones_share_modes_and_statistics() {
         let injector = RuntimeFailureInjector::default();
         let subsystem = injector.clone();
-        injector.arm_once(RuntimeFailurePoint::HeapSlot);
+        let probe = injector.arm_once(RuntimeFailurePoint::HeapSlot);
         assert!(subsystem.trigger(RuntimeFailurePoint::HeapSlot));
+        probe.require_consumed().unwrap();
         assert_eq!(
             injector.stats(RuntimeFailurePoint::HeapSlot),
             FailurePointStats {

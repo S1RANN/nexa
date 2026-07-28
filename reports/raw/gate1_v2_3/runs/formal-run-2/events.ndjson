@@ -1,2 +1,0 @@
-{"sequence":0,"run_id":"formal-run-2","process_nonce":"supervisor-32435-1785128968750845000","phase":"supervisor.worker","operation":"spawn independent worker","before_snapshot_hash":"65b670dd1dedacfb","after_snapshot_hash":"6cb1f156405286f9","result":"process completed"}
-{"sequence":1,"run_id":"formal-run-2","process_nonce":"supervisor-32435-1785128968750845000","phase":"supervisor.postflight","operation":"strict postflight","before_snapshot_hash":"6cb1f156405286f9","after_snapshot_hash":"86cec27aa5d0b4f9","result":"PASS"}

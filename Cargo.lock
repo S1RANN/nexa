@@ -89,309 +89,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexa-contract-gate-protocol"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-contract-gates"
-version = "0.1.0"
-dependencies = [
- "nexa",
- "nexa-contract-gate-protocol",
- "nexa-model",
- "nexa-runtime",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "nexa-core"
 version = "0.1.0"
-
-[[package]]
-name = "nexa-gate1-decision"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-experiments"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-4"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-4-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-4-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-4",
- "nexa-gate1-v2-4-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-4-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-4-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-4",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-5"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-5-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-5-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-5",
- "nexa-gate1-v2-5-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-5-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-5-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-5",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-6"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-6-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-6-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-6",
- "nexa-gate1-v2-6-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-6-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-6-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-6",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-7"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-7-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-7-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-7",
- "nexa-gate1-v2-7-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-7-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-7-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-7",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-8"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-8-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-8-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-8",
- "nexa-gate1-v2-8-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-8-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-8-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-8",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-9"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-gate1-v2-9-fixtures",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-9-decision"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-9",
- "nexa-gate1-v2-9-gates",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-9-fixtures"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-gate1-v2-9-gates"
-version = "0.1.0"
-dependencies = [
- "nexa-gate1-v2-9",
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "nexa-idl"
@@ -422,21 +121,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nexa-milestone4-experiments"
-version = "0.1.0"
-dependencies = [
- "nexa-bytecode",
- "nexa-compiler",
- "nexa-core",
- "nexa-idl",
- "nexa-migrate",
- "nexa-runtime",
- "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "nexa-model"
 version = "0.1.0"
 dependencies = [
@@ -445,15 +129,6 @@ dependencies = [
  "nexa-machine",
  "nexa-runtime",
  "nexa-verifier",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "nexa-release-audit"
-version = "0.1.0"
-dependencies = [
- "nexa-contract-gate-protocol",
  "serde",
  "serde_json",
 ]
@@ -554,6 +229,14 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "zmij"

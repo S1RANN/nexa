@@ -2138,7 +2138,8 @@ mod tests {
     fn allocation_failure_does_not_drop_live_objects() {
         let mut heap = Heap::new(2);
         let live = heap.allocate(Object::I32Array(vec![1, 2])).unwrap();
-        heap.failure_injector()
+        let _probe = heap
+            .failure_injector()
             .arm_once(RuntimeFailurePoint::HeapSlot);
         assert_eq!(
             heap.allocate(Object::String("no".into())),

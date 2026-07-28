@@ -50,7 +50,6 @@ impl ErrorCode {
     pub const NX6001: Self = Self::new("NX6001");
     pub const NX6002: Self = Self::new("NX6002");
     pub const NX6003: Self = Self::new("NX6003");
-    pub const NX6004: Self = Self::new("NX6004");
     pub const NX6005: Self = Self::new("NX6005");
 
     #[must_use]
@@ -124,7 +123,6 @@ pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
     ErrorCodeDefinition::new(ErrorCode::NX6001, "Migration limit"),
     ErrorCodeDefinition::new(ErrorCode::NX6002, "Migration graph failure"),
     ErrorCodeDefinition::new(ErrorCode::NX6003, "Activation failure"),
-    ErrorCodeDefinition::new(ErrorCode::NX6004, "Reload completion capacity"),
     ErrorCodeDefinition::new(ErrorCode::NX6005, "Invalid ReloadMetadata"),
 ];
 
@@ -271,12 +269,6 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
         NX6003,
         "nexa-runtime::realm",
         "ActivationFailure",
-        ".runtime"
-    ),
-    emission!(
-        NX6004,
-        "nexa-runtime::reload",
-        "CompletionBufferCapacity",
         ".runtime"
     ),
     emission!(NX6005, "nexa-verifier", "InvalidReloadMetadata", ".bin"),
@@ -896,12 +888,37 @@ impl ClassifiedError for VerifyError {
 
 impl ClassifiedError for RuntimeError {
     fn metadata(&self) -> ErrorMetadata {
+        if let Self::Trap(trap) = self {
+            return ErrorMetadata {
+                code: runtime_trap_code(trap.diagnostic_code),
+                category: ErrorCategory::Host,
+                context: ErrorContext {
+                    span: trap.source_span,
+                    module_epoch: trap.module.zip(trap.epoch).map(|(module, epoch)| {
+                        ErrorModuleEpoch {
+                            module: ModuleId(module.index),
+                            epoch,
+                        }
+                    }),
+                    task: trap.task,
+                },
+            };
+        }
+        if let Self::Realm(error) = self {
+            return error.metadata();
+        }
         ErrorMetadata {
             code: match self {
                 Self::ResourceLimit(_)
                 | Self::Scope(ScopeError::Allocation(_))
                 | Self::Task(TaskError::Allocation(_)) => ErrorCode::NX5004,
-                Self::Scope(_) | Self::Task(_) | Self::InjectedFailure(_) => ErrorCode::NX5001,
+                Self::Scope(_)
+                | Self::Task(_)
+                | Self::TerminalTask
+                | Self::StaleTaskHandle
+                | Self::CrossRealmTaskHandle
+                | Self::InjectedFailure(_) => ErrorCode::NX5001,
+                Self::Trap(_) | Self::Realm(_) => unreachable!(),
             },
             category: ErrorCategory::Runtime,
             context: ErrorContext::default(),
@@ -912,14 +929,7 @@ impl ClassifiedError for RuntimeError {
 impl ClassifiedError for Trap {
     fn metadata(&self) -> ErrorMetadata {
         ErrorMetadata {
-            code: match self.diagnostic_code() {
-                "NX4001" => ErrorCode::NX4001,
-                "NX4003" => ErrorCode::NX4003,
-                "NX5002" => ErrorCode::NX5002,
-                "NX5003" => ErrorCode::NX5003,
-                "NX5004" => ErrorCode::NX5004,
-                _ => ErrorCode::NX5001,
-            },
+            code: runtime_trap_code(self.diagnostic_code()),
             category: ErrorCategory::Host,
             context: ErrorContext {
                 span: self.source_span,
@@ -939,7 +949,6 @@ impl ClassifiedError for Trap {
 impl ClassifiedError for ReloadError {
     fn metadata(&self) -> ErrorMetadata {
         let code = match self {
-            Self::CompletionBufferCapacity => ErrorCode::NX6004,
             Self::MigrationLimit(_) => ErrorCode::NX6001,
             Self::GraphCheck
             | Self::MissingForwarding
@@ -1149,6 +1158,17 @@ fn host_trap_code(error: &HostTrap) -> ErrorCode {
     }
 }
 
+fn runtime_trap_code(code: &str) -> ErrorCode {
+    match code {
+        "NX4001" => ErrorCode::NX4001,
+        "NX4003" => ErrorCode::NX4003,
+        "NX5002" => ErrorCode::NX5002,
+        "NX5003" => ErrorCode::NX5003,
+        "NX5004" => ErrorCode::NX5004,
+        _ => ErrorCode::NX5001,
+    }
+}
+
 fn host_request_code(error: &HostRequestError) -> ErrorCode {
     match error {
         HostRequestError::CompletionQueueFull | HostRequestError::Allocation(_) => {
@@ -1184,6 +1204,8 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
         | RealmError::MissingModule(_)
         | RealmError::ModuleNotCallable
         | RealmError::TerminalTask
+        | RealmError::StaleTaskHandle
+        | RealmError::CrossRealmTaskHandle
         | RealmError::TaskWaiting
         | RealmError::InjectedFailure(_) => ErrorCode::NX5001,
     }
@@ -1240,7 +1262,6 @@ mod tests {
             ("NX6001", "Migration limit"),
             ("NX6002", "Migration graph failure"),
             ("NX6003", "Activation failure"),
-            ("NX6004", "Reload completion capacity"),
             ("NX6005", "Invalid ReloadMetadata"),
         ];
 
@@ -1272,8 +1293,8 @@ mod tests {
             .map(|definition| definition.code)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(registered, emitted);
-        assert_eq!(ERROR_CODE_TABLE.len(), 34);
-        assert_eq!(ERROR_EMISSION_TABLE.len(), 34);
+        assert_eq!(ERROR_CODE_TABLE.len(), 33);
+        assert_eq!(ERROR_EMISSION_TABLE.len(), 33);
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for definition in ERROR_EMISSION_TABLE {
             assert!(!definition.module.is_empty());
@@ -1305,7 +1326,9 @@ mod tests {
             }),
             NexaError::Runtime(RuntimeError::ResourceLimit("task")),
             NexaError::Host(HostError::Request(HostRequestError::CompletionQueueFull)),
-            NexaError::Reload(ReloadError::CompletionBufferCapacity),
+            NexaError::Reload(ReloadError::Activation(
+                nexa_runtime::RuntimeMessage::inline("activation"),
+            )),
             NexaError::Migration(MigrationError::Limit(MigrationLimitError::Objects)),
         ];
         let expected = [
@@ -1314,7 +1337,7 @@ mod tests {
             (ErrorCategory::Verify, "NX3002"),
             (ErrorCategory::Runtime, "NX5004"),
             (ErrorCategory::Host, "NX5004"),
-            (ErrorCategory::Reload, "NX6004"),
+            (ErrorCategory::Reload, "NX6003"),
             (ErrorCategory::Migration, "NX6001"),
         ];
 

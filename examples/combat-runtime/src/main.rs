@@ -3,14 +3,14 @@ use std::sync::{Arc, Mutex};
 
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostPayload, ModuleLifecycle, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeHostDomain, RuntimeValue, ScriptFunction, StepConfig, TaskLimits,
-    TickBudget,
+    HostPayload, ModuleLifecycle, RealmConfig, RealmRuntime, ResourceContext, RestartReloadOutcome,
+    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostDomain, RuntimeValue,
+    ScriptFunction, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 
 #[allow(dead_code)]
 mod generated {
-    include!(concat!(env!("OUT_DIR"), "/engine.rs"));
+    include!(concat!(env!("OUT_DIR"), "/combat_api.rs"));
 }
 
 struct EngineHost {
@@ -73,8 +73,9 @@ impl generated::GameHost for EngineHost {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(generated::Update::EXPORT_NAME, "Update");
     let _typed_export_id = generated::Update::FUNCTION_ID;
-    let idl = nexa_idl::parse(include_str!("../engine.idl"))?;
-    let host_hash = nexa_idl::exact_hash(&idl);
+    let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
+    let host_hash = generated::INTERFACE_HASH;
+    assert_eq!(host_hash, nexa_idl::exact_hash(&idl));
     let schema_hash = StableId::from_name("combat-state-v1");
     let schema_hash_v2 = StableId::from_name("combat-state-v2");
     let verified =
@@ -161,7 +162,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RuntimeValue::I32(6),
         ],
     )?;
-    let feature_task = realm.call(
+    let feature_task = realm.spawn_task(
         module,
         5,
         &[buffer],
@@ -175,9 +176,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(matches!(
         realm.poll_task(feature_task, 1_024)?,
-        PollResult::Completed(Some(RuntimeValue::I32(9)))
+        TaskPoll::Completed(RuntimeValue::I32(9))
     ));
-    let state_task = realm.call(
+    let state_task = realm.spawn_task(
         module,
         6,
         &[RuntimeValue::StateHandle {
@@ -196,9 +197,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(matches!(
         realm.poll_task(state_task, 256)?,
-        PollResult::Completed(Some(RuntimeValue::I32(_)))
+        TaskPoll::Completed(RuntimeValue::I32(_))
     ));
-    let checked = realm.call(
+    let checked = realm.spawn_task(
         module,
         3,
         &[RuntimeValue::I32(7)],
@@ -210,10 +211,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limits: TaskLimits::default(),
         },
     )?;
-    assert_eq!(
+    assert!(matches!(
         realm.poll_task(checked, 64)?,
-        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
-    );
+        TaskPoll::Waiting(_)
+    ));
     let pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -231,7 +232,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             RuntimeValue::NamedRef { .. }
         )))
     ));
-    let checked_error = realm.call(
+    let checked_error = realm.spawn_task(
         module,
         3,
         &[RuntimeValue::I32(8)],
@@ -243,10 +244,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limits: TaskLimits::default(),
         },
     )?;
-    assert_eq!(
+    assert!(matches!(
         realm.poll_task(checked_error, 64)?,
-        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
-    );
+        TaskPoll::Waiting(_)
+    ));
     let pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -268,7 +269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
     ));
 
-    let task = realm.call(
+    let task = realm.spawn_task(
         module,
         4,
         &[RuntimeValue::I32(41)],
@@ -281,10 +282,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    assert_eq!(
-        realm.poll_task(task, 32)?,
-        PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
-    );
+    assert!(matches!(realm.poll_task(task, 32)?, TaskPoll::Waiting(_)));
     let pending = last_request
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -304,7 +302,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )))
     ));
 
-    let live = realm.call(
+    let live = realm.spawn_task(
         module,
         4,
         &[RuntimeValue::I32(10)],
@@ -316,20 +314,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             limits: TaskLimits::default(),
         },
     )?;
-    let mut late_pending = realm.create_host_request(live)?;
-    realm.wait_for_request(live, late_pending.request)?;
+    assert!(matches!(realm.poll_task(live, 32)?, TaskPoll::Waiting(_)));
+    let mut late_pending = last_request
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .expect("late animation request was captured by the host");
     let v2 = nexa_compiler::compile_with_metadata(
         include_str!("../reload/v2.nexa"),
         host_hash,
         schema_hash_v2,
     )?;
-    let v2 = realm.prepare_reload(module, v2, host_hash)?;
-    realm.quiesce_reload()?;
-    assert_eq!(
-        realm.stage_reload(&[RuntimeValue::I32(10)])?,
-        Some(RuntimeValue::I32(10))
-    );
-    realm.commit_reload(&[RuntimeValue::I32(10)], 4_096)?;
+    let RestartReloadOutcome::Committed(v2) = realm.restart_reload(
+        module,
+        v2,
+        RestartReloadPolicy {
+            migration_arguments: vec![RuntimeValue::I32(10)],
+            activation_arguments: vec![RuntimeValue::I32(10)],
+            activation_fuel: 4_096,
+        },
+    )?
+    else {
+        return Err(Box::new(HostFailure(
+            "combat restart reload did not commit",
+        )));
+    };
     let migrated_state = realm
         .state_handles(v2)?
         .into_iter()
@@ -382,7 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let cancelled_scope = realm.create_scope(None)?;
-    let cancelled_task = realm.call(
+    let cancelled_task = realm.spawn_task(
         v2,
         2,
         &[RuntimeValue::I32(5)],
@@ -396,7 +405,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     assert!(matches!(
         realm.poll_task(cancelled_task, 0)?,
-        PollResult::Pending(_)
+        TaskPoll::Yielded(_)
     ));
     assert_eq!(realm.cancel_scope(cancelled_scope)?, 1);
     assert!(matches!(
@@ -408,7 +417,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ))
     ));
 
-    let live = realm.call(
+    let live = realm.spawn_task(
         v2,
         2,
         &[RuntimeValue::I32(1)],
@@ -425,10 +434,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         host_hash,
         schema_hash_v2,
     )?;
-    let fault = realm.prepare_reload(v2, fault, host_hash)?;
-    realm.quiesce_reload()?;
-    realm.stage_reload(&[RuntimeValue::I32(1)])?;
-    assert!(realm.commit_reload(&[], 4_096).is_err());
+    let activation_probe = realm
+        .failure_injector()
+        .arm_once(RuntimeFailurePoint::ActivationTrap);
+    let RestartReloadOutcome::ActivationFaulted {
+        candidate: fault, ..
+    } = realm.restart_reload(
+        v2,
+        fault,
+        RestartReloadPolicy {
+            migration_arguments: vec![RuntimeValue::I32(1)],
+            activation_arguments: vec![RuntimeValue::I32(1)],
+            activation_fuel: 4_096,
+        },
+    )?
+    else {
+        return Err(Box::new(HostFailure(
+            "combat activation fault was not observable",
+        )));
+    };
+    activation_probe.require_consumed().map_err(HostFailure)?;
     assert_eq!(realm.active_root(), Some(fault));
     assert_eq!(
         realm.module_lifecycle(fault)?,
@@ -436,7 +461,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(
         realm
-            .call(
+            .spawn_task(
                 fault,
                 0,
                 &[RuntimeValue::I32(1)],
@@ -456,10 +481,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             nexa_runtime::CancelReason::ReloadCommit
         ))
     ));
-    assert!(
-        realm.retired_epochs().len() >= 2,
-        "the combat reload must retain multiple retired epochs"
-    );
     late_pending.ticket.complete(HostPayload::I32(99))?;
     realm.tick(TickBudget {
         max_tasks: 0,

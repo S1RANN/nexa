@@ -339,7 +339,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let task =
                 call(&mut async_realm, async_module, async_scope, 7).expect("async task admission");
             assert!(matches!(
-                async_realm.poll_task(task, 64),
+                async_realm.poll_task_raw(task, 64),
                 Ok(PollResult::Pending(
                     nexa_runtime::PendingReason::HostRequest
                 ))
@@ -403,11 +403,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || prepared_reload(&old_module, &new_module),
         |mut prepared| {
             let before = PeakResources::from_ledger(prepared.realm.resource_ledger());
-            let active = prepared
+            let outcome = prepared
                 .realm
-                .commit_reload(&[], 4_096)
-                .expect("reload commit");
-            assert_eq!(active, prepared.candidate);
+                .restart_reload(
+                    prepared.old,
+                    prepared.candidate,
+                    nexa_runtime::RestartReloadPolicy::default(),
+                )
+                .expect("restart reload");
+            assert!(matches!(
+                outcome,
+                nexa_runtime::RestartReloadOutcome::Committed(_)
+            ));
             let after = prepared.realm.resource_ledger();
             let mut resources = before;
             resources.merge(PeakResources::from_ledger(after));
@@ -431,7 +438,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let scope = realm.create_scope(None).expect("drop scope");
             let task = call(&mut realm, module, scope, 1).expect("drop task");
             assert!(matches!(
-                realm.poll_task(task, 0),
+                realm.poll_task_raw(task, 0),
                 Ok(PollResult::Pending(_))
             ));
             let peak = PeakResources::from_ledger(realm.resource_ledger());
@@ -842,7 +849,8 @@ task fn update(value: i32) -> i32 { return value + 1; }
 
 struct PreparedReload {
     realm: RealmRuntime,
-    candidate: nexa_runtime::ModuleHandle,
+    old: nexa_runtime::ModuleHandle,
+    candidate: VerifiedModule,
 }
 
 fn prepared_reload(old: &VerifiedModule, new: &VerifiedModule) -> PreparedReload {
@@ -867,12 +875,11 @@ fn prepared_reload(old: &VerifiedModule, new: &VerifiedModule) -> PreparedReload
             }),
         )
         .expect("old reload state");
-    let candidate = realm
-        .prepare_reload(old_handle, new.clone(), HOST)
-        .expect("prepare reload");
-    realm.quiesce_reload().expect("quiesce reload");
-    realm.stage_reload(&[]).expect("stage reload");
-    PreparedReload { realm, candidate }
+    PreparedReload {
+        realm,
+        old: old_handle,
+        candidate: new.clone(),
+    }
 }
 
 fn bench<T>(

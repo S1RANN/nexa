@@ -21,7 +21,7 @@ fn failure_artifact_serializes_real_realm_inspection() {
         RealmV5RuntimeEvent::Commit,
     ]);
     let before = runtime.realm().inspection_snapshot();
-    runtime
+    let _probe = runtime
         .failure_injector()
         .arm_once(RuntimeFailurePoint::HeapSlot);
     assert!(matches!(
@@ -143,7 +143,7 @@ fn production_failure_modes_and_stats_are_complete() {
     let mut runtime = RealmV5RuntimeAdapter::new();
     let injector = runtime.failure_injector().clone();
 
-    injector.arm_once(RuntimeFailurePoint::HeapSlot);
+    let _probe = injector.arm_once(RuntimeFailurePoint::HeapSlot);
     assert_eq!(
         runtime.realm_mut().allocate(Object::String("once".into())),
         Err(RealmError::Heap(HeapError::InjectedFailure(
@@ -208,8 +208,8 @@ fn production_failure_modes_and_stats_are_complete() {
         }
     );
 
-    injector.arm_once(RuntimeFailurePoint::ScopeSlot);
-    injector.arm_once(RuntimeFailurePoint::HeapSlot);
+    let _scope_probe = injector.arm_once(RuntimeFailurePoint::ScopeSlot);
+    let _heap_probe = injector.arm_once(RuntimeFailurePoint::HeapSlot);
     assert!(matches!(
         runtime.realm_mut().create_scope(None),
         Err(RealmError::Runtime(RuntimeError::InjectedFailure(
@@ -333,7 +333,7 @@ fn every_production_failure_point_is_differentially_atomic() {
     for &(point, path, event) in atomic_cases {
         let mut runtime = replay(path);
         let before = runtime.realm().inspection_snapshot();
-        runtime.failure_injector().arm_once(point);
+        let _probe = runtime.failure_injector().arm_once(point);
         assert_eq!(
             runtime.apply(event),
             Err(RealmV5RuntimeApplyError::InjectedFailure(point)),
@@ -383,7 +383,7 @@ fn every_production_failure_point_is_differentially_atomic() {
 fn assert_scope_slot_is_injected_by_realm_runtime() {
     let mut runtime = RealmV5RuntimeAdapter::new();
     let before = runtime.realm().inspection_snapshot();
-    runtime
+    let _probe = runtime
         .failure_injector()
         .arm_once(RuntimeFailurePoint::ScopeSlot);
     assert_eq!(
@@ -403,7 +403,7 @@ fn assert_activation_trap_is_post_publication_and_exactly_once() {
         RealmV5RuntimeEvent::Quiesce,
         RealmV5RuntimeEvent::Migration,
     ]);
-    runtime
+    let _probe = runtime
         .failure_injector()
         .arm_once(RuntimeFailurePoint::ActivationTrap);
     assert_eq!(

@@ -30,7 +30,7 @@ fn gc_suspended_root() {
             super::support::task_config(scope),
         )
         .unwrap();
-    let result = realm.poll_task(task, 16).unwrap();
+    let result = realm.poll_task_raw(task, 16).unwrap();
     let live = realm.collect_garbage().unwrap();
     realm.cancel_scope(scope).unwrap();
     let reclaimed = realm.collect_garbage().unwrap();

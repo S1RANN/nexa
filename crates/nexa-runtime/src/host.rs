@@ -2480,6 +2480,19 @@ impl HostRequestManager {
         }
     }
 
+    fn submit_result(
+        &self,
+        request: HostRequestHandle,
+        result: HostCompletionResult,
+    ) -> Result<(), HostRequestError> {
+        let reservation = self
+            .requests
+            .resolve(request.raw())?
+            .completion_reservation
+            .ok_or(HostRequestError::AlreadyCompleted)?;
+        self.completion_sender().submit(reservation, result)
+    }
+
     #[cfg(test)]
     pub fn create(
         &mut self,
@@ -3432,6 +3445,14 @@ impl RuntimeResources {
         std::iter::from_fn(|| self.pop_completion()).collect()
     }
 
+    pub(crate) fn complete_request(
+        &self,
+        request: HostRequestHandle,
+        result: HostCompletionResult,
+    ) -> Result<(), HostRequestError> {
+        self.requests.submit_result(request, result)
+    }
+
     pub(crate) fn pop_completion(&mut self) -> Option<HostCompletionDelivery> {
         let delivery = self.requests.pop_completion(&mut self.releases)?;
         self.ownership.retain(|owned| {
@@ -3757,7 +3778,11 @@ impl ResourceContext<'_> {
     }
 
     fn fail_if_injected(&self, point: crate::RuntimeFailurePoint) -> Result<(), HostRequestError> {
-        if self.resources.failure_injector.trigger(point) {
+        if self
+            .resources
+            .failure_injector
+            .trigger_with_context(point, Some(self.task), None)
+        {
             Err(HostRequestError::InjectedFailure(point))
         } else {
             Ok(())
@@ -3973,13 +3998,15 @@ mod tests {
     fn host_return_transaction_is_atomic_and_reuses_collection_arena() {
         let mut heap = Heap::new_with_arena_limits(4, 64, 8, 8, 5);
         let initial = heap.collection_inspection();
-        heap.failure_injector()
+        let _collection_probe = heap
+            .failure_injector()
             .arm_once(RuntimeFailurePoint::HostReturnCollectionWrite);
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);
         assert_eq!(heap.collection_inspection(), initial);
 
-        heap.failure_injector()
+        let _commit_probe = heap
+            .failure_injector()
             .arm_once(RuntimeFailurePoint::HostReturnCommit);
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);

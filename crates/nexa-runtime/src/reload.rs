@@ -19,22 +19,10 @@ pub enum ReloadError {
     DuplicateForwarding,
     InvalidStateHandle,
     MigrationLimit(MigrationLimitError),
-    CompletionBufferCapacity,
     Migration(RuntimeMessage),
     GraphCheck,
     QuiesceTimeout,
     Activation(RuntimeMessage),
-}
-
-pub fn validate_reload_completion_capacity(
-    capacity: usize,
-    buffered: usize,
-) -> Result<(), ReloadError> {
-    if buffered >= capacity {
-        Err(ReloadError::CompletionBufferCapacity)
-    } else {
-        Ok(())
-    }
 }
 
 pub fn invoke_reload_activation(
@@ -67,11 +55,14 @@ impl ReloadCompletionBuffer {
     }
 
     pub(crate) fn push(&mut self, delivery: HostCompletionDelivery) -> Result<(), ReloadError> {
-        validate_reload_completion_capacity(self.capacity, self.entries.len())?;
+        if self.entries.len() >= self.capacity {
+            return Err(ReloadError::StagingCapacity);
+        }
         self.entries.push_back(delivery);
         Ok(())
     }
 
+    #[cfg(any(test, feature = "model-adapter"))]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.entries.len()

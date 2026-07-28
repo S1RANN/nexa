@@ -1,1 +1,0 @@
-{"id":"G1-S03","input":{"Damage":9},"expected":{"tag":"Damage","value":9},"language":["payload-enum"],"runtime_path":"H1/CombatEvent","resource_limit":64,"hash":"bound-by-manifest"}

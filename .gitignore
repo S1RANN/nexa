@@ -1,6 +1,11 @@
-/target/
+target/
+target/nexa-artifacts/
 /.idea/
 /.vscode/
 *.swp
 *.swo
 *.trace.jsonl
+*.log
+*.ndjson
+reports/raw/
+fuzz/*/Cargo.lock
