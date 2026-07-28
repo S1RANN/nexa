@@ -18,9 +18,9 @@ MVR Scope 1.0
 Milestone 4.0R3 is complete at receipt
 `reports/contracts/milestone4r3_verification_receipt.json`.
 
-<!-- gate1-v2.8-status:start -->
-Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is **STRUCTURAL_CLOSURE_FAILED / INCOMPLETE** and its recorded STOP is unauthorized. Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable. Gate 1 v2.8 is **VERIFIED_TERMINAL_DECISION**, its decision is **UNVERIFIABLE_WITHIN_MVR**, and Milestone 5.0R8 is **COMPLETE**.
-<!-- gate1-v2.8-status:end -->
+<!-- gate1-v2.9-status:start -->
+Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is **STRUCTURAL_CLOSURE_FAILED / INCOMPLETE** and its recorded STOP is unauthorized. Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable. Gate 1 v2.8 is **SEMANTICALLY_INSUFFICIENT / INCOMPLETE** and its recorded decision is unauthorized. Gate 1 v2.9 is **VERIFIED_TERMINAL_DECISION**, its decision is **STOP**, and Milestone 5.0R9 is **COMPLETE**.
+<!-- gate1-v2.9-status:end -->
 
 The current normative experiment entry points are:
 
