@@ -47,6 +47,14 @@ migrates state on staging, commits the new root, then activates it. Migration
 failure rolls back before commit; activation failure remains observable after
 commit. Old continuations and intermediate completion queues are not supported.
 
+The binding gate compiles 20 textual `.nidl` mutations against the handwritten
+`BusinessHostV1`, applies explicit business-code patches where required, rejects
+old bytecode before interpretation, and executes the changed `heartbeat`
+contract. External callers cannot create Requests or manually place Tasks into
+Waiting: those transitions only come from generated Host bindings and
+`TaskPoll::Waiting`. Real-`RealmRuntime` differential/fuzz coverage and Combat
+verify Request, Token, and Snapshot release exactly once.
+
 ## Run
 
 The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
@@ -55,6 +63,7 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 cargo run -p nexa-cli -- compile examples/add.nexa
 cargo run -p combat-runtime
 cargo xtask check
+cargo xtask finalize-m1
 ```
 
 Focused commands are documented in [Testing](docs/TESTING.md). Generated

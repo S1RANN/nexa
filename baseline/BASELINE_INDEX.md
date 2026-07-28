@@ -23,6 +23,11 @@ Internal Language Scope
 > Roadmap
 ```
 
+M1 conformance requires real handwritten Business Host mutation checks, a
+real-`RealmRuntime` differential/fuzz adapter, no public Request or manual
+Waiting constructor, exactly-once Request/Token/Snapshot release, and Restart
+Reload rollback without old-Task revival.
+
 ## Active specifications
 
 - [`internal/INTERNAL_LANGUAGE_SCOPE.md`](internal/INTERNAL_LANGUAGE_SCOPE.md)

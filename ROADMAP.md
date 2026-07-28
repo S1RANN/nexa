@@ -25,8 +25,8 @@ Gate 1 v2.9 STOP (historical tag)
    → Combat dogfood loop
 ```
 
-Internal Pivot M1 passed every Cargo and xtask gate on one commit with a clean
-working tree.
+Internal Pivot M1 remains `FINALIZING` until every Cargo and xtask gate,
+including `finalize-m1`, passes on one clean commit.
 
 ## Active product
 
@@ -37,6 +37,12 @@ working tree.
 - Typed state migration with Preserve, Replace, and Delete.
 - Stop-the-module Restart Reload with late-completion discard by epoch.
 - Differential models, fuzz smoke, absolute allocation and latency budgets.
+
+The finalization contract uses a handwritten `BusinessHostV1` for all 20 IDL
+mutations, drives Realm differential and fuzz inputs through a real
+`RealmRuntime`, closes public Request/Waiting construction bypasses, and proves
+exactly-once Request/Token/Snapshot release through the generated Combat Host
+binding. Restart rollback never restores quiesced Tasks.
 
 ## M1 finalization scope
 

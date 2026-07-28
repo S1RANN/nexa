@@ -13,6 +13,9 @@ spawn_task
 Only `TaskPoll::Waiting` exposes a `HostRequestHandle`. A valid request may be
 completed or abandoned once. Resume happens by polling the Task again; callers
 never manufacture state-machine events or a Task-complete transition.
+`create_host_request_for_runtime` and `wait_for_request` are crate-private;
+external products, examples, tools, and integration tests cannot create a
+Request or manually switch a Task to Waiting.
 
 Terminal polls are immutable. Polling a terminal Task returns
 `RuntimeError::TerminalTask`; cross-Realm and stale Task handles have distinct
@@ -24,7 +27,8 @@ After every terminal transition:
 - continuation, request, scheduler token, completion reservation, and release
   reservation counts are zero;
 - one terminal record remains observable;
-- Host resources are released exactly once.
+- Request, Resource Token, and Typed Snapshot resources are each released
+  exactly once; the second and third Host drains remain empty.
 
 The raw poll result and its pending reason are crate-private implementation
 details. Product code, examples, integration tests, diagnostics, and benchmark

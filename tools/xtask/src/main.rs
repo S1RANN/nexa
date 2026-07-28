@@ -30,6 +30,10 @@ struct RepoHealth {
     public_api_violations: Vec<String>,
     public_raw_task_api_violations: usize,
     public_task_lifecycle_bypass_violations: usize,
+    shadow_runtime_model_violations: usize,
+    business_host_stub_e2e_violations: usize,
+    real_runtime_fuzz_violations: usize,
+    unverified_host_resource_release_kinds: usize,
     legacy_host_abi_violations: usize,
     completion_buffer_symbol_violations: usize,
     reload_pause_symbol_violations: usize,
@@ -48,6 +52,22 @@ struct FinalizationInventory {
     internal_whitelist: Vec<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct M1FinalReport {
+    head: String,
+    tag_type: String,
+    tag_target: String,
+    cargo_xtask_check: &'static str,
+    working_tree_clean: bool,
+    business_host_mutations: u64,
+    real_runtime_differential: &'static str,
+    real_runtime_fuzz_build: &'static str,
+    request_release_tests: &'static str,
+    token_release_tests: &'static str,
+    snapshot_release_tests: &'static str,
+    status: &'static str,
+}
+
 fn main() -> Result<(), DynError> {
     let command = std::env::args().nth(1).unwrap_or_else(|| "help".into());
     match command.as_str() {
@@ -60,14 +80,63 @@ fn main() -> Result<(), DynError> {
         "fuzz-smoke" => fuzz_smoke(),
         "bench-smoke" => bench_smoke(),
         "repo-audit" => repo_audit(),
+        "finalize-m1" => finalize_m1(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
                  check|test-core|test-binding|test-task|test-reload|test-model|\
-                 fuzz-smoke|bench-smoke|repo-audit"
+                 fuzz-smoke|bench-smoke|repo-audit|finalize-m1"
             );
             Err("unknown xtask command".into())
         }
+    }
+}
+
+fn finalize_m1() -> Result<(), DynError> {
+    let root = workspace_root();
+    let cargo_xtask_check = cargo(&["xtask", "check"]).is_ok();
+    let tag_type = git_output(&["cat-file", "-t", "gate1-v2.9-stop"])?;
+    let tag_target = git_output(&["rev-parse", "gate1-v2.9-stop^{}"])?;
+    let working_tree_clean = git_output(&["status", "--porcelain"])?.is_empty();
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let mutation_report: Value = serde_json::from_slice(&fs::read(
+        root.join("target/nexa-artifacts/idl-e2e/mutation-report.json"),
+    )?)?;
+    let business_host_mutations = mutation_report["mutation_count"]
+        .as_u64()
+        .unwrap_or_default();
+    let passed = cargo_xtask_check
+        && tag_type == "tag"
+        && tag_target == "8552064ec01b3191467633717de7b77c97cb24f1"
+        && working_tree_clean
+        && business_host_mutations == 20
+        && mutation_report["status"] == "PASS";
+    let check_status = if cargo_xtask_check { "PASS" } else { "FAIL" };
+    let report = M1FinalReport {
+        head,
+        tag_type,
+        tag_target,
+        cargo_xtask_check: check_status,
+        working_tree_clean,
+        business_host_mutations,
+        real_runtime_differential: check_status,
+        real_runtime_fuzz_build: check_status,
+        request_release_tests: check_status,
+        token_release_tests: check_status,
+        snapshot_release_tests: check_status,
+        status: if passed { "PASS" } else { "FAIL" },
+    };
+    let output = root.join("target/nexa-artifacts/m1-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("final report path has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
+        Ok(())
+    } else {
+        Err("M1 finalization failed".into())
     }
 }
 
@@ -306,6 +375,76 @@ fn repo_audit() -> Result<(), DynError> {
                 .sum::<usize>()
         })
         .sum::<usize>();
+    let model_adapter_source =
+        fs::read_to_string(root.join("crates/nexa-runtime/src/model_adapter.rs"))?;
+    let model_adapter_fields = model_adapter_source
+        .split_once("pub struct RealmRuntimeModelAdapter")
+        .and_then(|(_, tail)| tail.split_once("\n}"))
+        .map_or("", |(fields, _)| fields);
+    let shadow_runtime_model_violations = missing_evidence(
+        &model_adapter_source,
+        &[
+            "realm: Option<RealmRuntime>",
+            "runtime_host: RuntimeHost",
+            "inspection_snapshot()",
+            "resource_ledger()",
+            "completion_accounting()",
+            "pending_releases()",
+            "pending_completions()",
+        ],
+    ) + model_adapter_fields
+        .matches("snapshot: RuntimeRealmSnapshot")
+        .count();
+    let business_host_e2e_source = [
+        "crates/nexa-idl/tests/e2e_mutations.rs",
+        "crates/nexa-idl/tests/e2e_support.rs",
+        "crates/nexa-idl/tests/fixtures/business_host/business_host.rs",
+    ]
+    .iter()
+    .map(|path| fs::read_to_string(root.join(path)))
+    .collect::<Result<Vec<_>, _>>()?
+    .join("\n");
+    let business_host_stub_e2e_violations = missing_evidence(
+        &business_host_e2e_source,
+        &[
+            "struct MutationCase",
+            "BusinessHostV1",
+            "business_host.rs",
+            "--message-format=json",
+            "assert_expected_business_diagnostic",
+        ],
+    ) + business_host_e2e_source
+        .matches("GeneratedHostStub")
+        .count();
+    let realm_fuzz_source =
+        fs::read_to_string(root.join("fuzz/realm-events/fuzz_targets/realm_event_sequence.rs"))?;
+    let real_runtime_fuzz_violations =
+        missing_evidence(
+            &realm_fuzz_source,
+            &[
+                "RealmRuntimeModelAdapter::default()",
+                "runtime.apply(event)",
+                "runtime.snapshot()",
+                "runtime.invariants_hold()",
+            ],
+        ) + missing_evidence(&model_adapter_source, &["realm: Option<RealmRuntime>"]);
+    let task_lifecycle_source =
+        fs::read_to_string(root.join("crates/nexa-runtime/tests/task_lifecycle.rs"))?;
+    let combat_source = fs::read_to_string(root.join("examples/combat-runtime/src/main.rs"))?;
+    let release_lifecycle_source = format!("{task_lifecycle_source}\n{combat_source}");
+    let unverified_host_resource_release_kinds = missing_evidence(
+        &release_lifecycle_source,
+        &[
+            "struct ExpectedReleases",
+            "ReleaseKind::HostRequest",
+            "ReleaseKind::ResourceToken",
+            "ReleaseKind::Snapshot",
+            "generated_host_binding_releases_request_token_and_snapshot_exactly_once",
+            "cancel_task(",
+            "restart_reload(",
+            "decode_owned()",
+        ],
+    );
     let legacy_host_abi_violations = count_identifier(&audit_sources, "HostArgs")
         + count_identifier(&audit_sources, "HostValue")
         + count_occurrences(
@@ -351,6 +490,10 @@ fn repo_audit() -> Result<(), DynError> {
         && public_api_violations.is_empty()
         && public_raw_task_api_violations == 0
         && public_task_lifecycle_bypass_violations == 0
+        && shadow_runtime_model_violations == 0
+        && business_host_stub_e2e_violations == 0
+        && real_runtime_fuzz_violations == 0
+        && unverified_host_resource_release_kinds == 0
         && legacy_host_abi_violations == 0
         && completion_buffer_symbol_violations == 0
         && reload_pause_symbol_violations == 0
@@ -359,7 +502,7 @@ fn repo_audit() -> Result<(), DynError> {
         && versioned_model_file_count == 0
         && tag_valid;
     let report = RepoHealth {
-        schema_version: 2,
+        schema_version: 3,
         product_rust_loc,
         unit_test_loc,
         integration_test_loc,
@@ -378,6 +521,10 @@ fn repo_audit() -> Result<(), DynError> {
         public_api_violations,
         public_raw_task_api_violations,
         public_task_lifecycle_bypass_violations,
+        shadow_runtime_model_violations,
+        business_host_stub_e2e_violations,
+        real_runtime_fuzz_violations,
+        unverified_host_resource_release_kinds,
         legacy_host_abi_violations,
         completion_buffer_symbol_violations,
         reload_pause_symbol_violations,
@@ -486,6 +633,13 @@ fn count_occurrences(sources: &BTreeMap<String, String>, needles: &[&str]) -> us
                 .sum::<usize>()
         })
         .sum()
+}
+
+fn missing_evidence(source: &str, required: &[&str]) -> usize {
+    required
+        .iter()
+        .filter(|needle| !source.contains(**needle))
+        .count()
 }
 
 fn count_identifier(sources: &BTreeMap<String, String>, identifier: &str) -> usize {

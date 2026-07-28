@@ -30,6 +30,10 @@ module epoch is stale: the result is discarded and its Host resource is
 released exactly once. It never enters an intermediate replay queue and never
 resumes an old Task.
 
+Rollback restores only the pre-commit root and state. It does not revive an old
+Task, Request, Resource Token, Typed Snapshot, continuation, or completion.
+Every resource owned by a quiesced Task is released exactly once.
+
 Nexa does not preserve old continuations, resume old Tasks, run old and new
 business code concurrently, route work through released modules, or support
 seamless multi-version reload.

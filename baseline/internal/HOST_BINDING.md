@@ -27,3 +27,10 @@ parsed, validated, generated three times byte-for-byte, compiled in an
 independent Host crate, and checked against old bytecode before interpreter
 admission. A Host implementation is patched only when its generated Trait
 contract actually changes.
+
+Compatibility is decided against the handwritten `BusinessHostV1`, never a
+generated Stub. Rust JSON diagnostics must point into `business_host.rs` and
+name an affected business symbol. Each incompatible case applies an explicit
+minimal business-code patch; every changed binding then loads and executes the
+stable `heartbeat` function. Generated binding and Dispatcher files are never
+hand-edited.
