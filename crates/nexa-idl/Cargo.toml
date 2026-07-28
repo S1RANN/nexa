@@ -9,5 +9,10 @@ publish.workspace = true
 nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-core = { path = "../nexa-core" }
 
+[dev-dependencies]
+nexa-compiler = { path = "../nexa-compiler" }
+nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
+nexa-verifier = { path = "../nexa-verifier" }
+
 [lints]
 workspace = true

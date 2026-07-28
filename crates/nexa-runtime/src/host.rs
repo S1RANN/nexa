@@ -1053,40 +1053,6 @@ impl HostPayload {
     }
 }
 
-/// Legacy materialized host value. Converting runtime values to this form may allocate.
-#[deprecated(note = "use RuntimeHostArgs borrowed views and HostReturnTransaction")]
-#[derive(Clone, Debug, PartialEq)]
-pub enum HostValue {
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    Bool(bool),
-    Rune(char),
-    String(String),
-    Array(CopyBuffer<HostValue>),
-    Buffer(CopyBuffer<HostValue>),
-    Opaque(u64),
-    Struct(Vec<HostValue>),
-    Enum {
-        type_id: nexa_core::StableId,
-        variant: nexa_core::StableId,
-        tag: u32,
-        payload: Option<Box<HostValue>>,
-    },
-    Request(HostRequestHandle),
-    Token(ResourceTokenHandle),
-    Snapshot(SnapshotHandle),
-    Unit,
-}
-
-impl HostValue {
-    #[must_use]
-    pub fn structure<const N: usize>(fields: [Self; N]) -> Self {
-        Self::Struct(Vec::from(fields))
-    }
-}
-
 const MAX_HOST_ARGUMENTS: usize = 8;
 pub const MAX_HOST_RETURN_FIELDS: usize = nexa_bytecode::MAX_STRUCT_FIELDS;
 
@@ -1537,10 +1503,6 @@ impl<'a> RuntimeHostArgs<'a> {
         }
     }
 
-    pub fn host_value(&self, index: usize) -> Result<HostValue, HostTrap> {
-        runtime_argument_to_host_value(self.value(index)?, self.heap.as_deref())
-    }
-
     pub fn return_transaction(
         self,
         requirements: HostReturnRequirements,
@@ -1548,153 +1510,9 @@ impl<'a> RuntimeHostArgs<'a> {
         HostReturnTransaction::new(self.heap.ok_or(HostTrap::Type)?, requirements)
     }
 
-    fn materialize(&self) -> Result<HostArgs<'static>, HostTrap> {
-        HostArgs::from_runtime(self.values, self.heap.as_deref())
-    }
-
     fn value(&self, index: usize) -> Result<crate::RuntimeValue, HostTrap> {
         self.values.get(index).copied().ok_or(HostTrap::Arity)
     }
-}
-
-/// Legacy materialized argument list. Runtime conversion may allocate.
-#[deprecated(note = "use RuntimeHostArgs borrowed views")]
-#[derive(Clone, Debug)]
-pub struct HostArgs<'a> {
-    borrowed: Option<&'a [HostValue]>,
-    inline: [HostValue; MAX_HOST_ARGUMENTS],
-    len: usize,
-}
-
-impl<'a> HostArgs<'a> {
-    #[must_use]
-    pub fn new(values: &'a [HostValue]) -> Self {
-        Self {
-            borrowed: Some(values),
-            inline: std::array::from_fn(|_| HostValue::Unit),
-            len: values.len(),
-        }
-    }
-
-    pub(crate) fn from_runtime(
-        values: &[crate::RuntimeValue],
-        heap: Option<&crate::Heap>,
-    ) -> Result<Self, HostTrap> {
-        if values.len() > MAX_HOST_ARGUMENTS {
-            return Err(HostTrap::Arity);
-        }
-        let mut inline = std::array::from_fn(|_| HostValue::Unit);
-        for (destination, value) in inline.iter_mut().zip(values.iter().copied()) {
-            *destination = runtime_argument_to_host_value(value, heap)?;
-        }
-        Ok(Self {
-            borrowed: None,
-            inline,
-            len: values.len(),
-        })
-    }
-
-    #[must_use]
-    pub const fn len(&self) -> usize {
-        self.len
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-
-    pub fn get(&self, index: usize) -> Result<&HostValue, HostTrap> {
-        let values = self.borrowed.unwrap_or(&self.inline[..self.len]);
-        values.get(index).ok_or(HostTrap::Arity)
-    }
-}
-
-fn runtime_argument_to_host_value(
-    value: crate::RuntimeValue,
-    heap: Option<&crate::Heap>,
-) -> Result<HostValue, HostTrap> {
-    Ok(match value {
-        crate::RuntimeValue::I32(value) => HostValue::I32(value),
-        crate::RuntimeValue::I64(value) => HostValue::I64(value),
-        crate::RuntimeValue::F32(bits) => HostValue::F32(f32::from_bits(bits)),
-        crate::RuntimeValue::F64(bits) => HostValue::F64(f64::from_bits(bits)),
-        crate::RuntimeValue::Bool(value) => HostValue::Bool(value),
-        crate::RuntimeValue::Rune(value) => {
-            HostValue::Rune(char::from_u32(value).expect("verified rune is a Unicode scalar value"))
-        }
-        crate::RuntimeValue::String { reference, .. } => HostValue::String(
-            heap.ok_or(HostTrap::Type)?
-                .string(reference)
-                .map_err(|_| HostTrap::Type)?
-                .to_owned(),
-        ),
-        value @ crate::RuntimeValue::Struct { .. } => HostValue::Struct(
-            heap.ok_or(HostTrap::Type)?
-                .struct_fields(value)
-                .map_err(|_| HostTrap::Type)?
-                .iter()
-                .map(|field| runtime_argument_to_host_value(*field, heap))
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
-        value @ crate::RuntimeValue::NamedRef { .. }
-            if heap.is_some_and(|heap| heap.array_values(value).is_ok()) =>
-        {
-            HostValue::Array(CopyBuffer::new(
-                heap.expect("array guard requires a heap")
-                    .array_values(value)
-                    .map_err(|_| HostTrap::Type)?
-                    .iter()
-                    .map(|element| runtime_argument_to_host_value(*element, heap))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        }
-        value @ crate::RuntimeValue::NamedRef { .. }
-            if heap.is_some_and(|heap| heap.buffer_values(value).is_ok()) =>
-        {
-            HostValue::Buffer(CopyBuffer::new(
-                heap.expect("buffer guard requires a heap")
-                    .buffer_values(value)
-                    .map_err(|_| HostTrap::Type)?
-                    .iter()
-                    .map(|element| runtime_argument_to_host_value(*element, heap))
-                    .collect::<Result<Vec<_>, _>>()?,
-            ))
-        }
-        value @ crate::RuntimeValue::NamedRef { .. }
-            if heap.is_some_and(|heap| heap.enum_parts(value).is_ok()) =>
-        {
-            let (type_id, variant, tag, payload) = heap
-                .expect("enum guard requires a heap")
-                .enum_parts(value)
-                .map_err(|_| HostTrap::Type)?;
-            HostValue::Enum {
-                type_id,
-                variant,
-                tag,
-                payload: payload
-                    .map(|payload| runtime_argument_to_host_value(payload, heap))
-                    .transpose()?
-                    .map(Box::new),
-            }
-        }
-        crate::RuntimeValue::Ref(reference) | crate::RuntimeValue::NamedRef { reference, .. } => {
-            HostValue::Opaque(u64::from(reference.generation) << 32 | u64::from(reference.index))
-        }
-        crate::RuntimeValue::HostRequest(request) => HostValue::Request(request),
-        crate::RuntimeValue::ResourceToken(token) => HostValue::Token(token),
-        crate::RuntimeValue::Snapshot(snapshot) => HostValue::Snapshot(snapshot),
-        crate::RuntimeValue::Opaque { value, .. } => HostValue::Opaque(value),
-        crate::RuntimeValue::StateHandle {
-            domain,
-            stable_id,
-            generation,
-            ..
-        } => HostValue::Opaque(
-            domain ^ stable_id.0.rotate_left(17) ^ u64::from(generation).rotate_left(41),
-        ),
-        crate::RuntimeValue::Unit => HostValue::Unit,
-    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2034,7 +1852,6 @@ impl EncodeHostReturn for String {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HostCallOutcome {
-    Immediate(HostValue),
     RuntimeImmediate(crate::RuntimeValue),
     Pending(HostRequestHandle),
 }
@@ -2054,23 +1871,12 @@ pub trait HostRegistry {
         None
     }
 
-    /// Compatibility dispatch for materialized callers. This path may allocate.
-    #[deprecated(note = "production registries must override call_runtime")]
-    fn call(
-        &mut self,
-        id: u32,
-        context: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
-    ) -> Result<HostCallOutcome, HostTrap>;
-
     fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
-    ) -> Result<HostCallOutcome, HostTrap> {
-        self.call(id, context, args.materialize()?)
-    }
+    ) -> Result<HostCallOutcome, HostTrap>;
 }
 
 pub trait ScriptFunction {

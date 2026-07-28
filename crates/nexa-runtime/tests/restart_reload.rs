@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
@@ -9,9 +7,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap,
-    PendingHostRequest, RealmConfig, RealmRuntime, ReleaseKind, ResourceContext,
-    RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeValue,
+    CancelReason, HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest,
+    RealmConfig, RealmRuntime, ReleaseKind, ResourceContext, RestartReloadOutcome,
+    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeValue,
     StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
@@ -32,11 +30,11 @@ impl HostRegistry for Host {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        arguments: HostArgs<'_>,
+        arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         if id != 0 || !arguments.is_empty() {
             return Err(HostTrap::Arity);

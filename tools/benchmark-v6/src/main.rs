@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,9 +15,9 @@ use nexa_migrate::{
 };
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, ExecutionCharge, FrameLimits, FuelState, Heap,
-    HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, InterpreterOutcome,
-    OpcodeCostTable, PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RuntimeHost, RuntimeResourceLedger, RuntimeValue, StateObject, StateValue, StepConfig,
+    HostCallOutcome, HostPayload, HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable,
+    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost,
+    RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue, StateObject, StateValue, StepConfig,
     TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
@@ -720,11 +718,11 @@ impl HostRegistry for NullRegistry {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         _: u32,
         _: &mut ResourceContext<'_>,
-        _: HostArgs<'_>,
+        _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         Err(HostTrap::UnknownFunction(u32::MAX))
     }
@@ -739,11 +737,11 @@ impl HostRegistry for AsyncRegistry {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
+        args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         if id != 0 || args.len() != 1 {
             return Err(HostTrap::UnknownFunction(id));

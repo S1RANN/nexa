@@ -1,13 +1,11 @@
-#![allow(deprecated)]
-
 use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, PollResult, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeHost, RuntimeValue, ScopeHandle, StepConfig, TaskHandle,
-    TaskLimits,
+    HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, PollResult, RealmConfig, RealmRuntime,
+    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StepConfig,
+    TaskHandle, TaskLimits,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -66,11 +64,11 @@ impl HostRegistry for NoHost {
         Some(self.0)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         _: &mut ResourceContext<'_>,
-        _: HostArgs<'_>,
+        _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         Err(HostTrap::UnknownFunction(id))
     }

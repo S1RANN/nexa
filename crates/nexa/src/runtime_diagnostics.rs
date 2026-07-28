@@ -10,7 +10,7 @@ use nexa_bytecode::{
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_runtime::{
-    GcRef, HostArgs, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
+    GcRef, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
     ModuleHandle, PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext,
     RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeLimits,
     RuntimeValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
@@ -219,15 +219,6 @@ impl DiagnosticRegistry {
 impl HostRegistry for DiagnosticRegistry {
     fn interface_hash(&self) -> Option<StableId> {
         Some(self.hash)
-    }
-
-    fn call(
-        &mut self,
-        _: u32,
-        _: &mut ResourceContext<'_>,
-        _: HostArgs<'_>,
-    ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(u32::MAX))
     }
 
     fn call_runtime(

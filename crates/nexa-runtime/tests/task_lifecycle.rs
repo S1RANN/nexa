@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::sync::{Arc, Mutex};
 
 use nexa_bytecode::{
@@ -8,10 +6,10 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostArgs, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostRegistry,
-    HostTrap, PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeFailurePoint,
-    RuntimeHost, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason,
-    TickBudget, YieldReason,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostRegistry, HostTrap,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeFailurePoint,
+    RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
+    TaskTerminalReason, TickBudget, YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -28,11 +26,11 @@ impl HostRegistry for AsyncRegistry {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        arguments: HostArgs<'_>,
+        arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         assert!(!self.panic, "injected host panic");
         if id != 0 || !arguments.is_empty() {

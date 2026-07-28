@@ -15,15 +15,15 @@ use crate::scheduler::Scheduler;
 use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, StatefulRegistry};
 use crate::task::TaskExecution;
 use crate::{
-    CheckedInterpreter, CollectionStats, ContinuationReservation, CopyBuffer, DiagnosticCode,
-    ExecutionCharge, FuelState, GcRef, GcRoots, Heap, HeapError, HostCallOutcome,
-    HostCompletionDelivery, HostCompletionResult, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostTrap, HostValue, InterpreterError, InterpreterHost,
-    InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object, OpcodeCostTable,
-    PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError, RuntimeHost,
-    RuntimeHostArgs, RuntimeHostDomain, RuntimeHostState, RuntimeLimits, RuntimeMessage,
-    RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError, SlotPool,
-    SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap, TrapKind,
+    CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
+    FuelState, GcRef, GcRoots, Heap, HeapError, HostCallOutcome, HostCompletionDelivery,
+    HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
+    InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
+    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
+    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
+    RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue,
+    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
+    TaskRuntime, TaskState, Trap, TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -152,18 +152,6 @@ struct RealmHostBridge<'a> {
     module_id: u32,
     epoch: u64,
     imports: &'a [HostImport],
-    enum_types: &'a [nexa_bytecode::EnumType],
-    struct_types: &'a [nexa_bytecode::StructType],
-    array_types: &'a [nexa_bytecode::ArrayType],
-    buffer_types: &'a [nexa_bytecode::BufferType],
-}
-
-#[derive(Clone, Copy)]
-struct HostBoundaryTypes<'a> {
-    enums: &'a [nexa_bytecode::EnumType],
-    structs: &'a [nexa_bytecode::StructType],
-    arrays: &'a [nexa_bytecode::ArrayType],
-    buffers: &'a [nexa_bytecode::BufferType],
 }
 
 impl InterpreterHost for RealmHostBridge<'_> {
@@ -171,30 +159,18 @@ impl InterpreterHost for RealmHostBridge<'_> {
         &mut self,
         import: u32,
         arguments: &[RuntimeValue],
-        mut heap: Option<&mut Heap>,
+        heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
-        let metadata = self
-            .imports
+        self.imports
             .get(import as usize)
             .ok_or(HostTrap::UnknownFunction(import))?;
-        let values = RuntimeHostArgs::new(arguments, heap.as_deref_mut())?;
+        let values = RuntimeHostArgs::new(arguments, heap)?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
         match crate::invoke_host_boundary(|| {
             self.registry.call_runtime(import, &mut context, values)
         })? {
-            HostCallOutcome::Immediate(value) => {
-                Ok(InterpreterHostOutcome::Immediate(host_to_runtime_value(
-                    value,
-                    metadata.result,
-                    heap,
-                    self.enum_types,
-                    self.struct_types,
-                    self.array_types,
-                    self.buffer_types,
-                )?))
-            }
             HostCallOutcome::RuntimeImmediate(value) => {
                 Ok(InterpreterHostOutcome::Immediate(value))
             }
@@ -226,400 +202,6 @@ impl InterpreterState for RealmStateBridge<'_> {
     fn is_alive(&mut self, handle: crate::StateHandle) -> bool {
         self.registry.is_handle_alive(handle)
     }
-}
-
-fn host_to_runtime_value(
-    value: HostValue,
-    expected: Option<ValueType>,
-    heap: Option<&mut Heap>,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    array_types: &[nexa_bytecode::ArrayType],
-    buffer_types: &[nexa_bytecode::BufferType],
-) -> Result<RuntimeValue, HostTrap> {
-    let types = HostBoundaryTypes {
-        enums: enum_types,
-        structs: struct_types,
-        arrays: array_types,
-        buffers: buffer_types,
-    };
-    let slots = validate_host_value(
-        &value,
-        expected,
-        heap.as_deref(),
-        enum_types,
-        struct_types,
-        array_types,
-        buffer_types,
-    )?;
-    if slots == 0 {
-        return commit_host_value(value, expected, None, None, types);
-    }
-    let heap = heap.ok_or(HostTrap::Type)?;
-    let mut reservation = heap.preflight(slots).map_err(|_| HostTrap::Type)?;
-    commit_host_value(value, expected, Some(heap), Some(&mut reservation), types)
-}
-
-#[allow(clippy::too_many_lines)]
-fn validate_host_value(
-    value: &HostValue,
-    expected: Option<ValueType>,
-    heap: Option<&Heap>,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    array_types: &[nexa_bytecode::ArrayType],
-    buffer_types: &[nexa_bytecode::BufferType],
-) -> Result<usize, HostTrap> {
-    match (value, expected) {
-        (HostValue::I32(_), Some(ValueType::I32))
-        | (HostValue::I64(_), Some(ValueType::I64))
-        | (HostValue::F32(_), Some(ValueType::F32))
-        | (HostValue::F64(_), Some(ValueType::F64))
-        | (HostValue::Bool(_), Some(ValueType::Bool))
-        | (HostValue::Rune(_), Some(ValueType::Rune))
-        | (
-            HostValue::Request(_) | HostValue::Token(_) | HostValue::Opaque(_),
-            Some(ValueType::Named(_)),
-        )
-        | (HostValue::Unit, None) => Ok(0),
-        (HostValue::Snapshot(snapshot), Some(ValueType::Named(type_id)))
-            if snapshot.type_id() == type_id =>
-        {
-            Ok(0)
-        }
-        (HostValue::String(value), Some(ValueType::String)) => {
-            heap.ok_or(HostTrap::Type)?
-                .validate_string_length(value.len())
-                .map_err(|_| HostTrap::Type)?;
-            Ok(1)
-        }
-        (
-            HostValue::Enum {
-                type_id,
-                variant,
-                tag,
-                payload,
-            },
-            Some(ValueType::Named(expected_type)),
-        ) if *type_id == expected_type => {
-            let metadata = enum_types
-                .iter()
-                .find(|enum_type| enum_type.type_id == expected_type)
-                .and_then(|enum_type| {
-                    enum_type
-                        .variants
-                        .iter()
-                        .find(|candidate| candidate.stable_id == *variant && candidate.tag == *tag)
-                })
-                .ok_or(HostTrap::Type)?;
-            let payload_slots = match (payload.as_deref(), metadata.payload_type) {
-                (Some(payload), Some(payload_type)) => validate_host_value(
-                    payload,
-                    Some(payload_type),
-                    heap,
-                    enum_types,
-                    struct_types,
-                    array_types,
-                    buffer_types,
-                )?,
-                (None, None) => 0,
-                _ => return Err(HostTrap::Type),
-            };
-            payload_slots.checked_add(1).ok_or(HostTrap::Type)
-        }
-        (HostValue::Struct(fields), Some(ValueType::Named(type_id))) => {
-            let metadata = struct_types
-                .iter()
-                .find(|struct_type| struct_type.type_id == type_id)
-                .ok_or(HostTrap::Type)?;
-            if fields.len() != metadata.fields.len() {
-                return Err(HostTrap::Type);
-            }
-            fields
-                .iter()
-                .zip(&metadata.fields)
-                .try_fold(1_usize, |slots, (value, field)| {
-                    slots
-                        .checked_add(validate_host_value(
-                            value,
-                            Some(field.ty),
-                            heap,
-                            enum_types,
-                            struct_types,
-                            array_types,
-                            buffer_types,
-                        )?)
-                        .ok_or(HostTrap::Type)
-                })
-        }
-        (HostValue::Array(array), Some(ValueType::Named(type_id))) => validate_host_array(
-            array,
-            type_id,
-            heap.ok_or(HostTrap::Type)?,
-            enum_types,
-            struct_types,
-            array_types,
-            buffer_types,
-        ),
-        (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => validate_host_buffer(
-            buffer,
-            type_id,
-            heap.ok_or(HostTrap::Type)?,
-            enum_types,
-            struct_types,
-            array_types,
-            buffer_types,
-        ),
-        _ => Err(HostTrap::Type),
-    }
-}
-
-fn validate_host_array(
-    array: &CopyBuffer<HostValue>,
-    type_id: StableId,
-    heap: &Heap,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    array_types: &[nexa_bytecode::ArrayType],
-    buffer_types: &[nexa_bytecode::BufferType],
-) -> Result<usize, HostTrap> {
-    let metadata = array_types
-        .iter()
-        .find(|array| array.type_id == type_id)
-        .ok_or(HostTrap::Type)?;
-    heap.validate_collection_length(array.len())
-        .map_err(|_| HostTrap::Type)?;
-    array.as_slice().iter().try_fold(1_usize, |slots, value| {
-        slots
-            .checked_add(validate_host_value(
-                value,
-                Some(metadata.element),
-                Some(heap),
-                enum_types,
-                struct_types,
-                array_types,
-                buffer_types,
-            )?)
-            .ok_or(HostTrap::Type)
-    })
-}
-
-fn validate_host_buffer(
-    buffer: &CopyBuffer<HostValue>,
-    type_id: StableId,
-    heap: &Heap,
-    enum_types: &[nexa_bytecode::EnumType],
-    struct_types: &[nexa_bytecode::StructType],
-    array_types: &[nexa_bytecode::ArrayType],
-    buffer_types: &[nexa_bytecode::BufferType],
-) -> Result<usize, HostTrap> {
-    let metadata = buffer_types
-        .iter()
-        .find(|buffer| buffer.type_id == type_id)
-        .ok_or(HostTrap::Type)?;
-    heap.validate_collection_length(buffer.len())
-        .map_err(|_| HostTrap::Type)?;
-    buffer.as_slice().iter().try_fold(1_usize, |slots, value| {
-        slots
-            .checked_add(validate_host_value(
-                value,
-                Some(metadata.element),
-                Some(heap),
-                enum_types,
-                struct_types,
-                array_types,
-                buffer_types,
-            )?)
-            .ok_or(HostTrap::Type)
-    })
-}
-
-#[allow(clippy::too_many_lines)]
-fn commit_host_value(
-    value: HostValue,
-    expected: Option<ValueType>,
-    mut heap: Option<&mut Heap>,
-    mut reservation: Option<&mut HeapReservation>,
-    types: HostBoundaryTypes<'_>,
-) -> Result<RuntimeValue, HostTrap> {
-    match (value, expected) {
-        (HostValue::I32(value), Some(ValueType::I32)) => Ok(RuntimeValue::I32(value)),
-        (HostValue::I64(value), Some(ValueType::I64)) => Ok(RuntimeValue::I64(value)),
-        (HostValue::F32(value), Some(ValueType::F32)) => Ok(RuntimeValue::F32(value.to_bits())),
-        (HostValue::F64(value), Some(ValueType::F64)) => Ok(RuntimeValue::F64(value.to_bits())),
-        (HostValue::Bool(value), Some(ValueType::Bool)) => Ok(RuntimeValue::Bool(value)),
-        (HostValue::Rune(value), Some(ValueType::Rune)) => Ok(RuntimeValue::Rune(value.into())),
-        (HostValue::String(value), Some(ValueType::String)) => {
-            let heap = heap.as_deref_mut().ok_or(HostTrap::Type)?;
-            let reference = heap.commit(
-                reservation.as_deref_mut().ok_or(HostTrap::Type)?,
-                Object::String(value),
-            );
-            let hash = heap.string_hash(reference).map_err(|_| HostTrap::Type)?;
-            Ok(RuntimeValue::String { reference, hash })
-        }
-        (
-            HostValue::Enum {
-                type_id,
-                variant,
-                tag,
-                payload,
-            },
-            Some(ValueType::Named(expected_type)),
-        ) if type_id == expected_type => {
-            let metadata = types
-                .enums
-                .iter()
-                .find(|enum_type| enum_type.type_id == expected_type)
-                .and_then(|enum_type| {
-                    enum_type
-                        .variants
-                        .iter()
-                        .find(|candidate| candidate.stable_id == variant && candidate.tag == tag)
-                })
-                .ok_or(HostTrap::Type)?;
-            let payload = match (payload, metadata.payload_type) {
-                (Some(payload), Some(payload_type)) => Some(commit_host_value(
-                    *payload,
-                    Some(payload_type),
-                    heap.as_deref_mut(),
-                    reservation.as_deref_mut(),
-                    types,
-                )?),
-                (None, None) => None,
-                _ => return Err(HostTrap::Type),
-            };
-            let heap = heap.ok_or(HostTrap::Type)?;
-            let reference = heap.commit(
-                reservation.ok_or(HostTrap::Type)?,
-                Object::Enum {
-                    type_id,
-                    variant,
-                    tag,
-                    payload,
-                },
-            );
-            Ok(RuntimeValue::NamedRef { reference, type_id })
-        }
-        (HostValue::Struct(fields), Some(ValueType::Named(type_id))) => commit_host_struct(
-            fields,
-            type_id,
-            heap.ok_or(HostTrap::Type)?,
-            reservation.ok_or(HostTrap::Type)?,
-            types,
-        ),
-        (HostValue::Array(array), Some(ValueType::Named(type_id))) => commit_host_array(
-            array,
-            type_id,
-            heap.ok_or(HostTrap::Type)?,
-            reservation.ok_or(HostTrap::Type)?,
-            types,
-        ),
-        (HostValue::Buffer(buffer), Some(ValueType::Named(type_id))) => commit_host_buffer(
-            buffer,
-            type_id,
-            heap.ok_or(HostTrap::Type)?,
-            reservation.ok_or(HostTrap::Type)?,
-            types,
-        ),
-        (HostValue::Request(value), Some(ValueType::Named(_))) => {
-            Ok(RuntimeValue::HostRequest(value))
-        }
-        (HostValue::Token(value), Some(ValueType::Named(_))) => {
-            Ok(RuntimeValue::ResourceToken(value))
-        }
-        (HostValue::Snapshot(value), Some(ValueType::Named(type_id)))
-            if value.type_id() == type_id =>
-        {
-            Ok(RuntimeValue::Snapshot(value))
-        }
-        (HostValue::Opaque(value), Some(ValueType::Named(type_id))) => {
-            Ok(RuntimeValue::Opaque { value, type_id })
-        }
-        (HostValue::Unit, None) => Ok(RuntimeValue::Unit),
-        _ => Err(HostTrap::Type),
-    }
-}
-
-fn commit_host_array(
-    array: CopyBuffer<HostValue>,
-    type_id: StableId,
-    heap: &mut Heap,
-    reservation: &mut HeapReservation,
-    types: HostBoundaryTypes<'_>,
-) -> Result<RuntimeValue, HostTrap> {
-    let metadata = types
-        .arrays
-        .iter()
-        .find(|array| array.type_id == type_id)
-        .ok_or(HostTrap::Type)?;
-    let mut values = Vec::with_capacity(array.len());
-    for value in array.into_vec() {
-        values.push(commit_host_value(
-            value,
-            Some(metadata.element),
-            Some(&mut *heap),
-            Some(&mut *reservation),
-            types,
-        )?);
-    }
-    heap.commit_array_values_reserved(reservation, type_id, metadata.element, &values)
-        .map_err(|_| HostTrap::Type)
-}
-
-fn commit_host_buffer(
-    buffer: CopyBuffer<HostValue>,
-    type_id: StableId,
-    heap: &mut Heap,
-    reservation: &mut HeapReservation,
-    types: HostBoundaryTypes<'_>,
-) -> Result<RuntimeValue, HostTrap> {
-    let metadata = types
-        .buffers
-        .iter()
-        .find(|buffer| buffer.type_id == type_id)
-        .ok_or(HostTrap::Type)?;
-    let mut values = Vec::with_capacity(buffer.len());
-    for value in buffer.into_vec() {
-        values.push(commit_host_value(
-            value,
-            Some(metadata.element),
-            Some(&mut *heap),
-            Some(&mut *reservation),
-            types,
-        )?);
-    }
-    heap.commit_buffer_values_reserved(reservation, type_id, metadata.element, &values)
-        .map_err(|_| HostTrap::Type)
-}
-
-fn commit_host_struct(
-    fields: Vec<HostValue>,
-    type_id: StableId,
-    heap: &mut Heap,
-    reservation: &mut HeapReservation,
-    types: HostBoundaryTypes<'_>,
-) -> Result<RuntimeValue, HostTrap> {
-    let metadata = types
-        .structs
-        .iter()
-        .find(|struct_type| struct_type.type_id == type_id)
-        .ok_or(HostTrap::Type)?;
-    if fields.len() != metadata.fields.len() {
-        return Err(HostTrap::Type);
-    }
-    let mut values = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-    for (index, (field, metadata)) in fields.into_iter().zip(&metadata.fields).enumerate() {
-        values[index] = commit_host_value(
-            field,
-            Some(metadata.ty),
-            Some(&mut *heap),
-            Some(&mut *reservation),
-            types,
-        )?;
-    }
-    heap.commit_struct(reservation, type_id, &values[..metadata.fields.len()])
-        .map_err(|_| HostTrap::Type)
 }
 
 fn completion_to_runtime(
@@ -2345,10 +1927,6 @@ impl RealmRuntime {
                 module_id: snapshot.module_id,
                 epoch: snapshot.module_epoch,
                 imports: &module.verified.module().host_imports,
-                enum_types: &module.verified.module().enum_types,
-                struct_types: &module.verified.module().struct_types,
-                array_types: &module.verified.module().array_types,
-                buffer_types: &module.verified.module().buffer_types,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
                 &module.verified,
@@ -4162,9 +3740,9 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex};
 
     use nexa_bytecode::{
-        ArrayType, BufferType, EnumType, EnumVariant, Function, FunctionBuilder, FunctionEffect,
-        HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap, Signature, SourceMapEntry,
-        StateField, StateSchema, StateType, StructField, StructType, ValueType,
+        Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
+        ModuleBuilder, RootMap, Signature, SourceMapEntry, StateField, StateSchema, StateType,
+        ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
@@ -4176,10 +3754,9 @@ mod tests {
     };
     use crate::task::TaskExecution;
     use crate::{
-        CopyBuffer, DecodeTypedSnapshot, HostArgs, HostCallOutcome, HostErrorPayload, HostPayload,
-        HostRegistry, HostTrap, HostValue, Object, ReloadError, ResourceContext, RuntimeHost,
-        RuntimeHostArgs, RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskState,
-        TickBudget,
+        DecodeTypedSnapshot, HostCallOutcome, HostErrorPayload, HostPayload, HostRegistry,
+        HostTrap, Object, ReloadError, ResourceContext, RuntimeHost, RuntimeHostArgs,
+        RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskState, TickBudget,
     };
 
     #[derive(Clone, Copy)]
@@ -4236,144 +3813,6 @@ mod tests {
     }
 
     #[test]
-    fn host_string_arguments_and_results_cross_the_gc_boundary() {
-        let mut heap = crate::Heap::new_with_string_limit(4, 32);
-        let runtime = super::host_to_runtime_value(
-            HostValue::String("host-result".into()),
-            Some(ValueType::String),
-            Some(&mut heap),
-            &[],
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-        let RuntimeValue::String { reference, .. } = runtime else {
-            panic!("host string result must become a GC string");
-        };
-        assert_eq!(heap.string(reference), Ok("host-result"));
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(args.get(0), Ok(&HostValue::String("host-result".into())));
-    }
-
-    #[test]
-    fn host_buffers_cross_sync_and_async_boundaries_by_copy() {
-        let metadata = BufferType::new(ValueType::I32);
-        let buffers = [metadata];
-        let host = HostValue::Buffer(CopyBuffer::new(vec![
-            HostValue::I32(1),
-            HostValue::I32(2),
-            HostValue::I32(3),
-        ]));
-        let retained_host_copy = host.clone();
-        let mut heap = crate::Heap::new_with_limits(8, usize::MAX, 4);
-        let runtime = super::host_to_runtime_value(
-            host,
-            Some(ValueType::Named(metadata.type_id)),
-            Some(&mut heap),
-            &[],
-            &[],
-            &[],
-            &buffers,
-        )
-        .unwrap();
-        let outbound = HostArgs::from_runtime(&[runtime], Some(&heap))
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .clone();
-        heap.buffer_set(runtime, 0, RuntimeValue::I32(9)).unwrap();
-        assert_eq!(
-            retained_host_copy,
-            HostValue::Buffer(CopyBuffer::new(vec![
-                HostValue::I32(1),
-                HostValue::I32(2),
-                HostValue::I32(3),
-            ]))
-        );
-        assert_eq!(outbound, retained_host_copy);
-        assert_eq!(heap.buffer_get(runtime, 0), Ok(RuntimeValue::I32(9)));
-
-        let completion = HostPayload::Buffer(CopyBuffer::new(vec![
-            HostPayload::I32(4),
-            HostPayload::I32(5),
-        ]));
-        let planned = super::plan_host_payload(
-            &completion,
-            ValueType::Named(metadata.type_id),
-            &[],
-            &[],
-            &[],
-            &buffers,
-        )
-        .unwrap();
-        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 1);
-        super::validate_planned_payload(&heap, &planned).unwrap();
-        let mut reservation = heap.preflight(1).unwrap();
-        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(
-            args.get(0),
-            Ok(&HostValue::Buffer(CopyBuffer::new(vec![
-                HostValue::I32(4),
-                HostValue::I32(5),
-            ])))
-        );
-    }
-
-    #[test]
-    fn host_arrays_cross_sync_and_async_boundaries_by_copy() {
-        let metadata = ArrayType::new(ValueType::I32);
-        let arrays = [metadata];
-        let host = HostValue::Array(CopyBuffer::new(vec![HostValue::I32(1), HostValue::I32(2)]));
-        let mut heap = crate::Heap::new_with_limits(8, usize::MAX, 4);
-        let runtime = super::host_to_runtime_value(
-            host.clone(),
-            Some(ValueType::Named(metadata.type_id)),
-            Some(&mut heap),
-            &[],
-            &[],
-            &arrays,
-            &[],
-        )
-        .unwrap();
-        let outbound = HostArgs::from_runtime(&[runtime], Some(&heap))
-            .unwrap()
-            .get(0)
-            .unwrap()
-            .clone();
-        heap.array_set(runtime, 0, RuntimeValue::I32(9)).unwrap();
-        assert_eq!(outbound, host);
-        assert_eq!(heap.array_get(runtime, 0), Ok(RuntimeValue::I32(9)));
-
-        let completion = HostPayload::Array(CopyBuffer::new(vec![
-            HostPayload::I32(3),
-            HostPayload::I32(4),
-        ]));
-        let planned = super::plan_host_payload(
-            &completion,
-            ValueType::Named(metadata.type_id),
-            &[],
-            &[],
-            &arrays,
-            &[],
-        )
-        .unwrap();
-        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 1);
-        let mut reservation = heap.preflight(1).unwrap();
-        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
-        assert_eq!(
-            HostArgs::from_runtime(&[runtime], Some(&heap))
-                .unwrap()
-                .get(0),
-            Ok(&HostValue::Array(CopyBuffer::new(vec![
-                HostValue::I32(3),
-                HostValue::I32(4),
-            ])))
-        );
-    }
-
-    #[test]
     fn typed_snapshot_host_boundaries_reject_content_type_confusion() {
         let mut tasks = crate::TaskRuntime::new(1, crate::RuntimeLimits::default());
         let scope = tasks.create_scope(None).unwrap();
@@ -4392,32 +3831,6 @@ mod tests {
             )
             .unwrap();
         let snapshot_type = nexa_bytecode::snapshot_type(content_type);
-        assert_eq!(
-            super::host_to_runtime_value(
-                HostValue::Snapshot(snapshot),
-                Some(ValueType::Named(snapshot_type)),
-                None,
-                &[],
-                &[],
-                &[],
-                &[],
-            ),
-            Ok(RuntimeValue::Snapshot(snapshot))
-        );
-        assert_eq!(
-            super::host_to_runtime_value(
-                HostValue::Snapshot(snapshot),
-                Some(ValueType::Named(nexa_bytecode::snapshot_type(
-                    StableId::from_name("OtherView"),
-                ))),
-                None,
-                &[],
-                &[],
-                &[],
-                &[],
-            ),
-            Err(HostTrap::Type)
-        );
         assert_eq!(
             super::completion_to_runtime(
                 HostPayload::Snapshot(snapshot),
@@ -4443,11 +3856,11 @@ mod tests {
                 Some(self.0)
             }
 
-            fn call(
+            fn call_runtime(
                 &mut self,
                 _id: u32,
                 _context: &mut ResourceContext<'_>,
-                _args: HostArgs<'_>,
+                _args: RuntimeHostArgs<'_>,
             ) -> Result<HostCallOutcome, HostTrap> {
                 Err(HostTrap::UnknownFunction(0))
             }
@@ -4501,157 +3914,6 @@ mod tests {
         };
         assert!(realm.create_typed_snapshot(task, invalid).is_err());
         assert_eq!(realm.resource_ledger(), before);
-    }
-
-    #[test]
-    fn host_enum_payloads_cross_the_gc_boundary_with_metadata_validation() {
-        let type_id = StableId::from_name("Event");
-        let variant = StableId::from_parts(&["Event", "::", "Damage"]);
-        let enum_types = [EnumType {
-            type_id,
-            variants: vec![EnumVariant {
-                stable_id: variant,
-                tag: 0,
-                payload_type: Some(ValueType::String),
-            }],
-        }];
-        let host = HostValue::Enum {
-            type_id,
-            variant,
-            tag: 0,
-            payload: Some(Box::new(HostValue::String("critical".into()))),
-        };
-        let mut heap = crate::Heap::new_with_string_limit(4, 32);
-        let runtime = super::host_to_runtime_value(
-            host.clone(),
-            Some(ValueType::Named(type_id)),
-            Some(&mut heap),
-            &enum_types,
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(args.get(0), Ok(&host));
-
-        let invalid = HostValue::Enum {
-            type_id,
-            variant,
-            tag: 1,
-            payload: Some(Box::new(HostValue::String("wrong-tag".into()))),
-        };
-        assert_eq!(
-            super::host_to_runtime_value(
-                invalid,
-                Some(ValueType::Named(type_id)),
-                Some(&mut heap),
-                &enum_types,
-                &[],
-                &[],
-                &[],
-            ),
-            Err(HostTrap::Type)
-        );
-
-        let completion = HostPayload::Enum {
-            type_id,
-            variant,
-            tag: 0,
-            payload: Some(Box::new(HostPayload::String("async".into()))),
-        };
-        let planned = super::plan_host_payload(
-            &completion,
-            ValueType::Named(type_id),
-            &enum_types,
-            &[],
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
-        super::validate_planned_payload(&heap, &planned).unwrap();
-        let mut reservation = heap.preflight(2).unwrap();
-        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(
-            args.get(0),
-            Ok(&HostValue::Enum {
-                type_id,
-                variant,
-                tag: 0,
-                payload: Some(Box::new(HostValue::String("async".into()))),
-            })
-        );
-    }
-
-    #[test]
-    fn host_structs_cross_sync_and_async_gc_boundaries_with_metadata_validation() {
-        let type_id = StableId::from_name("Position");
-        let struct_types = [StructType {
-            type_id,
-            fields: vec![
-                StructField {
-                    stable_id: StableId::from_parts(&["Position", "::x"]),
-                    ty: ValueType::I32,
-                },
-                StructField {
-                    stable_id: StableId::from_parts(&["Position", "::label"]),
-                    ty: ValueType::String,
-                },
-            ],
-        }];
-        let host = HostValue::Struct(vec![HostValue::I32(7), HostValue::String("spawn".into())]);
-        let mut heap = crate::Heap::new_with_string_limit(8, 64);
-        let runtime = super::host_to_runtime_value(
-            host.clone(),
-            Some(ValueType::Named(type_id)),
-            Some(&mut heap),
-            &[],
-            &struct_types,
-            &[],
-            &[],
-        )
-        .unwrap();
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(args.get(0), Ok(&host));
-        assert_eq!(
-            super::host_to_runtime_value(
-                HostValue::Struct(vec![HostValue::I32(7)]),
-                Some(ValueType::Named(type_id)),
-                Some(&mut heap),
-                &[],
-                &struct_types,
-                &[],
-                &[],
-            ),
-            Err(HostTrap::Type)
-        );
-
-        let completion = HostPayload::Struct(vec![
-            HostPayload::I32(8),
-            HostPayload::String("resume".into()),
-        ]);
-        let planned = super::plan_host_payload(
-            &completion,
-            ValueType::Named(type_id),
-            &[],
-            &struct_types,
-            &[],
-            &[],
-        )
-        .unwrap();
-        assert_eq!(super::planned_payload_slots(&planned).unwrap(), 2);
-        let mut reservation = heap.preflight(2).unwrap();
-        let runtime = super::commit_planned_payload(&mut heap, &mut reservation, planned).unwrap();
-        let args = HostArgs::from_runtime(&[runtime], Some(&heap)).unwrap();
-        assert_eq!(
-            args.get(0),
-            Ok(&HostValue::Struct(vec![
-                HostValue::I32(8),
-                HostValue::String("resume".into()),
-            ]))
-        );
     }
 
     fn module(yields: bool) -> (nexa_verifier::VerifiedModule, StableId, StableId) {
@@ -5068,15 +4330,6 @@ mod tests {
             Some(self.hash)
         }
 
-        fn call(
-            &mut self,
-            _: u32,
-            _: &mut ResourceContext<'_>,
-            _: HostArgs<'_>,
-        ) -> Result<HostCallOutcome, HostTrap> {
-            panic!("materializing call must not run")
-        }
-
         fn call_runtime(
             &mut self,
             id: u32,
@@ -5103,11 +4356,11 @@ mod tests {
             Some(self.hash)
         }
 
-        fn call(
+        fn call_runtime(
             &mut self,
             id: u32,
             context: &mut ResourceContext<'_>,
-            args: HostArgs<'_>,
+            args: RuntimeHostArgs<'_>,
         ) -> Result<HostCallOutcome, HostTrap> {
             if id != 0 || !args.is_empty() {
                 return Err(HostTrap::Arity);
@@ -5190,7 +4443,7 @@ mod tests {
     }
 
     #[test]
-    fn production_registry_never_calls_materializing_api() {
+    fn production_registry_uses_direct_runtime_api() {
         assert!(matches!(
             run_direct_writer_registry(),
             PollResult::Completed(Some(RuntimeValue::String { .. }))
@@ -5207,11 +4460,11 @@ mod tests {
             Some(self.hash)
         }
 
-        fn call(
+        fn call_runtime(
             &mut self,
             id: u32,
             context: &mut ResourceContext<'_>,
-            args: HostArgs<'_>,
+            args: RuntimeHostArgs<'_>,
         ) -> Result<HostCallOutcome, HostTrap> {
             if id != 0 || !args.is_empty() {
                 return Err(HostTrap::Arity);
@@ -6206,11 +5459,11 @@ mod tests {
                 Some(self.0)
             }
 
-            fn call(
+            fn call_runtime(
                 &mut self,
                 _id: u32,
                 _context: &mut ResourceContext<'_>,
-                _args: HostArgs<'_>,
+                _args: RuntimeHostArgs<'_>,
             ) -> Result<HostCallOutcome, HostTrap> {
                 Err(HostTrap::UnknownFunction(0))
             }

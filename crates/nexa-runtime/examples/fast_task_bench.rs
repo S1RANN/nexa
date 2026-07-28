@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::hint::black_box;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -10,8 +8,8 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostArgs, HostCallOutcome, HostPayload, HostRegistry, HostTrap, HostValue, PendingHostRequest,
-    PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostDomain,
+    HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, PollResult,
+    RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
     RuntimeValue, StepConfig, TaskLimits, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
@@ -118,10 +116,11 @@ fn main() {
     results.push(bench("generated_rust_thunk_direct_call", samples, || {
         let outcome = realm
             .with_resource_context(task, |context| {
-                registry.call(
+                registry.call_runtime(
                     0,
                     context,
-                    HostArgs::new(&[HostValue::I32(20), HostValue::I32(22)]),
+                    RuntimeHostArgs::new(&[RuntimeValue::I32(20), RuntimeValue::I32(22)], None)
+                        .unwrap(),
                 )
             })
             .unwrap()
@@ -558,19 +557,19 @@ impl HostRegistry for AddRegistry {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         _: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
+        args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         if id != 0 || args.len() != 2 {
             return Err(HostTrap::UnknownFunction(id));
         }
-        let (HostValue::I32(lhs), HostValue::I32(rhs)) = (args.get(0)?, args.get(1)?) else {
-            return Err(HostTrap::Type);
-        };
-        Ok(HostCallOutcome::Immediate(HostValue::I32(lhs + rhs)))
+        let (lhs, rhs) = (args.i32(0)?, args.i32(1)?);
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
+            lhs + rhs,
+        )))
     }
 }
 
@@ -583,11 +582,11 @@ impl HostRegistry for AsyncRegistry {
         Some(HOST)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
+        args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         if id != 0 || args.len() != 1 {
             return Err(HostTrap::UnknownFunction(id));

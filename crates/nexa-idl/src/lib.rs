@@ -705,12 +705,6 @@ pub fn generate_rust(idl: &Idl) -> String {
     )
     .expect("String writes do not fail");
     output.push_str(
-        "#[allow(deprecated)] fn call(&mut self, _: u32, _: &mut \
-         nexa_runtime::ResourceContext<'_>, _: nexa_runtime::HostArgs<'_>) -> \
-         Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> { \
-         panic!(\"materializing GeneratedHostRegistry::call is disabled\") }\n",
-    );
-    output.push_str(
         "fn call_runtime(&mut self, id: u32, context: &mut \
          nexa_runtime::ResourceContext<'_>, args: nexa_runtime::RuntimeHostArgs<'_>) -> \
          Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n",
@@ -2518,14 +2512,11 @@ mod tests {
         }
         for forbidden in [
             "args.host_value(",
-            "HostArgs::from_runtime",
             "runtime_argument_to_host_value",
             "to_owned",
             "collect::<Vec",
             "Box::new",
             "CopyBuffer::new",
-            "HostValue::Struct",
-            "HostValue::Enum",
         ] {
             assert!(
                 !runtime_dispatch.contains(forbidden),
@@ -2576,8 +2567,6 @@ mod tests {
             "Vec::with_capacity",
             "collect::<Vec",
             "into_vec()",
-            "HostValue::Array",
-            "HostValue::Buffer",
             "args.host_value",
         ] {
             assert!(
@@ -2820,14 +2809,12 @@ mod tests {
         let generated = generate_rust(&idl);
         assert!(generated.contains("fn call_runtime"));
         assert!(generated.contains("args.i32(7)?"));
-        assert!(!generated.contains("Vec<HostValue>"));
-        assert!(!generated.contains("HostValue::Struct(vec!"));
         fs::write(directory.join("src/bindings.rs"), generated).unwrap();
         fs::write(
             directory.join("src/main.rs"),
             r#"mod bindings;
 use bindings::{Entity, Event, EventRef, GameHost, GeneratedHostRegistry, HostError, Vec3, Vec3Ref};
-use nexa_runtime::{HostArgs, HostCallOutcome, HostRegistry, HostValue, RuntimeLimits, RuntimeResources, TaskRuntime};
+use nexa_runtime::{HostCallOutcome, HostRegistry, RuntimeLimits, RuntimeResources, TaskRuntime};
 
 struct Mock;
 impl GameHost for Mock {
@@ -2962,9 +2949,6 @@ fn main() {
             .unwrap(),
         HostCallOutcome::RuntimeImmediate(nexa_runtime::RuntimeValue::I32(36))
     );
-    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = registry.call(0, &mut context, HostArgs::new(&[]));
-    })).is_err());
 }
 "#,
         )

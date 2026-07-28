@@ -1,5 +1,3 @@
-#![allow(deprecated)]
-
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -13,8 +11,8 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, CopyBuffer, Heap, HeapError, HostArgs, HostCallOutcome, HostErrorPayload,
-    HostPayload, HostRegistry, HostReturnRequirements, HostTrap, HostValue,
+    CancelReason, CopyBuffer, Heap, HeapError, HostCallOutcome, HostErrorPayload, HostPayload,
+    HostRegistry, HostReturnRequirements, HostTrap,
     MigrationAllocationPhase, ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig,
     RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint,
     RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
@@ -2511,13 +2509,13 @@ impl HostRegistry for AsyncHost {
         Some(self.host_hash)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
+        args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 1 || !matches!(args.get(0)?, HostValue::I32(_)) {
+        if id != 0 || args.len() != 1 || args.i32(0).is_err() {
             return Err(HostTrap::Type);
         }
         let pending = context.create_request().map_err(|_| HostTrap::Panicked)?;
@@ -2532,25 +2530,6 @@ impl HostRegistry for ImmediateHost {
         Some(self.0)
     }
 
-    fn call(
-        &mut self,
-        id: u32,
-        _: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
-    ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 8 {
-            return Err(HostTrap::Arity);
-        }
-        let mut sum = 0;
-        for index in 0..8 {
-            let HostValue::I32(value) = args.get(index)? else {
-                return Err(HostTrap::Type);
-            };
-            sum += value;
-        }
-        Ok(HostCallOutcome::Immediate(HostValue::I32(sum)))
-    }
-
     fn call_runtime(
         &mut self,
         id: u32,
@@ -2560,7 +2539,7 @@ impl HostRegistry for ImmediateHost {
         if id != 0 || args.len() != 8 {
             return Err(HostTrap::Arity);
         }
-        Ok(HostCallOutcome::Immediate(HostValue::I32(
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
             args.i32(0)?
                 + args.i32(1)?
                 + args.i32(2)?
@@ -2578,11 +2557,11 @@ impl HostRegistry for NoHost {
         Some(self.0)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         _: &mut ResourceContext<'_>,
-        _: HostArgs<'_>,
+        _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         Err(HostTrap::UnknownFunction(id))
     }

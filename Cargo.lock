@@ -97,7 +97,10 @@ name = "nexa-idl"
 version = "0.1.0"
 dependencies = [
  "nexa-bytecode",
+ "nexa-compiler",
  "nexa-core",
+ "nexa-runtime",
+ "nexa-verifier",
 ]
 
 [[package]]

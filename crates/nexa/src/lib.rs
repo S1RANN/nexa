@@ -1,7 +1,6 @@
 //! Public Nexa facade.
 //!
 //! Stable facade over Nexa's model-checked runtime, compiler, bytecode and IDL APIs.
-#![allow(deprecated)]
 
 mod diagnostic_corpus;
 mod error;
@@ -67,9 +66,9 @@ pub mod prelude {
     pub use nexa_core::{FileId, FunctionId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_idl::{exact_hash as exact_idl_hash, generate_rust as generate_rust_bindings};
     pub use nexa_runtime::{
-        CancelReason, CompletionAccounting, HostArgs, HostCallOutcome, HostCompletionResult,
+        CancelReason, CompletionAccounting, HostCallOutcome, HostCompletionResult,
         HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
-        HostTrap, HostValue, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
+        HostTrap, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
         MigrationUsageReport, ModuleHandle, PendingHostRequest, PendingReason, PollResult,
         RealmConfig, RealmError, RealmRuntime, ResourceContext, ResourceTokenHandle,
         RestartReloadOutcome, RestartReloadPolicy, RuntimeFailureConfigError,

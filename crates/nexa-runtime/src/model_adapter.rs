@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use crate::scheduler::{Scheduler, SchedulerCheckpoint};
 use crate::task::TaskExecution;
 use crate::{
-    CheckedInterpreter, FuelState, HostArgs, HostCallOutcome, HostCompletionResult, HostPayload,
+    CheckedInterpreter, FuelState, HostCallOutcome, HostCompletionResult, HostPayload,
     HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable, PendingHostRequest, RealmConfig,
     RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostState, RuntimeLimits, RuntimeResources,
     RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskRuntime, TaskSnapshot, TaskState,
@@ -1072,16 +1072,13 @@ impl HostRegistry for RoutingRegistry {
         Some(self.hash)
     }
 
-    fn call(
+    fn call_runtime(
         &mut self,
         id: u32,
         context: &mut ResourceContext<'_>,
-        args: HostArgs<'_>,
+        args: crate::RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0
-            || args.len() > 1
-            || (args.len() == 1 && !matches!(args.get(0)?, crate::HostValue::I32(_)))
-        {
+        if id != 0 || args.len() > 1 || (args.len() == 1 && args.i32(0).is_err()) {
             return Err(HostTrap::Arity);
         }
         let pending = context

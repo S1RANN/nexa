@@ -1,5 +1,4 @@
 //! Model-driven Nexa runtime primitives.
-#![allow(deprecated)]
 
 mod allocation;
 mod failure;
@@ -51,17 +50,17 @@ pub use heap::{
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
-    HostArgs, HostArrayRef, HostBufferRef, HostCallOutcome, HostCollectionBuilder,
-    HostCompletionDelivery, HostCompletionProtocolError, HostCompletionResult,
-    HostCompletionTicket, HostEnumRef, HostErrorPayload, HostOptionRef, HostPayload, HostRegistry,
-    HostRequestError, HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
-    HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValue, HostValueRef,
-    MAX_HOST_RETURN_FIELDS, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
-    ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
-    ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
-    RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
-    RuntimeResources, ScriptFunction, SnapshotHandle, SnapshotLayout, TaskResourceSet,
-    TypedSnapshotRef, invoke_host_boundary, validate_host_completion,
+    HostArrayRef, HostBufferRef, HostCallOutcome, HostCollectionBuilder, HostCompletionDelivery,
+    HostCompletionProtocolError, HostCompletionResult, HostCompletionTicket, HostEnumRef,
+    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
+    HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValueRef, MAX_HOST_RETURN_FIELDS,
+    PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError,
+    ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle,
+    RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
+    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
+    SnapshotLayout, TaskResourceSet, TypedSnapshotRef, invoke_host_boundary,
+    validate_host_completion,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};

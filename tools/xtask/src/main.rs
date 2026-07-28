@@ -92,6 +92,15 @@ fn test_core() -> Result<(), DynError> {
 
 fn test_binding() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-idl"])?;
+    cargo(&[
+        "run",
+        "-p",
+        "nexa-cli",
+        "--",
+        "idl",
+        "check",
+        "examples/combat-runtime/combat_api.nidl",
+    ])?;
     cargo(&["check", "-p", "combat-runtime"])
 }
 
