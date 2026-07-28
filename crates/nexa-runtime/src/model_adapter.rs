@@ -708,10 +708,10 @@ impl RealmV4RoutingRuntimeAdapter {
             limits: TaskLimits::default(),
         };
         let task_a = realm
-            .call(module_a, 0, &[], config)
+            .spawn_task(module_a, 0, &[], config)
             .expect("module A task starts");
         let task_b = realm
-            .call(module_b, 0, &[], config)
+            .spawn_task(module_b, 0, &[], config)
             .expect("module B task starts");
         realm
             .poll_task_raw(task_a, 32)

@@ -16,9 +16,9 @@ use nexa_migrate::{
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, ExecutionCharge, FrameLimits, FuelState, Heap,
     HostCallOutcome, HostPayload, HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable,
-    PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost,
-    RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue, StateObject, StateValue, StepConfig,
-    TaskLimits, TickBudget,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs,
+    RuntimeResourceLedger, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll,
+    TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
@@ -337,10 +337,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let task =
                 call(&mut async_realm, async_module, async_scope, 7).expect("async task admission");
             assert!(matches!(
-                async_realm.poll_task_raw(task, 64),
-                Ok(PollResult::Pending(
-                    nexa_runtime::PendingReason::HostRequest
-                ))
+                async_realm.poll_task(task, 64),
+                Ok(TaskPoll::Waiting(_))
             ));
             let peak = PeakResources::from_ledger(async_realm.resource_ledger());
             let mut request = pending
@@ -435,10 +433,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .expect("drop module");
             let scope = realm.create_scope(None).expect("drop scope");
             let task = call(&mut realm, module, scope, 1).expect("drop task");
-            assert!(matches!(
-                realm.poll_task_raw(task, 0),
-                Ok(PollResult::Pending(_))
-            ));
+            assert!(matches!(realm.poll_task(task, 0), Ok(TaskPoll::Yielded(_))));
             let peak = PeakResources::from_ledger(realm.resource_ledger());
             (realm, peak)
         },
@@ -764,18 +759,20 @@ fn call(
     scope: nexa_runtime::ScopeHandle,
     value: i32,
 ) -> Result<nexa_runtime::TaskHandle, nexa_runtime::RealmError> {
-    realm.call(
-        module,
-        0,
-        &[RuntimeValue::I32(value)],
-        StepConfig {
-            owner: scope,
-            priority: 1,
-            fuel_slice: 64,
-            cumulative_budget: 1_024,
-            limits: TaskLimits::default(),
-        },
-    )
+    realm
+        .spawn_task(
+            module,
+            0,
+            &[RuntimeValue::I32(value)],
+            StepConfig {
+                owner: scope,
+                priority: 1,
+                fuel_slice: 64,
+                cumulative_budget: 1_024,
+                limits: TaskLimits::default(),
+            },
+        )
+        .map_err(Into::into)
 }
 
 fn close_host(host: &RuntimeHost) -> Result<(), Box<dyn std::error::Error>> {

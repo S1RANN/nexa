@@ -5,8 +5,8 @@ fn explicit_yield() {
         nexa_bytecode::Instruction::Return { source: 0 },
     ]);
     let (scope, task) = super::support::spawn(&mut realm, module);
-    let first = realm.poll_task_raw(task, 16).unwrap();
-    let second = realm.poll_task_raw(task, 16).unwrap();
+    let first = realm.poll_task(task, 16).unwrap();
+    let second = realm.poll_task(task, 16).unwrap();
     let extra = format!("first={first:?}\n");
     super::support::assert_snapshot(
         "explicit_yield",

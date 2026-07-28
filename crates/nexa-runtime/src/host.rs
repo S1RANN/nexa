@@ -2186,7 +2186,10 @@ pub enum HostRequestError {
     CompletionQueueFull,
     CompletionQueueClosed,
     UnknownCustomDomain(u32),
+    StaleHostRequestHandle,
+    CrossRealmHostRequestHandle,
     AlreadyCompleted,
+    DetachedByReload,
     InvalidState,
     InjectedFailure(crate::RuntimeFailurePoint),
 }
@@ -2291,11 +2294,23 @@ impl HostRequestManager {
         request: HostRequestHandle,
         result: HostCompletionResult,
     ) -> Result<(), HostRequestError> {
-        let reservation = self
-            .requests
-            .resolve(request.raw())?
-            .completion_reservation
-            .ok_or(HostRequestError::AlreadyCompleted)?;
+        if request.raw().realm_id != self.realm_id {
+            return Err(HostRequestError::CrossRealmHostRequestHandle);
+        }
+        let reservation = match self.requests.resolve(request.raw()) {
+            Ok(request) => request
+                .completion_reservation
+                .ok_or(HostRequestError::AlreadyCompleted)?,
+            Err(_) => {
+                return Err(match self.terminal_record(request) {
+                    Some(terminal) if terminal.state == HostRequestState::Detached => {
+                        HostRequestError::DetachedByReload
+                    }
+                    Some(_) => HostRequestError::AlreadyCompleted,
+                    None => HostRequestError::StaleHostRequestHandle,
+                });
+            }
+        };
         self.completion_sender().submit(reservation, result)
     }
 

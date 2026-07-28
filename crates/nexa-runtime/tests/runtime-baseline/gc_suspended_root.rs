@@ -23,14 +23,14 @@ fn gc_suspended_root() {
         .allocate(nexa_runtime::Object::String("root".into()))
         .unwrap();
     let task = realm
-        .call(
+        .spawn_task(
             module,
             0,
             &[nexa_runtime::RuntimeValue::Ref(reference)],
             super::support::task_config(scope),
         )
         .unwrap();
-    let result = realm.poll_task_raw(task, 16).unwrap();
+    let result = realm.poll_task(task, 16).unwrap();
     let live = realm.collect_garbage().unwrap();
     realm.cancel_scope(scope).unwrap();
     let reclaimed = realm.collect_garbage().unwrap();

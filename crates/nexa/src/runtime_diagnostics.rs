@@ -11,10 +11,10 @@ use nexa_bytecode::{
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_runtime::{
     GcRef, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
-    ModuleHandle, PendingHostRequest, PollResult, RealmConfig, RealmRuntime, ResourceContext,
-    RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeLimits,
-    RuntimeValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskTerminalReason,
-    TickBudget,
+    ModuleHandle, PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeHost, RuntimeHostArgs,
+    RuntimeLimits, RuntimeValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskPoll,
+    TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits};
 use serde::Serialize;
@@ -29,6 +29,13 @@ const RUNTIME_CODES: [&str; 10] = [
 
 type PendingRequestSlot = Arc<Mutex<Option<PendingHostRequest>>>;
 type HostedHarness = (RuntimeDiagnosticHarness, ModuleHandle, PendingRequestSlot);
+
+fn runtime_error_code(error: &RuntimeError) -> &'static str {
+    match error {
+        RuntimeError::Trap(trap) => trap.diagnostic_code,
+        _ => "",
+    }
+}
 
 pub struct RuntimeDiagnosticHarness {
     realm: RealmRuntime,
@@ -88,7 +95,7 @@ impl RuntimeDiagnosticHarness {
             .map_err(|error| error.to_string())?;
         let task = self
             .realm
-            .call(
+            .spawn_task(
                 module,
                 function,
                 &[],
@@ -456,9 +463,9 @@ fn host_argument_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let task = harness.call(module, 0)?;
     let result = harness
         .realm
-        .poll_task_raw(task, 128)
+        .poll_task(task, 128)
         .map_err(|error| error.to_string())?;
-    let PollResult::Trapped(trap) = result else {
+    let TaskPoll::Trapped(trap) = result else {
         return Err("host argument mismatch did not trap".into());
     };
     let after = harness.snapshot();
@@ -470,7 +477,10 @@ fn host_argument_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     if !matches!(terminal.reason, TaskTerminalReason::Trapped(_)) {
         unexpected.push("task did not enter Trapped terminal state".into());
     }
-    if trap.script_call_stack.is_empty() || trap.host_call_boundary.is_none() {
+    let TaskTerminalReason::Trapped(terminal_trap) = &terminal.reason else {
+        unreachable!("terminal reason checked above");
+    };
+    if terminal_trap.script_call_stack.is_empty() || terminal_trap.host_call_boundary.is_none() {
         unexpected.push("script stack or host call boundary is missing".into());
     }
     if harness.realm.resource_ledger().requests != 0 {
@@ -502,9 +512,9 @@ fn host_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let panic_task = panic_harness.call(panic_module, 0)?;
     let panic_result = panic_harness
         .realm
-        .poll_task_raw(panic_task, 128)
+        .poll_task(panic_task, 128)
         .map_err(|error| error.to_string())?;
-    let PollResult::Trapped(panic_trap) = panic_result else {
+    let TaskPoll::Trapped(panic_trap) = panic_result else {
         return Err("host panic did not trap".into());
     };
     let panic_after = panic_harness.snapshot();
@@ -514,14 +524,14 @@ fn host_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let mismatch_task = mismatch_harness.call(mismatch_module, 0)?;
     let mismatch_result = mismatch_harness
         .realm
-        .poll_task_raw(mismatch_task, 128)
+        .poll_task(mismatch_task, 128)
         .map_err(|error| error.to_string())?;
-    let PollResult::Trapped(mismatch_trap) = mismatch_result else {
+    let TaskPoll::Trapped(mismatch_trap) = mismatch_result else {
         return Err("host result mismatch did not trap".into());
     };
     let unexpected = [
-        panic_trap.diagnostic_code(),
-        mismatch_trap.diagnostic_code(),
+        runtime_error_code(&panic_trap),
+        runtime_error_code(&mismatch_trap),
     ]
     .iter()
     .enumerate()
@@ -542,7 +552,7 @@ fn host_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
             ("panic_contained".into(), json!(true)),
             (
                 "result_mismatch_observed".into(),
-                json!(mismatch_trap.diagnostic_code()),
+                json!(runtime_error_code(&mismatch_trap)),
             ),
         ]),
     ))
@@ -555,9 +565,9 @@ fn host_abandoned_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     assert!(matches!(
         harness
             .realm
-            .poll_task_raw(task, 128)
+            .poll_task(task, 128)
             .map_err(|error| error.to_string())?,
-        PollResult::Pending(_)
+        TaskPoll::Waiting(_)
     ));
     let request = pending
         .lock()
@@ -613,9 +623,9 @@ fn unknown_host_error_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     assert!(matches!(
         harness
             .realm
-            .poll_task_raw(task, 128)
+            .poll_task(task, 128)
             .map_err(|error| error.to_string())?,
-        PollResult::Pending(_)
+        TaskPoll::Waiting(_)
     ));
     let mut request = pending
         .lock()
@@ -688,7 +698,7 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         .map_err(|error| error.to_string())?;
     let task_error = task_harness
         .realm
-        .call(
+        .spawn_task(
             module,
             0,
             &[],
@@ -712,9 +722,9 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         },
     )?;
     let request_task = request_harness.call(request_module, 0)?;
-    let PollResult::Trapped(request_trap) = request_harness
+    let TaskPoll::Trapped(request_trap) = request_harness
         .realm
-        .poll_task_raw(request_task, 128)
+        .poll_task(request_task, 128)
         .map_err(|error| error.to_string())?
     else {
         return Err("request capacity did not trap".into());
@@ -722,7 +732,7 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let codes = [
         NexaError::from(module_error).code().as_str(),
         NexaError::from(task_error).code().as_str(),
-        request_trap.diagnostic_code(),
+        runtime_error_code(&request_trap),
     ];
     let unexpected = codes
         .iter()

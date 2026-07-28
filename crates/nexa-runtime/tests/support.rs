@@ -3,9 +3,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, PollResult, RealmConfig, RealmRuntime,
+    HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, RealmConfig, RealmRuntime,
     ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StepConfig,
-    TaskHandle, TaskLimits,
+    TaskHandle, TaskLimits, TaskPoll,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -88,7 +88,7 @@ pub fn task_config(owner: ScopeHandle) -> StepConfig {
 pub fn spawn(realm: &mut RealmRuntime, module: ModuleHandle) -> (ScopeHandle, TaskHandle) {
     let scope = realm.create_scope(None).unwrap();
     let task = realm
-        .call(module, 0, &[RuntimeValue::I32(7)], task_config(scope))
+        .spawn_task(module, 0, &[RuntimeValue::I32(7)], task_config(scope))
         .unwrap();
     (scope, task)
 }
@@ -98,7 +98,7 @@ pub fn snapshot(
     realm: &RealmRuntime,
     scope: ScopeHandle,
     task: TaskHandle,
-    result: &PollResult<Option<RuntimeValue>>,
+    result: &TaskPoll,
     extra: &str,
 ) -> String {
     format!(

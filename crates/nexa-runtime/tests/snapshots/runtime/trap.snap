@@ -1,4 +1,4 @@
-result=Trapped(Trap { kind: BytecodeTrap, message: "bytecode trap", module: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }), epoch: Some(1), function: 0, pc: 0, source_span: None, task: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }), script_call_stack: ScriptCallStack([ScriptFrame { function: 0, pc: 0, source_span: None }]), host_call_boundary: None })
+result=Trapped(Trap(RuntimeTrap { kind: BytecodeTrap, diagnostic_code: "NX5001", module: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }), epoch: Some(1), function: 0, pc: 0, source_span: None, task: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }) }))
 scope_state=Active
 terminal_state=Some(Trapped)
 terminal_reason=Some(Trapped(Trap { kind: BytecodeTrap, message: "bytecode trap", module: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }), epoch: Some(1), function: 0, pc: 0, source_span: None, task: Some(RawHandle { realm_id: 1, index: 0, generation: 0 }), script_call_stack: ScriptCallStack([ScriptFrame { function: 0, pc: 0, source_span: None }]), host_call_boundary: None }))

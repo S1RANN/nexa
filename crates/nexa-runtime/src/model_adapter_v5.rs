@@ -598,7 +598,7 @@ impl RealmV5RuntimeAdapter {
         for index in 0..REALM_V5_TASK_COUNT {
             let task = self
                 .realm
-                .call(
+                .spawn_task(
                     active,
                     4,
                     &[RuntimeValue::I32(

@@ -271,7 +271,7 @@ impl Default for RealmConfig {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PendingReason {
+pub(crate) enum PendingReason {
     Fuel,
     ExplicitYield,
     HostRequest,
@@ -282,7 +282,6 @@ pub enum PendingReason {
 pub enum YieldReason {
     Fuel,
     Explicit,
-    RestartReload,
 }
 
 pub type NexaValue = RuntimeValue;
@@ -674,7 +673,7 @@ pub enum CancelReason {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
-pub enum PollResult<T> {
+pub(crate) enum PollResult<T> {
     Completed(T),
     Pending(PendingReason),
     Cancelled(CancelReason),
@@ -1773,7 +1772,7 @@ impl RealmRuntime {
         self.active_root = Some(root);
     }
 
-    pub fn call(
+    fn spawn_task_inner(
         &mut self,
         module: ModuleHandle,
         function: u32,
@@ -1818,16 +1817,6 @@ impl RealmRuntime {
         Ok(task)
     }
 
-    pub fn spawn(
-        &mut self,
-        module: ModuleHandle,
-        function: u32,
-        arguments: &[RuntimeValue],
-        config: StepConfig,
-    ) -> Result<TaskHandle, RealmError> {
-        self.call(module, function, arguments, config)
-    }
-
     pub fn spawn_task(
         &mut self,
         module: ModuleHandle,
@@ -1835,13 +1824,12 @@ impl RealmRuntime {
         arguments: &[RuntimeValue],
         config: StepConfig,
     ) -> Result<TaskHandle, RuntimeError> {
-        self.call(module, function, arguments, config)
+        self.spawn_task_inner(module, function, arguments, config)
             .map_err(RuntimeError::from)
     }
 
     #[allow(clippy::too_many_lines)]
-    #[doc(hidden)]
-    pub fn poll_task_raw(
+    pub(crate) fn poll_task_raw(
         &mut self,
         task: TaskHandle,
         fuel_slice: u64,
@@ -2075,7 +2063,7 @@ impl RealmRuntime {
                 TaskPoll::Yielded(YieldReason::Explicit)
             }
             PollResult::Pending(PendingReason::ReloadPause) => {
-                TaskPoll::Yielded(YieldReason::RestartReload)
+                return Err(RuntimeError::from(RealmError::TaskWaiting));
             }
             PollResult::Pending(PendingReason::HostRequest) => {
                 let request = match self.tasks.execution(task)? {
@@ -3876,7 +3864,7 @@ mod tests {
         let module = realm.load_module(verified, host_hash, schema_hash).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(module, 0, &[RuntimeValue::I32(1)], task_config(scope))
+            .spawn_task(module, 0, &[RuntimeValue::I32(1)], task_config(scope))
             .unwrap();
         let content = TypedStorageRef::<'static>::CONTENT_TYPE;
         assert_eq!(
@@ -4118,7 +4106,7 @@ mod tests {
         let module = realm.load_module(module, host, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -4158,7 +4146,7 @@ mod tests {
         let fuel_module = realm.load_module(fuel_module, host, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let fuel_task = realm
-            .call(fuel_module, 0, &[RuntimeValue::I32(7)], task_config(scope))
+            .spawn_task(fuel_module, 0, &[RuntimeValue::I32(7)], task_config(scope))
             .unwrap();
         assert_eq!(
             realm.poll_task_raw(fuel_task, 0).unwrap(),
@@ -4181,7 +4169,7 @@ mod tests {
         let (explicit_module, _, _) = module(true);
         let explicit_module = realm.load_module(explicit_module, host, schema).unwrap();
         let explicit_task = realm
-            .call(
+            .spawn_task(
                 explicit_module,
                 0,
                 &[RuntimeValue::I32(9)],
@@ -4234,7 +4222,7 @@ mod tests {
                 .unwrap();
             let scope = realm.create_scope(None).unwrap();
             let task = realm
-                .call(module, 1, &[RuntimeValue::I32(3)], task_config(scope))
+                .spawn_task(module, 1, &[RuntimeValue::I32(3)], task_config(scope))
                 .unwrap();
             assert_eq!(
                 realm.poll_task_raw(task, 32).unwrap(),
@@ -4288,7 +4276,7 @@ mod tests {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(old, 1, &[RuntimeValue::I32(3)], task_config(scope))
+            .spawn_task(old, 1, &[RuntimeValue::I32(3)], task_config(scope))
             .unwrap();
         assert_eq!(
             realm.poll_task_raw(task, 32).unwrap(),
@@ -4430,7 +4418,9 @@ mod tests {
         .unwrap();
         let module = realm.load_module(module, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task = realm.call(module, 0, &[], task_config(scope)).unwrap();
+        let task = realm
+            .spawn_task(module, 0, &[], task_config(scope))
+            .unwrap();
         realm.poll_task_raw(task, 32).unwrap()
     }
 
@@ -4612,8 +4602,12 @@ mod tests {
             )
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
-        let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
+        let task_a = realm
+            .spawn_task(module_a, 2, &[], task_config(scope))
+            .unwrap();
+        let task_b = realm
+            .spawn_task(module_b, 2, &[], task_config(scope))
+            .unwrap();
         assert_eq!(
             realm.poll_task_raw(task_a, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
@@ -4715,7 +4709,7 @@ mod tests {
             )
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
+        let task = realm.spawn_task(old, 2, &[], task_config(scope)).unwrap();
         assert_eq!(
             realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
@@ -4818,7 +4812,7 @@ mod tests {
             )
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task = realm.call(old, 2, &[], task_config(scope)).unwrap();
+        let task = realm.spawn_task(old, 2, &[], task_config(scope)).unwrap();
         assert_eq!(
             realm.poll_task_raw(task, 32).unwrap(),
             PollResult::Pending(PendingReason::HostRequest)
@@ -4902,8 +4896,12 @@ mod tests {
                 )
                 .unwrap();
             let scope = realm.create_scope(None).unwrap();
-            let task_a = realm.call(module_a, 2, &[], task_config(scope)).unwrap();
-            let task_b = realm.call(module_b, 2, &[], task_config(scope)).unwrap();
+            let task_a = realm
+                .spawn_task(module_a, 2, &[], task_config(scope))
+                .unwrap();
+            let task_b = realm
+                .spawn_task(module_b, 2, &[], task_config(scope))
+                .unwrap();
             assert!(matches!(
                 realm.poll_task_raw(task_a, 32).unwrap(),
                 PollResult::Pending(PendingReason::HostRequest)
@@ -5045,7 +5043,7 @@ mod tests {
         let module = realm.load_module(module, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[],
@@ -5164,7 +5162,7 @@ mod tests {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let waiting = realm
-            .call(
+            .spawn_task(
                 epoch_one,
                 2,
                 &[],
@@ -5199,7 +5197,7 @@ mod tests {
         realm.commit_reload(&[], 32).unwrap();
 
         let token_owner = realm
-            .call(
+            .spawn_task(
                 epoch_two,
                 3,
                 &[RuntimeValue::I32(7)],
@@ -5284,7 +5282,7 @@ mod tests {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let waiting = realm
-            .call(
+            .spawn_task(
                 epoch_a,
                 2,
                 &[],
@@ -5330,7 +5328,7 @@ mod tests {
         realm.commit_reload(&[], 32).unwrap();
 
         let token_owner = realm
-            .call(
+            .spawn_task(
                 epoch_c,
                 3,
                 &[RuntimeValue::I32(7)],
@@ -5480,7 +5478,7 @@ mod tests {
         let module = realm.load_module(verified, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -5640,7 +5638,7 @@ mod tests {
         let old = realm.load_module(old, host_hash, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 old,
                 0,
                 &[],
@@ -6017,7 +6015,7 @@ mod tests {
 
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[value, value],
@@ -6058,7 +6056,7 @@ mod tests {
 
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 1,
                 &[stale_value],
@@ -6099,7 +6097,7 @@ mod tests {
         };
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 1,
                 &[foreign],
@@ -6161,7 +6159,7 @@ mod tests {
         let module = isolated.load_module(pure, host, schema).unwrap();
         let scope = isolated.create_scope(None).unwrap();
         let task = isolated
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(1)],
@@ -6199,7 +6197,7 @@ mod tests {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 2,
                 &[],
@@ -6275,7 +6273,9 @@ mod tests {
             .load_module(reloadable_async_module(host, schema), host, schema)
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
+        let task = realm
+            .spawn_task(module, 2, &[], task_config(scope))
+            .unwrap();
         let snapshot = realm.task_snapshot(task).unwrap();
         assert_eq!(
             realm.poll_task_raw(task, 32).unwrap(),
@@ -6367,7 +6367,9 @@ task fn entry() -> i32 {
         let mut realm = RealmRuntime::isolated(RealmConfig::default());
         let module = realm.load_module(verified, host_hash, schema_hash).unwrap();
         let scope = realm.create_scope(None).unwrap();
-        let task = realm.call(module, 2, &[], task_config(scope)).unwrap();
+        let task = realm
+            .spawn_task(module, 2, &[], task_config(scope))
+            .unwrap();
         let task_epoch = realm.task_snapshot(task).unwrap().module_epoch;
         let PollResult::Trapped(trap) = realm.poll_task_raw(task, 128).unwrap() else {
             panic!("source-compiled nested call must trap");
@@ -6474,7 +6476,7 @@ task fn entry() -> i32 {
         let module = realm.load_module(verified, host, schema).unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(module, 0, &[RuntimeValue::I32(9)], task_config(scope))
+            .spawn_task(module, 0, &[RuntimeValue::I32(9)], task_config(scope))
             .unwrap();
         let root = realm
             .allocate(Object::String("inspection-root".into()))

@@ -1180,7 +1180,10 @@ fn host_request_code(error: &HostRequestError) -> ErrorCode {
         | HostRequestError::HostClosing
         | HostRequestError::HostClosed
         | HostRequestError::CompletionQueueClosed
+        | HostRequestError::StaleHostRequestHandle
+        | HostRequestError::CrossRealmHostRequestHandle
         | HostRequestError::AlreadyCompleted
+        | HostRequestError::DetachedByReload
         | HostRequestError::InvalidState
         | HostRequestError::InjectedFailure(_) => ErrorCode::NX5001,
     }

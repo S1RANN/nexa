@@ -13,11 +13,11 @@ use nexa_core::StableId;
 use nexa_runtime::{
     CancelReason, CopyBuffer, Heap, HeapError, HostCallOutcome, HostErrorPayload, HostPayload,
     HostRegistry, HostReturnRequirements, HostTrap,
-    MigrationAllocationPhase, ModuleHandle, PendingHostRequest, PendingReason, PollResult, RealmConfig,
-    RealmError, RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint,
+    MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
+    RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint, TaskPoll,
     RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
     RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskRuntime, TaskState, TickBudget, set_migration_allocation_observer,
+    TaskRuntime, TaskState, TickBudget, YieldReason, set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -237,7 +237,7 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
     drop(pending.lock().unwrap());
     let scope = realm.create_scope(None).unwrap();
     let task = realm
-        .call(
+        .spawn_task(
             module,
             0,
             &[RuntimeValue::I32(11)],
@@ -250,10 +250,10 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
             },
         )
         .unwrap();
-    assert_eq!(
-        realm.poll_task_raw(task, 64).unwrap(),
-        PollResult::Pending(PendingReason::HostRequest)
-    );
+    assert!(matches!(
+        realm.poll_task(task, 64).unwrap(),
+        TaskPoll::Waiting(_)
+    ));
     let mut ticket = pending.lock().unwrap().take().unwrap().ticket;
     match completion {
         ObservedCompletion::Error(code) => {
@@ -343,7 +343,7 @@ fn observe_cleanup(cleanup_traps: bool) -> u64 {
     let (mut realm, module) = make_cleanup_realm(cleanup_traps);
     let scope = realm.create_scope(None).unwrap();
     let task = realm
-        .call(
+        .spawn_task(
             module,
             1,
             &[RuntimeValue::I32(19)],
@@ -357,8 +357,8 @@ fn observe_cleanup(cleanup_traps: bool) -> u64 {
         )
         .unwrap();
     assert_eq!(
-        realm.poll_task_raw(task, 64).unwrap(),
-        PollResult::Pending(PendingReason::ExplicitYield)
+        realm.poll_task(task, 64).unwrap(),
+        TaskPoll::Yielded(YieldReason::Explicit)
     );
     let allocations = observed(|| {
         realm
@@ -1292,7 +1292,7 @@ fn main() {
         ]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -1307,21 +1307,21 @@ fn main() {
             .unwrap();
         let promotion = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Pending(PendingReason::ExplicitYield)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Yielded(YieldReason::Explicit)
             ));
         });
         let explicit_resume = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
 
         let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(21)],
@@ -1335,20 +1335,20 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task_raw(task, 0).unwrap(),
-            PollResult::Pending(PendingReason::Fuel)
+            realm.poll_task(task, 0).unwrap(),
+            TaskPoll::Yielded(YieldReason::Fuel)
         );
         let fuel_resume = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
 
         let (mut realm, module) = make_realm(vec![Instruction::Return { source: 0 }]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(22)],
@@ -1363,15 +1363,15 @@ fn main() {
             .unwrap();
         let task_completed = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
 
         let (mut realm, module) = make_realm(vec![Instruction::Trap]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(23)],
@@ -1386,8 +1386,8 @@ fn main() {
             .unwrap();
         let task_trapped = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Trapped(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Trapped(_)
             ));
         });
 
@@ -1395,7 +1395,7 @@ fn main() {
             make_realm(vec![Instruction::Yield, Instruction::Return { source: 0 }]);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(24)],
@@ -1409,8 +1409,8 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task_raw(task, 64).unwrap(),
-            PollResult::Pending(PendingReason::ExplicitYield)
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Yielded(YieldReason::Explicit)
         );
         let task_cancelled = observed(|| {
             realm
@@ -1432,7 +1432,7 @@ fn main() {
         realm.set_trace_enabled(false);
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -1447,8 +1447,8 @@ fn main() {
             .unwrap();
         let trace_off = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
 
@@ -1456,7 +1456,7 @@ fn main() {
         let (mut realm, module) = make_immediate_host_realm(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[
@@ -1480,8 +1480,8 @@ fn main() {
             .unwrap();
         let immediate_host_call = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(Some(RuntimeValue::I32(36)))
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(RuntimeValue::I32(36))
             ));
         });
         drop(realm);
@@ -1495,7 +1495,7 @@ fn main() {
         drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -1509,10 +1509,10 @@ fn main() {
             )
             .unwrap();
         let async_admission = observed(|| {
-            assert_eq!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Pending(PendingReason::HostRequest)
-            );
+            assert!(matches!(
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Waiting(_)
+            ));
         });
         pending
             .lock()
@@ -1532,7 +1532,7 @@ fn main() {
                 .unwrap();
         });
         let failed = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(9)],
@@ -1545,10 +1545,10 @@ fn main() {
                 },
             )
             .unwrap();
-        assert_eq!(
-            realm.poll_task_raw(failed, 64).unwrap(),
-            PollResult::Pending(PendingReason::HostRequest)
-        );
+        assert!(matches!(
+            realm.poll_task(failed, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
         pending
             .lock()
             .unwrap()
@@ -1619,7 +1619,7 @@ fn main() {
         drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let first = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(1)],
@@ -1632,12 +1632,12 @@ fn main() {
                 },
             )
             .unwrap();
-        assert_eq!(
-            realm.poll_task_raw(first, 64).unwrap(),
-            PollResult::Pending(PendingReason::HostRequest)
-        );
+        assert!(matches!(
+            realm.poll_task(first, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
         let rejected = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(2)],
@@ -1652,8 +1652,8 @@ fn main() {
             .unwrap();
         let async_admission_capacity_failure = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(rejected, 64),
-                Ok(PollResult::Trapped(_))
+                realm.poll_task(rejected, 64),
+                Ok(TaskPoll::Trapped(_))
             ));
         });
         drop(realm);
@@ -1669,7 +1669,7 @@ fn main() {
         drop(pending.lock().unwrap());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(3)],
@@ -1682,10 +1682,10 @@ fn main() {
                 },
             )
             .unwrap();
-        assert_eq!(
-            realm.poll_task_raw(task, 64).unwrap(),
-            PollResult::Pending(PendingReason::HostRequest)
-        );
+        assert!(matches!(
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
         let async_admission_cancellation = observed(|| {
             realm
                 .cancel_task(task, CancelReason::ScopeCancelled)
@@ -1701,7 +1701,7 @@ fn main() {
         let (mut realm, module) = make_realm_with_host(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(7)],
@@ -1730,7 +1730,7 @@ fn main() {
         let (mut realm, module) = make_realm_with_host(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(31)],
@@ -1748,8 +1748,8 @@ fn main() {
             .unwrap();
         let token_release = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
         drop(realm);
@@ -1764,7 +1764,7 @@ fn main() {
         let (mut realm, module) = make_realm_with_host(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(32)],
@@ -1790,8 +1790,8 @@ fn main() {
             .unwrap();
         let snapshot_release = observed(|| {
             assert!(matches!(
-                realm.poll_task_raw(task, 64).unwrap(),
-                PollResult::Completed(_)
+                realm.poll_task(task, 64).unwrap(),
+                TaskPoll::Completed(_)
             ));
         });
         drop(realm);
@@ -1804,7 +1804,7 @@ fn main() {
         let (mut realm, module) = make_realm_with_host(host.clone());
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 module,
                 0,
                 &[RuntimeValue::I32(33)],
@@ -1844,7 +1844,7 @@ fn main() {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = realm
-            .call(
+            .spawn_task(
                 old,
                 2,
                 &[RuntimeValue::I32(34)],
@@ -1858,8 +1858,8 @@ fn main() {
             )
             .unwrap();
         assert_eq!(
-            realm.poll_task_raw(task, 64).unwrap(),
-            PollResult::Pending(PendingReason::ExplicitYield)
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Yielded(YieldReason::Explicit)
         );
         realm
             .create_resource_token(task, RuntimeHostDomain::Io)

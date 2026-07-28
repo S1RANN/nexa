@@ -1,4 +1,4 @@
-result=Pending(ExplicitYield)
+result=Yielded(Explicit)
 scope_state=Cancelled
 terminal_state=Some(Cancelled)
 terminal_reason=Some(Cancelled(ScopeCancelled))

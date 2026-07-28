@@ -6,7 +6,7 @@ fn resource_token() {
     let token = realm
         .create_resource_token(task, nexa_runtime::RuntimeHostDomain::Render)
         .unwrap();
-    let result = realm.poll_task_raw(task, 16).unwrap();
+    let result = realm.poll_task(task, 16).unwrap();
     let report = realm
         .tick(nexa_runtime::TickBudget {
             max_tasks: 0,

@@ -1,4 +1,4 @@
-result=Completed(Some(I32(7)))
+result=Completed(I32(7))
 scope_state=Active
 terminal_state=Some(Completed)
 terminal_reason=Some(Completed(Some(I32(7))))

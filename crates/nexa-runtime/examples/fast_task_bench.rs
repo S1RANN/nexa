@@ -8,9 +8,9 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, PollResult,
-    RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeValue, StepConfig, TaskLimits, TickBudget,
+    HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeValue,
+    StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -78,13 +78,13 @@ fn main() {
     let (mut realm, module, scope) = loaded(fast.clone());
     results.push(bench("nexa_fast_complete", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task_raw(task, 64).unwrap());
+        black_box(realm.poll_task(task, 64).unwrap());
     }));
     let (mut realm, module, scope) = loaded(fast.clone());
     realm.set_trace_enabled(false);
     results.push(bench("nexa_fast_complete_trace_off", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task_raw(task, 64).unwrap());
+        black_box(realm.poll_task(task, 64).unwrap());
     }));
 
     let yielded = build_module(
@@ -97,17 +97,17 @@ fn main() {
     results.push(bench("nexa_fuel_promotion_resume", samples, || {
         let task = call(&mut realm, module, scope, 7);
         assert!(matches!(
-            realm.poll_task_raw(task, 0).unwrap(),
-            PollResult::Pending(_)
+            realm.poll_task(task, 0).unwrap(),
+            TaskPoll::Yielded(_)
         ));
-        black_box(realm.poll_task_raw(task, 64).unwrap());
+        black_box(realm.poll_task(task, 64).unwrap());
     }));
 
     let nested = nested_module();
     let (mut realm, module, scope) = loaded(nested);
     results.push(bench("nexa_nested_calls", samples, || {
         let task = call(&mut realm, module, scope, 7);
-        black_box(realm.poll_task_raw(task, 64).unwrap());
+        black_box(realm.poll_task(task, 64).unwrap());
     }));
 
     let (mut realm, module, scope, generated_host) = loaded_hosted(yielded.clone());
@@ -144,7 +144,7 @@ fn main() {
     let host_scope = host_realm.create_scope(None).unwrap();
     results.push(bench("nexa_host_call_opcode_immediate", samples, || {
         let task = host_realm
-            .call(
+            .spawn_task(
                 host_module,
                 0,
                 &[RuntimeValue::I32(20), RuntimeValue::I32(22)],
@@ -157,7 +157,7 @@ fn main() {
                 },
             )
             .unwrap();
-        black_box(host_realm.poll_task_raw(task, 64).unwrap());
+        black_box(host_realm.poll_task(task, 64).unwrap());
     }));
     drop(host_realm);
     let _ = immediate_host.drain_releases();
@@ -182,10 +182,10 @@ fn main() {
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = call(&mut realm, module, scope, 1);
-        assert_eq!(
-            realm.poll_task_raw(task, 64).unwrap(),
-            PollResult::Pending(nexa_runtime::PendingReason::HostRequest)
-        );
+        assert!(matches!(
+            realm.poll_task(task, 64).unwrap(),
+            TaskPoll::Waiting(_)
+        ));
         let mut pending = pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -208,7 +208,7 @@ fn main() {
                 .create_resource_token(task, RuntimeHostDomain::Render)
                 .unwrap(),
         );
-        black_box(realm.poll_task_raw(task, 64).unwrap());
+        black_box(realm.poll_task(task, 64).unwrap());
         drop(realm);
         let _ = host.drain_releases();
         let _ = host.begin_close();
@@ -535,7 +535,7 @@ fn call(
     value: i32,
 ) -> nexa_runtime::TaskHandle {
     realm
-        .call(
+        .spawn_task(
             module,
             0,
             &[RuntimeValue::I32(value)],

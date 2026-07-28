@@ -6,10 +6,11 @@ use nexa_bytecode::{
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostRegistry, HostTrap,
-    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeFailurePoint,
-    RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
-    TaskTerminalReason, TickBudget, YieldReason,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostRegistry,
+    HostRequestError, HostTrap, PendingHostRequest, RealmConfig, RealmError, RealmRuntime,
+    ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs,
+    RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
+    YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
@@ -187,7 +188,12 @@ fn spawn(
         .expect("task")
 }
 
-fn assert_terminal_invariants(realm: &mut RealmRuntime, task: TaskHandle) {
+fn assert_terminal_invariants(
+    realm: &mut RealmRuntime,
+    runtime_host: &RuntimeHost,
+    task: TaskHandle,
+    expected_release_counts: &[(ReleaseKind, usize)],
+) {
     realm
         .tick(TickBudget {
             max_tasks: 0,
@@ -195,6 +201,7 @@ fn assert_terminal_invariants(realm: &mut RealmRuntime, task: TaskHandle) {
             collect_garbage: false,
         })
         .expect("terminal flush");
+    let releases = runtime_host.drain_releases();
     let ledger = realm.resource_ledger();
     assert_eq!(ledger.continuations, 0);
     assert_eq!(ledger.requests, 0);
@@ -202,22 +209,53 @@ fn assert_terminal_invariants(realm: &mut RealmRuntime, task: TaskHandle) {
     assert_eq!(ledger.completion_reservations, 0);
     assert_eq!(ledger.release_reservations, 0);
     assert!(realm.terminal_record(task).is_some());
+    for (kind, expected) in expected_release_counts {
+        assert_eq!(
+            releases
+                .iter()
+                .filter(|record| record.kind == *kind)
+                .count(),
+            *expected,
+            "wrong release count for {kind:?}"
+        );
+    }
+    assert_eq!(
+        releases.len(),
+        expected_release_counts
+            .iter()
+            .map(|(_, expected)| expected)
+            .sum(),
+        "unexpected release kind"
+    );
+    assert!(runtime_host.drain_releases().is_empty());
+}
+
+fn assert_request_error(
+    result: Result<nexa_runtime::CompletionDisposition, RuntimeError>,
+    expected: HostRequestError,
+) {
+    match result {
+        Err(RuntimeError::Realm(error)) => {
+            assert_eq!(*error, RealmError::Host(expected));
+        }
+        other => panic!("unexpected request result: {other:?}"),
+    }
 }
 
 #[test]
 fn normal_completion() {
-    let (mut realm, module, _, _) = hosted(immediate_module(), RealmConfig::default(), false);
+    let (mut realm, module, host, _) = hosted(immediate_module(), RealmConfig::default(), false);
     let task = spawn(&mut realm, module, &[RuntimeValue::I32(7)]);
     assert_eq!(
         realm.poll_task(task, 64).expect("poll"),
         TaskPoll::Completed(RuntimeValue::I32(7))
     );
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
 #[test]
 fn host_error_is_a_typed_completion() {
-    let (mut realm, module, _, _) = hosted(async_module(), RealmConfig::default(), false);
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
     let task = spawn(&mut realm, module, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("request handle must only come from Waiting");
@@ -235,40 +273,200 @@ fn host_error_is_a_typed_completion() {
         realm.poll_task(task, 64),
         Ok(TaskPoll::Completed(_))
     ));
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+}
+
+#[test]
+fn completion_is_idempotent_and_releases_once() {
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
+        panic!("expected request");
+    };
+    assert_eq!(
+        realm
+            .complete_request(
+                request,
+                HostCompletionResult::Error(HostErrorPayload { code: 3 }),
+            )
+            .expect("first completion"),
+        nexa_runtime::CompletionDisposition::Delivered
+    );
+    assert_request_error(
+        realm.complete_request(
+            request,
+            HostCompletionResult::Error(HostErrorPayload { code: 4 }),
+        ),
+        HostRequestError::AlreadyCompleted,
+    );
+    assert!(matches!(
+        realm.poll_task(task, 64),
+        Ok(TaskPoll::Completed(_))
+    ));
+    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
+}
+
+#[test]
+fn request_handle_errors_are_distinct() {
+    let limits = RealmConfig {
+        max_host_resources: 1,
+        ..RealmConfig::default()
+    };
+    let (mut first, module, host, pending) = hosted(async_module(), limits, false);
+    let first_task = spawn(&mut first, module, &[]);
+    let TaskPoll::Waiting(first_request) = first.poll_task(first_task, 64).expect("first wait")
+    else {
+        panic!("expected first request");
+    };
+
+    let (mut foreign, _, _, _) = hosted(
+        immediate_module(),
+        RealmConfig {
+            realm_id: 2,
+            ..RealmConfig::default()
+        },
+        false,
+    );
+    assert_request_error(
+        foreign.complete_request(
+            first_request,
+            HostCompletionResult::Error(HostErrorPayload { code: 1 }),
+        ),
+        HostRequestError::CrossRealmHostRequestHandle,
+    );
+    first
+        .complete_request(
+            first_request,
+            HostCompletionResult::Error(HostErrorPayload { code: 1 }),
+        )
+        .expect("complete first");
+    let mut first_physical = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("first physical request");
+    assert!(first_physical.ticket.cancelled().is_err());
+    assert!(matches!(
+        first.poll_task(first_task, 64),
+        Ok(TaskPoll::Completed(_))
+    ));
+
+    let second_task = spawn(&mut first, module, &[]);
+    let TaskPoll::Waiting(second_request) = first.poll_task(second_task, 64).expect("second wait")
+    else {
+        panic!("expected second request");
+    };
+    first
+        .complete_request(
+            second_request,
+            HostCompletionResult::Error(HostErrorPayload { code: 2 }),
+        )
+        .expect("complete second");
+    assert!(matches!(
+        first.poll_task(second_task, 64),
+        Ok(TaskPoll::Completed(_))
+    ));
+    assert_request_error(
+        first.complete_request(
+            first_request,
+            HostCompletionResult::Error(HostErrorPayload { code: 9 }),
+        ),
+        HostRequestError::StaleHostRequestHandle,
+    );
+    first
+        .tick(TickBudget {
+            max_tasks: 0,
+            frame_fuel_budget: 0,
+            collect_garbage: false,
+        })
+        .expect("flush releases");
+    let releases = host.drain_releases();
+    assert_eq!(
+        releases
+            .iter()
+            .filter(|record| record.kind == ReleaseKind::HostRequest)
+            .count(),
+        2
+    );
+    assert!(host.drain_releases().is_empty());
+}
+
+#[test]
+fn reload_detached_request_is_reported_distinctly() {
+    let definition = async_module();
+    let (mut realm, module, host, pending) =
+        hosted(definition.clone(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
+        panic!("expected request");
+    };
+    assert!(matches!(
+        realm
+            .restart_reload(
+                module,
+                definition,
+                nexa_runtime::RestartReloadPolicy::default()
+            )
+            .expect("reload"),
+        nexa_runtime::RestartReloadOutcome::Committed(_)
+    ));
+    assert_request_error(
+        realm.complete_request(
+            request,
+            HostCompletionResult::Error(HostErrorPayload { code: 8 }),
+        ),
+        HostRequestError::DetachedByReload,
+    );
+    let mut physical = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("physical request");
+    physical
+        .ticket
+        .complete(nexa_runtime::HostPayload::I32(5))
+        .expect("late physical completion");
+    realm
+        .tick(TickBudget {
+            max_tasks: 0,
+            frame_fuel_budget: 0,
+            collect_garbage: false,
+        })
+        .expect("discard late completion");
+    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
 }
 
 #[test]
 fn host_panic_is_isolated_as_a_trap() {
-    let (mut realm, module, _, _) = hosted(async_module(), RealmConfig::default(), true);
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), true);
     let task = spawn(&mut realm, module, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Trapped(_))
     ));
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
 #[test]
 fn task_cancel_returns_terminal_poll() {
-    let (mut realm, module, _, _) = hosted(yielding_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[RuntimeValue::I32(1)]);
-    assert_eq!(
-        realm.poll_task(task, 64).expect("yield"),
-        TaskPoll::Yielded(YieldReason::Explicit)
-    );
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
+    assert!(matches!(
+        realm.poll_task(task, 64).expect("wait"),
+        TaskPoll::Waiting(_)
+    ));
     assert_eq!(
         realm
             .cancel_task(task, CancelReason::HostCancelled)
             .expect("cancel"),
         TaskPoll::Cancelled(CancelReason::HostCancelled)
     );
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
 }
 
 #[test]
 fn request_abandon_traps_without_invalid_task_state() {
-    let (mut realm, module, _, _) = hosted(async_module(), RealmConfig::default(), false);
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
     let task = spawn(&mut realm, module, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("expected host request");
@@ -278,7 +476,7 @@ fn request_abandon_traps_without_invalid_task_state() {
         realm.terminal_record(task).map(|record| &record.reason),
         Some(TaskTerminalReason::Trapped(_))
     ));
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[(ReleaseKind::HostRequest, 1)]);
 }
 
 #[test]
@@ -288,7 +486,7 @@ fn task_capacity_is_reported_at_admission() {
         max_scheduler_tokens: 1,
         ..nexa_runtime::RuntimeLimits::default()
     };
-    let (mut realm, module, _, _) = hosted(
+    let (mut realm, module, host, _) = hosted(
         yielding_module(),
         RealmConfig {
             runtime_limits: limits,
@@ -306,12 +504,12 @@ fn task_capacity_is_reported_at_admission() {
     realm
         .cancel_task(first, CancelReason::RuntimeShutdown)
         .expect("cleanup first");
-    assert_terminal_invariants(&mut realm, first);
+    assert_terminal_invariants(&mut realm, &host, first, &[]);
 }
 
 #[test]
 fn request_capacity_probe_is_consumed() {
-    let (mut realm, module, _, _) = hosted(async_module(), RealmConfig::default(), false);
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
     let probe = realm
         .failure_injector()
         .arm_once(RuntimeFailurePoint::RequestSlot);
@@ -321,12 +519,12 @@ fn request_capacity_probe_is_consumed() {
         Ok(TaskPoll::Trapped(_))
     ));
     probe.require_consumed().expect("request scenario reached");
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
 #[test]
 fn completion_capacity_probe_is_consumed() {
-    let (mut realm, module, _, _) = hosted(async_module(), RealmConfig::default(), false);
+    let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
     let probe = realm
         .failure_injector()
         .arm_once(RuntimeFailurePoint::CompletionSlot);
@@ -338,10 +536,10 @@ fn completion_capacity_probe_is_consumed() {
     probe
         .require_consumed()
         .expect("completion scenario reached");
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
-fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle, RuntimeHost) {
     let source = "
         fn finalize(value: i32) -> i32 { return value; }
         task fn work(value: i32) -> i32 {
@@ -353,13 +551,13 @@ fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     ";
     let module =
         nexa_compiler::compile_with_metadata(source, HOST, SCHEMA).expect("cleanup module");
-    let (realm, handle, _, _) = hosted(module, RealmConfig::default(), false);
-    (realm, handle)
+    let (realm, handle, host, _) = hosted(module, RealmConfig::default(), false);
+    (realm, handle, host)
 }
 
 #[test]
 fn cleanup_succeeds_and_balances_resources() {
-    let (mut realm, module) = cleanup_realm();
+    let (mut realm, module, host) = cleanup_realm();
     let scope = realm.create_scope(None).expect("cleanup scope");
     let task = realm
         .spawn_task(module, 1, &[RuntimeValue::I32(1)], config(scope))
@@ -373,12 +571,12 @@ fn cleanup_succeeds_and_balances_resources() {
         realm.cancel_task(task, CancelReason::HostCancelled),
         Ok(TaskPoll::Cancelled(_))
     ));
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
 #[test]
 fn cleanup_trap_probe_is_consumed() {
-    let (mut realm, module) = cleanup_realm();
+    let (mut realm, module, host) = cleanup_realm();
     let scope = realm.create_scope(None).expect("cleanup scope");
     let task = realm
         .spawn_task(module, 1, &[RuntimeValue::I32(1)], config(scope))
@@ -396,25 +594,41 @@ fn cleanup_trap_probe_is_consumed() {
         Ok(TaskPoll::Trapped(_))
     ));
     probe.require_consumed().expect("cleanup scenario reached");
-    assert_terminal_invariants(&mut realm, task);
+    assert_terminal_invariants(&mut realm, &host, task, &[]);
 }
 
 #[test]
 fn realm_drop_releases_live_task_resources_once() {
-    let (mut realm, module, host, _) = hosted(yielding_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[RuntimeValue::I32(1)]);
+    let (mut realm, module, host, pending) = hosted(async_module(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
-        Ok(TaskPoll::Yielded(_))
+        Ok(TaskPoll::Waiting(_))
     ));
+    let mut physical_request = pending
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("physical request");
     drop(realm);
+    assert!(physical_request.ticket.cancelled().is_err());
     assert_eq!(host.pending_completions(), 0);
+    let releases = host.drain_releases();
+    assert_eq!(
+        releases
+            .iter()
+            .filter(|record| record.kind == ReleaseKind::HostRequest)
+            .count(),
+        1
+    );
+    assert!(host.drain_releases().is_empty());
+    assert!(host.drain_releases().is_empty());
 }
 
 #[test]
 fn module_restart_cancels_old_task_and_starts_new_module() {
     let module_definition = yielding_module();
-    let (mut realm, module, _, _) =
+    let (mut realm, module, host, _) =
         hosted(module_definition.clone(), RealmConfig::default(), false);
     let task = spawn(&mut realm, module, &[RuntimeValue::I32(1)]);
     assert!(matches!(
@@ -443,7 +657,7 @@ fn module_restart_cancels_old_task_and_starts_new_module() {
     realm
         .cancel_task(new_task, CancelReason::RuntimeShutdown)
         .expect("new task cleanup");
-    assert_terminal_invariants(&mut realm, new_task);
+    assert_terminal_invariants(&mut realm, &host, new_task, &[]);
 }
 
 #[test]
