@@ -1,0 +1,18 @@
+interface GameHost {
+    opaque Entity;
+    opaque ActionLock;
+    opaque MotionLock;
+    struct EnemyView { health: i32; }
+    struct EnemyState { health: i32; }
+    enum AnimationError { MissingClip, Code(i32), Cancelled, Abandoned }
+    sync fuel 5 fn update(entity: i32, delta: i32) -> i32;
+    request(return_error, trap) fn animation(entity: i32)
+        -> request<Result<i32, AnimationError>>;
+    sync fn lock(entity: i32) -> token<ActionLock>;
+    sync fn view() -> snapshot<EnemyView>;
+    sync fn inspect(entity: Entity) -> i32;
+    sync fn score(view: EnemyView) -> i32;
+    sync fn classify(error: AnimationError) -> i32;
+    sync fn heartbeat(value: i32) -> i32;
+    export Update(entity: i32) -> i32;
+}

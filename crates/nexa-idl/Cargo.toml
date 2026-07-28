@@ -13,6 +13,7 @@ nexa-core = { path = "../nexa-core" }
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
 nexa-verifier = { path = "../nexa-verifier" }
+serde_json.workspace = true
 
 [lints]
 workspace = true

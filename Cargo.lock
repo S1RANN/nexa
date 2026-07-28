@@ -101,6 +101,7 @@ dependencies = [
  "nexa-core",
  "nexa-runtime",
  "nexa-verifier",
+ "serde_json",
 ]
 
 [[package]]
