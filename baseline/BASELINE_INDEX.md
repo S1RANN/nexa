@@ -2,6 +2,8 @@
 
 Version: **2.0.0**
 
+Nexa Internal Pivot M1 = **FINALIZING**
+
 This is the only normative entry point for the active Internal Language Pivot.
 Precedence is:
 

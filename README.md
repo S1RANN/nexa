@@ -9,6 +9,7 @@ Reload.
 ```text
 Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
+Nexa Internal Pivot M1 = FINALIZING
 Current target = Rust-only dogfood Gameplay Language
 Seamless advanced Reload = REMOVED
 ```

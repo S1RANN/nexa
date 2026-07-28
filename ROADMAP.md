@@ -1,5 +1,7 @@
 # Nexa Roadmap
 
+Nexa Internal Pivot M1 = **FINALIZING**
+
 ## Current position
 
 The former MVR reached a verified Gate 1 v2.9 decision of **STOP** because
