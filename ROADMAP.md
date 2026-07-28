@@ -32,15 +32,13 @@ Gate -1
 Current implementation milestone: **4.0R3 complete**.
 
 <!-- gate1-v2.8-status:start -->
-Current project gate: **Gate 1 v2.8 frozen / incomplete**.
+Current project gate: **Gate 1 v2.8 verified terminal decision**.
 
-Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is
-**STRUCTURAL_CLOSURE_FAILED / INCOMPLETE**; its recorded STOP is not authorized.
-Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable.
+Gate 1 v2.5 is **STRUCTURAL_CLOSURE_FAILED** and not decision-usable. Gate 1 v2.6 is **STRUCTURAL_CLOSURE_FAILED / INCOMPLETE**; its recorded STOP is not authorized. Gate 1 v2.7 is **INVALID_ENVIRONMENT_EXECUTION / INCOMPLETE** and not decision-usable.
 
-Current Gate 1 v2.8 decision: **NOT_COMPUTED**.
+Current Gate 1 v2.8 decision: **UNVERIFIABLE_WITHIN_MVR**.
 
-Current milestone: **5.0R8 — INCOMPLETE**.
+Current milestone: **5.0R8 — COMPLETE**.
 <!-- gate1-v2.8-status:end -->
 
 ## Gates
@@ -60,8 +58,8 @@ Current milestone: **5.0R8 — INCOMPLETE**.
 | Gate 1 v2.5 | Three formal executions completed | Structural closure and Receipt are valid | Structural closure failed |
 | Gate 1 v2.6 | Three formal executions and finalization were recorded | Raw-to-Gate semantics and direct Contracts are trustworthy | Structural closure failed |
 | Gate 1 v2.7 | Qualified environment and frozen apparatus | Formal Run 1 executes in qualified unrestricted environment | Invalid environment execution |
-| Gate 1 v2.8 | Stable projection and finalization apparatus is prefreeze-complete | Two formal runs and replay preserve real outcomes | Frozen |
-| Gate 1 v2.8 Decision | Valid v2.8 evidence is available | One legal terminal decision and verified F2.8 are recorded | Pending |
+| Gate 1 v2.8 | Stable semantic projection and explicit finalization | I/E/D/R/F chain and Raw-derived Receipt | Verified terminal decision |
+| Gate 1 v2.8 Decision | Valid v2.8 evidence and 50/50 contracts | Verified I/E/D/R/F and empty structural gaps | UNVERIFIABLE_WITHIN_MVR |
 | Pilot | Gate 1 permits Pilot and a team commits | Pilot exit review accepts, pivots, or stops | Conditional |
 | Gate 2 RFC | H1/H2 pass, H3 is acceptable, Pilot commits, budget is approved | RFC decision only; no implementation is implied | Conditional |
 

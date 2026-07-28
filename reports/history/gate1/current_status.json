@@ -1,14 +1,15 @@
 {
-  "schema_version": 1,
+  "apparatus_status": "PASS",
   "current_experiment": "gate1-v2.8",
-  "experiment_status": "FROZEN",
-  "apparatus_status": "PENDING",
-  "evidence_status": "NOT_STARTED",
-  "product_decision": null,
-  "gate1_status": "INCOMPLETE",
+  "evidence_status": "VERIFIED",
+  "experiment_status": "VERIFIED_TERMINAL_DECISION",
+  "finalization_status": "FINALIZED",
+  "finalization_verified": true,
+  "gate1_status": "VERIFIED_TERMINAL_DECISION",
   "milestone": "5.0R8",
-  "milestone_status": "INCOMPLETE",
-  "receipt_verified": false,
-  "finalization_verified": false,
-  "push_status": "FORBIDDEN"
+  "milestone_status": "COMPLETE",
+  "product_decision": "UNVERIFIABLE_WITHIN_MVR",
+  "push_status": "AUTHORIZED",
+  "receipt_verified": true,
+  "schema_version": 1
 }
