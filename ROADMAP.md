@@ -1,12 +1,12 @@
 # Nexa Roadmap
 
 ```text
-Nexa Internal Pivot M1 = FINALIZING
+Nexa Internal Pivot M1 = COMPLETE
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = FINALIZING
-Task Runtime Stabilization = FINALIZING
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = FINALIZING
+Combat Dogfood Loop = COMPLETE
 ```
 
 ## Current position
@@ -25,8 +25,8 @@ Gate 1 v2.9 STOP (historical tag)
    → Combat dogfood loop
 ```
 
-Internal Pivot M1 remains `FINALIZING` until every Cargo and xtask gate,
-including `finalize-m1`, passes on one clean commit.
+Internal Pivot M1 is complete: every Cargo and xtask gate, including
+`finalize-m1`, passed on a clean commit before the final status transition.
 
 ## Active product
 
