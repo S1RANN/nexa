@@ -1666,8 +1666,9 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let host = RuntimeHost::new(4);
-        let (mut realm, module) = make_realm_with_host(host.clone());
-        drop(pending.lock().unwrap());
+        let pending = Arc::new(Mutex::new(None));
+        let (mut realm, module) =
+            make_async_host_realm(RealmConfig::default(), host.clone(), Arc::clone(&pending));
         let scope = realm.create_scope(None).unwrap();
         let task = realm
             .spawn_task(
