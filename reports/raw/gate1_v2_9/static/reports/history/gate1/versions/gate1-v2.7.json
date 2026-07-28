@@ -1,0 +1,18 @@
+{
+  "version": "gate1-v2.7",
+  "status": "INVALID_ENVIRONMENT_EXECUTION",
+  "decision_usable": false,
+  "implementation_sha": "6e65ab62e592536609ebe7de30a9f753a5df3b39",
+  "evidence_sha": null,
+  "decision_sha": null,
+  "receipt_sha": null,
+  "finalization_sha": null,
+  "canonical_record_hash": "reports/history/gate1/v2_7/attempt_manifest.json",
+  "historical_record_immutable": true,
+  "gate1_status": "INCOMPLETE",
+  "formal_run_1_status": "INVALID",
+  "formal_run_2_started": false,
+  "replay_started": false,
+  "supersedes": "gate1-v2.6",
+  "superseded_by": "gate1-v2.8"
+}

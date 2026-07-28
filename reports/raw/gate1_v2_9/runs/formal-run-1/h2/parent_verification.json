@@ -1,0 +1,13 @@
+{
+  "attestation_hash": "344758a6ce32e512c3c0dbe402eca17957f8ce2e",
+  "child_id": 94659,
+  "failures": [],
+  "output_status": 0,
+  "protocol": "gate1-process-handshake-v1",
+  "result_not_before_handshake": true,
+  "result_path": "/Users/orokane/projects/nexa/target/gate1-v2.9/formal-run-1/h2/result.json",
+  "role": "h2-worker",
+  "run_id": "formal-run-1",
+  "status": "PASS",
+  "worker_reported_pid": 94659
+}

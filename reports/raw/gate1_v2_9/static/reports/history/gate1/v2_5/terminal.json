@@ -1,0 +1,24 @@
+{
+  "apparatus_valid": true,
+  "comparison": "INCONCLUSIVE",
+  "decision_commit_created": false,
+  "decision_usable": false,
+  "finalization_created": false,
+  "formal_execution_complete": true,
+  "gate_contract_count": 21,
+  "gate_contracts_passed": 19,
+  "product_outcomes": {
+    "H1a": "FAIL",
+    "H2a": "FAIL",
+    "H3a": "FAIL"
+  },
+  "pushed": false,
+  "raw_to_gate_rebuild": "PASS",
+  "receipt_created": false,
+  "replay": "INCONCLUSIVE",
+  "retries_used": 0,
+  "schema_version": 1,
+  "status": "STRUCTURAL_CLOSURE_FAILED",
+  "superseded_by": "gate1-v2.6",
+  "version": "gate1-v2.5"
+}

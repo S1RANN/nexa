@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "experiment_version": "gate1-v2.8",
+  "status": "SEMANTICALLY_INSUFFICIENT",
+  "gate1_status": "INCOMPLETE",
+  "recorded_product_decision": "UNVERIFIABLE_WITHIN_MVR",
+  "recorded_product_decision_authorized": false,
+  "receipt_structurally_valid": true,
+  "receipt_semantically_sufficient": false,
+  "defect": {
+    "class": "STABLE_CORE_FAILURE_EXTRACTION_USED_REPRESENTATIVE_SUBGATES",
+    "incorrect_sources": {
+      "H1": "h1_equivalence",
+      "H2": "h2_configuration",
+      "H3": "h3_migration"
+    },
+    "required_source": "PER_RUN_AGGREGATE_HYPOTHESIS_OUTCOMES",
+    "correct_stable_core_failures": ["H1", "H2", "H3"]
+  },
+  "superseded_by": "gate1-v2.9"
+}

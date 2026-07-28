@@ -1,0 +1,21 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.9",
+  "failures": [],
+  "gate": "budget",
+  "generator": "nexa-gate1-v2-9-gates/raw-v1",
+  "implementation_sha": "d3d66810ea6f6a7ef36f104f2e74a7588736e077",
+  "implementation_tree": "e22824f3e812abbd983ec345094589decabb7150",
+  "layer": "EXTERNAL",
+  "metrics": {
+    "approved": false,
+    "source": {
+      "approved": false,
+      "decision_source": "repository owner",
+      "experiment_version": "gate1-v2.9",
+      "scope": "Gate 2 implementation"
+    }
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}

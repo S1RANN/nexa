@@ -1,0 +1,113 @@
+{
+  "cases": [
+    {
+      "actual": "HOLD",
+      "case": "all-pass-no-pilot",
+      "expected": "HOLD",
+      "matched": true
+    },
+    {
+      "actual": "STOP",
+      "case": "h1-fail",
+      "expected": "STOP",
+      "matched": true
+    },
+    {
+      "actual": "STOP",
+      "case": "h2-fail",
+      "expected": "STOP",
+      "matched": true
+    },
+    {
+      "actual": "STOP",
+      "case": "h3-fail",
+      "expected": "STOP",
+      "matched": true
+    },
+    {
+      "actual": "STOP",
+      "case": "all-fail",
+      "expected": "STOP",
+      "matched": true
+    },
+    {
+      "actual": "INVALID",
+      "case": "invalid",
+      "expected": "INVALID",
+      "matched": true
+    },
+    {
+      "actual": "PROCEED_TO_PILOT",
+      "case": "pilot",
+      "expected": "PROCEED_TO_PILOT",
+      "matched": true
+    },
+    {
+      "actual": "PROCEED_TO_GATE2_RFC",
+      "case": "gate2",
+      "expected": "PROCEED_TO_GATE2_RFC",
+      "matched": true
+    },
+    {
+      "case": "contract-49-of-50",
+      "matched": true
+    },
+    {
+      "case": "receipt-missing",
+      "matched": true
+    },
+    {
+      "case": "verified",
+      "matched": true
+    },
+    {
+      "actual": "STOP",
+      "case": "representative-subgates-pass-aggregate-hypotheses-fail",
+      "exercises_stable_failure_extraction": true,
+      "expected": "STOP",
+      "matched": true,
+      "per_run_product_outcomes": {
+        "H1": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ],
+        "H2": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ],
+        "H3": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ]
+      },
+      "representative_subgate_outcomes": {
+        "H1": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ],
+        "H2": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ],
+        "H3": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ]
+      },
+      "stable_core_failures": [
+        "H1",
+        "H2",
+        "H3"
+      ]
+    }
+  ],
+  "experiment_version": "gate1-v2.9",
+  "schema_version": 1,
+  "status": "PASS"
+}

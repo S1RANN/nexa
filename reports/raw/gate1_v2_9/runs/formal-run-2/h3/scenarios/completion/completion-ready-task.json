@@ -1,0 +1,216 @@
+{
+  "actual_outcome": "FAIL",
+  "after": {
+    "active_root": "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }",
+    "candidate_root": null,
+    "completion_accounting": {
+      "abandoned": 0,
+      "cancelled": 0,
+      "delivered": 0,
+      "late_discarded": 0,
+      "queued": 0,
+      "reload_discarded": 0,
+      "reserved": 0
+    },
+    "continuation_arena": 2,
+    "modules": [
+      "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }"
+    ],
+    "release_queue": [],
+    "reload": {
+      "candidate_module": null,
+      "completion_buffer": 0,
+      "old_module": null,
+      "paused_tasks": [],
+      "root_publications": [],
+      "state": "Idle"
+    },
+    "request_slots": [],
+    "resources": {
+      "completion_reservations": 0,
+      "continuations": 2,
+      "heap_objects": 0,
+      "queued_releases": 0,
+      "release_reservations": 0,
+      "requests": 0,
+      "retired_epochs": 0,
+      "scheduler_tokens": 2,
+      "scopes": 1,
+      "snapshots": 0,
+      "state_objects": 0,
+      "tasks": 2,
+      "tokens": 0
+    },
+    "retired_epochs": [],
+    "roots": "RootInspection { module_globals: 0, stateful_registry: 0, staging_heap: 0, suspended_tasks: 0, published_roots: 0 }",
+    "runtime_host": "Some(Open)",
+    "scheduler": [
+      "Ready",
+      "Ready"
+    ],
+    "tasks": [
+      {
+        "continuation_id": 1,
+        "continuation_resume_count": 0,
+        "request": null,
+        "scheduler_token": 2,
+        "state": "FuelYielded",
+        "task": "RawHandle { realm_id: 83, index: 0, generation: 0 }",
+        "terminal_record_count": 0
+      },
+      {
+        "continuation_id": 2,
+        "continuation_resume_count": 0,
+        "request": null,
+        "scheduler_token": 3,
+        "state": "FuelYielded",
+        "task": "RawHandle { realm_id: 83, index: 1, generation: 0 }",
+        "terminal_record_count": 0
+      }
+    ],
+    "terminal_records": []
+  },
+  "after_snapshot_hash": "f818ba3897a7e591",
+  "assertions": [
+    {
+      "actual": false,
+      "expected": true,
+      "matched": false,
+      "operator": "eq",
+      "pointer": "/completion_accounted"
+    }
+  ],
+  "before": {
+    "active_root": "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }",
+    "candidate_root": null,
+    "completion_accounting": {
+      "abandoned": 0,
+      "cancelled": 0,
+      "delivered": 0,
+      "late_discarded": 0,
+      "queued": 0,
+      "reload_discarded": 0,
+      "reserved": 0
+    },
+    "continuation_arena": 0,
+    "modules": [
+      "ModuleInspection { handle: ModuleHandle(RawHandle { realm_id: 83, index: 0, generation: 0 }), generation: 0, module_id: 0, epoch: 1, lifecycle: Active, stateful_domain: StatefulDomainId(1), state_objects: 0, module_gc_roots: 0, state_gc_roots: 0, staging_gc_roots: 0 }"
+    ],
+    "release_queue": [],
+    "reload": {
+      "candidate_module": null,
+      "completion_buffer": 0,
+      "old_module": null,
+      "paused_tasks": [],
+      "root_publications": [],
+      "state": "Idle"
+    },
+    "request_slots": [],
+    "resources": {
+      "completion_reservations": 0,
+      "continuations": 0,
+      "heap_objects": 0,
+      "queued_releases": 0,
+      "release_reservations": 0,
+      "requests": 0,
+      "retired_epochs": 0,
+      "scheduler_tokens": 0,
+      "scopes": 1,
+      "snapshots": 0,
+      "state_objects": 0,
+      "tasks": 0,
+      "tokens": 0
+    },
+    "retired_epochs": [],
+    "roots": "RootInspection { module_globals: 0, stateful_registry: 0, staging_heap: 0, suspended_tasks: 0, published_roots: 0 }",
+    "runtime_host": "Some(Open)",
+    "scheduler": [],
+    "tasks": [],
+    "terminal_records": []
+  },
+  "before_snapshot_hash": "d7801bddec568e48",
+  "declared_operations": [
+    "LoadOld",
+    "CreateReadyTask",
+    "CompleteTask",
+    "InspectTerminal"
+  ],
+  "description": "ready task completion point",
+  "executor": "completion_ready_task",
+  "executor_fingerprint": "088646e963de3cb5",
+  "executor_symbol": "completion_ready_task",
+  "expected_rejection": false,
+  "fixture": "h3://completion/ready",
+  "fixture_hash": "c90ab46093963748",
+  "fresh_realm_runtime": true,
+  "fresh_runtime_host": true,
+  "group": "completion",
+  "id": "completion-ready-task",
+  "input_hash": "c66d70969c2790ab",
+  "observed_facts": {
+    "activated": false,
+    "activation_faulted": false,
+    "actual_outcome": "FAIL",
+    "buffered_count": 0,
+    "capacity_failure_atomic": false,
+    "committed": false,
+    "completion_accounted": false,
+    "completion_discarded": false,
+    "cross_domain_rejected": false,
+    "deleted": false,
+    "field_added": false,
+    "field_deleted": false,
+    "field_type_replaced": false,
+    "generation_incremented": false,
+    "handle_remapped": false,
+    "independent_reap": false,
+    "late_completion_accounted": false,
+    "limit_failure_atomic": false,
+    "module_identity_preserved": false,
+    "preserved": false,
+    "replaced": false,
+    "request_completed": false,
+    "resume_count": 0,
+    "retired_epoch_count": 0,
+    "rolled_back": false,
+    "stale_handle_rejected": false,
+    "trap_rolled_back": false
+  },
+  "operation_contract_met": false,
+  "operation_trace_hash": "d68f925e05bd97d7",
+  "production_api_trace": [
+    {
+      "after_hash": "be362ff6e63461c4",
+      "before_hash": "d7801bddec568e48",
+      "detail": "Ok(())",
+      "event": "TaskAdmission",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "f818ba3897a7e591",
+      "before_hash": "be362ff6e63461c4",
+      "detail": "Ok(())",
+      "event": "PollTask",
+      "result": "APPLIED"
+    },
+    {
+      "after_hash": "f818ba3897a7e591",
+      "before_hash": "f818ba3897a7e591",
+      "detail": "Err(Rejected(InvalidTaskState))",
+      "event": "TaskComplete",
+      "result": "REJECTED"
+    }
+  ],
+  "provenance": {
+    "measurement": "RuntimeSnapshot",
+    "run_id": "formal-run-2",
+    "sample_count": 1,
+    "source_artifact": "events.ndjson",
+    "source_pointer": "/",
+    "value": "completion-ready-task"
+  },
+  "rejections": [
+    "TaskComplete: Rejected(InvalidTaskState)"
+  ],
+  "scenario_spec_hash": "3eeebb0e1afa726b"
+}

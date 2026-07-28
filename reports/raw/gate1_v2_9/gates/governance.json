@@ -1,0 +1,99 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.9",
+  "failures": [],
+  "gate": "governance",
+  "generator": "nexa-gate1-v2-9-gates/raw-v1",
+  "implementation_sha": "d3d66810ea6f6a7ef36f104f2e74a7588736e077",
+  "implementation_tree": "e22824f3e812abbd983ec345094589decabb7150",
+  "layer": "APPARATUS",
+  "metrics": {
+    "authorization": "AUTHORIZED",
+    "formal_decision_evidence": {
+      "aggregate_product_outcomes": {
+        "H1": "FAIL",
+        "H2": "FAIL",
+        "H3": "FAIL"
+      },
+      "apparatus_statuses": [
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "decision_priority_branch": "stable_core_failure",
+      "decision_recomputed_from_raw": true,
+      "derived_product_decision": "STOP",
+      "formal_semantic_comparisons": {
+        "H1": "PASS",
+        "H2": "PASS",
+        "H3": "PASS"
+      },
+      "h2_allocation_comparisons": [
+        "PASS",
+        "PASS"
+      ],
+      "h2_performance_comparisons": [
+        "INCONCLUSIVE",
+        "INCONCLUSIVE"
+      ],
+      "per_run_product_outcomes": {
+        "H1": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ],
+        "H2": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ],
+        "H3": [
+          "FAIL",
+          "FAIL",
+          "FAIL"
+        ]
+      },
+      "replay_semantic_comparisons": {
+        "H1": "PASS",
+        "H2": "PASS",
+        "H3": "PASS"
+      },
+      "representative_subgate_outcomes": {
+        "H1": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ],
+        "H2": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ],
+        "H3": [
+          "PASS",
+          "PASS",
+          "PASS"
+        ]
+      },
+      "signature_stable": {
+        "H1": true,
+        "H2": true,
+        "H3": true
+      },
+      "source": "FORMAL_RAW_COMPONENT_OUTCOMES_AND_COMPARISONS",
+      "stable_core_failures": [
+        "H1",
+        "H2",
+        "H3"
+      ],
+      "stable_failure_dominates_inconclusive": true,
+      "stable_failure_priority_applied": true,
+      "structured_pivot_approved": false
+    },
+    "negative_tests": "PASS",
+    "prefreeze_closure": "PASS",
+    "thresholds_weakened": false
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}

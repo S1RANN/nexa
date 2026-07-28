@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "version": "gate1-v2.7",
+  "status": "INVALID_ENVIRONMENT_EXECUTION",
+  "gate1_status": "INCOMPLETE",
+  "formal_run_1_started": true,
+  "formal_run_1_status": "INVALID",
+  "formal_run_2_started": false,
+  "replay_started": false,
+  "preflight_status": "PASS",
+  "postflight_status": "PASS",
+  "failure_stage": "h1 temporary worktree creation",
+  "failure_kind": "PermissionDenied",
+  "failure_message": "fatal: could not create leading directories of '.git/worktrees/handwritten': Operation not permitted",
+  "qualified_environment_required_unrestricted_subprocess_access": true,
+  "invocation_used_unrestricted_subprocess_access": false,
+  "formal_evidence_usable": false,
+  "decision_usable": false,
+  "product_decision": null,
+  "retry_used": false,
+  "superseded_by": "gate1-v2.8"
+}

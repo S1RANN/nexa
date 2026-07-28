@@ -1,0 +1,40 @@
+{
+  "cases": [
+    {
+      "actual_gate1_status": "NOT_TRUSTWORTHY",
+      "contract_count": 44,
+      "contracts_satisfied": 42,
+      "expected_gate1_status": "NOT_TRUSTWORTHY",
+      "matched": true,
+      "name": "v2.4-42-of-44",
+      "receipt_present": false
+    },
+    {
+      "actual_gate1_status": "DECISION_COMPUTED_PENDING_FINALIZATION",
+      "contract_count": 50,
+      "contracts_satisfied": 47,
+      "expected_gate1_status": "DECISION_COMPUTED_PENDING_FINALIZATION",
+      "matched": true,
+      "name": "v2.5-49-of-50",
+      "receipt_present": false
+    },
+    {
+      "actual_gate1_status": "NOT_TRUSTWORTHY",
+      "contract_count": 50,
+      "contracts_satisfied": 50,
+      "expected_gate1_status": "NOT_TRUSTWORTHY",
+      "matched": true,
+      "name": "receipt-mismatch",
+      "receipt_matches": false,
+      "receipt_present": true
+    }
+  ],
+  "experiment_version": "gate1-v2.9",
+  "old_generator_regression": {
+    "input": "v2.4 42/44",
+    "new_output": "INCOMPLETE / NOT_TRUSTWORTHY",
+    "old_output": "VERIFIED_TERMINAL_DECISION"
+  },
+  "schema_version": 1,
+  "status": "PASS"
+}

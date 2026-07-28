@@ -1,0 +1,27 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.9",
+  "failures": [],
+  "gate": "artifact_hygiene",
+  "generator": "nexa-gate1-v2-9-gates/raw-v1",
+  "implementation_sha": "d3d66810ea6f6a7ef36f104f2e74a7588736e077",
+  "implementation_tree": "e22824f3e812abbd983ec345094589decabb7150",
+  "layer": "APPARATUS",
+  "metrics": {
+    "build_output_location": "target/",
+    "forbidden_extensions": [
+      "rlib",
+      "rmeta",
+      "o",
+      "d"
+    ],
+    "forbidden_names": [
+      ".fingerprint",
+      "CACHEDIR.TAG",
+      "Cargo.lock"
+    ],
+    "violations": []
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}

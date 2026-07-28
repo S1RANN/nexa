@@ -1,0 +1,32 @@
+{
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.9",
+  "failures": [],
+  "gate": "validity",
+  "generator": "nexa-gate1-v2-9-gates/raw-v1",
+  "implementation_sha": "d3d66810ea6f6a7ef36f104f2e74a7588736e077",
+  "implementation_tree": "e22824f3e812abbd983ec345094589decabb7150",
+  "layer": "APPARATUS",
+  "metrics": {
+    "apparatus_valid": true,
+    "formal_run_count": 3,
+    "postflight_statuses": [
+      "PASS",
+      "PASS",
+      "PASS"
+    ],
+    "preflight_postflight_present": true,
+    "preflight_statuses": [
+      "PASS",
+      "PASS",
+      "PASS"
+    ],
+    "validity_statuses": [
+      "PASS",
+      "PASS",
+      "PASS"
+    ]
+  },
+  "outcome": "PASS",
+  "schema_version": 1
+}
