@@ -1,0 +1,93 @@
+{
+  "cases": [
+    {
+      "actual_decision": "HOLD",
+      "apparatus_status": "PASS",
+      "expected_decision": "HOLD",
+      "matched": true,
+      "name": "all-pass",
+      "outcomes": [
+        "PASS",
+        "PASS",
+        "PASS"
+      ],
+      "worker_exit_code": 0
+    },
+    {
+      "actual_decision": "STOP",
+      "apparatus_status": "PASS",
+      "expected_decision": "STOP",
+      "matched": true,
+      "name": "h1-fail",
+      "outcomes": [
+        "FAIL",
+        "PASS",
+        "PASS"
+      ],
+      "worker_exit_code": 0
+    },
+    {
+      "actual_decision": "STOP",
+      "apparatus_status": "PASS",
+      "expected_decision": "STOP",
+      "matched": true,
+      "name": "h2-fail",
+      "outcomes": [
+        "PASS",
+        "FAIL",
+        "PASS"
+      ],
+      "worker_exit_code": 0
+    },
+    {
+      "actual_decision": "STOP",
+      "apparatus_status": "PASS",
+      "expected_decision": "STOP",
+      "matched": true,
+      "name": "h3-fail",
+      "outcomes": [
+        "PASS",
+        "PASS",
+        "FAIL"
+      ],
+      "worker_exit_code": 0
+    },
+    {
+      "actual_decision": "UNVERIFIABLE_WITHIN_MVR",
+      "apparatus_status": "PASS",
+      "expected_decision": "UNVERIFIABLE_WITHIN_MVR",
+      "matched": true,
+      "name": "inconclusive",
+      "outcomes": [
+        "INCONCLUSIVE",
+        "PASS",
+        "PASS"
+      ],
+      "worker_exit_code": 0
+    },
+    {
+      "actual_decision": "INVALID",
+      "apparatus_status": "INVALID",
+      "expected_decision": "INVALID",
+      "matched": true,
+      "name": "invalid",
+      "outcomes": [
+        "INVALID",
+        "PASS",
+        "PASS"
+      ],
+      "worker_exit_code": 0
+    }
+  ],
+  "crash_case": {
+    "matched": true,
+    "name": "crash-or-missing-result",
+    "supervisor_outcome": "INVALID",
+    "worker_exit_code": 23
+  },
+  "fail_preserved": true,
+  "inconclusive_preserved": true,
+  "protocol": "gate1-outcome-transport-v2",
+  "schema_version": 1,
+  "status": "PASS"
+}

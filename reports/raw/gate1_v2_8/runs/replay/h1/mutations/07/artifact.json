@@ -1,0 +1,76 @@
+{
+  "actual_error_code": "HostHashMismatch",
+  "actual_error_variant": "HostHashMismatch",
+  "after_tree": "0bc0500d5fad953e",
+  "before_tree": "7c616ac84745133a60b3ae7f8bbcfeeecb2dc69c",
+  "command_exit_code": 0,
+  "detection_phase": "Load",
+  "early_rejected": true,
+  "expected_changed_symbols": [
+    "CombatHost::enemy_view"
+  ],
+  "expected_detection_phase": "Load",
+  "generated": {
+    "build": {
+      "command": "cargo check",
+      "exit_code": 0,
+      "stderr": "warning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:126:382\n    |\n126 | ...::ZERO,CombatEvent::Damage(value) => nexa_runtime::HostReturnRequirements::ZERO,CombatEvent::Moved(value) => nexa_runtime::Encod...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n    |\n    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default\n\nwarning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:192:161\n    |\n192 | ...ked_add(match &result { Ok(value) => nexa_runtime::HostReturnRequirements::ZERO, Err(error) => nexa_runtime::HostReturnRequireme...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n\nwarning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:197:161\n    |\n197 | ...ked_add(match &result { Ok(value) => nexa_runtime::HostReturnRequirements::ZERO, Err(error) => nexa_runtime::HostReturnRequireme...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n\nwarning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:209:241\n    |\n209 | ...::ZERO,CombatEvent::Damage(value) => nexa_runtime::HostReturnRequirements::ZERO,CombatEvent::Moved(value) => nexa_runtime::Encod...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n\nwarning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:270:163\n    |\n270 | ...d_add(match &result { Some(value) => nexa_runtime::HostReturnRequirements::ZERO, None => nexa_runtime::HostReturnRequirements::Z...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n\nwarning: unused variable: `value`\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:274:161\n    |\n274 | ...ked_add(match &result { Ok(value) => nexa_runtime::HostReturnRequirements::ZERO, Err(error) => nexa_runtime::HostReturnRequireme...\n    |                               ^^^^^ help: if this is intentional, prefix it with an underscore: `_value`\n\nwarning: associated function `from_runtime` is never used\n  --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:60:34\n   |\n60 | impl<'a> CombatErrorRef<'a> { fn from_runtime(value: nexa_runtime::HostEnumRef<'a>) -> Result<Self, nexa_runtime::HostTrap> {\n   | ---------------------------      ^^^^^^^^^^^^\n   | |\n   | associated function in this implementation\n   |\n   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default\n\nwarning: associated function `from_runtime` is never used\n  --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:83:34\n   |\n83 | impl<'a> CombatEventRef<'a> { fn from_runtime(value: nexa_runtime::HostEnumRef<'a>) -> Result<Self, nexa_runtime::HostTrap> {\n   | ---------------------------      ^^^^^^^^^^^^\n   | |\n   | associated function in this implementation\n\nwarning: associated function `from_runtime` is never used\n   --> /Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated/experiments/gate1/h1/generated/combat.rs:107:4\n    |\n106 | impl<'a> EnemyViewRef<'a> {\n    | ------------------------- associated function in this implementation\n107 | fn from_runtime(value: nexa_runtime::HostStructRef<'a>) -> Self { Self(value) }\n    |    ^^^^^^^^^^^^\n\n",
+      "stderr_hash": "b9d4be5811aa2121"
+    },
+    "generated_output_diff": {
+      "changed_files": 1,
+      "changed_lines": 2,
+      "numstat": "1\t1\texperiments/gate1/h1/generated/combat.rs",
+      "patch": "diff --git a/experiments/gate1/h1/generated/combat.rs b/experiments/gate1/h1/generated/combat.rs\nindex bb12b5a..d217a4a 100644\n--- a/experiments/gate1/h1/generated/combat.rs\n+++ b/experiments/gate1/h1/generated/combat.rs\n@@ -181,7 +181,7 @@ pub const THUNK_INSPECT_EVENTS: u32 = 19;\n pub struct GeneratedHostRegistry<H> { pub host: H }\n impl<H> GeneratedHostRegistry<H> { pub const fn new(host: H) -> Self { Self { host } } }\n impl<H: CombatHost> nexa_runtime::HostRegistry for GeneratedHostRegistry<H> {\n-fn interface_hash(&self) -> Option<nexa_runtime::StableId> { Some(nexa_runtime::StableId(5233262731947482443)) }\n+fn interface_hash(&self) -> Option<nexa_runtime::StableId> { Some(nexa_runtime::StableId(68411268958997776)) }\n #[allow(deprecated)] fn call(&mut self, _: u32, _: &mut nexa_runtime::ResourceContext<'_>, _: nexa_runtime::HostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> { panic!(\"materializing GeneratedHostRegistry::call is disabled\") }\n fn call_runtime(&mut self, id: u32, context: &mut nexa_runtime::ResourceContext<'_>, args: nexa_runtime::RuntimeHostArgs<'_>) -> Result<nexa_runtime::HostCallOutcome, nexa_runtime::HostTrap> {\n match id {",
+      "patch_hash": "0bc0500d5fad953e"
+    },
+    "generation_hash": "d217a4a0ec2909b9aeeaac6925dc75b32116eee7",
+    "load_result": "rejected",
+    "maintained_diff": {
+      "changed_files": 1,
+      "changed_lines": 2,
+      "numstat": "1\t1\texperiments/gate1/h1/combat.idl",
+      "patch": "diff --git a/experiments/gate1/h1/combat.idl b/experiments/gate1/h1/combat.idl\nindex 0735876..71f97ac 100644\n--- a/experiments/gate1/h1/combat.idl\n+++ b/experiments/gate1/h1/combat.idl\n@@ -8,7 +8,7 @@ interface CombatHost {\n     sync fuel 1 fn apply_damage(entity: i32, amount: i32) -> Result<i32, CombatError>;\n     sync fuel 1 fn heal(entity: i32, amount: i32) -> Result<i32, CombatError>;\n     sync fuel 2 fn entity_name(entity: i32) -> string;\n-    sync fuel 2 fn enemy_view(entity: i32) -> EnemyView;\n+    sync fuel 3 fn enemy_view(entity: i32) -> EnemyView;\n     sync fuel 2 fn combat_event(entity: i32) -> CombatEvent;\n     sync fuel 2 fn maybe_target(entity: i32) -> Option<EnemyView>;\n     sync fuel 2 fn nearby(entity: i32) -> array<i32>;",
+      "patch_hash": "4b88dda2f6a3fc35"
+    },
+    "worktree": "/Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/generated"
+  },
+  "generated_semantic_signature": "policy:enemy_view:fuel-2->3",
+  "generation_deterministic": true,
+  "handwritten": {
+    "build": {
+      "command": "cargo check",
+      "exit_code": 0,
+      "stderr": "",
+      "stderr_hash": "cbf29ce484222325"
+    },
+    "build_matches_expectation": true,
+    "diff": {
+      "changed_files": 1,
+      "changed_lines": 2,
+      "numstat": "1\t1\texperiments/gate1-v2.8/fixtures/h1_handwritten.rs",
+      "patch": "diff --git a/experiments/gate1-v2.8/fixtures/h1_handwritten.rs b/experiments/gate1-v2.8/fixtures/h1_handwritten.rs\nindex 0d256f4..3affc5f 100644\n--- a/experiments/gate1-v2.8/fixtures/h1_handwritten.rs\n+++ b/experiments/gate1-v2.8/fixtures/h1_handwritten.rs\n@@ -18,7 +18,7 @@ pub fn add_parameter(value: i32) -> i32 { value }\n pub fn delete_parameter(value: i32) -> i32 { value }\n pub fn parameter_order(entity: i32, amount: i64) -> i64 { i64::from(entity) + amount }\n pub fn sync_to_async() -> HostResult { HostResult::Value }\n-pub const FUEL_COST: u32 = 1;\n+pub const FUEL_COST: u32 = 3;\n pub const CANCEL_POLICY: &str = \"return_error\";\n pub const ABANDON_POLICY: &str = \"return_error\";",
+      "patch_hash": "666bb2f34052c4c5"
+    },
+    "host_interface_check": {
+      "command": "cargo check + exact interface load check",
+      "error_code": "HostHashMismatch",
+      "error_variant": "HostHashMismatch",
+      "exit_code": 0
+    },
+    "worktree": "/Users/orokane/projects/nexa/target/gate1-v2.8/replay/h1/mutations/07/handwritten"
+  },
+  "handwritten_semantic_signature": "policy:enemy_view:fuel-2->3",
+  "id": "07",
+  "interpreter_entered": false,
+  "mutation_kind": "FuelCost",
+  "mutation_spec_hash": "704ec91423ed484a",
+  "new_interface_hash": 68411268958997776,
+  "old_interface_hash": 5233262731947482443,
+  "patch_hash": "a89803f80c9c7246",
+  "runtime_call_count": 0,
+  "scenario": "fuel cost change",
+  "semantic_change_signature": "policy:enemy_view:fuel-2->3",
+  "semantic_equivalence": true,
+  "stderr_hash": "b9d4be5811aa2121"
+}

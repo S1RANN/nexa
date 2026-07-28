@@ -1,0 +1,17 @@
+{
+  "version": "gate1-v2.6",
+  "status": "STRUCTURAL_CLOSURE_FAILED",
+  "decision_usable": false,
+  "implementation_sha": "e83579984056226737202fad455ef9e312ae2a22",
+  "evidence_sha": "a9c3ddd2d10c793bff21bd51dccb79ccf7f65f5c",
+  "decision_sha": "3907e0056c9c0325b7adf5623b664ac8c7438bf9",
+  "receipt_sha": "7d2ea923543a8bfb90e1c164da2656bbde0cbb2b",
+  "finalization_sha": "a59e028ad1067bab6284df3fe83311c938a6c903",
+  "canonical_record_hash": "reports/history/gate1/v2_6/raw_manifest.json",
+  "historical_record_immutable": true,
+  "recorded_product_decision": "STOP",
+  "recorded_product_decision_authorized": false,
+  "gate1_status": "INCOMPLETE",
+  "supersedes": "gate1-v2.5",
+  "superseded_by": "gate1-v2.7"
+}

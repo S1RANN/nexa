@@ -1,0 +1,31 @@
+{
+  "artifact_hash_recomputed": true,
+  "contracts_recomputed": true,
+  "decision_paths_valid": true,
+  "decision_recomputed": true,
+  "decision_sha": "053931a8dd7c462d353df880669a3554632faf46",
+  "evidence_paths_valid": true,
+  "evidence_sha": "fb56c2d343578951b919610cdf3608a95dbd4ce5",
+  "final_hashes_match_receipt": true,
+  "finalization_paths_valid": true,
+  "finalization_sha": "199c0f3febd7bcb5c78dd8adbca4f1bc4eee0ef1",
+  "formal_evidence_usable": false,
+  "implementation_sha": "e16d37972206b82d668e7d2e23c17f994ec77e2c",
+  "markdown_rebuilt": true,
+  "negative_cases": {
+    "extra_final_file_rejected": true,
+    "extra_receipt_file_rejected": true,
+    "final_hash_mismatch_rejected": true,
+    "wrong_parent_rejected": true
+  },
+  "parent_chain_valid": true,
+  "push_is_contract_prerequisite": false,
+  "receipt_paths_valid": true,
+  "receipt_sha": "e4c67ebd798d6e7e8ec575a5ef91f66d6adfea6d",
+  "schema_version": 1,
+  "status": "PASS",
+  "status_blocks_rebuilt": true,
+  "synthetic": true,
+  "wp_050_pass_after_candidate_finalization": true,
+  "wp_050_pending_before_finalization": true
+}

@@ -1,0 +1,1408 @@
+{
+  "apparatus_status": "PASS",
+  "components": {
+    "allocation": "PASS",
+    "performance": "INCONCLUSIVE",
+    "semantic": "PASS"
+  },
+  "contract_failures": [],
+  "contract_status": "PASS",
+  "experiment_version": "gate1-v2.8",
+  "failures": [
+    "h2 comparison is INCONCLUSIVE"
+  ],
+  "gate": "replay",
+  "generator": "nexa-gate1-v2-8-gates/raw-v2",
+  "implementation_sha": "61b091636b14484b7776f76d1147c0c599b87922",
+  "implementation_tree": "7c616ac84745133a60b3ae7f8bbcfeeecb2dc69c",
+  "layer": "COMPARISON",
+  "metrics": {
+    "comparison": {
+      "failures": [
+        "h2 comparison is INCONCLUSIVE"
+      ],
+      "h1": {
+        "left_outcome": "FAIL",
+        "left_signature": "af6600462d0eb4df",
+        "mutation_count": 20,
+        "outcome_equal": true,
+        "right_outcome": "FAIL",
+        "right_signature": "af6600462d0eb4df",
+        "schema_valid": true,
+        "semantic_equal": true,
+        "status": "PASS"
+      },
+      "h2": {
+        "allocation": {
+          "failures": [],
+          "observations": {
+            "equal": true,
+            "left": {
+              "baseline_subtracted": false,
+              "count_semantics": "ABSOLUTE_GLOBAL_ALLOCATOR_DELTAS",
+              "observer_run_count": 3,
+              "projection": "gate1-v2.8-h2-allocation-v1",
+              "runs": [
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                },
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                },
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                }
+              ],
+              "schema_version": 1
+            },
+            "right": {
+              "baseline_subtracted": false,
+              "count_semantics": "ABSOLUTE_GLOBAL_ALLOCATOR_DELTAS",
+              "observer_run_count": 3,
+              "projection": "gate1-v2.8-h2-allocation-v1",
+              "runs": [
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                },
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                },
+                {
+                  "explicit_resume": 0,
+                  "fuel_resume": 0,
+                  "host_resume": 0,
+                  "promotion": 0,
+                  "trace_off": 0
+                }
+              ],
+              "schema_version": 1
+            }
+          },
+          "rule": "equal allocation projection and equal absolute zero-allocation conditions",
+          "status": "PASS"
+        },
+        "performance": {
+          "failures": [
+            "array_operations:mean_ns",
+            "array_operations:p50_ns",
+            "array_operations:p90_ns",
+            "array_operations:p95_ns",
+            "array_operations:p99_ns",
+            "array_operations:throughput_ops_per_second",
+            "array_operations:frame_1000_calls_ns",
+            "async_admission:mean_ns",
+            "async_admission:p50_ns",
+            "async_admission:p90_ns",
+            "async_admission:p95_ns",
+            "async_admission:throughput_ops_per_second",
+            "async_admission:frame_1000_calls_ns",
+            "buffer_copy:mean_ns",
+            "buffer_copy:p50_ns",
+            "buffer_copy:p90_ns",
+            "buffer_copy:p95_ns",
+            "buffer_copy:throughput_ops_per_second",
+            "buffer_copy:frame_1000_calls_ns",
+            "class_allocation:mean_ns",
+            "class_allocation:p50_ns",
+            "class_allocation:p90_ns",
+            "class_allocation:p95_ns",
+            "class_allocation:throughput_ops_per_second",
+            "class_allocation:frame_1000_calls_ns",
+            "enum_construction_match:mean_ns",
+            "enum_construction_match:p50_ns",
+            "enum_construction_match:p90_ns",
+            "enum_construction_match:p95_ns",
+            "enum_construction_match:throughput_ops_per_second",
+            "enum_construction_match:frame_1000_calls_ns",
+            "explicit_resume:mean_ns",
+            "explicit_resume:p50_ns",
+            "explicit_resume:p90_ns",
+            "explicit_resume:p95_ns",
+            "explicit_resume:p99_ns",
+            "explicit_resume:throughput_ops_per_second",
+            "explicit_resume:frame_1000_calls_ns",
+            "fuel_resume:mean_ns",
+            "fuel_resume:p50_ns",
+            "fuel_resume:p90_ns",
+            "fuel_resume:p95_ns",
+            "fuel_resume:throughput_ops_per_second",
+            "fuel_resume:frame_1000_calls_ns",
+            "immediate_call:mean_ns",
+            "immediate_call:p50_ns",
+            "immediate_call:p90_ns",
+            "immediate_call:p95_ns",
+            "immediate_call:throughput_ops_per_second",
+            "immediate_call:frame_1000_calls_ns",
+            "map_operations:mean_ns",
+            "map_operations:p50_ns",
+            "map_operations:p90_ns",
+            "map_operations:p95_ns",
+            "map_operations:p99_ns",
+            "map_operations:throughput_ops_per_second",
+            "map_operations:frame_1000_calls_ns",
+            "migration:mean_ns",
+            "migration:p50_ns",
+            "migration:p90_ns",
+            "migration:p95_ns",
+            "migration:throughput_ops_per_second",
+            "migration:frame_1000_calls_ns",
+            "realm_drop:mean_ns",
+            "realm_drop:p50_ns",
+            "realm_drop:p90_ns",
+            "realm_drop:p95_ns",
+            "realm_drop:throughput_ops_per_second",
+            "realm_drop:frame_1000_calls_ns",
+            "reload_commit:mean_ns",
+            "reload_commit:p50_ns",
+            "reload_commit:p90_ns",
+            "reload_commit:p95_ns",
+            "reload_commit:throughput_ops_per_second",
+            "reload_commit:frame_1000_calls_ns",
+            "result_ok_err:mean_ns",
+            "result_ok_err:p50_ns",
+            "result_ok_err:p90_ns",
+            "result_ok_err:p95_ns",
+            "result_ok_err:throughput_ops_per_second",
+            "result_ok_err:frame_1000_calls_ns",
+            "snapshot_access:mean_ns",
+            "snapshot_access:p50_ns",
+            "snapshot_access:p90_ns",
+            "snapshot_access:p95_ns",
+            "snapshot_access:p99_ns",
+            "snapshot_access:throughput_ops_per_second",
+            "snapshot_access:frame_1000_calls_ns",
+            "string_concat:mean_ns",
+            "string_concat:p50_ns",
+            "string_concat:p90_ns",
+            "string_concat:p95_ns",
+            "string_concat:p99_ns",
+            "string_concat:throughput_ops_per_second",
+            "string_concat:frame_1000_calls_ns",
+            "struct_construction:mean_ns",
+            "struct_construction:p50_ns",
+            "struct_construction:p90_ns",
+            "struct_construction:p95_ns",
+            "struct_construction:throughput_ops_per_second",
+            "struct_construction:frame_1000_calls_ns"
+          ],
+          "observations": {
+            "aggregation": "median-of-three-independent-process-values-per-case",
+            "comparisons": [
+              {
+                "case": "array_operations",
+                "delta": 0.5572207084468664,
+                "left": 734.0,
+                "metric": "mean_ns",
+                "right": 1143.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.5867418899858956,
+                "left": 709.0,
+                "metric": "p50_ns",
+                "right": 1125.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.5006002400960384,
+                "left": 833.0,
+                "metric": "p90_ns",
+                "right": 1250.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.42857142857142855,
+                "left": 875.0,
+                "metric": "p95_ns",
+                "right": 1250.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.4337851929092805,
+                "left": 959.0,
+                "metric": "p99_ns",
+                "right": 1375.0,
+                "tolerance": 0.35,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.5571617495945145,
+                "left": 1362325.0,
+                "metric": "throughput_ops_per_second",
+                "right": 874877.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.5572207084468664,
+                "left": 734000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1143000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "array_operations",
+                "delta": 0.008242976923000342,
+                "left": 0.09227265070846195,
+                "metric": "coefficient_of_variation",
+                "right": 0.1005156276314623,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.4204144620811288,
+                "left": 4536.0,
+                "metric": "mean_ns",
+                "right": 6443.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.4420858329487771,
+                "left": 4334.0,
+                "metric": "p50_ns",
+                "right": 6250.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.4276521739130435,
+                "left": 5750.0,
+                "metric": "p90_ns",
+                "right": 8209.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.38672,
+                "left": 6250.0,
+                "metric": "p95_ns",
+                "right": 8667.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.10194570662938368,
+                "left": 8583.0,
+                "metric": "p99_ns",
+                "right": 9458.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.42044561281426784,
+                "left": 220456.0,
+                "metric": "throughput_ops_per_second",
+                "right": 155202.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.4204144620811288,
+                "left": 4536000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 6443000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "async_admission",
+                "delta": 0.049330636925902005,
+                "left": 0.4271775634362744,
+                "metric": "coefficient_of_variation",
+                "right": 0.3778469265103724,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.39628482972136225,
+                "left": 646.0,
+                "metric": "mean_ns",
+                "right": 902.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.4656,
+                "left": 625.0,
+                "metric": "p50_ns",
+                "right": 916.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.2786666666666667,
+                "left": 750.0,
+                "metric": "p90_ns",
+                "right": 959.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.2004801920768307,
+                "left": 833.0,
+                "metric": "p95_ns",
+                "right": 1000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.13631406761177753,
+                "left": 917.0,
+                "metric": "p99_ns",
+                "right": 1042.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.3967874218695006,
+                "left": 1547755.0,
+                "metric": "throughput_ops_per_second",
+                "right": 1108082.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.39628482972136225,
+                "left": 646000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 902000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "buffer_copy",
+                "delta": 0.07337903831310347,
+                "left": 0.1360912764651364,
+                "metric": "coefficient_of_variation",
+                "right": 0.06271223815203295,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.47002724795640327,
+                "left": 734.0,
+                "metric": "mean_ns",
+                "right": 1079.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.5296610169491526,
+                "left": 708.0,
+                "metric": "p50_ns",
+                "right": 1083.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.4722222222222222,
+                "left": 792.0,
+                "metric": "p90_ns",
+                "right": 1166.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.27262813522355506,
+                "left": 917.0,
+                "metric": "p95_ns",
+                "right": 1167.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.1,
+                "left": 1375.0,
+                "metric": "p99_ns",
+                "right": 1250.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.46992362721099007,
+                "left": 1361896.0,
+                "metric": "throughput_ops_per_second",
+                "right": 926508.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.47002724795640327,
+                "left": 734000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1079000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "class_allocation",
+                "delta": 0.09883582732614384,
+                "left": 0.1675240169877089,
+                "metric": "coefficient_of_variation",
+                "right": 0.06868818966156506,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.3607843137254902,
+                "left": 765.0,
+                "metric": "mean_ns",
+                "right": 1041.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.4682651622002821,
+                "left": 709.0,
+                "metric": "p50_ns",
+                "right": 1041.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.3997599039615846,
+                "left": 833.0,
+                "metric": "p90_ns",
+                "right": 1166.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.21689259645464024,
+                "left": 959.0,
+                "metric": "p95_ns",
+                "right": 1167.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.0347682119205298,
+                "left": 1208.0,
+                "metric": "p99_ns",
+                "right": 1250.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.36084373421643207,
+                "left": 1306757.0,
+                "metric": "throughput_ops_per_second",
+                "right": 960255.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.3607843137254902,
+                "left": 765000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1041000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "enum_construction_match",
+                "delta": 0.12215747480798551,
+                "left": 0.20290699090050807,
+                "metric": "coefficient_of_variation",
+                "right": 0.08074951609252254,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.5063694267515924,
+                "left": 314.0,
+                "metric": "mean_ns",
+                "right": 473.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.3783783783783784,
+                "left": 333.0,
+                "metric": "p50_ns",
+                "right": 459.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.3333333333333333,
+                "left": 375.0,
+                "metric": "p90_ns",
+                "right": 500.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.44266666666666665,
+                "left": 375.0,
+                "metric": "p95_ns",
+                "right": 541.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.3980815347721823,
+                "left": 417.0,
+                "metric": "p99_ns",
+                "right": 583.0,
+                "tolerance": 0.35,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.5044024216278047,
+                "left": 3177498.0,
+                "metric": "throughput_ops_per_second",
+                "right": 2112133.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.5063694267515924,
+                "left": 314000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 473000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "explicit_resume",
+                "delta": 0.023372418211918947,
+                "left": 0.10826862779673012,
+                "metric": "coefficient_of_variation",
+                "right": 0.08489620958481117,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.4393203883495146,
+                "left": 412.0,
+                "metric": "mean_ns",
+                "right": 593.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.4014423076923077,
+                "left": 416.0,
+                "metric": "p50_ns",
+                "right": 583.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.3616557734204793,
+                "left": 459.0,
+                "metric": "p90_ns",
+                "right": 625.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.3616557734204793,
+                "left": 459.0,
+                "metric": "p95_ns",
+                "right": 625.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.23062730627306272,
+                "left": 542.0,
+                "metric": "p99_ns",
+                "right": 667.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.43894975611925696,
+                "left": 2426465.0,
+                "metric": "throughput_ops_per_second",
+                "right": 1686275.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.4393203883495146,
+                "left": 412000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 593000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "fuel_resume",
+                "delta": 0.04291577154798789,
+                "left": 0.09557973833134882,
+                "metric": "coefficient_of_variation",
+                "right": 0.05266396678336093,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.4173076923076923,
+                "left": 520.0,
+                "metric": "mean_ns",
+                "right": 737.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.5,
+                "left": 500.0,
+                "metric": "p50_ns",
+                "right": 750.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.2672,
+                "left": 625.0,
+                "metric": "p90_ns",
+                "right": 792.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.24887556221889057,
+                "left": 667.0,
+                "metric": "p95_ns",
+                "right": 833.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.10619469026548672,
+                "left": 791.0,
+                "metric": "p99_ns",
+                "right": 875.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.4156410598457149,
+                "left": 1920797.0,
+                "metric": "throughput_ops_per_second",
+                "right": 1356839.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.4173076923076923,
+                "left": 520000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 737000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "immediate_call",
+                "delta": 0.1243727296066092,
+                "left": 0.19979145006909096,
+                "metric": "coefficient_of_variation",
+                "right": 0.07541872046248176,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.5067567567567568,
+                "left": 888.0,
+                "metric": "mean_ns",
+                "right": 1338.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.5234285714285715,
+                "left": 875.0,
+                "metric": "p50_ns",
+                "right": 1333.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.458,
+                "left": 1000.0,
+                "metric": "p90_ns",
+                "right": 1458.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.3471837488457987,
+                "left": 1083.0,
+                "metric": "p95_ns",
+                "right": 1459.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.3564695801199657,
+                "left": 1167.0,
+                "metric": "p99_ns",
+                "right": 1583.0,
+                "tolerance": 0.35,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.5060550610994283,
+                "left": 1125115.0,
+                "metric": "throughput_ops_per_second",
+                "right": 747061.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.5067567567567568,
+                "left": 888000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1338000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "map_operations",
+                "delta": 0.1859841850695245,
+                "left": 0.2536259651223397,
+                "metric": "coefficient_of_variation",
+                "right": 0.43961015019186417,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "migration",
+                "delta": 0.4127566678267473,
+                "left": 31607.0,
+                "metric": "mean_ns",
+                "right": 44653.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.49582676901417894,
+                "left": 29833.0,
+                "metric": "p50_ns",
+                "right": 44625.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.22020278287131917,
+                "left": 37084.0,
+                "metric": "p90_ns",
+                "right": 45250.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.20443937625967964,
+                "left": 37708.0,
+                "metric": "p95_ns",
+                "right": 45417.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.14971094271829008,
+                "left": 43417.0,
+                "metric": "p99_ns",
+                "right": 49917.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "migration",
+                "delta": 0.4127444851299455,
+                "left": 31637.0,
+                "metric": "throughput_ops_per_second",
+                "right": 22394.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.4127566678267473,
+                "left": 31607000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 44653000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "migration",
+                "delta": 0.10985609139527255,
+                "left": 0.1321358136607066,
+                "metric": "coefficient_of_variation",
+                "right": 0.022279722265434024,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.6054158607350096,
+                "left": 1551.0,
+                "metric": "mean_ns",
+                "right": 2490.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.6577503429355281,
+                "left": 1458.0,
+                "metric": "p50_ns",
+                "right": 2417.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.5455537370430987,
+                "left": 1833.0,
+                "metric": "p90_ns",
+                "right": 2833.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.48978549540347294,
+                "left": 1958.0,
+                "metric": "p95_ns",
+                "right": 2917.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.24971878515185603,
+                "left": 2667.0,
+                "metric": "p99_ns",
+                "right": 3333.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.6047234368930104,
+                "left": 644412.0,
+                "metric": "throughput_ops_per_second",
+                "right": 401572.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.6054158607350096,
+                "left": 1551000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 2490000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "realm_drop",
+                "delta": 0.17533421437319768,
+                "left": 0.2803499792220989,
+                "metric": "coefficient_of_variation",
+                "right": 0.10501576484890122,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.5321322936273192,
+                "left": 3719.0,
+                "metric": "mean_ns",
+                "right": 5698.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.5467485347474184,
+                "left": 3583.0,
+                "metric": "p50_ns",
+                "right": 5542.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.5151515151515151,
+                "left": 4125.0,
+                "metric": "p90_ns",
+                "right": 6250.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.4667428571428571,
+                "left": 4375.0,
+                "metric": "p95_ns",
+                "right": 6417.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.33560171919770776,
+                "left": 5584.0,
+                "metric": "p99_ns",
+                "right": 7458.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.5323326095752623,
+                "left": 268883.0,
+                "metric": "throughput_ops_per_second",
+                "right": 175473.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.5321322936273192,
+                "left": 3719000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 5698000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "reload_commit",
+                "delta": 0.2038461202911243,
+                "left": 0.33114598876762835,
+                "metric": "coefficient_of_variation",
+                "right": 0.127299868476504,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.3730314960629922,
+                "left": 1016.0,
+                "metric": "mean_ns",
+                "right": 1395.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.375,
+                "left": 1000.0,
+                "metric": "p50_ns",
+                "right": 1375.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.3333333333333333,
+                "left": 1125.0,
+                "metric": "p90_ns",
+                "right": 1500.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.24172185430463575,
+                "left": 1208.0,
+                "metric": "p95_ns",
+                "right": 1500.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.288510101010101,
+                "left": 2041.0,
+                "metric": "p99_ns",
+                "right": 1584.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.3723855445226748,
+                "left": 983376.0,
+                "metric": "throughput_ops_per_second",
+                "right": 716545.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.3730314960629922,
+                "left": 1016000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1395000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "result_ok_err",
+                "delta": 0.12471437401416424,
+                "left": 0.18144453990956055,
+                "metric": "coefficient_of_variation",
+                "right": 0.056730165895396305,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.4936936936936937,
+                "left": 555.0,
+                "metric": "mean_ns",
+                "right": 829.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.5369003690036901,
+                "left": 542.0,
+                "metric": "p50_ns",
+                "right": 833.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.3344,
+                "left": 625.0,
+                "metric": "p90_ns",
+                "right": 834.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.3733133433283358,
+                "left": 667.0,
+                "metric": "p95_ns",
+                "right": 916.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.3511988716502116,
+                "left": 709.0,
+                "metric": "p99_ns",
+                "right": 958.0,
+                "tolerance": 0.35,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.494537588872562,
+                "left": 1801272.0,
+                "metric": "throughput_ops_per_second",
+                "right": 1205237.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.4936936936936937,
+                "left": 555000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 829000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "snapshot_access",
+                "delta": 0.03805448369245024,
+                "left": 0.07855568636786003,
+                "metric": "coefficient_of_variation",
+                "right": 0.0405012026754098,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.5269286754002911,
+                "left": 687.0,
+                "metric": "mean_ns",
+                "right": 1049.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.5622188905547226,
+                "left": 667.0,
+                "metric": "p50_ns",
+                "right": 1042.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.5,
+                "left": 750.0,
+                "metric": "p90_ns",
+                "right": 1125.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.4734848484848485,
+                "left": 792.0,
+                "metric": "p95_ns",
+                "right": 1167.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.3817142857142858,
+                "left": 875.0,
+                "metric": "p99_ns",
+                "right": 1209.0,
+                "tolerance": 0.35,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.5275780282517893,
+                "left": 1455568.0,
+                "metric": "throughput_ops_per_second",
+                "right": 952860.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.5269286754002911,
+                "left": 687000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1049000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "string_concat",
+                "delta": 0.02023879826142405,
+                "left": 0.08987351510654545,
+                "metric": "coefficient_of_variation",
+                "right": 0.0696347168451214,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.47307132459970885,
+                "left": 687.0,
+                "metric": "mean_ns",
+                "right": 1012.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.5015015015015015,
+                "left": 666.0,
+                "metric": "p50_ns",
+                "right": 1000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.3674242424242424,
+                "left": 792.0,
+                "metric": "p90_ns",
+                "right": 1083.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.3013205282112845,
+                "left": 833.0,
+                "metric": "p95_ns",
+                "right": 1084.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.27262813522355506,
+                "left": 917.0,
+                "metric": "p99_ns",
+                "right": 1167.0,
+                "tolerance": 0.35,
+                "within_tolerance": true
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.4716506583808184,
+                "left": 1454035.0,
+                "metric": "throughput_ops_per_second",
+                "right": 988030.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.47307132459970885,
+                "left": 687000.0,
+                "metric": "frame_1000_calls_ns",
+                "right": 1012000.0,
+                "tolerance": 0.2,
+                "within_tolerance": false
+              },
+              {
+                "case": "struct_construction",
+                "delta": 0.041831863644417475,
+                "left": 0.1110736083483472,
+                "metric": "coefficient_of_variation",
+                "right": 0.06924174470392973,
+                "tolerance": 1.0,
+                "within_tolerance": true
+              }
+            ]
+          },
+          "rule": "absolute performance budgets are hypothesis outcomes; valid cross-run excess is INCONCLUSIVE",
+          "status": "INCONCLUSIVE"
+        },
+        "semantic": {
+          "failures": [],
+          "observations": {
+            "equal": true,
+            "left_signature": "781811e491cfdc95",
+            "right_signature": "781811e491cfdc95"
+          },
+          "rule": "equal outcomes, semantic signatures, 32 scenario projections, 12 cleanup projections, and runtime invariant classes",
+          "status": "PASS"
+        },
+        "status": "INCONCLUSIVE"
+      },
+      "h3": {
+        "left_outcome": "FAIL",
+        "left_signature": "b49d56d08bea6514",
+        "outcome_equal": true,
+        "right_outcome": "FAIL",
+        "right_signature": "b49d56d08bea6514",
+        "scenario_count": 30,
+        "schema_valid": true,
+        "semantic_equal": true,
+        "status": "PASS"
+      },
+      "implementation_sha": "61b091636b14484b7776f76d1147c0c599b87922",
+      "implementation_tree": "7c616ac84745133a60b3ae7f8bbcfeeecb2dc69c",
+      "left": "formal-run-1",
+      "right": "replay",
+      "semantic_match": {
+        "measurement": "DerivedCalculation",
+        "run_id": "formal-run-1__replay",
+        "sample_count": 3,
+        "source_artifact": "worker/result.json",
+        "source_pointer": "/h1|h2|h3",
+        "value": false
+      },
+      "status": "INCONCLUSIVE"
+    }
+  },
+  "outcome": "INCONCLUSIVE",
+  "schema_version": 2
+}

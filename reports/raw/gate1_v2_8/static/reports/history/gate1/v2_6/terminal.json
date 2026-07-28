@@ -1,0 +1,31 @@
+{
+  "apparatus_valid": false,
+  "decision_commit_created": true,
+  "decision_usable": false,
+  "finalization_created": true,
+  "formal_evidence_usable": false,
+  "formal_execution_complete": true,
+  "gate1_status": "INCOMPLETE",
+  "pushed": true,
+  "raw_h2_facts": {
+    "allocation_count_semantics": "ABSOLUTE_GLOBAL_ALLOCATOR_DELTAS",
+    "allocator_observer_repeats": 3,
+    "benchmark_processes": 3,
+    "cleanup_cases": 12,
+    "invariant_violations": 0,
+    "snapshot_scenarios": 32
+  },
+  "receipt_created": true,
+  "recorded_product_decision": "STOP",
+  "recorded_product_decision_authorized": false,
+  "retries_used": 0,
+  "schema_version": 1,
+  "status": "STRUCTURAL_CLOSURE_FAILED",
+  "structural_failures": [
+    "H2 Gate generator read obsolete root-level Raw paths",
+    "per-run derived outcomes were not compared with recorded component outcomes",
+    "Contract Manifest lacked direct Raw assertions for H2 counts and absolute zero allocations"
+  ],
+  "superseded_by": "gate1-v2.7",
+  "version": "gate1-v2.6"
+}

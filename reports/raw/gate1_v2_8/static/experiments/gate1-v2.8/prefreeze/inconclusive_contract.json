@@ -1,0 +1,51 @@
+{
+  "check": "inconclusive_contract",
+  "experiment_version": "gate1-v2.8",
+  "failures": [],
+  "metrics": [
+    {
+      "components": {
+        "allocation": "PASS",
+        "performance": "INCONCLUSIVE",
+        "semantic": "PASS"
+      },
+      "contract_status": "PASS",
+      "fixture": "formal",
+      "formal_evidence_usable": false,
+      "outcome": "INCONCLUSIVE"
+    },
+    {
+      "components": {
+        "allocation": "PASS",
+        "performance": "INCONCLUSIVE",
+        "semantic": "PASS"
+      },
+      "contract_status": "PASS",
+      "fixture": "replay",
+      "formal_evidence_usable": false,
+      "outcome": "INCONCLUSIVE"
+    },
+    {
+      "contract_status": "FAIL",
+      "negative": "semantic-diff-mislabeled"
+    },
+    {
+      "contract_status": "FAIL",
+      "negative": "allocation-diff-mislabeled"
+    },
+    {
+      "contract_status": "FAIL",
+      "negative": "performance-within-tolerance-mislabeled"
+    },
+    {
+      "contract_status": "FAIL",
+      "negative": "missing-performance-samples"
+    },
+    {
+      "contract_status": "FAIL",
+      "negative": "components-outcome-mismatch"
+    }
+  ],
+  "schema_version": 1,
+  "status": "PASS"
+}

@@ -1,0 +1,43 @@
+{
+  "allocator": "System observed by isolated allocation-observer",
+  "architecture": "aarch64",
+  "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+  "cpu_power": {
+    "available": true,
+    "stderr": "",
+    "stdout": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=34668643)\t100%; charged; 0:00 remaining present: true"
+  },
+  "execution_budget": {
+    "formal_run_1": 1,
+    "formal_run_2": 1,
+    "replay": 1,
+    "retry": 0
+  },
+  "experiment_version": "gate1-v2.8",
+  "feature_set": [
+    "nexa-runtime/allocation-counting",
+    "nexa-runtime/model-adapter"
+  ],
+  "os": "Darwin 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:34 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6041 arm64 arm",
+  "provenance_protocol": "gate1-process-handshake-v1",
+  "qualification_hash": "5d07436dacd675008b3de95f5f4f901a67fa1fb6",
+  "qualified_host": {
+    "available_memory": "25769803776",
+    "cargo": "cargo 1.97.1 (c980f4866 2026-06-30)",
+    "cpu_architecture": "aarch64",
+    "filesystem": "/Users/orokane/projects/nexa",
+    "fsync_capability": true,
+    "host_id": "U-FGJ2XX43-0102",
+    "nested_spawn_capability": true,
+    "os": "Darwin 25.5.0 Darwin Kernel Version 25.5.0: Tue Jun  9 22:28:34 PDT 2026; root:xnu-12377.121.10~1/RELEASE_ARM64_T6041 arm64 arm",
+    "power_mode": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=34668643)\t100%; charged; 0:00 remaining present: true",
+    "process_spawn_capability": true,
+    "rust": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+    "sandbox_status": "codex-managed execution; qualification requires approved unrestricted subprocess access",
+    "shell": "/opt/homebrew/bin/fish",
+    "terminal_host": "Codex Desktop"
+  },
+  "rust": "rustc 1.97.1 (8bab26f4f 2026-07-14)",
+  "schema_version": 2,
+  "timer": "std::time::Instant monotonic"
+}
