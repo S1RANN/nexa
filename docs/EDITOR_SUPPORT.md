@@ -1,7 +1,7 @@
 # Nexa editor support
 
 Nexa provides local syntax support for `.nexa` and `.nidl` files in VS Code
-and Zed. Version `0.1.1` provides syntax highlighting, bracket handling,
+and Zed. Version `0.1.2` provides syntax highlighting, bracket handling,
 indentation, and outlines where the editor supports them. It does not provide
 comments, an LSP, semantic highlighting, diagnostics, navigation, completion,
 formatting, snippets, code actions, or debugging.
@@ -43,7 +43,7 @@ Build output is written to:
 
 ```text
 target/nexa-editor-support/
-├── vscode/nexa-language-support-0.1.1.vsix
+├── vscode/nexa-language-support-0.1.2.vsix
 └── zed/
     ├── extension.toml
     ├── languages/
@@ -60,7 +60,7 @@ Install the local package:
 
 ```sh
 code --install-extension \
-  target/nexa-editor-support/vscode/nexa-language-support-0.1.1.vsix
+  target/nexa-editor-support/vscode/nexa-language-support-0.1.2.vsix
 ```
 
 Reload VS Code after upgrading the package. Remove it with:
@@ -121,7 +121,10 @@ TextMate JSON files by hand.
   type-checking and semantic validation remain authoritative.
 - Incomplete expressions or blocks may temporarily produce recovery nodes,
   but the extension remains usable.
+- VS Code does not register `<` and `>` as global bracket pairs. This prevents
+  bracket-pair colorization from treating the `>` in `->` and `=>` as an
+  unmatched closing bracket; generic angle brackets remain syntax-highlighted.
 - The Zed package contains an absolute local Grammar URL and must be rebuilt
   after moving or cloning the repository.
-- Version `0.1.1` is for local contributor use only and is not published to
+- Version `0.1.2` is for local contributor use only and is not published to
   the VS Code Marketplace or Zed Extension Gallery.

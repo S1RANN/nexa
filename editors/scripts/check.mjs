@@ -170,6 +170,15 @@ function validateContributions() {
       path.join(vscodeDirectory, "language-configuration", `${language}.json`),
     );
     assert(!("comments" in config), `${language} must not declare comments`);
+    const configuredPairs = [
+      ...config.brackets,
+      ...config.autoClosingPairs.map((pair) => [pair.open, pair.close]),
+      ...config.surroundingPairs,
+    ];
+    assert(
+      !configuredPairs.some(([open, close]) => open === "<" && close === ">"),
+      `${language} must not register angle brackets that split arrow operators`,
+    );
   }
 }
 
