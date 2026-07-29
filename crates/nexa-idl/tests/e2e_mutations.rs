@@ -3,9 +3,9 @@ mod e2e_support;
 use std::fs;
 
 use e2e_support::{
-    BUSINESS_HOST_V1, MutationEvidence, artifact_root, assert_changed_heartbeat_executes,
-    assert_expected_business_diagnostic, assert_pre_interpreter_rejection, check_business_host,
-    mutations, patch_delta, prepare_case, stable_bytes_hash, write_report,
+    BUSINESS_HOST_V1, MutationEvidence, artifact_root, assert_expected_business_diagnostic,
+    check_business_host, mutations, patch_delta, prepare_case, run_generated_registry_positive,
+    stable_bytes_hash, write_report,
 };
 
 #[test]
@@ -66,8 +66,15 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
             );
         }
 
-        assert_pre_interpreter_rejection(&base_idl, changed_hash);
-        assert_changed_heartbeat_executes(&changed_idl, changed_hash);
+        let positive =
+            run_generated_registry_positive(&case, &first, &patched_host, &shared_target);
+        assert!(
+            positive.status.success(),
+            "{} GeneratedHostRegistry positive runtime must pass:\nstdout:\n{}\nstderr:\n{}",
+            mutation.name,
+            String::from_utf8_lossy(&positive.stdout),
+            String::from_utf8_lossy(&positive.stderr)
+        );
         evidence.push(MutationEvidence {
             id: mutation.id,
             name: mutation.name,
@@ -79,7 +86,12 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
             patch_insertions,
             patch_deletions,
             old_bytecode_rejected: true,
-            changed_heartbeat_executed: true,
+            positive_registry: "GeneratedHostRegistry",
+            patched_business_host_compiled: true,
+            changed_module_loaded: true,
+            heartbeat_result: 42,
+            runtime_terminal_record: true,
+            runtime_ledger_balanced: true,
         });
     }
 

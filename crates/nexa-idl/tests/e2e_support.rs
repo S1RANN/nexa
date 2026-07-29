@@ -5,14 +5,91 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use nexa_core::StableId;
-use nexa_runtime::{
-    HostCallOutcome, HostRegistry, HostTrap, RealmConfig, RealmError, RealmRuntime,
-    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig, TaskLimits, TaskPoll,
-};
 use serde_json::Value;
 
 pub const BASE_NIDL: &str = include_str!("fixtures/business_host/interface.nidl");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
+const GENERATED_REGISTRY_RUNTIME_TEST: &str = r#"
+use super::*;
+
+#[test]
+fn changed_binding_executes_through_generated_registry() {
+    let base_idl = nexa_idl::parse(include_str!("base_interface.nidl")).expect("base NIDL");
+    let changed_idl = nexa_idl::parse(include_str!("interface.nidl")).expect("changed NIDL");
+    assert_eq!(INTERFACE_HASH, nexa_idl::exact_hash(&changed_idl));
+    let schema_hash = nexa_runtime::StableId::from_name("idl-e2e-schema");
+    let source = include_str!("module.nexa");
+    let old_module =
+        nexa_compiler::compile_with_interface(source, &base_idl, schema_hash).expect("old module");
+    let changed_module = nexa_compiler::compile_with_interface(
+        source,
+        &changed_idl,
+        schema_hash,
+    )
+    .expect("changed module");
+    let _verifier_limits = nexa_verifier::VerifierLimits::default();
+    let runtime_host = nexa_runtime::RuntimeHost::new(8);
+    let registry = GeneratedHostRegistry::new(BusinessHostV1);
+    let mut realm = nexa_runtime::RealmRuntime::hosted(
+        nexa_runtime::RealmConfig::default(),
+        runtime_host.clone(),
+        Box::new(registry),
+    )
+    .expect("hosted changed Registry");
+
+    let before = realm.inspection_snapshot();
+    assert_eq!(
+        realm.load_module(old_module, INTERFACE_HASH, schema_hash),
+        Err(nexa_runtime::RealmError::HostHashMismatch)
+    );
+    let rejected = realm.inspection_snapshot();
+    assert_eq!(rejected.active_root, before.active_root);
+    assert_eq!(rejected.modules.len(), before.modules.len());
+    assert!(rejected.tasks.is_empty());
+    assert!(rejected.terminal_tasks.is_empty());
+
+    let module = realm
+        .load_module(changed_module, INTERFACE_HASH, schema_hash)
+        .expect("changed module loads");
+    let scope = realm.create_scope(None).expect("heartbeat scope");
+    let task = realm
+        .spawn_task(
+            module,
+            0,
+            &[nexa_runtime::RuntimeValue::I32(41)],
+            nexa_runtime::StepConfig {
+                owner: scope,
+                priority: 1,
+                fuel_slice: 64,
+                cumulative_budget: 1_024,
+                limits: nexa_runtime::TaskLimits::default(),
+            },
+        )
+        .expect("spawn changed heartbeat");
+    assert_eq!(
+        realm.poll_task(task, 64).expect("poll changed heartbeat"),
+        nexa_runtime::TaskPoll::Completed(nexa_runtime::RuntimeValue::I32(42))
+    );
+    assert!(realm.terminal_record(task).is_some());
+    let ledger = realm.resource_ledger();
+    assert_eq!(ledger.tasks, 0);
+    assert_eq!(ledger.continuations, 0);
+    assert_eq!(ledger.scheduler_tokens, 0);
+    assert_eq!(ledger.requests, 0);
+    assert_eq!(ledger.completion_reservations, 0);
+    assert_eq!(ledger.tokens, 0);
+    assert_eq!(ledger.snapshots, 0);
+    assert_eq!(ledger.release_reservations, 0);
+    realm.cancel_scope(scope).expect("close heartbeat scope");
+    realm
+        .destroy_empty_scope(scope)
+        .expect("destroy heartbeat scope");
+    drop(realm);
+    assert!(runtime_host.drain_releases().is_empty());
+    let _ = runtime_host.begin_close();
+    runtime_host.try_finish_close().expect("close changed Host");
+}
+"#;
 
 pub struct MutationCase {
     pub id: &'static str,
@@ -35,7 +112,12 @@ pub struct MutationEvidence {
     pub patch_insertions: usize,
     pub patch_deletions: usize,
     pub old_bytecode_rejected: bool,
-    pub changed_heartbeat_executed: bool,
+    pub positive_registry: &'static str,
+    pub patched_business_host_compiled: bool,
+    pub changed_module_loaded: bool,
+    pub heartbeat_result: i32,
+    pub runtime_terminal_record: bool,
+    pub runtime_ledger_balanced: bool,
 }
 
 #[must_use]
@@ -460,25 +542,55 @@ pub fn prepare_case(
         "module idl_e2e;\nimport engine;\ntask fn update(entity: i32) -> i32 { return engine.heartbeat(entity); }\nfn reset() -> i32 { return 0; }\n",
     )
     .expect("write positive script");
-    let runtime = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../nexa-runtime")
+    fs::write(case.join("host/src/base_interface.nidl"), BASE_NIDL)
+        .expect("write base interface fixture");
+    fs::write(case.join("host/src/interface.nidl"), &mutation.mutated_nidl)
+        .expect("write changed interface fixture");
+    fs::write(
+        case.join("host/src/module.nexa"),
+        "module idl_e2e;\nimport engine;\ntask fn update(entity: i32) -> i32 { return engine.heartbeat(entity); }\nfn reset() -> i32 { return 0; }\n",
+    )
+    .expect("write changed script fixture");
+    let crate_path = |name: &str| {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join(format!("../{name}"))
+            .canonicalize()
+            .unwrap_or_else(|error| panic!("{name} path: {error}"))
+    };
+    let runtime = crate_path("nexa-runtime");
+    let compiler = crate_path("nexa-compiler");
+    let idl = Path::new(env!("CARGO_MANIFEST_DIR"))
         .canonicalize()
-        .expect("runtime path");
+        .expect("IDL path");
+    let verifier = crate_path("nexa-verifier");
     fs::write(
         case.join("host/Cargo.toml"),
         format!(
             "[package]\nname=\"idl-e2e-{}\"\nversion=\"0.0.0\"\nedition=\"2024\"\n\
-             [workspace]\n[dependencies]\nnexa-runtime={{path=\"{}\"}}\n",
+             [workspace]\n[dependencies]\n\
+             nexa-runtime={{path=\"{}\",features=[\"model-adapter\"]}}\n\
+             nexa-compiler={{path=\"{}\"}}\n\
+             nexa-idl={{path=\"{}\"}}\n\
+             nexa-verifier={{path=\"{}\"}}\n",
             mutation.id,
-            runtime.display()
+            runtime.display(),
+            compiler.display(),
+            idl.display(),
+            verifier.display(),
         ),
     )
     .expect("write host Cargo manifest");
     fs::write(
         case.join("host/src/lib.rs"),
-        "include!(\"bindings.rs\");\ninclude!(\"business_host.rs\");\n",
+        "include!(\"bindings.rs\");\ninclude!(\"business_host.rs\");\n\
+         #[cfg(test)] mod runtime_test;\n",
     )
     .expect("write host crate root");
+    fs::write(
+        case.join("host/src/runtime_test.rs"),
+        GENERATED_REGISTRY_RUNTIME_TEST,
+    )
+    .expect("write generated Registry runtime test");
     case
 }
 
@@ -497,6 +609,27 @@ pub fn check_business_host(
         .current_dir(case.join("host"))
         .output()
         .expect("run business Host cargo check")
+}
+
+#[must_use]
+pub fn run_generated_registry_positive(
+    case: &Path,
+    changed_generated: &str,
+    patched_business_host: &str,
+    shared_target: &Path,
+) -> Output {
+    fs::write(case.join("host/src/bindings.rs"), changed_generated).expect("write bindings");
+    fs::write(
+        case.join("host/src/business_host.rs"),
+        patched_business_host,
+    )
+    .expect("write patched business Host");
+    Command::new("cargo")
+        .args(["+1.97.1", "test", "--offline", "--message-format=json"])
+        .env("CARGO_TARGET_DIR", shared_target)
+        .current_dir(case.join("host"))
+        .output()
+        .expect("run generated Registry positive test")
 }
 
 pub fn assert_expected_business_diagnostic(mutation: &MutationCase, output: &Output) {
@@ -557,109 +690,6 @@ pub fn patch_delta(before: &str, after: &str) -> (usize, usize) {
     )
 }
 
-pub fn assert_pre_interpreter_rejection(base_idl: &nexa_idl::Idl, changed_hash: StableId) {
-    let schema_hash = StableId::from_name("idl-e2e-schema");
-    let old_module = nexa_compiler::compile_with_interface(
-        "module idl_e2e;\nimport engine;\ntask fn update(entity: i32) -> i32 { return engine.heartbeat(entity); }\nfn reset() -> i32 { return 0; }",
-        base_idl,
-        schema_hash,
-    )
-    .expect("compile base module");
-    let runtime_host = RuntimeHost::new(8);
-    let mut realm = RealmRuntime::hosted(
-        RealmConfig::default(),
-        runtime_host.clone(),
-        Box::new(HeartbeatRegistry(changed_hash)),
-    )
-    .expect("hosted realm");
-    let before = realm.inspection_snapshot();
-    assert_eq!(
-        realm.load_module(old_module, changed_hash, schema_hash),
-        Err(RealmError::HostHashMismatch)
-    );
-    let after = realm.inspection_snapshot();
-    assert_eq!(after.active_root, before.active_root);
-    assert_eq!(after.modules.len(), before.modules.len());
-    assert!(after.tasks.is_empty());
-    assert!(after.terminal_tasks.is_empty());
-    drop(realm);
-    let _ = runtime_host.begin_close();
-    runtime_host
-        .try_finish_close()
-        .expect("close rejection Host");
-}
-
-pub fn assert_changed_heartbeat_executes(changed_idl: &nexa_idl::Idl, changed_hash: StableId) {
-    let schema_hash = StableId::from_name("idl-e2e-schema");
-    let module = nexa_compiler::compile_with_interface(
-        "module idl_e2e;\nimport engine;\ntask fn update(entity: i32) -> i32 { return engine.heartbeat(entity); }\nfn reset() -> i32 { return 0; }",
-        changed_idl,
-        schema_hash,
-    )
-    .expect("compile changed heartbeat module");
-    let runtime_host = RuntimeHost::new(8);
-    let mut realm = RealmRuntime::hosted(
-        RealmConfig::default(),
-        runtime_host.clone(),
-        Box::new(HeartbeatRegistry(changed_hash)),
-    )
-    .expect("hosted realm");
-    let module = realm
-        .load_module(module, changed_hash, schema_hash)
-        .expect("changed module loads");
-    let scope = realm.create_scope(None).expect("create heartbeat scope");
-    let task = realm
-        .spawn_task(
-            module,
-            0,
-            &[RuntimeValue::I32(41)],
-            StepConfig {
-                owner: scope,
-                priority: 1,
-                fuel_slice: 64,
-                cumulative_budget: 1_024,
-                limits: TaskLimits::default(),
-            },
-        )
-        .expect("spawn heartbeat");
-    assert_eq!(
-        realm.poll_task(task, 64).expect("poll heartbeat"),
-        TaskPoll::Completed(RuntimeValue::I32(42))
-    );
-    realm.cancel_scope(scope).expect("close heartbeat scope");
-    realm
-        .destroy_empty_scope(scope)
-        .expect("destroy heartbeat scope");
-    drop(realm);
-    let _ = runtime_host.drain_releases();
-    let _ = runtime_host.begin_close();
-    runtime_host
-        .try_finish_close()
-        .expect("close heartbeat Host");
-}
-
-struct HeartbeatRegistry(StableId);
-
-impl HostRegistry for HeartbeatRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
-    }
-
-    fn call_runtime(
-        &mut self,
-        id: u32,
-        _: &mut ResourceContext<'_>,
-        args: RuntimeHostArgs<'_>,
-    ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 7 || args.len() != 1 {
-            return Err(HostTrap::UnknownFunction(id));
-        }
-        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
-            args.i32(0)? + 1,
-        )))
-    }
-}
-
 #[must_use]
 pub fn stable_bytes_hash(bytes: &str) -> u64 {
     bytes.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
@@ -684,7 +714,9 @@ pub fn write_report(root: &Path, evidence: &[MutationEvidence]) {
              \"changed_interface_hash\":\"{:016x}\",\"base_generated_hash\":\"{:016x}\",\
              \"changed_generated_hash\":\"{:016x}\",\"unchanged_business_host_should_compile\":{},\
              \"patch_insertions\":{},\"patch_deletions\":{},\"old_bytecode_rejected\":{},\
-             \"changed_heartbeat_executed\":{}}}",
+             \"positive_registry\":\"{}\",\"patched_business_host_compiled\":{},\
+             \"changed_module_loaded\":{},\"heartbeat_result\":{},\
+             \"runtime_terminal_record\":{},\"runtime_ledger_balanced\":{}}}",
             item.id,
             item.name,
             item.base_interface_hash.0,
@@ -695,16 +727,24 @@ pub fn write_report(root: &Path, evidence: &[MutationEvidence]) {
             item.patch_insertions,
             item.patch_deletions,
             item.old_bytecode_rejected,
-            item.changed_heartbeat_executed,
+            item.positive_registry,
+            item.patched_business_host_compiled,
+            item.changed_module_loaded,
+            item.heartbeat_result,
+            item.runtime_terminal_record,
+            item.runtime_ledger_balanced,
         )
         .expect("write JSON evidence row");
     }
     fs::write(
         root.join("mutation-report.json"),
         format!(
-            "{{\n  \"schema_version\":2,\n  \"business_host\":\"BusinessHostV1\",\
-             \n  \"mutation_count\":{},\n  \"status\":\"PASS\",\
+            "{{\n  \"schema_version\":3,\n  \"business_host\":\"BusinessHostV1\",\
+             \n  \"mutation_count\":{},\
+             \n  \"generated_registry_positive_runs\":{},\
+             \n  \"manual_registry_positive_runs\":0,\n  \"status\":\"PASS\",\
              \n  \"mutations\":[\n{rows}\n  ]\n}}\n",
+            evidence.len(),
             evidence.len()
         ),
     )
