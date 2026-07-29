@@ -7,6 +7,8 @@ use std::fmt::Write;
 use nexa_bytecode::ValueType;
 use nexa_core::StableId;
 
+pub mod build;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Idl {
     pub interface: String,
@@ -234,6 +236,83 @@ pub fn canonical(idl: &Idl) -> String {
 }
 
 #[must_use]
+pub fn canonical_source(idl: &Idl) -> String {
+    let mut output = format!("interface {} {{\n", idl.interface);
+    for handle in &idl.opaque_handles {
+        writeln!(output, "    opaque {handle};").expect("String writes do not fail");
+    }
+    for structure in &idl.structs {
+        write!(output, "    struct {} {{ ", structure.name).expect("String writes do not fail");
+        for field in &structure.fields {
+            write!(output, "{}: {}; ", field.name, type_name(&field.ty))
+                .expect("String writes do not fail");
+        }
+        output.push_str("}\n");
+    }
+    for enumeration in &idl.enums {
+        write!(output, "    enum {} {{ ", enumeration.name).expect("String writes do not fail");
+        for variant in &enumeration.variants {
+            write!(output, "{}", variant.name).expect("String writes do not fail");
+            if let Some(payload) = &variant.payload {
+                write!(output, "({})", type_name(payload)).expect("String writes do not fail");
+            }
+            output.push_str(", ");
+        }
+        output.push_str("}\n");
+    }
+    for function in &idl.functions {
+        if function.synchronous {
+            output.push_str("    sync ");
+        } else {
+            write!(
+                output,
+                "    request({}, {}) ",
+                match function.cancel_policy {
+                    CancelPolicy::ReturnError => "return_error",
+                    CancelPolicy::CancelTask => "cancel_task",
+                },
+                match function.abandon_policy {
+                    AbandonPolicy::ReturnError => "return_error",
+                    AbandonPolicy::Trap => "trap",
+                },
+            )
+            .expect("String writes do not fail");
+        }
+        if function.fuel_cost != 1 {
+            write!(output, "fuel {} ", function.fuel_cost).expect("String writes do not fail");
+        }
+        write!(output, "fn {}(", function.name).expect("String writes do not fail");
+        for (index, parameter) in function.parameters.iter().enumerate() {
+            if index != 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{}: {}", parameter.name, type_name(&parameter.ty))
+                .expect("String writes do not fail");
+        }
+        writeln!(output, ") -> {};", type_name(&function.result))
+            .expect("String writes do not fail");
+    }
+    for export in &idl.exports {
+        write!(output, "    export {}(", export.name).expect("String writes do not fail");
+        for (index, parameter) in export.parameters.iter().enumerate() {
+            if index != 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{}: {}", parameter.name, type_name(&parameter.ty))
+                .expect("String writes do not fail");
+        }
+        writeln!(
+            output,
+            ") -> {};",
+            export.result.as_ref().map_or("void".to_owned(), type_name)
+        )
+        .expect("String writes do not fail");
+    }
+    output.push_str("}\n");
+    output
+}
+
+#[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn generate_rust(idl: &Idl) -> String {
     let mut output = String::from(
@@ -250,6 +329,23 @@ pub fn generate_rust(idl: &Idl) -> String {
         output,
         "pub const NEXA_MODULE_DECLARATION: &str = {:?};",
         canonical(idl)
+    )
+    .expect("String writes do not fail");
+    writeln!(
+        output,
+        "pub const CANONICAL_IDL: &str = {:?};",
+        canonical_source(idl)
+    )
+    .expect("String writes do not fail");
+    output.push_str(
+        "pub fn contract() -> nexa_runtime::HostContract {\n\
+         nexa_runtime::HostContract {\n",
+    );
+    writeln!(
+        output,
+        "interface_name: {:?}, canonical_idl: CANONICAL_IDL, interface_hash: INTERFACE_HASH, \
+         generator_schema_version: nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,\n}} }}",
+        idl.interface
     )
     .expect("String writes do not fail");
     for handle in &idl.opaque_handles {
@@ -711,6 +807,13 @@ pub fn generate_rust(idl: &Idl) -> String {
     );
     emit_host_dispatch(&mut output, idl);
     output.push_str("}\n}\n");
+    writeln!(
+        output,
+        "pub fn registry<H: {} + 'static>(host: H) -> Box<dyn nexa_runtime::HostRegistry> {{ \
+         Box::new(GeneratedHostRegistry::new(host)) }}",
+        idl.interface
+    )
+    .expect("String writes do not fail");
     for (index, export) in idl.exports.iter().enumerate() {
         let args = if export.parameters.is_empty() {
             format!(
@@ -731,16 +834,68 @@ pub fn generate_rust(idl: &Idl) -> String {
         };
         let output_type = export.result.as_ref().map_or("()".to_owned(), rust_type);
         let export_id = StableId::from_parts(&[&idl.interface, "::export::", &export.name]).0;
+        let mut requirements = String::from(
+            "let mut __nexa_requirements = \
+             nexa_runtime::ScriptArgumentRequirements::ZERO;",
+        );
+        let mut encoded = String::new();
+        let mut parameter_types = String::new();
+        for parameter in &export.parameters {
+            let requirement =
+                requirements_value_expr(idl, &parameter.ty, &format!("&args.{}", parameter.name));
+            write!(
+                requirements,
+                "__nexa_requirements = __nexa_requirements.checked_add({requirement})?;"
+            )
+            .expect("String writes do not fail");
+            let value = encode_runtime_return_value(
+                idl,
+                &parameter.ty,
+                &format!("args.{}.clone()", parameter.name),
+                "writer",
+            );
+            write!(encoded, "{value},").expect("String writes do not fail");
+            let value_type = runtime_value_type_expr(idl, &parameter.ty);
+            write!(parameter_types, "{value_type},").expect("String writes do not fail");
+        }
+        let output_signature = export.result.as_ref().map_or_else(
+            || "None".to_owned(),
+            |result| format!("Some({})", runtime_value_type_expr(idl, result)),
+        );
+        let decoded_output = export.result.as_ref().map_or_else(
+            || {
+                "match value { nexa_runtime::RuntimeValue::Unit => (), _ => return \
+                 Err(nexa_runtime::ScriptCallError::OutputDecoding) }"
+                    .to_owned()
+            },
+            |result| decode_script_output_value(idl, result, "reader.value(value)"),
+        );
         writeln!(
             output,
             "{args}\n\
              pub type {name}Output = {output_type};\n\
              pub enum {name} {{}}\n\
-             impl nexa_runtime::ScriptFunction for {name} {{\n\
+             impl nexa_runtime::ScriptExport for {name} {{\n\
              type Args = {name}Args; type Output = {name}Output;\n\
-             const FUNCTION_ID: u32 = {index}; }}\n\
+             const STABLE_ID: nexa_runtime::StableId = nexa_runtime::StableId({export_id});\n\
+             const NAME: &'static str = \"{name}\";\n\
+             fn signature() -> nexa_runtime::Signature {{ nexa_runtime::Signature {{ \
+             parameters: vec![{parameter_types}], result: {output_signature} }} }}\n\
+             fn argument_requirements(args: &Self::Args) -> \
+             Result<nexa_runtime::ScriptArgumentRequirements, nexa_runtime::ScriptCallError> {{ \
+             let _ = args; {requirements} Ok(__nexa_requirements) }}\n\
+             #[allow(clippy::clone_on_copy)] \
+             fn encode_args(writer: &mut nexa_runtime::ScriptCallWriter<'_>, args: &Self::Args) \
+             -> Result<Vec<nexa_runtime::RuntimeValue>, nexa_runtime::ScriptCallError> {{ \
+             let _ = writer; let _ = args; \
+             let __nexa_values = vec![{encoded}]; \
+             Ok(__nexa_values) }}\n\
+             fn decode_output(reader: &nexa_runtime::ScriptOutputReader<'_>, \
+             value: nexa_runtime::RuntimeValue) -> Result<Self::Output, \
+             nexa_runtime::ScriptCallError> {{ let _ = reader; Ok({decoded_output}) }} }}\n\
              impl {name} {{ pub const EXPORT_NAME: &'static str = \"{name}\"; \
-             pub const EXPORT_ID: nexa_runtime::StableId = nexa_runtime::StableId({export_id}); }}",
+             pub const EXPORT_ID: nexa_runtime::StableId = nexa_runtime::StableId({export_id}); \
+             pub const LEGACY_FUNCTION_INDEX: u32 = {index}; }}",
             name = export.name,
         )
         .expect("String writes do not fail");
@@ -1045,8 +1200,12 @@ fn requirements_value_expr(idl: &Idl, ty: &TypeRef, source: &str) -> String {
             for variant in &enumeration.variants {
                 if let Some(payload) = &variant.payload {
                     let nested = requirements_value_expr(idl, payload, "value");
-                    write!(expression, "{name}::{}(value) => {nested},", variant.name)
-                        .expect("String writes do not fail");
+                    write!(
+                        expression,
+                        "{name}::{}(value) => {{ let _ = value; {nested} }},",
+                        variant.name
+                    )
+                    .expect("String writes do not fail");
                 } else {
                     write!(
                         expression,
@@ -1202,6 +1361,184 @@ fn encode_runtime_return_value(idl: &Idl, ty: &TypeRef, source: &str, writer: &s
         }
         TypeRef::Named(_) => {
             format!("nexa_runtime::EncodeHostReturn::encode_into({source}, {writer})?")
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn decode_script_output_value(idl: &Idl, ty: &TypeRef, source: &str) -> String {
+    match ty {
+        TypeRef::I32 => format!("{source}.i32()?"),
+        TypeRef::I64 => format!("{source}.i64()?"),
+        TypeRef::F32 => format!("{source}.f32()?"),
+        TypeRef::F64 => format!("{source}.f64()?"),
+        TypeRef::Bool => format!("{source}.bool()?"),
+        TypeRef::Rune => format!("{source}.rune()?"),
+        TypeRef::String => format!("{source}.str_ref()?.as_str().to_owned()"),
+        TypeRef::HostRequest(_) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::HostRequest(value) => \
+             value, _ => return Err(nexa_runtime::ScriptCallError::OutputDecoding) }}"
+        ),
+        TypeRef::ResourceToken(Some(inner)) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::ResourceToken(value) => \
+             {}::from_raw(value), _ => return \
+             Err(nexa_runtime::ScriptCallError::OutputDecoding) }}",
+            typed_handle_name(inner, "Token")
+        ),
+        TypeRef::Snapshot(Some(inner)) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::Snapshot(value) => \
+             {}::try_from(value).map_err(|_| nexa_runtime::ScriptCallError::OutputDecoding)?, \
+             _ => return Err(nexa_runtime::ScriptCallError::OutputDecoding) }}",
+            typed_handle_name(inner, "Snapshot")
+        ),
+        TypeRef::ResourceToken(None) | TypeRef::Snapshot(None) => {
+            unreachable!("validated handles are typed")
+        }
+        TypeRef::Array(inner) | TypeRef::Buffer(inner) => {
+            let type_id = match ty {
+                TypeRef::Array(_) => nexa_bytecode::array_type(value_type(idl, inner)),
+                TypeRef::Buffer(_) => nexa_bytecode::buffer_type(value_type(idl, inner)),
+                _ => unreachable!(),
+            };
+            let accessor = if matches!(ty, TypeRef::Array(_)) {
+                "array_ref"
+            } else {
+                "buffer_ref"
+            };
+            let decoded = decode_script_output_value(idl, inner, "__nexa_value");
+            let collection = format!(
+                "{{ let __nexa_collection = {source}.{accessor}(nexa_runtime::StableId({}))?; \
+                 let mut __nexa_output = Vec::with_capacity(__nexa_collection.len()); \
+                 for __nexa_value in __nexa_collection.iter() {{ \
+                 __nexa_output.push({decoded}); }} __nexa_output }}",
+                type_id.0
+            );
+            if matches!(ty, TypeRef::Buffer(_)) {
+                format!("nexa_runtime::CopyBuffer::new({collection})")
+            } else {
+                collection
+            }
+        }
+        TypeRef::Option(inner) => {
+            let metadata = nexa_bytecode::option_type(value_type(idl, inner));
+            let none = &metadata.variants[0];
+            let some = &metadata.variants[1];
+            let payload = decode_script_output_value(
+                idl,
+                inner,
+                "__nexa_enum.payload().ok_or(nexa_runtime::ScriptCallError::OutputDecoding)?",
+            );
+            format!(
+                "{{ let __nexa_enum = {source}.enum_ref(nexa_runtime::StableId({type_id}))?; \
+                 match (__nexa_enum.variant(), __nexa_enum.tag()) {{ \
+                 (nexa_runtime::StableId({none_id}), {none_tag}) if \
+                 __nexa_enum.payload().is_none() => None, \
+                 (nexa_runtime::StableId({some_id}), {some_tag}) => Some({payload}), \
+                 _ => return Err(nexa_runtime::ScriptCallError::OutputDecoding), }} }}",
+                type_id = metadata.type_id.0,
+                none_id = none.stable_id.0,
+                none_tag = none.tag,
+                some_id = some.stable_id.0,
+                some_tag = some.tag,
+            )
+        }
+        TypeRef::Result(success, error) => {
+            let metadata =
+                nexa_bytecode::result_type(value_type(idl, success), value_type(idl, error));
+            let ok = &metadata.variants[0];
+            let err = &metadata.variants[1];
+            let success = decode_script_output_value(
+                idl,
+                success,
+                "__nexa_enum.payload().ok_or(nexa_runtime::ScriptCallError::OutputDecoding)?",
+            );
+            let error = decode_script_output_value(
+                idl,
+                error,
+                "__nexa_enum.payload().ok_or(nexa_runtime::ScriptCallError::OutputDecoding)?",
+            );
+            format!(
+                "{{ let __nexa_enum = {source}.enum_ref(nexa_runtime::StableId({type_id}))?; \
+                 match (__nexa_enum.variant(), __nexa_enum.tag()) {{ \
+                 (nexa_runtime::StableId({ok_id}), {ok_tag}) => Ok({success}), \
+                 (nexa_runtime::StableId({err_id}), {err_tag}) => Err({error}), \
+                 _ => return Err(nexa_runtime::ScriptCallError::OutputDecoding), }} }}",
+                type_id = metadata.type_id.0,
+                ok_id = ok.stable_id.0,
+                ok_tag = ok.tag,
+                err_id = err.stable_id.0,
+                err_tag = err.tag,
+            )
+        }
+        TypeRef::Named(name) if idl.opaque_handles.contains(name) => format!(
+            "match {source}.runtime_value() {{ nexa_runtime::RuntimeValue::Opaque {{ value, \
+             type_id }} if type_id == nexa_runtime::StableId({}) => {name}(value), \
+             _ => return Err(nexa_runtime::ScriptCallError::OutputDecoding) }}",
+            StableId::from_name(name).0
+        ),
+        TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
+            let enumeration = idl
+                .enums
+                .iter()
+                .find(|item| item.name == *name)
+                .expect("validated enum exists");
+            let mut expression = format!(
+                "{{ let __nexa_enum = {source}.enum_ref(nexa_runtime::StableId({}))?; \
+                 match (__nexa_enum.variant(), __nexa_enum.tag()) {{",
+                StableId::from_name(name).0
+            );
+            for (tag, variant) in enumeration.variants.iter().enumerate() {
+                let variant_id = StableId::from_parts(&[name, "::", &variant.name]).0;
+                if let Some(payload) = &variant.payload {
+                    let payload = decode_script_output_value(
+                        idl,
+                        payload,
+                        "__nexa_enum.payload().ok_or(\
+                         nexa_runtime::ScriptCallError::OutputDecoding)?",
+                    );
+                    write!(
+                        expression,
+                        "(nexa_runtime::StableId({variant_id}), {tag}) => \
+                         {name}::{}({payload}),",
+                        variant.name
+                    )
+                    .expect("String writes do not fail");
+                } else {
+                    write!(
+                        expression,
+                        "(nexa_runtime::StableId({variant_id}), {tag}) if \
+                         __nexa_enum.payload().is_none() => {name}::{},",
+                        variant.name
+                    )
+                    .expect("String writes do not fail");
+                }
+            }
+            expression
+                .push_str("_ => return Err(nexa_runtime::ScriptCallError::OutputDecoding), } }");
+            expression
+        }
+        TypeRef::Named(name) => {
+            let structure = idl
+                .structs
+                .iter()
+                .find(|item| item.name == *name)
+                .expect("validated struct exists");
+            let mut expression = format!(
+                "{{ let __nexa_struct = {source}.struct_ref(nexa_runtime::StableId({}))?; \
+                 {name} {{",
+                StableId::from_name(name).0
+            );
+            for (index, field) in structure.fields.iter().enumerate() {
+                let decoded = decode_script_output_value(
+                    idl,
+                    &field.ty,
+                    &format!("__nexa_struct.field({index})?"),
+                );
+                write!(expression, "{}: {decoded},", field.name)
+                    .expect("String writes do not fail");
+            }
+            expression.push_str("} }");
+            expression
         }
     }
 }
@@ -2496,7 +2833,11 @@ mod tests {
             .unwrap(),
         );
         let runtime_start = generated.find("fn call_runtime").unwrap();
-        let runtime_dispatch = &generated[runtime_start..];
+        let runtime_end = generated[runtime_start..]
+            .find("pub fn registry")
+            .map(|offset| runtime_start + offset)
+            .unwrap();
+        let runtime_dispatch = &generated[runtime_start..runtime_end];
         for direct in [
             "args.str_ref(0)?.as_str()",
             "args.value_ref(1)?",
@@ -2601,7 +2942,7 @@ mod tests {
             "pub trait Typed",
             "pub struct LoadCompletionTicket",
             "nexa_runtime::CopyBuffer<EnemyView>",
-            "impl nexa_runtime::ScriptFunction for Update",
+            "impl nexa_runtime::ScriptExport for Update",
             "pub const EXPORT_ID",
         ] {
             assert!(first.contains(expected), "{expected}");

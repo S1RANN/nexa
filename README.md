@@ -10,12 +10,19 @@ Reload.
 Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
 Nexa Internal Pivot M1 = COMPLETE
+Nexa M2 Embedding & Snake Pilot = COMPLETE
+nexa-embed v1 = COMPLETE
+Typed Script Export = COMPLETE
+Snake Core = COMPLETE
+Built-in Package Pilot = COMPLETE
+Official DLC Pilot = COMPLETE
+Trusted Local Mod Pilot = COMPLETE
 Repository Slimming = COMPLETE
 Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
-Current target = Rust-only dogfood Gameplay Language
+Current target = sustained embedding and Snake dogfood
 Seamless advanced Reload = REMOVED
 ```
 
@@ -37,9 +44,11 @@ Nexa source
 → Restart Reload
 ```
 
-`examples/hello-runtime` is the minimal onboarding example: one generated
-`console.log` Host function, one Task, and one `spawn_task`/`poll_task` cycle
-printing `hello, world`. `examples/combat-runtime` is the dogfood loop. Its
+`examples/hello-runtime` is the minimal high-level onboarding example. It uses
+`nexa-embed` to discover one in-memory package, enable it, call a generated
+typed export, and print `hello, world`; it does not manage Realm, Scope, Task,
+or release queues. `examples/combat-runtime` remains the low-level consistency
+example. Its
 `combat_api.nidl` is the only Host API source and generates the Rust Trait,
 Dispatcher, codecs, stable function IDs, Exact Interface Hash, Nexa
 declaration, and test Stub into `OUT_DIR`. The Host implements only that
@@ -60,6 +69,28 @@ only come from generated Host bindings and `TaskPoll::Waiting`. Real
 Runtime APIs, while Combat verifies Request, Token, and Snapshot release
 exactly once.
 
+## High-level embedding
+
+```rust
+let source = MemorySource::new(SourceId::new("app")?, app_policy)
+    .package(package_manifest, package_source);
+let mut embed = NexaEmbed::builder(generated::contract())
+    .host_factory(|context| {
+        generated::registry(AppHost::new(context))
+    })
+    .package_source(source)
+    .storage_dir("user-data/extensions")
+    .require_export::<generated::Main>()
+    .build()?;
+embed.discover()?;
+embed.enable_defaults()?;
+let output = embed.call::<generated::Main>(&package_id, &args)?;
+embed.shutdown()?;
+```
+
+Package sources, policies, lifecycle, and diagnostics are documented in
+[Embedding](docs/EMBEDDING.md).
+
 ## Run
 
 The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
@@ -68,6 +99,7 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 cargo run -p nexa-cli -- compile examples/add.nexa
 cargo run -p hello-runtime
 cargo run -p combat-runtime
+cargo run -p snake-game
 cargo xtask check
 cargo xtask finalize-m1
 ```

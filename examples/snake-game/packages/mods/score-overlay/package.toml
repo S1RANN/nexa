@@ -1,0 +1,10 @@
+schema = 1
+id = "community.score-overlay"
+name = "Score Overlay"
+version = "1.0.0"
+entry = "main.nexa"
+priority = 160
+activation = "user-controlled"
+state_schema = "v1"
+handler_fuel = 30000
+capabilities = ["stats.read", "ui.register", "ui.update"]

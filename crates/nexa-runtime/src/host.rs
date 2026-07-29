@@ -1083,6 +1083,13 @@ pub struct HostValueRef<'a> {
 }
 
 impl<'a> HostValueRef<'a> {
+    pub(crate) const fn new(value: crate::RuntimeValue, heap: &'a crate::Heap) -> Self {
+        Self {
+            value,
+            heap: Some(heap),
+        }
+    }
+
     #[must_use]
     pub const fn runtime_value(self) -> crate::RuntimeValue {
         self.value
@@ -1594,7 +1601,7 @@ pub struct HostReturnTransaction<'a> {
 }
 
 impl<'a> HostReturnTransaction<'a> {
-    fn new(
+    pub(crate) fn new(
         heap: &'a mut crate::Heap,
         requirements: HostReturnRequirements,
     ) -> Result<Self, HostTrap> {
@@ -1773,6 +1780,19 @@ impl<'a> HostReturnTransaction<'a> {
     }
 
     pub fn commit(mut self, value: crate::RuntimeValue) -> Result<crate::RuntimeValue, HostTrap> {
+        self.finish()?;
+        Ok(value)
+    }
+
+    pub fn commit_arguments(
+        mut self,
+        values: Vec<crate::RuntimeValue>,
+    ) -> Result<Vec<crate::RuntimeValue>, HostTrap> {
+        self.finish()?;
+        Ok(values)
+    }
+
+    fn finish(&mut self) -> Result<(), HostTrap> {
         if self
             .heap
             .failure_trigger(crate::RuntimeFailurePoint::HostReturnCommit)
@@ -1786,7 +1806,7 @@ impl<'a> HostReturnTransaction<'a> {
         }
         self.heap.commit_host_transaction();
         self.committed = true;
-        Ok(value)
+        Ok(())
     }
 }
 
@@ -1883,6 +1903,108 @@ pub trait ScriptFunction {
     type Args;
     type Output;
     const FUNCTION_ID: u32;
+}
+
+pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HostContract {
+    pub interface_name: &'static str,
+    pub canonical_idl: &'static str,
+    pub interface_hash: StableId,
+    pub generator_schema_version: u32,
+}
+
+pub type ScriptArgumentRequirements = HostReturnRequirements;
+pub type ScriptCallWriter<'a> = HostReturnTransaction<'a>;
+
+#[derive(Clone, Copy, Debug)]
+pub struct ScriptOutputReader<'a> {
+    heap: &'a crate::Heap,
+}
+
+impl<'a> ScriptOutputReader<'a> {
+    pub(crate) const fn new(heap: &'a crate::Heap) -> Self {
+        Self { heap }
+    }
+
+    #[must_use]
+    pub const fn value(self, value: crate::RuntimeValue) -> HostValueRef<'a> {
+        HostValueRef::new(value, self.heap)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScriptCallError {
+    MissingExport {
+        name: &'static str,
+        stable_id: StableId,
+    },
+    SignatureMismatch {
+        name: &'static str,
+    },
+    EffectNotCallable {
+        name: &'static str,
+    },
+    ArgumentEncoding,
+    OutputDecoding,
+    Runtime(String),
+    HandlerDidNotComplete,
+    HostWaitNotAllowed,
+    HandlerTrapped(String),
+}
+
+impl fmt::Display for ScriptCallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{self:?}")
+    }
+}
+
+impl std::error::Error for ScriptCallError {}
+
+impl From<HostTrap> for ScriptCallError {
+    fn from(_: HostTrap) -> Self {
+        Self::ArgumentEncoding
+    }
+}
+
+pub trait ScriptExport {
+    type Args;
+    type Output;
+
+    const STABLE_ID: StableId;
+    const NAME: &'static str;
+
+    fn signature() -> nexa_bytecode::Signature;
+
+    fn argument_requirements(
+        args: &Self::Args,
+    ) -> Result<ScriptArgumentRequirements, ScriptCallError>;
+
+    fn encode_args(
+        writer: &mut ScriptCallWriter<'_>,
+        args: &Self::Args,
+    ) -> Result<Vec<crate::RuntimeValue>, ScriptCallError>;
+
+    fn decode_output(
+        reader: &ScriptOutputReader<'_>,
+        value: crate::RuntimeValue,
+    ) -> Result<Self::Output, ScriptCallError>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MustCompletePolicy {
+    pub fuel: u64,
+    pub cumulative_budget: u64,
+}
+
+impl Default for MustCompletePolicy {
+    fn default() -> Self {
+        Self {
+            fuel: 20_000,
+            cumulative_budget: 20_000,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

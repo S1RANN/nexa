@@ -1,0 +1,19 @@
+[package]
+name = "nexa-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nexa-compiler = { path = "../nexa-compiler" }
+nexa-core = { path = "../nexa-core" }
+nexa-idl = { path = "../nexa-idl" }
+nexa-runtime = { path = "../nexa-runtime" }
+nexa-verifier = { path = "../nexa-verifier" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

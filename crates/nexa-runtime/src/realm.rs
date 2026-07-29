@@ -1371,27 +1371,9 @@ impl RealmRuntime {
             .modules
             .resolve(candidate_handle.raw())
             .map_err(RealmError::ModuleHandle)?;
-        let Some(migration_entry) = candidate.verified.module().reload_metadata.migration_entry
-        else {
-            self.last_migration_usage_report = None;
-            self.reload.staged()?;
-            return Ok(None);
-        };
-        self.last_migration_usage_report = Some(crate::MigrationUsageReport::default());
-        let function = candidate
-            .verified
-            .module()
-            .functions
-            .get(migration_entry as usize)
-            .ok_or(RealmError::MissingModule(migration_entry))?;
-        if function.effect != nexa_bytecode::FunctionEffect::Migration {
-            return Err(ReloadError::Migration(
-                "migration entry does not have Migration effect".into(),
-            )
-            .into());
-        }
         let candidate_domain = candidate.stateful_domain;
         let candidate_schema = candidate.verified.module().state_schema.clone();
+        let migration_entry = candidate.verified.module().reload_metadata.migration_entry;
         let old_module = self.reload.transaction()?.old_module;
         let old_root = self
             .modules
@@ -1413,6 +1395,25 @@ impl RealmRuntime {
             schema_unchanged,
             self.migration_limits,
         )?;
+        let Some(migration_entry) = migration_entry else {
+            return self.stage_reload_without_entry(candidate_handle, migration);
+        };
+        self.last_migration_usage_report = Some(crate::MigrationUsageReport::default());
+        let function = self
+            .modules
+            .resolve(candidate_handle.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .verified
+            .module()
+            .functions
+            .get(migration_entry as usize)
+            .ok_or(RealmError::MissingModule(migration_entry))?;
+        if function.effect != nexa_bytecode::FunctionEffect::Migration {
+            return Err(ReloadError::Migration(
+                "migration entry does not have Migration effect".into(),
+            )
+            .into());
+        }
         let execution = CheckedInterpreter::run_migration(
             &candidate.verified,
             migration_entry,
@@ -1464,6 +1465,25 @@ impl RealmRuntime {
                 Err(ReloadError::Migration(trap.message).into())
             }
         }
+    }
+
+    fn stage_reload_without_entry(
+        &mut self,
+        candidate: ModuleHandle,
+        migration: crate::stateful::MigrationContext,
+    ) -> Result<Option<RuntimeValue>, RealmError> {
+        let (migrated, hash, usage) = migration.finish()?.into_shared();
+        if migrated_graph_has_invalid_gc_root(&self.heap, &migrated) {
+            return Err(ReloadError::GraphCheck.into());
+        }
+        self.last_migration_usage_report = Some(usage);
+        self.last_migration_hash = Some(hash);
+        self.modules
+            .resolve_mut(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state = migrated;
+        self.reload.staged()?;
+        Ok(None)
     }
 
     pub(crate) fn commit_reload(
@@ -1662,6 +1682,105 @@ impl RealmRuntime {
     ) -> Result<TaskHandle, RuntimeError> {
         self.spawn_task_inner(module, function, arguments, config)
             .map_err(RuntimeError::from)
+    }
+
+    pub fn resolve_export<E: crate::ScriptExport>(
+        &self,
+        module: ModuleHandle,
+    ) -> Result<u32, crate::ScriptCallError> {
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(|error| crate::ScriptCallError::Runtime(format!("{error:?}")))?;
+        let export = loaded
+            .verified
+            .module()
+            .exports
+            .iter()
+            .find(|candidate| candidate.stable_id == E::STABLE_ID)
+            .ok_or(crate::ScriptCallError::MissingExport {
+                name: E::NAME,
+                stable_id: E::STABLE_ID,
+            })?;
+        if export.signature != E::signature() {
+            return Err(crate::ScriptCallError::SignatureMismatch { name: E::NAME });
+        }
+        let function = loaded
+            .verified
+            .module()
+            .functions
+            .get(
+                usize::try_from(export.function)
+                    .map_err(|_| crate::ScriptCallError::SignatureMismatch { name: E::NAME })?,
+            )
+            .ok_or(crate::ScriptCallError::SignatureMismatch { name: E::NAME })?;
+        if matches!(
+            function.effect,
+            nexa_bytecode::FunctionEffect::Migration | nexa_bytecode::FunctionEffect::Cleanup
+        ) {
+            return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
+        }
+        Ok(export.function)
+    }
+
+    pub fn spawn_export<E: crate::ScriptExport>(
+        &mut self,
+        module: ModuleHandle,
+        args: &E::Args,
+        config: StepConfig,
+    ) -> Result<TaskHandle, crate::ScriptCallError> {
+        let function = self.resolve_export::<E>(module)?;
+        let requirements = E::argument_requirements(args)?;
+        let values = {
+            let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?;
+            let values = E::encode_args(&mut writer, args)?;
+            writer
+                .commit_arguments(values)
+                .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?
+        };
+        self.spawn_task(module, function, &values, config)
+            .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))
+    }
+
+    pub fn call_export<E: crate::ScriptExport>(
+        &mut self,
+        module: ModuleHandle,
+        owner: ScopeHandle,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<E::Output, crate::ScriptCallError> {
+        let task = self.spawn_export::<E>(
+            module,
+            args,
+            StepConfig {
+                owner,
+                priority: 1,
+                fuel_slice: policy.fuel,
+                cumulative_budget: policy.cumulative_budget,
+                limits: crate::TaskLimits::default(),
+            },
+        )?;
+        match self.poll_task(task, policy.fuel) {
+            Ok(TaskPoll::Completed(value)) => {
+                let reader = crate::ScriptOutputReader::new(&self.heap);
+                E::decode_output(&reader, value)
+            }
+            Ok(TaskPoll::Yielded(_)) => {
+                let _ = self.cancel_task(task, CancelReason::HostCancelled);
+                Err(crate::ScriptCallError::HandlerDidNotComplete)
+            }
+            Ok(TaskPoll::Waiting(_)) => {
+                let _ = self.cancel_task(task, CancelReason::HostCancelled);
+                Err(crate::ScriptCallError::HostWaitNotAllowed)
+            }
+            Ok(TaskPoll::Trapped(error)) | Err(error) => {
+                Err(crate::ScriptCallError::HandlerTrapped(error.to_string()))
+            }
+            Ok(TaskPoll::Cancelled(reason)) => Err(crate::ScriptCallError::Runtime(format!(
+                "handler cancelled: {reason:?}"
+            ))),
+        }
     }
 
     #[allow(clippy::too_many_lines)]

@@ -4,6 +4,13 @@ Version: **2.0.0**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
+Nexa M2 Embedding & Snake Pilot = COMPLETE
+nexa-embed v1 = COMPLETE
+Typed Script Export = COMPLETE
+Snake Core = COMPLETE
+Built-in Package Pilot = COMPLETE
+Official DLC Pilot = COMPLETE
+Trusted Local Mod Pilot = COMPLETE
 Repository Slimming = COMPLETE
 Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
@@ -19,6 +26,7 @@ Internal Language Scope
 > Host Binding
 > Task Runtime
 > Restart Reload
+> Embedding and package lifecycle
 > ABI and machine details
 > Roadmap
 ```
@@ -35,6 +43,11 @@ rollback without old-Task revival.
 - [`internal/HOST_BINDING.md`](internal/HOST_BINDING.md)
 - [`internal/TASK_RUNTIME.md`](internal/TASK_RUNTIME.md)
 - [`internal/RESTART_RELOAD.md`](internal/RESTART_RELOAD.md)
+- [`embed/EMBED_API.md`](embed/EMBED_API.md)
+- [`embed/PACKAGE_SOURCE.md`](embed/PACKAGE_SOURCE.md)
+- [`embed/PACKAGE_POLICY.md`](embed/PACKAGE_POLICY.md)
+- [`embed/PACKAGE_LIFECYCLE.md`](embed/PACKAGE_LIFECYCLE.md)
+- [`embed/SNAKE_PILOT.md`](embed/SNAKE_PILOT.md)
 - [`abi/IDL.md`](abi/IDL.md)
 - [`abi/BYTECODE.md`](abi/BYTECODE.md)
 - [`runtime/HANDLES.md`](runtime/HANDLES.md)

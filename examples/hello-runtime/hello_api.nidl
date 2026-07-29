@@ -1,3 +1,4 @@
 interface ConsoleHost {
     sync fn log(message: string) -> i32;
+    export Main() -> i32;
 }

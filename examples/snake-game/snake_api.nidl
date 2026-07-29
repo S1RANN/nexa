@@ -1,0 +1,51 @@
+interface SnakeHost {
+    struct Cell { x: i32; y: i32; }
+    struct AvailableCells { values: array<Cell>; }
+    struct FoodInstance { kind: string; cell: Cell; }
+    struct GameStats {
+        score: i32;
+        total_plays: i64;
+        foods: i32;
+        snake_length: i32;
+    }
+    struct GameSnapshot {
+        stats: GameStats;
+        width: i32;
+        height: i32;
+        food: Option<FoodInstance>;
+        available: AvailableCells;
+    }
+    struct WidgetText { local_id: string; text: string; }
+    struct FoodDefinition {
+        local_id: string;
+        length_delta: i32;
+        score_delta: i32;
+        speed_delta: i32;
+    }
+    enum SnakeEvent {
+        PackageEnabled(GameSnapshot),
+        GameStarted(GameSnapshot),
+        GameTick(GameSnapshot),
+        ScoreChanged(GameSnapshot),
+        FoodSpawnRequested(GameSnapshot),
+        FoodEaten(GameSnapshot),
+        GameEnded(GameSnapshot),
+        SettingsChanged(GameSnapshot)
+    }
+    enum SnakeCommand {
+        RegisterWidget(string),
+        SetWidgetText(WidgetText),
+        RegisterSkin(string),
+        RegisterFood(FoodDefinition),
+        RegisterSpawnPolicy(string),
+        AddScore(i32),
+        ResizeSnake(i32),
+        SetSpeed(i32),
+        ProposeFoodSpawn(Cell),
+        ShowToast(string)
+    }
+    sync fn format_score(score: i32) -> string;
+    sync fn format_stats(score: i32, total_plays: i64, foods: i32) -> string;
+    sync fn log(message: string) -> i32;
+    export OnEvent(event: SnakeEvent) -> array<SnakeCommand>;
+}

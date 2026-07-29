@@ -80,6 +80,16 @@ struct M1FinalReport {
     status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+struct M2FinalReport {
+    head: String,
+    tag_type: String,
+    tag_target: String,
+    working_tree_clean: bool,
+    ergonomics_audit: &'static str,
+    status: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct CheckSummary {
@@ -121,11 +131,18 @@ fn main() -> Result<(), DynError> {
         "bench-smoke" => bench_smoke(),
         "repo-audit" => repo_audit(),
         "finalize-m1" => finalize_m1(),
+        "test-embed" => test_embed(),
+        "test-snake" => test_snake(),
+        "snake-headless-smoke" => snake_headless("smoke"),
+        "snake-stress" => snake_headless("stress"),
+        "snake-bench" => snake_headless("bench"),
+        "finalize-m2" => finalize_m2(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
                  check|test-core|test-binding|test-task|test-reload|test-model|\
-                 fuzz-smoke|bench-smoke|repo-audit|finalize-m1"
+                 fuzz-smoke|bench-smoke|repo-audit|finalize-m1|test-embed|test-snake|\
+                 snake-headless-smoke|snake-stress|snake-bench|finalize-m2"
             );
             Err("unknown xtask command".into())
         }
@@ -193,10 +210,164 @@ fn finalize_m1() -> Result<(), DynError> {
 fn check() -> Result<(), DynError> {
     let summary = run_check_summary();
     println!("{summary:#?}");
-    if summary.passed() {
+    if !summary.passed() {
+        return Err("one or more independently executed M1 check gates failed".into());
+    }
+    test_embed()?;
+    test_snake()?;
+    snake_headless("smoke")?;
+    snake_headless("stress")?;
+    snake_headless("bench")?;
+    m2_audit()
+}
+
+fn test_embed() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-embed"])
+}
+
+fn test_snake() -> Result<(), DynError> {
+    cargo(&["test", "-p", "snake-game"])
+}
+
+fn snake_headless(mode: &str) -> Result<(), DynError> {
+    cargo(&[
+        "run",
+        "-p",
+        "snake-game",
+        "--bin",
+        "snake-headless",
+        "--",
+        mode,
+    ])
+}
+
+fn m2_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    let main = fs::read_to_string(root.join("examples/snake-game/src/main.rs"))?;
+    for forbidden in [
+        "nexa_runtime",
+        "nexa_compiler",
+        "RealmRuntime",
+        "RuntimeHost",
+        "ModuleHandle",
+        "ScopeHandle",
+        "TaskHandle",
+        "StepConfig",
+        "TaskPoll",
+        "drain_releases",
+    ] {
+        if main.contains(forbidden) {
+            return Err(format!("Snake main contains low-level symbol {forbidden}").into());
+        }
+    }
+    let loop_body = main
+        .split_once("loop {")
+        .and_then(|(_, body)| body.split_once("next_frame().await"))
+        .map_or("", |(body, _)| body);
+    for call in ["apply_pending_actions", "handle_events", ".tick("] {
+        if loop_body.matches(call).count() != 1 {
+            return Err(format!("Snake game loop must call {call} exactly once").into());
+        }
+    }
+    let embed_root = root.join("crates/nexa-embed/src");
+    let embed_source = fs::read_dir(embed_root)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.path().extension().is_some_and(|value| value == "rs"))
+        .map(|entry| fs::read_to_string(entry.path()))
+        .collect::<Result<Vec<_>, _>>()?
+        .join("\n");
+    for forbidden in [
+        "builtin_root",
+        "dlc_root",
+        "mod_root",
+        "Builtin",
+        "Dlc",
+        "Snake",
+        "Food",
+        "Skin",
+        "GameCommand",
+    ] {
+        if embed_source.contains(forbidden) {
+            return Err(format!("nexa-embed domain leak: {forbidden}").into());
+        }
+    }
+    let hello = fs::read_to_string(root.join("examples/hello-runtime/src/main.rs"))?;
+    for forbidden in [
+        "RealmRuntime",
+        "RuntimeHost",
+        "StepConfig",
+        "TaskPoll",
+        "ModuleHandle",
+        "ScopeHandle",
+    ] {
+        if hello.contains(forbidden) {
+            return Err(format!("hello-runtime contains low-level symbol {forbidden}").into());
+        }
+    }
+    let package_count = ["builtin", "dlc", "mods"]
+        .iter()
+        .map(|category| {
+            fs::read_dir(root.join("examples/snake-game/packages").join(category)).map(|entries| {
+                entries
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().is_dir())
+                    .count()
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .sum::<usize>();
+    if package_count != 9 {
+        return Err(format!("expected 9 Snake packages, found {package_count}").into());
+    }
+    let overlay =
+        fs::read_to_string(root.join("examples/snake-game/packages/mods/score-overlay/main.nexa"))?;
+    if !overlay.contains("@stateful(1) class OverlayState") {
+        return Err("Score Overlay does not declare typed state".into());
+    }
+    for required in [
+        "docs/EMBEDDING.md",
+        "docs/PACKAGE_SOURCES.md",
+        "docs/PACKAGE_POLICIES.md",
+        "docs/SNAKE_MODDING.md",
+        "examples/snake-game/README.md",
+    ] {
+        if !root.join(required).is_file() {
+            return Err(format!("missing M2 documentation {required}").into());
+        }
+    }
+    Ok(())
+}
+
+fn finalize_m2() -> Result<(), DynError> {
+    let root = workspace_root();
+    let audit = m2_audit().is_ok();
+    let tag_type = git_output(&["cat-file", "-t", "embed-snake-m2-complete"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_target = git_output(&["rev-parse", "embed-snake-m2-complete^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let working_tree_clean = git_output(&["status", "--porcelain"])?.is_empty();
+    let passed = audit && tag_type == "tag" && tag_target == head && working_tree_clean;
+    let report = M2FinalReport {
+        head,
+        tag_type,
+        tag_target,
+        working_tree_clean,
+        ergonomics_audit: status(audit),
+        status: if passed { "PASS" } else { "FAIL" },
+    };
+    let output = root.join("target/nexa-artifacts/m2-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M2 final report has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
         Ok(())
     } else {
-        Err("one or more independently executed check gates failed".into())
+        Err("M2 finalization failed".into())
     }
 }
 

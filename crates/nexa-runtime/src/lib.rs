@@ -36,7 +36,7 @@ pub use failure::{
 pub use kernel::{RuntimeError, RuntimeLimits, RuntimeTrap, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
-pub use nexa_bytecode::ValueType;
+pub use nexa_bytecode::{Signature, ValueType};
 pub use nexa_core::StableId;
 
 #[cfg(test)]
@@ -50,16 +50,18 @@ pub use heap::{
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
-    HostArrayRef, HostBufferRef, HostCallOutcome, HostCollectionBuilder, HostCompletionDelivery,
-    HostCompletionProtocolError, HostCompletionResult, HostCompletionTicket, HostEnumRef,
-    HostErrorPayload, HostOptionRef, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
-    HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValueRef, MAX_HOST_RETURN_FIELDS,
+    HOST_CONTRACT_SCHEMA_VERSION, HostArrayRef, HostBufferRef, HostCallOutcome,
+    HostCollectionBuilder, HostCompletionDelivery, HostCompletionProtocolError,
+    HostCompletionResult, HostCompletionTicket, HostContract, HostEnumRef, HostErrorPayload,
+    HostOptionRef, HostPayload, HostRegistry, HostRequestError, HostRequestHandle,
+    HostRequestState, HostResultRef, HostReturnRequirements, HostReturnTransaction, HostStr,
+    HostStructRef, HostTrap, HostValueRef, MAX_HOST_RETURN_FIELDS, MustCompletePolicy,
     PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError,
     ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle,
     RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
-    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptFunction, SnapshotHandle,
-    SnapshotLayout, TaskResourceSet, TypedSnapshotRef, invoke_host_boundary,
+    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptArgumentRequirements,
+    ScriptCallError, ScriptCallWriter, ScriptExport, ScriptFunction, ScriptOutputReader,
+    SnapshotHandle, SnapshotLayout, TaskResourceSet, TypedSnapshotRef, invoke_host_boundary,
     validate_host_completion,
 };
 #[cfg(feature = "fuzzing")]

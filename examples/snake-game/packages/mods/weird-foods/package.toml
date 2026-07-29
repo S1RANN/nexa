@@ -1,0 +1,10 @@
+schema = 1
+id = "community.weird-foods"
+name = "Weird Foods"
+version = "1.0.0"
+entry = "main.nexa"
+priority = 140
+activation = "user-controlled"
+state_schema = "v1"
+handler_fuel = 30000
+capabilities = ["food.register", "game.resize", "game.score"]

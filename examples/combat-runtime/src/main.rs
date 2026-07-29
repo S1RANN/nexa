@@ -5,7 +5,7 @@ use nexa_core::StableId;
 use nexa_runtime::{
     HostPayload, ModuleLifecycle, RealmConfig, RealmRuntime, ReleaseKind, ResourceContext,
     RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostDomain,
-    RuntimeValue, ScriptFunction, StepConfig, TaskLimits, TaskPoll, TickBudget,
+    RuntimeValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 
 #[allow(dead_code)]
@@ -178,7 +178,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "Combat bindings must be generated without manual edits"
     );
     assert_eq!(generated::Update::EXPORT_NAME, "Update");
-    let _typed_export_id = generated::Update::FUNCTION_ID;
+    let _typed_export_id = generated::Update::EXPORT_ID;
     let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
     let host_hash = generated::INTERFACE_HASH;
     assert_eq!(host_hash, nexa_idl::exact_hash(&idl));

@@ -182,6 +182,52 @@ fn schema_unchanged_commits() {
 }
 
 #[test]
+fn schema_unchanged_restart_preserves_typed_state_without_migration_entry() {
+    let module = compile(V1, SCHEMA_V1);
+    let (mut realm, old) = realm(module.clone(), SCHEMA_V1);
+    let state_id = StableId::from_name("overlay");
+    realm
+        .insert_state(
+            old,
+            state_id,
+            StateValue::Object(StateObject {
+                type_id: StableId::from_name("EnemyBrain"),
+                version: 1,
+                fields: BTreeMap::from([
+                    (StableId::from_name("EnemyBrain::phase"), StateValue::I32(7)),
+                    (
+                        StableId::from_name("EnemyBrain::legacy_target"),
+                        StateValue::I32(11),
+                    ),
+                ]),
+            }),
+        )
+        .expect("insert state");
+    let RestartReloadOutcome::Committed(candidate) = realm
+        .restart_reload(old, module, RestartReloadPolicy::default())
+        .expect("reload")
+    else {
+        panic!("schema-identical reload commits");
+    };
+    let handle = realm
+        .state_handles(candidate)
+        .expect("state handles")
+        .into_iter()
+        .find(|handle| handle.stable_id == state_id)
+        .expect("preserved state");
+    let StateValue::Object(state) = realm
+        .resolve_state(candidate, handle)
+        .expect("resolve preserved state")
+    else {
+        panic!("state remains typed object");
+    };
+    assert_eq!(
+        state.fields.get(&StableId::from_name("EnemyBrain::phase")),
+        Some(&StateValue::I32(7))
+    );
+}
+
+#[test]
 fn appended_field_receives_migration_default() {
     let mut scenario = stateful_scenario();
     let candidate = commit_stateful(&mut scenario);
