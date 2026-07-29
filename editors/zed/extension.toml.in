@@ -1,0 +1,12 @@
+id = "nexa"
+name = "Nexa"
+version = "0.1.0"
+schema_version = 1
+authors = ["Nexa Contributors"]
+description = "Syntax highlighting and structural editing for Nexa and Nexa IDL."
+repository = "https://github.com/S1RANN/nexa"
+languages = ["languages/nexa", "languages/nexa-idl"]
+
+[grammars.nexa]
+repository = "{{GRAMMAR_REPOSITORY}}"
+rev = "{{GRAMMAR_REVISION}}"

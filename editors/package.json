@@ -1,0 +1,23 @@
+{
+  "name": "nexa-editor-support",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local editor support tooling for Nexa and Nexa IDL.",
+  "license": "MIT OR Apache-2.0",
+  "scripts": {
+    "generate": "node scripts/generate.mjs",
+    "check": "node scripts/check.mjs",
+    "package:vscode": "node scripts/package-vscode.mjs",
+    "prepare:zed": "node scripts/prepare-zed.mjs",
+    "package": "pnpm run generate && pnpm run check && pnpm run package:vscode && pnpm run prepare:zed"
+  },
+  "devDependencies": {
+    "@iarna/toml": "2.2.5",
+    "@vscode/vsce": "3.9.2",
+    "tree-sitter-cli": "0.26.11"
+  },
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=22"
+  }
+}

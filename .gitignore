@@ -9,3 +9,7 @@ target/nexa-artifacts/
 *.ndjson
 reports/raw/
 fuzz/*/Cargo.lock
+editors/node_modules/
+editors/**/node_modules/
+editors/tree-sitter-nexa/.tree-sitter/
+editors/tree-sitter-nexa/build/

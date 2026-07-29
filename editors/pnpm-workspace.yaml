@@ -1,0 +1,4 @@
+allowBuilds:
+  tree-sitter-cli: true
+  "@vscode/vsce-sign": false
+  keytar: false

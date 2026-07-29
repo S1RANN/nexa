@@ -1,0 +1,180 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Nexa",
+  "scopeName": "source.nexa",
+  "fileTypes": [
+    "nexa"
+  ],
+  "patterns": [
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#runes"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#attributes"
+    },
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#intrinsics"
+    },
+    {
+      "include": "#constructors"
+    },
+    {
+      "include": "#builtin-types"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#function-calls"
+    },
+    {
+      "include": "#properties"
+    },
+    {
+      "include": "#type-names"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "strings": {
+      "name": "string.quoted.double.nexa",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nexa",
+          "match": "\\\\[nrt\\\\\"]"
+        }
+      ]
+    },
+    "runes": {
+      "name": "string.quoted.single.nexa",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nexa",
+          "match": "\\\\[nrt\\\\']"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.float.nexa",
+          "match": "\\b[0-9]+\\.[0-9]+\\b"
+        },
+        {
+          "name": "constant.numeric.integer.nexa",
+          "match": "\\b[0-9]+\\b"
+        }
+      ]
+    },
+    "attributes": {
+      "match": "(@)(stateful|activation)\\b",
+      "captures": {
+        "1": {
+          "name": "punctuation.definition.annotation.nexa"
+        },
+        "2": {
+          "name": "entity.name.tag.nexa"
+        }
+      }
+    },
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.module.nexa"
+            },
+            "2": {
+              "name": "entity.name.namespace.nexa"
+            }
+          }
+        },
+        {
+          "match": "\\b(struct|enum|class)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.nexa"
+            },
+            "2": {
+              "name": "entity.name.type.nexa"
+            }
+          }
+        },
+        {
+          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.nexa"
+            },
+            "2": {
+              "name": "entity.name.function.nexa"
+            }
+          }
+        }
+      ]
+    },
+    "intrinsics": {
+      "name": "support.function.builtin.nexa",
+      "match": "\\b(?:old\\.get|old\\.field|new\\.create|new\\.set|preserve|replace|delete|finish_migration)\\b"
+    },
+    "constructors": {
+      "name": "entity.name.type.variant.nexa",
+      "match": "\\b(?:Some|None|Ok|Err)\\b"
+    },
+    "builtin-types": {
+      "name": "support.type.builtin.nexa",
+      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Map|Buffer|Option|Result|Task|HostRequest|ResourceToken|Snapshot|StateHandle|StableId|StateHandleError)\\b"
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.nexa",
+          "match": "\\b(?:module|import|fn|struct|enum|class|task|immediate|migration|cleanup|return|let|var|if|else|while|match|with|new|await|yield|defer|for|in)\\b"
+        },
+        {
+          "name": "constant.language.boolean.nexa",
+          "match": "\\b(?:true|false)\\b"
+        }
+      ]
+    },
+    "function-calls": {
+      "name": "entity.name.function.call.nexa",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:<[^;{}()]+>)?\\s*\\()"
+    },
+    "properties": {
+      "name": "variable.other.property.nexa",
+      "match": "(?<=\\.)[A-Za-z_][A-Za-z0-9_]*"
+    },
+    "type-names": {
+      "name": "entity.name.type.nexa",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.nexa",
+      "match": "==|=>|->|\\.\\.|[+*/=<>?:@-]"
+    },
+    "punctuation": {
+      "name": "punctuation.separator.nexa",
+      "match": "[{},();,.]"
+    }
+  }
+}

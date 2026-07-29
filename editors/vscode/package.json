@@ -1,0 +1,68 @@
+{
+  "name": "nexa-language-support",
+  "displayName": "Nexa Language Support",
+  "description": "Syntax highlighting and structural editing for Nexa and Nexa IDL.",
+  "version": "0.1.0",
+  "publisher": "s1rann",
+  "license": "MIT OR Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/S1RANN/nexa.git",
+    "directory": "editors/vscode"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "keywords": [
+    "nexa",
+    "nidl",
+    "language",
+    "syntax"
+  ],
+  "extensionKind": [
+    "ui",
+    "workspace"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nexa",
+        "aliases": [
+          "Nexa",
+          "nexa"
+        ],
+        "extensions": [
+          ".nexa"
+        ],
+        "configuration": "./language-configuration/nexa.json"
+      },
+      {
+        "id": "nexa-idl",
+        "aliases": [
+          "Nexa IDL",
+          "NIDL",
+          "nidl"
+        ],
+        "extensions": [
+          ".nidl"
+        ],
+        "configuration": "./language-configuration/nexa-idl.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nexa",
+        "scopeName": "source.nexa",
+        "path": "./syntaxes/nexa.tmLanguage.json"
+      },
+      {
+        "language": "nexa-idl",
+        "scopeName": "source.nexa-idl",
+        "path": "./syntaxes/nexa-idl.tmLanguage.json"
+      }
+    ]
+  }
+}

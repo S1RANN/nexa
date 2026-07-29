@@ -1,0 +1,118 @@
+{
+  "nexa": {
+    "declarationKeywords": [
+      "module",
+      "import",
+      "fn",
+      "struct",
+      "enum",
+      "class"
+    ],
+    "effectKeywords": [
+      "task",
+      "immediate",
+      "migration",
+      "cleanup"
+    ],
+    "statementKeywords": [
+      "return",
+      "let",
+      "var",
+      "if",
+      "else",
+      "while",
+      "match",
+      "with",
+      "new",
+      "await",
+      "yield",
+      "defer",
+      "for",
+      "in"
+    ],
+    "attributeKeywords": [
+      "stateful",
+      "activation"
+    ],
+    "literalKeywords": [
+      "true",
+      "false"
+    ],
+    "builtinTypes": [
+      "i32",
+      "i64",
+      "f32",
+      "f64",
+      "bool",
+      "rune",
+      "string",
+      "Array",
+      "Map",
+      "Buffer",
+      "Option",
+      "Result",
+      "Task",
+      "HostRequest",
+      "ResourceToken",
+      "Snapshot",
+      "StateHandle",
+      "StableId",
+      "StateHandleError"
+    ],
+    "constructors": [
+      "Some",
+      "None",
+      "Ok",
+      "Err"
+    ],
+    "migrationIntrinsics": [
+      "old.get",
+      "old.field",
+      "new.create",
+      "new.set",
+      "preserve",
+      "replace",
+      "delete",
+      "finish_migration"
+    ]
+  },
+  "nidl": {
+    "declarationKeywords": [
+      "interface",
+      "opaque",
+      "struct",
+      "enum",
+      "fn",
+      "export"
+    ],
+    "modeKeywords": [
+      "sync",
+      "request",
+      "fuel"
+    ],
+    "policyKeywords": [
+      "return_error",
+      "cancel_task",
+      "trap"
+    ],
+    "builtinTypes": [
+      "i32",
+      "i64",
+      "f32",
+      "f64",
+      "bool",
+      "rune",
+      "string",
+      "host_request",
+      "request",
+      "resource_token",
+      "token",
+      "snapshot",
+      "array",
+      "buffer",
+      "Option",
+      "Result",
+      "void"
+    ]
+  }
+}

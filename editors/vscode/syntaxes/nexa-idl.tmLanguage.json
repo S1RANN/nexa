@@ -1,0 +1,104 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Nexa IDL",
+  "scopeName": "source.nexa-idl",
+  "fileTypes": [
+    "nidl"
+  ],
+  "patterns": [
+    {
+      "include": "#declarations"
+    },
+    {
+      "include": "#policies"
+    },
+    {
+      "include": "#builtin-types"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#function-names"
+    },
+    {
+      "include": "#field-names"
+    },
+    {
+      "include": "#type-names"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#punctuation"
+    }
+  ],
+  "repository": {
+    "declarations": {
+      "patterns": [
+        {
+          "match": "\\b(interface|opaque|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.nexa-idl"
+            },
+            "2": {
+              "name": "entity.name.type.nexa-idl"
+            }
+          }
+        },
+        {
+          "match": "\\b(fn|export)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.type.function.nexa-idl"
+            },
+            "2": {
+              "name": "entity.name.function.nexa-idl"
+            }
+          }
+        }
+      ]
+    },
+    "policies": {
+      "name": "constant.language.policy.nexa-idl",
+      "match": "\\b(?:return_error|cancel_task|trap)\\b"
+    },
+    "builtin-types": {
+      "name": "support.type.builtin.nexa-idl",
+      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|host_request|request|resource_token|token|snapshot|array|buffer|Option|Result|void)\\b"
+    },
+    "keywords": {
+      "name": "keyword.control.nexa-idl",
+      "match": "\\b(?:interface|opaque|struct|enum|fn|export|sync|request|fuel)\\b"
+    },
+    "function-names": {
+      "name": "entity.name.function.call.nexa-idl",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*\\()"
+    },
+    "field-names": {
+      "name": "variable.other.property.nexa-idl",
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?=\\s*:)"
+    },
+    "type-names": {
+      "name": "entity.name.type.nexa-idl",
+      "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
+    },
+    "numbers": {
+      "name": "constant.numeric.integer.nexa-idl",
+      "match": "\\b[0-9]+\\b"
+    },
+    "operators": {
+      "name": "keyword.operator.nexa-idl",
+      "match": "->|[:<>]"
+    },
+    "punctuation": {
+      "name": "punctuation.separator.nexa-idl",
+      "match": "[{},();]"
+    }
+  }
+}
