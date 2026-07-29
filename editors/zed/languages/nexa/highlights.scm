@@ -90,10 +90,10 @@
 (string_literal) @string
 (rune_literal) @string.special
 (operator) @operator
+(return_arrow_operator) @operator
+(match_arrow_operator) @operator
 
 [
-  "->"
-  "=>"
   "="
   "?"
   ".."

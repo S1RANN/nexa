@@ -42,9 +42,9 @@
   name: (_) @constructor)
 
 (integer_literal) @number
+(return_arrow_operator) @operator
 
 [
-  "->"
   ":"
 ] @operator
 

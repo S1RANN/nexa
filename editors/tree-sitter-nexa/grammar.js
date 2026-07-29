@@ -146,7 +146,7 @@ module.exports = grammar({
         field("keyword", $.function_keyword),
         field("name", $.identifier),
         field("parameters", $.parameter_list),
-        "->",
+        field("arrow", $.return_arrow_operator),
         field("return_type", $.type),
         field("body", $.block),
       ),
@@ -280,7 +280,7 @@ module.exports = grammar({
       seq(
         field("variant", $.type_identifier),
         optional(seq("(", field("binding", $.identifier), ")")),
-        "=>",
+        field("arrow", $.match_arrow_operator),
         field("value", $.expression),
       ),
 
@@ -624,7 +624,7 @@ module.exports = grammar({
         field("keyword", $.nidl_function_keyword),
         field("name", $.nidl_identifier),
         field("parameters", $.nidl_parameter_list),
-        "->",
+        field("arrow", $.return_arrow_operator),
         field("return_type", $.nidl_type),
         ";",
       ),
@@ -656,7 +656,7 @@ module.exports = grammar({
         field("keyword", $.export_keyword),
         field("name", $.nidl_identifier),
         field("parameters", $.nidl_parameter_list),
-        "->",
+        field("arrow", $.return_arrow_operator),
         field("return_type", choice($.nidl_type, $.void_type)),
         ";",
       ),
@@ -708,6 +708,10 @@ module.exports = grammar({
       ),
     void_type: ($) =>
       syntax.nidl.builtinTypes.find((type) => type === "void"),
+
+    return_arrow_operator: ($) => "->",
+
+    match_arrow_operator: ($) => "=>",
 
     operator: ($) => choice("==", "+", "-", "*", "/"),
   },

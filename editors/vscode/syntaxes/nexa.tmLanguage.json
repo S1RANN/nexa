@@ -169,8 +169,16 @@
       "match": "\\b[A-Z][A-Za-z0-9_]*\\b"
     },
     "operators": {
-      "name": "keyword.operator.nexa",
-      "match": "==|=>|->|\\.\\.|[+*/=<>?:@-]"
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.nexa",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.nexa",
+          "match": "==|\\.\\.|[+*/=<>?:@-]"
+        }
+      ]
     },
     "punctuation": {
       "name": "punctuation.separator.nexa",

@@ -8,10 +8,14 @@ import {
 } from "./lib.mjs";
 
 const outputDirectory = path.join(artifactDirectory, "vscode");
+const extensionPackage = JSON.parse(
+  fs.readFileSync(path.join(vscodeDirectory, "package.json"), "utf8"),
+);
 const output = path.join(
   outputDirectory,
-  "nexa-language-support-0.1.0.vsix",
+  `nexa-language-support-${extensionPackage.version}.vsix`,
 );
+fs.rmSync(outputDirectory, { recursive: true, force: true });
 fs.mkdirSync(outputDirectory, { recursive: true });
 
 const result = spawnSync(

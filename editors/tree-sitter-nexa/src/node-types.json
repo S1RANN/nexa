@@ -707,6 +707,16 @@
     "type": "export_declaration",
     "named": true,
     "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "return_arrow_operator",
+            "named": true
+          }
+        ]
+      },
       "keyword": {
         "multiple": false,
         "required": true,
@@ -940,6 +950,16 @@
     "type": "function_declaration",
     "named": true,
     "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "return_arrow_operator",
+            "named": true
+          }
+        ]
+      },
       "body": {
         "multiple": false,
         "required": true,
@@ -1085,6 +1105,16 @@
     "type": "host_function_declaration",
     "named": true,
     "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "return_arrow_operator",
+            "named": true
+          }
+        ]
+      },
       "keyword": {
         "multiple": false,
         "required": true,
@@ -1259,6 +1289,16 @@
     "type": "match_arm",
     "named": true,
     "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "match_arrow_operator",
+            "named": true
+          }
+        ]
+      },
       "binding": {
         "multiple": false,
         "required": false,
@@ -2235,10 +2275,6 @@
     "named": false
   },
   {
-    "type": "->",
-    "named": false
-  },
-  {
     "type": ".",
     "named": false
   },
@@ -2260,10 +2296,6 @@
   },
   {
     "type": "=",
-    "named": false
-  },
-  {
-    "type": "=>",
     "named": false
   },
   {
@@ -2459,6 +2491,10 @@
     "named": true
   },
   {
+    "type": "match_arrow_operator",
+    "named": true
+  },
+  {
     "type": "match_keyword",
     "named": true
   },
@@ -2509,6 +2545,10 @@
   {
     "type": "resource_token",
     "named": false
+  },
+  {
+    "type": "return_arrow_operator",
+    "named": true
   },
   {
     "type": "return_error",

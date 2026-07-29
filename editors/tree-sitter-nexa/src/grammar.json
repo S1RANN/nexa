@@ -529,8 +529,12 @@
           }
         },
         {
-          "type": "STRING",
-          "value": "->"
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "return_arrow_operator"
+          }
         },
         {
           "type": "FIELD",
@@ -1182,8 +1186,12 @@
           ]
         },
         {
-          "type": "STRING",
-          "value": "=>"
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "match_arrow_operator"
+          }
         },
         {
           "type": "FIELD",
@@ -2843,8 +2851,12 @@
           }
         },
         {
-          "type": "STRING",
-          "value": "->"
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "return_arrow_operator"
+          }
         },
         {
           "type": "FIELD",
@@ -3009,8 +3021,12 @@
           }
         },
         {
-          "type": "STRING",
-          "value": "->"
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "return_arrow_operator"
+          }
         },
         {
           "type": "FIELD",
@@ -3267,6 +3283,14 @@
     "void_type": {
       "type": "STRING",
       "value": "void"
+    },
+    "return_arrow_operator": {
+      "type": "STRING",
+      "value": "->"
+    },
+    "match_arrow_operator": {
+      "type": "STRING",
+      "value": "=>"
     },
     "operator": {
       "type": "CHOICE",

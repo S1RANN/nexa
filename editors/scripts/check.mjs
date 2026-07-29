@@ -2,9 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createRequire } from "node:module";
 import { pathToFileURL } from "node:url";
 
 import TOML from "@iarna/toml";
+import vscodeOniguruma from "vscode-oniguruma";
+import vscodeTextmate from "vscode-textmate";
 
 import {
   editorsDirectory,
@@ -23,6 +26,10 @@ const generatedGrammarFiles = [
   "src/grammar.json",
   "src/node-types.json",
 ];
+
+const require = createRequire(import.meta.url);
+const { OnigScanner, OnigString, loadWASM } = vscodeOniguruma;
+const { INITIAL, Registry, parseRawGrammar } = vscodeTextmate;
 
 const exampleFiles = [
   "examples/add.nexa",
@@ -215,14 +222,91 @@ function validateSyntaxContract() {
   const nexaTextMate = parseJson(
     path.join(vscodeDirectory, "syntaxes", "nexa.tmLanguage.json"),
   );
+  const operatorPatterns = nexaTextMate.repository.operators.patterns.map(
+    (pattern) => pattern.match,
+  );
   assert(
-    nexaTextMate.repository.operators.match.includes("/"),
+    operatorPatterns.some((pattern) => pattern.includes("/")),
     "TextMate grammar must highlight / as an operator",
   );
   assert(
     !Object.hasOwn(nexaTextMate.repository, "comments"),
     "TextMate grammar must not define comments",
   );
+}
+
+async function validateTextMateTokenization() {
+  const wasm = fs.readFileSync(
+    require.resolve("vscode-oniguruma/release/onig.wasm"),
+  );
+  await loadWASM(
+    wasm.buffer.slice(wasm.byteOffset, wasm.byteOffset + wasm.byteLength),
+  );
+  const grammarFiles = new Map([
+    [
+      "source.nexa",
+      path.join(vscodeDirectory, "syntaxes", "nexa.tmLanguage.json"),
+    ],
+    [
+      "source.nexa-idl",
+      path.join(vscodeDirectory, "syntaxes", "nexa-idl.tmLanguage.json"),
+    ],
+  ]);
+  const registry = new Registry({
+    onigLib: Promise.resolve({
+      createOnigScanner: (patterns) => new OnigScanner(patterns),
+      createOnigString: (value) => new OnigString(value),
+    }),
+    loadGrammar: async (scopeName) => {
+      const grammarFile = grammarFiles.get(scopeName);
+      return grammarFile
+        ? parseRawGrammar(read(grammarFile), grammarFile)
+        : null;
+    },
+  });
+
+  const cases = [
+    {
+      scopeName: "source.nexa",
+      line: "fn add(a: i32, b: i32) -> i32 {",
+      arrows: [["->", "keyword.operator.arrow.nexa"]],
+    },
+    {
+      scopeName: "source.nexa",
+      line: "Some(found) => found, None => 0,",
+      arrows: [
+        ["=>", "keyword.operator.arrow.nexa"],
+        ["=>", "keyword.operator.arrow.nexa"],
+      ],
+    },
+    {
+      scopeName: "source.nexa-idl",
+      line: "sync fn log(message: string) -> i32;",
+      arrows: [["->", "keyword.operator.arrow.nexa-idl"]],
+    },
+  ];
+
+  for (const testCase of cases) {
+    const grammar = await registry.loadGrammar(testCase.scopeName);
+    assert(grammar, `failed to load ${testCase.scopeName}`);
+    const tokens = grammar.tokenizeLine(testCase.line, INITIAL).tokens;
+    let searchOffset = 0;
+    for (const [arrow, expectedScope] of testCase.arrows) {
+      const start = testCase.line.indexOf(arrow, searchOffset);
+      const end = start + arrow.length;
+      const matches = tokens.filter(
+        (token) => token.startIndex < end && token.endIndex > start,
+      );
+      assert(
+        matches.length === 1 &&
+          matches[0].startIndex === start &&
+          matches[0].endIndex === end &&
+          matches[0].scopes.includes(expectedScope),
+        `${testCase.scopeName} must tokenize ${arrow} as one arrow operator`,
+      );
+      searchOffset = end;
+    }
+  }
 }
 
 function checkGeneratedFiles(temporaryDirectory) {
@@ -313,6 +397,7 @@ try {
   validateContributions();
   validateZedFiles();
   validateSyntaxContract();
+  await validateTextMateTokenization();
   checkGeneratedFiles(temporaryDirectory);
   validateExamplesAndQueries(temporaryDirectory);
   console.log(

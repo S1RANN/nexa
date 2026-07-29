@@ -178,8 +178,16 @@ export function textMateGrammars(syntax = readSyntax()) {
         match: "\\b[A-Z][A-Za-z0-9_]*\\b",
       },
       operators: {
-        name: "keyword.operator.nexa",
-        match: "==|=>|->|\\.\\.|[+*/=<>?:@-]",
+        patterns: [
+          {
+            name: "keyword.operator.arrow.nexa",
+            match: "->|=>",
+          },
+          {
+            name: "keyword.operator.nexa",
+            match: "==|\\.\\.|[+*/=<>?:@-]",
+          },
+        ],
       },
       punctuation: {
         name: "punctuation.separator.nexa",
@@ -259,8 +267,16 @@ export function textMateGrammars(syntax = readSyntax()) {
         match: "\\b[0-9]+\\b",
       },
       operators: {
-        name: "keyword.operator.nexa-idl",
-        match: "->|[:<>]",
+        patterns: [
+          {
+            name: "keyword.operator.arrow.nexa-idl",
+            match: "->",
+          },
+          {
+            name: "keyword.operator.nexa-idl",
+            match: "[:<>]",
+          },
+        ],
       },
       punctuation: {
         name: "punctuation.separator.nexa-idl",

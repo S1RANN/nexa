@@ -1,6 +1,6 @@
 id = "nexa"
 name = "Nexa"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["Nexa Contributors"]
 description = "Syntax highlighting and structural editing for Nexa and Nexa IDL."

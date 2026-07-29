@@ -93,8 +93,16 @@
       "match": "\\b[0-9]+\\b"
     },
     "operators": {
-      "name": "keyword.operator.nexa-idl",
-      "match": "->|[:<>]"
+      "patterns": [
+        {
+          "name": "keyword.operator.arrow.nexa-idl",
+          "match": "->"
+        },
+        {
+          "name": "keyword.operator.nexa-idl",
+          "match": "[:<>]"
+        }
+      ]
     },
     "punctuation": {
       "name": "punctuation.separator.nexa-idl",
