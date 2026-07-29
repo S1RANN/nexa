@@ -101,6 +101,7 @@ pub struct MutationCase {
     pub expected_changed_interface_hash: bool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct MutationEvidence {
     pub id: &'static str,
     pub name: &'static str,
