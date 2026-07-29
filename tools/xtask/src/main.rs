@@ -137,12 +137,22 @@ fn main() -> Result<(), DynError> {
         "snake-stress" => snake_headless("stress"),
         "snake-bench" => snake_headless("bench"),
         "finalize-m2" => finalize_m2(),
+        "test-engine-api" => test_engine_api(),
+        "test-diagnostics" => test_diagnostics(),
+        "test-dev-loop" => test_dev_loop(),
+        "test-cli" => test_cli(),
+        "test-lsp" => test_lsp(),
+        "editor-check" => editor_check(),
+        "dev-loop-stress" => dev_loop_stress(),
+        "finalize-m3" => finalize_m3(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
                  check|test-core|test-binding|test-task|test-reload|test-model|\
                  fuzz-smoke|bench-smoke|repo-audit|finalize-m1|test-embed|test-snake|\
-                 snake-headless-smoke|snake-stress|snake-bench|finalize-m2"
+                 snake-headless-smoke|snake-stress|snake-bench|finalize-m2|\
+                 test-engine-api|test-diagnostics|test-dev-loop|test-cli|test-lsp|\
+                 editor-check|dev-loop-stress|finalize-m3"
             );
             Err("unknown xtask command".into())
         }
@@ -218,7 +228,193 @@ fn check() -> Result<(), DynError> {
     snake_headless("smoke")?;
     snake_headless("stress")?;
     snake_headless("bench")?;
-    m2_audit()
+    m2_audit()?;
+    test_engine_api()?;
+    test_diagnostics()?;
+    test_dev_loop()?;
+    test_cli()?;
+    test_lsp()?;
+    editor_check()?;
+    dev_loop_stress()?;
+    m3_audit()
+}
+
+fn test_engine_api() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-embed", "--test", "embed"])
+}
+
+fn test_diagnostics() -> Result<(), DynError> {
+    cargo(&["run", "-p", "nexa-cli", "--", "diagnostic-corpus-check"])?;
+    cargo(&["test", "-p", "nexa-embed", "--test", "m3", "diagnostic"])
+}
+
+fn test_dev_loop() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-embed", "--test", "m3", "dev_loop"])
+}
+
+fn test_cli() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-cli"])?;
+    for format in ["human", "json", "ndjson"] {
+        cargo(&[
+            "run",
+            "-p",
+            "nexa-cli",
+            "--",
+            "check",
+            "--project",
+            "nexa.dev.toml",
+            "--diagnostic-format",
+            format,
+        ])?;
+    }
+    cargo(&[
+        "run",
+        "-p",
+        "nexa-cli",
+        "--",
+        "check",
+        "examples/snake-game/packages/builtin/classic-rules",
+        "--contract",
+        "examples/snake-game/snake_api.nidl",
+    ])?;
+    cargo(&[
+        "run",
+        "-p",
+        "nexa-cli",
+        "--",
+        "dev",
+        "--project",
+        "nexa.dev.toml",
+        "--once",
+        "--diagnostic-format",
+        "ndjson",
+    ])
+}
+
+fn test_lsp() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-cli", "lsp_"])
+}
+
+fn editor_check() -> Result<(), DynError> {
+    let status = Command::new("pnpm")
+        .args(["--dir", "editors", "check"])
+        .env("CI", "true")
+        .current_dir(workspace_root())
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pnpm editor check failed with {status}").into())
+    }
+}
+
+fn dev_loop_stress() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-embed", "--test", "m3", "stress"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "embed",
+        "stress_reload",
+    ])?;
+    cargo(&["test", "-p", "nexa-verifier", "stress_rejects_100"])
+}
+
+fn finalize_m3() -> Result<(), DynError> {
+    m3_audit()?;
+    if !git_output(&["status", "--porcelain"])?.is_empty() {
+        return Err("M3 finalization requires a clean worktree".into());
+    }
+    let root = workspace_root();
+    let report = serde_json::json!({
+        "schema": 1,
+        "head": git_output(&["rev-parse", "HEAD"])?,
+        "status": "PASS",
+        "milestone": "Nexa M3 Developer Loop & Diagnostics"
+    });
+    let output = root.join("target/nexa-artifacts/m3-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M3 report has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn m3_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    let active_roots = [
+        "README.md",
+        "ROADMAP.md",
+        "baseline",
+        "crates",
+        "examples",
+        "docs",
+    ];
+    let forbidden = [
+        "pub struct NexaEmbed",
+        "pub type NexaEmbed",
+        "NexaEmbedBuilder",
+        "EmbedError",
+        "EmbedHealth",
+        "NexaEmbed::builder",
+    ];
+    let mut violations = Vec::new();
+    for active_root in active_roots {
+        collect_forbidden(&root.join(active_root), &root, &forbidden, &mut violations)?;
+    }
+    if !violations.is_empty() {
+        return Err(format!("M3 legacy API audit failed: {violations:?}").into());
+    }
+    if !fs::read_to_string(root.join("crates/nexa-embed/Cargo.toml"))?
+        .contains("name = \"nexa-embed\"")
+    {
+        return Err("nexa-embed crate name changed".into());
+    }
+    for required in [
+        "docs/DEVELOPMENT_LOOP.md",
+        "docs/DIAGNOSTICS.md",
+        "docs/RELOAD_WORKFLOW.md",
+        "docs/EDITOR_SUPPORT.md",
+        "nexa.dev.toml",
+    ] {
+        if !root.join(required).is_file() {
+            return Err(format!("missing M3 artifact {required}").into());
+        }
+    }
+    Ok(())
+}
+
+fn collect_forbidden(
+    path: &Path,
+    root: &Path,
+    forbidden: &[&str],
+    violations: &mut Vec<String>,
+) -> Result<(), DynError> {
+    if path.is_dir() {
+        for entry in fs::read_dir(path)? {
+            collect_forbidden(&entry?.path(), root, forbidden, violations)?;
+        }
+        return Ok(());
+    }
+    if !path
+        .extension()
+        .is_some_and(|extension| matches!(extension.to_str(), Some("rs" | "md" | "toml" | "json")))
+    {
+        return Ok(());
+    }
+    let source = fs::read_to_string(path)?;
+    for symbol in forbidden {
+        if source.contains(symbol) {
+            violations.push(format!(
+                "{}: {symbol}",
+                path.strip_prefix(root).unwrap_or(path).display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn test_embed() -> Result<(), DynError> {

@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::manifest::{PackageManifest, SourceId};
 use crate::policy::PackagePolicy;
+use crate::source_file::SourceFileRegistry;
 
 #[derive(Clone, Debug)]
 pub struct PackageCandidate {
@@ -10,17 +11,25 @@ pub struct PackageCandidate {
     pub entry_source: String,
     pub manifest_hash: nexa_core::StableId,
     pub entry_hash: nexa_core::StableId,
+    pub source_files: SourceFileRegistry,
 }
 
 impl PackageCandidate {
     #[must_use]
     pub fn new(manifest: PackageManifest, manifest_source: String, entry_source: String) -> Self {
+        let entry_path = manifest.entry.as_path().to_path_buf();
+        let source_files = SourceFileRegistry::from_files([
+            ("package.toml".into(), manifest_source.clone()),
+            (entry_path, entry_source.clone()),
+        ])
+        .expect("validated manifest paths are package-relative and unique");
         Self {
             manifest_hash: nexa_core::StableId::from_name(&manifest_source),
             entry_hash: nexa_core::StableId::from_name(&entry_source),
             manifest,
             manifest_source,
             entry_source,
+            source_files,
         }
     }
 }

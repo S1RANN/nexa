@@ -13,6 +13,10 @@ use nexa_model::system::{
 };
 use serde_json::{Value, json};
 
+mod dev;
+mod lsp;
+mod project;
+
 const REQUIRED_BASELINE: &[&str] = &[
     "baseline/BASELINE_INDEX.md",
     "baseline/internal/INTERNAL_LANGUAGE_SCOPE.md",
@@ -36,6 +40,7 @@ const REQUIRED_BASELINE: &[&str] = &[
 enum DiagnosticFormat {
     Human,
     Json,
+    Ndjson,
 }
 
 fn main() {
@@ -44,7 +49,7 @@ fn main() {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("nexa: {error}");
-            std::process::exit(1);
+            std::process::exit(2);
         }
     };
     let result = match arguments.as_slice() {
@@ -63,6 +68,10 @@ fn main() {
         [command, arguments @ ..] if command == "trace" => {
             run_command(arguments, diagnostic_format, true)
         }
+        [command, arguments @ ..] if command == "dev" => {
+            dev::dev_command(arguments, diagnostic_format)
+        }
+        [command] if command == "lsp" => lsp::run(),
         [command] if command == "model-check" => check_models(),
         [command] if command == "diagnostic-corpus-check" => diagnostic_corpus_check(false),
         [command, flag, format]
@@ -85,12 +94,15 @@ fn main() {
             generate_idl(Path::new(path))
         }
         _ => Err("usage: nexa check|build|verify|dump|run|trace ... | \
+             nexa check <package-directory> --contract <app_api.nidl> | \
+             nexa check --project <nexa.dev.toml> | nexa dev --project <nexa.dev.toml> | \
+             nexa lsp | \
              nexa model-check | nexa diagnostic-corpus-check | nexa model-replay <artifact.json> | \
              nexa migrate-check ... | nexa fixture-check <fixture-or-directory> | \
              nexa baseline check | nexa machine check | nexa idl check|generate <file> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
              [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
-             [MigrationLimits] [--diagnostic-format human|json]"
+             [MigrationLimits] [--diagnostic-format human|json|ndjson]"
             .to_owned()),
     };
     if let Err(error) = result {
@@ -104,8 +116,37 @@ fn main() {
                 }))
                 .expect("diagnostic JSON serialization does not fail")
             ),
+            DiagnosticFormat::Ndjson => eprintln!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": 1,
+                    "status": "error",
+                    "message": error,
+                }))
+                .expect("diagnostic JSON serialization does not fail")
+            ),
         }
-        std::process::exit(1);
+        std::process::exit(exit_code_for(&error));
+    }
+}
+
+fn exit_code_for(error: &str) -> i32 {
+    let lower = error.to_ascii_lowercase();
+    if lower.starts_with("usage:")
+        || lower.starts_with("unknown ")
+        || lower.starts_with("unexpected ")
+        || lower.contains("missing value for")
+    {
+        2
+    } else if lower.contains("could not read")
+        || lower.contains("could not write")
+        || lower.contains("could not resolve")
+        || lower.contains("worker")
+        || lower.contains("lsp ")
+    {
+        3
+    } else {
+        1
     }
 }
 
@@ -147,7 +188,10 @@ fn extract_diagnostic_format(
             format = match value.as_str() {
                 "human" => DiagnosticFormat::Human,
                 "json" => DiagnosticFormat::Json,
-                _ => return Err("`--diagnostic-format` must be `human` or `json`".into()),
+                "ndjson" => DiagnosticFormat::Ndjson,
+                _ => {
+                    return Err("`--diagnostic-format` must be `human`, `json`, or `ndjson`".into());
+                }
             };
             index += 2;
         } else {
@@ -159,8 +203,57 @@ fn extract_diagnostic_format(
 }
 
 fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+    if let [flag, project] = arguments
+        && flag == "--project"
+    {
+        let project = project::LoadedProject::load(Path::new(project))?;
+        let report = project.check()?;
+        if !report.diagnostics.is_empty() {
+            render_engine_diagnostics(&report.diagnostics, format)?;
+            return Err(format!(
+                "{} package diagnostics emitted",
+                report.diagnostics.len()
+            ));
+        }
+        print_success(
+            format,
+            "check",
+            &json!({"project": project.config_path, "packages": report.checked_packages}),
+            &format!(
+                "checked {} packages from {}",
+                report.checked_packages,
+                project.config_path.display()
+            ),
+        );
+        return Ok(());
+    }
+    if let Some((directory, contract)) = parse_package_check(arguments)? {
+        let contract_source = std::fs::read_to_string(&contract)
+            .map_err(|error| format!("could not read {}: {error}", contract.display()))?;
+        let idl = nexa_idl::parse(&contract_source)
+            .map_err(|error| format!("invalid {}: {error}", contract.display()))?;
+        match project::check_package(&directory, &idl, &[]) {
+            Ok(artifact) => {
+                print_success(
+                    format,
+                    "check",
+                    &json!({
+                        "package": directory,
+                        "contract": contract,
+                        "functions": artifact.verified.module().functions.len(),
+                    }),
+                    &format!("checked package {}", directory.display()),
+                );
+                return Ok(());
+            }
+            Err(diagnostic) => {
+                render_engine_diagnostics(&[diagnostic], format)?;
+                return Err("package check failed".into());
+            }
+        }
+    }
     let (path, limits) = parse_input_and_limits(arguments, "check")?;
-    let verified = compile_source(&path)?;
+    let verified = compile_source_diagnostic(&path, format)?;
     verify_with_limits(verified.module().clone(), limits)?;
     print_success(
         format,
@@ -175,6 +268,116 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
             verified.module().functions.len()
         ),
     );
+    Ok(())
+}
+
+fn compile_source_diagnostic(
+    path: &Path,
+    format: DiagnosticFormat,
+) -> Result<nexa_verifier::VerifiedModule, String> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("main.nexa");
+    let registry = nexa_embed::SourceFileRegistry::from_files([(file_name, source.clone())])
+        .map_err(|error| error.to_string())?;
+    let file = registry
+        .file_id(file_name)
+        .ok_or("source file was not registered")?;
+    match nexa::compile_file(&source, file) {
+        Ok(verified) => Ok(verified),
+        Err(nexa::NexaError::Diagnostic(diagnostic)) => {
+            let stage = match diagnostic.code.as_str().as_bytes().get(2).copied() {
+                Some(b'1') => nexa_embed::EngineDiagnosticStage::Parse,
+                Some(b'2') => nexa_embed::EngineDiagnosticStage::TypeCheck,
+                Some(b'3') => nexa_embed::EngineDiagnosticStage::Verify,
+                _ => nexa_embed::EngineDiagnosticStage::Compile,
+            };
+            let diagnostic = nexa_embed::EngineDiagnostic::from_leaf(
+                None,
+                nexa_embed::SourceId::new("cli").ok(),
+                stage,
+                *diagnostic,
+                Some(&registry),
+            );
+            render_engine_diagnostics(&[diagnostic], format)?;
+            Err("source check failed".into())
+        }
+        Err(error) => {
+            let diagnostic = nexa_embed::EngineDiagnostic::without_source(
+                None,
+                nexa_embed::SourceId::new("cli").ok(),
+                nexa_embed::EngineDiagnosticStage::Verify,
+                error.code(),
+                error.to_string(),
+            );
+            render_engine_diagnostics(&[diagnostic], format)?;
+            Err("source verification failed".into())
+        }
+    }
+}
+
+fn parse_package_check(arguments: &[String]) -> Result<Option<(PathBuf, PathBuf)>, String> {
+    let Some(first) = arguments.first() else {
+        return Ok(None);
+    };
+    let directory = PathBuf::from(first);
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let mut contract = None;
+    let mut index = 1;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--contract" => {
+                contract = Some(PathBuf::from(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("missing value for `--contract`")?,
+                ));
+                index += 2;
+            }
+            option => return Err(format!("unknown package check option `{option}`")),
+        }
+    }
+    Ok(contract.map(|contract| (directory, contract)))
+}
+
+fn render_engine_diagnostics(
+    diagnostics: &[nexa_embed::EngineDiagnostic],
+    format: DiagnosticFormat,
+) -> Result<(), String> {
+    match format {
+        DiagnosticFormat::Human => {
+            for diagnostic in diagnostics {
+                eprintln!("{}", nexa_embed::DiagnosticRenderer::human(diagnostic));
+            }
+        }
+        DiagnosticFormat::Json => {
+            let values = diagnostics
+                .iter()
+                .map(nexa_embed::DiagnosticRenderer::json)
+                .map(|value| {
+                    value
+                        .and_then(|value| serde_json::from_str::<Value>(&value))
+                        .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            eprintln!(
+                "{}",
+                serde_json::to_string_pretty(&values).map_err(|error| error.to_string())?
+            );
+        }
+        DiagnosticFormat::Ndjson => {
+            eprint!(
+                "{}",
+                nexa_embed::DiagnosticRenderer::ndjson(diagnostics)
+                    .map_err(|error| error.to_string())?
+            );
+        }
+    }
     Ok(())
 }
 
@@ -490,6 +693,16 @@ fn print_success(format: DiagnosticFormat, command: &str, data: &Value, human: &
         DiagnosticFormat::Json => println!(
             "{}",
             serde_json::to_string(&json!({
+                "status": "ok",
+                "command": command,
+                "data": data,
+            }))
+            .expect("diagnostic JSON serialization does not fail")
+        ),
+        DiagnosticFormat::Ndjson => println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schema": 1,
                 "status": "ok",
                 "command": command,
                 "data": data,
@@ -1616,6 +1829,10 @@ mod tests {
             ])
             .is_err()
         );
+        assert_eq!(super::exit_code_for("type mismatch"), 1);
+        assert_eq!(super::exit_code_for("usage: nexa check <path>"), 2);
+        assert_eq!(super::exit_code_for("could not read project"), 3);
+        assert_eq!(super::exit_code_for("worker terminated"), 3);
     }
 
     #[test]

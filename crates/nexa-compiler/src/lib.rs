@@ -7774,10 +7774,20 @@ pub fn compile_with_interface(
     interface: &Idl,
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
+    compile_with_interface_file(source, FileId::default(), interface, schema_hash)
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn compile_with_interface_file(
+    source: &str,
+    file: FileId,
+    interface: &Idl,
+    schema_hash: StableId,
+) -> Result<VerifiedModule, CompileError> {
     let (idl_array_types, idl_buffer_types, idl_parameterized_enums) =
         collect_idl_boundary_types(interface);
     let tokens = lex(source)?;
-    let mut ast = parse(&tokens)?;
+    let mut ast = parse_with_file(&tokens, file)?;
     let interface_span = ast.imports.first().map_or(ast.span, |import| import.span);
     let idl_snapshot_types = collect_idl_snapshot_types(interface, interface_span)?;
     for structure in &interface.structs {
@@ -9614,6 +9624,15 @@ migration fn migrate() -> bool {
         let mut required_instruction_count = 0_usize;
         for (function_index, function) in module.functions.iter().enumerate() {
             for (pc, instruction) in function.code.iter().enumerate() {
+                let span = module
+                    .source_span(
+                        u32::try_from(function_index).unwrap(),
+                        u32::try_from(pc).unwrap(),
+                    )
+                    .expect("every executable instruction has a Source Map entry");
+                assert_eq!(span.file, FileId(0));
+                assert!(!span.is_empty());
+                assert!(span.end as usize <= source.len());
                 if matches!(
                     instruction,
                     Instruction::Call { .. }
@@ -9626,15 +9645,6 @@ migration fn migrate() -> bool {
                         | Instruction::Safepoint
                 ) {
                     required_instruction_count += 1;
-                    let span = module
-                        .source_span(
-                            u32::try_from(function_index).unwrap(),
-                            u32::try_from(pc).unwrap(),
-                        )
-                        .unwrap();
-                    assert_eq!(span.file, FileId(0));
-                    assert!(!span.is_empty());
-                    assert!(span.end as usize <= source.len());
                 }
             }
         }

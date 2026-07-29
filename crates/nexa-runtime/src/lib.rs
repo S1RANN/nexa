@@ -75,9 +75,9 @@ pub use interpreter::{
 pub use metrics::ExecutionMetrics;
 pub use realm::{
     CancelReason, CompletionDisposition, HostResult, ModuleHandle, ModuleLifecycle, NexaValue,
-    RealmConfig, RealmError, RealmRuntime, RestartReloadOutcome, RestartReloadPolicy,
-    RuntimeCapacityReport, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget,
-    TickReport, YieldReason,
+    RealmConfig, RealmError, RealmRuntime, ReloadAccounting, RestartReloadOutcome,
+    RestartReloadPolicy, RuntimeCapacityReport, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
+    TickBudget, TickReport, YieldReason,
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{

@@ -209,7 +209,10 @@ pub fn draw_settings(extensions: &SnakeExtensions, selected_item: usize, opened_
             ),
             format!(
                 "Recent error: {}",
-                package.last_error.as_deref().unwrap_or("none")
+                package
+                    .last_diagnostic
+                    .as_ref()
+                    .map_or("none", |diagnostic| diagnostic.message.as_str())
             ),
         ] {
             draw_wrapped_text(

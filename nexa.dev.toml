@@ -1,0 +1,10 @@
+schema = 1
+contract = "examples/snake-game/snake_api.nidl"
+
+package_roots = [
+    "examples/snake-game/packages/builtin",
+    "examples/snake-game/packages/dlc",
+    "examples/snake-game/packages/mods",
+]
+
+required_exports = ["OnEvent"]

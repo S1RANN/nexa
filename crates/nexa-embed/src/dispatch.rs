@@ -1,1 +1,1 @@
-//! Deterministic dispatch is implemented by `NexaEmbed::dispatch`.
+//! Deterministic dispatch is implemented by `NexaEngine::dispatch`.

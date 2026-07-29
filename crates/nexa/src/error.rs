@@ -51,6 +51,20 @@ impl ErrorCode {
     pub const NX6002: Self = Self::new("NX6002");
     pub const NX6003: Self = Self::new("NX6003");
     pub const NX6005: Self = Self::new("NX6005");
+    pub const NX7001: Self = Self::new("NX7001");
+    pub const NX7002: Self = Self::new("NX7002");
+    pub const NX7003: Self = Self::new("NX7003");
+    pub const NX7004: Self = Self::new("NX7004");
+    pub const NX7010: Self = Self::new("NX7010");
+    pub const NX7011: Self = Self::new("NX7011");
+    pub const NX7101: Self = Self::new("NX7101");
+    pub const NX7102: Self = Self::new("NX7102");
+    pub const NX7103: Self = Self::new("NX7103");
+    pub const NX7201: Self = Self::new("NX7201");
+    pub const NX7202: Self = Self::new("NX7202");
+    pub const NX7301: Self = Self::new("NX7301");
+    pub const NX7302: Self = Self::new("NX7302");
+    pub const NX7303: Self = Self::new("NX7303");
 
     #[must_use]
     pub const fn new(value: &'static str) -> Self {
@@ -124,6 +138,20 @@ pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
     ErrorCodeDefinition::new(ErrorCode::NX6002, "Migration graph failure"),
     ErrorCodeDefinition::new(ErrorCode::NX6003, "Activation failure"),
     ErrorCodeDefinition::new(ErrorCode::NX6005, "Invalid ReloadMetadata"),
+    ErrorCodeDefinition::new(ErrorCode::NX7001, "Package source failure"),
+    ErrorCodeDefinition::new(ErrorCode::NX7002, "Invalid package manifest"),
+    ErrorCodeDefinition::new(ErrorCode::NX7003, "Package policy rejection"),
+    ErrorCodeDefinition::new(ErrorCode::NX7004, "Entitlement unavailable"),
+    ErrorCodeDefinition::new(ErrorCode::NX7010, "Missing required export"),
+    ErrorCodeDefinition::new(ErrorCode::NX7011, "Export signature mismatch"),
+    ErrorCodeDefinition::new(ErrorCode::NX7101, "Handler yielded under MustComplete"),
+    ErrorCodeDefinition::new(ErrorCode::NX7102, "Handler waited under MustComplete"),
+    ErrorCodeDefinition::new(ErrorCode::NX7103, "Handler trapped"),
+    ErrorCodeDefinition::new(ErrorCode::NX7201, "Reload rolled back before commit"),
+    ErrorCodeDefinition::new(ErrorCode::NX7202, "Activation faulted after commit"),
+    ErrorCodeDefinition::new(ErrorCode::NX7301, "Release processing failed"),
+    ErrorCodeDefinition::new(ErrorCode::NX7302, "Persistence failed"),
+    ErrorCodeDefinition::new(ErrorCode::NX7303, "Engine shutdown incomplete"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -272,6 +300,35 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
         ".runtime"
     ),
     emission!(NX6005, "nexa-verifier", "InvalidReloadMetadata", ".bin"),
+    emission!(
+        NX7001,
+        "nexa-embed::source",
+        "PackageSourceFailure",
+        ".engine"
+    ),
+    emission!(NX7002, "nexa-embed::manifest", "InvalidManifest", ".engine"),
+    emission!(NX7003, "nexa-embed::policy", "PolicyRejected", ".engine"),
+    emission!(NX7004, "nexa-embed::entitlement", "Unavailable", ".engine"),
+    emission!(NX7010, "nexa-embed::export", "MissingRequired", ".engine"),
+    emission!(NX7011, "nexa-embed::export", "SignatureMismatch", ".engine"),
+    emission!(NX7101, "nexa-embed::handler", "Yielded", ".engine"),
+    emission!(NX7102, "nexa-embed::handler", "Waited", ".engine"),
+    emission!(NX7103, "nexa-embed::handler", "Trapped", ".engine"),
+    emission!(NX7201, "nexa-embed::reload", "RolledBack", ".engine"),
+    emission!(NX7202, "nexa-embed::reload", "ActivationFaulted", ".engine"),
+    emission!(NX7301, "nexa-embed::resource", "ReleaseFailed", ".engine"),
+    emission!(
+        NX7302,
+        "nexa-embed::persistence",
+        "PersistenceFailed",
+        ".engine"
+    ),
+    emission!(
+        NX7303,
+        "nexa-embed::shutdown",
+        "ShutdownIncomplete",
+        ".engine"
+    ),
 ];
 
 /// The stable top-level class of an error crossing the Nexa facade.
@@ -1266,6 +1323,20 @@ mod tests {
             ("NX6002", "Migration graph failure"),
             ("NX6003", "Activation failure"),
             ("NX6005", "Invalid ReloadMetadata"),
+            ("NX7001", "Package source failure"),
+            ("NX7002", "Invalid package manifest"),
+            ("NX7003", "Package policy rejection"),
+            ("NX7004", "Entitlement unavailable"),
+            ("NX7010", "Missing required export"),
+            ("NX7011", "Export signature mismatch"),
+            ("NX7101", "Handler yielded under MustComplete"),
+            ("NX7102", "Handler waited under MustComplete"),
+            ("NX7103", "Handler trapped"),
+            ("NX7201", "Reload rolled back before commit"),
+            ("NX7202", "Activation faulted after commit"),
+            ("NX7301", "Release processing failed"),
+            ("NX7302", "Persistence failed"),
+            ("NX7303", "Engine shutdown incomplete"),
         ];
 
         let actual = ERROR_CODE_TABLE
@@ -1296,8 +1367,8 @@ mod tests {
             .map(|definition| definition.code)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(registered, emitted);
-        assert_eq!(ERROR_CODE_TABLE.len(), 33);
-        assert_eq!(ERROR_EMISSION_TABLE.len(), 33);
+        assert_eq!(ERROR_CODE_TABLE.len(), 47);
+        assert_eq!(ERROR_EMISSION_TABLE.len(), ERROR_CODE_TABLE.len());
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for definition in ERROR_EMISSION_TABLE {
             assert!(!definition.module.is_empty());

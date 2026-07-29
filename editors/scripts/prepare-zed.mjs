@@ -31,6 +31,15 @@ const output = path.join(artifactDirectory, "zed");
 fs.rmSync(output, { recursive: true, force: true });
 fs.mkdirSync(output, { recursive: true });
 copyDirectory(path.join(zedDirectory, "languages"), path.join(output, "languages"));
+fs.copyFileSync(
+  path.join(zedDirectory, "Cargo.toml"),
+  path.join(output, "Cargo.toml"),
+);
+fs.copyFileSync(
+  path.join(zedDirectory, "Cargo.lock"),
+  path.join(output, "Cargo.lock"),
+);
+copyDirectory(path.join(zedDirectory, "src"), path.join(output, "src"));
 
 const packagedGrammar = path.join(output, "tree-sitter-nexa");
 fs.mkdirSync(packagedGrammar, { recursive: true });

@@ -3,11 +3,13 @@ use crate::lifecycle::{PackageLifecycle, PackageStatus};
 use crate::manifest::{EntitlementId, PackageId, PackageVersion, SourceId};
 use crate::policy::{ActivationPolicy, PackagePolicy, TrustLevel};
 use crate::source::PackageCandidate;
+use crate::{EngineDiagnosticSummary, LastKnownGood};
 
 pub(crate) struct PackageRuntime {
     pub realm: nexa_runtime::RealmRuntime,
     pub module: nexa_runtime::ModuleHandle,
     pub root_scope: nexa_runtime::ScopeHandle,
+    pub artifact: crate::CompiledPackageArtifact,
 }
 
 pub(crate) struct PackageRecord {
@@ -16,7 +18,13 @@ pub(crate) struct PackageRecord {
     pub candidate: PackageCandidate,
     pub lifecycle: PackageLifecycle,
     pub runtime: Option<PackageRuntime>,
-    pub last_error: Option<String>,
+    pub last_diagnostic: Option<EngineDiagnosticSummary>,
+    pub last_known_good: Option<LastKnownGood>,
+    pub development: crate::development::PackageDevelopment,
+    pub handler_calls_this_tick: u64,
+    pub fuel_used_this_tick: u64,
+    pub outputs_this_tick: u64,
+    pub ready_candidate: Option<crate::development::ReadyCandidate>,
 }
 
 impl PackageRecord {
@@ -33,7 +41,7 @@ impl PackageRecord {
             entitlement: self.candidate.manifest.entitlement.clone(),
             status: self.lifecycle.status(),
             priority: self.candidate.manifest.priority,
-            last_error: self.last_error.clone(),
+            last_diagnostic: self.last_diagnostic.clone(),
         }
     }
 }
@@ -50,7 +58,7 @@ pub struct PackageInfo {
     pub entitlement: Option<EntitlementId>,
     pub status: PackageStatus,
     pub priority: i32,
-    pub last_error: Option<String>,
+    pub last_diagnostic: Option<EngineDiagnosticSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -64,7 +72,7 @@ pub struct PackageOutput<T> {
 
 /// Aggregate runtime ownership visible to embedding health and stress checks.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct EmbedHealth {
+pub struct EngineHealth {
     pub enabled_packages: usize,
     pub tasks: u64,
     pub scopes: u64,

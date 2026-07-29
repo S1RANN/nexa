@@ -1,13 +1,15 @@
 # Nexa Embed API
 
-Status: M2 COMPLETE
+Status: M3 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust
 application and Nexa Runtime. Applications provide a generated `HostContract`,
 a per-package `HostRegistryFactory`, one or more `PackageSource` values, an
 optional entitlement resolver, and an optional storage directory.
 
-The lifecycle entry points are `discover`, `enable_defaults`, `enable`,
+The application-owned facade is `NexaEngine`, built by
+`NexaEngineBuilder`; the crate remains named `nexa-embed`. The lifecycle entry
+points are `discover`, `enable_defaults`, `enable`,
 `disable`, `reload`, `reload_changed`, `call`, `dispatch`, `tick`, and
 `shutdown`. The application never needs Realm, Module, Scope, Task, release
 queue, or raw `RuntimeValue` operations.
@@ -29,3 +31,13 @@ source ID, trust, and effective capabilities come from the host-owned package
 record and cannot be supplied by script.
 
 Explicit `shutdown` is normative. `Drop` is best-effort only.
+
+When `DevelopmentConfig` is enabled, source changes are stabilized by content
+hash, compiled and verified by one bounded worker, and returned to the calling
+thread. Only `NexaEngine::tick()` may commit the newest generation. A failed,
+stale, or Host-contract-incompatible Candidate cannot replace the active
+Runtime or Last Known Good artifact.
+
+`tick` returns `EngineTickReport`; `inspection` returns bounded, read-only
+Engine, Package, development, diagnostic, Reload, and metric DTOs. These APIs
+do not expose Realm, Runtime Host objects, or raw handles.

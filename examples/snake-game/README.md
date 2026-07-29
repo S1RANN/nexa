@@ -24,6 +24,12 @@ status, capabilities, recent error, selected skin, and selected spawn policy.
 Gameplay is paused while a menu is open. Package mutations remain queued and
 are applied at the game Tick safe point.
 
+With M3 development mode enabled, stable source saves compile on the bounded
+background worker. Only the newest verified generation can Reload at the game
+Tick safe point; a failed Candidate leaves the active package and Last Known
+Good unchanged. Use the repository `nexa.dev.toml` with `nexa check` or
+`nexa dev` for the same nine-package headless compiler loop.
+
 Headless validation:
 
 ```sh

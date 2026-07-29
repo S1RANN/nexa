@@ -9,7 +9,8 @@ mod runtime_diagnostics;
 pub use diagnostic_corpus::{
     BinaryDiagnosticReport, CaseFormatReport, CompilerDiagnosticReport, DiagnosticCorpusReport,
     ObservedDiagnosticCase, PipelineReport, RuntimeDiagnosticReport, run_binary_diagnostic_cases,
-    run_compiler_diagnostic_cases, run_diagnostic_corpus, run_runtime_diagnostic_cases,
+    run_compiler_diagnostic_cases, run_diagnostic_corpus, run_engine_diagnostic_cases,
+    run_runtime_diagnostic_cases,
 };
 pub use error::{
     ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ERROR_EMISSION_TABLE,
@@ -43,7 +44,18 @@ pub fn compile_with_interface(
     interface: &Idl,
     schema_hash: StableId,
 ) -> Result<VerifiedModule, NexaError> {
-    nexa_compiler::compile_with_interface(source, interface, schema_hash).map_err(NexaError::from)
+    compile_with_interface_file(source, FileId::default(), interface, schema_hash)
+}
+
+/// Compiles source against an exact IDL interface while preserving its real file identity.
+pub fn compile_with_interface_file(
+    source: &str,
+    file: FileId,
+    interface: &Idl,
+    schema_hash: StableId,
+) -> Result<VerifiedModule, NexaError> {
+    nexa_compiler::compile_with_interface_file(source, file, interface, schema_hash)
+        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
 }
 
 /// Decodes a bytecode module through the stable facade error boundary.
@@ -84,7 +96,7 @@ pub mod prelude {
         ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
         ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, Label,
         MigrationError, NexaError, Severity, compile, compile_file, compile_with_interface,
-        decode_module, verify_module,
+        compile_with_interface_file, decode_module, verify_module,
     };
 }
 
@@ -129,11 +141,10 @@ mod tests {
     fn complete_diagnostic_corpus_observes_the_registered_set_twice() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let report = crate::run_diagnostic_corpus(&root).unwrap();
-        assert_eq!(report.registered_codes, 33);
-        assert_eq!(report.emission_definitions, 33);
-        assert_eq!(report.fixture_codes, 33);
-        assert_eq!(report.observed_codes, 33);
-        assert_eq!(report.deterministic_cases, 33);
+        assert_eq!(report.emission_definitions, report.registered_codes);
+        assert_eq!(report.fixture_codes, report.registered_codes);
+        assert_eq!(report.observed_codes, report.registered_codes);
+        assert_eq!(report.deterministic_cases, report.registered_codes);
         assert!(report.missing_codes.is_empty());
         assert!(report.unexpected_codes.is_empty());
         assert!(report.case_format.invalid_pipelines.is_empty());

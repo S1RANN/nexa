@@ -11,6 +11,14 @@ Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
 Nexa Internal Pivot M1 = COMPLETE
 Nexa M2 Embedding & Snake Pilot = COMPLETE
+Nexa M3 Developer Loop & Diagnostics = COMPLETE
+NexaEngine API = COMPLETE
+Automatic Candidate Compilation = COMPLETE
+Last Known Good Reload = COMPLETE
+Unified Diagnostics = COMPLETE
+Source-level Runtime Stack Traces = COMPLETE
+Package-aware CLI = COMPLETE
+Editor Diagnostics = COMPLETE
 nexa-embed v1 = COMPLETE
 Typed Script Export = COMPLETE
 Snake Core = COMPLETE
@@ -74,18 +82,19 @@ exactly once.
 ```rust
 let source = MemorySource::new(SourceId::new("app")?, app_policy)
     .package(package_manifest, package_source);
-let mut embed = NexaEmbed::builder(generated::contract())
+let mut engine = NexaEngine::builder(generated::contract())
     .host_factory(|context| {
         generated::registry(AppHost::new(context))
     })
     .package_source(source)
     .storage_dir("user-data/extensions")
     .require_export::<generated::Main>()
+    .development(DevelopmentConfig::default())
     .build()?;
-embed.discover()?;
-embed.enable_defaults()?;
-let output = embed.call::<generated::Main>(&package_id, &args)?;
-embed.shutdown()?;
+engine.discover()?;
+engine.enable_defaults()?;
+let report = engine.tick()?;
+engine.shutdown()?;
 ```
 
 Package sources, policies, lifecycle, and diagnostics are documented in
@@ -97,6 +106,8 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 
 ```sh
 cargo run -p nexa-cli -- compile examples/add.nexa
+cargo run -p nexa-cli -- check --project nexa.dev.toml
+cargo run -p nexa-cli -- dev --project nexa.dev.toml
 cargo run -p hello-runtime
 cargo run -p combat-runtime
 cargo run -p snake-game

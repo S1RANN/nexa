@@ -137,6 +137,16 @@ function validateJsonFiles() {
 
 function validateContributions() {
   const extension = parseJson(path.join(vscodeDirectory, "package.json"));
+  assert(
+    extension.main === "./extension.js",
+    "VS Code must activate the Nexa language server client",
+  );
+  assert(
+    read(path.join(vscodeDirectory, "extension.js")).includes(
+      'cp.spawn(executable, ["lsp"]',
+    ),
+    "VS Code must launch `nexa lsp`",
+  );
   const languages = new Map(
     extension.contributes.languages.map((language) => [language.id, language]),
   );
@@ -212,6 +222,23 @@ function validateZedFiles() {
   assert(
     manifest.grammars.nexa.rev === "local",
     "Zed local grammar revision is invalid",
+  );
+  assert(
+    manifest.language_servers?.nexa?.languages?.includes("Nexa") &&
+      manifest.language_servers?.nexa?.languages?.includes("Nexa IDL"),
+    "Zed must attach the Nexa language server to both languages",
+  );
+  assert(
+    read(path.join(zedDirectory, "src", "lib.rs")).includes(
+      'args: vec!["lsp".to_owned()]',
+    ),
+    "Zed must launch `nexa lsp`",
+  );
+  assert(
+    read(path.join(zedDirectory, "Cargo.lock")).includes(
+      'name = "zed_extension_api"',
+    ),
+    "Zed extension dependencies must be locked",
   );
 }
 

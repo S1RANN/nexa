@@ -13,6 +13,12 @@
   "engines": {
     "vscode": "^1.90.0"
   },
+  "main": "./extension.js",
+  "activationEvents": [
+    "onLanguage:nexa",
+    "onLanguage:nexa-idl",
+    "onCommand:nexa.restartLanguageServer"
+  ],
   "categories": [
     "Programming Languages"
   ],
@@ -27,6 +33,22 @@
     "workspace"
   ],
   "contributes": {
+    "commands": [
+      {
+        "command": "nexa.restartLanguageServer",
+        "title": "Nexa: Restart Language Server"
+      }
+    ],
+    "configuration": {
+      "title": "Nexa",
+      "properties": {
+        "nexa.server.path": {
+          "type": "string",
+          "default": "nexa",
+          "description": "Path to the Nexa CLI executable used to run `nexa lsp`."
+        }
+      }
+    },
     "languages": [
       {
         "id": "nexa",

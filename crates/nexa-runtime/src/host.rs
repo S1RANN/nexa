@@ -1951,7 +1951,7 @@ pub enum ScriptCallError {
     Runtime(String),
     HandlerDidNotComplete,
     HostWaitNotAllowed,
-    HandlerTrapped(String),
+    HandlerTrapped(Box<crate::Trap>),
 }
 
 impl fmt::Display for ScriptCallError {

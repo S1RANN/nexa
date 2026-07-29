@@ -1,10 +1,18 @@
 # Nexa Baseline Index
 
-Version: **2.0.0**
+Version: **3.0.0**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
 Nexa M2 Embedding & Snake Pilot = COMPLETE
+Nexa M3 Developer Loop & Diagnostics = COMPLETE
+NexaEngine API = COMPLETE
+Automatic Candidate Compilation = COMPLETE
+Last Known Good Reload = COMPLETE
+Unified Diagnostics = COMPLETE
+Source-level Runtime Stack Traces = COMPLETE
+Package-aware CLI = COMPLETE
+Editor Diagnostics = COMPLETE
 nexa-embed v1 = COMPLETE
 Typed Script Export = COMPLETE
 Snake Core = COMPLETE
@@ -27,6 +35,7 @@ Internal Language Scope
 > Task Runtime
 > Restart Reload
 > Embedding and package lifecycle
+> Developer loop and diagnostics
 > ABI and machine details
 > Roadmap
 ```
@@ -48,6 +57,10 @@ rollback without old-Task revival.
 - [`embed/PACKAGE_POLICY.md`](embed/PACKAGE_POLICY.md)
 - [`embed/PACKAGE_LIFECYCLE.md`](embed/PACKAGE_LIFECYCLE.md)
 - [`embed/SNAKE_PILOT.md`](embed/SNAKE_PILOT.md)
+- [`../docs/DEVELOPMENT_LOOP.md`](../docs/DEVELOPMENT_LOOP.md)
+- [`../docs/DIAGNOSTICS.md`](../docs/DIAGNOSTICS.md)
+- [`../docs/RELOAD_WORKFLOW.md`](../docs/RELOAD_WORKFLOW.md)
+- [`../docs/EDITOR_SUPPORT.md`](../docs/EDITOR_SUPPORT.md)
 - [`abi/IDL.md`](abi/IDL.md)
 - [`abi/BYTECODE.md`](abi/BYTECODE.md)
 - [`runtime/HANDLES.md`](runtime/HANDLES.md)

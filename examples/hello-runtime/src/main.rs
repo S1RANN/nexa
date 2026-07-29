@@ -1,7 +1,7 @@
 //! Minimal high-level Nexa embedding example.
 
 use nexa_embed::{
-    ActivationPolicy, ActivationSet, CapabilitySet, MemorySource, NexaEmbed, PackageId,
+    ActivationPolicy, ActivationSet, CapabilitySet, MemorySource, NexaEngine, PackageId,
     PackagePolicy, PackageRuntimeLimits, SourceId, TrustLevel,
 };
 
@@ -42,17 +42,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
          entry='hello.nexa'\nactivation='required'\ncapabilities=[]\nhandler_fuel=1024\n",
         include_str!("../hello.nexa"),
     );
-    let mut embed = NexaEmbed::builder(generated::contract())
+    let mut engine = NexaEngine::builder(generated::contract())
         .host_factory(|_: &nexa_embed::PackageContext| generated::registry(StdoutConsole))
         .package_source(source)
         .require_export::<generated::Main>()
         .build()?;
-    embed.discover()?;
-    embed.enable_defaults()?;
+    engine.discover()?;
+    engine.enable_defaults()?;
     let result =
-        embed.call::<generated::Main>(&PackageId::new("example.hello")?, &generated::MainArgs)?;
+        engine.call::<generated::Main>(&PackageId::new("example.hello")?, &generated::MainArgs)?;
     assert_eq!(result.value, 12);
-    embed.shutdown()?;
+    engine.shutdown()?;
     Ok(())
 }
 

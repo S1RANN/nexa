@@ -284,6 +284,15 @@ pub enum RestartReloadOutcome {
     },
 }
 
+/// Handle-free reload accounting for high-level embedding inspection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReloadAccounting {
+    pub cancelled_tasks: usize,
+    pub detached_requests: usize,
+    pub total_cancelled_tasks: u64,
+    pub total_detached_requests: u64,
+}
+
 #[derive(Debug)]
 enum PlannedResultPayload {
     Value(RuntimeValue),
@@ -1055,12 +1064,22 @@ impl RealmRuntime {
         }
     }
 
-    pub(crate) fn module_epoch(&self, module: ModuleHandle) -> Result<u64, RealmError> {
+    pub fn active_module_epoch(&self, module: ModuleHandle) -> Result<u64, RealmError> {
         Ok(self
             .modules
             .resolve(module.raw())
             .map_err(RealmError::ModuleHandle)?
             .epoch)
+    }
+
+    #[must_use]
+    pub const fn reload_accounting(&self) -> ReloadAccounting {
+        ReloadAccounting {
+            cancelled_tasks: self.last_reload_cancelled_tasks,
+            detached_requests: self.last_reload_detached_requests,
+            total_cancelled_tasks: self.total_reload_cancelled_tasks,
+            total_detached_requests: self.total_reload_detached_requests,
+        }
     }
 
     pub fn module_stateful_domain(
@@ -1589,7 +1608,7 @@ impl RealmRuntime {
         let next_publication_id = publication_id
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
-        let candidate_epoch = self.module_epoch(candidate)?;
+        let candidate_epoch = self.active_module_epoch(candidate)?;
         self.reload.publish()?;
         self.set_active_root(candidate);
         self.next_publication_id = next_publication_id;
@@ -1750,6 +1769,17 @@ impl RealmRuntime {
         args: &E::Args,
         policy: crate::MustCompletePolicy,
     ) -> Result<E::Output, crate::ScriptCallError> {
+        self.call_export_metered::<E>(module, owner, args, policy)
+            .map(|(output, _)| output)
+    }
+
+    pub fn call_export_metered<E: crate::ScriptExport>(
+        &mut self,
+        module: ModuleHandle,
+        owner: ScopeHandle,
+        args: &E::Args,
+        policy: crate::MustCompletePolicy,
+    ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
         let task = self.spawn_export::<E>(
             module,
             args,
@@ -1764,7 +1794,11 @@ impl RealmRuntime {
         match self.poll_task(task, policy.fuel) {
             Ok(TaskPoll::Completed(value)) => {
                 let reader = crate::ScriptOutputReader::new(&self.heap);
-                E::decode_output(&reader, value)
+                let output = E::decode_output(&reader, value)?;
+                let charge = self
+                    .terminal_record(task)
+                    .map_or_else(ExecutionCharge::default, |record| record.final_charge);
+                Ok((output, charge))
             }
             Ok(TaskPoll::Yielded(_)) => {
                 let _ = self.cancel_task(task, CancelReason::HostCancelled);
@@ -1774,9 +1808,17 @@ impl RealmRuntime {
                 let _ = self.cancel_task(task, CancelReason::HostCancelled);
                 Err(crate::ScriptCallError::HostWaitNotAllowed)
             }
-            Ok(TaskPoll::Trapped(error)) | Err(error) => {
-                Err(crate::ScriptCallError::HandlerTrapped(error.to_string()))
-            }
+            Ok(TaskPoll::Trapped(error)) => self
+                .terminal_record(task)
+                .and_then(|record| match &record.reason {
+                    TaskTerminalReason::Trapped(trap) => Some(trap.clone()),
+                    _ => None,
+                })
+                .map_or_else(
+                    || Err(crate::ScriptCallError::Runtime(error.to_string())),
+                    |trap| Err(crate::ScriptCallError::HandlerTrapped(Box::new(trap))),
+                ),
+            Err(error) => Err(crate::ScriptCallError::Runtime(error.to_string())),
             Ok(TaskPoll::Cancelled(reason)) => Err(crate::ScriptCallError::Runtime(format!(
                 "handler cancelled: {reason:?}"
             ))),

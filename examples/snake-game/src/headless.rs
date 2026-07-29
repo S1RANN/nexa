@@ -178,7 +178,7 @@ fn package_id(value: &str) -> Result<PackageId, Box<dyn std::error::Error>> {
 }
 
 fn assert_transient_resources(
-    health: nexa_embed::EmbedHealth,
+    health: nexa_embed::EngineHealth,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if health.tasks != 0
         || health.continuations != 0

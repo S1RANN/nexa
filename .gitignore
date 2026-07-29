@@ -11,5 +11,6 @@ reports/raw/
 fuzz/*/Cargo.lock
 editors/node_modules/
 editors/**/node_modules/
+.pnpm-store/
 editors/tree-sitter-nexa/.tree-sitter/
 editors/tree-sitter-nexa/build/

@@ -2080,6 +2080,23 @@ mod tests {
     }
 
     #[test]
+    fn stress_rejects_100_forged_candidates_deterministically() {
+        for generation in 0..100 {
+            let mut forged = ModuleBuilder::new();
+            forged.array_type(ArrayType {
+                type_id: StableId::from_parts(&["forged-array", &generation.to_string()]),
+                element: ValueType::I32,
+            });
+            assert_eq!(
+                verify(forged.finish(), VerifierLimits::default())
+                    .unwrap_err()
+                    .kind,
+                VerifyErrorKind::InvalidArrayMetadata
+            );
+        }
+    }
+
+    #[test]
     fn buffer_metadata_instruction_types_and_effects_are_verified_independently() {
         let buffer = BufferType::new(ValueType::I32);
         let mut valid = ModuleBuilder::new();

@@ -2,10 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use nexa_embed::{
-    ActivationPolicy, ActivationSet, CapabilitySet, DirectorySource, EmbedError, EntitlementId,
-    EntitlementResolver, HostContract, MemorySource, NexaEmbed, PackageCandidate, PackageId,
-    PackagePolicy, PackageRuntimeLimits, PackageSource, PackageSourceError, PackageStatus,
-    SourceId, TrustLevel,
+    ActivationPolicy, ActivationSet, CapabilitySet, DevelopmentConfig, DevelopmentEvent,
+    DirectorySource, EngineError, EntitlementId, EntitlementResolver, HostContract, MemorySource,
+    NexaEngine, PackageCandidate, PackageId, PackagePolicy, PackageRuntimeLimits, PackageSource,
+    PackageSourceError, PackageStatus, SourceId, TrustLevel,
 };
 use nexa_runtime::{
     HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue,
@@ -41,6 +41,23 @@ impl HostRegistry for Registry {
         } else {
             Err(HostTrap::UnknownFunction(id))
         }
+    }
+}
+
+struct TrappingRegistry(StableId);
+
+impl HostRegistry for TrappingRegistry {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
+    fn call_runtime(
+        &mut self,
+        _: u32,
+        _: &mut ResourceContext<'_>,
+        _: RuntimeHostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        Err(HostTrap::Panicked)
     }
 }
 
@@ -134,10 +151,10 @@ fn source(id: &str, package: &str, activation: &str, script: &str) -> MemorySour
     )
 }
 
-fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEmbedBuilder {
+fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilder {
     let contract = contract();
     let hash = contract.interface_hash;
-    NexaEmbed::builder(contract)
+    NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
             Box::new(Registry(hash)) as Box<dyn HostRegistry>
         })
@@ -147,7 +164,7 @@ fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEmbedBuilder
 
 #[test]
 fn memory_source_enables_calls_disables_and_shuts_down() {
-    let mut embed = builder(source(
+    let mut engine = builder(source(
         "memory",
         "tests.basic",
         "default-enabled",
@@ -155,15 +172,15 @@ fn memory_source_enables_calls_disables_and_shuts_down() {
     ))
     .build()
     .expect("build");
-    embed.discover().expect("discover");
-    embed.enable_defaults().expect("enable");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.basic").expect("package ID");
-    assert_eq!(embed.call::<Run>(&id, &41).expect("call").value, 42);
-    assert_eq!(embed.health().enabled_packages, 1);
-    embed.disable(&id).expect("disable");
-    assert_eq!(embed.health().enabled_packages, 0);
-    assert_eq!(embed.health().host_pending_releases, 0);
-    embed.shutdown().expect("shutdown");
+    assert_eq!(engine.call::<Run>(&id, &41).expect("call").value, 42);
+    assert_eq!(engine.health().enabled_packages, 1);
+    engine.disable(&id).expect("disable");
+    assert_eq!(engine.health().enabled_packages, 0);
+    assert_eq!(engine.health().host_pending_releases, 0);
+    engine.shutdown().expect("shutdown");
 }
 
 #[test]
@@ -182,10 +199,10 @@ fn duplicate_source_and_package_ids_are_rejected_deterministically() {
     );
     assert!(matches!(
         builder(left).package_source(right).build(),
-        Err(EmbedError::DuplicateSourceId(_))
+        Err(EngineError::DuplicateSourceId(_))
     ));
 
-    let mut embed = builder(source(
+    let mut engine = builder(source(
         "left",
         "tests.duplicate",
         "user-controlled",
@@ -199,7 +216,7 @@ fn duplicate_source_and_package_ids_are_rejected_deterministically() {
     ))
     .build()
     .expect("build duplicate candidates");
-    let packages = embed.discover().expect("discover duplicates");
+    let packages = engine.discover().expect("discover duplicates");
     assert_eq!(packages.len(), 2);
     assert!(
         packages
@@ -231,21 +248,21 @@ fn entitlement_lock_unlock_and_required_policy_are_enforced() {
          import test;\n\
          fn Run(value: i32) -> i32 { return value; }",
     );
-    let mut embed = builder(licensed)
+    let mut engine = builder(licensed)
         .entitlements(resolver.clone())
         .build()
         .expect("build");
-    embed.discover().expect("discover");
+    engine.discover().expect("discover");
     let id = PackageId::new("tests.licensed").expect("package ID");
-    assert_eq!(embed.status(&id), Some(PackageStatus::Locked));
+    assert_eq!(engine.status(&id), Some(PackageStatus::Locked));
     resolver
         .0
         .write()
         .expect("entitlement lock")
         .push(entitlement);
-    embed.refresh_entitlements().expect("unlock");
-    assert_eq!(embed.status(&id), Some(PackageStatus::Disabled));
-    embed.enable(&id).expect("enable unlocked package");
+    engine.refresh_entitlements().expect("unlock");
+    assert_eq!(engine.status(&id), Some(PackageStatus::Disabled));
+    engine.enable(&id).expect("enable unlocked package");
 
     let mut required = builder(source(
         "required",
@@ -260,7 +277,7 @@ fn entitlement_lock_unlock_and_required_policy_are_enforced() {
     let id = PackageId::new("tests.required").expect("package ID");
     assert!(matches!(
         required.disable(&id),
-        Err(EmbedError::RequiredPackage(_))
+        Err(EngineError::RequiredPackage(_))
     ));
 }
 
@@ -304,21 +321,24 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
         manifest: manifest("tests.reload", "default-enabled", ""),
         script: script.clone(),
     };
-    let mut embed = builder(source).build().expect("build");
-    embed.discover().expect("discover");
-    embed.enable_defaults().expect("enable");
+    let mut engine = builder(source).build().expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.reload").expect("package ID");
-    assert_eq!(embed.call::<Run>(&id, &1).expect("call v1").value, 2);
+    assert_eq!(engine.call::<Run>(&id, &1).expect("call v1").value, 2);
     *script.write().expect("source lock") = "module tests.reload;\nimport test;\n\
          fn Run(value: i32) -> i32 { return value + 2; }"
         .into();
-    embed.reload(&id).expect("reload v2");
-    assert_eq!(embed.call::<Run>(&id, &1).expect("call v2").value, 3);
+    engine.reload(&id).expect("reload v2");
+    assert_eq!(engine.call::<Run>(&id, &1).expect("call v2").value, 3);
     *script.write().expect("source lock") = "fn Run(".into();
-    assert!(matches!(embed.reload(&id), Err(EmbedError::Reload(_, _))));
-    assert_eq!(embed.status(&id), Some(PackageStatus::Enabled));
+    assert!(matches!(
+        engine.reload(&id),
+        Err(EngineError::Diagnostic(_))
+    ));
+    assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
     assert_eq!(
-        embed
+        engine
             .call::<Run>(&id, &1)
             .expect("old module retained")
             .value,
@@ -328,7 +348,7 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
 
 #[test]
 fn handler_yield_fault_isolated_and_dispatch_order_is_stable() {
-    let mut embed = builder(source(
+    let mut engine = builder(source(
         "normal",
         "tests.a-normal",
         "default-enabled",
@@ -342,9 +362,9 @@ fn handler_yield_fault_isolated_and_dispatch_order_is_stable() {
     ))
     .build()
     .expect("build");
-    embed.discover().expect("discover");
-    embed.enable_defaults().expect("enable");
-    let results = embed.dispatch::<Run>(&7);
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let results = engine.dispatch::<Run>(&7);
     assert_eq!(results.len(), 2);
     assert_eq!(
         results[0]
@@ -354,13 +374,13 @@ fn handler_yield_fault_isolated_and_dispatch_order_is_stable() {
             .as_str(),
         "tests.a-normal"
     );
-    assert!(matches!(results[1], Err(EmbedError::Handler(_, _))));
+    assert!(matches!(results[1], Err(EngineError::Handler(_, _))));
     assert_eq!(
-        embed.status(&PackageId::new("tests.a-normal").expect("package ID")),
+        engine.status(&PackageId::new("tests.a-normal").expect("package ID")),
         Some(PackageStatus::Enabled)
     );
     assert_eq!(
-        embed.status(&PackageId::new("tests.z-yield").expect("package ID")),
+        engine.status(&PackageId::new("tests.z-yield").expect("package ID")),
         Some(PackageStatus::Faulted)
     );
 }
@@ -400,23 +420,78 @@ fn trap_fuel_yield_and_host_wait_are_distinct_package_failures() {
             raw_manifest,
             format!("module tests.{source_id};\nimport test;\n{script}"),
         );
-        let mut embed = builder(source).build().expect("build");
-        embed.discover().expect("discover");
-        embed.enable_defaults().expect("enable");
+        let mut engine = builder(source).build().expect("build");
+        engine.discover().expect("discover");
+        engine.enable_defaults().expect("enable");
         let id = PackageId::new(package_id).expect("package ID");
         assert!(matches!(
-            embed.call::<Run>(&id, &7),
-            Err(EmbedError::Handler(_, _))
+            engine.call::<Run>(&id, &7),
+            Err(EngineError::Handler(_, _))
         ));
-        assert_eq!(embed.status(&id), Some(PackageStatus::Faulted));
-        assert_eq!(embed.health().host_pending_releases, 0);
+        assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
+        assert_eq!(engine.health().host_pending_releases, 0);
         assert!(
-            embed
+            engine
                 .diagnostics()
                 .iter()
                 .any(|diagnostic| diagnostic.package_id.as_ref() == Some(&id))
         );
     }
+}
+
+#[test]
+fn runtime_trap_diagnostic_contains_script_stack_and_host_boundary() {
+    let source = source(
+        "host-trap",
+        "tests.host-trap",
+        "default-enabled",
+        "task fn Run(value: i32) -> i32 {
+             let result: Result<i32, WaitError> = await test.wait(value);
+             return match result { Ok(found) => found, Err(error) => 0 };
+         }",
+    );
+    let contract = contract();
+    let hash = contract.interface_hash;
+    let mut engine = NexaEngine::builder(contract)
+        .host_factory(move |_: &nexa_embed::PackageContext| {
+            Box::new(TrappingRegistry(hash)) as Box<dyn HostRegistry>
+        })
+        .package_source(source)
+        .require_export::<Run>()
+        .build()
+        .expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let id = PackageId::new("tests.host-trap").expect("package ID");
+    assert!(matches!(
+        engine.call::<Run>(&id, &7),
+        Err(EngineError::Handler(_, _))
+    ));
+    let diagnostic = engine
+        .diagnostics()
+        .into_iter()
+        .find(|diagnostic| diagnostic.package_id.as_ref() == Some(&id))
+        .expect("runtime diagnostic");
+    assert!(diagnostic.file.is_some());
+    assert_eq!(diagnostic.context.export.as_deref(), Some("Run"));
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.message.contains("at Run"))
+    );
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.message.contains("while calling Host function"))
+    );
+    assert!(
+        diagnostic
+            .related
+            .iter()
+            .any(|related| related.message.contains("declared here"))
+    );
 }
 
 #[test]
@@ -439,7 +514,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
         Err(nexa_embed::ManifestError::ActivationNotAllowed)
     ));
 
-    let mut embed = builder(source(
+    let mut engine = builder(source(
         "broken",
         "tests.broken",
         "default-enabled",
@@ -447,12 +522,12 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
     ))
     .build()
     .expect("build");
-    embed.discover().expect("discover");
+    engine.discover().expect("discover");
     let id = PackageId::new("tests.broken").expect("package ID");
-    assert!(embed.enable(&id).is_err());
-    assert_eq!(embed.status(&id), Some(PackageStatus::Faulted));
-    assert_eq!(embed.health().enabled_packages, 0);
-    assert_eq!(embed.health().host_pending_releases, 0);
+    assert!(engine.enable(&id).is_err());
+    assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
+    assert_eq!(engine.health().enabled_packages, 0);
+    assert_eq!(engine.health().host_pending_releases, 0);
 }
 
 #[test]
@@ -469,11 +544,11 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         manifest: manifest("tests.state", "default-enabled", ""),
         script: script.clone(),
     };
-    let mut embed = builder(source).build().expect("build");
-    embed.discover().expect("discover");
-    embed.enable_defaults().expect("enable");
+    let mut engine = builder(source).build().expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.state").expect("package ID");
-    embed
+    engine
         .set_state_i32(&id, "store", "Store", 1, "value", 9)
         .expect("insert state");
 
@@ -481,10 +556,10 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
          @stateful(1) class Store { value: i32; }\n\
          fn Run(value: i32) -> i32 { return value + 2; }"
         .into();
-    assert_eq!(embed.reload_changed().expect("change scan reload"), 1);
-    assert_eq!(embed.call::<Run>(&id, &1).expect("v2").value, 3);
+    assert_eq!(engine.reload_changed().expect("change scan reload"), 1);
+    assert_eq!(engine.call::<Run>(&id, &1).expect("v2").value, 3);
     assert_eq!(
-        embed
+        engine
             .state_i32(&id, "store", "Store", "value")
             .expect("read state"),
         Some(9)
@@ -494,18 +569,223 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
          @stateful(2) class Store { value: i32; extra: i32; }\n\
          fn Run(value: i32) -> i32 { return value + 3; }"
         .into();
-    assert!(matches!(embed.reload(&id), Err(EmbedError::Reload(_, _))));
-    assert_eq!(embed.status(&id), Some(PackageStatus::Enabled));
-    assert_eq!(embed.call::<Run>(&id, &1).expect("rollback old").value, 3);
+    assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
+    assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
+    assert_eq!(engine.call::<Run>(&id, &1).expect("rollback old").value, 3);
 
     *script.write().expect("source lock") = "module tests.state;\nimport test;\n\
          @stateful(1) class Store { value: i32; }\n\
          fn Run(value: i32) -> i32 { return value + 4; }\n\
          @activation fn activate(value: i32) -> i32 { return value; }"
         .into();
-    assert!(matches!(embed.reload(&id), Err(EmbedError::Reload(_, _))));
-    assert_eq!(embed.status(&id), Some(PackageStatus::Faulted));
-    assert_eq!(embed.health().enabled_packages, 0);
+    assert!(matches!(
+        engine.reload(&id),
+        Err(EngineError::Activation(_, _))
+    ));
+    assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
+    assert_eq!(engine.health().enabled_packages, 0);
+}
+
+#[test]
+fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
+    let script = Arc::new(RwLock::new(
+        "module tests.stress;\nimport test;\n\
+         @stateful(1) class Store { value: i32; }\n\
+         fn Run(value: i32) -> i32 { return value; }"
+            .to_owned(),
+    ));
+    let source = SharedSource {
+        id: SourceId::new("stress").expect("source ID"),
+        policy: policy([ActivationPolicy::DefaultEnabled]),
+        manifest: manifest("tests.stress", "default-enabled", ""),
+        script: script.clone(),
+    };
+    let mut engine = builder(source).build().expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let id = PackageId::new("tests.stress").expect("package ID");
+    engine
+        .set_state_i32(&id, "store", "Store", 1, "value", 7)
+        .expect("seed state");
+
+    for generation in 1..=100 {
+        *script.write().expect("source lock") = format!(
+            "module tests.stress;\nimport test;\n\
+             @stateful(1) class Store {{ value: i32; }}\n\
+             fn Run(value: i32) -> i32 {{ return value + {generation}; }}"
+        );
+        engine.reload(&id).expect("successful reload");
+        engine.tick().expect("maintenance tick");
+        assert_eq!(
+            engine
+                .state_i32(&id, "store", "Store", "value")
+                .expect("state"),
+            Some(7)
+        );
+    }
+    assert_eq!(engine.call::<Run>(&id, &1).expect("latest").value, 101);
+
+    for _ in 0..100 {
+        *script.write().expect("source lock") = "fn Run(".into();
+        assert!(matches!(
+            engine.reload(&id),
+            Err(EngineError::Diagnostic(_))
+        ));
+        assert_eq!(engine.call::<Run>(&id, &1).expect("syntax LKG").value, 101);
+    }
+    for _ in 0..100 {
+        *script.write().expect("source lock") =
+            "module tests.stress;\nimport test;\nfn Run(value: i32) -> i32 { return missing; }"
+                .into();
+        assert!(matches!(
+            engine.reload(&id),
+            Err(EngineError::Diagnostic(_))
+        ));
+        assert_eq!(engine.call::<Run>(&id, &1).expect("type LKG").value, 101);
+    }
+    for _ in 0..100 {
+        *script.write().expect("source lock") = "module tests.stress;\nimport test;\n\
+             @stateful(2) class Store { value: i32; extra: i32; }\n\
+             fn Run(value: i32) -> i32 { return value + 999; }"
+            .into();
+        assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
+        assert_eq!(
+            engine.call::<Run>(&id, &1).expect("migration LKG").value,
+            101
+        );
+    }
+
+    for generation in 1..=10 {
+        *script.write().expect("source lock") = "module tests.stress;\nimport test;\n\
+             @stateful(1) class Store { value: i32; }\n\
+             fn Run(value: i32) -> i32 { return value; }\n\
+             @activation fn activate(value: i32) -> i32 { return value; }"
+            .into();
+        assert!(matches!(
+            engine.reload(&id),
+            Err(EngineError::Activation(_, _))
+        ));
+        assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
+
+        *script.write().expect("source lock") = format!(
+            "module tests.stress;\nimport test;\n\
+             @stateful(1) class Store {{ value: i32; }}\n\
+             fn Run(value: i32) -> i32 {{ return value + {generation}; }}"
+        );
+        engine.reload(&id).expect("fault recovery reload");
+        assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
+    }
+
+    engine.tick().expect("final maintenance");
+    let health = engine.health();
+    assert_eq!(health.tasks, 0);
+    assert_eq!(health.requests, 0);
+    assert_eq!(health.tokens, 0);
+    assert_eq!(health.snapshots, 0);
+    assert_eq!(health.queued_releases, 0);
+    assert_eq!(engine.diagnostics().len(), 64);
+    assert!(engine.inspection().dropped_diagnostics >= 236);
+    assert!(
+        engine
+            .inspection()
+            .packages
+            .iter()
+            .all(|package| package.recent_metrics.len() <= 32)
+    );
+    engine.shutdown().expect("clean shutdown");
+}
+
+#[test]
+fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
+    let script = Arc::new(RwLock::new(
+        "module tests.dev;\nimport test;\n\
+         fn Run(value: i32) -> i32 { return value + 1; }"
+            .to_owned(),
+    ));
+    let source = SharedSource {
+        id: SourceId::new("dev").expect("source ID"),
+        policy: policy([ActivationPolicy::DefaultEnabled]),
+        manifest: manifest("tests.dev", "default-enabled", ""),
+        script: script.clone(),
+    };
+    let mut engine = builder(source)
+        .development(DevelopmentConfig {
+            scan_interval_ticks: 1,
+            stable_scan_count: 2,
+            ..DevelopmentConfig::default()
+        })
+        .build()
+        .expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let id = PackageId::new("tests.dev").expect("package ID");
+
+    *script.write().expect("source lock") =
+        "module tests.dev;\nimport test;\nfn Run(value: i32) -> i32 { return value + 2; }".into();
+    let observed = engine.tick().expect("observe save");
+    assert!(
+        observed
+            .development_events
+            .iter()
+            .any(|event| matches!(event, DevelopmentEvent::ChangeDetected(_)))
+    );
+    assert_eq!(engine.call::<Run>(&id, &1).expect("old active").value, 2);
+
+    let queued = engine.tick().expect("stabilize save");
+    assert!(
+        queued
+            .development_events
+            .iter()
+            .any(|event| matches!(event, DevelopmentEvent::CompileQueued(_)))
+    );
+    assert_eq!(
+        engine
+            .call::<Run>(&id, &1)
+            .expect("worker cannot commit")
+            .value,
+        2
+    );
+
+    let mut committed = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let report = engine.tick().expect("candidate tick");
+        committed |= report
+            .reloads
+            .iter()
+            .any(nexa_embed::ReloadReport::committed);
+        if committed {
+            break;
+        }
+    }
+    assert!(committed);
+    assert_eq!(engine.call::<Run>(&id, &1).expect("new active").value, 3);
+
+    *script.write().expect("source lock") =
+        "module tests.dev;\nimport test;\nfn Run(value: i32) -> i32 { return missing; }".into();
+    engine.tick().expect("observe invalid");
+    engine.tick().expect("queue invalid");
+    let mut failed = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let report = engine.tick().expect("failure tick");
+        failed |= report
+            .development_events
+            .iter()
+            .any(|event| matches!(event, DevelopmentEvent::CompileFailed(_)));
+        if failed {
+            break;
+        }
+    }
+    assert!(failed);
+    assert_eq!(
+        engine
+            .call::<Run>(&id, &1)
+            .expect("Last Known Good remains active")
+            .value,
+        3
+    );
+    engine.shutdown().expect("worker joins");
 }
 
 #[test]
@@ -541,14 +821,14 @@ fn directory_source_rejects_traversal_and_persistence_restores_selection() {
         ))
         .storage_dir(&storage)
         .build()
-        .expect("build persisted embed")
+        .expect("build persisted engine")
     };
     let id = PackageId::new("tests.persisted").expect("package ID");
     {
-        let mut embed = make();
-        embed.discover().expect("discover");
-        embed.enable(&id).expect("enable");
-        embed.shutdown().expect("shutdown");
+        let mut engine = make();
+        engine.discover().expect("discover");
+        engine.enable(&id).expect("enable");
+        engine.shutdown().expect("shutdown");
     }
     let mut restored = make();
     restored.discover().expect("discover restored");
@@ -558,7 +838,7 @@ fn directory_source_rejects_traversal_and_persistence_restores_selection() {
 
 fn unique_temp(label: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "nexa-embed-{label}-{}-{}",
+        "nexa-m3-{label}-{}-{}",
         std::process::id(),
         std::thread::current().name().unwrap_or("test")
     ));

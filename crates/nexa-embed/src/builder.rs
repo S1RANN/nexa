@@ -1,26 +1,25 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
-use crate::change_scan::ChangeScanConfig;
 use crate::contract::{ExportRequirement, HostContract};
+use crate::development::DevelopmentConfig;
 use crate::entitlement::{EntitlementResolver, NoEntitlements};
 use crate::manifest::SourceId;
 use crate::source::PackageSource;
-use crate::{EmbedError, HostRegistryFactory, NexaEmbed};
+use crate::{EngineError, HostRegistryFactory, NexaEngine};
 
-pub struct NexaEmbedBuilder {
+pub struct NexaEngineBuilder {
     pub(crate) contract: HostContract,
     pub(crate) host_factory: Option<Box<dyn HostRegistryFactory>>,
     pub(crate) sources: Vec<Box<dyn PackageSource>>,
     pub(crate) entitlements: Box<dyn EntitlementResolver>,
     pub(crate) storage_dir: Option<PathBuf>,
     pub(crate) runtime_host_capacity: usize,
-    pub(crate) development_mode: bool,
-    pub(crate) change_scan: ChangeScanConfig,
+    pub(crate) development: DevelopmentConfig,
     pub(crate) required_exports: Vec<ExportRequirement>,
 }
 
-impl NexaEmbedBuilder {
+impl NexaEngineBuilder {
     pub(crate) fn new(contract: HostContract) -> Self {
         Self {
             contract,
@@ -29,8 +28,10 @@ impl NexaEmbedBuilder {
             entitlements: Box::<NoEntitlements>::default(),
             storage_dir: None,
             runtime_host_capacity: 16_384,
-            development_mode: false,
-            change_scan: ChangeScanConfig::default(),
+            development: DevelopmentConfig {
+                enabled: false,
+                ..DevelopmentConfig::default()
+            },
             required_exports: Vec::new(),
         }
     }
@@ -66,14 +67,8 @@ impl NexaEmbedBuilder {
     }
 
     #[must_use]
-    pub const fn development_mode(mut self, enabled: bool) -> Self {
-        self.development_mode = enabled;
-        self
-    }
-
-    #[must_use]
-    pub const fn change_scan(mut self, config: ChangeScanConfig) -> Self {
-        self.change_scan = config;
+    pub fn development(mut self, config: DevelopmentConfig) -> Self {
+        self.development = config;
         self
     }
 
@@ -83,16 +78,16 @@ impl NexaEmbedBuilder {
         self
     }
 
-    pub fn build(self) -> Result<NexaEmbed, EmbedError> {
+    pub fn build(self) -> Result<NexaEngine, EngineError> {
         if self.host_factory.is_none() {
-            return Err(EmbedError::MissingHostFactory);
+            return Err(EngineError::MissingHostFactory);
         }
         let mut ids = BTreeSet::<SourceId>::new();
         for source in &self.sources {
             if !ids.insert(source.id().clone()) {
-                return Err(EmbedError::DuplicateSourceId(source.id().clone()));
+                return Err(EngineError::DuplicateSourceId(source.id().clone()));
             }
         }
-        NexaEmbed::from_builder(self)
+        NexaEngine::from_builder(self)
     }
 }

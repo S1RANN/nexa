@@ -2,9 +2,10 @@
 
 Nexa provides local syntax support for `.nexa` and `.nidl` files in VS Code
 and Zed. Version `0.1.2` provides syntax highlighting, bracket handling,
-indentation, and outlines where the editor supports them. It does not provide
-comments, an LSP, semantic highlighting, diagnostics, navigation, completion,
-formatting, snippets, code actions, or debugging.
+indentation, outlines, and live compiler diagnostics through `nexa lsp`.
+It does not provide comments, semantic highlighting, completion, hover,
+definition, references, rename, formatting, snippets, code actions, DAP, or
+debugging.
 
 The editor tooling is isolated under `editors/`. It is not part of the Rust
 Workspace and does not change Runtime gates.
@@ -16,6 +17,7 @@ Workspace and does not change Runtime gates.
 - Git, for preparing the local Zed grammar repository
 - Zed installed with a Rust toolchain managed by rustup when installing a Dev
   Extension
+- a built or installed `nexa` executable on `PATH`
 
 ## Build and verify
 
@@ -37,7 +39,8 @@ pnpm --dir editors package
 
 `generate` updates the committed Tree-sitter outputs and both TextMate
 grammars. `check` regenerates into a temporary directory, rejects drift,
-parses the repository examples, and compiles every Zed query.
+parses the repository examples, compiles every Zed query, and verifies that
+both editors attach to `nexa lsp`.
 
 Build output is written to:
 
@@ -46,6 +49,8 @@ target/nexa-editor-support/
 ├── vscode/nexa-language-support-0.1.2.vsix
 └── zed/
     ├── extension.toml
+    ├── Cargo.toml
+    ├── src/
     ├── languages/
     └── tree-sitter-nexa/
 ```
@@ -69,6 +74,9 @@ Reload VS Code after upgrading the package. Remove it with:
 code --uninstall-extension s1rann.nexa-language-support
 ```
 
+Set `nexa.server.path` if the CLI is not available as `nexa`. Use
+**Nexa: Restart Language Server** after replacing the executable.
+
 ## Zed installation
 
 1. Run `pnpm --dir editors prepare:zed`.
@@ -80,6 +88,9 @@ code --uninstall-extension s1rann.nexa-language-support
 After rebuilding, run `zed: rebuild dev extension` to load the new files.
 Remove or disable the local entry from Zed's Extensions page when it is no
 longer needed.
+
+The Zed extension resolves `nexa` from the Worktree shell environment and
+starts it with the `lsp` argument.
 
 ## Supported language surface
 
@@ -119,6 +130,8 @@ TextMate JSON files by hand.
 
 - Parsing is intended for editor structure and highlighting; compiler
   type-checking and semantic validation remain authoritative.
+- The diagnostics-only LSP publishes compiler Problems for unsaved overlays,
+  converts byte spans to UTF-16 positions, and clears diagnostics after fixes.
 - Incomplete expressions or blocks may temporarily produce recovery nodes,
   but the extension remains usable.
 - VS Code does not register `<` and `>` as global bracket pairs. This prevents

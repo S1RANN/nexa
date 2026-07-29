@@ -1,6 +1,6 @@
 # Embedding Nexa
 
-`nexa-embed` is the default application-facing API for trusted local Nexa
+`nexa-embed` is the default application-facing crate for trusted local Nexa
 packages. It owns IDL validation, compilation, verification, stable export
 lookup, one Realm per enabled package, root Scope lifetime, MustComplete
 handlers, garbage collection, release draining, change scanning, selection
@@ -23,18 +23,19 @@ The generated module provides:
 Applications construct a package source and call only high-level operations:
 
 ```rust
-let mut embed = NexaEmbed::builder(generated::contract())
+let mut engine = NexaEngine::builder(generated::contract())
     .host_factory(|context| generated::registry(AppHost::new(context)))
     .package_source(source)
     .entitlements(entitlements)
     .storage_dir("user-data/extensions")
     .require_export::<generated::OnEvent>()
+    .development(DevelopmentConfig::default())
     .build()?;
-embed.discover()?;
-embed.enable_defaults()?;
-let outputs = embed.dispatch::<generated::OnEvent>(&args);
-embed.tick()?;
-embed.shutdown()?;
+engine.discover()?;
+engine.enable_defaults()?;
+let outputs = engine.dispatch::<generated::OnEvent>(&args);
+let report = engine.tick()?;
+engine.shutdown()?;
 ```
 
 `call` targets one enabled package. `dispatch` invokes every enabled package by
@@ -47,7 +48,8 @@ before writing. Commit publishes the complete graph at once. Output decoding
 copies owned Rust values out of the Realm. `MustCompletePolicy` rejects fuel
 yield, explicit yield, Host wait, and trap; M2 event handlers cannot suspend.
 
-Call `tick` once at the application's safe point. It advances Runtime work,
+Call `tick` once at the application's safe point. It accepts completed
+background Candidates, commits only the newest generation, advances Runtime work,
 processes cancellation, collects unreachable argument/output graphs, drains
 release records, updates faults, and performs deterministic development change
 scans. Do not access Realm release queues from application code.
@@ -58,3 +60,7 @@ report an error.
 See `examples/hello-runtime` for the minimal integration and
 `examples/snake-game` for package lifecycle, capabilities, entitlements,
 runtime settings, typed state, and fault isolation.
+
+Import the common facade surface with `nexa_embed::prelude::*`. The prelude
+intentionally excludes Realm, Host Runtime, Task, Scope, Step, and release
+queue handles.

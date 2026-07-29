@@ -10,3 +10,11 @@ languages = ["languages/nexa", "languages/nexa-idl"]
 [grammars.nexa]
 repository = "{{GRAMMAR_REPOSITORY}}"
 rev = "{{GRAMMAR_REVISION}}"
+
+[language_servers.nexa]
+name = "Nexa Language Server"
+languages = ["Nexa", "Nexa IDL"]
+
+[language_servers.nexa.language_ids]
+"Nexa" = "nexa"
+"Nexa IDL" = "nexa-idl"

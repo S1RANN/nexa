@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock};
 
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CapabilityId, CapabilitySet, DirectorySource, EntitlementId,
-    EntitlementResolver, NexaEmbed, PackageId, PackageInfo, PackagePolicy, PackageRuntimeLimits,
+    EntitlementResolver, NexaEngine, PackageId, PackageInfo, PackagePolicy, PackageRuntimeLimits,
     PackageStatus, SourceId, TrustLevel,
 };
 
@@ -123,7 +123,7 @@ impl generated::SnakeHost for SnakeHost {
 }
 
 pub struct SnakeExtensions {
-    embed: NexaEmbed,
+    engine: NexaEngine,
     registries: ExtensionRegistries,
     pending_actions: Vec<ExtensionAction>,
     safe_mode: bool,
@@ -157,7 +157,7 @@ impl SnakeExtensions {
                 .iter()
                 .filter_map(|value| EntitlementId::new(value.clone()).ok()),
         );
-        let mut embed = NexaEmbed::builder(generated::contract())
+        let mut engine = NexaEngine::builder(generated::contract())
             .host_factory(|_: &nexa_embed::PackageContext| generated::registry(SnakeHost))
             .package_source(DirectorySource::new(
                 SourceId::new("snake-builtin")?,
@@ -175,14 +175,14 @@ impl SnakeExtensions {
                 source_policy(SourceCategory::Mod)?,
             ))
             .entitlements(entitlements.clone())
-            .storage_dir(data_root.join("embed"))
-            .development_mode(true)
+            .storage_dir(data_root.join("engine"))
+            .development(nexa_embed::DevelopmentConfig::default())
             .require_export::<generated::OnEvent>()
             .build()?;
-        embed.discover()?;
-        embed.enable_defaults()?;
+        engine.discover()?;
+        engine.enable_defaults()?;
         let mut extensions = Self {
-            embed,
+            engine,
             registries: ExtensionRegistries::default(),
             pending_actions: Vec::new(),
             safe_mode: false,
@@ -194,7 +194,7 @@ impl SnakeExtensions {
         };
         let event = GameEvent::new(GameEventKind::PackageEnabled, game.snapshot());
         let enabled = extensions
-            .embed
+            .engine
             .packages()
             .into_iter()
             .filter(|package| package.status == PackageStatus::Enabled)
@@ -216,7 +216,7 @@ impl SnakeExtensions {
             self.update_overlay_state(event.kind)?;
             let overlay_foods = self.overlay_foods();
             let outputs =
-                self.embed
+                self.engine
                     .dispatch_with::<generated::OnEvent>(|package| generated::OnEventArgs {
                         event: to_generated_event(
                             &event,
@@ -255,8 +255,8 @@ impl SnakeExtensions {
     }
 
     pub fn tick(&mut self, _: &mut SnakeGame) -> Result<(), Box<dyn std::error::Error>> {
-        self.embed.tick()?;
-        let packages = self.embed.packages();
+        self.engine.tick()?;
+        let packages = self.engine.packages();
         let classic_rules = packages.iter().any(|package| {
             package.id.as_str() == "builtin.classic-rules"
                 && package.status == PackageStatus::Enabled
@@ -281,7 +281,7 @@ impl SnakeExtensions {
             ) = match action {
                 ExtensionAction::Enable(id) => {
                     let result = (|| {
-                        self.embed.enable(&id)?;
+                        self.engine.enable(&id)?;
                         if id.as_str() == SCORE_OVERLAY_ID {
                             self.set_overlay_foods(0)?;
                         }
@@ -292,7 +292,7 @@ impl SnakeExtensions {
                 }
                 ExtensionAction::Disable(id) => {
                     let result = self
-                        .embed
+                        .engine
                         .disable(&id)
                         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>);
                     if result.is_ok() {
@@ -302,17 +302,17 @@ impl SnakeExtensions {
                 }
                 ExtensionAction::Reload(id) => {
                     let result = self
-                        .embed
+                        .engine
                         .reload(&id)
                         .map_err(|error| Box::new(error) as Box<dyn std::error::Error>);
                     (id, result, false)
                 }
             };
             if let Err(error) = result {
-                if fault_enabled && self.embed.status(&id) == Some(PackageStatus::Enabled) {
-                    let _ = self.embed.fault(&id, error.to_string());
+                if fault_enabled && self.engine.status(&id) == Some(PackageStatus::Enabled) {
+                    let _ = self.engine.fault(&id, error.to_string());
                 }
-                if self.embed.status(&id) != Some(PackageStatus::Enabled) {
+                if self.engine.status(&id) != Some(PackageStatus::Enabled) {
                     self.registries.remove_owner(&id);
                 }
                 self.toast = Some(self.action_error_message(&id, error.as_ref()));
@@ -328,7 +328,7 @@ impl SnakeExtensions {
         event: &GameEvent,
         game: &mut Option<&mut SnakeGame>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let output = self.embed.call::<generated::OnEvent>(
+        let output = self.engine.call::<generated::OnEvent>(
             id,
             &generated::OnEventArgs {
                 event: to_generated_event(
@@ -361,7 +361,7 @@ impl SnakeExtensions {
         game: &mut SnakeGame,
     ) -> Result<(), String> {
         let package = self
-            .embed
+            .engine
             .packages()
             .into_iter()
             .find(|package| package.id == *owner)
@@ -412,9 +412,9 @@ impl SnakeExtensions {
         event: GameEventKind,
         commands: Vec<SnakeCommand>,
         game: &mut SnakeGame,
-    ) -> Result<(), nexa_embed::EmbedError> {
+    ) -> Result<(), nexa_embed::EngineError> {
         if let Err(error) = self.apply_batch(owner, event, commands, game) {
-            self.embed.fault(owner, error.clone())?;
+            self.engine.fault(owner, error.clone())?;
             self.registries.remove_owner(owner);
             self.toast = Some(format!("{owner} faulted: {error}"));
         }
@@ -458,13 +458,13 @@ impl SnakeExtensions {
     pub fn set_entitlements(
         &mut self,
         values: impl IntoIterator<Item = EntitlementId>,
-    ) -> Result<(), nexa_embed::EmbedError> {
-        let before = self.embed.packages();
+    ) -> Result<(), nexa_embed::EngineError> {
+        let before = self.engine.packages();
         self.entitlements.replace(values);
-        self.embed.refresh_entitlements()?;
+        self.engine.refresh_entitlements()?;
         for package in before {
             if package.status == PackageStatus::Enabled
-                && self.embed.status(&package.id) != Some(PackageStatus::Enabled)
+                && self.engine.status(&package.id) != Some(PackageStatus::Enabled)
             {
                 self.registries.remove_owner(&package.id);
             }
@@ -475,13 +475,13 @@ impl SnakeExtensions {
 
     #[must_use]
     pub fn packages(&self) -> Vec<PackageInfo> {
-        self.embed.packages()
+        self.engine.packages()
     }
 
     #[must_use]
     pub fn view(&self) -> ExtensionView {
         ExtensionView {
-            packages: self.embed.packages(),
+            packages: self.engine.packages(),
             widgets: self
                 .registries
                 .ui
@@ -502,13 +502,13 @@ impl SnakeExtensions {
     }
 
     #[must_use]
-    pub fn health(&self) -> nexa_embed::EmbedHealth {
-        self.embed.health()
+    pub fn health(&self) -> nexa_embed::EngineHealth {
+        self.engine.health()
     }
 
     pub fn shutdown(&mut self, total_plays: i64) -> Result<(), Box<dyn std::error::Error>> {
         self.save_settings(total_plays)?;
-        self.embed.shutdown()?;
+        self.engine.shutdown()?;
         Ok(())
     }
 
@@ -541,14 +541,14 @@ impl SnakeExtensions {
         error: &(dyn std::error::Error + 'static),
     ) -> String {
         let name = self
-            .embed
+            .engine
             .packages()
             .into_iter()
             .find(|package| package.id == *id)
             .map_or_else(|| id.to_string(), |package| package.name);
         if matches!(
-            error.downcast_ref::<nexa_embed::EmbedError>(),
-            Some(nexa_embed::EmbedError::RequiredPackage(_))
+            error.downcast_ref::<nexa_embed::EngineError>(),
+            Some(nexa_embed::EngineError::RequiredPackage(_))
         ) {
             format!("{name} is required and cannot be disabled")
         } else {
@@ -559,7 +559,7 @@ impl SnakeExtensions {
     fn save_settings(&self, total_plays: i64) -> Result<(), std::io::Error> {
         let settings = SnakeSettings {
             enabled_packages: self
-                .embed
+                .engine
                 .packages()
                 .into_iter()
                 .filter(|package| package.status == PackageStatus::Enabled)
@@ -578,7 +578,7 @@ impl SnakeExtensions {
         event: GameEventKind,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let id = PackageId::new(SCORE_OVERLAY_ID)?;
-        if self.embed.status(&id) != Some(PackageStatus::Enabled) {
+        if self.engine.status(&id) != Some(PackageStatus::Enabled) {
             return Ok(());
         }
         match event {
@@ -594,9 +594,9 @@ impl SnakeExtensions {
         Ok(())
     }
 
-    fn set_overlay_foods(&mut self, value: i32) -> Result<(), nexa_embed::EmbedError> {
+    fn set_overlay_foods(&mut self, value: i32) -> Result<(), nexa_embed::EngineError> {
         let id = PackageId::new(SCORE_OVERLAY_ID).expect("static package ID is valid");
-        self.embed.set_state_i32(
+        self.engine.set_state_i32(
             &id,
             OVERLAY_STATE_KEY,
             OVERLAY_STATE_TYPE,
@@ -608,7 +608,7 @@ impl SnakeExtensions {
 
     fn overlay_foods(&self) -> Option<i32> {
         let id = PackageId::new(SCORE_OVERLAY_ID).expect("static package ID is valid");
-        self.embed
+        self.engine
             .state_i32(
                 &id,
                 OVERLAY_STATE_KEY,
@@ -1029,7 +1029,7 @@ mod tests {
             .expect("isolate invalid Mod");
         assert_eq!(game.score(), before);
         assert_eq!(
-            extensions.embed.status(&owner),
+            extensions.engine.status(&owner),
             Some(PackageStatus::Faulted)
         );
         assert!(
@@ -1049,11 +1049,14 @@ mod tests {
     fn locked_dlc_unlocks_and_safe_mode_survives_package_faults() {
         let (mut game, mut extensions, _) = harness("safe");
         let dlc = id("official.food-chaos");
-        assert_eq!(extensions.embed.status(&dlc), Some(PackageStatus::Locked));
+        assert_eq!(extensions.engine.status(&dlc), Some(PackageStatus::Locked));
         extensions
             .set_entitlements([EntitlementId::new("official.food-chaos").expect("entitlement")])
             .expect("grant entitlement");
-        assert_eq!(extensions.embed.status(&dlc), Some(PackageStatus::Disabled));
+        assert_eq!(
+            extensions.engine.status(&dlc),
+            Some(PackageStatus::Disabled)
+        );
         enable(&mut extensions, &mut game, "official.food-chaos");
 
         for package in [
@@ -1064,7 +1067,7 @@ mod tests {
         ] {
             let package = id(package);
             extensions
-                .embed
+                .engine
                 .fault(&package, "test fault")
                 .expect("fault package");
             extensions.registries.remove_owner(&package);

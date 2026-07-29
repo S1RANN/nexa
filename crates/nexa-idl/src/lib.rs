@@ -73,6 +73,23 @@ pub struct Export {
     pub result: Option<TypeRef>,
 }
 
+#[must_use]
+pub fn export_stable_id(idl: &Idl, export: &Export) -> StableId {
+    StableId::from_parts(&[&idl.interface, "::export::", &export.name])
+}
+
+#[must_use]
+pub fn export_signature(idl: &Idl, export: &Export) -> nexa_bytecode::Signature {
+    nexa_bytecode::Signature {
+        parameters: export
+            .parameters
+            .iter()
+            .map(|parameter| value_type(idl, &parameter.ty))
+            .collect(),
+        result: export.result.as_ref().map(|result| value_type(idl, result)),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TypeRef {
     I32,

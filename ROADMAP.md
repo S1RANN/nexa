@@ -3,6 +3,14 @@
 ```text
 Nexa Internal Pivot M1 = COMPLETE
 Nexa M2 Embedding & Snake Pilot = COMPLETE
+Nexa M3 Developer Loop & Diagnostics = COMPLETE
+NexaEngine API = COMPLETE
+Automatic Candidate Compilation = COMPLETE
+Last Known Good Reload = COMPLETE
+Unified Diagnostics = COMPLETE
+Source-level Runtime Stack Traces = COMPLETE
+Package-aware CLI = COMPLETE
+Editor Diagnostics = COMPLETE
 nexa-embed v1 = COMPLETE
 Typed Script Export = COMPLETE
 Snake Core = COMPLETE
@@ -38,6 +46,14 @@ playable Snake pilot using the same package contract for first-party content,
 licensed content, and reviewed local extensions. Its finalization gates cover
 the full workspace, package lifecycle stress, resource stability, and dispatch
 latency.
+
+M3 makes that embedding loop usable during daily development. The public
+facade is `NexaEngine`; stable source snapshots compile on one bounded worker,
+and only `engine.tick()` may commit the newest verified Candidate. Failed or
+superseded Candidates leave the active Runtime and Last Known Good artifact
+unchanged. Compiler, Verifier, Reload, Runtime, resource, persistence, and
+shutdown failures share one bounded `EngineDiagnostic` model. `nexa check`,
+`nexa dev`, and the diagnostic-only LSP reuse that same compiler path.
 
 M1 final closure includes the generated-registry
 positive path, real invalid-event Runtime calls, deterministic fuzz corpus
@@ -98,8 +114,19 @@ code sandboxing, network or arbitrary filesystem permissions, new language
 syntax, LSP/DAP, old-Task migration, completion replay, or multi-version
 business execution.
 
+## M3 scope
+
+M3 is limited to naming, the package development loop, diagnostics, source
+identity and stack metadata, inspection DTOs, package-aware CLI commands, and
+editor Problems. It does not include Pluie integration, sustained dogfood data
+collection, JIT/AOT, an optimizing compiler, new syntax, user generics,
+`dynamic`, `interface`, cross-package dependencies, cross-module state,
+seamless old-Task migration, completion replay, remote Mods, an untrusted-code
+sandbox, completion/refactoring LSP features, or DAP debugging.
+
 ## Next review
 
-Dogfood the M2 embedding API and Snake pilot before approving broader
-integration. Do not reopen seamless Reload or a general-product route without
-new user evidence and a separately approved milestone.
+Dogfood the M3 save–diagnose–reload loop through the Snake pilot before
+approving broader integration. Do not reopen seamless Reload or a
+general-product route without new user evidence and a separately approved
+milestone.
