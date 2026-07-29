@@ -13,15 +13,16 @@ cargo run -p snake-game
 
 Controls:
 
-- Arrow keys or WASD: move; Space: restart; Escape: exit.
-- PageUp/PageDown: select a package.
-- E/X/R: enable, disable, or Restart Reload the selected package.
-- L: grant/revoke the Food Chaos entitlement.
-- K/P: cycle registered skin or spawn policy.
+- Main menu: Up/Down or W/S to select; Enter/Space to confirm.
+- In game: Arrow keys or WASD to move; Space to restart; Escape to pause.
+- Pause menu: Continue, Settings, or Back to Main Menu.
+- Settings: Up/Down selects; Left/Right changes skin or spawn policy.
+- Package settings: Enter enables/disables; R reloads; L grants/revokes DLC access.
 
-The settings panel shows package name/ID, source category, version, lifecycle
+The settings screen shows package name/ID, source category, version, lifecycle
 status, capabilities, recent error, selected skin, and selected spawn policy.
-All mutations are queued and applied at the game Tick safe point.
+Gameplay is paused while a menu is open. Package mutations remain queued and
+are applied at the game Tick safe point.
 
 Headless validation:
 

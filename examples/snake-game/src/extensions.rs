@@ -315,7 +315,7 @@ impl SnakeExtensions {
                 if self.embed.status(&id) != Some(PackageStatus::Enabled) {
                     self.registries.remove_owner(&id);
                 }
-                self.toast = Some(format!("{id}: {error}"));
+                self.toast = Some(self.action_error_message(&id, error.as_ref()));
             }
         }
         self.update_fallbacks();
@@ -433,6 +433,10 @@ impl SnakeExtensions {
         self.pending_actions.push(ExtensionAction::Reload(id));
     }
 
+    pub fn show_toast(&mut self, message: impl Into<String>) {
+        self.toast = Some(message.into());
+    }
+
     pub fn select_skin(&mut self, id: &str) -> bool {
         if self.registries.skins.contains(id) {
             self.selected_skin = Some(id.to_owned());
@@ -528,6 +532,27 @@ impl SnakeExtensions {
         }
         if self.selected_spawn_policy.is_none() {
             self.selected_spawn_policy = self.registries.spawn_policies.first_id();
+        }
+    }
+
+    fn action_error_message(
+        &self,
+        id: &PackageId,
+        error: &(dyn std::error::Error + 'static),
+    ) -> String {
+        let name = self
+            .embed
+            .packages()
+            .into_iter()
+            .find(|package| package.id == *id)
+            .map_or_else(|| id.to_string(), |package| package.name);
+        if matches!(
+            error.downcast_ref::<nexa_embed::EmbedError>(),
+            Some(nexa_embed::EmbedError::RequiredPackage(_))
+        ) {
+            format!("{name} is required and cannot be disabled")
+        } else {
+            format!("{name}: {error}")
         }
     }
 
