@@ -30,7 +30,7 @@ Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
-Current target = sustained embedding and Snake dogfood
+Current target = M3R1 complete; M4 not started
 Seamless advanced Reload = REMOVED
 ```
 
@@ -113,6 +113,7 @@ cargo run -p combat-runtime
 cargo run -p snake-game
 cargo xtask check
 cargo xtask finalize-m1
+cargo xtask finalize-m3-r1
 ```
 
 Focused commands are documented in [Testing](docs/TESTING.md). Generated

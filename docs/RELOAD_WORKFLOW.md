@@ -1,6 +1,6 @@
 # Nexa Reload workflow
 
-Status: M3 COMPLETE
+Status: M3R1 COMPLETE
 
 The M3 workflow preserves Restart Reload semantics and adds a guarded Candidate
 pipeline:
@@ -25,8 +25,27 @@ artifact. Activation then runs; its failure is explicitly post-commit and
 faults the package.
 
 `ReloadReport` records package and generation identity, old/new epochs, source
-hash, compile/verify/migration/activation durations, cancelled Tasks, detached
-Requests, and one of:
+hash, cancelled Tasks, detached Requests, and independently measured timing:
+
+```text
+change-to-stable
+queue
+compile
+verify
+ready-to-commit
+quiesce
+migration
+commit
+activation
+total change-to-visible
+```
+
+`reload_duration` is the sum of quiesce, migration, commit, and activation; no
+phase receives an invented whole-operation duration. Compile and Verify use
+separate calls and clocks. Execution inspection also records instruction count
+and charged Fuel independently.
+
+The report outcome is one of:
 
 ```text
 Committed

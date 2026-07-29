@@ -1,6 +1,6 @@
 # Nexa development loop
 
-Status: M3 COMPLETE
+Status: M3R1 COMPLETE
 
 `NexaEngine` owns the package development loop. Applications opt in with
 `DevelopmentConfig`; they do not create compiler threads or mutate a Realm
@@ -37,8 +37,9 @@ Idle
 ```
 
 Failure states are `CompileFailed`, `VerifyFailed`, `MigrationFailed`,
-`ActivationFaulted`, and `HostRebuildRequired`. Every transition produces a
-bounded `DevelopmentEvent`.
+`ActivationFaulted`, `HostRebuildRequired`, and `SourceMissing`.
+`AwaitingQueue` is an explicit backpressure state. Every transition produces
+a bounded `DevelopmentEvent`.
 
 The scanner uses modification metadata only as a possible prefilter. The
 commit identity is a deterministic hash of the package manifest and entry
@@ -48,11 +49,25 @@ consecutive scans before compilation is queued.
 One bounded worker reads an immutable Candidate snapshot and performs parse,
 type checking, bytecode generation, verification, required-export checks, and
 artifact construction. It cannot access a Realm, call Host code, process
-releases, or change package state.
+releases, or change package state. Queue capacity applies backpressure: the
+Engine retains the Job in `AwaitingQueue` and retries on a later Tick.
 
-Queued generations from the same package are superseded by newer generations.
-When a result reaches `NexaEngine::tick()`, its generation is checked again.
-Only the newest verified Candidate can enter Restart Reload.
+Each Package has at most one in-flight Generation and one newer pending
+Generation. Replacing pending work emits `SupersededBeforeCompile` without
+changing its FIFO position. An older in-flight result emits
+`SupersededAfterCompile`. A full Result queue blocks the Worker until
+`NexaEngine::tick()` drains space; completed results are never evicted.
+
+Every Generation has exactly one terminal outcome. Disable, source removal,
+and shutdown explicitly cancel pending, in-flight, and ready work. Source
+removal keeps the active Runtime running and permits a new Generation after
+the source reappears. Only the newest verified Candidate can enter Restart
+Reload.
+
+Development identity is split into `observed_hash`, `stable_hash`,
+`queued_hash`, `in_flight_hash`, `terminal_hash`, and `active_hash`.
+Backpressure does not advance queued or terminal identity, so a stable version
+cannot be forgotten before compilation.
 
 ## Safety and Last Known Good
 
@@ -70,13 +85,18 @@ A changed Host contract cannot be committed as script-only Reload. `nexa dev`
 emits `HostRebuildRequired`, keeps the last successful Candidate, and instructs
 the developer to rebuild the Rust Host binding.
 
-Shutdown stops admission, clears queued jobs, signals and joins the worker,
-closes packages, drains releases, and closes `RuntimeHost`.
+Shutdown stops admission, terminates every queued and in-flight Generation,
+drains terminals, signals and joins the worker, closes packages, drains
+releases, and closes `RuntimeHost`.
 
 ## Headless development
 
-The repository `nexa.dev.toml` describes the Snake contract, package roots,
-and required export. Validate once or watch continuously:
+The repository `nexa.dev.toml` uses schema 2. Each source declares its ID,
+root, trust, allowed activation modes, capability ceiling, entitlement rule,
+package count, and Runtime limits. Package policy is selected from the source
+root; it is never inferred from a Package Manifest.
+
+Validate the full project once or watch continuously:
 
 ```sh
 cargo run -p nexa-cli -- check --project nexa.dev.toml
@@ -86,3 +106,15 @@ cargo run -p nexa-cli -- dev --project nexa.dev.toml
 `nexa dev` is a headless compiler watcher. It never owns an application
 Runtime; Runtime Reload remains the responsibility of the host's
 `NexaEngine::tick()`.
+
+Single-Package checks have three explicit validation levels:
+
+```sh
+cargo run -p nexa-cli -- check path/to/package --manifest-only
+cargo run -p nexa-cli -- check path/to/package --contract app_api.nidl
+cargo run -p nexa-cli -- check path/to/package \
+  --contract app_api.nidl --policy source-policy.toml
+```
+
+Their structured output reports `manifest-only`, `contract`, or
+`full-policy`. Project checks always report `full-policy`.

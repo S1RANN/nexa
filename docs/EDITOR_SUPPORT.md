@@ -1,5 +1,7 @@
 # Nexa editor support
 
+Status: M3R1 COMPLETE
+
 Nexa provides local syntax support for `.nexa` and `.nidl` files in VS Code
 and Zed. Version `0.1.2` provides syntax highlighting, bracket handling,
 indentation, outlines, and live compiler diagnostics through `nexa lsp`.
@@ -91,6 +93,16 @@ longer needed.
 
 The Zed extension resolves `nexa` from the Worktree shell environment and
 starts it with the `lsp` argument.
+
+The language server keeps unsaved document overlays by monotonically
+increasing document version. A stale `didChange` cannot replace a newer
+overlay, `didSave` republishes the current text, and `didClose` always clears
+Problems before returning to disk state. NIDL parser errors retain their exact
+byte Span and are converted to UTF-16 LSP positions.
+
+File URIs are handled by the standard URL implementation, including Unix
+paths, Windows drive paths, UNC shares, Unicode, spaces, and encoded `#`, `%`,
+and `?` characters.
 
 ## Supported language surface
 

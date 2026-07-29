@@ -62,7 +62,6 @@ impl ErrorCode {
     pub const NX7103: Self = Self::new("NX7103");
     pub const NX7201: Self = Self::new("NX7201");
     pub const NX7202: Self = Self::new("NX7202");
-    pub const NX7301: Self = Self::new("NX7301");
     pub const NX7302: Self = Self::new("NX7302");
     pub const NX7303: Self = Self::new("NX7303");
 
@@ -149,7 +148,6 @@ pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
     ErrorCodeDefinition::new(ErrorCode::NX7103, "Handler trapped"),
     ErrorCodeDefinition::new(ErrorCode::NX7201, "Reload rolled back before commit"),
     ErrorCodeDefinition::new(ErrorCode::NX7202, "Activation faulted after commit"),
-    ErrorCodeDefinition::new(ErrorCode::NX7301, "Release processing failed"),
     ErrorCodeDefinition::new(ErrorCode::NX7302, "Persistence failed"),
     ErrorCodeDefinition::new(ErrorCode::NX7303, "Engine shutdown incomplete"),
 ];
@@ -316,7 +314,6 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(NX7103, "nexa-embed::handler", "Trapped", ".engine"),
     emission!(NX7201, "nexa-embed::reload", "RolledBack", ".engine"),
     emission!(NX7202, "nexa-embed::reload", "ActivationFaulted", ".engine"),
-    emission!(NX7301, "nexa-embed::resource", "ReleaseFailed", ".engine"),
     emission!(
         NX7302,
         "nexa-embed::persistence",
@@ -1334,7 +1331,6 @@ mod tests {
             ("NX7103", "Handler trapped"),
             ("NX7201", "Reload rolled back before commit"),
             ("NX7202", "Activation faulted after commit"),
-            ("NX7301", "Release processing failed"),
             ("NX7302", "Persistence failed"),
             ("NX7303", "Engine shutdown incomplete"),
         ];
@@ -1367,7 +1363,7 @@ mod tests {
             .map(|definition| definition.code)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(registered, emitted);
-        assert_eq!(ERROR_CODE_TABLE.len(), 47);
+        assert_eq!(ERROR_CODE_TABLE.len(), 46);
         assert_eq!(ERROR_EMISSION_TABLE.len(), ERROR_CODE_TABLE.len());
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for definition in ERROR_EMISSION_TABLE {

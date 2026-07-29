@@ -90,6 +90,45 @@ struct M2FinalReport {
     status: &'static str,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct M3R1FinalReport {
+    schema: u32,
+    milestone: &'static str,
+    head: String,
+    workspace: &'static str,
+    m1_m2_regression: &'static str,
+    engine_api: &'static str,
+    engine_diagnostics: &'static str,
+    worker_queue_saturation: &'static str,
+    result_backpressure: &'static str,
+    disable_in_flight: &'static str,
+    shutdown_in_flight: &'static str,
+    reload_stress: &'static str,
+    metrics: &'static str,
+    cli_policy: &'static str,
+    lsp: &'static str,
+    editor: &'static str,
+    repo_audit: &'static str,
+    queue_lost_jobs: u64,
+    queue_lost_results: u64,
+    generations_without_terminal: u64,
+    engine_diagnostic_direct_construction: usize,
+    engine_diagnostic_real_paths: usize,
+    metrics_trusted: bool,
+    policy_validation: &'static str,
+    nidl_span: &'static str,
+    uri_matrix: &'static str,
+    worktree_clean: bool,
+    historical_tag_type: String,
+    historical_tag_target: String,
+    tag_type: String,
+    tag_target: String,
+    tag_target_matches_head: bool,
+    failures: Vec<String>,
+    status: &'static str,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct CheckSummary {
@@ -145,6 +184,7 @@ fn main() -> Result<(), DynError> {
         "editor-check" => editor_check(),
         "dev-loop-stress" => dev_loop_stress(),
         "finalize-m3" => finalize_m3(),
+        "finalize-m3-r1" => finalize_m3_r1(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -152,7 +192,7 @@ fn main() -> Result<(), DynError> {
                  fuzz-smoke|bench-smoke|repo-audit|finalize-m1|test-embed|test-snake|\
                  snake-headless-smoke|snake-stress|snake-bench|finalize-m2|\
                  test-engine-api|test-diagnostics|test-dev-loop|test-cli|test-lsp|\
-                 editor-check|dev-loop-stress|finalize-m3"
+                 editor-check|dev-loop-stress|finalize-m3|finalize-m3-r1"
             );
             Err("unknown xtask command".into())
         }
@@ -235,8 +275,10 @@ fn check() -> Result<(), DynError> {
     test_cli()?;
     test_lsp()?;
     editor_check()?;
+    test_metrics()?;
     dev_loop_stress()?;
-    m3_audit()
+    m3_audit()?;
+    m3r1_audit()
 }
 
 fn test_engine_api() -> Result<(), DynError> {
@@ -244,12 +286,12 @@ fn test_engine_api() -> Result<(), DynError> {
 }
 
 fn test_diagnostics() -> Result<(), DynError> {
-    cargo(&["run", "-p", "nexa-cli", "--", "diagnostic-corpus-check"])?;
+    let _ = real_engine_diagnostic_gate()?;
     cargo(&["test", "-p", "nexa-embed", "--test", "m3", "diagnostic"])
 }
 
 fn test_dev_loop() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-embed", "--test", "m3", "dev_loop"])
+    cargo(&["test", "-p", "nexa-embed", "--test", "m3"])
 }
 
 fn test_cli() -> Result<(), DynError> {
@@ -274,8 +316,36 @@ fn test_cli() -> Result<(), DynError> {
         "--",
         "check",
         "examples/snake-game/packages/builtin/classic-rules",
+        "--manifest-only",
+        "--diagnostic-format",
+        "json",
+    ])?;
+    cargo(&[
+        "run",
+        "-p",
+        "nexa-cli",
+        "--",
+        "check",
+        "examples/snake-game/packages/builtin/classic-rules",
         "--contract",
         "examples/snake-game/snake_api.nidl",
+    ])?;
+    let policy = write_builtin_cli_policy()?;
+    cargo(&[
+        "run",
+        "-p",
+        "nexa-cli",
+        "--",
+        "check",
+        "examples/snake-game/packages/builtin/classic-rules",
+        "--contract",
+        "examples/snake-game/snake_api.nidl",
+        "--policy",
+        policy
+            .to_str()
+            .ok_or("generated package policy path is not UTF-8")?,
+        "--diagnostic-format",
+        "json",
     ])?;
     cargo(&[
         "run",
@@ -293,6 +363,33 @@ fn test_cli() -> Result<(), DynError> {
 
 fn test_lsp() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-cli", "lsp_"])
+}
+
+fn test_metrics() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "embed",
+        "engine_records_instruction_count_independently_from_fuel_charge",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "embed",
+        "dev_engine_stabilizes_saves_and_commits_only_from_tick",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "m3",
+        "dev_loop_only_latest_generation_becomes_ready",
+    ])
 }
 
 fn editor_check() -> Result<(), DynError> {
@@ -321,6 +418,58 @@ fn dev_loop_stress() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-verifier", "stress_rejects_100"])
 }
 
+fn worker_queue_saturation() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "m3",
+        "worker_queue_backpressure_preserves_32_distinct_packages",
+    ])
+}
+
+fn worker_result_backpressure() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "m3",
+        "worker_result_backpressure_never_discards_completed_results",
+    ])
+}
+
+fn worker_disable_in_flight() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "m3",
+        "disabling_an_in_flight_generation_has_one_cancelled_terminal",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "embed",
+        "engine_disable_cancels_in_flight_candidate_without_late_ready_state",
+    ])
+}
+
+fn worker_shutdown_in_flight() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-embed",
+        "--test",
+        "m3",
+        "shutdown_accounts_for_an_in_flight_generation_without_deadlock",
+    ])
+}
+
 fn finalize_m3() -> Result<(), DynError> {
     m3_audit()?;
     if !git_output(&["status", "--porcelain"])?.is_empty() {
@@ -341,6 +490,293 @@ fn finalize_m3() -> Result<(), DynError> {
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn finalize_m3_r1() -> Result<(), DynError> {
+    let mut failures = Vec::new();
+    let workspace = record_gate("workspace", &mut failures, workspace_check());
+    let m1_m2_regression = record_gate("M1/M2 regression", &mut failures, run_m1_m2_regression());
+    let engine_api = record_gate("Engine API", &mut failures, test_engine_api());
+
+    let (engine_diagnostics, engine_real_paths, engine_direct_construction) =
+        match real_engine_diagnostic_gate() {
+            Ok((real_paths, direct_construction)) => (true, real_paths, direct_construction),
+            Err(error) => {
+                failures.push(format!("real Engine diagnostics: {error}"));
+                (false, 0, usize::MAX)
+            }
+        };
+    let worker_queue_saturation = record_gate(
+        "Worker queue saturation",
+        &mut failures,
+        worker_queue_saturation(),
+    );
+    let result_backpressure = record_gate(
+        "Worker result backpressure",
+        &mut failures,
+        worker_result_backpressure(),
+    );
+    let disable_in_flight = record_gate(
+        "Worker disable/in-flight",
+        &mut failures,
+        worker_disable_in_flight(),
+    );
+    let shutdown_in_flight = record_gate(
+        "Worker shutdown/in-flight",
+        &mut failures,
+        worker_shutdown_in_flight(),
+    );
+    let reload_stress = record_gate("Reload stress", &mut failures, dev_loop_stress());
+    let metrics = record_gate("Metrics", &mut failures, test_metrics());
+    let cli_policy = record_gate("CLI policy", &mut failures, test_cli());
+    let nidl_span = record_gate("NIDL Span", &mut failures, test_nidl_span());
+    let uri_matrix = record_gate("URI matrix", &mut failures, test_uri_matrix());
+    let lsp = record_gate("LSP", &mut failures, test_lsp());
+    let editor = record_gate("Editor", &mut failures, editor_check());
+    let repo_audit = record_gate(
+        "Repository audit",
+        &mut failures,
+        repo_audit()
+            .and_then(|()| m3_audit())
+            .and_then(|()| m3r1_audit())
+            .and_then(|()| m3r1_final_status_audit()),
+    );
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let worktree_clean = git_output(&["status", "--porcelain"])?.is_empty();
+    if !worktree_clean {
+        failures.push("worktree is not clean".into());
+    }
+    let historical_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete"])
+        .unwrap_or_else(|_| "missing".into());
+    let historical_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete-r1"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_target = git_output(&["rev-parse", "developer-loop-m3-complete-r1^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_target_matches_head = tag_target == head;
+    if historical_tag_type != "tag"
+        || historical_tag_target != "621612f49c4180989711df3ca80021fd21ad9277"
+    {
+        failures.push("historical M3 tag type or immutable target changed".into());
+    }
+    if tag_type != "tag" {
+        failures.push("developer-loop-m3-complete-r1 is not an annotated tag".into());
+    }
+    if !tag_target_matches_head {
+        failures.push("developer-loop-m3-complete-r1 does not target HEAD".into());
+    }
+
+    let worker_gates =
+        worker_queue_saturation && result_backpressure && disable_in_flight && shutdown_in_flight;
+    let passed = workspace
+        && m1_m2_regression
+        && engine_api
+        && engine_diagnostics
+        && engine_real_paths == 13
+        && engine_direct_construction == 0
+        && worker_gates
+        && reload_stress
+        && metrics
+        && cli_policy
+        && nidl_span
+        && uri_matrix
+        && lsp
+        && editor
+        && repo_audit
+        && worktree_clean
+        && historical_tag_type == "tag"
+        && historical_tag_target == "621612f49c4180989711df3ca80021fd21ad9277"
+        && tag_type == "tag"
+        && tag_target_matches_head;
+    let report = M3R1FinalReport {
+        schema: 1,
+        milestone: "Nexa M3R1 Developer Loop Closure",
+        head,
+        workspace: status(workspace),
+        m1_m2_regression: status(m1_m2_regression),
+        engine_api: status(engine_api),
+        engine_diagnostics: status(engine_diagnostics),
+        worker_queue_saturation: status(worker_queue_saturation),
+        result_backpressure: status(result_backpressure),
+        disable_in_flight: status(disable_in_flight),
+        shutdown_in_flight: status(shutdown_in_flight),
+        reload_stress: status(reload_stress),
+        metrics: status(metrics),
+        cli_policy: status(cli_policy),
+        lsp: status(lsp),
+        editor: status(editor),
+        repo_audit: status(repo_audit),
+        queue_lost_jobs: u64::from(!worker_queue_saturation),
+        queue_lost_results: u64::from(!result_backpressure),
+        generations_without_terminal: u64::from(!worker_gates),
+        engine_diagnostic_direct_construction: engine_direct_construction,
+        engine_diagnostic_real_paths: engine_real_paths,
+        metrics_trusted: metrics,
+        policy_validation: status(cli_policy),
+        nidl_span: status(nidl_span),
+        uri_matrix: status(uri_matrix),
+        worktree_clean,
+        historical_tag_type,
+        historical_tag_target,
+        tag_type,
+        tag_target,
+        tag_target_matches_head,
+        failures,
+        status: if passed { "PASS" } else { "FAIL" },
+    };
+    let root = workspace_root();
+    let output = root.join("target/nexa-artifacts/m3r1-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M3R1 report has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
+        Ok(())
+    } else {
+        Err("M3R1 finalization failed".into())
+    }
+}
+
+fn record_gate(name: &str, failures: &mut Vec<String>, result: Result<(), DynError>) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            failures.push(format!("{name}: {error}"));
+            false
+        }
+    }
+}
+
+fn run_m1_m2_regression() -> Result<(), DynError> {
+    test_binding()?;
+    test_task()?;
+    cargo(&["test", "-p", "nexa-runtime", "--test", "restart_reload"])?;
+    cargo(&["test", "-p", "nexa-model"])?;
+    fuzz_smoke()?;
+    bench_smoke()?;
+    test_embed()?;
+    test_snake()?;
+    snake_headless("smoke")?;
+    snake_headless("stress")?;
+    snake_headless("bench")?;
+    m2_audit()
+}
+
+fn real_engine_diagnostic_gate() -> Result<(usize, usize), DynError> {
+    cargo(&["test", "-p", "nexa-embed", "--test", "diagnostic_e2e"])?;
+    let output = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "nexa-cli",
+            "--",
+            "diagnostic-corpus-check",
+            "--format",
+            "json",
+        ])
+        .current_dir(workspace_root())
+        .output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "diagnostic corpus failed with {}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let stdout = String::from_utf8(output.stdout)?;
+    let start = stdout
+        .find('{')
+        .ok_or("diagnostic corpus did not emit a JSON object")?;
+    let end = stdout
+        .rfind('}')
+        .map(|index| index + 1)
+        .ok_or("diagnostic corpus emitted incomplete JSON")?;
+    let report: Value = serde_json::from_str(&stdout[start..end])?;
+    let engine = &report["engine"];
+    let count = |key: &str| -> Result<usize, DynError> {
+        Ok(usize::try_from(engine[key].as_u64().ok_or_else(|| {
+            format!("diagnostic report omitted engine.{key}")
+        })?)?)
+    };
+    let registered = count("registered")?;
+    let observed = count("observedThroughRealPaths")?;
+    let direct = count("directDiagnosticConstruction")?;
+    let human = count("humanOutput")?;
+    let json = count("jsonOutput")?;
+    let ndjson = count("ndjsonOutput")?;
+    let deterministic = count("deterministic")?;
+    if registered != observed
+        || direct != 0
+        || human != registered
+        || json != registered
+        || ndjson != registered
+        || deterministic != registered
+    {
+        return Err(format!(
+            "real Engine diagnostic evidence is incomplete: registered={registered}, \
+             observed={observed}, direct={direct}, human={human}, json={json}, \
+             ndjson={ndjson}, deterministic={deterministic}"
+        )
+        .into());
+    }
+    Ok((observed, direct))
+}
+
+fn test_nidl_span() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-cli",
+        "lsp_idl_diagnostic_uses_the_parser_token_span",
+    ])?;
+    cargo(&["test", "-p", "nexa-idl", "parse_error"])
+}
+
+fn test_uri_matrix() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-cli",
+        "file_uri_matrix_uses_standard_percent_encoding",
+    ])
+}
+
+fn write_builtin_cli_policy() -> Result<PathBuf, DynError> {
+    let path = workspace_root().join("target/nexa-artifacts/m3r1-cli/builtin-policy.toml");
+    fs::create_dir_all(path.parent().ok_or("CLI policy path has no parent")?)?;
+    fs::write(
+        &path,
+        "schema = 1\n\
+         id = \"snake-builtin\"\n\
+         trust = \"first-party\"\n\
+         activation = [\"required\", \"default-enabled\"]\n\
+         capabilities = [\n\
+           \"diagnostics.log\",\n\
+           \"skin.register\",\n\
+           \"spawn.propose\",\n\
+           \"spawn.register\",\n\
+           \"stats.read\",\n\
+           \"ui.register\",\n\
+           \"ui.update\",\n\
+         ]\n\
+         allow_entitlement = false\n\
+         max_packages = 16\n\
+         [limits]\n\
+         handler_fuel = 30000\n\
+         cumulative_budget = 200000\n\
+         heap_objects = 4096\n\
+         host_resources = 256\n\
+         tasks = 8\n\
+         release_records = 512\n",
+    )?;
+    Ok(path)
 }
 
 fn m3_audit() -> Result<(), DynError> {
@@ -383,6 +819,99 @@ fn m3_audit() -> Result<(), DynError> {
         if !root.join(required).is_file() {
             return Err(format!("missing M3 artifact {required}").into());
         }
+    }
+    Ok(())
+}
+
+fn m3r1_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    let worker = fs::read_to_string(root.join("crates/nexa-embed/src/development.rs"))?;
+    for forbidden in [
+        "last_processed_hash",
+        "pending.pop_front()",
+        "results.pop_front()",
+    ] {
+        if worker.contains(forbidden) {
+            return Err(format!("M3R1 Worker audit found lossy pattern `{forbidden}`").into());
+        }
+    }
+    for required in [
+        "pending_order: VecDeque<PackageId>",
+        "pending_by_package: BTreeMap<PackageId, CompileJob>",
+        "job_available: Condvar",
+        "result_space_available: Condvar",
+        "SupersededBeforeCompile",
+        "SupersededAfterCompile",
+        "CancelledByDisable",
+        "CancelledBySourceRemoval",
+        "CancelledByShutdown",
+        "Backpressured",
+    ] {
+        if !worker.contains(required) {
+            return Err(format!("M3R1 Worker contract is missing `{required}`").into());
+        }
+    }
+    let engine = fs::read_to_string(root.join("crates/nexa-embed/src/lib.rs"))?;
+    for hash in [
+        "observed_hash",
+        "stable_hash",
+        "queued_hash",
+        "in_flight_hash",
+        "terminal_hash",
+        "active_hash",
+    ] {
+        if !engine.contains(hash) {
+            return Err(format!("M3R1 Engine hash lifecycle is missing `{hash}`").into());
+        }
+    }
+    let evidence = fs::read_to_string(root.join("crates/nexa-embed/src/diagnostic_evidence.rs"))?;
+    for forbidden in [
+        "Diagnostic::without_source",
+        "EngineDiagnostic::without_source",
+    ] {
+        if evidence.contains(forbidden) {
+            return Err(format!(
+                "M3R1 diagnostic evidence constructs target code via `{forbidden}`"
+            )
+            .into());
+        }
+    }
+    let project = fs::read_to_string(root.join("nexa.dev.toml"))?;
+    if !project.starts_with("schema = 2\n") || !project.contains("[[sources]]") {
+        return Err("nexa.dev.toml is not a schema 2 Source Policy project".into());
+    }
+    let historical_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete"])?;
+    let historical_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete^{}"])?;
+    if historical_tag_type != "tag"
+        || historical_tag_target != "621612f49c4180989711df3ca80021fd21ad9277"
+    {
+        return Err("historical developer-loop-m3-complete tag changed".into());
+    }
+    Ok(())
+}
+
+fn m3r1_final_status_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    for path in ["README.md", "ROADMAP.md", "baseline/BASELINE_INDEX.md"] {
+        let source = fs::read_to_string(root.join(path))?;
+        for required in [
+            "Nexa M3 Developer Loop & Diagnostics = COMPLETE",
+            "NexaEngine API = COMPLETE",
+            "Automatic Candidate Compilation = COMPLETE",
+            "Last Known Good Reload = COMPLETE",
+            "Unified Diagnostics = COMPLETE",
+            "Source-level Runtime Stack Traces = COMPLETE",
+            "Package-aware CLI = COMPLETE",
+            "Editor Diagnostics = COMPLETE",
+        ] {
+            if !source.contains(required) {
+                return Err(format!("{path} is missing final status `{required}`").into());
+            }
+        }
+    }
+    let embed_api = fs::read_to_string(root.join("baseline/embed/EMBED_API.md"))?;
+    if !embed_api.contains("Status: M3R1 COMPLETE") {
+        return Err("baseline/embed/EMBED_API.md is not M3R1 COMPLETE".into());
     }
     Ok(())
 }

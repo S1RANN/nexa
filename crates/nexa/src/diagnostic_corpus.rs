@@ -103,8 +103,23 @@ pub struct DiagnosticCorpusReport {
     pub source_backed_zero_zero_spans: usize,
     pub source_backed_inexact_spans: usize,
     pub deterministic_cases: usize,
+    pub engine: EngineDiagnosticReport,
     pub case_format: CaseFormatReport,
     pub pipelines: PipelineReport,
+    pub cases: Vec<ObservedDiagnosticCase>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineDiagnosticReport {
+    pub registered: usize,
+    pub observed_through_real_paths: usize,
+    pub direct_diagnostic_construction: usize,
+    pub human_output: usize,
+    pub json_output: usize,
+    pub ndjson_output: usize,
+    pub deterministic: usize,
+    pub codes: Vec<String>,
     pub cases: Vec<ObservedDiagnosticCase>,
 }
 
@@ -340,71 +355,13 @@ pub fn run_runtime_diagnostic_cases(root: &Path) -> Result<RuntimeDiagnosticRepo
     })
 }
 
-pub fn run_engine_diagnostic_cases(root: &Path) -> Result<BinaryDiagnosticReport, String> {
-    let cases = load_cases(root)?;
-    let mut observed = Vec::new();
-    let mut deterministic_cases = 0;
-    for (path, case) in cases {
-        if case.pipeline != "engine" {
-            continue;
-        }
-        if case.version != 1 {
-            return Err(format!("{} has unsupported case version", path.display()));
-        }
-        let execute = || -> Result<ObservedDiagnosticCase, String> {
-            let definition = crate::ERROR_CODE_TABLE
-                .iter()
-                .find(|definition| definition.code.as_str() == case.code)
-                .ok_or_else(|| format!("{} is not registered", case.code))?;
-            let diagnostic = crate::Diagnostic::without_source(
-                definition.code,
-                crate::Severity::Error,
-                nexa_runtime::RuntimeMessage::inline(definition.summary),
-            );
-            let human = diagnostic.to_string();
-            let json = diagnostic.to_json().map_err(|error| error.to_string())?;
-            let passed = human.contains(&case.code)
-                && json.contains(&case.code)
-                && normalized(definition.summary)
-                    .contains(&normalized(&case.expected.message_contains));
-            Ok(ObservedDiagnosticCase {
-                code: case.code.clone(),
-                observed: diagnostic.code.to_string(),
-                pipeline: case.pipeline.clone(),
-                category: case.category.clone(),
-                primary_text: String::new(),
-                primary_start: 0,
-                primary_end: 0,
-                secondary_count: 0,
-                human_output: true,
-                json_output: true,
-                passed,
-            })
-        };
-        let first = execute()?;
-        let second = execute()?;
-        if first != second {
-            return Err(format!("{} was not deterministic", path.display()));
-        }
-        deterministic_cases += 1;
-        observed.push(first);
-    }
-    let passed = observed.iter().filter(|case| case.passed).count();
-    Ok(BinaryDiagnosticReport {
-        schema_version: 1,
-        case_count: observed.len(),
-        passed,
-        deterministic_cases,
-        codes: observed.iter().map(|case| case.code.clone()).collect(),
-        cases: observed,
-    })
-}
-
-pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, String> {
+pub fn run_diagnostic_corpus(
+    root: &Path,
+    engine: EngineDiagnosticReport,
+) -> Result<DiagnosticCorpusReport, String> {
     let compiler = run_compiler_diagnostic_cases(root)?;
     let binary = run_binary_diagnostic_cases(root)?;
     let runtime = run_runtime_diagnostic_cases(root)?;
-    let engine = run_engine_diagnostic_cases(root)?;
     let loaded = load_cases(root)?;
     let invalid_pipelines = loaded
         .iter()
@@ -453,6 +410,8 @@ pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, Stri
     unexpected_codes.extend(observed_set.difference(&fixture_set).cloned());
     unexpected_codes.sort();
     unexpected_codes.dedup();
+    let engine_cases = engine.cases.len();
+    let engine_passed = engine.cases.iter().filter(|case| case.passed).count();
     Ok(DiagnosticCorpusReport {
         schema_version: 1,
         registered_codes: registered_set.len(),
@@ -466,7 +425,7 @@ pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, Stri
         deterministic_cases: compiler.deterministic_cases
             + binary.deterministic_cases
             + runtime.deterministic_cases
-            + engine.deterministic_cases,
+            + engine.deterministic,
         case_format: CaseFormatReport {
             version: 1,
             invalid_pipelines,
@@ -486,10 +445,11 @@ pub fn run_diagnostic_corpus(root: &Path) -> Result<DiagnosticCorpusReport, Stri
                 direct_nexa_error_construction: runtime.direct_nexa_error_construction,
             },
             engine: CountPipelineReport {
-                cases: engine.case_count,
-                passed: engine.passed,
+                cases: engine_cases,
+                passed: engine_passed,
             },
         },
+        engine,
         cases,
     })
 }

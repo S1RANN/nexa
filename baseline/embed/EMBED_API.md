@@ -1,6 +1,6 @@
 # Nexa Embed API
 
-Status: M3 COMPLETE
+Status: M3R1 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust
 application and Nexa Runtime. Applications provide a generated `HostContract`,

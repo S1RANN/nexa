@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::artifact::{CandidateCompilation, compile_package_candidate};
 use crate::contract::ExportRequirement;
 use crate::{
-    CompiledPackageArtifact, EngineDiagnostic, PackageCandidate, PackageId, ReloadReportSummary,
+    EngineDiagnostic, EngineDiagnosticStage, PackageCandidate, PackageId, ReloadReportSummary,
     SourceHash, SourceId,
 };
 
@@ -41,6 +41,7 @@ pub enum DevelopmentState {
     Idle,
     ChangeObserved,
     WaitingForStableWrite,
+    AwaitingQueue,
     CompileQueued,
     Compiling,
     CandidateReady,
@@ -52,6 +53,7 @@ pub enum DevelopmentState {
     MigrationFailed,
     ActivationFaulted,
     HostRebuildRequired,
+    SourceMissing,
 }
 
 #[derive(Clone, Debug)]
@@ -80,6 +82,8 @@ pub enum DevelopmentEvent {
     ReloadRolledBack(DevelopmentEventData),
     ActivationFaulted(DevelopmentEventData),
     HostRebuildRequired(DevelopmentEventData),
+    SourceMissing(DevelopmentEventData),
+    CandidateCancelled(DevelopmentEventData),
 }
 
 impl DevelopmentEvent {
@@ -99,7 +103,9 @@ impl DevelopmentEvent {
             | Self::ReloadCommitted(data)
             | Self::ReloadRolledBack(data)
             | Self::ActivationFaulted(data)
-            | Self::HostRebuildRequired(data) => data,
+            | Self::HostRebuildRequired(data)
+            | Self::SourceMissing(data)
+            | Self::CandidateCancelled(data) => data,
         }
     }
 
@@ -120,17 +126,138 @@ impl DevelopmentEvent {
             Self::ReloadRolledBack(_) => "reload-rolled-back",
             Self::ActivationFaulted(_) => "activation-faulted",
             Self::HostRebuildRequired(_) => "host-rebuild-required",
+            Self::SourceMissing(_) => "source-missing",
+            Self::CandidateCancelled(_) => "candidate-cancelled",
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateTerminalKind {
+    Compiled,
+    CompileFailed,
+    VerifyFailed,
+    SupersededBeforeCompile,
+    SupersededAfterCompile,
+    CancelledByDisable,
+    CancelledBySourceRemoval,
+    CancelledByShutdown,
+    RejectedHostContractChange,
+}
+
+#[derive(Clone, Debug)]
+pub struct CandidateTerminalData {
+    pub package_id: PackageId,
+    pub source_id: SourceId,
+    pub generation: u64,
+    pub source_hash: SourceHash,
+    pub queue_duration: Duration,
+    pub work_duration: Duration,
+}
+
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum CandidateTerminal {
+    Compiled {
+        data: CandidateTerminalData,
+        candidate: PackageCandidate,
+        compilation: CandidateCompilation,
+    },
+    CompileFailed {
+        data: CandidateTerminalData,
+        diagnostic: EngineDiagnostic,
+        compile_duration: Duration,
+        verify_duration: Duration,
+    },
+    VerifyFailed {
+        data: CandidateTerminalData,
+        diagnostic: EngineDiagnostic,
+        compile_duration: Duration,
+        verify_duration: Duration,
+    },
+    SupersededBeforeCompile(CandidateTerminalData),
+    SupersededAfterCompile(CandidateTerminalData),
+    CancelledByDisable(CandidateTerminalData),
+    CancelledBySourceRemoval(CandidateTerminalData),
+    CancelledByShutdown(CandidateTerminalData),
+    RejectedHostContractChange(CandidateTerminalData),
+}
+
+impl CandidateTerminal {
+    #[must_use]
+    pub const fn data(&self) -> &CandidateTerminalData {
+        match self {
+            Self::Compiled { data, .. }
+            | Self::CompileFailed { data, .. }
+            | Self::VerifyFailed { data, .. }
+            | Self::SupersededBeforeCompile(data)
+            | Self::SupersededAfterCompile(data)
+            | Self::CancelledByDisable(data)
+            | Self::CancelledBySourceRemoval(data)
+            | Self::CancelledByShutdown(data)
+            | Self::RejectedHostContractChange(data) => data,
+        }
+    }
+
+    #[must_use]
+    pub const fn kind(&self) -> CandidateTerminalKind {
+        match self {
+            Self::Compiled { .. } => CandidateTerminalKind::Compiled,
+            Self::CompileFailed { .. } => CandidateTerminalKind::CompileFailed,
+            Self::VerifyFailed { .. } => CandidateTerminalKind::VerifyFailed,
+            Self::SupersededBeforeCompile(_) => CandidateTerminalKind::SupersededBeforeCompile,
+            Self::SupersededAfterCompile(_) => CandidateTerminalKind::SupersededAfterCompile,
+            Self::CancelledByDisable(_) => CandidateTerminalKind::CancelledByDisable,
+            Self::CancelledBySourceRemoval(_) => CandidateTerminalKind::CancelledBySourceRemoval,
+            Self::CancelledByShutdown(_) => CandidateTerminalKind::CancelledByShutdown,
+            Self::RejectedHostContractChange(_) => {
+                CandidateTerminalKind::RejectedHostContractChange
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum WorkerEvent {
+    CompileStarted {
+        package_id: PackageId,
+        source_id: SourceId,
+        generation: u64,
+        source_hash: SourceHash,
+        queue_duration: Duration,
+    },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerInspection {
+    pub queued_packages: usize,
+    pub in_flight_package: Option<PackageId>,
+    pub completed_results: usize,
+    pub backpressure_count: u64,
+    pub pending_superseded_count: u64,
+    pub compiled_superseded_count: u64,
+    pub cancelled_count: u64,
 }
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PackageDevelopment {
     pub state: DevelopmentState,
     pub observed_hash: Option<SourceHash>,
-    pub last_processed_hash: Option<SourceHash>,
+    pub stable_hash: Option<SourceHash>,
+    pub queued_hash: Option<SourceHash>,
+    pub in_flight_hash: Option<SourceHash>,
+    pub terminal_hash: Option<SourceHash>,
+    pub active_hash: Option<SourceHash>,
     pub stable_scans: u8,
     pub latest_generation: u64,
+    pub terminal_count: u64,
+    pub terminal_generations: BTreeMap<u64, CandidateTerminalKind>,
+    pub change_observed_at: Option<Instant>,
+    pub last_change_to_stable_duration: Duration,
+    pub last_ready_to_commit_duration: Duration,
+    pub last_quiesce_duration: Duration,
+    pub last_commit_duration: Duration,
+    pub last_total_change_to_visible_duration: Duration,
     pub last_compile_duration: Option<Duration>,
     pub last_reload_duration: Option<Duration>,
     pub last_discovery_duration: Duration,
@@ -146,11 +273,11 @@ pub(crate) struct PackageDevelopment {
 pub(crate) struct ReadyCandidate {
     pub candidate: PackageCandidate,
     pub compilation: CandidateCompilation,
-    pub generation: u64,
+    pub terminal_data: CandidateTerminalData,
 }
 
 #[derive(Clone)]
-pub(crate) struct CompileJob {
+pub struct CompileJob {
     pub package_id: PackageId,
     pub source_id: SourceId,
     pub generation: u64,
@@ -158,28 +285,124 @@ pub(crate) struct CompileJob {
     pub candidate: PackageCandidate,
     pub idl: nexa_idl::Idl,
     pub required_exports: Vec<ExportRequirement>,
-    pub queued_at: Instant,
+    queued_at: Instant,
 }
 
-pub(crate) struct CompileResult {
-    pub package_id: PackageId,
-    pub generation: u64,
-    pub source_hash: SourceHash,
-    pub candidate: PackageCandidate,
-    pub queue_duration: Duration,
-    pub work_duration: Duration,
-    pub result: Result<CandidateCompilation, EngineDiagnostic>,
+impl CompileJob {
+    pub(crate) fn new(
+        package_id: PackageId,
+        source_id: SourceId,
+        generation: u64,
+        source_hash: SourceHash,
+        candidate: PackageCandidate,
+        idl: nexa_idl::Idl,
+        required_exports: Vec<ExportRequirement>,
+    ) -> Self {
+        Self {
+            package_id,
+            source_id,
+            generation,
+            source_hash,
+            candidate,
+            idl,
+            required_exports,
+            queued_at: Instant::now(),
+        }
+    }
+
+    fn from_request(request: DevelopmentCompileRequest) -> Self {
+        let source_hash = SourceHash(nexa_core::StableId::from_parts(&[
+            &request.candidate.manifest_source,
+            "\0",
+            &request.candidate.entry_source,
+        ]));
+        Self::new(
+            request.package_id,
+            request.source_id,
+            request.generation,
+            source_hash,
+            request.candidate,
+            request.idl,
+            request.required_exports,
+        )
+    }
+
+    fn terminal_data(
+        &self,
+        queue_duration: Duration,
+        work_duration: Duration,
+    ) -> CandidateTerminalData {
+        CandidateTerminalData {
+            package_id: self.package_id.clone(),
+            source_id: self.source_id.clone(),
+            generation: self.generation,
+            source_hash: self.source_hash,
+            queue_duration,
+            work_duration,
+        }
+    }
+
+    pub(crate) fn cancel(self, reason: CandidateCancellation) -> CandidateTerminal {
+        let queue_duration = self.queued_at.elapsed();
+        cancelled_terminal(reason, self.terminal_data(queue_duration, Duration::ZERO))
+    }
+
+    pub(crate) fn supersede_before_compile(self) -> CandidateTerminal {
+        let queue_duration = self.queued_at.elapsed();
+        CandidateTerminal::SupersededBeforeCompile(
+            self.terminal_data(queue_duration, Duration::ZERO),
+        )
+    }
+}
+
+#[allow(clippy::large_enum_variant)]
+pub enum EnqueueOutcome {
+    Accepted,
+    ReplacedPending {
+        superseded_generation: u64,
+        terminal: CandidateTerminal,
+    },
+    Backpressured {
+        job: CompileJob,
+    },
+    Stopping {
+        job: CompileJob,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateCancellation {
+    Disable,
+    SourceRemoval,
+    Shutdown,
+}
+
+#[derive(Clone)]
+struct InFlightJob {
+    job: CompileJob,
+    queue_duration: Duration,
+    cancel_reason: Option<CandidateCancellation>,
 }
 
 struct WorkerState {
-    pending: VecDeque<CompileJob>,
-    results: VecDeque<CompileResult>,
+    pending_order: VecDeque<PackageId>,
+    pending_by_package: BTreeMap<PackageId, CompileJob>,
+    in_flight: Option<InFlightJob>,
+    results: VecDeque<CandidateTerminal>,
+    result_count: usize,
+    events: VecDeque<WorkerEvent>,
+    shutdown_terminals: Vec<CandidateTerminal>,
     stopping: bool,
+    backpressure_count: u64,
+    pending_superseded_count: u64,
+    compiled_superseded_count: u64,
+    cancelled_count: u64,
 }
 
 struct WorkerShared {
     state: Mutex<WorkerState>,
-    wake: Condvar,
+    job_available: Condvar,
+    result_space_available: Condvar,
     queue_capacity: usize,
     result_capacity: usize,
 }
@@ -203,14 +426,9 @@ pub struct DevelopmentCompileRequest {
     pub required_exports: Vec<ExportRequirement>,
 }
 
-pub struct DevelopmentCompileResult {
-    pub package_id: PackageId,
-    pub generation: u64,
-    pub source_hash: SourceHash,
-    pub candidate: PackageCandidate,
-    pub queue_duration: Duration,
-    pub work_duration: Duration,
-    pub result: Result<CompiledPackageArtifact, EngineDiagnostic>,
+pub(crate) struct WorkerDrain {
+    pub events: Vec<WorkerEvent>,
+    pub terminals: Vec<CandidateTerminal>,
 }
 
 impl DevelopmentCompiler {
@@ -221,43 +439,41 @@ impl DevelopmentCompiler {
     }
 
     #[must_use]
-    pub fn submit(&self, request: DevelopmentCompileRequest) -> Vec<(PackageId, u64, SourceHash)> {
-        let source_hash = SourceHash(nexa_core::StableId::from_parts(&[
-            &request.candidate.manifest_source,
-            "\0",
-            &request.candidate.entry_source,
-        ]));
-        self.worker.enqueue(CompileJob {
-            package_id: request.package_id,
-            source_id: request.source_id,
-            generation: request.generation,
-            source_hash,
-            candidate: request.candidate,
-            idl: request.idl,
-            required_exports: request.required_exports,
-            queued_at: Instant::now(),
-        })
+    pub fn submit(&self, request: DevelopmentCompileRequest) -> EnqueueOutcome {
+        self.worker.enqueue(CompileJob::from_request(request))
     }
 
     #[must_use]
-    pub fn poll(&self) -> Vec<DevelopmentCompileResult> {
-        self.worker
-            .drain_results()
-            .into_iter()
-            .map(|result| DevelopmentCompileResult {
-                package_id: result.package_id,
-                generation: result.generation,
-                source_hash: result.source_hash,
-                candidate: result.candidate,
-                queue_duration: result.queue_duration,
-                work_duration: result.work_duration,
-                result: result.result.map(|compilation| compilation.artifact),
-            })
-            .collect()
+    pub fn retry(&self, job: CompileJob) -> EnqueueOutcome {
+        self.worker.enqueue(job)
     }
 
-    pub fn shutdown(&mut self) {
-        self.worker.shutdown();
+    #[must_use]
+    pub fn cancel(
+        &self,
+        package_id: &PackageId,
+        reason: CandidateCancellation,
+    ) -> Vec<CandidateTerminal> {
+        self.worker.cancel_package(package_id, reason)
+    }
+
+    #[must_use]
+    pub fn poll(&self) -> Vec<CandidateTerminal> {
+        self.worker.drain_terminals()
+    }
+
+    #[must_use]
+    pub fn poll_events(&self) -> Vec<WorkerEvent> {
+        self.worker.drain_events()
+    }
+
+    #[must_use]
+    pub fn inspection(&self) -> WorkerInspection {
+        self.worker.inspection()
+    }
+
+    pub fn shutdown(&mut self) -> Vec<CandidateTerminal> {
+        self.worker.shutdown().terminals
     }
 }
 
@@ -269,11 +485,21 @@ impl DevelopmentWorker {
         }
         let shared = Arc::new(WorkerShared {
             state: Mutex::new(WorkerState {
-                pending: VecDeque::new(),
+                pending_order: VecDeque::new(),
+                pending_by_package: BTreeMap::new(),
+                in_flight: None,
                 results: VecDeque::new(),
+                result_count: 0,
+                events: VecDeque::new(),
+                shutdown_terminals: Vec::new(),
                 stopping: false,
+                backpressure_count: 0,
+                pending_superseded_count: 0,
+                compiled_superseded_count: 0,
+                cancelled_count: 0,
             }),
-            wake: Condvar::new(),
+            job_available: Condvar::new(),
+            result_space_available: Condvar::new(),
             queue_capacity: config.compile_queue_capacity.max(1),
             result_capacity: config.result_queue_capacity.max(1),
         });
@@ -288,55 +514,152 @@ impl DevelopmentWorker {
         })
     }
 
-    pub fn enqueue(&self, job: CompileJob) -> Vec<(PackageId, u64, SourceHash)> {
+    pub fn enqueue(&self, job: CompileJob) -> EnqueueOutcome {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.stopping {
-            return vec![(job.package_id, job.generation, job.source_hash)];
+            return EnqueueOutcome::Stopping { job };
         }
-        let mut superseded = Vec::new();
-        let mut index = 0;
-        while index < state.pending.len() {
-            if state.pending[index].package_id == job.package_id {
-                let old = state.pending.remove(index).expect("index is in bounds");
-                superseded.push((old.package_id, old.generation, old.source_hash));
-            } else {
-                index += 1;
+        let package_id = job.package_id.clone();
+        let mut completed_superseded = 0_u64;
+        for terminal in &mut state.results {
+            if terminal.data().package_id == package_id
+                && terminal.data().generation < job.generation
+                && matches!(
+                    terminal,
+                    CandidateTerminal::Compiled { .. }
+                        | CandidateTerminal::CompileFailed { .. }
+                        | CandidateTerminal::VerifyFailed { .. }
+                )
+            {
+                let data = terminal.data().clone();
+                *terminal = CandidateTerminal::SupersededAfterCompile(data);
+                completed_superseded = completed_superseded.saturating_add(1);
             }
         }
-        while state.pending.len() >= self.shared.queue_capacity {
-            if let Some(old) = state.pending.pop_front() {
-                superseded.push((old.package_id, old.generation, old.source_hash));
-            }
+        state.compiled_superseded_count = state
+            .compiled_superseded_count
+            .saturating_add(completed_superseded);
+        if let Some(old) = state.pending_by_package.get_mut(&package_id) {
+            let old = std::mem::replace(old, job);
+            state.pending_superseded_count = state.pending_superseded_count.saturating_add(1);
+            let superseded_generation = old.generation;
+            let terminal = CandidateTerminal::SupersededBeforeCompile(
+                old.terminal_data(old.queued_at.elapsed(), Duration::ZERO),
+            );
+            self.shared.job_available.notify_one();
+            return EnqueueOutcome::ReplacedPending {
+                superseded_generation,
+                terminal,
+            };
         }
-        state.pending.push_back(job);
-        self.shared.wake.notify_one();
-        superseded
+        if state.pending_by_package.len() >= self.shared.queue_capacity {
+            state.backpressure_count = state.backpressure_count.saturating_add(1);
+            return EnqueueOutcome::Backpressured { job };
+        }
+        state.pending_by_package.insert(package_id.clone(), job);
+        state.pending_order.push_back(package_id);
+        self.shared.job_available.notify_one();
+        EnqueueOutcome::Accepted
     }
 
-    pub fn drain_results(&self) -> Vec<CompileResult> {
+    pub fn cancel_package(
+        &self,
+        package_id: &PackageId,
+        reason: CandidateCancellation,
+    ) -> Vec<CandidateTerminal> {
         let mut state = self
             .shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.results.drain(..).collect()
+        let mut terminals = Vec::new();
+        if let Some(job) = state.pending_by_package.remove(package_id) {
+            state.pending_order.retain(|queued| queued != package_id);
+            state.cancelled_count = state.cancelled_count.saturating_add(1);
+            terminals.push(cancelled_terminal(
+                reason,
+                job.terminal_data(job.queued_at.elapsed(), Duration::ZERO),
+            ));
+        }
+        if let Some(in_flight) = state.in_flight.as_mut()
+            && in_flight.job.package_id == *package_id
+        {
+            in_flight.cancel_reason = Some(reason);
+        }
+        let mut converted = 0_u64;
+        for terminal in &mut state.results {
+            if terminal.data().package_id == *package_id {
+                let data = terminal.data().clone();
+                *terminal = cancelled_terminal(reason, data);
+                converted = converted.saturating_add(1);
+            }
+        }
+        state.cancelled_count = state.cancelled_count.saturating_add(converted);
+        terminals
     }
 
-    #[must_use]
-    pub fn queued_len(&self) -> usize {
+    pub fn drain(&self) -> WorkerDrain {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let terminals = state.results.drain(..).collect::<Vec<_>>();
+        state.result_count = 0;
+        let events = state.events.drain(..).collect();
+        self.shared.result_space_available.notify_all();
+        WorkerDrain { events, terminals }
+    }
+
+    fn drain_terminals(&self) -> Vec<CandidateTerminal> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let terminals = state.results.drain(..).collect();
+        state.result_count = 0;
+        self.shared.result_space_available.notify_all();
+        terminals
+    }
+
+    fn drain_events(&self) -> Vec<WorkerEvent> {
         self.shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending
-            .len()
+            .events
+            .drain(..)
+            .collect()
     }
 
-    pub fn shutdown(&mut self) {
+    #[must_use]
+    pub fn inspection(&self) -> WorkerInspection {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        WorkerInspection {
+            queued_packages: state.pending_by_package.len(),
+            in_flight_package: state
+                .in_flight
+                .as_ref()
+                .map(|in_flight| in_flight.job.package_id.clone()),
+            completed_results: state.result_count,
+            backpressure_count: state.backpressure_count,
+            pending_superseded_count: state.pending_superseded_count,
+            compiled_superseded_count: state.compiled_superseded_count,
+            cancelled_count: state.cancelled_count,
+        }
+    }
+
+    pub fn shutdown(&mut self) -> WorkerDrain {
+        let mut immediate = Vec::new();
         {
             let mut state = self
                 .shared
@@ -344,21 +667,48 @@ impl DevelopmentWorker {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.stopping = true;
-            state.pending.clear();
-            self.shared.wake.notify_all();
+            let pending = std::mem::take(&mut state.pending_by_package);
+            state.pending_order.clear();
+            for (_, job) in pending {
+                state.cancelled_count = state.cancelled_count.saturating_add(1);
+                immediate.push(CandidateTerminal::CancelledByShutdown(
+                    job.terminal_data(job.queued_at.elapsed(), Duration::ZERO),
+                ));
+            }
+            if let Some(in_flight) = state.in_flight.as_mut() {
+                in_flight.cancel_reason = Some(CandidateCancellation::Shutdown);
+            }
+            immediate.extend(state.results.drain(..));
+            state.result_count = 0;
+            self.shared.job_available.notify_all();
+            self.shared.result_space_available.notify_all();
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
+        }
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        immediate.extend(state.results.drain(..));
+        immediate.append(&mut state.shutdown_terminals);
+        state.result_count = 0;
+        let events = state.events.drain(..).collect();
+        WorkerDrain {
+            events,
+            terminals: immediate,
         }
     }
 }
 
 impl Drop for DevelopmentWorker {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn worker_loop(shared: &WorkerShared) {
     loop {
         let job = {
@@ -366,18 +716,39 @@ fn worker_loop(shared: &WorkerShared) {
                 .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            while state.pending.is_empty() && !state.stopping {
+            while state.pending_order.is_empty() && !state.stopping {
                 state = shared
-                    .wake
+                    .job_available
                     .wait(state)
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
             }
             if state.stopping {
                 return;
             }
-            state.pending.pop_front().expect("queue is non-empty")
+            let package_id = state
+                .pending_order
+                .pop_front()
+                .expect("pending order is non-empty");
+            let job = state
+                .pending_by_package
+                .remove(&package_id)
+                .expect("pending order and map remain consistent");
+            let queue_duration = job.queued_at.elapsed();
+            state.events.push_back(WorkerEvent::CompileStarted {
+                package_id: job.package_id.clone(),
+                source_id: job.source_id.clone(),
+                generation: job.generation,
+                source_hash: job.source_hash,
+                queue_duration,
+            });
+            state.in_flight = Some(InFlightJob {
+                job: job.clone(),
+                queue_duration,
+                cancel_reason: None,
+            });
+            job
         };
-        let queue_duration = job.queued_at.elapsed();
+
         let work_started = Instant::now();
         let result = compile_package_candidate(
             &job.idl,
@@ -385,24 +756,75 @@ fn worker_loop(shared: &WorkerShared) {
             &job.source_id,
             &job.candidate,
         );
+        let work_duration = work_started.elapsed();
+
         let mut state = shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while state.result_count >= shared.result_capacity && !state.stopping {
+            state = shared
+                .result_space_available
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        let in_flight = state
+            .in_flight
+            .take()
+            .expect("the Worker owns exactly one in-flight Job");
+        let data = job.terminal_data(in_flight.queue_duration, work_duration);
         if state.stopping {
+            state.cancelled_count = state.cancelled_count.saturating_add(1);
+            state
+                .shutdown_terminals
+                .push(CandidateTerminal::CancelledByShutdown(data));
             return;
         }
-        while state.results.len() >= shared.result_capacity {
-            state.results.pop_front();
-        }
-        state.results.push_back(CompileResult {
-            package_id: job.package_id,
-            generation: job.generation,
-            source_hash: job.source_hash,
-            candidate: job.candidate,
-            queue_duration,
-            work_duration: work_started.elapsed(),
-            result,
-        });
+        let terminal = if let Some(reason) = in_flight.cancel_reason {
+            state.cancelled_count = state.cancelled_count.saturating_add(1);
+            cancelled_terminal(reason, data)
+        } else if state
+            .pending_by_package
+            .get(&job.package_id)
+            .is_some_and(|pending| pending.generation > job.generation)
+        {
+            state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(1);
+            CandidateTerminal::SupersededAfterCompile(data)
+        } else {
+            match result {
+                Ok(compilation) => CandidateTerminal::Compiled {
+                    data,
+                    candidate: job.candidate,
+                    compilation,
+                },
+                Err(failure) if failure.diagnostic.stage == EngineDiagnosticStage::Verify => {
+                    CandidateTerminal::VerifyFailed {
+                        data,
+                        diagnostic: failure.diagnostic,
+                        compile_duration: failure.compile_duration,
+                        verify_duration: failure.verify_duration,
+                    }
+                }
+                Err(failure) => CandidateTerminal::CompileFailed {
+                    data,
+                    diagnostic: failure.diagnostic,
+                    compile_duration: failure.compile_duration,
+                    verify_duration: failure.verify_duration,
+                },
+            }
+        };
+        state.results.push_back(terminal);
+        state.result_count = state.result_count.saturating_add(1);
+    }
+}
+
+fn cancelled_terminal(
+    reason: CandidateCancellation,
+    data: CandidateTerminalData,
+) -> CandidateTerminal {
+    match reason {
+        CandidateCancellation::Disable => CandidateTerminal::CancelledByDisable(data),
+        CandidateCancellation::SourceRemoval => CandidateTerminal::CancelledBySourceRemoval(data),
+        CandidateCancellation::Shutdown => CandidateTerminal::CancelledByShutdown(data),
     }
 }

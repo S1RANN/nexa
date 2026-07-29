@@ -13,8 +13,17 @@ cargo xtask test-model
 cargo xtask fuzz-smoke
 cargo xtask bench-smoke
 cargo xtask repo-audit
+cargo xtask test-engine-api
+cargo xtask test-diagnostics
+cargo xtask test-dev-loop
+cargo xtask test-cli
+cargo xtask test-lsp
+cargo xtask editor-check
+cargo xtask dev-loop-stress
 cargo xtask check
 cargo xtask finalize-m1
+cargo xtask finalize-m2
+cargo xtask finalize-m3-r1
 ```
 
 Unit tests cover parser, type checking, bytecode, verifier, migration, and
@@ -29,6 +38,13 @@ runs three independent 1000-sample processes and enforces only the absolute
 budgets: p95 at most 100 microseconds and 1000 calls at most 100 milliseconds.
 
 Generated artifacts belong in `target/nexa-artifacts/`.
+
+`finalize-m3-r1` independently reruns workspace fmt/check/clippy/test/doc,
+M1/M2 regressions, real Engine diagnostic evidence, Worker queue and Result
+backpressure races, Reload stress, metric consistency, CLI Source Policy, NIDL
+Span and URI/LSP coverage, editor checks, repository audits, clean-worktree
+validation, and annotated-tag validation. Its report is written to
+`target/nexa-artifacts/m3r1-finalize/final-report.json`.
 
 `test-binding` includes all 20 textual IDL mutation crates against the
 handwritten `BusinessHostV1`. Every changed crate compiles its changed script

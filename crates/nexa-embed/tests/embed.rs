@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -61,6 +62,28 @@ impl HostRegistry for TrappingRegistry {
     }
 }
 
+struct MeteredRegistry(StableId);
+
+impl HostRegistry for MeteredRegistry {
+    fn interface_hash(&self) -> Option<StableId> {
+        Some(self.0)
+    }
+
+    fn call_runtime(
+        &mut self,
+        id: u32,
+        _: &mut ResourceContext<'_>,
+        args: RuntimeHostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        if id != 0 {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
+            args.i32(0)?.saturating_add(1),
+        )))
+    }
+}
+
 struct Run;
 
 impl ScriptExport for Run {
@@ -98,6 +121,40 @@ impl ScriptExport for Run {
             .value(value)
             .i32()
             .map_err(|_| ScriptCallError::OutputDecoding)
+    }
+}
+
+struct MeterRun;
+
+impl ScriptExport for MeterRun {
+    type Args = i32;
+    type Output = i32;
+
+    const STABLE_ID: StableId = StableId(0x45a3_6e76_9a57_b233);
+    const NAME: &'static str = "Run";
+
+    fn signature() -> Signature {
+        Run::signature()
+    }
+
+    fn argument_requirements(
+        args: &Self::Args,
+    ) -> Result<ScriptArgumentRequirements, ScriptCallError> {
+        Run::argument_requirements(args)
+    }
+
+    fn encode_args(
+        writer: &mut ScriptCallWriter<'_>,
+        args: &Self::Args,
+    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+        Run::encode_args(writer, args)
+    }
+
+    fn decode_output(
+        reader: &ScriptOutputReader<'_>,
+        value: RuntimeValue,
+    ) -> Result<Self::Output, ScriptCallError> {
+        Run::decode_output(reader, value)
     }
 }
 
@@ -180,6 +237,59 @@ fn memory_source_enables_calls_disables_and_shuts_down() {
     engine.disable(&id).expect("disable");
     assert_eq!(engine.health().enabled_packages, 0);
     assert_eq!(engine.health().host_pending_releases, 0);
+    engine.shutdown().expect("shutdown");
+}
+
+#[test]
+fn engine_records_instruction_count_independently_from_fuel_charge() {
+    const METER_IDL: &str = "interface MeterHost {
+        sync fuel 11 fn expensive(value: i32) -> i32;
+        export Run(value: i32) -> i32;
+    }";
+    let idl = nexa_idl::parse(METER_IDL).expect("meter IDL");
+    let contract = HostContract {
+        interface_name: "MeterHost",
+        canonical_idl: METER_IDL,
+        interface_hash: nexa_idl::exact_hash(&idl),
+        generator_schema_version: nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
+    };
+    let hash = contract.interface_hash;
+    let source = MemorySource::new(
+        SourceId::new("meter").expect("source ID"),
+        policy([ActivationPolicy::DefaultEnabled]),
+    )
+    .package(
+        manifest("tests.meter", "default-enabled", ""),
+        "module tests.meter;
+         import meter;
+         fn Run(value: i32) -> i32 { return meter.expensive(value); }",
+    );
+    let mut engine = NexaEngine::builder(contract)
+        .host_factory(move |_: &nexa_embed::PackageContext| {
+            Box::new(MeteredRegistry(hash)) as Box<dyn HostRegistry>
+        })
+        .package_source(source)
+        .require_export::<MeterRun>()
+        .build()
+        .expect("meter Engine");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let package_id = PackageId::new("tests.meter").expect("package ID");
+    assert_eq!(
+        engine
+            .call::<MeterRun>(&package_id, &7)
+            .expect("metered call")
+            .value,
+        8
+    );
+    let inspection = engine.inspection();
+    let package = inspection
+        .packages
+        .iter()
+        .find(|package| package.package_id == package_id)
+        .expect("metered Package inspection");
+    assert!(package.handler_instructions_this_tick > 0);
+    assert!(package.fuel_used_this_tick > package.handler_instructions_this_tick);
     engine.shutdown().expect("shutdown");
 }
 
@@ -305,6 +415,32 @@ impl PackageSource for SharedSource {
             self.manifest.clone(),
             self.script.read().expect("source lock").clone(),
         )])
+    }
+}
+
+#[derive(Clone)]
+struct RemovableSource {
+    source: SharedSource,
+    available: Arc<RwLock<bool>>,
+}
+
+impl PackageSource for RemovableSource {
+    fn id(&self) -> &SourceId {
+        &self.source.id
+    }
+
+    fn policy(&self) -> &PackagePolicy {
+        &self.source.policy
+    }
+
+    fn discover(&self) -> Result<Vec<PackageCandidate>, PackageSourceError> {
+        if !*self.available.read().expect("availability lock") {
+            return Err(PackageSourceError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Package source disappeared",
+            )));
+        }
+        self.source.discover()
     }
 }
 
@@ -696,6 +832,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     let script = Arc::new(RwLock::new(
         "module tests.dev;\nimport test;\n\
@@ -746,19 +883,41 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
         2
     );
 
-    let mut committed = false;
+    let mut committed = None;
     for _ in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let report = engine.tick().expect("candidate tick");
-        committed |= report
-            .reloads
-            .iter()
-            .any(nexa_embed::ReloadReport::committed);
-        if committed {
+        committed = committed.or_else(|| {
+            report
+                .reloads
+                .into_iter()
+                .find(nexa_embed::ReloadReport::committed)
+        });
+        if committed.is_some() {
             break;
         }
     }
-    assert!(committed);
+    let committed = committed.expect("committed Reload report");
+    assert!(committed.compile_duration > std::time::Duration::ZERO);
+    assert!(committed.verify_duration > std::time::Duration::ZERO);
+    assert_eq!(
+        committed.reload_duration,
+        committed
+            .quiesce_duration
+            .saturating_add(committed.migration_duration)
+            .saturating_add(committed.commit_duration)
+            .saturating_add(committed.activation_duration)
+    );
+    assert_eq!(
+        committed.total_change_to_visible_duration,
+        committed
+            .change_to_stable_duration
+            .saturating_add(committed.queue_duration)
+            .saturating_add(committed.compile_duration)
+            .saturating_add(committed.verify_duration)
+            .saturating_add(committed.ready_to_commit_duration)
+            .saturating_add(committed.reload_duration)
+    );
     assert_eq!(engine.call::<Run>(&id, &1).expect("new active").value, 3);
 
     *script.write().expect("source lock") =
@@ -786,6 +945,176 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
         3
     );
     engine.shutdown().expect("worker joins");
+}
+
+#[test]
+fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearance() {
+    let script = Arc::new(RwLock::new(
+        "module tests.removable;\nimport test;\n\
+         fn Run(value: i32) -> i32 { return value + 1; }"
+            .to_owned(),
+    ));
+    let available = Arc::new(RwLock::new(true));
+    let source = RemovableSource {
+        source: SharedSource {
+            id: SourceId::new("removable").expect("source ID"),
+            policy: policy([ActivationPolicy::DefaultEnabled]),
+            manifest: manifest("tests.removable", "default-enabled", ""),
+            script: Arc::clone(&script),
+        },
+        available: Arc::clone(&available),
+    };
+    let mut engine = builder(source)
+        .development(DevelopmentConfig {
+            scan_interval_ticks: 1,
+            stable_scan_count: 1,
+            ..DevelopmentConfig::default()
+        })
+        .build()
+        .expect("build");
+    engine.discover().expect("discover");
+    engine.enable_defaults().expect("enable");
+    let package_id = PackageId::new("tests.removable").expect("package ID");
+
+    *script.write().expect("source lock") =
+        "module tests.removable;\nimport test;\nfn Run(value: i32) -> i32 { return value + 2; }"
+            .into();
+    engine.tick().expect("queue changed source");
+    *available.write().expect("availability lock") = false;
+    let missing = engine.tick().expect("observe source removal");
+    assert!(
+        missing
+            .development_events
+            .iter()
+            .any(|event| matches!(event, DevelopmentEvent::SourceMissing(_)))
+    );
+    assert!(
+        missing
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.diagnostic.code == nexa::ErrorCode::NX7001)
+    );
+    assert_eq!(engine.status(&package_id), Some(PackageStatus::Enabled));
+    assert_eq!(
+        engine
+            .call::<Run>(&package_id, &1)
+            .expect("old active Package remains callable")
+            .value,
+        2
+    );
+    for _ in 0..100 {
+        engine.tick().expect("drain cancelled generation");
+        if engine.inspection().development.generations_without_terminal == 0 {
+            break;
+        }
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        engine.inspection().development.generations_without_terminal,
+        0
+    );
+
+    *available.write().expect("availability lock") = true;
+    let mut committed = false;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        committed |= engine
+            .tick()
+            .expect("reappearance tick")
+            .reloads
+            .iter()
+            .any(nexa_embed::ReloadReport::committed);
+        if committed {
+            break;
+        }
+    }
+    assert!(committed);
+    assert_eq!(
+        engine
+            .call::<Run>(&package_id, &1)
+            .expect("reappeared Candidate")
+            .value,
+        3
+    );
+    engine.shutdown().expect("shutdown");
+}
+
+#[test]
+fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
+    let script = Arc::new(RwLock::new(
+        "module tests.disable_race;\nimport test;\n\
+         fn Run(value: i32) -> i32 { return value + 1; }"
+            .to_owned(),
+    ));
+    let source = SharedSource {
+        id: SourceId::new("disable-race").expect("source ID"),
+        policy: policy([ActivationPolicy::UserControlled]),
+        manifest: manifest("tests.disable-race", "user-controlled", ""),
+        script: Arc::clone(&script),
+    };
+    let mut engine = builder(source)
+        .development(DevelopmentConfig {
+            scan_interval_ticks: 1,
+            stable_scan_count: 1,
+            ..DevelopmentConfig::default()
+        })
+        .build()
+        .expect("build");
+    engine.discover().expect("discover");
+    let package_id = PackageId::new("tests.disable-race").expect("package ID");
+    engine.enable(&package_id).expect("enable");
+    let mut slow =
+        String::from("module tests.disable_race;\nimport test;\nfn Run(value: i32) -> i32 {\n");
+    for index in 0..1_000 {
+        writeln!(&mut slow, "let value_{index}: i32 = {index};").expect("write slow source");
+    }
+    slow.push_str("return value + 2;\n}\n");
+    *script.write().expect("source lock") = slow;
+    engine.tick().expect("queue slow Candidate");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while engine
+        .inspection()
+        .development
+        .worker
+        .in_flight_package
+        .as_ref()
+        != Some(&package_id)
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert_eq!(
+        engine
+            .inspection()
+            .development
+            .worker
+            .in_flight_package
+            .as_ref(),
+        Some(&package_id)
+    );
+    engine
+        .disable(&package_id)
+        .expect("disable in-flight Package");
+    let mut saw_ready = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        let report = engine.tick().expect("drain late Worker result");
+        saw_ready |= report
+            .development_events
+            .iter()
+            .any(|event| matches!(event, DevelopmentEvent::CandidateReady(_)));
+        if engine.inspection().development.generations_without_terminal == 0 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(!saw_ready);
+    assert_eq!(engine.status(&package_id), Some(PackageStatus::Disabled));
+    assert_eq!(
+        engine.inspection().development.generations_without_terminal,
+        0
+    );
+    engine.shutdown().expect("shutdown");
 }
 
 #[test]

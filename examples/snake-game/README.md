@@ -25,9 +25,12 @@ Gameplay is paused while a menu is open. Package mutations remain queued and
 are applied at the game Tick safe point.
 
 With M3 development mode enabled, stable source saves compile on the bounded
-background worker. Only the newest verified generation can Reload at the game
-Tick safe point; a failed Candidate leaves the active package and Last Known
-Good unchanged. Use the repository `nexa.dev.toml` with `nexa check` or
+background worker. Queue and Result capacity apply lossless backpressure, and
+every Generation ends as compiled, failed, superseded, or explicitly
+cancelled. Only the newest verified generation can Reload at the game Tick
+safe point; a failed Candidate leaves the active package and Last Known Good
+unchanged. The schema 2 repository `nexa.dev.toml` assigns separate real
+policies to built-in, DLC, and local Mod roots. Use it with `nexa check` or
 `nexa dev` for the same nine-package headless compiler loop.
 
 Headless validation:

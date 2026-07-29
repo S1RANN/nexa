@@ -6,12 +6,14 @@ use nexa_embed::{
     EngineDiagnostic, EngineDiagnosticStage, PackageCandidate, SourceFileRegistry, SourceId,
 };
 use serde_json::{Value, json};
+use url::Url;
 
 use crate::project;
 
 #[derive(Clone)]
 struct OpenDocument {
     text: String,
+    version: i64,
 }
 
 pub fn run() -> Result<(), String> {
@@ -22,6 +24,7 @@ pub fn run() -> Result<(), String> {
     run_session(&mut reader, &mut writer)
 }
 
+#[allow(clippy::too_many_lines)]
 fn run_session(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(), String> {
     let mut documents = BTreeMap::<String, OpenDocument>::new();
     let mut shutdown = false;
@@ -53,15 +56,28 @@ fn run_session(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(),
                 let params = &message["params"]["textDocument"];
                 let uri = required_str(params, "uri")?.to_owned();
                 let text = required_str(params, "text")?.to_owned();
-                documents.insert(uri.clone(), OpenDocument { text });
+                let version = params.get("version").and_then(Value::as_i64).unwrap_or(0);
+                documents.insert(uri.clone(), OpenDocument { text, version });
                 publish_for(
                     writer,
                     &uri,
                     documents.get(&uri).map(|doc| doc.text.as_str()),
+                    Some(version),
                 )?;
             }
             Some("textDocument/didChange") => {
-                let uri = required_str(&message["params"]["textDocument"], "uri")?.to_owned();
+                let document = &message["params"]["textDocument"];
+                let uri = required_str(document, "uri")?.to_owned();
+                let version = document
+                    .get("version")
+                    .and_then(Value::as_i64)
+                    .ok_or("didChange has no document version")?;
+                if documents
+                    .get(&uri)
+                    .is_some_and(|document| version <= document.version)
+                {
+                    continue;
+                }
                 let text = message["params"]["contentChanges"]
                     .as_array()
                     .and_then(|changes| changes.last())
@@ -69,42 +85,42 @@ fn run_session(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(),
                     .and_then(Value::as_str)
                     .ok_or("didChange has no full document text")?
                     .to_owned();
-                documents.insert(uri.clone(), OpenDocument { text });
+                documents.insert(uri.clone(), OpenDocument { text, version });
                 publish_for(
                     writer,
                     &uri,
                     documents.get(&uri).map(|doc| doc.text.as_str()),
+                    Some(version),
                 )?;
             }
             Some("textDocument/didSave") => {
                 let uri = required_str(&message["params"]["textDocument"], "uri")?.to_owned();
                 if let Some(text) = message["params"].get("text").and_then(Value::as_str) {
+                    let version = documents.get(&uri).map_or(0, |document| document.version);
                     documents.insert(
                         uri.clone(),
                         OpenDocument {
                             text: text.to_owned(),
+                            version,
                         },
                     );
                 }
+                let version = documents.get(&uri).map(|document| document.version);
                 publish_for(
                     writer,
                     &uri,
                     documents.get(&uri).map(|doc| doc.text.as_str()),
+                    version,
                 )?;
             }
             Some("textDocument/didClose") => {
                 let uri = required_str(&message["params"]["textDocument"], "uri")?.to_owned();
                 documents.remove(&uri);
-                let path = file_uri_to_path(&uri)?;
-                if path.is_file() {
-                    publish_for(writer, &uri, None)?;
-                } else {
-                    notify(
-                        writer,
-                        "textDocument/publishDiagnostics",
-                        &json!({"uri": uri, "diagnostics": []}),
-                    )?;
-                }
+                notify(
+                    writer,
+                    "textDocument/publishDiagnostics",
+                    &json!({"uri": uri, "diagnostics": []}),
+                )?;
             }
             Some("shutdown") => {
                 shutdown = true;
@@ -125,7 +141,12 @@ fn run_session(reader: &mut impl BufRead, writer: &mut impl Write) -> Result<(),
     Ok(())
 }
 
-fn publish_for(writer: &mut impl Write, uri: &str, overlay: Option<&str>) -> Result<(), String> {
+fn publish_for(
+    writer: &mut impl Write,
+    uri: &str,
+    overlay: Option<&str>,
+    version: Option<i64>,
+) -> Result<(), String> {
     let path = file_uri_to_path(uri)?;
     let diagnostics = diagnostics_for_path(&path, overlay)?;
     let diagnostic_root = find_upward(&path, "package.toml")
@@ -138,7 +159,7 @@ fn publish_for(writer: &mut impl Write, uri: &str, overlay: Option<&str>) -> Res
     notify(
         writer,
         "textDocument/publishDiagnostics",
-        &json!({"uri": uri, "diagnostics": diagnostics}),
+        &json!({"uri": uri, "version": version, "diagnostics": diagnostics}),
     )
 }
 
@@ -165,16 +186,41 @@ fn diagnostics_for_path(
                         source,
                     )])
                     .map_err(|error| error.to_string())?;
-                    let file = registry.files().next().cloned();
-                    let mut diagnostic = EngineDiagnostic::without_source(
-                        None,
-                        None,
-                        EngineDiagnosticStage::Parse,
+                    let file_id = registry
+                        .file_id(
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or("contract.nidl"),
+                        )
+                        .ok_or("NIDL source file was not registered")?;
+                    let mut leaf = nexa::Diagnostic::from_parts(
                         nexa::ErrorCode::NX1002,
-                        error.to_string(),
+                        nexa::Severity::Error,
+                        nexa_runtime::RuntimeMessage::inline(&error.message),
+                        nexa::Label {
+                            span: nexa_core::SourceSpan::new(
+                                file_id,
+                                u32::try_from(error.start).unwrap_or(u32::MAX),
+                                u32::try_from(error.end).unwrap_or(u32::MAX),
+                            ),
+                            message: nexa_runtime::RuntimeMessage::inline(&format!(
+                                "expected {}, found {}",
+                                error.expected, error.actual
+                            )),
+                        },
                     );
-                    diagnostic.file = file;
-                    Ok(vec![diagnostic])
+                    leaf.notes
+                        .push(nexa_runtime::RuntimeMessage::inline(&format!(
+                            "expected: {}; actual: {}",
+                            error.expected, error.actual
+                        )));
+                    Ok(vec![EngineDiagnostic::from_leaf(
+                        None,
+                        SourceId::new("editor").ok(),
+                        EngineDiagnosticStage::Parse,
+                        leaf,
+                        Some(&registry),
+                    )])
                 }
             }
         }
@@ -192,7 +238,7 @@ fn diagnostics_for_nexa(
         if let Some(package) = find_upward(path, "package.toml")
             .and_then(|manifest| manifest.parent().map(Path::to_path_buf))
         {
-            let (source_id, mut candidate) = match project::load_package_candidate(&package) {
+            let (source_id, mut candidate) = match project.load_candidate(&package) {
                 Ok(candidate) => candidate,
                 Err(diagnostic) => return Ok(vec![diagnostic]),
             };
@@ -288,7 +334,7 @@ fn lsp_diagnostic(diagnostic: &EngineDiagnostic, diagnostic_root: Option<&Path>)
             };
             Some(json!({
                 "location": {
-                    "uri": path_to_file_uri(&path),
+                    "uri": path_to_file_uri(&path).ok()?,
                     "range": {
                         "start": {"line": start.line, "character": start.character},
                         "end": {"line": end.line, "character": end.character}
@@ -396,46 +442,86 @@ fn find_upward(path: &Path, name: &str) -> Option<PathBuf> {
 }
 
 fn file_uri_to_path(uri: &str) -> Result<PathBuf, String> {
-    let encoded = uri
-        .strip_prefix("file://")
-        .ok_or_else(|| format!("unsupported document URI: {uri}"))?;
-    let mut decoded = Vec::with_capacity(encoded.len());
-    let bytes = encoded.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' && index + 2 < bytes.len() {
-            let high = hex(bytes[index + 1]).ok_or("invalid URI escape")?;
-            let low = hex(bytes[index + 2]).ok_or("invalid URI escape")?;
-            decoded.push((high << 4) | low);
-            index += 3;
-        } else {
-            decoded.push(bytes[index]);
-            index += 1;
-        }
+    let url = Url::parse(uri).map_err(|error| format!("invalid document URI `{uri}`: {error}"))?;
+    if url.scheme() != "file" {
+        return Err(format!("unsupported document URI scheme: {}", url.scheme()));
     }
-    String::from_utf8(decoded)
-        .map(PathBuf::from)
-        .map_err(|error| format!("document URI is not UTF-8: {error}"))
-}
-
-fn path_to_file_uri(path: &Path) -> String {
+    if let Some(host) = url
+        .host_str()
+        .filter(|host| !host.is_empty() && *host != "localhost")
+    {
+        let decoded = percent_decoded_path(&url)?;
+        return Ok(PathBuf::from(format!("//{host}{decoded}")));
+    }
+    let mut path = url
+        .to_file_path()
+        .map_err(|()| format!("document URI is not a valid file path: {uri}"))?;
     let rendered = path.to_string_lossy();
-    format!("file://{}", rendered.replace(' ', "%20"))
+    if rendered.len() >= 4
+        && rendered.starts_with('/')
+        && rendered.as_bytes()[1].is_ascii_alphabetic()
+        && rendered.as_bytes()[2] == b':'
+        && rendered.as_bytes()[3] == b'/'
+    {
+        path = PathBuf::from(&rendered[1..]);
+    }
+    Ok(path)
 }
 
-const fn hex(value: u8) -> Option<u8> {
-    match value {
-        b'0'..=b'9' => Some(value - b'0'),
-        b'a'..=b'f' => Some(value - b'a' + 10),
-        b'A'..=b'F' => Some(value - b'A' + 10),
-        _ => None,
+fn path_to_file_uri(path: &Path) -> Result<String, String> {
+    let rendered = path.to_string_lossy().replace('\\', "/");
+    if rendered.len() >= 3
+        && rendered.as_bytes()[0].is_ascii_alphabetic()
+        && rendered.as_bytes()[1] == b':'
+        && rendered.as_bytes()[2] == b'/'
+    {
+        let (drive, remainder) = rendered
+            .split_once('/')
+            .expect("recognized Windows path contains a separator");
+        let mut url = Url::parse(&format!("file:///{drive}/"))
+            .map_err(|error| format!("invalid Windows drive `{drive}`: {error}"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|()| "Windows file URL cannot contain path segments")?;
+            segments.pop_if_empty();
+            segments.extend(remainder.split('/'));
+        }
+        return Ok(url.into());
     }
+    if let Some(unc) = rendered.strip_prefix("//") {
+        let (host, path) = unc
+            .split_once('/')
+            .ok_or("UNC path must contain a server and share")?;
+        let mut url = Url::parse(&format!("file://{host}/"))
+            .map_err(|error| format!("invalid UNC host `{host}`: {error}"))?;
+        {
+            let mut segments = url
+                .path_segments_mut()
+                .map_err(|()| "UNC file URL cannot contain path segments")?;
+            segments.pop_if_empty();
+            segments.extend(path.split('/'));
+        }
+        return Ok(url.into());
+    }
+    Url::from_file_path(path)
+        .map(String::from)
+        .map_err(|()| format!("path is not absolute: {}", path.display()))
+}
+
+fn percent_decoded_path(url: &Url) -> Result<String, String> {
+    let local = Url::parse(&format!("file://{}", url.path()))
+        .map_err(|error| format!("invalid file URI path: {error}"))?;
+    local
+        .to_file_path()
+        .map(|path| path.to_string_lossy().into_owned())
+        .map_err(|()| "file URI path could not be decoded".into())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use serde_json::json;
 
@@ -486,6 +572,47 @@ mod tests {
     }
 
     #[test]
+    fn lsp_idl_diagnostic_uses_the_parser_token_span() {
+        let source = "interface Valid {\n    sync fn broken(value: i32) i32;\n}";
+        let diagnostics =
+            super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-precise.nidl"), Some(source))
+                .expect("invalid IDL diagnostics");
+        assert_eq!(diagnostics.len(), 1);
+        let diagnostic = &diagnostics[0];
+        let primary = diagnostic
+            .diagnostic
+            .primary
+            .as_ref()
+            .expect("NIDL primary Span");
+        let actual_start = source.rfind("i32;").expect("actual token");
+        assert_eq!(primary.span.start as usize, actual_start);
+        assert_eq!(primary.span.end as usize, actual_start + 3);
+        let rendered = super::lsp_diagnostic(diagnostic, Some(Path::new("/tmp")));
+        assert_eq!(rendered["range"]["start"]["line"], 1);
+        assert!(rendered["range"]["start"]["character"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn file_uri_matrix_uses_standard_percent_encoding() {
+        for path in [
+            PathBuf::from("/tmp/Nexa 界 # percent% query?.nexa"),
+            PathBuf::from("C:/Users/Nexa User/界#%?.nexa"),
+            PathBuf::from("//server/share/Nexa User/界#%?.nexa"),
+        ] {
+            let uri = super::path_to_file_uri(&path).expect("file URI");
+            assert!(uri.starts_with("file://"));
+            assert!(!uri.contains(' '));
+            assert!(!uri.contains('#'));
+            assert!(!uri.contains('?'));
+            assert!(uri.contains("%23"));
+            assert!(uri.contains("%25"));
+            let decoded = super::file_uri_to_path(&uri).expect("decoded path");
+            assert_eq!(decoded, path, "{uri}");
+        }
+        assert!(super::file_uri_to_path("https://example.com/main.nexa").is_err());
+    }
+
+    #[test]
     fn lsp_session_publishes_and_clears_overlay_diagnostics() {
         let uri = "file:///tmp/nexa-lsp-session.nexa";
         let messages = [
@@ -520,5 +647,61 @@ mod tests {
         assert!(output.contains("\"code\":\"NX2101\""));
         assert!(output.contains("\"diagnostics\":[]"));
         assert!(output.contains("\"textDocumentSync\""));
+    }
+
+    #[test]
+    fn lsp_document_versions_prevent_stale_diagnostics_and_close_clears() {
+        let uri = "file:///tmp/nexa-lsp-lifecycle.nexa";
+        let messages = [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}),
+            json!({"jsonrpc":"2.0","method":"initialized","params":{}}),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didOpen",
+                "params":{"textDocument":{
+                    "uri":uri,
+                    "languageId":"nexa",
+                    "version":1,
+                    "text":"fn Value() -> i32 { return \"界\"; }"
+                }}
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didChange",
+                "params":{
+                    "textDocument":{"uri":uri,"version":2},
+                    "contentChanges":[{"text":"fn Value() -> i32 { return 1; }"}]
+                }
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didChange",
+                "params":{
+                    "textDocument":{"uri":uri,"version":1},
+                    "contentChanges":[{"text":"fn Value() -> i32 { return \"stale\"; }"}]
+                }
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didSave",
+                "params":{"textDocument":{"uri":uri},"text":"fn Value() -> i32 { return 2; }"}
+            }),
+            json!({
+                "jsonrpc":"2.0",
+                "method":"textDocument/didClose",
+                "params":{"textDocument":{"uri":uri}}
+            }),
+            json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}),
+            json!({"jsonrpc":"2.0","method":"exit","params":null}),
+        ];
+        let input = messages.iter().flat_map(framed).collect::<Vec<_>>();
+        let mut reader = Cursor::new(input);
+        let mut output = Vec::new();
+        super::run_session(&mut reader, &mut output).expect("LSP lifecycle");
+        let output = String::from_utf8(output).expect("UTF-8 output");
+        assert_eq!(output.matches("\"code\":\"NX2101\"").count(), 1);
+        assert!(output.contains("\"version\":1"));
+        assert!(output.contains("\"version\":2"));
+        assert!(output.matches("\"diagnostics\":[]").count() >= 3);
     }
 }

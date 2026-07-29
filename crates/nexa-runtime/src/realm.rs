@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, MigrationLimitRequirements, ValueType,
@@ -282,6 +283,26 @@ pub enum RestartReloadOutcome {
         candidate: ModuleHandle,
         error: ReloadError,
     },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestartReloadMetrics {
+    pub quiesce_duration: Duration,
+    pub migration_duration: Duration,
+    pub commit_duration: Duration,
+    pub activation_duration: Duration,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RestartReloadResult {
+    pub outcome: RestartReloadOutcome,
+    pub metrics: RestartReloadMetrics,
+}
+
+struct CommitReloadMeasurement {
+    result: Result<ModuleHandle, RealmError>,
+    commit_duration: Duration,
+    activation_duration: Duration,
 }
 
 /// Handle-free reload accounting for high-level embedding inspection.
@@ -1301,11 +1322,22 @@ impl RealmRuntime {
         candidate: VerifiedModule,
         policy: RestartReloadPolicy,
     ) -> Result<RestartReloadOutcome, ReloadError> {
+        self.restart_reload_measured(module, candidate, policy)
+            .map(|result| result.outcome)
+    }
+
+    pub fn restart_reload_measured(
+        &mut self,
+        module: ModuleHandle,
+        candidate: VerifiedModule,
+        policy: RestartReloadPolicy,
+    ) -> Result<RestartReloadResult, ReloadError> {
         let RestartReloadPolicy {
             migration_arguments,
             activation_arguments,
             activation_fuel,
         } = policy;
+        let mut metrics = RestartReloadMetrics::default();
         let host_hash = self
             .modules
             .resolve(module.raw())
@@ -1314,19 +1346,30 @@ impl RealmRuntime {
         let candidate = self
             .prepare_reload(module, candidate, host_hash)
             .map_err(restart_reload_error)?;
+        let quiesce_started = Instant::now();
         self.quiesce_reload().map_err(restart_reload_error)?;
+        metrics.quiesce_duration = quiesce_started.elapsed();
 
+        let migration_started = Instant::now();
         if let Err(error) = self.stage_reload(&migration_arguments) {
+            metrics.migration_duration = migration_started.elapsed();
             let reason = restart_reload_error(error);
             self.rollback_reload().map_err(restart_reload_error)?;
             self.flush_releases();
-            return Ok(RestartReloadOutcome::RolledBackBeforeCommit { candidate, reason });
+            return Ok(RestartReloadResult {
+                outcome: RestartReloadOutcome::RolledBackBeforeCommit { candidate, reason },
+                metrics,
+            });
         }
+        metrics.migration_duration = migration_started.elapsed();
 
-        match self.commit_reload(&activation_arguments, activation_fuel) {
+        let commit = self.commit_reload_measured(&activation_arguments, activation_fuel);
+        metrics.commit_duration = commit.commit_duration;
+        metrics.activation_duration = commit.activation_duration;
+        let outcome = match commit.result {
             Ok(committed) => {
                 self.flush_releases();
-                Ok(RestartReloadOutcome::Committed(committed))
+                RestartReloadOutcome::Committed(committed)
             }
             Err(error)
                 if self.active_root == Some(candidate)
@@ -1336,10 +1379,11 @@ impl RealmRuntime {
             {
                 let error = restart_reload_error(error);
                 self.flush_releases();
-                Ok(RestartReloadOutcome::ActivationFaulted { candidate, error })
+                RestartReloadOutcome::ActivationFaulted { candidate, error }
             }
-            Err(error) => Err(restart_reload_error(error)),
-        }
+            Err(error) => return Err(restart_reload_error(error)),
+        };
+        Ok(RestartReloadResult { outcome, metrics })
     }
 
     pub(crate) fn quiesce_reload(&mut self) -> Result<usize, RealmError> {
@@ -1505,86 +1549,108 @@ impl RealmRuntime {
         Ok(None)
     }
 
-    pub(crate) fn commit_reload(
+    fn commit_reload_measured(
         &mut self,
         activation_arguments: &[RuntimeValue],
         activation_fuel: u64,
-    ) -> Result<ModuleHandle, RealmError> {
-        let candidate = self.reload.transaction()?.candidate;
-        let verified = self
-            .modules
-            .resolve(candidate.raw())
-            .map_err(RealmError::ModuleHandle)?
-            .verified
-            .clone();
-        let activation_entry = verified.module().reload_metadata.activation_entry;
-        self.publish_reload_root()?;
-        if self
-            .failure_injector
-            .trigger(crate::RuntimeFailurePoint::ActivationTrap)
-        {
-            self.reload.activation_failed()?;
-            self.modules
-                .resolve_mut(candidate.raw())
+    ) -> CommitReloadMeasurement {
+        let commit_started = Instant::now();
+        let prepared = (|| {
+            let candidate = self.reload.transaction()?.candidate;
+            let verified = self
+                .modules
+                .resolve(candidate.raw())
                 .map_err(RealmError::ModuleHandle)?
-                .lifecycle = ModuleLifecycle::ActivationFaulted;
-            self.reload.finish()?;
-            return Err(RealmError::InjectedFailure(
-                crate::RuntimeFailurePoint::ActivationTrap,
-            ));
-        }
-        let activation_result: Result<(), RuntimeMessage> = (|| {
-            let Some(activation_entry) = activation_entry else {
-                return Ok(());
-            };
-            let function = verified
-                .module()
-                .functions
-                .get(activation_entry as usize)
-                .ok_or(RuntimeMessage::Static("activation function is missing"))?;
-            if function.effect != nexa_bytecode::FunctionEffect::Immediate {
-                return Err(RuntimeMessage::Static(
-                    "activation entry must have Immediate effect",
-                ));
-            }
-            match CheckedInterpreter::run_with_heap(
-                &verified,
-                activation_entry,
-                activation_arguments,
-                activation_fuel,
-                &mut self.heap,
-            )
-            .map_err(|_| RuntimeMessage::Static("activation interpreter failed"))?
-            {
-                InterpreterOutcome::Returned { .. } => Ok(()),
-                InterpreterOutcome::Trapped { trap, .. } => Err(trap.message),
-                InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
-                    Err(RuntimeMessage::Static(
-                        "activation entry attempted to suspend",
-                    ))
-                }
-            }
+                .verified
+                .clone();
+            let activation_entry = verified.module().reload_metadata.activation_entry;
+            self.publish_reload_root()?;
+            Ok::<_, RealmError>((candidate, verified, activation_entry))
         })();
-        match crate::invoke_reload_activation(|| activation_result) {
-            Ok(()) => {
-                self.reload.activation_succeeded()?;
-                self.modules
-                    .resolve_mut(candidate.raw())
-                    .map_err(RealmError::ModuleHandle)?
-                    .lifecycle = ModuleLifecycle::Active;
-                let transaction = self.reload.finish()?;
-                Ok(transaction.candidate)
+        let (candidate, verified, activation_entry) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return CommitReloadMeasurement {
+                    result: Err(error),
+                    commit_duration: commit_started.elapsed(),
+                    activation_duration: Duration::ZERO,
+                };
             }
-            Err(ReloadError::Activation(error)) => {
+        };
+        let commit_duration = commit_started.elapsed();
+        let activation_started = Instant::now();
+        let result = (|| {
+            if self
+                .failure_injector
+                .trigger(crate::RuntimeFailurePoint::ActivationTrap)
+            {
                 self.reload.activation_failed()?;
                 self.modules
                     .resolve_mut(candidate.raw())
                     .map_err(RealmError::ModuleHandle)?
                     .lifecycle = ModuleLifecycle::ActivationFaulted;
                 self.reload.finish()?;
-                Err(ReloadError::Activation(error).into())
+                return Err(RealmError::InjectedFailure(
+                    crate::RuntimeFailurePoint::ActivationTrap,
+                ));
             }
-            Err(error) => Err(error.into()),
+            let activation_result: Result<(), RuntimeMessage> = (|| {
+                let Some(activation_entry) = activation_entry else {
+                    return Ok(());
+                };
+                let function = verified
+                    .module()
+                    .functions
+                    .get(activation_entry as usize)
+                    .ok_or(RuntimeMessage::Static("activation function is missing"))?;
+                if function.effect != nexa_bytecode::FunctionEffect::Immediate {
+                    return Err(RuntimeMessage::Static(
+                        "activation entry must have Immediate effect",
+                    ));
+                }
+                match CheckedInterpreter::run_with_heap(
+                    &verified,
+                    activation_entry,
+                    activation_arguments,
+                    activation_fuel,
+                    &mut self.heap,
+                )
+                .map_err(|_| RuntimeMessage::Static("activation interpreter failed"))?
+                {
+                    InterpreterOutcome::Returned { .. } => Ok(()),
+                    InterpreterOutcome::Trapped { trap, .. } => Err(trap.message),
+                    InterpreterOutcome::Suspended { .. }
+                    | InterpreterOutcome::HostPending { .. } => Err(RuntimeMessage::Static(
+                        "activation entry attempted to suspend",
+                    )),
+                }
+            })();
+            match crate::invoke_reload_activation(|| activation_result) {
+                Ok(()) => {
+                    self.reload.activation_succeeded()?;
+                    self.modules
+                        .resolve_mut(candidate.raw())
+                        .map_err(RealmError::ModuleHandle)?
+                        .lifecycle = ModuleLifecycle::Active;
+                    let transaction = self.reload.finish()?;
+                    Ok(transaction.candidate)
+                }
+                Err(ReloadError::Activation(error)) => {
+                    self.reload.activation_failed()?;
+                    self.modules
+                        .resolve_mut(candidate.raw())
+                        .map_err(RealmError::ModuleHandle)?
+                        .lifecycle = ModuleLifecycle::ActivationFaulted;
+                    self.reload.finish()?;
+                    Err(ReloadError::Activation(error).into())
+                }
+                Err(error) => Err(error.into()),
+            }
+        })();
+        CommitReloadMeasurement {
+            result,
+            commit_duration,
+            activation_duration: activation_started.elapsed(),
         }
     }
 

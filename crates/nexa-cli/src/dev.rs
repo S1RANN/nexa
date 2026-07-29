@@ -4,16 +4,21 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use nexa_embed::{DevelopmentCompileRequest, DevelopmentCompiler, DevelopmentConfig, SourceHash};
+use nexa_embed::{
+    CandidateTerminal, CompileJob, DevelopmentCompileRequest, DevelopmentCompiler,
+    DevelopmentConfig, EnqueueOutcome, PackageId, SourceHash, WorkerEvent,
+};
 use serde_json::json;
 
 use crate::{DiagnosticFormat, project, render_engine_diagnostics};
 
 #[derive(Default)]
 struct WatchedPackage {
-    observed: Option<SourceHash>,
+    observed_hash: Option<SourceHash>,
+    stable_hash: Option<SourceHash>,
+    queued_hash: Option<SourceHash>,
+    terminal_hash: Option<SourceHash>,
     stable_scans: u8,
-    processed: Option<SourceHash>,
     generation: u64,
 }
 
@@ -53,10 +58,14 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> Result<(),
     ctrlc::set_handler(move || signal.store(false, Ordering::Release))
         .map_err(|error| format!("could not install Ctrl+C handler: {error}"))?;
     let mut watched = BTreeMap::<PathBuf, WatchedPackage>::new();
+    let mut awaiting = BTreeMap::<PackageId, CompileJob>::new();
     let mut contract_hash = stable_hash(&project.contract_source);
     let mut successful = BTreeMap::new();
     let mut scans = 0_u64;
     while running.load(Ordering::Acquire) {
+        retry_awaiting(&compiler, &mut awaiting, &mut watched, format)?;
+        emit_worker_events(&compiler, format);
+
         let current_contract = std::fs::read_to_string(project.root.join(&project.config.contract))
             .map_err(|error| format!("could not read Host contract: {error}"))?;
         let current_contract_hash = stable_hash(&current_contract);
@@ -73,8 +82,12 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> Result<(),
                 project = updated;
             }
         }
-        for directory in project.package_directories()? {
-            let loaded = project::load_package_candidate(&directory);
+        for package in project.package_directories()? {
+            let loaded = project::load_package_candidate(
+                &package.directory,
+                &package.source_id,
+                &package.policy,
+            );
             let (source_id, candidate) = match loaded {
                 Ok(candidate) => candidate,
                 Err(diagnostic) => {
@@ -87,84 +100,60 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> Result<(),
                 "\0",
                 &candidate.entry_source,
             ]));
-            let state = watched.entry(directory.clone()).or_default();
-            if state.processed == Some(hash) {
+            let state = watched.entry(package.directory.clone()).or_default();
+            if state.terminal_hash == Some(hash) || state.queued_hash == Some(hash) {
                 continue;
             }
-            if state.observed != Some(hash) {
-                state.observed = Some(hash);
+            if state.observed_hash != Some(hash) {
+                state.observed_hash = Some(hash);
                 state.stable_scans = 1;
                 emit_event(
                     format,
                     "change-detected",
                     Some(candidate.manifest.id.as_str()),
                     state.generation.saturating_add(1),
-                    &directory.display().to_string(),
+                    &package.directory.display().to_string(),
                 );
                 continue;
             }
             state.stable_scans = state.stable_scans.saturating_add(1);
-            if state.stable_scans < config.stable_scan_count {
+            if state.stable_scans < config.stable_scan_count || state.stable_hash == Some(hash) {
                 continue;
             }
+            state.stable_hash = Some(hash);
             state.generation = state.generation.saturating_add(1);
-            state.processed = Some(hash);
-            emit_event(
-                format,
-                "compile-queued",
-                Some(candidate.manifest.id.as_str()),
-                state.generation,
-                "stable source snapshot",
-            );
-            for (package_id, generation, _) in compiler.submit(DevelopmentCompileRequest {
-                package_id: candidate.manifest.id.clone(),
+            let package_id = candidate.manifest.id.clone();
+            let generation = state.generation;
+            let request = DevelopmentCompileRequest {
+                package_id: package_id.clone(),
                 source_id,
-                generation: state.generation,
+                generation,
                 candidate,
                 idl: project.idl.clone(),
                 required_exports: project.required_exports.clone(),
-            }) {
-                emit_event(
-                    format,
-                    "candidate-superseded",
-                    Some(package_id.as_str()),
-                    generation,
-                    "newer source generation replaced this queued candidate",
-                );
-            }
+            };
+            handle_enqueue(
+                compiler.submit(request),
+                &package_id,
+                generation,
+                hash,
+                &package.directory,
+                &mut watched,
+                &mut awaiting,
+                format,
+            )?;
         }
         std::thread::sleep(Duration::from_millis(25));
-        for result in compiler.poll() {
-            match result.result {
-                Ok(artifact) => {
-                    successful.insert(result.package_id.clone(), artifact);
-                    emit_event(
-                        format,
-                        "candidate-ready",
-                        Some(result.package_id.as_str()),
-                        result.generation,
-                        "latest successful Candidate retained",
-                    );
-                }
-                Err(diagnostic) => {
-                    emit_event(
-                        format,
-                        "compile-failed",
-                        Some(result.package_id.as_str()),
-                        result.generation,
-                        "Last Known Good Candidate retained",
-                    );
-                    render_engine_diagnostics(&[diagnostic], format)?;
-                }
-            }
-        }
+        emit_worker_events(&compiler, format);
+        process_terminals(compiler.poll(), &mut watched, &mut successful, format)?;
         scans = scans.saturating_add(1);
         if once && scans >= 3 {
             break;
         }
         std::thread::sleep(Duration::from_millis(75));
     }
-    compiler.shutdown();
+    let terminals = compiler.shutdown();
+    process_terminals(terminals, &mut watched, &mut successful, format)?;
     emit_event(
         format,
         "shutdown",
@@ -173,6 +162,206 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> Result<(),
         &format!("{} successful Candidates retained", successful.len()),
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_enqueue(
+    outcome: EnqueueOutcome,
+    package_id: &PackageId,
+    generation: u64,
+    hash: SourceHash,
+    directory: &PathBuf,
+    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
+    awaiting: &mut BTreeMap<PackageId, CompileJob>,
+    format: DiagnosticFormat,
+) -> Result<(), String> {
+    match outcome {
+        EnqueueOutcome::Accepted => {
+            let state = watched
+                .get_mut(directory)
+                .ok_or("development state disappeared before enqueue")?;
+            state.queued_hash = Some(hash);
+            emit_event(
+                format,
+                "compile-queued",
+                Some(package_id.as_str()),
+                generation,
+                "stable source snapshot",
+            );
+        }
+        EnqueueOutcome::ReplacedPending { terminal, .. } => {
+            mark_terminal(watched, terminal.data().source_hash);
+            emit_terminal_event(&terminal, format);
+            let state = watched
+                .get_mut(directory)
+                .ok_or("development state disappeared before enqueue")?;
+            state.queued_hash = Some(hash);
+            emit_event(
+                format,
+                "compile-queued",
+                Some(package_id.as_str()),
+                generation,
+                "newest stable source replaced this Package's pending Candidate",
+            );
+        }
+        EnqueueOutcome::Backpressured { job } => {
+            emit_event(
+                format,
+                "compile-backpressured",
+                Some(package_id.as_str()),
+                generation,
+                "Worker queue is full; the Candidate will be retried",
+            );
+            awaiting.insert(package_id.clone(), job);
+        }
+        EnqueueOutcome::Stopping { .. } => {
+            return Err("development compiler stopped while accepting a Candidate".into());
+        }
+    }
+    Ok(())
+}
+
+fn retry_awaiting(
+    compiler: &DevelopmentCompiler,
+    awaiting: &mut BTreeMap<PackageId, CompileJob>,
+    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
+    format: DiagnosticFormat,
+) -> Result<(), String> {
+    let jobs = std::mem::take(awaiting);
+    for (package_id, job) in jobs {
+        let generation = job.generation;
+        let hash = job.source_hash;
+        match compiler.retry(job) {
+            EnqueueOutcome::Accepted => {
+                if let Some(state) = watched
+                    .values_mut()
+                    .find(|state| state.stable_hash == Some(hash))
+                {
+                    state.queued_hash = Some(hash);
+                }
+                emit_event(
+                    format,
+                    "compile-queued",
+                    Some(package_id.as_str()),
+                    generation,
+                    "backpressured Candidate accepted",
+                );
+            }
+            EnqueueOutcome::ReplacedPending { terminal, .. } => {
+                mark_terminal(watched, terminal.data().source_hash);
+                emit_terminal_event(&terminal, format);
+                if let Some(state) = watched
+                    .values_mut()
+                    .find(|state| state.stable_hash == Some(hash))
+                {
+                    state.queued_hash = Some(hash);
+                }
+            }
+            EnqueueOutcome::Backpressured { job } => {
+                awaiting.insert(package_id, job);
+            }
+            EnqueueOutcome::Stopping { .. } => {
+                return Err("development compiler stopped while retrying a Candidate".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn emit_worker_events(compiler: &DevelopmentCompiler, format: DiagnosticFormat) {
+    for event in compiler.poll_events() {
+        match event {
+            WorkerEvent::CompileStarted {
+                package_id,
+                generation,
+                queue_duration,
+                ..
+            } => emit_event(
+                format,
+                "compile-started",
+                Some(package_id.as_str()),
+                generation,
+                &format!("queued for {} μs", queue_duration.as_micros()),
+            ),
+        }
+    }
+}
+
+fn process_terminals(
+    terminals: Vec<CandidateTerminal>,
+    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
+    successful: &mut BTreeMap<PackageId, nexa_embed::CompiledPackageArtifact>,
+    format: DiagnosticFormat,
+) -> Result<(), String> {
+    for terminal in terminals {
+        mark_terminal(watched, terminal.data().source_hash);
+        match terminal {
+            CandidateTerminal::Compiled {
+                data, compilation, ..
+            } => {
+                successful.insert(data.package_id.clone(), compilation.artifact);
+                emit_event(
+                    format,
+                    "candidate-ready",
+                    Some(data.package_id.as_str()),
+                    data.generation,
+                    "latest successful Candidate retained",
+                );
+            }
+            CandidateTerminal::CompileFailed {
+                data, diagnostic, ..
+            }
+            | CandidateTerminal::VerifyFailed {
+                data, diagnostic, ..
+            } => {
+                emit_event(
+                    format,
+                    "compile-failed",
+                    Some(data.package_id.as_str()),
+                    data.generation,
+                    "Last Known Good Candidate retained",
+                );
+                render_engine_diagnostics(&[diagnostic], format)?;
+            }
+            terminal => emit_terminal_event(&terminal, format),
+        }
+    }
+    Ok(())
+}
+
+fn mark_terminal(watched: &mut BTreeMap<PathBuf, WatchedPackage>, hash: SourceHash) {
+    if let Some(state) = watched
+        .values_mut()
+        .find(|state| state.queued_hash == Some(hash) || state.stable_hash == Some(hash))
+    {
+        state.terminal_hash = Some(hash);
+        if state.queued_hash == Some(hash) {
+            state.queued_hash = None;
+        }
+    }
+}
+
+fn emit_terminal_event(terminal: &CandidateTerminal, format: DiagnosticFormat) {
+    let data = terminal.data();
+    emit_event(
+        format,
+        match terminal.kind() {
+            nexa_embed::CandidateTerminalKind::SupersededBeforeCompile
+            | nexa_embed::CandidateTerminalKind::SupersededAfterCompile => "candidate-superseded",
+            nexa_embed::CandidateTerminalKind::CancelledByDisable
+            | nexa_embed::CandidateTerminalKind::CancelledBySourceRemoval
+            | nexa_embed::CandidateTerminalKind::CancelledByShutdown => "candidate-cancelled",
+            nexa_embed::CandidateTerminalKind::RejectedHostContractChange => {
+                "host-rebuild-required"
+            }
+            nexa_embed::CandidateTerminalKind::Compiled => "candidate-ready",
+            nexa_embed::CandidateTerminalKind::CompileFailed => "compile-failed",
+            nexa_embed::CandidateTerminalKind::VerifyFailed => "verify-failed",
+        },
+        Some(data.package_id.as_str()),
+        data.generation,
+        &format!("{:?}", terminal.kind()),
+    );
 }
 
 fn stable_hash(source: &str) -> nexa_core::StableId {

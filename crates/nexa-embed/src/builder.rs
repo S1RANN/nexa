@@ -15,6 +15,7 @@ pub struct NexaEngineBuilder {
     pub(crate) entitlements: Box<dyn EntitlementResolver>,
     pub(crate) storage_dir: Option<PathBuf>,
     pub(crate) runtime_host_capacity: usize,
+    pub(crate) runtime_host: Option<nexa_runtime::RuntimeHost>,
     pub(crate) development: DevelopmentConfig,
     pub(crate) required_exports: Vec<ExportRequirement>,
 }
@@ -28,6 +29,7 @@ impl NexaEngineBuilder {
             entitlements: Box::<NoEntitlements>::default(),
             storage_dir: None,
             runtime_host_capacity: 16_384,
+            runtime_host: None,
             development: DevelopmentConfig {
                 enabled: false,
                 ..DevelopmentConfig::default()
@@ -63,6 +65,14 @@ impl NexaEngineBuilder {
     #[must_use]
     pub const fn runtime_host_capacity(mut self, capacity: usize) -> Self {
         self.runtime_host_capacity = capacity;
+        self
+    }
+
+    pub(crate) fn runtime_host_for_evidence(
+        mut self,
+        runtime_host: nexa_runtime::RuntimeHost,
+    ) -> Self {
+        self.runtime_host = Some(runtime_host);
         self
     }
 

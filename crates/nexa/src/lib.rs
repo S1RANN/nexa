@@ -8,8 +8,8 @@ mod runtime_diagnostics;
 
 pub use diagnostic_corpus::{
     BinaryDiagnosticReport, CaseFormatReport, CompilerDiagnosticReport, DiagnosticCorpusReport,
-    ObservedDiagnosticCase, PipelineReport, RuntimeDiagnosticReport, run_binary_diagnostic_cases,
-    run_compiler_diagnostic_cases, run_diagnostic_corpus, run_engine_diagnostic_cases,
+    EngineDiagnosticReport, ObservedDiagnosticCase, PipelineReport, RuntimeDiagnosticReport,
+    run_binary_diagnostic_cases, run_compiler_diagnostic_cases, run_diagnostic_corpus,
     run_runtime_diagnostic_cases,
 };
 pub use error::{
@@ -58,6 +58,17 @@ pub fn compile_with_interface_file(
         .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
 }
 
+/// Compiles through lowering but deliberately leaves structural verification to the caller.
+pub fn compile_module_with_interface_file(
+    source: &str,
+    file: FileId,
+    interface: &Idl,
+    schema_hash: StableId,
+) -> Result<Module, NexaError> {
+    nexa_compiler::compile_module_with_interface_file(source, file, interface, schema_hash)
+        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
+}
+
 /// Decodes a bytecode module through the stable facade error boundary.
 pub fn decode_module(bytes: &[u8], limits: DecodeLimits) -> Result<Module, NexaError> {
     Module::decode_with_limits(bytes, limits).map_err(NexaError::from)
@@ -82,21 +93,23 @@ pub mod prelude {
         HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
         HostTrap, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
         MigrationUsageReport, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
-        RealmRuntime, ResourceContext, ResourceTokenHandle, RestartReloadOutcome,
-        RestartReloadPolicy, RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode,
-        RuntimeFailurePoint, RuntimeHost, RuntimeHostCloseError, RuntimeHostCloseStatus,
-        RuntimeHostDomain, RuntimeHostState, RuntimeResourceLedger, RuntimeValue, ScopeHandle,
-        ScopeSnapshot, ScriptFunction, SnapshotHandle, StateHandle, StateHandleError, StateValue,
-        StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason,
-        TaskTerminalRecord, TickBudget, TickReport, YieldReason,
+        RealmRuntime, ResourceContext, ResourceTokenHandle, RestartReloadMetrics,
+        RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult, RuntimeFailureConfigError,
+        RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint, RuntimeHost,
+        RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
+        RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
+        SnapshotHandle, StateHandle, StateHandleError, StateValue, StatefulDomainId, StepConfig,
+        TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget,
+        TickReport, YieldReason,
     };
     pub use nexa_verifier::VerifierLimits;
 
     pub use crate::{
         ClassifiedError, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
         ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch, HostError, Label,
-        MigrationError, NexaError, Severity, compile, compile_file, compile_with_interface,
-        compile_with_interface_file, decode_module, verify_module,
+        MigrationError, NexaError, Severity, compile, compile_file,
+        compile_module_with_interface_file, compile_with_interface, compile_with_interface_file,
+        decode_module, verify_module,
     };
 }
 
@@ -135,18 +148,5 @@ mod tests {
         assert_eq!(report.passed, 10);
         assert_eq!(report.deterministic_cases, 10);
         assert!(!report.direct_nexa_error_construction);
-    }
-
-    #[test]
-    fn complete_diagnostic_corpus_observes_the_registered_set_twice() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let report = crate::run_diagnostic_corpus(&root).unwrap();
-        assert_eq!(report.emission_definitions, report.registered_codes);
-        assert_eq!(report.fixture_codes, report.registered_codes);
-        assert_eq!(report.observed_codes, report.registered_codes);
-        assert_eq!(report.deterministic_cases, report.registered_codes);
-        assert!(report.missing_codes.is_empty());
-        assert!(report.unexpected_codes.is_empty());
-        assert!(report.case_format.invalid_pipelines.is_empty());
     }
 }

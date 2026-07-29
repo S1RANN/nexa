@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **3.0.0**
+Version: **3.0.1**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -57,6 +57,8 @@ rollback without old-Task revival.
 - [`embed/PACKAGE_POLICY.md`](embed/PACKAGE_POLICY.md)
 - [`embed/PACKAGE_LIFECYCLE.md`](embed/PACKAGE_LIFECYCLE.md)
 - [`embed/SNAKE_PILOT.md`](embed/SNAKE_PILOT.md)
+- [`embed/DEVELOPMENT_WORKER.md`](embed/DEVELOPMENT_WORKER.md)
+- [`embed/ENGINE_DIAGNOSTICS.md`](embed/ENGINE_DIAGNOSTICS.md)
 - [`../docs/DEVELOPMENT_LOOP.md`](../docs/DEVELOPMENT_LOOP.md)
 - [`../docs/DIAGNOSTICS.md`](../docs/DIAGNOSTICS.md)
 - [`../docs/RELOAD_WORKFLOW.md`](../docs/RELOAD_WORKFLOW.md)

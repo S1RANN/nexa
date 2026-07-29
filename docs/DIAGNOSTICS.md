@@ -1,6 +1,6 @@
 # Nexa diagnostics
 
-Status: M3 COMPLETE
+Status: M3R1 COMPLETE
 
 `nexa::Diagnostic` remains the leaf truth for parser, type checker, compiler,
 Verifier, Runtime, and Reload errors. `nexa-embed` adds package identity,
@@ -20,10 +20,18 @@ Engine-only codes occupy the stable `NX7xxx` range:
 - `NX7010`–`NX7011`: required export presence and signature;
 - `NX7101`–`NX7103`: MustComplete yield, wait, and trap;
 - `NX7201`–`NX7202`: pre-commit rollback and activation fault;
-- `NX7301`–`NX7303`: release, persistence, and shutdown.
+- `NX7302`–`NX7303`: persistence and shutdown. `NX7301` is intentionally unregistered until a
+  fallible release sink exists in the product path.
 
 Compiler and Runtime failures retain their existing `NX1xxx`–`NX5xxx` code.
 The single diagnostic registry and corpus test define the observable code set.
+
+Every registered `NX7xxx` code is exercised through a real Engine product
+path. The evidence harness captures the emitted `EngineDiagnostic`, renders
+that same object as Human, JSON, and NDJSON, and runs each scenario twice for
+determinism. The corpus rejects direct construction of a target Engine code and
+requires `registered = observedThroughRealPaths` with
+`directDiagnosticConstruction = 0`.
 
 ## Source identity
 

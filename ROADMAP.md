@@ -47,13 +47,17 @@ licensed content, and reviewed local extensions. Its finalization gates cover
 the full workspace, package lifecycle stress, resource stability, and dispatch
 latency.
 
-M3 makes that embedding loop usable during daily development. The public
+M3R1 closes the correctness and evidence gaps in M3. The public
 facade is `NexaEngine`; stable source snapshots compile on one bounded worker,
 and only `engine.tick()` may commit the newest verified Candidate. Failed or
 superseded Candidates leave the active Runtime and Last Known Good artifact
 unchanged. Compiler, Verifier, Reload, Runtime, resource, persistence, and
 shutdown failures share one bounded `EngineDiagnostic` model. `nexa check`,
 `nexa dev`, and the diagnostic-only LSP reuse that same compiler path.
+
+The revision specifically requires lossless Worker backpressure and terminal
+accounting, Engine diagnostics observed through real product paths, trustworthy
+phase metrics, real project source policies, and exact NIDL/LSP locations.
 
 M1 final closure includes the generated-registry
 positive path, real invalid-event Runtime calls, deterministic fuzz corpus
@@ -124,9 +128,16 @@ collection, JIT/AOT, an optimizing compiler, new syntax, user generics,
 seamless old-Task migration, completion replay, remote Mods, an untrusted-code
 sandbox, completion/refactoring LSP features, or DAP debugging.
 
+## M3R1 scope
+
+M3R1 changes only the existing M3 development loop, diagnostics, metrics,
+package-aware CLI, NIDL locations, URI handling, editor diagnostics, and their
+finalization gates. It does not add language syntax, multi-file modules, user
+generics, JIT, interpreter optimization, a full semantic LSP, DAP, Pluie,
+remote packages, or untrusted execution.
+
 ## Next review
 
-Dogfood the M3 save–diagnose–reload loop through the Snake pilot before
-approving broader integration. Do not reopen seamless Reload or a
-general-product route without new user evidence and a separately approved
+M3R1 is complete. M4 Language Scale Foundation has not started; it may begin
+only from the immutable M3R1 completion tag under a separately frozen
 milestone.

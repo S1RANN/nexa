@@ -94,7 +94,8 @@ fn main() {
             generate_idl(Path::new(path))
         }
         _ => Err("usage: nexa check|build|verify|dump|run|trace ... | \
-             nexa check <package-directory> --contract <app_api.nidl> | \
+             nexa check <package-directory> --manifest-only | \
+             nexa check <package-directory> --contract <app_api.nidl> [--policy <policy.toml>] | \
              nexa check --project <nexa.dev.toml> | nexa dev --project <nexa.dev.toml> | \
              nexa lsp | \
              nexa model-check | nexa diagnostic-corpus-check | nexa model-replay <artifact.json> | \
@@ -152,11 +153,14 @@ fn exit_code_for(error: &str) -> i32 {
 
 fn diagnostic_corpus_check(json_output: bool) -> Result<(), String> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let report = nexa::run_diagnostic_corpus(&root)?;
+    let engine = nexa_embed::run_engine_diagnostic_cases(&root)?;
+    let report = nexa::run_diagnostic_corpus(&root, engine)?;
     if !report.missing_codes.is_empty()
         || !report.unexpected_codes.is_empty()
         || report.source_backed_inexact_spans != 0
         || !report.case_format.invalid_pipelines.is_empty()
+        || report.engine.registered != report.engine.observed_through_real_paths
+        || report.engine.direct_diagnostic_construction != 0
     {
         return Err("diagnostic corpus contains failed cases".into());
     }
@@ -202,6 +206,7 @@ fn extract_diagnostic_format(
     Ok((format, filtered))
 }
 
+#[allow(clippy::too_many_lines)]
 fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
     if let [flag, project] = arguments
         && flag == "--project"
@@ -218,7 +223,11 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
         print_success(
             format,
             "check",
-            &json!({"project": project.config_path, "packages": report.checked_packages}),
+            &json!({
+                "project": project.config_path,
+                "packages": report.checked_packages,
+                "validationLevel": "full-policy",
+            }),
             &format!(
                 "checked {} packages from {}",
                 report.checked_packages,
@@ -227,22 +236,63 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
         );
         return Ok(());
     }
-    if let Some((directory, contract)) = parse_package_check(arguments)? {
-        let contract_source = std::fs::read_to_string(&contract)
+    if let Some(package) = parse_package_check(arguments)? {
+        if package.manifest_only {
+            let manifest_path = package.directory.join("package.toml");
+            let manifest_source = std::fs::read_to_string(&manifest_path)
+                .map_err(|error| format!("could not read {}: {error}", manifest_path.display()))?;
+            let policy = project::manifest_validation_policy(&manifest_source)?;
+            let manifest = nexa_embed::PackageManifest::parse(&manifest_source, &policy)
+                .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+            print_success(
+                format,
+                "check",
+                &json!({
+                    "package": package.directory,
+                    "packageId": manifest.id.as_str(),
+                    "validationLevel": "manifest-only",
+                }),
+                &format!("checked package manifest {}", package.directory.display()),
+            );
+            return Ok(());
+        }
+        let contract = package
+            .contract
+            .as_ref()
+            .ok_or("package check requires `--contract` or `--manifest-only`")?;
+        let contract_source = std::fs::read_to_string(contract)
             .map_err(|error| format!("could not read {}: {error}", contract.display()))?;
         let idl = nexa_idl::parse(&contract_source)
             .map_err(|error| format!("invalid {}: {error}", contract.display()))?;
-        match project::check_package(&directory, &idl, &[]) {
+        let manifest_source = std::fs::read_to_string(package.directory.join("package.toml"))
+            .map_err(|error| {
+                format!(
+                    "could not read {}: {error}",
+                    package.directory.join("package.toml").display()
+                )
+            })?;
+        let (source_id, policy, validation_level) = if let Some(policy_path) = &package.policy {
+            let (source_id, policy) = project::load_policy(policy_path)?;
+            (source_id, policy, "full-policy")
+        } else {
+            (
+                nexa_embed::SourceId::new("contract-check").map_err(|error| error.to_string())?,
+                project::manifest_validation_policy(&manifest_source)?,
+                "contract",
+            )
+        };
+        match project::check_package(&package.directory, &idl, &[], &source_id, &policy) {
             Ok(artifact) => {
                 print_success(
                     format,
                     "check",
                     &json!({
-                        "package": directory,
+                        "package": package.directory,
                         "contract": contract,
                         "functions": artifact.verified.module().functions.len(),
+                        "validationLevel": validation_level,
                     }),
-                    &format!("checked package {}", directory.display()),
+                    &format!("checked package {}", package.directory.display()),
                 );
                 return Ok(());
             }
@@ -319,7 +369,14 @@ fn compile_source_diagnostic(
     }
 }
 
-fn parse_package_check(arguments: &[String]) -> Result<Option<(PathBuf, PathBuf)>, String> {
+struct PackageCheckArguments {
+    directory: PathBuf,
+    contract: Option<PathBuf>,
+    policy: Option<PathBuf>,
+    manifest_only: bool,
+}
+
+fn parse_package_check(arguments: &[String]) -> Result<Option<PackageCheckArguments>, String> {
     let Some(first) = arguments.first() else {
         return Ok(None);
     };
@@ -328,6 +385,8 @@ fn parse_package_check(arguments: &[String]) -> Result<Option<(PathBuf, PathBuf)
         return Ok(None);
     }
     let mut contract = None;
+    let mut policy = None;
+    let mut manifest_only = false;
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -339,10 +398,36 @@ fn parse_package_check(arguments: &[String]) -> Result<Option<(PathBuf, PathBuf)
                 ));
                 index += 2;
             }
+            "--policy" => {
+                policy = Some(PathBuf::from(
+                    arguments
+                        .get(index + 1)
+                        .ok_or("missing value for `--policy`")?,
+                ));
+                index += 2;
+            }
+            "--manifest-only" => {
+                manifest_only = true;
+                index += 1;
+            }
             option => return Err(format!("unknown package check option `{option}`")),
         }
     }
-    Ok(contract.map(|contract| (directory, contract)))
+    if manifest_only && (contract.is_some() || policy.is_some()) {
+        return Err("`--manifest-only` cannot be combined with `--contract` or `--policy`".into());
+    }
+    if policy.is_some() && contract.is_none() {
+        return Err("`--policy` requires `--contract`".into());
+    }
+    if !manifest_only && contract.is_none() {
+        return Err("package check requires `--contract` or `--manifest-only`".into());
+    }
+    Ok(Some(PackageCheckArguments {
+        directory,
+        contract,
+        policy,
+        manifest_only,
+    }))
 }
 
 fn render_engine_diagnostics(

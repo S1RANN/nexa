@@ -7784,6 +7784,22 @@ pub fn compile_with_interface_file(
     interface: &Idl,
     schema_hash: StableId,
 ) -> Result<VerifiedModule, CompileError> {
+    let module = compile_module_with_interface_file(source, file, interface, schema_hash)?;
+    verify(module, VerifierLimits::default()).map_err(|error| {
+        CompileError::verify(
+            error.to_string(),
+            SourceSpan::new(file, 0, u32::try_from(source.len()).unwrap_or(u32::MAX)),
+        )
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+pub fn compile_module_with_interface_file(
+    source: &str,
+    file: FileId,
+    interface: &Idl,
+    schema_hash: StableId,
+) -> Result<Module, CompileError> {
     let (idl_array_types, idl_buffer_types, idl_parameterized_enums) =
         collect_idl_boundary_types(interface);
     let tokens = lex(source)?;
@@ -8011,8 +8027,7 @@ pub fn compile_with_interface_file(
             signature,
         });
     }
-    verify(module, VerifierLimits::default())
-        .map_err(|error| CompileError::verify(error.to_string(), hir.span()))
+    Ok(module)
 }
 
 fn lower_idl_type(ty: &TypeRef) -> ValueType {

@@ -109,30 +109,74 @@ pub enum TypeRef {
     Named(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum IdlError {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdlErrorKind {
     MissingInterface,
-    Syntax(String),
-    Duplicate(String),
-    UnknownType(String),
+    Syntax,
+    Duplicate,
+    UnknownType,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdlError {
+    pub kind: IdlErrorKind,
+    pub start: usize,
+    pub end: usize,
+    pub expected: String,
+    pub actual: String,
+    pub message: String,
+}
+
+impl IdlError {
+    fn new(
+        kind: IdlErrorKind,
+        start: usize,
+        end: usize,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            start,
+            end,
+            expected: expected.into(),
+            actual: actual.into(),
+            message: message.into(),
+        }
+    }
+
+    fn semantic(
+        kind: IdlErrorKind,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::new(kind, 0, 0, expected, actual, message)
+    }
 }
 
 impl fmt::Display for IdlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{self:?}")
+        write!(
+            formatter,
+            "{} at bytes {}..{} (expected {}, found {})",
+            self.message, self.start, self.end, self.expected, self.actual
+        )
     }
 }
 
 impl std::error::Error for IdlError {}
 
 pub fn parse(source: &str) -> Result<Idl, IdlError> {
-    let cleaned = source
-        .lines()
-        .map(|line| line.split("//").next().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join(" ");
-    let tokens = tokenize(&cleaned);
-    let mut parser = Parser { tokens, cursor: 0 };
+    let tokens = tokenize(source);
+    let mut parser = Parser {
+        tokens,
+        cursor: 0,
+        source_len: source.len(),
+        type_spans: Vec::new(),
+        function_mode_spans: Vec::new(),
+    };
     parser.parse()
 }
 
@@ -2229,29 +2273,68 @@ fn input_type_borrows(idl: &Idl, ty: &TypeRef) -> bool {
     }
 }
 
-fn tokenize(source: &str) -> Vec<String> {
-    let mut output = String::new();
-    for character in source.chars() {
-        if character == '>' && output.ends_with('-') {
-            output.push(character);
-            output.push(' ');
-        } else if "{}(),:;<>".contains(character) {
-            output.push(' ');
-            output.push(character);
-            output.push(' ');
-        } else if character == '-' {
-            output.push(' ');
-            output.push(character);
-        } else {
-            output.push(character);
+#[derive(Clone, Debug)]
+struct Token {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
+fn tokenize(source: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    while cursor < source.len() {
+        let character = source[cursor..]
+            .chars()
+            .next()
+            .expect("cursor is on a character boundary");
+        if character.is_whitespace() {
+            cursor += character.len_utf8();
+            continue;
         }
+        if source[cursor..].starts_with("//") {
+            cursor = source[cursor..]
+                .find('\n')
+                .map_or(source.len(), |offset| cursor + offset + 1);
+            continue;
+        }
+        let start = cursor;
+        if source[cursor..].starts_with("->") {
+            cursor += 2;
+        } else if "{}(),:;<>".contains(character) {
+            cursor += character.len_utf8();
+        } else {
+            cursor += character.len_utf8();
+            while cursor < source.len() {
+                let next = source[cursor..]
+                    .chars()
+                    .next()
+                    .expect("cursor is on a character boundary");
+                if next.is_whitespace()
+                    || "{}(),:;<>".contains(next)
+                    || source[cursor..].starts_with("//")
+                    || source[cursor..].starts_with("->")
+                {
+                    break;
+                }
+                cursor += next.len_utf8();
+            }
+        }
+        tokens.push(Token {
+            text: source[start..cursor].to_owned(),
+            start,
+            end: cursor,
+        });
     }
-    output.split_whitespace().map(str::to_owned).collect()
+    tokens
 }
 
 struct Parser {
-    tokens: Vec<String>,
+    tokens: Vec<Token>,
     cursor: usize,
+    source_len: usize,
+    type_spans: Vec<(TypeRef, usize, usize)>,
+    function_mode_spans: Vec<(usize, usize)>,
 }
 
 impl Parser {
@@ -2274,7 +2357,10 @@ impl Parser {
                     self.cursor += 1;
                     let name = self.word()?;
                     self.expect(";")?;
-                    insert_unique(&mut idl.opaque_handles, name)?;
+                    if idl.opaque_handles.contains(&name) {
+                        return Err(self.duplicate(&name));
+                    }
+                    idl.opaque_handles.push(name);
                 }
                 Some("struct") => {
                     self.cursor += 1;
@@ -2286,7 +2372,7 @@ impl Parser {
                         self.expect(";")?;
                     }
                     if idl.structs.iter().any(|item| item.name == name) {
-                        return Err(IdlError::Duplicate(name));
+                        return Err(self.duplicate(&name));
                     }
                     idl.structs.push(Struct { name, fields });
                 }
@@ -2301,7 +2387,7 @@ impl Parser {
                             .iter()
                             .any(|variant: &EnumVariant| variant.name == variant_name)
                         {
-                            return Err(IdlError::Duplicate(format!("{name}::{variant_name}")));
+                            return Err(self.duplicate(&format!("{name}::{variant_name}")));
                         }
                         let payload = if self.take("(") {
                             let payload = self.ty()?;
@@ -2317,20 +2403,24 @@ impl Parser {
                         self.take(",");
                     }
                     if idl.enums.iter().any(|item| item.name == name) {
-                        return Err(IdlError::Duplicate(name));
+                        return Err(self.duplicate(&name));
                     }
                     idl.enums.push(Enum { name, variants });
                 }
                 Some("sync" | "request") => {
+                    let mode_span = self.current_span();
                     let synchronous = self.word()? == "sync";
                     let (cancel_policy, abandon_policy) = if !synchronous && self.take("(") {
                         let cancel_policy = match self.word()?.as_str() {
                             "return_error" => CancelPolicy::ReturnError,
                             "cancel_task" => CancelPolicy::CancelTask,
                             value => {
-                                return Err(IdlError::Syntax(format!(
-                                    "unknown cancel policy {value}"
-                                )));
+                                return Err(self.error_at_previous(
+                                    IdlErrorKind::Syntax,
+                                    "`return_error` or `cancel_task`",
+                                    value,
+                                    format!("unknown cancel policy {value}"),
+                                ));
                             }
                         };
                         self.expect(",")?;
@@ -2338,9 +2428,12 @@ impl Parser {
                             "return_error" => AbandonPolicy::ReturnError,
                             "trap" => AbandonPolicy::Trap,
                             value => {
-                                return Err(IdlError::Syntax(format!(
-                                    "unknown abandon policy {value}"
-                                )));
+                                return Err(self.error_at_previous(
+                                    IdlErrorKind::Syntax,
+                                    "`return_error` or `trap`",
+                                    value,
+                                    format!("unknown abandon policy {value}"),
+                                ));
                             }
                         };
                         self.expect(")")?;
@@ -2350,12 +2443,20 @@ impl Parser {
                     };
                     let fuel_cost = if self.take("fuel") {
                         let value = self.word()?;
-                        let fuel_cost = value
-                            .parse::<u32>()
-                            .map_err(|_| IdlError::Syntax(format!("invalid fuel cost {value}")))?;
+                        let fuel_cost = value.parse::<u32>().map_err(|_| {
+                            self.error_at_previous(
+                                IdlErrorKind::Syntax,
+                                "a positive u32 fuel cost",
+                                &value,
+                                format!("invalid fuel cost {value}"),
+                            )
+                        })?;
                         if fuel_cost == 0 {
-                            return Err(IdlError::Syntax(
-                                "fuel cost must be greater than zero".into(),
+                            return Err(self.error_at_previous(
+                                IdlErrorKind::Syntax,
+                                "a fuel cost greater than zero",
+                                value,
+                                "fuel cost must be greater than zero",
                             ));
                         }
                         fuel_cost
@@ -2379,7 +2480,7 @@ impl Parser {
                     let result = self.ty()?;
                     self.expect(";")?;
                     if idl.functions.iter().any(|item| item.name == name) {
-                        return Err(IdlError::Duplicate(name));
+                        return Err(self.duplicate(&name));
                     }
                     idl.functions.push(HostFunction {
                         name,
@@ -2390,6 +2491,7 @@ impl Parser {
                         cancel_policy,
                         abandon_policy,
                     });
+                    self.function_mode_spans.push(mode_span);
                 }
                 Some("export") => {
                     self.cursor += 1;
@@ -2413,7 +2515,7 @@ impl Parser {
                     };
                     self.expect(";")?;
                     if idl.exports.iter().any(|item| item.name == name) {
-                        return Err(IdlError::Duplicate(name));
+                        return Err(self.duplicate(&name));
                     }
                     idl.exports.push(Export {
                         name,
@@ -2421,10 +2523,17 @@ impl Parser {
                         result,
                     });
                 }
-                token => return Err(IdlError::Syntax(format!("unexpected {token:?}"))),
+                token => {
+                    return Err(self.error_at_current(
+                        IdlErrorKind::Syntax,
+                        "an interface member declaration or `}`",
+                        format!("{token:?}"),
+                        format!("unexpected {token:?}"),
+                    ));
+                }
             }
         }
-        validate_types(&idl)?;
+        validate_types(&idl, &self.type_spans, &self.function_mode_spans)?;
         Ok(idl)
     }
 
@@ -2439,7 +2548,8 @@ impl Parser {
 
     fn ty(&mut self) -> Result<TypeRef, IdlError> {
         let name = self.word()?;
-        Ok(match name.as_str() {
+        let (start, end) = self.previous_span();
+        let ty = match name.as_str() {
             "i32" => TypeRef::I32,
             "i64" => TypeRef::I64,
             "f32" => TypeRef::F32,
@@ -2477,8 +2587,17 @@ impl Parser {
                 TypeRef::Result(Box::new(success), Box::new(error))
             }
             named if self.peek() != Some("<") => TypeRef::Named(named.to_owned()),
-            named => return Err(IdlError::UnknownType(named.to_owned())),
-        })
+            named => {
+                return Err(self.error_at_previous(
+                    IdlErrorKind::UnknownType,
+                    "a built-in, declared, or non-generic named type",
+                    named,
+                    format!("unknown type {named}"),
+                ));
+            }
+        };
+        self.type_spans.push((ty.clone(), start, end));
+        Ok(ty)
     }
 
     fn optional_type_argument(&mut self) -> Result<Option<Box<TypeRef>>, IdlError> {
@@ -2492,7 +2611,9 @@ impl Parser {
     }
 
     fn peek(&self) -> Option<&str> {
-        self.tokens.get(self.cursor).map(String::as_str)
+        self.tokens
+            .get(self.cursor)
+            .map(|token| token.text.as_str())
     }
 
     fn take(&mut self, token: &str) -> bool {
@@ -2508,117 +2629,181 @@ impl Parser {
         if self.take(token) {
             Ok(())
         } else {
-            Err(IdlError::Syntax(format!(
-                "expected `{token}`, found {:?}",
-                self.peek()
-            )))
+            Err(self.error_at_current(
+                IdlErrorKind::Syntax,
+                format!("`{token}`"),
+                self.peek().unwrap_or("<eof>"),
+                format!("expected `{token}`, found {:?}", self.peek()),
+            ))
         }
     }
 
     fn word(&mut self) -> Result<String, IdlError> {
-        let word = self
-            .tokens
-            .get(self.cursor)
-            .ok_or_else(|| IdlError::Syntax("unexpected end".into()))?
-            .clone();
+        let word = self.tokens.get(self.cursor).ok_or_else(|| {
+            self.error_at_current(
+                IdlErrorKind::Syntax,
+                "an identifier",
+                "<eof>",
+                "unexpected end of IDL",
+            )
+        })?;
+        if matches!(
+            word.text.as_str(),
+            "{" | "}" | "(" | ")" | "," | ":" | ";" | "<" | ">" | "->"
+        ) {
+            return Err(self.error_at_current(
+                IdlErrorKind::Syntax,
+                "an identifier",
+                &word.text,
+                format!("expected an identifier, found `{}`", word.text),
+            ));
+        }
+        let word = word.text.clone();
         self.cursor += 1;
         Ok(word)
     }
-}
 
-fn insert_unique(items: &mut Vec<String>, name: String) -> Result<(), IdlError> {
-    if items.contains(&name) {
-        Err(IdlError::Duplicate(name))
-    } else {
-        items.push(name);
-        Ok(())
+    fn current_span(&self) -> (usize, usize) {
+        self.tokens
+            .get(self.cursor)
+            .map_or((self.source_len, self.source_len), |token| {
+                (token.start, token.end)
+            })
+    }
+
+    fn previous_span(&self) -> (usize, usize) {
+        self.cursor
+            .checked_sub(1)
+            .and_then(|index| self.tokens.get(index))
+            .map_or((self.source_len, self.source_len), |token| {
+                (token.start, token.end)
+            })
+    }
+
+    fn error_at_current(
+        &self,
+        kind: IdlErrorKind,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        message: impl Into<String>,
+    ) -> IdlError {
+        let (start, end) = self.current_span();
+        IdlError::new(kind, start, end, expected, actual, message)
+    }
+
+    fn error_at_previous(
+        &self,
+        kind: IdlErrorKind,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        message: impl Into<String>,
+    ) -> IdlError {
+        let (start, end) = self.previous_span();
+        IdlError::new(kind, start, end, expected, actual, message)
+    }
+
+    fn duplicate(&self, name: &str) -> IdlError {
+        self.error_at_previous(
+            IdlErrorKind::Duplicate,
+            "a unique declaration name",
+            name,
+            format!("duplicate declaration `{name}`"),
+        )
     }
 }
 
-fn validate_types(idl: &Idl) -> Result<(), IdlError> {
+fn validate_types(
+    idl: &Idl,
+    type_spans: &[(TypeRef, usize, usize)],
+    function_mode_spans: &[(usize, usize)],
+) -> Result<(), IdlError> {
     let known = |name: &str| {
         idl.opaque_handles.iter().any(|item| item == name)
             || idl.structs.iter().any(|item| item.name == name)
             || idl.enums.iter().any(|item| item.name == name)
     };
-    for ty in idl
-        .structs
-        .iter()
-        .flat_map(|structure| structure.fields.iter().map(|field| &field.ty))
-        .chain(idl.enums.iter().flat_map(|enumeration| {
-            enumeration
-                .variants
-                .iter()
-                .filter_map(|variant| variant.payload.as_ref())
-        }))
-        .chain(idl.functions.iter().flat_map(|function| {
-            function
-                .parameters
-                .iter()
-                .map(|field| &field.ty)
-                .chain(std::iter::once(&function.result))
-        }))
-        .chain(idl.exports.iter().flat_map(|export| {
-            export
-                .parameters
-                .iter()
-                .map(|field| &field.ty)
-                .chain(export.result.iter())
-        }))
-    {
-        validate_type_ref(ty, &known)?;
+    let mut ordered_types = type_spans.iter().collect::<Vec<_>>();
+    ordered_types.sort_by_key(|(_, start, _)| *start);
+    for (ty, start, end) in ordered_types {
+        if let Err(mut error) = validate_type_ref_shallow(ty, &known) {
+            error.start = *start;
+            error.end = *end;
+            return Err(error);
+        }
     }
-    if idl.functions.iter().any(|function| {
-        !function.synchronous
+    for (index, function) in idl.functions.iter().enumerate() {
+        let (start, end) = function_mode_spans.get(index).copied().unwrap_or((0, 0));
+        if !function.synchronous
             && !matches!(
                 function.result,
                 TypeRef::HostRequest(Some(ref inner))
                     if matches!(inner.as_ref(), TypeRef::Result(_, _))
             )
-    }) {
-        return Err(IdlError::Syntax(
-            "request functions must return request<Result<Success, Error>>".into(),
-        ));
-    }
-    if idl
-        .functions
-        .iter()
-        .any(|function| function.synchronous && matches!(function.result, TypeRef::HostRequest(_)))
-    {
-        return Err(IdlError::Syntax(
-            "sync functions cannot return request values".into(),
-        ));
+        {
+            return Err(IdlError::new(
+                IdlErrorKind::Syntax,
+                start,
+                end,
+                "request<Result<Success, Error>>",
+                "request",
+                "request functions must return request<Result<Success, Error>>",
+            ));
+        }
+        if function.synchronous && matches!(function.result, TypeRef::HostRequest(_)) {
+            return Err(IdlError::new(
+                IdlErrorKind::Syntax,
+                start,
+                end,
+                "a non-request result type",
+                "sync",
+                "sync functions cannot return request values",
+            ));
+        }
     }
     Ok(())
 }
 
-fn validate_type_ref(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), IdlError> {
+fn validate_type_ref_shallow(ty: &TypeRef, known: &impl Fn(&str) -> bool) -> Result<(), IdlError> {
     match ty {
-        TypeRef::Named(name) if !known(name) => Err(IdlError::UnknownType(name.clone())),
-        TypeRef::HostRequest(None) => Err(IdlError::Syntax(
-            "request types require a result type".into(),
+        TypeRef::Named(name) if !known(name) => Err(IdlError::semantic(
+            IdlErrorKind::UnknownType,
+            "a built-in or declared type",
+            name,
+            format!("unknown type `{name}`"),
         )),
-        TypeRef::ResourceToken(None) => Err(IdlError::Syntax(
-            "token types require a resource domain".into(),
+        TypeRef::HostRequest(None) => Err(IdlError::semantic(
+            IdlErrorKind::Syntax,
+            "request<Result<Success, Error>>",
+            "request",
+            "request types require a result type",
         )),
-        TypeRef::Snapshot(None) => Err(IdlError::Syntax(
-            "snapshot types require a nominal content type".into(),
+        TypeRef::ResourceToken(None) => Err(IdlError::semantic(
+            IdlErrorKind::Syntax,
+            "token<ResourceDomain>",
+            "token",
+            "token types require a resource domain",
         )),
-        TypeRef::Snapshot(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => Err(
-            IdlError::Syntax("snapshot content types must be nominal".into()),
-        ),
-        TypeRef::ResourceToken(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => Err(
-            IdlError::Syntax("token resource domains must be nominal".into()),
-        ),
-        TypeRef::HostRequest(Some(inner))
-        | TypeRef::ResourceToken(Some(inner))
-        | TypeRef::Snapshot(Some(inner))
-        | TypeRef::Array(inner)
-        | TypeRef::Buffer(inner)
-        | TypeRef::Option(inner) => validate_type_ref(inner, known),
-        TypeRef::Result(success, error) => {
-            validate_type_ref(success, known)?;
-            validate_type_ref(error, known)
+        TypeRef::Snapshot(None) => Err(IdlError::semantic(
+            IdlErrorKind::Syntax,
+            "snapshot<NominalType>",
+            "snapshot",
+            "snapshot types require a nominal content type",
+        )),
+        TypeRef::Snapshot(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => {
+            Err(IdlError::semantic(
+                IdlErrorKind::Syntax,
+                "a nominal snapshot content type",
+                "snapshot",
+                "snapshot content types must be nominal",
+            ))
+        }
+        TypeRef::ResourceToken(Some(inner)) if !matches!(inner.as_ref(), TypeRef::Named(_)) => {
+            Err(IdlError::semantic(
+                IdlErrorKind::Syntax,
+                "a nominal token resource domain",
+                "token",
+                "token resource domains must be nominal",
+            ))
         }
         _ => Ok(()),
     }
@@ -2642,6 +2827,47 @@ mod tests {
             export Update(entity: Entity, dt: f32) -> void;
         }
     ";
+
+    #[test]
+    fn parse_errors_preserve_original_byte_span_and_token_expectation() {
+        let source = "interface Host {\n    sync fn broken(value: i32) i32;\n}";
+        let error = parse(source).expect_err("missing return arrow");
+        let start = source.rfind("i32;").expect("actual token");
+        assert_eq!(error.start, start);
+        assert_eq!(error.end, start + 3);
+        assert_eq!(error.expected, "`->`");
+        assert_eq!(error.actual, "i32");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{start}..{}", start + 3))
+        );
+    }
+
+    #[test]
+    fn parse_error_spans_remain_exact_after_unicode_and_comments() {
+        let source = "// 界面\ninterface Host {\n    sync fn broken(value: string) -> ;\n}";
+        let error = parse(source).expect_err("missing result type");
+        let start = source.find(";\n}").expect("actual semicolon");
+        assert_eq!((error.start, error.end), (start, start + 1));
+        assert_eq!(error.expected, "an identifier");
+        assert_eq!(error.actual, ";");
+    }
+
+    #[test]
+    fn semantic_error_spans_point_to_the_failing_type_or_function_mode() {
+        let unknown = "interface Host {\n    sync fn broken(value: Host) -> i32;\n}";
+        let error = parse(unknown).expect_err("interface name is not a declared value type");
+        let start = unknown.rfind("Host").expect("parameter type");
+        assert_eq!((error.start, error.end), (start, start + 4));
+        assert_eq!(error.actual, "Host");
+
+        let request = "interface Host {\n    request fn broken() -> i32;\n}";
+        let error = parse(request).expect_err("request function result shape");
+        let start = request.find("request").expect("request mode");
+        assert_eq!((error.start, error.end), (start, start + "request".len()));
+        assert_eq!(error.actual, "request");
+    }
 
     #[test]
     fn exact_hash_ignores_comments_and_whitespace_but_preserves_field_order() {

@@ -21,10 +21,13 @@ pub(crate) struct PackageRecord {
     pub last_diagnostic: Option<EngineDiagnosticSummary>,
     pub last_known_good: Option<LastKnownGood>,
     pub development: crate::development::PackageDevelopment,
+    pub awaiting_job: Option<crate::CompileJob>,
     pub handler_calls_this_tick: u64,
+    pub handler_instructions_this_tick: u64,
     pub fuel_used_this_tick: u64,
     pub outputs_this_tick: u64,
     pub ready_candidate: Option<crate::development::ReadyCandidate>,
+    pub ready_commit_requested: bool,
 }
 
 impl PackageRecord {

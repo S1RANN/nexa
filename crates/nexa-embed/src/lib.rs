@@ -6,6 +6,7 @@ mod capability;
 mod contract;
 mod development;
 mod diagnostic;
+mod diagnostic_evidence;
 mod directory_source;
 mod dispatch;
 mod entitlement;
@@ -22,21 +23,27 @@ mod source_file;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub use artifact::{
-    CompiledPackageArtifact, FunctionDebugInfo, LastKnownGood, ManifestHash, ModuleDebugInfo,
-    SourceHash, compile_package,
+    CandidateCompilation, CompiledPackageArtifact, FunctionDebugInfo, LastKnownGood, ManifestHash,
+    ModuleDebugInfo, SourceHash, compile_package,
 };
 pub use builder::NexaEngineBuilder;
 pub use capability::CapabilitySet;
 pub use contract::{ExportRequirement, HostContract};
 pub use development::{
-    DevelopmentCompileRequest, DevelopmentCompileResult, DevelopmentCompiler, DevelopmentConfig,
-    DevelopmentEvent, DevelopmentEventData, DevelopmentState,
+    CandidateCancellation, CandidateTerminal, CandidateTerminalData, CandidateTerminalKind,
+    CompileJob, DevelopmentCompileRequest, DevelopmentCompiler, DevelopmentConfig,
+    DevelopmentEvent, DevelopmentEventData, DevelopmentState, EnqueueOutcome, WorkerEvent,
+    WorkerInspection,
 };
 pub use diagnostic::{
     DiagnosticRenderer, EngineDiagnostic, EngineDiagnosticContext, EngineDiagnosticStage,
     EngineDiagnosticSummary, EngineTaskId, RelatedDiagnostic,
+};
+pub use diagnostic_evidence::{
+    EngineDiagnosticEvidence, run_engine_diagnostic_cases, run_engine_diagnostic_evidence,
 };
 pub use directory_source::DirectorySource;
 pub use entitlement::{EntitlementResolver, NoEntitlements, StaticEntitlements};
@@ -59,7 +66,7 @@ pub use source_file::{
     SourceFile, SourceFileRegistry, SourceFileRegistryError, SourcePosition, SourceRange,
 };
 
-use development::{CompileJob, DevelopmentWorker};
+use development::DevelopmentWorker;
 use diagnostic::BoundedDiagnosticLog;
 use package::{PackageRecord, PackageRuntime};
 
@@ -143,7 +150,9 @@ impl NexaEngine {
             sources: builder.sources,
             entitlements: builder.entitlements,
             storage_dir: builder.storage_dir,
-            runtime_host: nexa_runtime::RuntimeHost::new(builder.runtime_host_capacity),
+            runtime_host: builder
+                .runtime_host
+                .unwrap_or_else(|| nexa_runtime::RuntimeHost::new(builder.runtime_host_capacity)),
             packages: Vec::new(),
             diagnostics: BoundedDiagnosticLog::default(),
             required_exports: builder.required_exports,
@@ -172,11 +181,30 @@ impl NexaEngine {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     let message = error.to_string();
+                    let (stage, code) = match &error {
+                        PackageSourceError::Manifest(
+                            ManifestError::ActivationNotAllowed
+                            | ManifestError::CapabilityCeiling
+                            | ManifestError::RuntimeLimit
+                            | ManifestError::EntitlementNotAllowed,
+                        )
+                        | PackageSourceError::EscapedRoot
+                        | PackageSourceError::TooManyPackages => {
+                            (EngineDiagnosticStage::Policy, nexa::ErrorCode::NX7003)
+                        }
+                        PackageSourceError::Manifest(_) => {
+                            (EngineDiagnosticStage::Manifest, nexa::ErrorCode::NX7002)
+                        }
+                        PackageSourceError::Io(_) => (
+                            EngineDiagnosticStage::SourceDiscovery,
+                            nexa::ErrorCode::NX7001,
+                        ),
+                    };
                     self.diagnostics.push(EngineDiagnostic::without_source(
                         None,
                         Some(source_id.clone()),
-                        EngineDiagnosticStage::SourceDiscovery,
-                        nexa::ErrorCode::NX7001,
+                        stage,
+                        code,
                         &message,
                     ));
                     return Err(EngineError::Source {
@@ -206,10 +234,13 @@ impl NexaEngine {
                     last_diagnostic: None,
                     last_known_good: None,
                     development: development::PackageDevelopment::default(),
+                    awaiting_job: None,
                     handler_calls_this_tick: 0,
+                    handler_instructions_this_tick: 0,
                     fuel_used_this_tick: 0,
                     outputs_this_tick: 0,
                     ready_candidate: None,
+                    ready_commit_requested: false,
                 });
             }
         }
@@ -225,16 +256,14 @@ impl NexaEngine {
                 .is_some_and(|count| *count > 1)
             {
                 record.lifecycle.transition(PackageStatus::Incompatible)?;
-                record.last_diagnostic = Some(
-                    EngineDiagnostic::without_source(
-                        Some(record.candidate.manifest.id.clone()),
-                        Some(record.source_id.clone()),
-                        EngineDiagnosticStage::Manifest,
-                        nexa::ErrorCode::NX7002,
-                        "duplicate package id",
-                    )
-                    .summary(),
-                );
+                let diagnostic = self.diagnostics.push(EngineDiagnostic::without_source(
+                    Some(record.candidate.manifest.id.clone()),
+                    Some(record.source_id.clone()),
+                    EngineDiagnosticStage::Manifest,
+                    nexa::ErrorCode::NX7002,
+                    "duplicate package id",
+                ));
+                record.last_diagnostic = Some(diagnostic.summary());
             }
         }
         self.packages = records;
@@ -267,7 +296,12 @@ impl NexaEngine {
         let index = self.unique_index(id)?;
         match self.packages[index].lifecycle.status() {
             PackageStatus::Enabled => return Ok(()),
-            PackageStatus::Locked => return Err(EngineError::Locked(id.clone())),
+            PackageStatus::Locked => {
+                let error = EngineError::Locked(id.clone());
+                let summary = self.record_error(index, &error);
+                self.packages[index].last_diagnostic = Some(summary);
+                return Err(error);
+            }
             PackageStatus::Incompatible => return Err(EngineError::Incompatible(id.clone())),
             PackageStatus::Discovered | PackageStatus::Disabled | PackageStatus::Faulted => {}
             status => return Err(EngineError::InvalidState(id.clone(), status)),
@@ -313,7 +347,11 @@ impl NexaEngine {
                     .lifecycle
                     .transition(PackageStatus::Enabled)?;
                 self.persisted.insert(id.clone(), true);
-                self.persist_selections()?;
+                if let Err(error) = self.persist_selections() {
+                    let summary = self.record_error(index, &error);
+                    self.packages[index].last_diagnostic = Some(summary);
+                    return Err(error);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -433,7 +471,7 @@ impl NexaEngine {
             candidate,
         )
         .map(|compilation| compilation.artifact)
-        .map_err(|diagnostic| EngineError::Diagnostic(Box::new(diagnostic)))
+        .map_err(|failure| EngineError::Diagnostic(Box::new(failure.diagnostic)))
     }
 
     fn validate_exports(
@@ -498,6 +536,7 @@ impl NexaEngine {
         if self.packages[index].lifecycle.status() == PackageStatus::Locked {
             return Ok(());
         }
+        self.cancel_development(index, CandidateCancellation::Disable);
         let id = self.packages[index].candidate.manifest.id.clone();
         self.packages[index]
             .lifecycle
@@ -517,7 +556,11 @@ impl NexaEngine {
             .transition(PackageStatus::Disabled)?;
         if persist {
             self.persisted.insert(id, false);
-            self.persist_selections()?;
+            if let Err(error) = self.persist_selections() {
+                let summary = self.record_error(index, &error);
+                self.packages[index].last_diagnostic = Some(summary);
+                return Err(error);
+            }
         }
         Ok(())
     }
@@ -537,28 +580,11 @@ impl NexaEngine {
         self.reload_candidate(index, candidate)
     }
 
-    pub fn commit_ready(&mut self, id: &PackageId) -> Result<Option<ReloadReport>, EngineError> {
+    pub fn request_ready_commit(&mut self, id: &PackageId) -> Result<bool, EngineError> {
         let index = self.unique_index(id)?;
-        let Some(ready) = self.packages[index].ready_candidate.take() else {
-            return Ok(None);
-        };
-        match self.commit_compiled_candidate(
-            index,
-            ready.candidate,
-            ready.compilation.artifact,
-            ready.generation,
-            ready.compilation.compile_duration,
-            ready.compilation.verify_duration,
-        ) {
-            Ok(report) => {
-                self.publish_reload(report.clone());
-                Ok(Some(report))
-            }
-            Err(failure) => {
-                self.publish_reload(failure.report);
-                Err(failure.error)
-            }
-        }
+        let ready = self.packages[index].ready_candidate.is_some();
+        self.packages[index].ready_commit_requested = ready;
+        Ok(ready)
     }
 
     fn reload_candidate(
@@ -573,7 +599,8 @@ impl NexaEngine {
             &candidate,
         ) {
             Ok(compilation) => compilation,
-            Err(diagnostic) => {
+            Err(failure) => {
+                let diagnostic = failure.diagnostic;
                 let diagnostic = self.diagnostics.push(diagnostic);
                 self.packages[index].last_diagnostic = Some(diagnostic.summary());
                 let report = reload_report(
@@ -586,9 +613,9 @@ impl NexaEngine {
                         .unwrap_or_default(),
                     None,
                     candidate_source_hash(&candidate),
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
+                    failure.compile_duration,
+                    failure.verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
                     if diagnostic.stage == EngineDiagnosticStage::Verify {
                         ReloadReportOutcome::VerifyFailed
                     } else {
@@ -655,7 +682,10 @@ impl NexaEngine {
                         source_hash,
                         compile_duration,
                         verify_duration,
-                        reload_started.elapsed(),
+                        nexa_runtime::RestartReloadMetrics {
+                            activation_duration: reload_started.elapsed(),
+                            ..nexa_runtime::RestartReloadMetrics::default()
+                        },
                         ReloadReportOutcome::ActivationFaulted,
                         0,
                         0,
@@ -685,7 +715,10 @@ impl NexaEngine {
                         source_hash,
                         compile_duration,
                         verify_duration,
-                        reload_started.elapsed(),
+                        nexa_runtime::RestartReloadMetrics {
+                            activation_duration: reload_started.elapsed(),
+                            ..nexa_runtime::RestartReloadMetrics::default()
+                        },
                         ReloadReportOutcome::Committed,
                         0,
                         0,
@@ -707,7 +740,10 @@ impl NexaEngine {
                             source_hash,
                             compile_duration,
                             verify_duration,
-                            reload_started.elapsed(),
+                            nexa_runtime::RestartReloadMetrics {
+                                activation_duration: reload_started.elapsed(),
+                                ..nexa_runtime::RestartReloadMetrics::default()
+                            },
                             ReloadReportOutcome::ActivationFaulted,
                             0,
                             0,
@@ -730,7 +766,7 @@ impl NexaEngine {
                     source_hash,
                     compile_duration,
                     verify_duration,
-                    reload_started.elapsed(),
+                    nexa_runtime::RestartReloadMetrics::default(),
                     ReloadReportOutcome::RolledBackBeforeCommit,
                     0,
                     0,
@@ -738,7 +774,7 @@ impl NexaEngine {
                 EngineError::Lifecycle(error),
             ));
         }
-        let outcome = {
+        let measured = {
             let runtime = self.packages[index].runtime.as_mut().ok_or_else(|| {
                 ReloadFailure::new(
                     reload_report(
@@ -749,7 +785,7 @@ impl NexaEngine {
                         source_hash,
                         compile_duration,
                         verify_duration,
-                        reload_started.elapsed(),
+                        nexa_runtime::RestartReloadMetrics::default(),
                         ReloadReportOutcome::RolledBackBeforeCommit,
                         0,
                         0,
@@ -757,11 +793,15 @@ impl NexaEngine {
                     EngineError::InvalidState(id.clone(), PackageStatus::Reloading),
                 )
             })?;
-            runtime.realm.restart_reload(
+            runtime.realm.restart_reload_measured(
                 runtime.module,
                 artifact.verified.clone(),
                 nexa_runtime::RestartReloadPolicy::default(),
             )
+        };
+        let (outcome, reload_metrics) = match measured {
+            Ok(result) => (Ok(result.outcome), result.metrics),
+            Err(error) => (Err(error), nexa_runtime::RestartReloadMetrics::default()),
         };
         let accounting = self.packages[index]
             .runtime
@@ -797,7 +837,7 @@ impl NexaEngine {
                     source_hash,
                     compile_duration,
                     verify_duration,
-                    reload_started.elapsed(),
+                    reload_metrics,
                     ReloadReportOutcome::Committed,
                     accounting.cancelled_tasks,
                     accounting.detached_requests,
@@ -821,7 +861,7 @@ impl NexaEngine {
                         source_hash,
                         compile_duration,
                         verify_duration,
-                        reload_started.elapsed(),
+                        reload_metrics,
                         ReloadReportOutcome::RolledBackBeforeCommit,
                         accounting.cancelled_tasks,
                         accounting.detached_requests,
@@ -847,7 +887,7 @@ impl NexaEngine {
                         source_hash,
                         compile_duration,
                         verify_duration,
-                        reload_started.elapsed(),
+                        reload_metrics,
                         ReloadReportOutcome::ActivationFaulted,
                         accounting.cancelled_tasks,
                         accounting.detached_requests,
@@ -878,6 +918,10 @@ impl NexaEngine {
             epoch,
             committed_generation: generation,
         });
+        self.packages[index].development.active_hash = self.packages[index]
+            .last_known_good
+            .as_ref()
+            .map(|known_good| known_good.source_hash);
     }
 
     pub fn reload_changed(&mut self) -> Result<usize, EngineError> {
@@ -923,22 +967,21 @@ impl NexaEngine {
             let candidates = match discovered {
                 Ok(candidates) => candidates,
                 Err(message) => {
-                    let diagnostic = self.diagnostics.push(EngineDiagnostic::without_source(
-                        None,
-                        Some(source_id),
-                        EngineDiagnosticStage::SourceDiscovery,
-                        nexa::ErrorCode::NX7001,
-                        message,
-                    ));
-                    if let Some(package_id) = diagnostic.package_id.clone() {
-                        self.publish_event(DevelopmentEvent::CompileFailed(
-                            development_event_data(
-                                package_id,
-                                0,
-                                SourceHash::default(),
-                                Some(diagnostic),
-                            ),
-                        ));
+                    let indexes = self
+                        .packages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, record)| {
+                            record.source_id == source_id
+                                && matches!(
+                                    record.lifecycle.status(),
+                                    PackageStatus::Enabled | PackageStatus::Faulted
+                                )
+                        })
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    for index in indexes {
+                        self.mark_source_missing(index, &message);
                     }
                     continue;
                 }
@@ -964,33 +1007,45 @@ impl NexaEngine {
                     .find(|candidate| candidate.manifest.id == package_id)
                     .cloned()
                 else {
-                    let generation = self.packages[index]
-                        .development
-                        .latest_generation
-                        .saturating_add(1);
-                    self.packages[index].development.state = DevelopmentState::HostRebuildRequired;
-                    self.publish_event(DevelopmentEvent::HostRebuildRequired(
-                        development_event_data(package_id, generation, SourceHash::default(), None),
-                    ));
+                    self.mark_source_missing(
+                        index,
+                        "Package source or Manifest disappeared; the active version remains loaded",
+                    );
                     continue;
                 };
+
                 let hash_started = std::time::Instant::now();
                 let source_hash = candidate_source_hash(&candidate);
                 self.packages[index].development.last_source_hash_duration = hash_started.elapsed();
-                let active_hash = candidate_source_hash(&self.packages[index].candidate);
-                if source_hash == active_hash
-                    || self.packages[index].development.last_processed_hash == Some(source_hash)
+                if self.packages[index].development.state == DevelopmentState::SourceMissing {
+                    self.packages[index].development.state = DevelopmentState::Idle;
+                    self.packages[index].development.terminal_hash = None;
+                }
+                if self.packages[index].development.active_hash == Some(source_hash)
+                    || self.packages[index].development.terminal_hash == Some(source_hash)
                 {
                     continue;
                 }
+
                 if self.packages[index].development.observed_hash == Some(source_hash) {
                     self.packages[index].development.stable_scans = self.packages[index]
                         .development
                         .stable_scans
                         .saturating_add(1);
                 } else {
+                    if let Some(job) = self.packages[index].awaiting_job.take() {
+                        self.process_candidate_terminal(job.supersede_before_compile());
+                    }
+                    if let Some(ready) = self.packages[index].ready_candidate.take() {
+                        self.process_candidate_terminal(CandidateTerminal::SupersededAfterCompile(
+                            ready.terminal_data,
+                        ));
+                    }
                     self.packages[index].development.observed_hash = Some(source_hash);
+                    self.packages[index].development.stable_hash = None;
                     self.packages[index].development.stable_scans = 1;
+                    self.packages[index].development.change_observed_at =
+                        Some(std::time::Instant::now());
                     self.packages[index].development.state = DevelopmentState::ChangeObserved;
                     self.packages[index].development.latest_generation = self.packages[index]
                         .development
@@ -1003,12 +1058,8 @@ impl NexaEngine {
                         source_hash,
                         None,
                     )));
-                    if self.development.stable_scan_count > 1 {
-                        self.packages[index].development.state =
-                            DevelopmentState::WaitingForStableWrite;
-                        continue;
-                    }
                 }
+
                 if self.packages[index].development.stable_scans
                     < self.development.stable_scan_count.max(1)
                 {
@@ -1017,245 +1068,628 @@ impl NexaEngine {
                     continue;
                 }
                 let generation = self.packages[index].development.latest_generation;
-                self.packages[index].development.last_processed_hash = Some(source_hash);
-                self.packages[index].development.state = DevelopmentState::CompileQueued;
-                self.publish_event(DevelopmentEvent::ChangeStabilized(development_event_data(
-                    package_id.clone(),
-                    generation,
-                    source_hash,
-                    None,
-                )));
-                let job = CompileJob {
-                    package_id: package_id.clone(),
-                    source_id: source_id.clone(),
-                    generation,
-                    source_hash,
-                    candidate,
-                    idl: self.idl.clone(),
-                    required_exports: self.required_exports.clone(),
-                    queued_at: std::time::Instant::now(),
-                };
-                let superseded = self
-                    .development_worker
-                    .as_ref()
-                    .map_or_else(Vec::new, |worker| worker.enqueue(job));
-                self.publish_event(DevelopmentEvent::CompileQueued(development_event_data(
-                    package_id,
-                    generation,
-                    source_hash,
-                    None,
-                )));
-                for (package_id, generation, source_hash) in superseded {
-                    self.publish_event(DevelopmentEvent::CandidateSuperseded(
-                        development_event_data(package_id, generation, source_hash, None),
-                    ));
+                if self.packages[index].development.stable_hash != Some(source_hash) {
+                    self.packages[index].development.stable_hash = Some(source_hash);
+                    self.packages[index]
+                        .development
+                        .last_change_to_stable_duration = self.packages[index]
+                        .development
+                        .change_observed_at
+                        .map_or(Duration::ZERO, |observed| observed.elapsed());
+                    self.publish_event(DevelopmentEvent::ChangeStabilized(development_event_data(
+                        package_id.clone(),
+                        generation,
+                        source_hash,
+                        None,
+                    )));
                 }
+                if self.packages[index].awaiting_job.is_some()
+                    || self.packages[index].development.queued_hash == Some(source_hash)
+                    || self.packages[index].development.in_flight_hash == Some(source_hash)
+                {
+                    continue;
+                }
+                self.try_enqueue_job(
+                    index,
+                    CompileJob::new(
+                        package_id,
+                        source_id.clone(),
+                        generation,
+                        source_hash,
+                        candidate,
+                        self.idl.clone(),
+                        self.required_exports.clone(),
+                    ),
+                );
             }
         }
     }
 
+    fn mark_source_missing(&mut self, index: usize, message: &str) {
+        if self.packages[index].development.state == DevelopmentState::SourceMissing {
+            return;
+        }
+        self.cancel_development(index, CandidateCancellation::SourceRemoval);
+        self.packages[index].development.state = DevelopmentState::SourceMissing;
+        self.packages[index].development.observed_hash = None;
+        self.packages[index].development.stable_hash = None;
+        let package_id = self.packages[index].candidate.manifest.id.clone();
+        let source_id = self.packages[index].source_id.clone();
+        let diagnostic = self.diagnostics.push(EngineDiagnostic::without_source(
+            Some(package_id.clone()),
+            Some(source_id),
+            EngineDiagnosticStage::SourceDiscovery,
+            nexa::ErrorCode::NX7001,
+            message,
+        ));
+        self.packages[index].last_diagnostic = Some(diagnostic.summary());
+        self.publish_event(DevelopmentEvent::SourceMissing(development_event_data(
+            package_id,
+            self.packages[index].development.latest_generation,
+            SourceHash::default(),
+            Some(diagnostic),
+        )));
+    }
+
+    fn retry_backpressured_jobs(&mut self) {
+        let indexes = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, record)| record.awaiting_job.as_ref().map(|_| index))
+            .collect::<Vec<_>>();
+        for index in indexes {
+            if let Some(job) = self.packages[index].awaiting_job.take() {
+                self.try_enqueue_job(index, job);
+            }
+        }
+    }
+
+    fn try_enqueue_job(&mut self, index: usize, job: CompileJob) {
+        let package_id = job.package_id.clone();
+        let generation = job.generation;
+        let source_hash = job.source_hash;
+        let Some(worker) = self.development_worker.as_ref() else {
+            self.process_candidate_terminal(job.cancel(CandidateCancellation::Shutdown));
+            return;
+        };
+        match worker.enqueue(job) {
+            EnqueueOutcome::Accepted => {
+                self.mark_job_queued(index, package_id, generation, source_hash);
+            }
+            EnqueueOutcome::ReplacedPending { terminal, .. } => {
+                self.process_candidate_terminal(terminal);
+                self.mark_job_queued(index, package_id, generation, source_hash);
+            }
+            EnqueueOutcome::Backpressured { job } => {
+                self.packages[index].development.state = DevelopmentState::AwaitingQueue;
+                self.packages[index].awaiting_job = Some(job);
+            }
+            EnqueueOutcome::Stopping { job } => {
+                self.process_candidate_terminal(job.cancel(CandidateCancellation::Shutdown));
+            }
+        }
+    }
+
+    fn mark_job_queued(
+        &mut self,
+        index: usize,
+        package_id: PackageId,
+        generation: u64,
+        source_hash: SourceHash,
+    ) {
+        self.packages[index].development.queued_hash = Some(source_hash);
+        self.packages[index].development.state = DevelopmentState::CompileQueued;
+        self.publish_event(DevelopmentEvent::CompileQueued(development_event_data(
+            package_id,
+            generation,
+            source_hash,
+            None,
+        )));
+    }
+
+    fn process_worker_activity(&mut self) {
+        let Some(worker) = self.development_worker.as_ref() else {
+            return;
+        };
+        let drain = worker.drain();
+        self.process_worker_drain(drain);
+    }
+
+    fn process_worker_drain(&mut self, drain: development::WorkerDrain) {
+        for event in drain.events {
+            match event {
+                WorkerEvent::CompileStarted {
+                    package_id,
+                    source_id,
+                    generation,
+                    source_hash,
+                    queue_duration,
+                } => {
+                    if let Some(index) = self.packages.iter().position(|record| {
+                        record.candidate.manifest.id == package_id && record.source_id == source_id
+                    }) {
+                        if self.packages[index].development.queued_hash == Some(source_hash) {
+                            self.packages[index].development.queued_hash = None;
+                        }
+                        self.packages[index].development.in_flight_hash = Some(source_hash);
+                        self.packages[index].development.last_queue_duration = queue_duration;
+                        if generation == self.packages[index].development.latest_generation {
+                            self.packages[index].development.state = DevelopmentState::Compiling;
+                        }
+                    }
+                    self.publish_event(DevelopmentEvent::CompileStarted(DevelopmentEventData {
+                        queue_duration: Some(queue_duration),
+                        ..development_event_data(package_id, generation, source_hash, None)
+                    }));
+                }
+            }
+        }
+        for terminal in drain.terminals {
+            self.process_candidate_terminal(terminal);
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn process_compile_results(&mut self) {
-        let results = self
-            .development_worker
-            .as_ref()
-            .map_or_else(Vec::new, DevelopmentWorker::drain_results);
-        for result in results {
-            let Some(index) = self
-                .packages
-                .iter()
-                .position(|record| record.candidate.manifest.id == result.package_id)
-            else {
-                continue;
-            };
-            if !matches!(
+    fn process_candidate_terminal(&mut self, terminal: CandidateTerminal) {
+        let data = terminal.data().clone();
+        let Some(index) = self.packages.iter().position(|record| {
+            record.candidate.manifest.id == data.package_id && record.source_id == data.source_id
+        }) else {
+            return;
+        };
+        let terminal = if matches!(
+            terminal,
+            CandidateTerminal::Compiled { .. }
+                | CandidateTerminal::CompileFailed { .. }
+                | CandidateTerminal::VerifyFailed { .. }
+        ) && data.generation != self.packages[index].development.latest_generation
+        {
+            CandidateTerminal::SupersededAfterCompile(data.clone())
+        } else if matches!(terminal, CandidateTerminal::Compiled { .. })
+            && !matches!(
                 self.packages[index].lifecycle.status(),
                 PackageStatus::Enabled | PackageStatus::Faulted
-            ) {
-                self.publish_event(DevelopmentEvent::CandidateSuperseded(
-                    development_event_data(
-                        result.package_id,
-                        result.generation,
-                        result.source_hash,
-                        None,
-                    ),
-                ));
-                continue;
+            )
+        {
+            CandidateTerminal::CancelledByDisable(data.clone())
+        } else {
+            terminal
+        };
+
+        match terminal {
+            CandidateTerminal::Compiled {
+                data,
+                candidate,
+                compilation,
+            } => self.process_compiled_candidate(index, data, candidate, compilation),
+            CandidateTerminal::CompileFailed {
+                data,
+                mut diagnostic,
+                compile_duration,
+                verify_duration,
             }
-            let started_data = development_event_data(
-                result.package_id.clone(),
-                result.generation,
-                result.source_hash,
-                None,
-            );
-            self.packages[index].development.state = DevelopmentState::Compiling;
-            self.packages[index].development.last_queue_duration = result.queue_duration;
-            self.publish_event(DevelopmentEvent::CompileStarted(DevelopmentEventData {
-                queue_duration: Some(result.queue_duration),
-                ..started_data
-            }));
-            if result.generation != self.packages[index].development.latest_generation {
-                self.publish_event(DevelopmentEvent::CandidateSuperseded(
+            | CandidateTerminal::VerifyFailed {
+                data,
+                mut diagnostic,
+                compile_duration,
+                verify_duration,
+            } => {
+                let verify = diagnostic.stage == EngineDiagnosticStage::Verify;
+                diagnostic.context.candidate_generation = Some(data.generation);
+                let diagnostic = self.diagnostics.push(diagnostic);
+                self.packages[index].last_diagnostic = Some(diagnostic.summary());
+                self.packages[index].development.last_compile_duration = Some(compile_duration);
+                self.packages[index].development.last_verify_duration = verify_duration;
+                self.packages[index].development.state = if verify {
+                    DevelopmentState::VerifyFailed
+                } else {
+                    DevelopmentState::CompileFailed
+                };
+                self.record_generation_terminal(
+                    index,
+                    &data,
+                    if verify {
+                        CandidateTerminalKind::VerifyFailed
+                    } else {
+                        CandidateTerminalKind::CompileFailed
+                    },
+                );
+                self.publish_event(if verify {
+                    DevelopmentEvent::VerifyFailed(development_event_data(
+                        data.package_id.clone(),
+                        data.generation,
+                        data.source_hash,
+                        Some(diagnostic),
+                    ))
+                } else {
+                    DevelopmentEvent::CompileFailed(development_event_data(
+                        data.package_id.clone(),
+                        data.generation,
+                        data.source_hash,
+                        Some(diagnostic),
+                    ))
+                });
+                self.publish_reload(reload_report(
+                    data.package_id,
+                    data.generation,
+                    0,
+                    None,
+                    data.source_hash,
+                    compile_duration,
+                    verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    if verify {
+                        ReloadReportOutcome::VerifyFailed
+                    } else {
+                        ReloadReportOutcome::CompileFailed
+                    },
+                    0,
+                    0,
+                ));
+            }
+            CandidateTerminal::SupersededBeforeCompile(data) => {
+                self.finish_noncompiled_terminal(
+                    index,
+                    data,
+                    CandidateTerminalKind::SupersededBeforeCompile,
+                    ReloadReportOutcome::Superseded,
+                    true,
+                );
+            }
+            CandidateTerminal::SupersededAfterCompile(data) => {
+                self.finish_noncompiled_terminal(
+                    index,
+                    data,
+                    CandidateTerminalKind::SupersededAfterCompile,
+                    ReloadReportOutcome::Superseded,
+                    true,
+                );
+            }
+            CandidateTerminal::CancelledByDisable(data) => {
+                self.finish_noncompiled_terminal(
+                    index,
+                    data,
+                    CandidateTerminalKind::CancelledByDisable,
+                    ReloadReportOutcome::Superseded,
+                    false,
+                );
+            }
+            CandidateTerminal::CancelledBySourceRemoval(data) => {
+                self.finish_noncompiled_terminal(
+                    index,
+                    data,
+                    CandidateTerminalKind::CancelledBySourceRemoval,
+                    ReloadReportOutcome::Superseded,
+                    false,
+                );
+            }
+            CandidateTerminal::CancelledByShutdown(data) => {
+                self.finish_noncompiled_terminal(
+                    index,
+                    data,
+                    CandidateTerminalKind::CancelledByShutdown,
+                    ReloadReportOutcome::Superseded,
+                    false,
+                );
+            }
+            CandidateTerminal::RejectedHostContractChange(data) => {
+                self.packages[index].development.state = DevelopmentState::HostRebuildRequired;
+                self.record_generation_terminal(
+                    index,
+                    &data,
+                    CandidateTerminalKind::RejectedHostContractChange,
+                );
+                self.publish_event(DevelopmentEvent::HostRebuildRequired(
                     development_event_data(
-                        result.package_id.clone(),
-                        result.generation,
-                        result.source_hash,
+                        data.package_id.clone(),
+                        data.generation,
+                        data.source_hash,
                         None,
                     ),
                 ));
                 self.publish_reload(reload_report(
-                    result.package_id,
-                    result.generation,
+                    data.package_id,
+                    data.generation,
                     0,
                     None,
-                    result.source_hash,
-                    result.work_duration,
-                    std::time::Duration::ZERO,
-                    std::time::Duration::ZERO,
-                    ReloadReportOutcome::Superseded,
+                    data.source_hash,
+                    data.work_duration,
+                    Duration::ZERO,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    ReloadReportOutcome::HostRebuildRequired,
                     0,
                     0,
                 ));
+            }
+        }
+    }
+
+    fn finish_noncompiled_terminal(
+        &mut self,
+        index: usize,
+        data: CandidateTerminalData,
+        kind: CandidateTerminalKind,
+        outcome: ReloadReportOutcome,
+        superseded: bool,
+    ) {
+        self.record_generation_terminal(index, &data, kind);
+        self.publish_event(if superseded {
+            DevelopmentEvent::CandidateSuperseded(development_event_data(
+                data.package_id.clone(),
+                data.generation,
+                data.source_hash,
+                None,
+            ))
+        } else {
+            DevelopmentEvent::CandidateCancelled(development_event_data(
+                data.package_id.clone(),
+                data.generation,
+                data.source_hash,
+                None,
+            ))
+        });
+        self.publish_reload(reload_report(
+            data.package_id,
+            data.generation,
+            0,
+            None,
+            data.source_hash,
+            data.work_duration,
+            Duration::ZERO,
+            nexa_runtime::RestartReloadMetrics::default(),
+            outcome,
+            0,
+            0,
+        ));
+    }
+
+    fn process_compiled_candidate(
+        &mut self,
+        index: usize,
+        data: CandidateTerminalData,
+        candidate: PackageCandidate,
+        compilation: CandidateCompilation,
+    ) {
+        self.packages[index].development.last_compile_duration = Some(compilation.compile_duration);
+        self.packages[index].development.last_verify_duration = compilation.verify_duration;
+        self.publish_event(DevelopmentEvent::CompileSucceeded(development_event_data(
+            data.package_id.clone(),
+            data.generation,
+            data.source_hash,
+            None,
+        )));
+        self.packages[index].development.state = DevelopmentState::CandidateReady;
+        self.publish_event(DevelopmentEvent::CandidateReady(development_event_data(
+            data.package_id.clone(),
+            data.generation,
+            data.source_hash,
+            None,
+        )));
+        if !self.development.auto_reload {
+            self.packages[index].ready_candidate = Some(development::ReadyCandidate {
+                candidate,
+                compilation,
+                terminal_data: data,
+            });
+            return;
+        }
+        self.record_generation_terminal(index, &data, CandidateTerminalKind::Compiled);
+        self.commit_compiled_from_tick(index, data, candidate, compilation);
+    }
+
+    fn commit_compiled_from_tick(
+        &mut self,
+        index: usize,
+        data: CandidateTerminalData,
+        candidate: PackageCandidate,
+        compilation: CandidateCompilation,
+    ) {
+        self.packages[index].development.state = DevelopmentState::ReloadPending;
+        self.publish_event(DevelopmentEvent::ReloadStarted(development_event_data(
+            data.package_id.clone(),
+            data.generation,
+            data.source_hash,
+            None,
+        )));
+        self.packages[index].development.state = DevelopmentState::Reloading;
+        let reload_started = std::time::Instant::now();
+        match self.commit_compiled_candidate(
+            index,
+            candidate,
+            compilation.artifact,
+            data.generation,
+            compilation.compile_duration,
+            compilation.verify_duration,
+        ) {
+            Ok(report) => {
+                let mut report = report;
+                self.finish_reload_metrics(index, &mut report);
+                self.packages[index].development.state = DevelopmentState::Reloaded;
+                self.packages[index].development.last_reload_duration =
+                    Some(reload_started.elapsed());
+                self.packages[index].development.last_migration_duration =
+                    report.migration_duration;
+                self.packages[index].development.last_activation_duration =
+                    report.activation_duration;
+                self.publish_event(DevelopmentEvent::ReloadCommitted(DevelopmentEventData {
+                    reload: Some(report.summary()),
+                    ..development_event_data(
+                        data.package_id,
+                        data.generation,
+                        data.source_hash,
+                        None,
+                    )
+                }));
+                self.publish_reload(report);
+            }
+            Err(failure) => {
+                let mut failure = failure;
+                self.finish_reload_metrics(index, &mut failure.report);
+                self.packages[index].development.last_migration_duration =
+                    failure.report.migration_duration;
+                self.packages[index].development.last_activation_duration =
+                    failure.report.activation_duration;
+                let activation = failure.report.outcome == ReloadReportOutcome::ActivationFaulted;
+                self.packages[index].development.state = if activation {
+                    DevelopmentState::ActivationFaulted
+                } else {
+                    DevelopmentState::MigrationFailed
+                };
+                let event_data = DevelopmentEventData {
+                    reload: Some(failure.report.summary()),
+                    ..development_event_data(
+                        data.package_id,
+                        data.generation,
+                        data.source_hash,
+                        None,
+                    )
+                };
+                self.publish_event(if activation {
+                    DevelopmentEvent::ActivationFaulted(event_data)
+                } else {
+                    DevelopmentEvent::ReloadRolledBack(event_data)
+                });
+                self.publish_reload(failure.report);
+            }
+        }
+    }
+
+    fn finish_reload_metrics(&mut self, index: usize, report: &mut ReloadReport) {
+        report.change_to_stable_duration = self.packages[index]
+            .development
+            .last_change_to_stable_duration;
+        report.queue_duration = self.packages[index].development.last_queue_duration;
+        let elapsed = self.packages[index]
+            .development
+            .change_observed_at
+            .map_or_else(
+                || {
+                    report
+                        .compile_duration
+                        .saturating_add(report.verify_duration)
+                        .saturating_add(report.reload_duration)
+                },
+                |observed| observed.elapsed(),
+            );
+        let measured_without_ready = report
+            .change_to_stable_duration
+            .saturating_add(report.queue_duration)
+            .saturating_add(report.compile_duration)
+            .saturating_add(report.verify_duration)
+            .saturating_add(report.reload_duration);
+        report.ready_to_commit_duration = elapsed.saturating_sub(measured_without_ready);
+        report.total_change_to_visible_duration =
+            measured_without_ready.saturating_add(report.ready_to_commit_duration);
+        self.packages[index]
+            .development
+            .last_ready_to_commit_duration = report.ready_to_commit_duration;
+        self.packages[index].development.last_quiesce_duration = report.quiesce_duration;
+        self.packages[index].development.last_commit_duration = report.commit_duration;
+        self.packages[index]
+            .development
+            .last_total_change_to_visible_duration = report.total_change_to_visible_duration;
+    }
+
+    fn record_generation_terminal(
+        &mut self,
+        index: usize,
+        data: &CandidateTerminalData,
+        kind: CandidateTerminalKind,
+    ) {
+        let previous = self.packages[index]
+            .development
+            .terminal_generations
+            .insert(data.generation, kind);
+        assert!(
+            previous.is_none(),
+            "Candidate generation {} for {} received two terminal outcomes",
+            data.generation,
+            data.package_id
+        );
+        self.packages[index].development.terminal_count = self.packages[index]
+            .development
+            .terminal_count
+            .saturating_add(1);
+        while self.packages[index].development.terminal_generations.len() > 128 {
+            let Some(oldest) = self.packages[index]
+                .development
+                .terminal_generations
+                .first_key_value()
+                .map(|(generation, _)| *generation)
+            else {
+                break;
+            };
+            self.packages[index]
+                .development
+                .terminal_generations
+                .remove(&oldest);
+        }
+        if self.packages[index].development.queued_hash == Some(data.source_hash) {
+            self.packages[index].development.queued_hash = None;
+        }
+        if self.packages[index].development.in_flight_hash == Some(data.source_hash) {
+            self.packages[index].development.in_flight_hash = None;
+        }
+        if data.generation == self.packages[index].development.latest_generation {
+            self.packages[index].development.terminal_hash = Some(data.source_hash);
+        }
+    }
+
+    fn cancel_development(&mut self, index: usize, reason: CandidateCancellation) {
+        let package_id = self.packages[index].candidate.manifest.id.clone();
+        let mut terminals = self
+            .development_worker
+            .as_ref()
+            .map_or_else(Vec::new, |worker| {
+                worker.cancel_package(&package_id, reason)
+            });
+        if let Some(job) = self.packages[index].awaiting_job.take() {
+            terminals.push(job.cancel(reason));
+        }
+        if let Some(ready) = self.packages[index].ready_candidate.take() {
+            terminals.push(match reason {
+                CandidateCancellation::Disable => {
+                    CandidateTerminal::CancelledByDisable(ready.terminal_data)
+                }
+                CandidateCancellation::SourceRemoval => {
+                    CandidateTerminal::CancelledBySourceRemoval(ready.terminal_data)
+                }
+                CandidateCancellation::Shutdown => {
+                    CandidateTerminal::CancelledByShutdown(ready.terminal_data)
+                }
+            });
+        }
+        self.packages[index].ready_commit_requested = false;
+        for terminal in terminals {
+            self.process_candidate_terminal(terminal);
+        }
+    }
+
+    fn commit_requested_ready_candidates(&mut self) {
+        let indexes = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.ready_commit_requested && record.ready_candidate.is_some())
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in indexes {
+            self.packages[index].ready_commit_requested = false;
+            let Some(ready) = self.packages[index].ready_candidate.take() else {
                 continue;
-            }
-            match result.result {
-                Err(mut diagnostic) => {
-                    diagnostic.context.candidate_generation = Some(result.generation);
-                    let stage = diagnostic.stage;
-                    let diagnostic = self.diagnostics.push(diagnostic);
-                    self.packages[index].last_diagnostic = Some(diagnostic.summary());
-                    self.packages[index].development.last_compile_duration =
-                        Some(result.work_duration);
-                    let data = development_event_data(
-                        result.package_id.clone(),
-                        result.generation,
-                        result.source_hash,
-                        Some(diagnostic),
-                    );
-                    let (event, outcome, next_state) = if stage == EngineDiagnosticStage::Verify {
-                        (
-                            DevelopmentEvent::VerifyFailed(data),
-                            ReloadReportOutcome::VerifyFailed,
-                            DevelopmentState::VerifyFailed,
-                        )
-                    } else {
-                        (
-                            DevelopmentEvent::CompileFailed(data),
-                            ReloadReportOutcome::CompileFailed,
-                            DevelopmentState::CompileFailed,
-                        )
-                    };
-                    self.packages[index].development.state = next_state;
-                    self.publish_event(event);
-                    self.publish_reload(reload_report(
-                        result.package_id,
-                        result.generation,
-                        0,
-                        None,
-                        result.source_hash,
-                        result.work_duration,
-                        std::time::Duration::ZERO,
-                        std::time::Duration::ZERO,
-                        outcome,
-                        0,
-                        0,
-                    ));
-                }
-                Ok(compilation) => {
-                    self.packages[index].development.last_compile_duration =
-                        Some(compilation.compile_duration);
-                    self.packages[index].development.last_verify_duration =
-                        compilation.verify_duration;
-                    self.publish_event(DevelopmentEvent::CompileSucceeded(development_event_data(
-                        result.package_id.clone(),
-                        result.generation,
-                        result.source_hash,
-                        None,
-                    )));
-                    self.packages[index].development.state = DevelopmentState::CandidateReady;
-                    self.publish_event(DevelopmentEvent::CandidateReady(development_event_data(
-                        result.package_id.clone(),
-                        result.generation,
-                        result.source_hash,
-                        None,
-                    )));
-                    if !self.development.auto_reload {
-                        self.packages[index].ready_candidate = Some(development::ReadyCandidate {
-                            candidate: result.candidate,
-                            compilation,
-                            generation: result.generation,
-                        });
-                        continue;
-                    }
-                    self.packages[index].development.state = DevelopmentState::ReloadPending;
-                    self.publish_event(DevelopmentEvent::ReloadStarted(development_event_data(
-                        result.package_id.clone(),
-                        result.generation,
-                        result.source_hash,
-                        None,
-                    )));
-                    self.packages[index].development.state = DevelopmentState::Reloading;
-                    let reload_started = std::time::Instant::now();
-                    match self.commit_compiled_candidate(
-                        index,
-                        result.candidate,
-                        compilation.artifact,
-                        result.generation,
-                        compilation.compile_duration,
-                        compilation.verify_duration,
-                    ) {
-                        Ok(report) => {
-                            self.packages[index].development.state = DevelopmentState::Reloaded;
-                            self.packages[index].development.last_reload_duration =
-                                Some(reload_started.elapsed());
-                            self.packages[index].development.last_migration_duration =
-                                report.migration_duration;
-                            self.packages[index].development.last_activation_duration =
-                                report.activation_duration;
-                            self.publish_event(DevelopmentEvent::ReloadCommitted(
-                                DevelopmentEventData {
-                                    reload: Some(report.summary()),
-                                    ..development_event_data(
-                                        result.package_id,
-                                        result.generation,
-                                        result.source_hash,
-                                        None,
-                                    )
-                                },
-                            ));
-                            self.publish_reload(report);
-                        }
-                        Err(failure) => {
-                            self.packages[index].development.last_migration_duration =
-                                failure.report.migration_duration;
-                            self.packages[index].development.last_activation_duration =
-                                failure.report.activation_duration;
-                            let activation =
-                                failure.report.outcome == ReloadReportOutcome::ActivationFaulted;
-                            self.packages[index].development.state = if activation {
-                                DevelopmentState::ActivationFaulted
-                            } else {
-                                DevelopmentState::MigrationFailed
-                            };
-                            let data = DevelopmentEventData {
-                                reload: Some(failure.report.summary()),
-                                ..development_event_data(
-                                    result.package_id,
-                                    result.generation,
-                                    result.source_hash,
-                                    None,
-                                )
-                            };
-                            self.publish_event(if activation {
-                                DevelopmentEvent::ActivationFaulted(data)
-                            } else {
-                                DevelopmentEvent::ReloadRolledBack(data)
-                            });
-                            self.publish_reload(failure.report);
-                        }
-                    }
-                }
-            }
+            };
+            self.record_generation_terminal(
+                index,
+                &ready.terminal_data,
+                CandidateTerminalKind::Compiled,
+            );
+            self.commit_compiled_from_tick(
+                index,
+                ready.terminal_data,
+                ready.candidate,
+                ready.compilation,
+            );
         }
     }
 
@@ -1310,6 +1744,9 @@ impl NexaEngine {
             policy,
         ) {
             Ok((value, charge)) => {
+                record.handler_instructions_this_tick = record
+                    .handler_instructions_this_tick
+                    .saturating_add(charge.instructions);
                 record.fuel_used_this_tick =
                     record.fuel_used_this_tick.saturating_add(charge.fuel_used);
                 record.outputs_this_tick = record.outputs_this_tick.saturating_add(1);
@@ -1491,6 +1928,7 @@ impl NexaEngine {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn tick(&mut self) -> Result<EngineTickReport, EngineError> {
         self.require_open()?;
         self.ticks = self.ticks.saturating_add(1);
@@ -1508,23 +1946,33 @@ impl NexaEngine {
                 tick: self.ticks,
                 discovery_duration: record.development.last_discovery_duration,
                 source_hash_duration: record.development.last_source_hash_duration,
+                change_to_stable_duration: record.development.last_change_to_stable_duration,
                 candidate_queue_duration: record.development.last_queue_duration,
                 compile_duration: record.development.last_compile_duration.unwrap_or_default(),
                 verify_duration: record.development.last_verify_duration,
+                ready_to_commit_duration: record.development.last_ready_to_commit_duration,
+                quiesce_duration: record.development.last_quiesce_duration,
                 reload_duration: record.development.last_reload_duration.unwrap_or_default(),
                 migration_duration: record.development.last_migration_duration,
+                commit_duration: record.development.last_commit_duration,
                 activation_duration: record.development.last_activation_duration,
+                total_change_to_visible_duration: record
+                    .development
+                    .last_total_change_to_visible_duration,
                 handler_calls: record.handler_calls_this_tick,
-                handler_instructions: record.fuel_used_this_tick,
+                handler_instructions: record.handler_instructions_this_tick,
                 fuel_used: record.fuel_used_this_tick,
                 output_count: record.outputs_this_tick,
                 task_peak: ledger.tasks,
                 request_peak: ledger.requests,
             });
             record.handler_calls_this_tick = 0;
+            record.handler_instructions_this_tick = 0;
             record.fuel_used_this_tick = 0;
             record.outputs_this_tick = 0;
         }
+        self.process_worker_activity();
+        self.retry_backpressured_jobs();
         if self.development.enabled
             && self.development.scan_interval_ticks != 0
             && self
@@ -1533,7 +1981,8 @@ impl NexaEngine {
         {
             self.scan_development_changes();
         }
-        self.process_compile_results();
+        self.process_worker_activity();
+        self.commit_requested_ready_candidates();
         let mut runtime_failures = Vec::new();
         for (index, record) in self.packages.iter_mut().enumerate() {
             if let Some(runtime) = record.runtime.as_mut()
@@ -1706,6 +2155,7 @@ impl NexaEngine {
                     waiting_requests: ledger.requests,
                     host_resources: ledger.tokens.saturating_add(ledger.snapshots),
                     handler_calls_this_tick: record.handler_calls_this_tick,
+                    handler_instructions_this_tick: record.handler_instructions_this_tick,
                     fuel_used_this_tick: record.fuel_used_this_tick,
                     last_compile_duration: record.development.last_compile_duration,
                     last_reload_duration: record.development.last_reload_duration,
@@ -1735,8 +2185,20 @@ impl NexaEngine {
                 queued_candidates: self
                     .development_worker
                     .as_ref()
-                    .map_or(0, DevelopmentWorker::queued_len),
+                    .map_or(0, |worker| worker.inspection().queued_packages),
                 retained_events: self.development_events.len(),
+                generations_without_terminal: self.packages.iter().fold(0_u64, |total, record| {
+                    total.saturating_add(
+                        record
+                            .development
+                            .latest_generation
+                            .saturating_sub(record.development.terminal_count),
+                    )
+                }),
+                worker: self
+                    .development_worker
+                    .as_ref()
+                    .map_or_else(WorkerInspection::default, DevelopmentWorker::inspection),
             },
             recent_diagnostics,
             recent_reloads: self
@@ -1753,8 +2215,12 @@ impl NexaEngine {
         if self.shutdown {
             return Ok(());
         }
+        for index in 0..self.packages.len() {
+            self.cancel_development(index, CandidateCancellation::Shutdown);
+        }
         if let Some(mut worker) = self.development_worker.take() {
-            worker.shutdown();
+            let drain = worker.shutdown();
+            self.process_worker_drain(drain);
         }
         for index in 0..self.packages.len() {
             if self.packages[index].lifecycle.status() == PackageStatus::Enabled {
@@ -1763,9 +2229,17 @@ impl NexaEngine {
         }
         self.drain_releases();
         let _ = self.runtime_host.begin_close();
-        self.runtime_host
-            .try_finish_close()
-            .map_err(|error| EngineError::Shutdown(error.to_string()))?;
+        if let Err(error) = self.runtime_host.try_finish_close() {
+            let error = EngineError::Shutdown(error.to_string());
+            self.diagnostics.push(EngineDiagnostic::without_source(
+                None,
+                None,
+                EngineDiagnosticStage::Shutdown,
+                nexa::ErrorCode::NX7303,
+                error.to_string(),
+            ));
+            return Err(error);
+        }
         self.shutdown = true;
         Ok(())
     }
@@ -1948,21 +2422,35 @@ fn reload_report(
     source_hash: SourceHash,
     compile_duration: std::time::Duration,
     verify_duration: std::time::Duration,
-    reload_duration: std::time::Duration,
+    reload_metrics: nexa_runtime::RestartReloadMetrics,
     outcome: ReloadReportOutcome,
     cancelled_tasks: usize,
     detached_requests: usize,
 ) -> ReloadReport {
+    let reload_duration = reload_metrics
+        .quiesce_duration
+        .saturating_add(reload_metrics.migration_duration)
+        .saturating_add(reload_metrics.commit_duration)
+        .saturating_add(reload_metrics.activation_duration);
     ReloadReport {
         package_id,
         candidate_generation,
         old_epoch,
         new_epoch,
         source_hash,
+        change_to_stable_duration: Duration::ZERO,
+        queue_duration: Duration::ZERO,
         compile_duration,
         verify_duration,
-        migration_duration: reload_duration,
-        activation_duration: std::time::Duration::ZERO,
+        ready_to_commit_duration: Duration::ZERO,
+        quiesce_duration: reload_metrics.quiesce_duration,
+        commit_duration: reload_metrics.commit_duration,
+        reload_duration,
+        migration_duration: reload_metrics.migration_duration,
+        activation_duration: reload_metrics.activation_duration,
+        total_change_to_visible_duration: compile_duration
+            .saturating_add(verify_duration)
+            .saturating_add(reload_duration),
         cancelled_tasks,
         detached_requests,
         outcome,
@@ -1993,6 +2481,7 @@ fn development_event_data(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn runtime_trap_diagnostic(
     record: &PackageRecord,
     contract: &HostContract,
@@ -2005,21 +2494,21 @@ fn runtime_trap_diagnostic(
             Some(record.candidate.manifest.id.clone()),
             Some(record.source_id.clone()),
             EngineDiagnosticStage::Runtime,
-            nexa::ErrorCode::NX5001,
+            nexa::ErrorCode::NX7103,
             trap.message.to_string(),
         );
     };
     let leaf = trap.source_span.map_or_else(
         || {
             nexa::Diagnostic::without_source(
-                nexa::ErrorCode::new(trap.diagnostic_code()),
+                nexa::ErrorCode::NX7103,
                 nexa::Severity::Error,
                 nexa_runtime::RuntimeMessage::inline(&trap.message.to_string()),
             )
         },
         |span| {
             nexa::Diagnostic::from_parts(
-                nexa::ErrorCode::new(trap.diagnostic_code()),
+                nexa::ErrorCode::NX7103,
                 nexa::Severity::Error,
                 nexa_runtime::RuntimeMessage::inline(&trap.message.to_string()),
                 nexa::Label {
@@ -2036,6 +2525,13 @@ fn runtime_trap_diagnostic(
         leaf,
         Some(&runtime.artifact.source_files),
     );
+    diagnostic
+        .diagnostic
+        .notes
+        .push(nexa_runtime::RuntimeMessage::inline(&format!(
+            "underlying runtime diagnostic: {}",
+            trap.diagnostic_code()
+        )));
     diagnostic.context.export = Some(export.to_owned());
     diagnostic.context.module_epoch = trap.epoch;
     diagnostic.context.task = trap.task.map(|task| EngineTaskId(u64::from(task.index)));
