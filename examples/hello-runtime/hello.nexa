@@ -1,0 +1,6 @@
+module examples.hello;
+import console;
+
+task fn main() -> i32 {
+    return console.log("hello, world");
+}

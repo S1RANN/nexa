@@ -37,10 +37,13 @@ Nexa source
 → Restart Reload
 ```
 
-`examples/combat-runtime` is the dogfood loop. Its `combat_api.nidl` is the only
-Host API source and generates the Rust Trait, Dispatcher, codecs, stable
-function IDs, Exact Interface Hash, Nexa declaration, and test Stub into
-`OUT_DIR`. The Host implements only that Trait.
+`examples/hello-runtime` is the minimal onboarding example: one generated
+`console.log` Host function, one Task, and one `spawn_task`/`poll_task` cycle
+printing `hello, world`. `examples/combat-runtime` is the dogfood loop. Its
+`combat_api.nidl` is the only Host API source and generates the Rust Trait,
+Dispatcher, codecs, stable function IDs, Exact Interface Hash, Nexa
+declaration, and test Stub into `OUT_DIR`. The Host implements only that
+Trait.
 
 Restart Reload stops admission, cancels old Tasks, detaches old Requests,
 migrates state on staging, commits the new root, then activates it. Migration
@@ -63,6 +66,7 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 
 ```sh
 cargo run -p nexa-cli -- compile examples/add.nexa
+cargo run -p hello-runtime
 cargo run -p combat-runtime
 cargo xtask check
 cargo xtask finalize-m1

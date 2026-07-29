@@ -14,6 +14,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "hello-runtime"
+version = "0.1.0"
+dependencies = [
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-idl",
+ "nexa-runtime",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/*",
     "examples/combat-runtime",
+    "examples/hello-runtime",
     "tools/xtask",
     "tools/benchmark-v6",
 ]
