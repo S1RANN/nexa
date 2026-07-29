@@ -234,7 +234,7 @@ fn compare_sequence(sequence: &[RealmEvent]) {
         let realm_was_dropped = matches!(runtime_result, Err(RuntimeRealmRejection::RealmDropped));
         let expected_attempt = !realm_was_dropped
             && !matches!(event, RealmEvent::RealmDrop)
-            && !(event == RealmEvent::LateCompletion && !had_physical_ticket);
+            && (had_physical_ticket || event != RealmEvent::LateCompletion);
         assert_eq!(
             counters_after.total(),
             counters_before.total() + u64::from(expected_attempt),

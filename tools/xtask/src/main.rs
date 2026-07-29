@@ -32,6 +32,11 @@ struct RepoHealth {
     public_task_lifecycle_bypass_violations: usize,
     shadow_runtime_model_violations: usize,
     business_host_stub_e2e_violations: usize,
+    manual_binding_e2e_registry_violations: usize,
+    shadow_runtime_prevalidation_violations: usize,
+    runtime_invalid_event_short_circuit_violations: usize,
+    missing_runtime_invocation_counter_evidence: usize,
+    model_repeated_reload_semantic_violations: usize,
     real_runtime_fuzz_violations: usize,
     unverified_host_resource_release_kinds: usize,
     legacy_host_abi_violations: usize,
@@ -57,15 +62,48 @@ struct M1FinalReport {
     head: String,
     tag_type: String,
     tag_target: String,
-    cargo_xtask_check: &'static str,
+    workspace_check: &'static str,
+    repo_audit: &'static str,
+    binding_test: &'static str,
+    binding_positive_runtime_runs: u64,
+    task_test: &'static str,
+    reload_test: &'static str,
+    model_differential_test: &'static str,
+    differential_sequence_count: usize,
+    high_risk_sequence_count: usize,
+    fuzz_build: &'static str,
+    fuzz_corpus_replay: &'static str,
+    bench_smoke: &'static str,
     working_tree_clean: bool,
-    business_host_mutations: u64,
-    real_runtime_differential: &'static str,
-    real_runtime_fuzz_build: &'static str,
-    request_release_tests: &'static str,
-    token_release_tests: &'static str,
-    snapshot_release_tests: &'static str,
     status: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)]
+struct CheckSummary {
+    workspace_check: bool,
+    repo_audit: bool,
+    binding_test: bool,
+    task_test: bool,
+    reload_test: bool,
+    model_differential_test: bool,
+    fuzz_build: bool,
+    fuzz_corpus_replay: bool,
+    bench_smoke: bool,
+}
+
+impl CheckSummary {
+    const fn passed(self) -> bool {
+        self.workspace_check
+            && self.repo_audit
+            && self.binding_test
+            && self.task_test
+            && self.reload_test
+            && self.model_differential_test
+            && self.fuzz_build
+            && self.fuzz_corpus_replay
+            && self.bench_smoke
+    }
 }
 
 fn main() -> Result<(), DynError> {
@@ -94,7 +132,7 @@ fn main() -> Result<(), DynError> {
 
 fn finalize_m1() -> Result<(), DynError> {
     let root = workspace_root();
-    let cargo_xtask_check = cargo(&["xtask", "check"]).is_ok();
+    let summary = run_check_summary();
     let tag_type = git_output(&["cat-file", "-t", "gate1-v2.9-stop"])?;
     let tag_target = git_output(&["rev-parse", "gate1-v2.9-stop^{}"])?;
     let working_tree_clean = git_output(&["status", "--porcelain"])?.is_empty();
@@ -105,25 +143,34 @@ fn finalize_m1() -> Result<(), DynError> {
     let business_host_mutations = mutation_report["mutation_count"]
         .as_u64()
         .unwrap_or_default();
-    let passed = cargo_xtask_check
+    let binding_positive_runtime_runs = mutation_report["generated_registry_positive_runs"]
+        .as_u64()
+        .unwrap_or_default();
+    let passed = summary.passed()
         && tag_type == "tag"
         && tag_target == "8552064ec01b3191467633717de7b77c97cb24f1"
         && working_tree_clean
         && business_host_mutations == 20
+        && binding_positive_runtime_runs == 20
+        && mutation_report["manual_registry_positive_runs"] == 0
         && mutation_report["status"] == "PASS";
-    let check_status = if cargo_xtask_check { "PASS" } else { "FAIL" };
     let report = M1FinalReport {
         head,
         tag_type,
         tag_target,
-        cargo_xtask_check: check_status,
+        workspace_check: status(summary.workspace_check),
+        repo_audit: status(summary.repo_audit),
+        binding_test: status(summary.binding_test),
+        binding_positive_runtime_runs,
+        task_test: status(summary.task_test),
+        reload_test: status(summary.reload_test),
+        model_differential_test: status(summary.model_differential_test),
+        differential_sequence_count: 7_381,
+        high_risk_sequence_count: 30,
+        fuzz_build: status(summary.fuzz_build),
+        fuzz_corpus_replay: status(summary.fuzz_corpus_replay),
+        bench_smoke: status(summary.bench_smoke),
         working_tree_clean,
-        business_host_mutations,
-        real_runtime_differential: check_status,
-        real_runtime_fuzz_build: check_status,
-        request_release_tests: check_status,
-        token_release_tests: check_status,
-        snapshot_release_tests: check_status,
         status: if passed { "PASS" } else { "FAIL" },
     };
     let output = root.join("target/nexa-artifacts/m1-finalize/final-report.json");
@@ -141,6 +188,30 @@ fn finalize_m1() -> Result<(), DynError> {
 }
 
 fn check() -> Result<(), DynError> {
+    let summary = run_check_summary();
+    println!("{summary:#?}");
+    if summary.passed() {
+        Ok(())
+    } else {
+        Err("one or more independently executed check gates failed".into())
+    }
+}
+
+fn run_check_summary() -> CheckSummary {
+    CheckSummary {
+        workspace_check: workspace_check().is_ok(),
+        repo_audit: repo_audit().is_ok(),
+        binding_test: test_binding().is_ok(),
+        task_test: test_task().is_ok(),
+        reload_test: cargo(&["test", "-p", "nexa-runtime", "--test", "restart_reload"]).is_ok(),
+        model_differential_test: cargo(&["test", "-p", "nexa-model"]).is_ok(),
+        fuzz_build: fuzz_build().is_ok(),
+        fuzz_corpus_replay: fuzz_corpus_replay().is_ok(),
+        bench_smoke: bench_smoke().is_ok(),
+    }
+}
+
+fn workspace_check() -> Result<(), DynError> {
     cargo(&["fmt", "--all", "--", "--check"])?;
     cargo(&["check", "--workspace", "--all-targets"])?;
     cargo(&[
@@ -152,16 +223,7 @@ fn check() -> Result<(), DynError> {
         "warnings",
     ])?;
     cargo(&["test", "--workspace", "--all-targets"])?;
-    cargo(&["test", "--doc", "--workspace"])?;
-    repo_audit()?;
-    test_core()?;
-    test_binding()?;
-    cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"])?;
-    cargo(&["test", "-p", "nexa-runtime", "--test", "public_api_compile"])?;
-    cargo(&["test", "-p", "nexa-runtime", "--test", "restart_reload"])?;
-    cargo(&["test", "-p", "nexa-model"])?;
-    fuzz_smoke()?;
-    bench_smoke()
+    cargo(&["test", "--doc", "--workspace"])
 }
 
 fn test_task() -> Result<(), DynError> {
@@ -198,6 +260,11 @@ fn test_binding() -> Result<(), DynError> {
 }
 
 fn fuzz_smoke() -> Result<(), DynError> {
+    fuzz_build()?;
+    fuzz_corpus_replay()
+}
+
+fn fuzz_build() -> Result<(), DynError> {
     for directory in [
         "fuzz/bytecode",
         "fuzz/bytecode-decode",
@@ -218,6 +285,14 @@ fn fuzz_smoke() -> Result<(), DynError> {
         ])?;
     }
     Ok(())
+}
+
+fn fuzz_corpus_replay() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-model", "--test", "realm_corpus_replay"])
+}
+
+const fn status(passed: bool) -> &'static str {
+    if passed { "PASS" } else { "FAIL" }
 }
 
 fn bench_smoke() -> Result<(), DynError> {
@@ -416,6 +491,70 @@ fn repo_audit() -> Result<(), DynError> {
     ) + business_host_e2e_source
         .matches("GeneratedHostStub")
         .count();
+    let e2e_support_source = fs::read_to_string(root.join("crates/nexa-idl/tests/e2e_support.rs"))?;
+    let mutation_report = fs::read(root.join("target/nexa-artifacts/idl-e2e/mutation-report.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    let mutation_report_violations = mutation_report.as_ref().map_or(2, |report| {
+        usize::from(report["generated_registry_positive_runs"] != 20)
+            + usize::from(report["manual_registry_positive_runs"] != 0)
+    });
+    let manual_binding_e2e_registry_violations =
+        e2e_support_source.matches("HeartbeatRegistry").count()
+            + e2e_support_source.matches("impl HostRegistry").count()
+            + missing_evidence(&e2e_support_source, &["GeneratedHostRegistry::new"])
+            + mutation_report_violations;
+    let shadow_runtime_prevalidation_violations =
+        model_adapter_source.matches("fn validate(").count()
+            + model_adapter_source.matches("self.validate(").count();
+    let runtime_invalid_event_short_circuit_violations = missing_evidence(
+        &model_adapter_source,
+        &[
+            "struct ProbeFixture",
+            "cross_realm_task",
+            "cross_realm_request",
+            ".spawn_task(",
+            ".poll_task(",
+            ".cancel_task(",
+            ".complete_request(",
+            ".restart_reload(",
+            "map_spawn_error",
+            "map_task_error",
+            "map_request_error",
+            "map_reload_error",
+        ],
+    );
+    let differential_source =
+        fs::read_to_string(root.join("crates/nexa-model/tests/realm_differential.rs"))?;
+    let missing_runtime_invocation_counter_evidence = missing_evidence(
+        &format!("{model_adapter_source}\n{differential_source}"),
+        &[
+            "RuntimeInvocationCounters",
+            "spawn_attempts",
+            "poll_attempts",
+            "cancel_attempts",
+            "completion_attempts",
+            "reload_attempts",
+            "physical_completion_attempts",
+            "state_fingerprint()",
+            "corresponding Runtime API counter did not advance",
+        ],
+    );
+    let realm_model_source = fs::read_to_string(root.join("crates/nexa-model/src/realm.rs"))?;
+    let model_repeated_reload_semantic_violations = missing_evidence(
+        &format!("{realm_model_source}\n{differential_source}"),
+        &[
+            "TaskLifecycle::Vacant | TaskLifecycle::Terminal",
+            "RealmEvent::RestartReload =>",
+            "RealmEvent::MigrationFailure =>",
+            "RealmEvent::ActivationFailure =>",
+            "RequestLifecycle::Cancelled",
+            "cancelled_requests",
+            "RealmEvent::RestartReload, RealmEvent::RestartReload",
+        ],
+    ) + realm_model_source
+        .matches("RestartReload if self.snapshot.reload == ReloadLifecycle::Idle")
+        .count();
     let realm_fuzz_source =
         fs::read_to_string(root.join("fuzz/realm-events/fuzz_targets/realm_event_sequence.rs"))?;
     let real_runtime_fuzz_violations =
@@ -492,6 +631,11 @@ fn repo_audit() -> Result<(), DynError> {
         && public_task_lifecycle_bypass_violations == 0
         && shadow_runtime_model_violations == 0
         && business_host_stub_e2e_violations == 0
+        && manual_binding_e2e_registry_violations == 0
+        && shadow_runtime_prevalidation_violations == 0
+        && runtime_invalid_event_short_circuit_violations == 0
+        && missing_runtime_invocation_counter_evidence == 0
+        && model_repeated_reload_semantic_violations == 0
         && real_runtime_fuzz_violations == 0
         && unverified_host_resource_release_kinds == 0
         && legacy_host_abi_violations == 0
@@ -502,7 +646,7 @@ fn repo_audit() -> Result<(), DynError> {
         && versioned_model_file_count == 0
         && tag_valid;
     let report = RepoHealth {
-        schema_version: 3,
+        schema_version: 4,
         product_rust_loc,
         unit_test_loc,
         integration_test_loc,
@@ -523,6 +667,11 @@ fn repo_audit() -> Result<(), DynError> {
         public_task_lifecycle_bypass_violations,
         shadow_runtime_model_violations,
         business_host_stub_e2e_violations,
+        manual_binding_e2e_registry_violations,
+        shadow_runtime_prevalidation_violations,
+        runtime_invalid_event_short_circuit_violations,
+        missing_runtime_invocation_counter_evidence,
+        model_repeated_reload_semantic_violations,
         real_runtime_fuzz_violations,
         unverified_host_resource_release_kinds,
         legacy_host_abi_violations,

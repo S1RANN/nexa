@@ -88,6 +88,7 @@ impl RealmModel {
         self.snapshot
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, event: RealmEvent) -> Result<(), RealmRejection> {
         if self.dropped {
             return Err(RealmRejection::RealmDropped);

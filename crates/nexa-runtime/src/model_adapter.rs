@@ -456,9 +456,10 @@ impl RealmRuntimeModelAdapter {
                 RestartReloadPolicy::default(),
             )
             .map_err(map_reload_error)?;
-        if !matches!(outcome, RestartReloadOutcome::RolledBackBeforeCommit { .. }) {
-            panic!("failing migration returned {outcome:?}");
-        }
+        assert!(
+            matches!(outcome, RestartReloadOutcome::RolledBackBeforeCommit { .. }),
+            "failing migration returned {outcome:?}"
+        );
         self.capture_detached_ticket(request_was_pending);
         Ok(())
     }
@@ -730,21 +731,22 @@ fn spawn_waiting_probe(
 }
 
 fn bounded_config(realm_id: u32) -> RealmConfig {
-    let mut config = RealmConfig::default();
-    config.realm_id = realm_id;
-    config.runtime_limits = RuntimeLimits {
-        max_tasks: 1,
-        max_scopes: 2,
-        max_frame_segments: 1,
-        max_scheduler_tokens: 1,
-        max_trace_records: 32,
-        max_transient_children_per_scope: 1,
-        max_persistent_children_per_scope: 1,
-    };
-    config.max_host_resources = 1;
-    config.release_capacity = 8;
-    config.tombstone_capacity = 16;
-    config
+    RealmConfig {
+        realm_id,
+        runtime_limits: RuntimeLimits {
+            max_tasks: 1,
+            max_scopes: 2,
+            max_frame_segments: 1,
+            max_scheduler_tokens: 1,
+            max_trace_records: 32,
+            max_transient_children_per_scope: 1,
+            max_persistent_children_per_scope: 1,
+        },
+        max_host_resources: 1,
+        release_capacity: 8,
+        tombstone_capacity: 16,
+        ..RealmConfig::default()
+    }
 }
 
 fn task_config(scope: ScopeHandle) -> StepConfig {
