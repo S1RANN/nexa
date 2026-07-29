@@ -1,12 +1,12 @@
 # Nexa Roadmap
 
 ```text
-Nexa Internal Pivot M1 = FINALIZING
+Nexa Internal Pivot M1 = COMPLETE
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = FINALIZING
-Task Runtime Stabilization = FINALIZING
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = FINALIZING
+Combat Dogfood Loop = COMPLETE
 ```
 
 ## Current position
@@ -25,7 +25,7 @@ Gate 1 v2.9 STOP (historical tag)
    → Combat dogfood loop
 ```
 
-Internal Pivot M1 has reopened finalization to close the generated-registry
+Internal Pivot M1 is complete. Its final closure includes the generated-registry
 positive path, real invalid-event Runtime calls, deterministic fuzz corpus
 replay, and independently observable final gates.
 
@@ -40,10 +40,11 @@ replay, and independently observable final gates.
 - Differential models, fuzz smoke, absolute allocation and latency budgets.
 
 The finalization contract uses a handwritten `BusinessHostV1` for all 20 IDL
-mutations, drives Realm differential and fuzz inputs through a real
-`RealmRuntime`, closes public Request/Waiting construction bypasses, and proves
-exactly-once Request/Token/Snapshot release through the generated Combat Host
-binding. Restart rollback never restores quiesced Tasks.
+mutations and executes each patched binding through its generated Registry. It
+drives Realm differential and fuzz inputs through a real `RealmRuntime`, closes
+public Request/Waiting construction bypasses, and proves exactly-once
+Request/Token/Snapshot release through the generated Combat Host binding.
+Restart rollback never restores quiesced Tasks.
 
 ## M1 finalization scope
 

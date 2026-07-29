@@ -3,12 +3,12 @@
 Version: **2.0.0**
 
 ```text
-Nexa Internal Pivot M1 = FINALIZING
+Nexa Internal Pivot M1 = COMPLETE
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = FINALIZING
-Task Runtime Stabilization = FINALIZING
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = FINALIZING
+Combat Dogfood Loop = COMPLETE
 ```
 
 This is the only normative entry point for the active Internal Language Pivot.
@@ -23,10 +23,11 @@ Internal Language Scope
 > Roadmap
 ```
 
-M1 conformance requires real handwritten Business Host mutation checks, a
-real-`RealmRuntime` differential/fuzz adapter, no public Request or manual
-Waiting constructor, exactly-once Request/Token/Snapshot release, and Restart
-Reload rollback without old-Task revival.
+M1 conformance requires real handwritten Business Host mutation checks executed
+through each changed generated Registry, a real-`RealmRuntime` differential/fuzz
+adapter with observable public API attempts, no public Request or manual Waiting
+constructor, exactly-once Request/Token/Snapshot release, and Restart Reload
+rollback without old-Task revival.
 
 ## Active specifications
 

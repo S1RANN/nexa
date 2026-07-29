@@ -9,12 +9,12 @@ Reload.
 ```text
 Gate 1 v2.9 old MVR = STOP
 Nexa Internal Language Pivot = ACTIVE
-Nexa Internal Pivot M1 = FINALIZING
+Nexa Internal Pivot M1 = COMPLETE
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = FINALIZING
-Task Runtime Stabilization = FINALIZING
+Rust Host Binding v1 = COMPLETE
+Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = FINALIZING
+Combat Dogfood Loop = COMPLETE
 Current target = Rust-only dogfood Gameplay Language
 Seamless advanced Reload = REMOVED
 ```
@@ -50,10 +50,12 @@ commit. Old continuations and intermediate completion queues are not supported.
 The binding gate compiles 20 textual `.nidl` mutations against the handwritten
 `BusinessHostV1`, applies explicit business-code patches where required, rejects
 old bytecode before interpretation, and executes the changed `heartbeat`
-contract. External callers cannot create Requests or manually place Tasks into
-Waiting: those transitions only come from generated Host bindings and
-`TaskPoll::Waiting`. Real-`RealmRuntime` differential/fuzz coverage and Combat
-verify Request, Token, and Snapshot release exactly once.
+contract through `GeneratedHostRegistry<PatchedBusinessHost>`. External callers
+cannot create Requests or manually place Tasks into Waiting: those transitions
+only come from generated Host bindings and `TaskPoll::Waiting`. Real
+`RealmRuntime` differential/fuzz coverage makes invalid events call public
+Runtime APIs, while Combat verifies Request, Token, and Snapshot release
+exactly once.
 
 ## Run
 
