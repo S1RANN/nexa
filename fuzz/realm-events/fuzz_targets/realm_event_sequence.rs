@@ -9,6 +9,7 @@ fuzz_target!(|bytes: &[u8]| {
     }
     let mut runtime = RealmRuntimeModelAdapter::default();
     for byte in bytes.iter().copied().take(64) {
+        let counters_before = runtime.invocation_counters();
         let event = match byte % 9 {
             0 => RuntimeRealmEvent::Spawn,
             1 => RuntimeRealmEvent::Poll,
@@ -22,6 +23,13 @@ fuzz_target!(|bytes: &[u8]| {
         };
         let _ = runtime.apply(event);
         let _ = runtime.snapshot();
+        let counters_after = runtime.invocation_counters();
+        assert!(counters_after.total() >= counters_before.total());
+        let state = runtime.state_fingerprint();
+        assert!(state.ledger.tasks <= 1);
+        assert!(state.ledger.scheduler_tokens <= 1);
+        assert!(state.ledger.requests <= 1);
+        assert!(state.ledger.completion_reservations <= 1);
         assert!(runtime.invariants_hold());
     }
 });
