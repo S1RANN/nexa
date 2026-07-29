@@ -14,8 +14,9 @@ pub enum RequestLifecycle {
     #[default]
     Vacant,
     Pending,
-    Detached,
     Completed,
+    Cancelled,
+    Detached,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -61,6 +62,7 @@ pub struct RealmSnapshot {
     pub task_resources: u8,
     pub request_resources: u8,
     pub cancelled_tasks: u64,
+    pub cancelled_requests: u64,
     pub detached_requests: u64,
     pub late_completions_discarded: u64,
     pub publications: u64,
@@ -77,7 +79,6 @@ pub enum RealmRejection {
 #[derive(Clone, Debug, Default)]
 pub struct RealmModel {
     snapshot: RealmSnapshot,
-    cancelled_requests: u64,
     dropped: bool,
 }
 
@@ -93,16 +94,31 @@ impl RealmModel {
         }
         match event {
             RealmEvent::Spawn
-                if self.snapshot.task == TaskLifecycle::Vacant
-                    && self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
+                if matches!(
+                    self.snapshot.task,
+                    TaskLifecycle::Vacant | TaskLifecycle::Terminal
+                ) && self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
             {
                 self.snapshot.task = TaskLifecycle::Ready;
                 self.snapshot.task_resources = 1;
+                if matches!(
+                    self.snapshot.request,
+                    RequestLifecycle::Completed | RequestLifecycle::Cancelled
+                ) {
+                    self.snapshot.request = RequestLifecycle::Vacant;
+                }
             }
             RealmEvent::Poll if self.snapshot.task == TaskLifecycle::Ready => {
-                self.snapshot.task = TaskLifecycle::Waiting;
-                self.snapshot.request = RequestLifecycle::Pending;
-                self.snapshot.request_resources = 1;
+                if self.snapshot.request == RequestLifecycle::Detached
+                    && self.snapshot.late_completions_discarded < self.snapshot.detached_requests
+                {
+                    self.snapshot.task = TaskLifecycle::Terminal;
+                    self.snapshot.task_resources = 0;
+                } else {
+                    self.snapshot.task = TaskLifecycle::Waiting;
+                    self.snapshot.request = RequestLifecycle::Pending;
+                    self.snapshot.request_resources = 1;
+                }
             }
             RealmEvent::CompleteRequest
                 if self.snapshot.request == RequestLifecycle::Pending
@@ -120,9 +136,8 @@ impl RealmModel {
                 ) =>
             {
                 if self.snapshot.request == RequestLifecycle::Pending {
-                    self.snapshot.request = RequestLifecycle::Completed;
-                    self.cancelled_requests += 1;
-                    self.snapshot.detached_requests += 1;
+                    self.snapshot.request = RequestLifecycle::Cancelled;
+                    self.snapshot.cancelled_requests += 1;
                     self.snapshot.request_resources = 0;
                 }
                 if self.snapshot.task != TaskLifecycle::Vacant {
@@ -131,20 +146,18 @@ impl RealmModel {
                 self.snapshot.task = TaskLifecycle::Terminal;
                 self.snapshot.task_resources = 0;
             }
-            RealmEvent::RestartReload if self.snapshot.reload == ReloadLifecycle::Idle => {
-                self.snapshot.detached_requests = self.cancelled_requests;
+            RealmEvent::RestartReload => {
                 self.restart_quiesce();
                 self.snapshot.epoch += 1;
                 self.snapshot.publications += 1;
                 self.snapshot.reload = ReloadLifecycle::Active;
             }
-            RealmEvent::MigrationFailure if self.snapshot.reload == ReloadLifecycle::Idle => {
-                self.snapshot.detached_requests = self.cancelled_requests;
+            RealmEvent::MigrationFailure => {
+                let prior_reload = self.snapshot.reload;
                 self.restart_quiesce();
-                self.snapshot.reload = ReloadLifecycle::Idle;
+                self.snapshot.reload = prior_reload;
             }
-            RealmEvent::ActivationFailure if self.snapshot.reload == ReloadLifecycle::Idle => {
-                self.snapshot.detached_requests = self.cancelled_requests;
+            RealmEvent::ActivationFailure => {
                 self.restart_quiesce();
                 self.snapshot.epoch += 1;
                 self.snapshot.publications += 1;
@@ -168,10 +181,10 @@ impl RealmModel {
             RealmEvent::CompleteRequest | RealmEvent::LateCompletion => {
                 return Err(RealmRejection::InvalidRequestState);
             }
-            RealmEvent::Spawn
-            | RealmEvent::RestartReload
-            | RealmEvent::MigrationFailure
-            | RealmEvent::ActivationFailure => {
+            RealmEvent::Spawn if self.snapshot.reload != ReloadLifecycle::ActivationFaulted => {
+                return Err(RealmRejection::InvalidTaskState);
+            }
+            RealmEvent::Spawn => {
                 return Err(RealmRejection::InvalidReloadState);
             }
         }

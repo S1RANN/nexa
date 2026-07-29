@@ -2,7 +2,8 @@ use nexa_model::realm::{
     CURRENT_REALM_EVENTS, RealmEvent, RealmModel, RealmRejection, RealmSnapshot,
 };
 use nexa_runtime::model_adapter::{
-    RealmRuntimeModelAdapter, RuntimeRealmEvent, RuntimeRealmRejection, RuntimeRealmSnapshot,
+    RealmRuntimeModelAdapter, RuntimeInvocationCounters, RuntimeRealmEvent, RuntimeRealmRejection,
+    RuntimeRealmSnapshot, RuntimeRequestLifecycle,
 };
 
 #[test]
@@ -154,9 +155,28 @@ fn high_risk_long_sequences_match_real_runtime() {
             RealmEvent::RestartReload,
             RealmEvent::LateCompletion,
         ],
+        vec![RealmEvent::RestartReload, RealmEvent::RestartReload],
+        vec![
+            RealmEvent::ActivationFailure,
+            RealmEvent::RestartReload,
+            RealmEvent::Spawn,
+        ],
+        vec![
+            RealmEvent::Spawn,
+            RealmEvent::Poll,
+            RealmEvent::CompleteRequest,
+            RealmEvent::Spawn,
+        ],
+        vec![RealmEvent::Spawn, RealmEvent::Cancel, RealmEvent::Spawn],
+        vec![RealmEvent::Spawn, RealmEvent::Spawn],
+        vec![
+            RealmEvent::RestartReload,
+            RealmEvent::LateCompletion,
+            RealmEvent::RestartReload,
+        ],
     ];
 
-    assert!(sequences.len() >= 20);
+    assert!(sequences.len() >= 30);
     for sequence in sequences {
         compare_sequence(&sequence);
     }
@@ -182,9 +202,13 @@ fn compare_sequence(sequence: &[RealmEvent]) {
 
     for (index, event) in sequence.iter().copied().enumerate() {
         let model_before = model.snapshot();
-        let runtime_before = runtime.snapshot();
+        let runtime_before = runtime.state_fingerprint();
+        let counters_before = runtime.invocation_counters();
+        let had_physical_ticket = runtime.has_physical_completion_ticket();
+        let had_detached_ticket = runtime.has_detached_physical_ticket();
         let model_result = model.apply(event);
         let runtime_result = runtime.apply(runtime_event(event));
+        let counters_after = runtime.invocation_counters();
         let prefix = &sequence[..=index];
 
         assert_eq!(
@@ -202,9 +226,36 @@ fn compare_sequence(sequence: &[RealmEvent]) {
                 "rejected model event mutated state\nprefix: {prefix:?}"
             );
             assert_eq!(
-                runtime.snapshot(),
+                runtime.state_fingerprint(),
                 runtime_before,
-                "rejected runtime event mutated state\nprefix: {prefix:?}"
+                "rejected Runtime API mutated snapshot, ledger, or Host queues\nprefix: {prefix:?}"
+            );
+        }
+        let realm_was_dropped = matches!(runtime_result, Err(RuntimeRealmRejection::RealmDropped));
+        let expected_attempt = !realm_was_dropped
+            && !matches!(event, RealmEvent::RealmDrop)
+            && !(event == RealmEvent::LateCompletion && !had_physical_ticket);
+        assert_eq!(
+            counters_after.total(),
+            counters_before.total() + u64::from(expected_attempt),
+            "Runtime API attempt evidence mismatch\nprefix: {prefix:?}\nbefore: \
+             {counters_before:?}\nafter: {counters_after:?}"
+        );
+        if expected_attempt {
+            assert_eq!(
+                event_counter(
+                    counters_after,
+                    event,
+                    runtime_before.snapshot.request,
+                    had_detached_ticket,
+                ),
+                event_counter(
+                    counters_before,
+                    event,
+                    runtime_before.snapshot.request,
+                    had_detached_ticket,
+                ) + 1,
+                "corresponding Runtime API counter did not advance\nprefix: {prefix:?}"
             );
         }
         assert_state(prefix, index + 1, &model, &runtime);
@@ -233,6 +284,32 @@ fn assert_state(
         "real resource invariant failed at step {step}\nprefix: {prefix:?}\nsnapshot: \
          {real_snapshot:?}"
     );
+}
+
+fn event_counter(
+    counters: RuntimeInvocationCounters,
+    event: RealmEvent,
+    request: RuntimeRequestLifecycle,
+    had_detached_ticket: bool,
+) -> u64 {
+    match event {
+        RealmEvent::Spawn => counters.spawn_attempts,
+        RealmEvent::Poll => counters.poll_attempts,
+        RealmEvent::Cancel => counters.cancel_attempts,
+        RealmEvent::RestartReload
+        | RealmEvent::MigrationFailure
+        | RealmEvent::ActivationFailure => counters.reload_attempts,
+        RealmEvent::CompleteRequest if request == RuntimeRequestLifecycle::Pending => {
+            counters.physical_completion_attempts
+        }
+        RealmEvent::LateCompletion
+            if request == RuntimeRequestLifecycle::Detached && had_detached_ticket =>
+        {
+            counters.physical_completion_attempts
+        }
+        RealmEvent::CompleteRequest | RealmEvent::LateCompletion => counters.completion_attempts,
+        RealmEvent::RealmDrop => counters.total(),
+    }
 }
 
 const fn rejection_name(rejection: Option<&RealmRejection>) -> Option<&'static str> {
@@ -284,8 +361,9 @@ const fn runtime_snapshot(snapshot: RuntimeRealmSnapshot) -> RealmSnapshot {
         request: match snapshot.request {
             RuntimeRequestLifecycle::Vacant => RequestLifecycle::Vacant,
             RuntimeRequestLifecycle::Pending => RequestLifecycle::Pending,
-            RuntimeRequestLifecycle::Detached => RequestLifecycle::Detached,
             RuntimeRequestLifecycle::Completed => RequestLifecycle::Completed,
+            RuntimeRequestLifecycle::Cancelled => RequestLifecycle::Cancelled,
+            RuntimeRequestLifecycle::Detached => RequestLifecycle::Detached,
         },
         reload: match snapshot.reload {
             RuntimeReloadLifecycle::Idle => ReloadLifecycle::Idle,
@@ -297,6 +375,7 @@ const fn runtime_snapshot(snapshot: RuntimeRealmSnapshot) -> RealmSnapshot {
         task_resources: snapshot.task_resources,
         request_resources: snapshot.request_resources,
         cancelled_tasks: snapshot.cancelled_tasks,
+        cancelled_requests: snapshot.cancelled_requests,
         detached_requests: snapshot.detached_requests,
         late_completions_discarded: snapshot.late_completions_discarded,
         publications: snapshot.publications,

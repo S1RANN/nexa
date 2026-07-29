@@ -207,8 +207,8 @@ impl FailureProbe {
 impl RuntimeFailureInjector {
     #[must_use = "retain the probe and require that the injected scenario was consumed"]
     pub fn arm_once(&self, point: RuntimeFailurePoint) -> FailureProbe {
-        let injected_before = self.stats(point).injected;
         self.configure(point, RuntimeFailureMode::Once);
+        let injected_before = self.stats(point).injected;
         self.record(FailureObservation {
             point,
             state: FailureProbeState::Armed,

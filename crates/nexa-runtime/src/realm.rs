@@ -762,6 +762,8 @@ pub struct ReloadInspection {
     pub candidate_module: Option<ModuleHandle>,
     pub cancelled_tasks: usize,
     pub detached_requests: usize,
+    pub total_cancelled_tasks: u64,
+    pub total_detached_requests: u64,
     pub late_completions_discarded: u64,
     pub root_publications: Vec<RootPublicationRecord>,
 }
@@ -906,6 +908,8 @@ pub struct RealmRuntime {
     last_migration_hash: Option<StableId>,
     last_reload_cancelled_tasks: usize,
     last_reload_detached_requests: usize,
+    total_reload_cancelled_tasks: u64,
+    total_reload_detached_requests: u64,
     host_registry: Option<Box<dyn HostRegistry>>,
     host_registry_hash: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
@@ -955,6 +959,8 @@ impl RealmRuntime {
             last_migration_hash: None,
             last_reload_cancelled_tasks: 0,
             last_reload_detached_requests: 0,
+            total_reload_cancelled_tasks: 0,
+            total_reload_detached_requests: 0,
             host_registry: None,
             host_registry_hash: None,
             runtime_host: None,
@@ -1345,6 +1351,12 @@ impl RealmRuntime {
         transaction.detached_request_count = detached_request_count;
         self.last_reload_cancelled_tasks = tasks.len();
         self.last_reload_detached_requests = detached_request_count;
+        self.total_reload_cancelled_tasks = self
+            .total_reload_cancelled_tasks
+            .saturating_add(u64::try_from(tasks.len()).unwrap_or(u64::MAX));
+        self.total_reload_detached_requests = self
+            .total_reload_detached_requests
+            .saturating_add(u64::try_from(detached_request_count).unwrap_or(u64::MAX));
         self.reload.quiesced()?;
         Ok(tasks.len())
     }
@@ -2296,6 +2308,8 @@ impl RealmRuntime {
                 .map_or(self.last_reload_detached_requests, |transaction| {
                     transaction.detached_request_count
                 }),
+            total_cancelled_tasks: self.total_reload_cancelled_tasks,
+            total_detached_requests: self.total_reload_detached_requests,
             late_completions_discarded: self.resources.discarded_late_results(),
             root_publications: self.root_publications.iter().copied().collect(),
         };

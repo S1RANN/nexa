@@ -10,10 +10,12 @@ use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
     CancelReason, HostCallOutcome, HostCompletionResult, HostPayload, HostRegistry,
-    HostRequestHandle, HostTrap, ModuleHandle, ModuleLifecycle, PendingHostRequest, RealmConfig,
-    RealmRuntime, ReloadInspectionState, ResourceContext, RestartReloadOutcome,
-    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, ScopeHandle,
-    StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskState, TickBudget, ValueType,
+    HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, ModuleLifecycle,
+    PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState,
+    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeFailurePoint,
+    RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger, ScopeHandle,
+    SlotAllocError, StepConfig, TaskError, TaskHandle, TaskLimits, TaskPoll, TaskState, TickBudget,
+    ValueType,
 };
 
 const MODEL_HOST: crate::StableId = crate::StableId(0x4d31_5245_414c_484f);
@@ -33,8 +35,9 @@ pub enum RuntimeRequestLifecycle {
     #[default]
     Vacant,
     Pending,
-    Detached,
     Completed,
+    Cancelled,
+    Detached,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -68,6 +71,7 @@ pub struct RuntimeRealmSnapshot {
     pub task_resources: u8,
     pub request_resources: u8,
     pub cancelled_tasks: u64,
+    pub cancelled_requests: u64,
     pub detached_requests: u64,
     pub late_completions_discarded: u64,
     pub publications: u64,
@@ -81,6 +85,36 @@ pub enum RuntimeRealmRejection {
     RealmDropped,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeInvocationCounters {
+    pub spawn_attempts: u64,
+    pub poll_attempts: u64,
+    pub cancel_attempts: u64,
+    pub completion_attempts: u64,
+    pub reload_attempts: u64,
+    pub physical_completion_attempts: u64,
+}
+
+impl RuntimeInvocationCounters {
+    #[must_use]
+    pub const fn total(self) -> u64 {
+        self.spawn_attempts
+            .saturating_add(self.poll_attempts)
+            .saturating_add(self.cancel_attempts)
+            .saturating_add(self.completion_attempts)
+            .saturating_add(self.reload_attempts)
+            .saturating_add(self.physical_completion_attempts)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RuntimeStateFingerprint {
+    pub snapshot: RuntimeRealmSnapshot,
+    pub ledger: RuntimeResourceLedger,
+    pub pending_host_completions: usize,
+    pub pending_host_releases: usize,
+}
+
 pub struct RealmRuntimeModelAdapter {
     realm: Option<RealmRuntime>,
     runtime_host: RuntimeHost,
@@ -90,7 +124,10 @@ pub struct RealmRuntimeModelAdapter {
     task: Option<TaskHandle>,
     request: Option<HostRequestHandle>,
     physical_request: Option<PendingHostRequest>,
+    detached_physical_request: Option<PendingHostRequest>,
     pending_slot: Arc<Mutex<Option<PendingHostRequest>>>,
+    probe: ProbeFixture,
+    counters: RuntimeInvocationCounters,
     drop_result: Option<RuntimeRealmSnapshot>,
     dropped: bool,
 }
@@ -106,10 +143,10 @@ impl std::fmt::Debug for RealmRuntimeModelAdapter {
 
 impl Default for RealmRuntimeModelAdapter {
     fn default() -> Self {
-        let runtime_host = RuntimeHost::new(64);
+        let runtime_host = RuntimeHost::new(8);
         let pending_slot = Arc::new(Mutex::new(None));
         let mut realm = RealmRuntime::hosted(
-            RealmConfig::default(),
+            bounded_config(1),
             runtime_host.clone(),
             Box::new(ModelHost {
                 pending: Arc::clone(&pending_slot),
@@ -130,7 +167,10 @@ impl Default for RealmRuntimeModelAdapter {
             task: None,
             request: None,
             physical_request: None,
+            detached_physical_request: None,
             pending_slot,
+            probe: ProbeFixture::new(),
+            counters: RuntimeInvocationCounters::default(),
             drop_result: None,
             dropped: false,
         }
@@ -184,13 +224,48 @@ impl RealmRuntimeModelAdapter {
                 == usize::try_from(accounting.pending()).unwrap_or(usize::MAX)
     }
 
+    #[must_use]
+    pub const fn invocation_counters(&self) -> RuntimeInvocationCounters {
+        self.counters
+    }
+
+    #[must_use]
+    pub fn state_fingerprint(&self) -> RuntimeStateFingerprint {
+        if self.dropped {
+            return RuntimeStateFingerprint {
+                snapshot: self.snapshot(),
+                ledger: RuntimeResourceLedger::default(),
+                pending_host_completions: self.runtime_host.pending_completions(),
+                pending_host_releases: self.runtime_host.pending_releases(),
+            };
+        }
+        RuntimeStateFingerprint {
+            snapshot: self.snapshot(),
+            ledger: self
+                .realm
+                .as_ref()
+                .expect("live adapter has a Realm")
+                .resource_ledger(),
+            pending_host_completions: self.runtime_host.pending_completions(),
+            pending_host_releases: self.runtime_host.pending_releases(),
+        }
+    }
+
+    #[must_use]
+    pub const fn has_detached_physical_ticket(&self) -> bool {
+        self.detached_physical_request.is_some()
+    }
+
+    #[must_use]
+    pub const fn has_physical_completion_ticket(&self) -> bool {
+        self.physical_request.is_some() || self.detached_physical_request.is_some()
+    }
+
     pub fn apply(&mut self, event: RuntimeRealmEvent) -> Result<(), RuntimeRealmRejection> {
         if self.dropped {
             return Err(RuntimeRealmRejection::RealmDropped);
         }
-        let before = self.snapshot();
-        self.validate(event, before)?;
-        let result = match event {
+        match event {
             RuntimeRealmEvent::Spawn => self.spawn(),
             RuntimeRealmEvent::Poll => self.poll(),
             RuntimeRealmEvent::CompleteRequest => self.complete_request(),
@@ -203,30 +278,136 @@ impl RealmRuntimeModelAdapter {
                 self.drop_realm();
                 Ok(())
             }
-        };
-        result.map_err(|()| rejection_for(event))
+        }
     }
 
-    fn validate(
-        &self,
-        event: RuntimeRealmEvent,
-        snapshot: RuntimeRealmSnapshot,
-    ) -> Result<(), RuntimeRealmRejection> {
-        match event {
-            RuntimeRealmEvent::Spawn
-                if snapshot.task == RuntimeTaskLifecycle::Vacant
-                    && snapshot.reload != RuntimeReloadLifecycle::ActivationFaulted =>
+    fn spawn(&mut self) -> Result<(), RuntimeRealmRejection> {
+        self.counters.spawn_attempts = self.counters.spawn_attempts.saturating_add(1);
+        let result = self
+            .realm
+            .as_mut()
+            .expect("live adapter has a Realm")
+            .spawn_task(self.module, 0, &[], task_config(self.scope));
+        match result {
+            Ok(task) => {
+                if self.request.is_some_and(|request| {
+                    self.realm
+                        .as_ref()
+                        .expect("live adapter has a Realm")
+                        .request_terminal_record(request)
+                        .is_some_and(|terminal| {
+                            matches!(
+                                terminal.state,
+                                HostRequestState::Completed
+                                    | HostRequestState::Failed
+                                    | HostRequestState::Cancelled
+                                    | HostRequestState::Abandoned
+                            )
+                        })
+                }) {
+                    self.request = None;
+                    self.physical_request.take();
+                }
+                self.task = Some(task);
+                Ok(())
+            }
+            Err(error) => Err(map_spawn_error(error)),
+        }
+    }
+
+    fn poll(&mut self) -> Result<(), RuntimeRealmRejection> {
+        let snapshot = self.snapshot();
+        let target = if snapshot.task == RuntimeTaskLifecycle::Ready {
+            self.task.expect("Ready snapshot has a Task handle")
+        } else if snapshot.task == RuntimeTaskLifecycle::Terminal {
+            self.task.expect("Terminal snapshot has a Task handle")
+        } else {
+            self.probe.cross_realm_task()
+        };
+        self.counters.poll_attempts = self.counters.poll_attempts.saturating_add(1);
+        match self
+            .realm
+            .as_mut()
+            .expect("live adapter has a Realm")
+            .poll_task(target, 64)
+        {
+            Ok(TaskPoll::Waiting(request)) if snapshot.task == RuntimeTaskLifecycle::Ready => {
+                self.request = Some(request);
+                self.physical_request = self
+                    .pending_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                assert!(
+                    self.physical_request.is_some(),
+                    "real Host call must publish its physical completion ticket"
+                );
+                Ok(())
+            }
+            Ok(TaskPoll::Trapped(_))
+                if snapshot.task == RuntimeTaskLifecycle::Ready
+                    && snapshot.request == RuntimeRequestLifecycle::Detached
+                    && snapshot.late_completions_discarded < snapshot.detached_requests =>
             {
                 Ok(())
             }
-            RuntimeRealmEvent::Poll if snapshot.task == RuntimeTaskLifecycle::Ready => Ok(()),
-            RuntimeRealmEvent::CompleteRequest
-                if snapshot.task == RuntimeTaskLifecycle::Waiting
-                    && snapshot.request == RuntimeRequestLifecycle::Pending =>
-            {
-                Ok(())
-            }
-            RuntimeRealmEvent::Cancel
+            Ok(unexpected) => panic!("unexpected successful poll for {snapshot:?}: {unexpected:?}"),
+            Err(error) => Err(map_task_error(error)),
+        }
+    }
+
+    fn complete_request(&mut self) -> Result<(), RuntimeRealmRejection> {
+        if self.snapshot().request == RuntimeRequestLifecycle::Pending {
+            let mut pending = self
+                .physical_request
+                .take()
+                .expect("Pending request must retain its physical ticket");
+            self.counters.physical_completion_attempts =
+                self.counters.physical_completion_attempts.saturating_add(1);
+            pending
+                .ticket
+                .complete(HostPayload::I32(7))
+                .unwrap_or_else(|error| panic!("physical completion failed: {error:?}"));
+            self.realm
+                .as_mut()
+                .expect("live adapter has a Realm")
+                .tick(single_task_tick())
+                .unwrap_or_else(|error| panic!("completion tick failed: {error:?}"));
+            return Ok(());
+        }
+        let target = self.probe.cross_realm_request();
+        self.counters.completion_attempts = self.counters.completion_attempts.saturating_add(1);
+        match self
+            .realm
+            .as_mut()
+            .expect("live adapter has a Realm")
+            .complete_request(target, HostCompletionResult::Success(HostPayload::I32(7)))
+        {
+            Ok(unexpected) => panic!("invalid completion unexpectedly succeeded: {unexpected:?}"),
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    fn cancel(&mut self) -> Result<(), RuntimeRealmRejection> {
+        let snapshot = self.snapshot();
+        let target = if matches!(
+            snapshot.task,
+            RuntimeTaskLifecycle::Ready
+                | RuntimeTaskLifecycle::Waiting
+                | RuntimeTaskLifecycle::Terminal
+        ) {
+            self.task.expect("non-vacant snapshot has a Task handle")
+        } else {
+            self.probe.cross_realm_task()
+        };
+        self.counters.cancel_attempts = self.counters.cancel_attempts.saturating_add(1);
+        match self
+            .realm
+            .as_mut()
+            .expect("live adapter has a Realm")
+            .cancel_task(target, CancelReason::RuntimeShutdown)
+        {
+            Ok(_)
                 if matches!(
                     snapshot.task,
                     RuntimeTaskLifecycle::Ready | RuntimeTaskLifecycle::Waiting
@@ -234,135 +415,58 @@ impl RealmRuntimeModelAdapter {
             {
                 Ok(())
             }
-            RuntimeRealmEvent::RestartReload
-            | RuntimeRealmEvent::MigrationFailure
-            | RuntimeRealmEvent::ActivationFailure
-                if snapshot.reload == RuntimeReloadLifecycle::Idle =>
-            {
-                Ok(())
+            Ok(unexpected) => {
+                panic!("invalid cancellation unexpectedly succeeded: {unexpected:?}")
             }
-            RuntimeRealmEvent::LateCompletion
-                if snapshot.request == RuntimeRequestLifecycle::Detached
-                    && self.physical_request.is_some() =>
-            {
-                Ok(())
-            }
-            RuntimeRealmEvent::RealmDrop => Ok(()),
-            RuntimeRealmEvent::Poll | RuntimeRealmEvent::Cancel => {
-                Err(RuntimeRealmRejection::InvalidTaskState)
-            }
-            RuntimeRealmEvent::CompleteRequest | RuntimeRealmEvent::LateCompletion => {
-                Err(RuntimeRealmRejection::InvalidRequestState)
-            }
-            RuntimeRealmEvent::Spawn
-            | RuntimeRealmEvent::RestartReload
-            | RuntimeRealmEvent::MigrationFailure
-            | RuntimeRealmEvent::ActivationFailure => {
-                Err(RuntimeRealmRejection::InvalidReloadState)
-            }
+            Err(error) => Err(map_task_error(error)),
         }
     }
 
-    fn spawn(&mut self) -> Result<(), ()> {
-        let realm = self.realm.as_mut().ok_or(())?;
-        self.task = Some(
-            realm
-                .spawn_task(
-                    self.module,
-                    0,
-                    &[],
-                    StepConfig {
-                        owner: self.scope,
-                        priority: 1,
-                        fuel_slice: 64,
-                        cumulative_budget: 1_024,
-                        limits: TaskLimits::default(),
-                    },
-                )
-                .map_err(|_| ())?,
-        );
-        Ok(())
-    }
-
-    fn poll(&mut self) -> Result<(), ()> {
-        let realm = self.realm.as_mut().ok_or(())?;
-        let TaskPoll::Waiting(request) =
-            realm.poll_task(self.task.ok_or(())?, 64).map_err(|_| ())?
-        else {
-            return Err(());
-        };
-        self.request = Some(request);
-        self.physical_request = self
-            .pending_slot
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        self.physical_request.as_ref().ok_or(())?;
-        Ok(())
-    }
-
-    fn complete_request(&mut self) -> Result<(), ()> {
-        let realm = self.realm.as_mut().ok_or(())?;
-        realm
-            .complete_request(
-                self.request.ok_or(())?,
-                HostCompletionResult::Success(HostPayload::I32(7)),
-            )
-            .map_err(|_| ())?;
-        let poll = realm.poll_task(self.task.ok_or(())?, 64).map_err(|_| ())?;
-        if !matches!(poll, TaskPoll::Completed(_)) {
-            return Err(());
-        }
-        self.physical_request.take();
-        Ok(())
-    }
-
-    fn cancel(&mut self) -> Result<(), ()> {
-        self.realm
-            .as_mut()
-            .ok_or(())?
-            .cancel_task(self.task.ok_or(())?, CancelReason::RuntimeShutdown)
-            .map_err(|_| ())?;
-        Ok(())
-    }
-
-    fn restart_reload(&mut self) -> Result<(), ()> {
+    fn restart_reload(&mut self) -> Result<(), RuntimeRealmRejection> {
+        let request_was_pending = self.snapshot().request == RuntimeRequestLifecycle::Pending;
+        self.counters.reload_attempts = self.counters.reload_attempts.saturating_add(1);
         let outcome = self
             .realm
             .as_mut()
-            .ok_or(())?
+            .expect("live adapter has a Realm")
             .restart_reload(
                 self.module,
                 self.replacement_module.clone(),
                 RestartReloadPolicy::default(),
             )
-            .map_err(|_| ())?;
+            .map_err(map_reload_error)?;
         let RestartReloadOutcome::Committed(candidate) = outcome else {
-            return Err(());
+            panic!("successful restart reload returned {outcome:?}");
         };
         self.module = candidate;
+        self.capture_detached_ticket(request_was_pending);
         Ok(())
     }
 
-    fn migration_failure(&mut self) -> Result<(), ()> {
+    fn migration_failure(&mut self) -> Result<(), RuntimeRealmRejection> {
+        let request_was_pending = self.snapshot().request == RuntimeRequestLifecycle::Pending;
+        self.counters.reload_attempts = self.counters.reload_attempts.saturating_add(1);
         let outcome = self
             .realm
             .as_mut()
-            .ok_or(())?
+            .expect("live adapter has a Realm")
             .restart_reload(
                 self.module,
                 async_module(true),
                 RestartReloadPolicy::default(),
             )
-            .map_err(|_| ())?;
+            .map_err(map_reload_error)?;
         if !matches!(outcome, RestartReloadOutcome::RolledBackBeforeCommit { .. }) {
-            return Err(());
+            panic!("failing migration returned {outcome:?}");
         }
+        self.capture_detached_ticket(request_was_pending);
         Ok(())
     }
 
-    fn activation_failure(&mut self) -> Result<(), ()> {
-        let realm = self.realm.as_mut().ok_or(())?;
+    fn activation_failure(&mut self) -> Result<(), RuntimeRealmRejection> {
+        let request_was_pending = self.snapshot().request == RuntimeRequestLifecycle::Pending;
+        self.counters.reload_attempts = self.counters.reload_attempts.saturating_add(1);
+        let realm = self.realm.as_mut().expect("live adapter has a Realm");
         let probe = realm
             .failure_injector()
             .arm_once(RuntimeFailurePoint::ActivationTrap);
@@ -372,28 +476,62 @@ impl RealmRuntimeModelAdapter {
                 self.replacement_module.clone(),
                 RestartReloadPolicy::default(),
             )
-            .map_err(|_| ())?;
-        probe.require_consumed().map_err(|_| ())?;
+            .map_err(map_reload_error)?;
         let RestartReloadOutcome::ActivationFaulted { candidate, .. } = outcome else {
-            return Err(());
+            panic!("activation failure returned {outcome:?}");
         };
+        probe
+            .require_consumed()
+            .unwrap_or_else(|error| panic!("ActivationTrap probe not consumed: {error:?}"));
         self.module = candidate;
+        self.capture_detached_ticket(request_was_pending);
         Ok(())
     }
 
-    fn late_completion(&mut self) -> Result<(), ()> {
-        self.physical_request
-            .take()
-            .ok_or(())?
-            .ticket
-            .complete(HostPayload::I32(9))
-            .map_err(|_| ())?;
-        self.realm
+    fn late_completion(&mut self) -> Result<(), RuntimeRealmRejection> {
+        if self.snapshot().request == RuntimeRequestLifecycle::Detached {
+            let Some(mut pending) = self.detached_physical_request.take() else {
+                return Err(RuntimeRealmRejection::InvalidRequestState);
+            };
+            self.counters.physical_completion_attempts =
+                self.counters.physical_completion_attempts.saturating_add(1);
+            pending
+                .ticket
+                .complete(HostPayload::I32(9))
+                .unwrap_or_else(|error| panic!("late physical completion failed: {error:?}"));
+            self.realm
+                .as_mut()
+                .expect("live adapter has a Realm")
+                .tick(single_task_tick())
+                .unwrap_or_else(|error| panic!("late completion tick failed: {error:?}"));
+            return Ok(());
+        }
+        if self.detached_physical_request.is_none() && self.physical_request.is_none() {
+            return Err(RuntimeRealmRejection::InvalidRequestState);
+        }
+        let target = self.probe.cross_realm_request();
+        self.counters.completion_attempts = self.counters.completion_attempts.saturating_add(1);
+        match self
+            .realm
             .as_mut()
-            .ok_or(())?
-            .tick(TickBudget::default())
-            .map_err(|_| ())?;
-        Ok(())
+            .expect("live adapter has a Realm")
+            .complete_request(target, HostCompletionResult::Success(HostPayload::I32(9)))
+        {
+            Ok(unexpected) => {
+                panic!("invalid late completion unexpectedly succeeded: {unexpected:?}")
+            }
+            Err(error) => Err(map_request_error(error)),
+        }
+    }
+
+    fn capture_detached_ticket(&mut self, request_was_pending: bool) {
+        if request_was_pending {
+            self.detached_physical_request = self.physical_request.take();
+            assert!(
+                self.detached_physical_request.is_some(),
+                "reload detached request must retain its physical ticket"
+            );
+        }
     }
 
     fn drop_realm(&mut self) {
@@ -431,6 +569,7 @@ impl RealmRuntimeModelAdapter {
 impl Drop for RealmRuntimeModelAdapter {
     fn drop(&mut self) {
         self.physical_request.take();
+        self.detached_physical_request.take();
         self.pending_slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -441,6 +580,188 @@ impl Drop for RealmRuntimeModelAdapter {
         }
         let _ = self.runtime_host.begin_close();
         let _ = self.runtime_host.try_finish_close();
+    }
+}
+
+struct ProbeFixture {
+    realm: Option<RealmRuntime>,
+    runtime_host: RuntimeHost,
+    cross_task: TaskHandle,
+    cross_request: HostRequestHandle,
+    cross_physical_request: Option<PendingHostRequest>,
+    terminal_task: TaskHandle,
+    completed_request: HostRequestHandle,
+    stale_task: TaskHandle,
+    stale_request: HostRequestHandle,
+}
+
+impl ProbeFixture {
+    fn new() -> Self {
+        let runtime_host = RuntimeHost::new(8);
+        let pending_slot = Arc::new(Mutex::new(None));
+        let mut config = bounded_config(2);
+        config.tombstone_capacity = 1;
+        let mut realm = RealmRuntime::hosted(
+            config,
+            runtime_host.clone(),
+            Box::new(ModelHost {
+                pending: Arc::clone(&pending_slot),
+            }),
+        )
+        .expect("Probe Realm");
+        let module = realm
+            .load_module(async_module(false), MODEL_HOST, MODEL_SCHEMA)
+            .expect("Probe module");
+        let scope = realm.create_scope(None).expect("Probe scope");
+
+        let (stale_task, stale_request, mut stale_physical) =
+            spawn_waiting_probe(&mut realm, &pending_slot, module, scope);
+        stale_physical
+            .ticket
+            .complete(HostPayload::I32(1))
+            .expect("complete stale Probe request");
+        realm
+            .tick(single_task_tick())
+            .expect("finish stale Probe task");
+
+        let (terminal_task, completed_request, mut completed_physical) =
+            spawn_waiting_probe(&mut realm, &pending_slot, module, scope);
+        completed_physical
+            .ticket
+            .complete(HostPayload::I32(2))
+            .expect("complete terminal Probe request");
+        realm
+            .tick(single_task_tick())
+            .expect("finish terminal Probe task");
+
+        assert!(matches!(
+            realm.poll_task(stale_task, 64),
+            Err(RuntimeError::StaleTaskHandle)
+        ));
+        assert!(matches!(
+            realm.complete_request(
+                stale_request,
+                HostCompletionResult::Success(HostPayload::I32(3))
+            ),
+            Err(RuntimeError::Realm(error))
+                if matches!(*error, RealmError::Host(crate::HostRequestError::StaleHostRequestHandle))
+        ));
+        assert!(matches!(
+            realm.poll_task(terminal_task, 64),
+            Err(RuntimeError::TerminalTask)
+        ));
+        assert!(matches!(
+            realm.complete_request(
+                completed_request,
+                HostCompletionResult::Success(HostPayload::I32(4))
+            ),
+            Err(RuntimeError::Realm(error))
+                if matches!(*error, RealmError::Host(crate::HostRequestError::AlreadyCompleted))
+        ));
+
+        let (cross_task, cross_request, cross_physical_request) =
+            spawn_waiting_probe(&mut realm, &pending_slot, module, scope);
+        Self {
+            realm: Some(realm),
+            runtime_host,
+            cross_task,
+            cross_request,
+            cross_physical_request: Some(cross_physical_request),
+            terminal_task,
+            completed_request,
+            stale_task,
+            stale_request,
+        }
+    }
+
+    const fn cross_realm_task(&self) -> TaskHandle {
+        self.cross_task
+    }
+
+    const fn cross_realm_request(&self) -> HostRequestHandle {
+        self.cross_request
+    }
+}
+
+impl Drop for ProbeFixture {
+    fn drop(&mut self) {
+        self.cross_physical_request.take();
+        drop(self.realm.take());
+        for _ in 0..3 {
+            let _ = self.runtime_host.drain_releases();
+        }
+        let _ = self.runtime_host.begin_close();
+        let _ = self.runtime_host.try_finish_close();
+    }
+}
+
+impl std::fmt::Debug for ProbeFixture {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProbeFixture")
+            .field("cross_task", &self.cross_task)
+            .field("cross_request", &self.cross_request)
+            .field("terminal_task", &self.terminal_task)
+            .field("completed_request", &self.completed_request)
+            .field("stale_task", &self.stale_task)
+            .field("stale_request", &self.stale_request)
+            .finish_non_exhaustive()
+    }
+}
+
+fn spawn_waiting_probe(
+    realm: &mut RealmRuntime,
+    pending_slot: &Arc<Mutex<Option<PendingHostRequest>>>,
+    module: ModuleHandle,
+    scope: ScopeHandle,
+) -> (TaskHandle, HostRequestHandle, PendingHostRequest) {
+    let task = realm
+        .spawn_task(module, 0, &[], task_config(scope))
+        .expect("spawn Probe task");
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("poll Probe task") else {
+        panic!("Probe task must wait on a Host request");
+    };
+    let physical = pending_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+        .expect("Probe physical completion ticket");
+    (task, request, physical)
+}
+
+fn bounded_config(realm_id: u32) -> RealmConfig {
+    let mut config = RealmConfig::default();
+    config.realm_id = realm_id;
+    config.runtime_limits = RuntimeLimits {
+        max_tasks: 1,
+        max_scopes: 2,
+        max_frame_segments: 1,
+        max_scheduler_tokens: 1,
+        max_trace_records: 32,
+        max_transient_children_per_scope: 1,
+        max_persistent_children_per_scope: 1,
+    };
+    config.max_host_resources = 1;
+    config.release_capacity = 8;
+    config.tombstone_capacity = 16;
+    config
+}
+
+fn task_config(scope: ScopeHandle) -> StepConfig {
+    StepConfig {
+        owner: scope,
+        priority: 1,
+        fuel_slice: 64,
+        cumulative_budget: 1_024,
+        limits: TaskLimits::default(),
+    }
+}
+
+const fn single_task_tick() -> TickBudget {
+    TickBudget {
+        max_tasks: 1,
+        frame_fuel_budget: 64,
+        collect_garbage: false,
     }
 }
 
@@ -472,17 +793,26 @@ fn normalize_snapshot(
             )
     });
     let publications = u64::try_from(inspection.reload.root_publications.len()).unwrap_or(u64::MAX);
-    let reload_detached_requests =
-        u64::try_from(inspection.reload.detached_requests).unwrap_or(u64::MAX);
-    let request_lifecycle = request.map_or(RuntimeRequestLifecycle::Vacant, |_| {
+    let request_lifecycle = request.map_or(RuntimeRequestLifecycle::Vacant, |handle| {
         if ledger.requests != 0 {
             RuntimeRequestLifecycle::Pending
-        } else if accounting.delivered != 0
-            || (accounting.cancelled != 0 && reload_detached_requests == 0)
-        {
-            RuntimeRequestLifecycle::Completed
         } else {
-            RuntimeRequestLifecycle::Detached
+            match realm
+                .request_terminal_record(handle)
+                .map(|record| record.state)
+            {
+                Some(HostRequestState::Completed | HostRequestState::Failed) => {
+                    RuntimeRequestLifecycle::Completed
+                }
+                Some(HostRequestState::Cancelled | HostRequestState::Abandoned) => {
+                    RuntimeRequestLifecycle::Cancelled
+                }
+                Some(HostRequestState::Detached) => RuntimeRequestLifecycle::Detached,
+                Some(HostRequestState::Pending | HostRequestState::CompletionQueued) => {
+                    panic!("terminal request record retained a live state")
+                }
+                None => panic!("current request has neither a live slot nor terminal evidence"),
+            }
         }
     });
     let activation_faulted = inspection
@@ -500,12 +830,15 @@ fn normalize_snapshot(
             | ReloadInspectionState::Committing
             | ReloadInspectionState::Published
             | ReloadInspectionState::Activating => RuntimeReloadLifecycle::Staging,
-            ReloadInspectionState::Idle | ReloadInspectionState::Completed if publications != 0 => {
-                RuntimeReloadLifecycle::Active
-            }
             ReloadInspectionState::Idle
             | ReloadInspectionState::Completed
-            | ReloadInspectionState::RolledBack => RuntimeReloadLifecycle::Idle,
+            | ReloadInspectionState::RolledBack => {
+                if publications == 0 {
+                    RuntimeReloadLifecycle::Idle
+                } else {
+                    RuntimeReloadLifecycle::Active
+                }
+            }
         }
     };
     let terminal_cancellations = inspection
@@ -526,7 +859,8 @@ fn normalize_snapshot(
         task_resources: u8::from(ledger.tasks != 0),
         request_resources: u8::from(ledger.requests != 0),
         cancelled_tasks: u64::try_from(terminal_cancellations).unwrap_or(u64::MAX),
-        detached_requests: accounting.cancelled.max(reload_detached_requests),
+        cancelled_requests: accounting.cancelled,
+        detached_requests: inspection.reload.total_detached_requests,
         late_completions_discarded: accounting.late_discarded,
         publications,
     }
@@ -536,19 +870,53 @@ fn self_host_pending_releases(inspection: &crate::RealmInspectionSnapshot) -> us
     inspection.runtime_host_releases.len()
 }
 
-const fn rejection_for(event: RuntimeRealmEvent) -> RuntimeRealmRejection {
-    match event {
-        RuntimeRealmEvent::Poll | RuntimeRealmEvent::Cancel => {
-            RuntimeRealmRejection::InvalidTaskState
+fn map_spawn_error(error: RuntimeError) -> RuntimeRealmRejection {
+    match error {
+        RuntimeError::Task(TaskError::Allocation(
+            SlotAllocError::CapacityExhausted | SlotAllocError::NoFreeSlot,
+        ))
+        | RuntimeError::ResourceLimit(
+            "scheduler token pool"
+            | "frame segment pool"
+            | "trace capacity pool"
+            | "transient child limit",
+        ) => RuntimeRealmRejection::InvalidTaskState,
+        RuntimeError::Realm(error) if matches!(*error, RealmError::ModuleNotCallable) => {
+            RuntimeRealmRejection::InvalidReloadState
         }
-        RuntimeRealmEvent::CompleteRequest | RuntimeRealmEvent::LateCompletion => {
-            RuntimeRealmRejection::InvalidRequestState
-        }
-        RuntimeRealmEvent::Spawn
-        | RuntimeRealmEvent::RestartReload
-        | RuntimeRealmEvent::MigrationFailure
-        | RuntimeRealmEvent::ActivationFailure => RuntimeRealmRejection::InvalidReloadState,
-        RuntimeRealmEvent::RealmDrop => RuntimeRealmRejection::RealmDropped,
+        unexpected => panic!("unknown spawn Runtime error: {unexpected:?}"),
+    }
+}
+
+fn map_task_error(error: RuntimeError) -> RuntimeRealmRejection {
+    match error {
+        RuntimeError::TerminalTask
+        | RuntimeError::StaleTaskHandle
+        | RuntimeError::CrossRealmTaskHandle => RuntimeRealmRejection::InvalidTaskState,
+        unexpected => panic!("unknown Task Runtime error: {unexpected:?}"),
+    }
+}
+
+fn map_request_error(error: RuntimeError) -> RuntimeRealmRejection {
+    match error {
+        RuntimeError::Realm(error) => match *error {
+            RealmError::Host(
+                crate::HostRequestError::StaleHostRequestHandle
+                | crate::HostRequestError::CrossRealmHostRequestHandle
+                | crate::HostRequestError::AlreadyCompleted
+                | crate::HostRequestError::DetachedByReload
+                | crate::HostRequestError::InvalidState,
+            ) => RuntimeRealmRejection::InvalidRequestState,
+            unexpected => panic!("unknown Realm request error: {unexpected:?}"),
+        },
+        unexpected => panic!("unknown request Runtime error: {unexpected:?}"),
+    }
+}
+
+fn map_reload_error(error: ReloadError) -> RuntimeRealmRejection {
+    match error {
+        ReloadError::InvalidState => RuntimeRealmRejection::InvalidReloadState,
+        unexpected => panic!("unknown Reload error: {unexpected:?}"),
     }
 }
 
