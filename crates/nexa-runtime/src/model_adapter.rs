@@ -85,6 +85,15 @@ pub enum RuntimeRealmRejection {
     RealmDropped,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RuntimeRequestRejection {
+    StaleHandle,
+    CrossRealmHandle,
+    AlreadyCompleted,
+    DetachedByReload,
+    InvalidState,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RuntimeInvocationCounters {
     pub spawn_attempts: u64,
@@ -128,6 +137,7 @@ pub struct RealmRuntimeModelAdapter {
     pending_slot: Arc<Mutex<Option<PendingHostRequest>>>,
     probe: ProbeFixture,
     counters: RuntimeInvocationCounters,
+    last_request_rejection: Option<RuntimeRequestRejection>,
     drop_result: Option<RuntimeRealmSnapshot>,
     dropped: bool,
 }
@@ -171,6 +181,7 @@ impl Default for RealmRuntimeModelAdapter {
             pending_slot,
             probe: ProbeFixture::new(),
             counters: RuntimeInvocationCounters::default(),
+            last_request_rejection: None,
             drop_result: None,
             dropped: false,
         }
@@ -230,6 +241,21 @@ impl RealmRuntimeModelAdapter {
     }
 
     #[must_use]
+    pub const fn current_task_handle(&self) -> Option<TaskHandle> {
+        self.task
+    }
+
+    #[must_use]
+    pub const fn current_request_handle(&self) -> Option<HostRequestHandle> {
+        self.request
+    }
+
+    #[must_use]
+    pub const fn last_request_rejection(&self) -> Option<RuntimeRequestRejection> {
+        self.last_request_rejection
+    }
+
+    #[must_use]
     pub fn state_fingerprint(&self) -> RuntimeStateFingerprint {
         if self.dropped {
             return RuntimeStateFingerprint {
@@ -265,6 +291,7 @@ impl RealmRuntimeModelAdapter {
         if self.dropped {
             return Err(RuntimeRealmRejection::RealmDropped);
         }
+        self.last_request_rejection = None;
         match event {
             RuntimeRealmEvent::Spawn => self.spawn(),
             RuntimeRealmEvent::Poll => self.poll(),
@@ -317,13 +344,7 @@ impl RealmRuntimeModelAdapter {
 
     fn poll(&mut self) -> Result<(), RuntimeRealmRejection> {
         let snapshot = self.snapshot();
-        let target = if snapshot.task == RuntimeTaskLifecycle::Ready {
-            self.task.expect("Ready snapshot has a Task handle")
-        } else if snapshot.task == RuntimeTaskLifecycle::Terminal {
-            self.task.expect("Terminal snapshot has a Task handle")
-        } else {
-            self.probe.cross_realm_task()
-        };
+        let target = self.current_task_or_probe();
         self.counters.poll_attempts = self.counters.poll_attempts.saturating_add(1);
         match self
             .realm
@@ -341,6 +362,21 @@ impl RealmRuntimeModelAdapter {
                 assert!(
                     self.physical_request.is_some(),
                     "real Host call must publish its physical completion ticket"
+                );
+                Ok(())
+            }
+            Ok(TaskPoll::Waiting(request)) if snapshot.task == RuntimeTaskLifecycle::Waiting => {
+                assert_eq!(
+                    Some(request),
+                    self.request,
+                    "re-polling a Waiting task must return its current request"
+                );
+                assert!(
+                    self.pending_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none(),
+                    "re-polling a Waiting task must not publish another physical ticket"
                 );
                 Ok(())
             }
@@ -375,7 +411,7 @@ impl RealmRuntimeModelAdapter {
                 .unwrap_or_else(|error| panic!("completion tick failed: {error:?}"));
             return Ok(());
         }
-        let target = self.probe.cross_realm_request();
+        let target = self.current_request_or_probe();
         self.counters.completion_attempts = self.counters.completion_attempts.saturating_add(1);
         match self
             .realm
@@ -384,7 +420,7 @@ impl RealmRuntimeModelAdapter {
             .complete_request(target, HostCompletionResult::Success(HostPayload::I32(7)))
         {
             Ok(unexpected) => panic!("invalid completion unexpectedly succeeded: {unexpected:?}"),
-            Err(error) => Err(map_request_error(error)),
+            Err(error) => Err(self.record_request_error(error)),
         }
     }
 
@@ -521,7 +557,7 @@ impl RealmRuntimeModelAdapter {
             Ok(unexpected) => {
                 panic!("invalid late completion unexpectedly succeeded: {unexpected:?}")
             }
-            Err(error) => Err(map_request_error(error)),
+            Err(error) => Err(self.record_request_error(error)),
         }
     }
 
@@ -533,6 +569,21 @@ impl RealmRuntimeModelAdapter {
                 "reload detached request must retain its physical ticket"
             );
         }
+    }
+
+    fn current_task_or_probe(&self) -> TaskHandle {
+        self.task.unwrap_or_else(|| self.probe.cross_realm_task())
+    }
+
+    fn current_request_or_probe(&self) -> HostRequestHandle {
+        self.request
+            .unwrap_or_else(|| self.probe.cross_realm_request())
+    }
+
+    fn record_request_error(&mut self, error: RuntimeError) -> RuntimeRealmRejection {
+        let (rejection, detail) = map_request_error(error);
+        self.last_request_rejection = Some(detail);
+        rejection
     }
 
     fn drop_realm(&mut self) {
@@ -899,16 +950,29 @@ fn map_task_error(error: RuntimeError) -> RuntimeRealmRejection {
     }
 }
 
-fn map_request_error(error: RuntimeError) -> RuntimeRealmRejection {
+fn map_request_error(error: RuntimeError) -> (RuntimeRealmRejection, RuntimeRequestRejection) {
     match error {
         RuntimeError::Realm(error) => match *error {
-            RealmError::Host(
-                crate::HostRequestError::StaleHostRequestHandle
-                | crate::HostRequestError::CrossRealmHostRequestHandle
-                | crate::HostRequestError::AlreadyCompleted
-                | crate::HostRequestError::DetachedByReload
-                | crate::HostRequestError::InvalidState,
-            ) => RuntimeRealmRejection::InvalidRequestState,
+            RealmError::Host(crate::HostRequestError::StaleHostRequestHandle) => (
+                RuntimeRealmRejection::InvalidRequestState,
+                RuntimeRequestRejection::StaleHandle,
+            ),
+            RealmError::Host(crate::HostRequestError::CrossRealmHostRequestHandle) => (
+                RuntimeRealmRejection::InvalidRequestState,
+                RuntimeRequestRejection::CrossRealmHandle,
+            ),
+            RealmError::Host(crate::HostRequestError::AlreadyCompleted) => (
+                RuntimeRealmRejection::InvalidRequestState,
+                RuntimeRequestRejection::AlreadyCompleted,
+            ),
+            RealmError::Host(crate::HostRequestError::DetachedByReload) => (
+                RuntimeRealmRejection::InvalidRequestState,
+                RuntimeRequestRejection::DetachedByReload,
+            ),
+            RealmError::Host(crate::HostRequestError::InvalidState) => (
+                RuntimeRealmRejection::InvalidRequestState,
+                RuntimeRequestRejection::InvalidState,
+            ),
             unexpected => panic!("unknown Realm request error: {unexpected:?}"),
         },
         unexpected => panic!("unknown request Runtime error: {unexpected:?}"),

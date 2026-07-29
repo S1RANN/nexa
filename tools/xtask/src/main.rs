@@ -35,6 +35,7 @@ struct RepoHealth {
     manual_binding_e2e_registry_violations: usize,
     shadow_runtime_prevalidation_violations: usize,
     runtime_invalid_event_short_circuit_violations: usize,
+    runtime_differential_current_handle_violations: usize,
     missing_runtime_invocation_counter_evidence: usize,
     model_repeated_reload_semantic_violations: usize,
     real_runtime_fuzz_violations: usize,
@@ -71,6 +72,7 @@ struct M1FinalReport {
     model_differential_test: &'static str,
     differential_sequence_count: usize,
     high_risk_sequence_count: usize,
+    semantic_regression_sequence_count: usize,
     fuzz_build: &'static str,
     fuzz_corpus_replay: &'static str,
     bench_smoke: &'static str,
@@ -167,6 +169,7 @@ fn finalize_m1() -> Result<(), DynError> {
         model_differential_test: status(summary.model_differential_test),
         differential_sequence_count: 7_381,
         high_risk_sequence_count: 30,
+        semantic_regression_sequence_count: 4,
         fuzz_build: status(summary.fuzz_build),
         fuzz_corpus_replay: status(summary.fuzz_corpus_replay),
         bench_smoke: status(summary.bench_smoke),
@@ -526,6 +529,17 @@ fn repo_audit() -> Result<(), DynError> {
     );
     let differential_source =
         fs::read_to_string(root.join("crates/nexa-model/tests/realm_differential.rs"))?;
+    let runtime_differential_current_handle_violations = missing_evidence(
+        &format!("{model_adapter_source}\n{differential_source}"),
+        &[
+            "current_task_or_probe",
+            "current_request_or_probe",
+            "current_handles_drive_semantic_regression_sequences",
+            "RuntimeRequestRejection::AlreadyCompleted",
+            "RuntimeRequestRejection::DetachedByReload",
+            "re-poll current Waiting task",
+        ],
+    );
     let missing_runtime_invocation_counter_evidence = missing_evidence(
         &format!("{model_adapter_source}\n{differential_source}"),
         &[
@@ -634,6 +648,7 @@ fn repo_audit() -> Result<(), DynError> {
         && manual_binding_e2e_registry_violations == 0
         && shadow_runtime_prevalidation_violations == 0
         && runtime_invalid_event_short_circuit_violations == 0
+        && runtime_differential_current_handle_violations == 0
         && missing_runtime_invocation_counter_evidence == 0
         && model_repeated_reload_semantic_violations == 0
         && real_runtime_fuzz_violations == 0
@@ -646,7 +661,7 @@ fn repo_audit() -> Result<(), DynError> {
         && versioned_model_file_count == 0
         && tag_valid;
     let report = RepoHealth {
-        schema_version: 4,
+        schema_version: 5,
         product_rust_loc,
         unit_test_loc,
         integration_test_loc,
@@ -670,6 +685,7 @@ fn repo_audit() -> Result<(), DynError> {
         manual_binding_e2e_registry_violations,
         shadow_runtime_prevalidation_violations,
         runtime_invalid_event_short_circuit_violations,
+        runtime_differential_current_handle_violations,
         missing_runtime_invocation_counter_evidence,
         model_repeated_reload_semantic_violations,
         real_runtime_fuzz_violations,

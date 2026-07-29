@@ -121,6 +121,7 @@ impl RealmModel {
                     self.snapshot.request_resources = 1;
                 }
             }
+            RealmEvent::Poll if self.snapshot.task == TaskLifecycle::Waiting => {}
             RealmEvent::CompleteRequest
                 if self.snapshot.request == RequestLifecycle::Pending
                     && self.snapshot.task == TaskLifecycle::Waiting =>

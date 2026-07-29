@@ -17,7 +17,7 @@
 | `nexa-model/tests/task_differential.rs` | Model Differential | Task machine matches executable kernel | Runtime/model transition mismatch | No | Model |
 | `nexa-model/tests/scope_differential.rs` | Model Differential | Scope machine matches executable kernel | Scope ownership mismatch | No | Model |
 | `nexa-model/tests/task_scope_system_differential.rs` | Model Differential | Coupled Task/Scope invariants | Cross-machine invariant mismatch | No | Model |
-| `nexa-model/tests/realm_differential.rs` | Model Differential | Real `RealmRuntime` matches all 7,381 bounded sequences and 20+ high-risk sequences; rejected events are immutable | Runtime/model or resource-ledger mismatch | Real adapter | Model |
+| `nexa-model/tests/realm_differential.rs` | Model Differential | Real `RealmRuntime` matches all 7,381 bounded sequences, 30 high-risk sequences, and four current-handle semantic regressions; rejected events are immutable | Runtime/model or resource-ledger mismatch | Real adapter | Model |
 | `nexa-model/tests/realm_failure_differential.rs` | Model Differential | Rejected operations preserve state | Failure classification or atomicity mismatch | No | Model |
 | `fuzz/bytecode*`, `fuzz/verifier`, `fuzz/root-map`, `fuzz/wcet` | Fuzz, Bytecode / Verifier | Decode, verify, root map, WCET safety | Panic, acceptance bug, or bound violation | No | Fuzz |
 | `fuzz/host-import`, `fuzz/idl` | Fuzz, Host Binding | Host ABI decoding and IDL canonicalization | Panic or inconsistent binding | No | Fuzz |

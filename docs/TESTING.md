@@ -42,10 +42,14 @@ Task revival, late-result discard, immediate old-module release, and
 post-publication activation failure.
 
 `test-model` executes all 7,381 Realm event sequences of length 0 through 4,
-plus 30 high-risk sequences, against a real `RealmRuntime`; every callable step
-must advance its corresponding Runtime API attempt counter, and every rejected
-step compares the real inspection snapshot, resource ledger, and Host queues
-before and after. The Realm fuzz target uses the same real adapter.
+plus 30 high-risk sequences and four current-handle semantic regressions,
+against a real `RealmRuntime`. Re-polling a Waiting Task must reuse the current
+Task and Request without changing state. Re-completion after completion or
+cancellation must report `AlreadyCompleted`, while re-completion after Restart
+Reload must report `DetachedByReload`. Every callable step must advance its
+corresponding Runtime API attempt counter, and every rejected step compares the
+real inspection snapshot, resource ledger, and Host queues before and after.
+The Realm fuzz target uses the same real adapter.
 `fuzz-smoke` also replays the committed deterministic Realm corpus with an
 ordinary test runner.
 

@@ -3,7 +3,7 @@ use nexa_model::realm::{
 };
 use nexa_runtime::model_adapter::{
     RealmRuntimeModelAdapter, RuntimeInvocationCounters, RuntimeRealmEvent, RuntimeRealmRejection,
-    RuntimeRealmSnapshot, RuntimeRequestLifecycle,
+    RuntimeRealmSnapshot, RuntimeRequestLifecycle, RuntimeRequestRejection,
 };
 
 #[test]
@@ -14,6 +14,93 @@ fn all_realm_event_sequences_through_length_four_match_real_runtime() {
         visit_sequences(length, &mut sequence, &mut executed);
     }
     assert_eq!(executed, 1 + 9 + 81 + 729 + 6_561);
+}
+
+#[test]
+fn current_handles_drive_semantic_regression_sequences() {
+    let sequences = [
+        vec![RealmEvent::Spawn, RealmEvent::Poll, RealmEvent::Poll],
+        vec![
+            RealmEvent::Spawn,
+            RealmEvent::Poll,
+            RealmEvent::CompleteRequest,
+            RealmEvent::CompleteRequest,
+        ],
+        vec![
+            RealmEvent::Spawn,
+            RealmEvent::Poll,
+            RealmEvent::Cancel,
+            RealmEvent::CompleteRequest,
+        ],
+        vec![
+            RealmEvent::Spawn,
+            RealmEvent::Poll,
+            RealmEvent::RestartReload,
+            RealmEvent::CompleteRequest,
+        ],
+    ];
+    for sequence in sequences {
+        compare_sequence(&sequence);
+    }
+
+    let mut waiting = RealmRuntimeModelAdapter::default();
+    waiting
+        .apply(RuntimeRealmEvent::Spawn)
+        .expect("spawn current task");
+    let current_task = waiting.current_task_handle().expect("current task");
+    waiting
+        .apply(RuntimeRealmEvent::Poll)
+        .expect("poll current task to Waiting");
+    let current_request = waiting.current_request_handle().expect("current request");
+    let waiting_state = waiting.state_fingerprint();
+    waiting
+        .apply(RuntimeRealmEvent::Poll)
+        .expect("re-poll current Waiting task");
+    assert_eq!(waiting.current_task_handle(), Some(current_task));
+    assert_eq!(waiting.current_request_handle(), Some(current_request));
+    assert_eq!(waiting.state_fingerprint(), waiting_state);
+
+    assert_current_request_rejection(
+        &[
+            RuntimeRealmEvent::Spawn,
+            RuntimeRealmEvent::Poll,
+            RuntimeRealmEvent::CompleteRequest,
+        ],
+        RuntimeRequestRejection::AlreadyCompleted,
+    );
+    assert_current_request_rejection(
+        &[
+            RuntimeRealmEvent::Spawn,
+            RuntimeRealmEvent::Poll,
+            RuntimeRealmEvent::Cancel,
+        ],
+        RuntimeRequestRejection::AlreadyCompleted,
+    );
+    assert_current_request_rejection(
+        &[
+            RuntimeRealmEvent::Spawn,
+            RuntimeRealmEvent::Poll,
+            RuntimeRealmEvent::RestartReload,
+        ],
+        RuntimeRequestRejection::DetachedByReload,
+    );
+}
+
+fn assert_current_request_rejection(
+    prefix: &[RuntimeRealmEvent],
+    expected: RuntimeRequestRejection,
+) {
+    let mut runtime = RealmRuntimeModelAdapter::default();
+    for event in prefix {
+        runtime.apply(*event).expect("regression prefix");
+    }
+    let request = runtime.current_request_handle().expect("current request");
+    assert_eq!(
+        runtime.apply(RuntimeRealmEvent::CompleteRequest),
+        Err(RuntimeRealmRejection::InvalidRequestState)
+    );
+    assert_eq!(runtime.current_request_handle(), Some(request));
+    assert_eq!(runtime.last_request_rejection(), Some(expected));
 }
 
 #[test]
