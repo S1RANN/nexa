@@ -1,12 +1,12 @@
 # Nexa Roadmap
 
 ```text
-Nexa Internal Pivot M1 = COMPLETE
+Nexa Internal Pivot M1 = FINALIZING
 Repository Slimming = COMPLETE
-Rust Host Binding v1 = COMPLETE
-Task Runtime Stabilization = COMPLETE
+Rust Host Binding v1 = FINALIZING
+Task Runtime Stabilization = FINALIZING
 Restart Reload v1 = COMPLETE
-Combat Dogfood Loop = COMPLETE
+Combat Dogfood Loop = FINALIZING
 ```
 
 ## Current position
@@ -25,8 +25,9 @@ Gate 1 v2.9 STOP (historical tag)
    → Combat dogfood loop
 ```
 
-Internal Pivot M1 is complete: every Cargo and xtask gate, including
-`finalize-m1`, passed on a clean commit before the final status transition.
+Internal Pivot M1 has reopened finalization to close the generated-registry
+positive path, real invalid-event Runtime calls, deterministic fuzz corpus
+replay, and independently observable final gates.
 
 ## Active product
 
@@ -55,6 +56,11 @@ This milestone does not add new syntax, user generics, `dynamic` or
 seamless old-Task migration, completion replay queues, multi-version business
 execution, cross-module stateful reload, or a new Gate/Contract/Receipt evidence
 system.
+
+The final-closure batch also explicitly excludes JIT/AOT, new language syntax,
+`dynamic`, `interface`, user generics, C++/C# bindings, UGC or untrusted
+bytecode, LSP/DAP, advanced seamless Reload, old-Task restoration, completion
+replay buffers, and any new Gate/Contract/Receipt system.
 
 ## Deliberately removed
 
