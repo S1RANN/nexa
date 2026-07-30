@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **3.0.1**
+Version: **3.0.2**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -8,6 +8,7 @@ Nexa M2 Embedding & Snake Pilot = COMPLETE
 Nexa M3 Developer Loop & Diagnostics = COMPLETE
 NexaEngine API = COMPLETE
 Automatic Candidate Compilation = COMPLETE
+Candidate Generation Terminal Accounting = COMPLETE
 Last Known Good Reload = COMPLETE
 Unified Diagnostics = COMPLETE
 Source-level Runtime Stack Traces = COMPLETE

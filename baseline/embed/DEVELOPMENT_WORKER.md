@@ -1,6 +1,6 @@
 # Development Worker
 
-Status: M3R1 COMPLETE
+Status: M3R2 COMPLETE
 
 The development Worker compiles immutable Package Candidate snapshots outside
 the Runtime thread. It is a bounded producer whose capacity creates
@@ -23,6 +23,13 @@ FIFO position and terminates the replaced Generation as
 `SupersededBeforeCompile`. A full cross-Package queue returns backpressure to
 the Engine, which retains and retries the Job.
 
+Observing a new content hash creates a Generation before stable-write
+detection. The Engine records that pre-queue Generation explicitly. If another
+hash replaces it, or the source returns to the active hash, it terminates as
+`SupersededBeforeCompile`. Disable, source removal, and shutdown terminate it
+with their corresponding cancellation outcome even though no `CompileJob`
+exists yet.
+
 Completed terminals use a bounded Result queue. When it is full the Worker
 waits for Result space or shutdown; it never removes an older Result. Worker
 start events and terminal results are drained by `NexaEngine::tick()`.
@@ -38,6 +45,12 @@ start events and terminal results are drained by `NexaEngine::tick()`.
 
 Only `terminal_hash` or `active_hash` suppresses re-queuing identical content.
 A backpressured Job does not update `queued_hash` or `terminal_hash`.
+`active_hash` is initialized when a Package is enabled, not only after its
+first Reload.
+
+Inspection reports cumulative created, terminal, duplicate, and unterminated
+Generation counts. Finalization reads those real Engine counts; it may not
+derive them from whether Worker tests passed.
 
 Shutdown stops admission, terminates pending work, accounts for in-flight work,
 drains terminals, joins the Worker, closes Package runtimes, drains releases,

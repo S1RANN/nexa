@@ -243,6 +243,7 @@ pub struct WorkerInspection {
 pub(crate) struct PackageDevelopment {
     pub state: DevelopmentState,
     pub observed_hash: Option<SourceHash>,
+    pub unqueued_generation: Option<CandidateTerminalData>,
     pub stable_hash: Option<SourceHash>,
     pub queued_hash: Option<SourceHash>,
     pub in_flight_hash: Option<SourceHash>,
@@ -251,6 +252,7 @@ pub(crate) struct PackageDevelopment {
     pub stable_scans: u8,
     pub latest_generation: u64,
     pub terminal_count: u64,
+    pub duplicate_terminal_count: u64,
     pub terminal_generations: BTreeMap<u64, CandidateTerminalKind>,
     pub change_observed_at: Option<Instant>,
     pub last_change_to_stable_duration: Duration,

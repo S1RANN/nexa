@@ -14,6 +14,7 @@ Nexa M2 Embedding & Snake Pilot = COMPLETE
 Nexa M3 Developer Loop & Diagnostics = COMPLETE
 NexaEngine API = COMPLETE
 Automatic Candidate Compilation = COMPLETE
+Candidate Generation Terminal Accounting = COMPLETE
 Last Known Good Reload = COMPLETE
 Unified Diagnostics = COMPLETE
 Source-level Runtime Stack Traces = COMPLETE
@@ -30,7 +31,7 @@ Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
-Current target = M3R1 complete; M4 not started
+Current target = M3R2 complete; M4 not started
 Seamless advanced Reload = REMOVED
 ```
 
@@ -114,6 +115,7 @@ cargo run -p snake-game
 cargo xtask check
 cargo xtask finalize-m1
 cargo xtask finalize-m3-r1
+cargo xtask finalize-m3-r2
 ```
 
 Focused commands are documented in [Testing](docs/TESTING.md). Generated

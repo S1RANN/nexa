@@ -1,6 +1,6 @@
 # Nexa Embed API
 
-Status: M3R1 COMPLETE
+Status: M3R2 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust
 application and Nexa Runtime. Applications provide a generated `HostContract`,
@@ -37,6 +37,10 @@ hash, compiled and verified by one bounded worker, and returned to the calling
 thread. Only `NexaEngine::tick()` may commit the newest generation. A failed,
 stale, or Host-contract-incompatible Candidate cannot replace the active
 Runtime or Last Known Good artifact.
+
+The first observation of a changed hash creates a Candidate Generation.
+Pre-queue Generations are explicitly tracked and receive a terminal outcome
+when replaced, reverted to active content, disabled, removed, or shut down.
 
 `tick` returns `EngineTickReport`; `inspection` returns bounded, read-only
 Engine, Package, development, diagnostic, Reload, and metric DTOs. These APIs

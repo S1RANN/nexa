@@ -4,7 +4,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 type DynError = Box<dyn std::error::Error>;
@@ -104,6 +104,7 @@ struct M3R1FinalReport {
     result_backpressure: &'static str,
     disable_in_flight: &'static str,
     shutdown_in_flight: &'static str,
+    generation_accounting: &'static str,
     reload_stress: &'static str,
     metrics: &'static str,
     cli_policy: &'static str,
@@ -122,6 +123,85 @@ struct M3R1FinalReport {
     worktree_clean: bool,
     historical_tag_type: String,
     historical_tag_target: String,
+    tag_type: String,
+    tag_target: String,
+    tag_target_matches_head: bool,
+    failures: Vec<String>,
+    status: &'static str,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GenerationAccountingReport {
+    schema: u32,
+    scenario_count: u64,
+    created_generations: u64,
+    terminal_generations: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    superseded_before_compile: u64,
+    cancelled_by_source_removal: u64,
+    cancelled_by_disable: u64,
+    cancelled_by_shutdown: u64,
+    status: String,
+}
+
+impl GenerationAccountingReport {
+    fn failed() -> Self {
+        Self {
+            schema: 0,
+            scenario_count: 0,
+            created_generations: 0,
+            terminal_generations: 0,
+            duplicate_terminals: u64::MAX,
+            generations_without_terminal: u64::MAX,
+            superseded_before_compile: 0,
+            cancelled_by_source_removal: 0,
+            cancelled_by_disable: 0,
+            cancelled_by_shutdown: 0,
+            status: "FAIL".into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct M3R2FinalReport {
+    schema: u32,
+    milestone: &'static str,
+    head: String,
+    workspace: &'static str,
+    m1_m2_regression: &'static str,
+    engine_api: &'static str,
+    engine_diagnostics: &'static str,
+    worker_queue_saturation: &'static str,
+    result_backpressure: &'static str,
+    disable_in_flight: &'static str,
+    shutdown_in_flight: &'static str,
+    generation_accounting: &'static str,
+    reload_stress: &'static str,
+    metrics: &'static str,
+    cli_policy: &'static str,
+    lsp: &'static str,
+    editor: &'static str,
+    repo_audit: &'static str,
+    queue_lost_jobs: u64,
+    queue_lost_results: u64,
+    created_generations: u64,
+    terminal_generations: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    engine_diagnostic_direct_construction: usize,
+    engine_diagnostic_real_paths: usize,
+    metrics_trusted: bool,
+    policy_validation: &'static str,
+    nidl_span: &'static str,
+    uri_matrix: &'static str,
+    worktree_clean: bool,
+    historical_tag_type: String,
+    historical_tag_target: String,
+    r1_tag_type: String,
+    r1_tag_target: String,
     tag_type: String,
     tag_target: String,
     tag_target_matches_head: bool,
@@ -183,8 +263,10 @@ fn main() -> Result<(), DynError> {
         "test-lsp" => test_lsp(),
         "editor-check" => editor_check(),
         "dev-loop-stress" => dev_loop_stress(),
+        "test-generation-accounting" => test_generation_accounting(),
         "finalize-m3" => finalize_m3(),
         "finalize-m3-r1" => finalize_m3_r1(),
+        "finalize-m3-r2" => finalize_m3_r2(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -192,7 +274,8 @@ fn main() -> Result<(), DynError> {
                  fuzz-smoke|bench-smoke|repo-audit|finalize-m1|test-embed|test-snake|\
                  snake-headless-smoke|snake-stress|snake-bench|finalize-m2|\
                  test-engine-api|test-diagnostics|test-dev-loop|test-cli|test-lsp|\
-                 editor-check|dev-loop-stress|finalize-m3|finalize-m3-r1"
+                 editor-check|dev-loop-stress|test-generation-accounting|\
+                 finalize-m3|finalize-m3-r1|finalize-m3-r2"
             );
             Err("unknown xtask command".into())
         }
@@ -277,8 +360,10 @@ fn check() -> Result<(), DynError> {
     editor_check()?;
     test_metrics()?;
     dev_loop_stress()?;
+    test_generation_accounting()?;
     m3_audit()?;
-    m3r1_audit()
+    m3r1_audit()?;
+    m3r2_audit()
 }
 
 fn test_engine_api() -> Result<(), DynError> {
@@ -470,6 +555,51 @@ fn worker_shutdown_in_flight() -> Result<(), DynError> {
     ])
 }
 
+fn test_generation_accounting() -> Result<(), DynError> {
+    generation_accounting_gate().map(|_| ())
+}
+
+fn generation_accounting_gate() -> Result<GenerationAccountingReport, DynError> {
+    let root = workspace_root();
+    let report_path = root.join("target/nexa-artifacts/m3r2-generation-accounting/report.json");
+    if report_path.exists() {
+        fs::remove_file(&report_path)?;
+    }
+    let status = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "nexa-embed",
+            "--test",
+            "embed",
+            "generation_accounting_machine_report_uses_real_engine_inspection",
+            "--",
+            "--nocapture",
+        ])
+        .env("NEXA_GENERATION_ACCOUNTING_REPORT", &report_path)
+        .current_dir(&root)
+        .status()?;
+    if !status.success() {
+        return Err(format!("Generation accounting test failed with {status}").into());
+    }
+    let report: GenerationAccountingReport = serde_json::from_slice(&fs::read(&report_path)?)?;
+    if report.schema != 1
+        || report.scenario_count != 5
+        || report.created_generations == 0
+        || report.created_generations != report.terminal_generations
+        || report.duplicate_terminals != 0
+        || report.generations_without_terminal != 0
+        || report.superseded_before_compile != 2
+        || report.cancelled_by_source_removal != 1
+        || report.cancelled_by_disable != 1
+        || report.cancelled_by_shutdown != 1
+        || report.status != "PASS"
+    {
+        return Err(format!("Generation accounting report is incomplete: {report:?}").into());
+    }
+    Ok(report)
+}
+
 fn finalize_m3() -> Result<(), DynError> {
     m3_audit()?;
     if !git_output(&["status", "--porcelain"])?.is_empty() {
@@ -527,6 +657,13 @@ fn finalize_m3_r1() -> Result<(), DynError> {
         &mut failures,
         worker_shutdown_in_flight(),
     );
+    let (generation_accounting, generation_report) = match generation_accounting_gate() {
+        Ok(report) => (true, report),
+        Err(error) => {
+            failures.push(format!("Generation terminal accounting: {error}"));
+            (false, GenerationAccountingReport::failed())
+        }
+    };
     let reload_stress = record_gate("Reload stress", &mut failures, dev_loop_stress());
     let metrics = record_gate("Metrics", &mut failures, test_metrics());
     let cli_policy = record_gate("CLI policy", &mut failures, test_cli());
@@ -578,6 +715,7 @@ fn finalize_m3_r1() -> Result<(), DynError> {
         && engine_real_paths == 13
         && engine_direct_construction == 0
         && worker_gates
+        && generation_accounting
         && reload_stress
         && metrics
         && cli_policy
@@ -603,6 +741,7 @@ fn finalize_m3_r1() -> Result<(), DynError> {
         result_backpressure: status(result_backpressure),
         disable_in_flight: status(disable_in_flight),
         shutdown_in_flight: status(shutdown_in_flight),
+        generation_accounting: status(generation_accounting),
         reload_stress: status(reload_stress),
         metrics: status(metrics),
         cli_policy: status(cli_policy),
@@ -611,7 +750,7 @@ fn finalize_m3_r1() -> Result<(), DynError> {
         repo_audit: status(repo_audit),
         queue_lost_jobs: u64::from(!worker_queue_saturation),
         queue_lost_results: u64::from(!result_backpressure),
-        generations_without_terminal: u64::from(!worker_gates),
+        generations_without_terminal: generation_report.generations_without_terminal,
         engine_diagnostic_direct_construction: engine_direct_construction,
         engine_diagnostic_real_paths: engine_real_paths,
         metrics_trusted: metrics,
@@ -639,6 +778,180 @@ fn finalize_m3_r1() -> Result<(), DynError> {
         Ok(())
     } else {
         Err("M3R1 finalization failed".into())
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn finalize_m3_r2() -> Result<(), DynError> {
+    let mut failures = Vec::new();
+    let workspace = record_gate("workspace", &mut failures, workspace_check());
+    let m1_m2_regression = record_gate("M1/M2 regression", &mut failures, run_m1_m2_regression());
+    let engine_api = record_gate("Engine API", &mut failures, test_engine_api());
+
+    let (engine_diagnostics, engine_real_paths, engine_direct_construction) =
+        match real_engine_diagnostic_gate() {
+            Ok((real_paths, direct_construction)) => (true, real_paths, direct_construction),
+            Err(error) => {
+                failures.push(format!("real Engine diagnostics: {error}"));
+                (false, 0, usize::MAX)
+            }
+        };
+    let worker_queue_saturation = record_gate(
+        "Worker queue saturation",
+        &mut failures,
+        worker_queue_saturation(),
+    );
+    let result_backpressure = record_gate(
+        "Worker result backpressure",
+        &mut failures,
+        worker_result_backpressure(),
+    );
+    let disable_in_flight = record_gate(
+        "Worker disable/in-flight",
+        &mut failures,
+        worker_disable_in_flight(),
+    );
+    let shutdown_in_flight = record_gate(
+        "Worker shutdown/in-flight",
+        &mut failures,
+        worker_shutdown_in_flight(),
+    );
+    let (generation_accounting, generation_report) = match generation_accounting_gate() {
+        Ok(report) => (true, report),
+        Err(error) => {
+            failures.push(format!("Generation terminal accounting: {error}"));
+            (false, GenerationAccountingReport::failed())
+        }
+    };
+    let reload_stress = record_gate("Reload stress", &mut failures, dev_loop_stress());
+    let metrics = record_gate("Metrics", &mut failures, test_metrics());
+    let cli_policy = record_gate("CLI policy", &mut failures, test_cli());
+    let nidl_span = record_gate("NIDL Span", &mut failures, test_nidl_span());
+    let uri_matrix = record_gate("URI matrix", &mut failures, test_uri_matrix());
+    let lsp = record_gate("LSP", &mut failures, test_lsp());
+    let editor = record_gate("Editor", &mut failures, editor_check());
+    let repo_audit = record_gate(
+        "Repository audit",
+        &mut failures,
+        repo_audit()
+            .and_then(|()| m3_audit())
+            .and_then(|()| m3r1_audit())
+            .and_then(|()| m3r2_audit())
+            .and_then(|()| m3r2_final_status_audit()),
+    );
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let worktree_clean = git_output(&["status", "--porcelain"])?.is_empty();
+    if !worktree_clean {
+        failures.push("worktree is not clean".into());
+    }
+    let historical_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete"])
+        .unwrap_or_else(|_| "missing".into());
+    let historical_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let r1_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete-r1"])
+        .unwrap_or_else(|_| "missing".into());
+    let r1_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete-r1^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete-r2"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_target = git_output(&["rev-parse", "developer-loop-m3-complete-r2^{}"])
+        .unwrap_or_else(|_| "missing".into());
+    let tag_target_matches_head = tag_target == head;
+    if historical_tag_type != "tag"
+        || historical_tag_target != "621612f49c4180989711df3ca80021fd21ad9277"
+    {
+        failures.push("historical M3 tag type or immutable target changed".into());
+    }
+    if r1_tag_type != "tag" || r1_tag_target != "b53ce21f98db7387b37cca0572fbbf920ab53d61" {
+        failures.push("historical M3R1 tag type or immutable target changed".into());
+    }
+    if tag_type != "tag" {
+        failures.push("developer-loop-m3-complete-r2 is not an annotated tag".into());
+    }
+    if !tag_target_matches_head {
+        failures.push("developer-loop-m3-complete-r2 does not target HEAD".into());
+    }
+
+    let worker_gates =
+        worker_queue_saturation && result_backpressure && disable_in_flight && shutdown_in_flight;
+    let passed = workspace
+        && m1_m2_regression
+        && engine_api
+        && engine_diagnostics
+        && engine_real_paths == 13
+        && engine_direct_construction == 0
+        && worker_gates
+        && generation_accounting
+        && reload_stress
+        && metrics
+        && cli_policy
+        && nidl_span
+        && uri_matrix
+        && lsp
+        && editor
+        && repo_audit
+        && worktree_clean
+        && historical_tag_type == "tag"
+        && historical_tag_target == "621612f49c4180989711df3ca80021fd21ad9277"
+        && r1_tag_type == "tag"
+        && r1_tag_target == "b53ce21f98db7387b37cca0572fbbf920ab53d61"
+        && tag_type == "tag"
+        && tag_target_matches_head;
+    let report = M3R2FinalReport {
+        schema: 1,
+        milestone: "Nexa M3R2 Candidate Generation Terminal Closure",
+        head,
+        workspace: status(workspace),
+        m1_m2_regression: status(m1_m2_regression),
+        engine_api: status(engine_api),
+        engine_diagnostics: status(engine_diagnostics),
+        worker_queue_saturation: status(worker_queue_saturation),
+        result_backpressure: status(result_backpressure),
+        disable_in_flight: status(disable_in_flight),
+        shutdown_in_flight: status(shutdown_in_flight),
+        generation_accounting: status(generation_accounting),
+        reload_stress: status(reload_stress),
+        metrics: status(metrics),
+        cli_policy: status(cli_policy),
+        lsp: status(lsp),
+        editor: status(editor),
+        repo_audit: status(repo_audit),
+        queue_lost_jobs: u64::from(!worker_queue_saturation),
+        queue_lost_results: u64::from(!result_backpressure),
+        created_generations: generation_report.created_generations,
+        terminal_generations: generation_report.terminal_generations,
+        duplicate_terminals: generation_report.duplicate_terminals,
+        generations_without_terminal: generation_report.generations_without_terminal,
+        engine_diagnostic_direct_construction: engine_direct_construction,
+        engine_diagnostic_real_paths: engine_real_paths,
+        metrics_trusted: metrics,
+        policy_validation: status(cli_policy),
+        nidl_span: status(nidl_span),
+        uri_matrix: status(uri_matrix),
+        worktree_clean,
+        historical_tag_type,
+        historical_tag_target,
+        r1_tag_type,
+        r1_tag_target,
+        tag_type,
+        tag_target,
+        tag_target_matches_head,
+        failures,
+        status: if passed { "PASS" } else { "FAIL" },
+    };
+    let root = workspace_root();
+    let output = root.join("target/nexa-artifacts/m3r2-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M3R2 report has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
+        Ok(())
+    } else {
+        Err("M3R2 finalization failed".into())
     }
 }
 
@@ -890,6 +1203,76 @@ fn m3r1_audit() -> Result<(), DynError> {
     Ok(())
 }
 
+fn m3r2_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    let engine = fs::read_to_string(root.join("crates/nexa-embed/src/lib.rs"))?;
+    let development = fs::read_to_string(root.join("crates/nexa-embed/src/development.rs"))?;
+    let inspection = fs::read_to_string(root.join("crates/nexa-embed/src/inspection.rs"))?;
+    let tests = fs::read_to_string(root.join("crates/nexa-embed/tests/embed.rs"))?;
+    let xtask = fs::read_to_string(root.join("tools/xtask/src/main.rs"))?;
+    for required in [
+        "terminate_unqueued_generation",
+        "clear_unqueued_observation",
+        "CandidateTerminalKind::SupersededBeforeCompile",
+        "CandidateTerminalKind::CancelledBySourceRemoval",
+        "CandidateTerminalKind::CancelledByDisable",
+        "CandidateTerminalKind::CancelledByShutdown",
+    ] {
+        if !engine.contains(required) {
+            return Err(format!("M3R2 Engine accounting is missing `{required}`").into());
+        }
+    }
+    if !development.contains("unqueued_generation: Option<CandidateTerminalData>") {
+        return Err("M3R2 does not explicitly track the unqueued Generation".into());
+    }
+    for required in [
+        "created_generations",
+        "terminal_generations",
+        "duplicate_terminals",
+        "generations_without_terminal",
+    ] {
+        if !inspection.contains(required) {
+            return Err(format!("M3R2 inspection is missing `{required}`").into());
+        }
+    }
+    for required in [
+        "prequeue_hash_replacement_supersedes_previous_generation",
+        "prequeue_revert_to_active_supersedes_observed_generation",
+        "prequeue_source_removal_cancels_observed_generation",
+        "prequeue_disable_cancels_observed_generation",
+        "prequeue_shutdown_cancels_observed_generation",
+        "generation_accounting_machine_report_uses_real_engine_inspection",
+    ] {
+        if !tests.contains(required) {
+            return Err(format!("M3R2 regression coverage is missing `{required}`").into());
+        }
+    }
+    let derived_generation_loss =
+        ["generations_without_terminal:", " u64::from(!worker_gates)"].concat();
+    if xtask.contains(&derived_generation_loss) {
+        return Err(
+            "M3R2 finalizer still derives Generation loss from Worker gate booleans".into(),
+        );
+    }
+    for required in [
+        "generation_accounting_gate",
+        "created_generations: generation_report.created_generations",
+        "terminal_generations: generation_report.terminal_generations",
+        "duplicate_terminals: generation_report.duplicate_terminals",
+        "generations_without_terminal: generation_report.generations_without_terminal",
+    ] {
+        if !xtask.contains(required) {
+            return Err(format!("M3R2 finalizer is missing real report field `{required}`").into());
+        }
+    }
+    let r1_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete-r1"])?;
+    let r1_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete-r1^{}"])?;
+    if r1_tag_type != "tag" || r1_tag_target != "b53ce21f98db7387b37cca0572fbbf920ab53d61" {
+        return Err("historical developer-loop-m3-complete-r1 tag changed".into());
+    }
+    Ok(())
+}
+
 fn m3r1_final_status_audit() -> Result<(), DynError> {
     let root = workspace_root();
     for path in ["README.md", "ROADMAP.md", "baseline/BASELINE_INDEX.md"] {
@@ -912,6 +1295,33 @@ fn m3r1_final_status_audit() -> Result<(), DynError> {
     let embed_api = fs::read_to_string(root.join("baseline/embed/EMBED_API.md"))?;
     if !embed_api.contains("Status: M3R1 COMPLETE") {
         return Err("baseline/embed/EMBED_API.md is not M3R1 COMPLETE".into());
+    }
+    Ok(())
+}
+
+fn m3r2_final_status_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    for path in ["README.md", "ROADMAP.md", "baseline/BASELINE_INDEX.md"] {
+        let source = fs::read_to_string(root.join(path))?;
+        for required in [
+            "Nexa M3 Developer Loop & Diagnostics = COMPLETE",
+            "NexaEngine API = COMPLETE",
+            "Automatic Candidate Compilation = COMPLETE",
+            "Candidate Generation Terminal Accounting = COMPLETE",
+            "Last Known Good Reload = COMPLETE",
+            "Unified Diagnostics = COMPLETE",
+            "Source-level Runtime Stack Traces = COMPLETE",
+            "Package-aware CLI = COMPLETE",
+            "Editor Diagnostics = COMPLETE",
+        ] {
+            if !source.contains(required) {
+                return Err(format!("{path} is missing final status `{required}`").into());
+            }
+        }
+    }
+    let embed_api = fs::read_to_string(root.join("baseline/embed/EMBED_API.md"))?;
+    if !embed_api.contains("Status: M3R2 COMPLETE") {
+        return Err("baseline/embed/EMBED_API.md is not M3R2 COMPLETE".into());
     }
     Ok(())
 }

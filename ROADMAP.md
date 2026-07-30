@@ -6,6 +6,7 @@ Nexa M2 Embedding & Snake Pilot = COMPLETE
 Nexa M3 Developer Loop & Diagnostics = COMPLETE
 NexaEngine API = COMPLETE
 Automatic Candidate Compilation = COMPLETE
+Candidate Generation Terminal Accounting = COMPLETE
 Last Known Good Reload = COMPLETE
 Unified Diagnostics = COMPLETE
 Source-level Runtime Stack Traces = COMPLETE
@@ -136,8 +137,15 @@ finalization gates. It does not add language syntax, multi-file modules, user
 generics, JIT, interpreter optimization, a full semantic LSP, DAP, Pluie,
 remote packages, or untrusted execution.
 
+## M3R2 scope
+
+M3R2 changes only Candidate Generation terminal accounting before Worker
+admission and its finalization evidence. It adds no language, Runtime, Package,
+LSP, editor, or optimization capability. The immutable M3R1 tag is retained.
+
 ## Next review
 
-M3R1 is complete. M4 Language Scale Foundation has not started; it may begin
-only from the immutable M3R1 completion tag under a separately frozen
-milestone.
+M3R1 remains immutable. M3R2 closes pre-queue Candidate Generation terminal
+accounting and completes M3. M4 Language Scale Foundation has not started; it
+may begin only from the immutable M3R2 completion tag under a separately
+frozen milestone.

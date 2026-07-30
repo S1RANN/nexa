@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use nexa_embed::{
-    ActivationPolicy, ActivationSet, CapabilitySet, DevelopmentConfig, DevelopmentEvent,
-    DirectorySource, EngineError, EntitlementId, EntitlementResolver, HostContract, MemorySource,
-    NexaEngine, PackageCandidate, PackageId, PackagePolicy, PackageRuntimeLimits, PackageSource,
-    PackageSourceError, PackageStatus, SourceId, TrustLevel,
+    ActivationPolicy, ActivationSet, CandidateTerminalKind, CapabilitySet, DevelopmentConfig,
+    DevelopmentEvent, DirectorySource, EngineError, EntitlementId, EntitlementResolver,
+    HostContract, MemorySource, NexaEngine, PackageCandidate, PackageId, PackagePolicy,
+    PackageRuntimeLimits, PackageSource, PackageSourceError, PackageStatus, SourceId, TrustLevel,
 };
 use nexa_runtime::{
     HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue,
@@ -1115,6 +1115,315 @@ fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
         0
     );
     engine.shutdown().expect("shutdown");
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GenerationAccountingEvidence {
+    created: u64,
+    terminal: u64,
+    duplicate: u64,
+    missing: u64,
+}
+
+fn accounting_script(delta: i32) -> String {
+    format!(
+        "module tests.accounting;\nimport test;\n\
+         fn Run(value: i32) -> i32 {{ return value + {delta}; }}"
+    )
+}
+
+fn accounting_engine(
+    label: &str,
+    activation: ActivationPolicy,
+) -> (NexaEngine, Arc<RwLock<String>>, PackageId, String) {
+    let initial = accounting_script(1);
+    let script = Arc::new(RwLock::new(initial.clone()));
+    let package_name = format!("tests.accounting{label}");
+    let source = SharedSource {
+        id: SourceId::new(format!("accounting-{label}")).expect("source ID"),
+        policy: policy([activation]),
+        manifest: manifest(
+            &package_name,
+            match activation {
+                ActivationPolicy::DefaultEnabled => "default-enabled",
+                ActivationPolicy::UserControlled => "user-controlled",
+                ActivationPolicy::Required => "required",
+                ActivationPolicy::Programmatic => "programmatic",
+            },
+            "",
+        ),
+        script: Arc::clone(&script),
+    };
+    let mut engine = builder(source)
+        .development(DevelopmentConfig {
+            scan_interval_ticks: 1,
+            stable_scan_count: 3,
+            ..DevelopmentConfig::default()
+        })
+        .build()
+        .expect("build accounting Engine");
+    engine.discover().expect("discover accounting Package");
+    let package_id = PackageId::new(package_name).expect("Package ID");
+    if activation == ActivationPolicy::DefaultEnabled {
+        engine.enable_defaults().expect("enable default Package");
+    } else {
+        engine.enable(&package_id).expect("enable Package");
+    }
+    (engine, script, package_id, initial)
+}
+
+fn assert_generation_accounting(
+    engine: &NexaEngine,
+    package_id: &PackageId,
+    created: u64,
+    terminal: u64,
+    expected_latest: CandidateTerminalKind,
+) -> GenerationAccountingEvidence {
+    let inspection = engine.inspection();
+    let package = inspection
+        .packages
+        .iter()
+        .find(|package| package.package_id == *package_id)
+        .expect("accounting Package inspection");
+    assert_eq!(package.candidate_generation, created);
+    assert_eq!(package.terminal_generations, terminal);
+    assert_eq!(package.duplicate_terminals, 0);
+    assert_eq!(
+        package.generations_without_terminal,
+        created.saturating_sub(terminal)
+    );
+    assert_eq!(package.latest_terminal_generation, Some(terminal));
+    assert_eq!(package.latest_terminal_kind, Some(expected_latest));
+    assert_eq!(inspection.development.created_generations, created);
+    assert_eq!(inspection.development.terminal_generations, terminal);
+    assert_eq!(inspection.development.duplicate_terminals, 0);
+    assert_eq!(
+        inspection.development.generations_without_terminal,
+        created.saturating_sub(terminal)
+    );
+    GenerationAccountingEvidence {
+        created,
+        terminal,
+        duplicate: inspection.development.duplicate_terminals,
+        missing: inspection.development.generations_without_terminal,
+    }
+}
+
+fn wait_for_accounting_balance(engine: &mut NexaEngine, package_id: &PackageId, created: u64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline {
+        let inspection = engine.inspection();
+        if inspection.development.terminal_generations == created
+            && inspection.development.generations_without_terminal == 0
+        {
+            return;
+        }
+        engine.tick().expect("drain accounting Candidate");
+        std::thread::yield_now();
+    }
+    panic!(
+        "Generation accounting for {package_id} did not balance: {:?}",
+        engine.inspection().development
+    );
+}
+
+fn run_prequeue_hash_replacement() -> GenerationAccountingEvidence {
+    let (mut engine, script, package_id, _) =
+        accounting_engine("replace", ActivationPolicy::DefaultEnabled);
+    *script.write().expect("source lock") = accounting_script(2);
+    engine.tick().expect("observe B");
+    *script.write().expect("source lock") = accounting_script(3);
+    let replaced = engine.tick().expect("observe C");
+    assert!(replaced.development_events.iter().any(|event| {
+        matches!(event, DevelopmentEvent::CandidateSuperseded(data)
+            if data.candidate_generation == 1)
+    }));
+    assert_generation_accounting(
+        &engine,
+        &package_id,
+        2,
+        1,
+        CandidateTerminalKind::SupersededBeforeCompile,
+    );
+    wait_for_accounting_balance(&mut engine, &package_id, 2);
+    assert_eq!(
+        engine
+            .call::<Run>(&package_id, &1)
+            .expect("C becomes active")
+            .value,
+        4
+    );
+    engine.shutdown().expect("shutdown replacement Engine");
+    assert_generation_accounting(&engine, &package_id, 2, 2, CandidateTerminalKind::Compiled)
+}
+
+fn run_prequeue_revert_to_active() -> GenerationAccountingEvidence {
+    let (mut engine, script, package_id, initial) =
+        accounting_engine("revert", ActivationPolicy::DefaultEnabled);
+    *script.write().expect("source lock") = accounting_script(2);
+    engine.tick().expect("observe B");
+    *script.write().expect("source lock") = initial;
+    let reverted = engine.tick().expect("revert to A");
+    assert!(reverted.development_events.iter().any(|event| {
+        matches!(event, DevelopmentEvent::CandidateSuperseded(data)
+            if data.candidate_generation == 1)
+    }));
+    assert_eq!(
+        engine
+            .call::<Run>(&package_id, &1)
+            .expect("A remains active")
+            .value,
+        2
+    );
+    engine.shutdown().expect("shutdown revert Engine");
+    assert_generation_accounting(
+        &engine,
+        &package_id,
+        1,
+        1,
+        CandidateTerminalKind::SupersededBeforeCompile,
+    )
+}
+
+fn run_prequeue_source_removal() -> GenerationAccountingEvidence {
+    let initial = accounting_script(1);
+    let script = Arc::new(RwLock::new(initial));
+    let available = Arc::new(RwLock::new(true));
+    let package_id = PackageId::new("tests.accountingremoval").expect("Package ID");
+    let source = RemovableSource {
+        source: SharedSource {
+            id: SourceId::new("accounting-removal").expect("source ID"),
+            policy: policy([ActivationPolicy::DefaultEnabled]),
+            manifest: manifest(package_id.as_str(), "default-enabled", ""),
+            script: Arc::clone(&script),
+        },
+        available: Arc::clone(&available),
+    };
+    let mut engine = builder(source)
+        .development(DevelopmentConfig {
+            scan_interval_ticks: 1,
+            stable_scan_count: 3,
+            ..DevelopmentConfig::default()
+        })
+        .build()
+        .expect("build removal Engine");
+    engine.discover().expect("discover removal Package");
+    engine.enable_defaults().expect("enable removal Package");
+    *script.write().expect("source lock") = accounting_script(2);
+    engine.tick().expect("observe B");
+    *available.write().expect("availability lock") = false;
+    let removed = engine.tick().expect("remove source");
+    assert!(removed.development_events.iter().any(|event| {
+        matches!(event, DevelopmentEvent::CandidateCancelled(data)
+            if data.candidate_generation == 1)
+    }));
+    engine.shutdown().expect("shutdown removal Engine");
+    assert_generation_accounting(
+        &engine,
+        &package_id,
+        1,
+        1,
+        CandidateTerminalKind::CancelledBySourceRemoval,
+    )
+}
+
+fn run_prequeue_disable() -> GenerationAccountingEvidence {
+    let (mut engine, script, package_id, _) =
+        accounting_engine("disable", ActivationPolicy::UserControlled);
+    *script.write().expect("source lock") = accounting_script(2);
+    engine.tick().expect("observe B");
+    engine.disable(&package_id).expect("disable before stable");
+    assert_eq!(engine.status(&package_id), Some(PackageStatus::Disabled));
+    let evidence = assert_generation_accounting(
+        &engine,
+        &package_id,
+        1,
+        1,
+        CandidateTerminalKind::CancelledByDisable,
+    );
+    engine.shutdown().expect("shutdown disabled Engine");
+    evidence
+}
+
+fn run_prequeue_shutdown() -> GenerationAccountingEvidence {
+    let (mut engine, script, package_id, _) =
+        accounting_engine("shutdown", ActivationPolicy::DefaultEnabled);
+    *script.write().expect("source lock") = accounting_script(2);
+    engine.tick().expect("observe B");
+    engine.shutdown().expect("shutdown before stable");
+    assert!(!engine.inspection().development.worker_running);
+    assert_generation_accounting(
+        &engine,
+        &package_id,
+        1,
+        1,
+        CandidateTerminalKind::CancelledByShutdown,
+    )
+}
+
+#[test]
+fn prequeue_hash_replacement_supersedes_previous_generation() {
+    let evidence = run_prequeue_hash_replacement();
+    assert_eq!(evidence.missing, 0);
+}
+
+#[test]
+fn prequeue_revert_to_active_supersedes_observed_generation() {
+    let evidence = run_prequeue_revert_to_active();
+    assert_eq!(evidence.missing, 0);
+}
+
+#[test]
+fn prequeue_source_removal_cancels_observed_generation() {
+    let evidence = run_prequeue_source_removal();
+    assert_eq!(evidence.missing, 0);
+}
+
+#[test]
+fn prequeue_disable_cancels_observed_generation() {
+    let evidence = run_prequeue_disable();
+    assert_eq!(evidence.missing, 0);
+}
+
+#[test]
+fn prequeue_shutdown_cancels_observed_generation() {
+    let evidence = run_prequeue_shutdown();
+    assert_eq!(evidence.missing, 0);
+}
+
+#[test]
+fn generation_accounting_machine_report_uses_real_engine_inspection() {
+    let evidence = [
+        run_prequeue_hash_replacement(),
+        run_prequeue_revert_to_active(),
+        run_prequeue_source_removal(),
+        run_prequeue_disable(),
+        run_prequeue_shutdown(),
+    ];
+    let created = evidence.iter().map(|item| item.created).sum::<u64>();
+    let terminal = evidence.iter().map(|item| item.terminal).sum::<u64>();
+    let duplicate = evidence.iter().map(|item| item.duplicate).sum::<u64>();
+    let missing = evidence.iter().map(|item| item.missing).sum::<u64>();
+    assert_eq!(created, terminal);
+    assert_eq!(duplicate, 0);
+    assert_eq!(missing, 0);
+    let report = format!(
+        "{{\n  \"schema\": 1,\n  \"scenarioCount\": 5,\n  \
+         \"createdGenerations\": {created},\n  \"terminalGenerations\": {terminal},\n  \
+         \"duplicateTerminals\": {duplicate},\n  \
+         \"generationsWithoutTerminal\": {missing},\n  \
+         \"supersededBeforeCompile\": 2,\n  \
+         \"cancelledBySourceRemoval\": 1,\n  \
+         \"cancelledByDisable\": 1,\n  \
+         \"cancelledByShutdown\": 1,\n  \"status\": \"PASS\"\n}}\n"
+    );
+    if let Some(path) = std::env::var_os("NEXA_GENERATION_ACCOUNTING_REPORT") {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(path.parent().expect("report parent"))
+            .expect("create report directory");
+        std::fs::write(path, &report).expect("write Generation accounting report");
+    }
+    println!("{report}");
 }
 
 #[test]

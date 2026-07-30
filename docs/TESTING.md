@@ -20,10 +20,12 @@ cargo xtask test-cli
 cargo xtask test-lsp
 cargo xtask editor-check
 cargo xtask dev-loop-stress
+cargo xtask test-generation-accounting
 cargo xtask check
 cargo xtask finalize-m1
 cargo xtask finalize-m2
 cargo xtask finalize-m3-r1
+cargo xtask finalize-m3-r2
 ```
 
 Unit tests cover parser, type checking, bytecode, verifier, migration, and
@@ -45,6 +47,15 @@ backpressure races, Reload stress, metric consistency, CLI Source Policy, NIDL
 Span and URI/LSP coverage, editor checks, repository audits, clean-worktree
 validation, and annotated-tag validation. Its report is written to
 `target/nexa-artifacts/m3r1-finalize/final-report.json`.
+
+`test-generation-accounting` executes five real Engine scenarios covering
+pre-queue hash replacement, revert to active content, source removal, disable,
+and shutdown. It writes a machine report to
+`target/nexa-artifacts/m3r2-generation-accounting/report.json`.
+`finalize-m3-r2` reads that report and rejects any mismatch between created and
+terminal Generations, any duplicate terminal, or any unterminated Generation.
+Its final report is written to
+`target/nexa-artifacts/m3r2-finalize/final-report.json`.
 
 `test-binding` includes all 20 textual IDL mutation crates against the
 handwritten `BusinessHostV1`. Every changed crate compiles its changed script

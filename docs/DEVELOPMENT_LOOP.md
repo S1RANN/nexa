@@ -1,6 +1,6 @@
 # Nexa development loop
 
-Status: M3R1 COMPLETE
+Status: M3R2 COMPLETE
 
 `NexaEngine` owns the package development loop. Applications opt in with
 `DevelopmentConfig`; they do not create compiler threads or mutate a Realm
@@ -59,15 +59,22 @@ changing its FIFO position. An older in-flight result emits
 `NexaEngine::tick()` drains space; completed results are never evicted.
 
 Every Generation has exactly one terminal outcome. Disable, source removal,
-and shutdown explicitly cancel pending, in-flight, and ready work. Source
-removal keeps the active Runtime running and permits a new Generation after
-the source reappears. Only the newest verified Candidate can enter Restart
-Reload.
+and shutdown explicitly cancel pre-queue, pending, in-flight, and ready work.
+A hash observed before it is stable is held in an explicit
+`unqueued_generation` ledger entry. A newer hash or a return to active content
+terminates that entry as `SupersededBeforeCompile`. Source removal keeps the
+active Runtime running and permits a new Generation after the source
+reappears. Only the newest verified Candidate can enter Restart Reload.
 
 Development identity is split into `observed_hash`, `stable_hash`,
 `queued_hash`, `in_flight_hash`, `terminal_hash`, and `active_hash`.
 Backpressure does not advance queued or terminal identity, so a stable version
 cannot be forgotten before compilation.
+
+`EngineInspection` reports real cumulative `created_generations`,
+`terminal_generations`, `duplicate_terminals`, and
+`generations_without_terminal` values. The completion gate requires created
+and terminal counts to match with zero duplicates and zero missing terminals.
 
 ## Safety and Last Known Good
 

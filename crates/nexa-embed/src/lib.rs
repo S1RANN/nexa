@@ -324,6 +324,8 @@ impl NexaEngine {
         match result {
             Ok(runtime) => {
                 let artifact = runtime.artifact.clone();
+                self.packages[index].development.active_hash = Some(artifact.source_hash);
+                self.packages[index].development.terminal_hash = None;
                 let epoch = runtime
                     .realm
                     .active_module_epoch(runtime.module)
@@ -1021,9 +1023,21 @@ impl NexaEngine {
                     self.packages[index].development.state = DevelopmentState::Idle;
                     self.packages[index].development.terminal_hash = None;
                 }
-                if self.packages[index].development.active_hash == Some(source_hash)
-                    || self.packages[index].development.terminal_hash == Some(source_hash)
-                {
+                let matches_active =
+                    self.packages[index].development.active_hash == Some(source_hash);
+                let matches_terminal =
+                    self.packages[index].development.terminal_hash == Some(source_hash);
+                if matches_active || matches_terminal {
+                    self.terminate_unqueued_generation(
+                        index,
+                        CandidateTerminalKind::SupersededBeforeCompile,
+                    );
+                    self.clear_unqueued_observation(index);
+                    self.packages[index].development.terminal_hash = if matches_terminal {
+                        Some(source_hash)
+                    } else {
+                        None
+                    };
                     continue;
                 }
 
@@ -1033,6 +1047,10 @@ impl NexaEngine {
                         .stable_scans
                         .saturating_add(1);
                 } else {
+                    self.terminate_unqueued_generation(
+                        index,
+                        CandidateTerminalKind::SupersededBeforeCompile,
+                    );
                     if let Some(job) = self.packages[index].awaiting_job.take() {
                         self.process_candidate_terminal(job.supersede_before_compile());
                     }
@@ -1052,6 +1070,15 @@ impl NexaEngine {
                         .latest_generation
                         .saturating_add(1);
                     let generation = self.packages[index].development.latest_generation;
+                    self.packages[index].development.unqueued_generation =
+                        Some(CandidateTerminalData {
+                            package_id: package_id.clone(),
+                            source_id: source_id.clone(),
+                            generation,
+                            source_hash,
+                            queue_duration: Duration::ZERO,
+                            work_duration: Duration::ZERO,
+                        });
                     self.publish_event(DevelopmentEvent::ChangeDetected(development_event_data(
                         package_id.clone(),
                         generation,
@@ -1084,11 +1111,19 @@ impl NexaEngine {
                     )));
                 }
                 if self.packages[index].awaiting_job.is_some()
+                    || self.packages[index].ready_candidate.is_some()
                     || self.packages[index].development.queued_hash == Some(source_hash)
                     || self.packages[index].development.in_flight_hash == Some(source_hash)
                 {
                     continue;
                 }
+                let unqueued = self.packages[index]
+                    .development
+                    .unqueued_generation
+                    .take()
+                    .expect("a stable unqueued Candidate has a Generation ledger entry");
+                assert_eq!(unqueued.generation, generation);
+                assert_eq!(unqueued.source_hash, source_hash);
                 self.try_enqueue_job(
                     index,
                     CompileJob::new(
@@ -1601,6 +1636,12 @@ impl NexaEngine {
             .development
             .terminal_generations
             .insert(data.generation, kind);
+        if previous.is_some() {
+            self.packages[index].development.duplicate_terminal_count = self.packages[index]
+                .development
+                .duplicate_terminal_count
+                .saturating_add(1);
+        }
         assert!(
             previous.is_none(),
             "Candidate generation {} for {} received two terminal outcomes",
@@ -1636,7 +1677,49 @@ impl NexaEngine {
         }
     }
 
+    fn terminate_unqueued_generation(&mut self, index: usize, kind: CandidateTerminalKind) -> bool {
+        let Some(data) = self.packages[index].development.unqueued_generation.take() else {
+            return false;
+        };
+        let terminal = match kind {
+            CandidateTerminalKind::SupersededBeforeCompile => {
+                CandidateTerminal::SupersededBeforeCompile(data)
+            }
+            CandidateTerminalKind::CancelledByDisable => {
+                CandidateTerminal::CancelledByDisable(data)
+            }
+            CandidateTerminalKind::CancelledBySourceRemoval => {
+                CandidateTerminal::CancelledBySourceRemoval(data)
+            }
+            CandidateTerminalKind::CancelledByShutdown => {
+                CandidateTerminal::CancelledByShutdown(data)
+            }
+            _ => unreachable!("an unqueued Candidate can only be superseded or cancelled"),
+        };
+        self.process_candidate_terminal(terminal);
+        true
+    }
+
+    fn clear_unqueued_observation(&mut self, index: usize) {
+        self.packages[index].development.observed_hash = None;
+        self.packages[index].development.stable_hash = None;
+        self.packages[index].development.stable_scans = 0;
+        self.packages[index].development.change_observed_at = None;
+        if matches!(
+            self.packages[index].development.state,
+            DevelopmentState::ChangeObserved | DevelopmentState::WaitingForStableWrite
+        ) {
+            self.packages[index].development.state = DevelopmentState::Idle;
+        }
+    }
+
     fn cancel_development(&mut self, index: usize, reason: CandidateCancellation) {
+        let unqueued_kind = match reason {
+            CandidateCancellation::Disable => CandidateTerminalKind::CancelledByDisable,
+            CandidateCancellation::SourceRemoval => CandidateTerminalKind::CancelledBySourceRemoval,
+            CandidateCancellation::Shutdown => CandidateTerminalKind::CancelledByShutdown,
+        };
+        self.terminate_unqueued_generation(index, unqueued_kind);
         let package_id = self.packages[index].candidate.manifest.id.clone();
         let mut terminals = self
             .development_worker
@@ -1664,6 +1747,7 @@ impl NexaEngine {
         for terminal in terminals {
             self.process_candidate_terminal(terminal);
         }
+        self.clear_unqueued_observation(index);
     }
 
     fn commit_requested_ready_candidates(&mut self) {
@@ -2151,6 +2235,22 @@ impl NexaEngine {
                         |known_good| known_good.source_hash,
                     ),
                     candidate_generation: record.development.latest_generation,
+                    terminal_generations: record.development.terminal_count,
+                    duplicate_terminals: record.development.duplicate_terminal_count,
+                    generations_without_terminal: record
+                        .development
+                        .latest_generation
+                        .saturating_sub(record.development.terminal_count),
+                    latest_terminal_generation: record
+                        .development
+                        .terminal_generations
+                        .last_key_value()
+                        .map(|(generation, _)| *generation),
+                    latest_terminal_kind: record
+                        .development
+                        .terminal_generations
+                        .last_key_value()
+                        .map(|(_, kind)| *kind),
                     tasks: ledger.tasks,
                     waiting_requests: ledger.requests,
                     host_resources: ledger.tokens.saturating_add(ledger.snapshots),
@@ -2179,27 +2279,7 @@ impl NexaEngine {
         EngineInspection {
             health: self.health(),
             packages,
-            development: DevelopmentInspection {
-                enabled: self.development.enabled,
-                worker_running: self.development_worker.is_some(),
-                queued_candidates: self
-                    .development_worker
-                    .as_ref()
-                    .map_or(0, |worker| worker.inspection().queued_packages),
-                retained_events: self.development_events.len(),
-                generations_without_terminal: self.packages.iter().fold(0_u64, |total, record| {
-                    total.saturating_add(
-                        record
-                            .development
-                            .latest_generation
-                            .saturating_sub(record.development.terminal_count),
-                    )
-                }),
-                worker: self
-                    .development_worker
-                    .as_ref()
-                    .map_or_else(WorkerInspection::default, DevelopmentWorker::inspection),
-            },
+            development: self.development_inspection(),
             recent_diagnostics,
             recent_reloads: self
                 .reload_reports
@@ -2208,6 +2288,39 @@ impl NexaEngine {
                 .collect(),
             dropped_diagnostics: self.diagnostics.dropped(),
             dropped_events: self.dropped_events,
+        }
+    }
+
+    fn development_inspection(&self) -> DevelopmentInspection {
+        DevelopmentInspection {
+            enabled: self.development.enabled,
+            worker_running: self.development_worker.is_some(),
+            queued_candidates: self
+                .development_worker
+                .as_ref()
+                .map_or(0, |worker| worker.inspection().queued_packages),
+            retained_events: self.development_events.len(),
+            created_generations: self.packages.iter().fold(0_u64, |total, record| {
+                total.saturating_add(record.development.latest_generation)
+            }),
+            terminal_generations: self.packages.iter().fold(0_u64, |total, record| {
+                total.saturating_add(record.development.terminal_count)
+            }),
+            duplicate_terminals: self.packages.iter().fold(0_u64, |total, record| {
+                total.saturating_add(record.development.duplicate_terminal_count)
+            }),
+            generations_without_terminal: self.packages.iter().fold(0_u64, |total, record| {
+                total.saturating_add(
+                    record
+                        .development
+                        .latest_generation
+                        .saturating_sub(record.development.terminal_count),
+                )
+            }),
+            worker: self
+                .development_worker
+                .as_ref()
+                .map_or_else(WorkerInspection::default, DevelopmentWorker::inspection),
         }
     }
 
