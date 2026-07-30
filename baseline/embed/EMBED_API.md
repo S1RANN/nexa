@@ -1,6 +1,6 @@
 # Nexa Embed API
 
-Status: M3R2 COMPLETE
+Status: M3R3 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust
 application and Nexa Runtime. Applications provide a generated `HostContract`,
@@ -41,7 +41,22 @@ Runtime or Last Known Good artifact.
 The first observation of a changed hash creates a Candidate Generation.
 Pre-queue Generations are explicitly tracked and receive a terminal outcome
 when replaced, reverted to active content, disabled, removed, or shut down.
+`PackageInspection::desired_hash` identifies the source content the Engine
+currently intends to run. It is `None` when discovery cannot produce a valid
+Candidate, including missing or unreadable source, so source failure closes the
+commit gate instead of preserving a previously observed identity.
+
+Immediately before entering Restart Reload, `tick` refreshes the Package
+source and requires both the latest Candidate Generation and an exact match
+between Candidate hash and `desired_hash`. Work made stale by a new hash,
+reversion to active content, or a return to previously terminal content is
+terminated across the unqueued, awaiting-queue, pending, in-flight,
+result-queue, and ready-Candidate stages. It cannot become active even when it
+completed compilation before the source changed.
 
 `tick` returns `EngineTickReport`; `inspection` returns bounded, read-only
 Engine, Package, development, diagnostic, Reload, and metric DTOs. These APIs
 do not expose Realm, Runtime Host objects, or raw handles.
+
+The immutable M3, M3R1, and M3R2 completion tags remain historical boundaries.
+M4 has not started.

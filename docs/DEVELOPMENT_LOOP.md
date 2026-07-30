@@ -1,6 +1,6 @@
 # Nexa development loop
 
-Status: M3R2 COMPLETE
+Status: M3R3 COMPLETE
 
 `NexaEngine` owns the package development loop. Applications opt in with
 `DevelopmentConfig`; they do not create compiler threads or mutate a Realm
@@ -67,9 +67,28 @@ active Runtime running and permits a new Generation after the source
 reappears. Only the newest verified Candidate can enter Restart Reload.
 
 Development identity is split into `observed_hash`, `stable_hash`,
-`queued_hash`, `in_flight_hash`, `terminal_hash`, and `active_hash`.
-Backpressure does not advance queued or terminal identity, so a stable version
-cannot be forgotten before compilation.
+`queued_hash`, `in_flight_hash`, `terminal_hash`, `active_hash`, and the
+fail-closed `desired_hash`. `desired_hash` is the source content the Engine
+currently intends to run; it becomes `None` when source discovery fails or the
+source is missing. Backpressure does not advance queued or terminal identity,
+so a stable version cannot be forgotten before compilation.
+
+Changing or reverting source triggers unified supersession across
+`unqueued_generation`, `AwaitingQueue`, Worker pending and in-flight Jobs,
+queued Results, and retained ready Candidates. Stale work receives exactly one
+terminal outcome and cannot become the active Runtime. Disable, removal, and
+shutdown cancellation still take precedence over supersession.
+
+Queued and in-flight bookkeeping compares both Generation and hash. Reusing
+identical source content in a later Generation cannot let an older Worker event
+or terminal clear the newer Candidate identity.
+
+`NexaEngine::tick()` refreshes the source immediately before Runtime mutation.
+Commit requires both the latest Candidate Generation and equality between the
+Candidate source hash and the refreshed `desired_hash`. This check is
+independent of ordinary scan cadence and therefore rejects a compiled Result or
+manual ready Candidate even when its source changed between scanning and
+commit. A refresh failure closes the gate.
 
 `EngineInspection` reports real cumulative `created_generations`,
 `terminal_generations`, `duplicate_terminals`, and
@@ -125,3 +144,6 @@ cargo run -p nexa-cli -- check path/to/package \
 
 Their structured output reports `manifest-only`, `contract`, or
 `full-policy`. Project checks always report `full-policy`.
+
+The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 has not
+started.

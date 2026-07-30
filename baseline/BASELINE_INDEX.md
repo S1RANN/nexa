@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **3.0.2**
+Version: **3.0.3**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -9,6 +9,7 @@ Nexa M3 Developer Loop & Diagnostics = COMPLETE
 NexaEngine API = COMPLETE
 Automatic Candidate Compilation = COMPLETE
 Candidate Generation Terminal Accounting = COMPLETE
+Candidate Freshness Commit Guard = COMPLETE
 Last Known Good Reload = COMPLETE
 Unified Diagnostics = COMPLETE
 Source-level Runtime Stack Traces = COMPLETE
@@ -46,6 +47,12 @@ through each changed generated Registry, a real-`RealmRuntime` differential/fuzz
 adapter with observable public API attempts, no public Request or manual Waiting
 constructor, exactly-once Request/Token/Snapshot release, and Restart Reload
 rollback without old-Task revival.
+
+M3R3 conformance requires a fail-closed desired source identity, a commit-time
+source refresh, and unified supersession of stale Candidate work before Worker
+admission, inside the Worker, in the Result queue, and after verification. The
+immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 has not
+started.
 
 ## Active specifications
 

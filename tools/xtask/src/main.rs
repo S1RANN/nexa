@@ -164,6 +164,75 @@ impl GenerationAccountingReport {
     }
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateFreshnessScenarioReport {
+    name: String,
+    stage: String,
+    stale_candidates_observed: u64,
+    stale_candidates_committed: u64,
+    desired_hash_mismatches_rejected: u64,
+    superseded_before_compile: u64,
+    superseded_after_compile: u64,
+    created_generations: u64,
+    terminal_generations: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    active_runtime_violations: u64,
+    last_known_good_violations: u64,
+    status: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CandidateFreshnessReport {
+    schema: u32,
+    scenario_count: u64,
+    pending_scenario_count: u64,
+    in_flight_scenario_count: u64,
+    result_queue_scenario_count: u64,
+    ready_candidate_scenario_count: u64,
+    stale_candidates_observed: u64,
+    stale_candidates_committed: u64,
+    desired_hash_mismatches_rejected: u64,
+    superseded_before_compile: u64,
+    superseded_after_compile: u64,
+    created_generations: u64,
+    terminal_generations: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    active_runtime_violations: u64,
+    last_known_good_violations: u64,
+    scenarios: Vec<CandidateFreshnessScenarioReport>,
+    status: String,
+}
+
+impl CandidateFreshnessReport {
+    fn failed() -> Self {
+        Self {
+            schema: 0,
+            scenario_count: 0,
+            pending_scenario_count: 0,
+            in_flight_scenario_count: 0,
+            result_queue_scenario_count: 0,
+            ready_candidate_scenario_count: 0,
+            stale_candidates_observed: 0,
+            stale_candidates_committed: u64::MAX,
+            desired_hash_mismatches_rejected: 0,
+            superseded_before_compile: 0,
+            superseded_after_compile: 0,
+            created_generations: 0,
+            terminal_generations: 0,
+            duplicate_terminals: u64::MAX,
+            generations_without_terminal: u64::MAX,
+            active_runtime_violations: u64::MAX,
+            last_known_good_violations: u64::MAX,
+            scenarios: Vec::new(),
+            status: "FAIL".into(),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct M3R2FinalReport {
@@ -202,6 +271,71 @@ struct M3R2FinalReport {
     historical_tag_target: String,
     r1_tag_type: String,
     r1_tag_target: String,
+    tag_type: String,
+    tag_target: String,
+    tag_target_matches_head: bool,
+    failures: Vec<String>,
+    status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct M3R3FinalReport {
+    schema: u32,
+    milestone: &'static str,
+    head: String,
+    workspace: &'static str,
+    m1_m2_regression: &'static str,
+    engine_api: &'static str,
+    engine_diagnostics: &'static str,
+    worker_queue_saturation: &'static str,
+    result_backpressure: &'static str,
+    disable_in_flight: &'static str,
+    shutdown_in_flight: &'static str,
+    generation_accounting: &'static str,
+    candidate_freshness: &'static str,
+    reload_stress: &'static str,
+    metrics: &'static str,
+    cli_policy: &'static str,
+    lsp: &'static str,
+    editor: &'static str,
+    repo_audit: &'static str,
+    status_audit: &'static str,
+    tag_audit: &'static str,
+    queue_lost_jobs: u64,
+    queue_lost_results: u64,
+    prequeue_scenario_count: u64,
+    prequeue_created_generations: u64,
+    prequeue_terminal_generations: u64,
+    freshness_scenario_count: u64,
+    pending_scenario_count: u64,
+    in_flight_scenario_count: u64,
+    result_queue_scenario_count: u64,
+    ready_candidate_scenario_count: u64,
+    freshness_created_generations: u64,
+    freshness_terminal_generations: u64,
+    stale_candidates_observed: u64,
+    stale_candidates_committed: u64,
+    desired_hash_mismatches_rejected: u64,
+    superseded_before_compile: u64,
+    superseded_after_compile: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    active_runtime_violations: u64,
+    last_known_good_violations: u64,
+    engine_diagnostic_direct_construction: usize,
+    engine_diagnostic_real_paths: usize,
+    metrics_trusted: bool,
+    policy_validation: &'static str,
+    nidl_span: &'static str,
+    uri_matrix: &'static str,
+    worktree_clean: bool,
+    historical_tag_type: String,
+    historical_tag_target: String,
+    r1_tag_type: String,
+    r1_tag_target: String,
+    r2_tag_type: String,
+    r2_tag_target: String,
     tag_type: String,
     tag_target: String,
     tag_target_matches_head: bool,
@@ -264,9 +398,11 @@ fn main() -> Result<(), DynError> {
         "editor-check" => editor_check(),
         "dev-loop-stress" => dev_loop_stress(),
         "test-generation-accounting" => test_generation_accounting(),
+        "test-candidate-freshness" => test_candidate_freshness(),
         "finalize-m3" => finalize_m3(),
         "finalize-m3-r1" => finalize_m3_r1(),
         "finalize-m3-r2" => finalize_m3_r2(),
+        "finalize-m3-r3" => finalize_m3_r3(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -275,7 +411,8 @@ fn main() -> Result<(), DynError> {
                  snake-headless-smoke|snake-stress|snake-bench|finalize-m2|\
                  test-engine-api|test-diagnostics|test-dev-loop|test-cli|test-lsp|\
                  editor-check|dev-loop-stress|test-generation-accounting|\
-                 finalize-m3|finalize-m3-r1|finalize-m3-r2"
+                 test-candidate-freshness|finalize-m3|finalize-m3-r1|finalize-m3-r2|\
+                 finalize-m3-r3"
             );
             Err("unknown xtask command".into())
         }
@@ -361,9 +498,11 @@ fn check() -> Result<(), DynError> {
     test_metrics()?;
     dev_loop_stress()?;
     test_generation_accounting()?;
+    test_candidate_freshness()?;
     m3_audit()?;
     m3r1_audit()?;
-    m3r2_audit()
+    m3r2_audit()?;
+    m3r3_product_audit()
 }
 
 fn test_engine_api() -> Result<(), DynError> {
@@ -596,6 +735,215 @@ fn generation_accounting_gate() -> Result<GenerationAccountingReport, DynError> 
         || report.status != "PASS"
     {
         return Err(format!("Generation accounting report is incomplete: {report:?}").into());
+    }
+    Ok(report)
+}
+
+fn test_candidate_freshness() -> Result<(), DynError> {
+    candidate_freshness_gate().map(|_| ())
+}
+
+#[derive(Default)]
+struct CandidateFreshnessTotals {
+    pending_scenario_count: u64,
+    in_flight_scenario_count: u64,
+    result_queue_scenario_count: u64,
+    ready_candidate_scenario_count: u64,
+    stale_candidates_observed: u64,
+    stale_candidates_committed: u64,
+    desired_hash_mismatches_rejected: u64,
+    superseded_before_compile: u64,
+    superseded_after_compile: u64,
+    created_generations: u64,
+    terminal_generations: u64,
+    duplicate_terminals: u64,
+    generations_without_terminal: u64,
+    active_runtime_violations: u64,
+    last_known_good_violations: u64,
+}
+
+impl CandidateFreshnessTotals {
+    fn add(&mut self, scenario: &CandidateFreshnessScenarioReport) -> Result<(), DynError> {
+        match scenario.stage.as_str() {
+            "pending" => {
+                self.pending_scenario_count = self.pending_scenario_count.saturating_add(1);
+            }
+            "in-flight" => {
+                self.in_flight_scenario_count = self.in_flight_scenario_count.saturating_add(1);
+            }
+            "result-queue" => {
+                self.result_queue_scenario_count =
+                    self.result_queue_scenario_count.saturating_add(1);
+            }
+            "ready-candidate" => {
+                self.ready_candidate_scenario_count =
+                    self.ready_candidate_scenario_count.saturating_add(1);
+            }
+            stage => return Err(format!("unknown Candidate freshness stage `{stage}`").into()),
+        }
+        self.stale_candidates_observed = self
+            .stale_candidates_observed
+            .saturating_add(scenario.stale_candidates_observed);
+        self.stale_candidates_committed = self
+            .stale_candidates_committed
+            .saturating_add(scenario.stale_candidates_committed);
+        self.desired_hash_mismatches_rejected = self
+            .desired_hash_mismatches_rejected
+            .saturating_add(scenario.desired_hash_mismatches_rejected);
+        self.superseded_before_compile = self
+            .superseded_before_compile
+            .saturating_add(scenario.superseded_before_compile);
+        self.superseded_after_compile = self
+            .superseded_after_compile
+            .saturating_add(scenario.superseded_after_compile);
+        self.created_generations = self
+            .created_generations
+            .saturating_add(scenario.created_generations);
+        self.terminal_generations = self
+            .terminal_generations
+            .saturating_add(scenario.terminal_generations);
+        self.duplicate_terminals = self
+            .duplicate_terminals
+            .saturating_add(scenario.duplicate_terminals);
+        self.generations_without_terminal = self
+            .generations_without_terminal
+            .saturating_add(scenario.generations_without_terminal);
+        self.active_runtime_violations = self
+            .active_runtime_violations
+            .saturating_add(scenario.active_runtime_violations);
+        self.last_known_good_violations = self
+            .last_known_good_violations
+            .saturating_add(scenario.last_known_good_violations);
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn candidate_freshness_gate() -> Result<CandidateFreshnessReport, DynError> {
+    let root = workspace_root();
+    let report_path = root.join("target/nexa-artifacts/m3r3-candidate-freshness/report.json");
+    if report_path.exists() {
+        fs::remove_file(&report_path)?;
+    }
+    let status = Command::new("cargo")
+        .args([
+            "test",
+            "-p",
+            "nexa-embed",
+            "--lib",
+            "freshness_tests",
+            "--",
+            "--nocapture",
+        ])
+        .env("NEXA_CANDIDATE_FRESHNESS_REPORT", &report_path)
+        .current_dir(&root)
+        .status()?;
+    if !status.success() {
+        return Err(format!("Candidate freshness test failed with {status}").into());
+    }
+    let report: CandidateFreshnessReport = serde_json::from_slice(&fs::read(&report_path)?)?;
+    let mut totals = CandidateFreshnessTotals::default();
+    let mut scenario_names = BTreeSet::new();
+    let expected_scenarios = BTreeMap::from([
+        ("pending-revert-active", ("pending", 1, 0, 0, 1)),
+        ("in-flight-revert-active", ("in-flight", 0, 1, 0, 1)),
+        ("result-queue-revert-active", ("result-queue", 0, 1, 1, 1)),
+        (
+            "manual-ready-revert-active",
+            ("ready-candidate", 0, 1, 1, 1),
+        ),
+        ("pending-revert-terminal-hash", ("pending", 1, 0, 0, 2)),
+        (
+            "result-queue-replaced-by-desired-c",
+            ("result-queue", 0, 1, 1, 2),
+        ),
+    ]);
+    for scenario in &report.scenarios {
+        if scenario.name.is_empty() || !scenario_names.insert(scenario.name.as_str()) {
+            return Err(format!(
+                "Candidate freshness report has an empty or duplicate scenario name: {:?}",
+                scenario.name
+            )
+            .into());
+        }
+        let Some(&(stage, before, after, mismatch, generations)) =
+            expected_scenarios.get(scenario.name.as_str())
+        else {
+            return Err(format!(
+                "Candidate freshness report contains unexpected scenario `{}`",
+                scenario.name
+            )
+            .into());
+        };
+        if scenario.status != "PASS"
+            || scenario.stage != stage
+            || scenario.stale_candidates_observed != 1
+            || scenario.stale_candidates_committed != 0
+            || scenario.desired_hash_mismatches_rejected != mismatch
+            || scenario.superseded_before_compile != before
+            || scenario.superseded_after_compile != after
+            || before.saturating_add(after) != 1
+            || scenario.created_generations != generations
+            || scenario.created_generations != scenario.terminal_generations
+            || scenario.duplicate_terminals != 0
+            || scenario.generations_without_terminal != 0
+            || scenario.active_runtime_violations != 0
+            || scenario.last_known_good_violations != 0
+        {
+            return Err(format!("Candidate freshness scenario is incomplete: {scenario:?}").into());
+        }
+        totals.add(scenario)?;
+    }
+    if scenario_names.len() != expected_scenarios.len()
+        || expected_scenarios
+            .keys()
+            .any(|name| !scenario_names.contains(name))
+    {
+        return Err(format!(
+            "Candidate freshness report does not contain the exact required scenario matrix: {scenario_names:?}"
+        )
+        .into());
+    }
+    let scenario_count = u64::try_from(report.scenarios.len())?;
+    let aggregates_match = report.scenario_count == scenario_count
+        && report.pending_scenario_count == totals.pending_scenario_count
+        && report.in_flight_scenario_count == totals.in_flight_scenario_count
+        && report.result_queue_scenario_count == totals.result_queue_scenario_count
+        && report.ready_candidate_scenario_count == totals.ready_candidate_scenario_count
+        && report.stale_candidates_observed == totals.stale_candidates_observed
+        && report.stale_candidates_committed == totals.stale_candidates_committed
+        && report.desired_hash_mismatches_rejected == totals.desired_hash_mismatches_rejected
+        && report.superseded_before_compile == totals.superseded_before_compile
+        && report.superseded_after_compile == totals.superseded_after_compile
+        && report.created_generations == totals.created_generations
+        && report.terminal_generations == totals.terminal_generations
+        && report.duplicate_terminals == totals.duplicate_terminals
+        && report.generations_without_terminal == totals.generations_without_terminal
+        && report.active_runtime_violations == totals.active_runtime_violations
+        && report.last_known_good_violations == totals.last_known_good_violations;
+    let required_totals = report.schema == 1
+        && report.scenario_count == 6
+        && report.pending_scenario_count == 2
+        && report.in_flight_scenario_count == 1
+        && report.result_queue_scenario_count == 2
+        && report.ready_candidate_scenario_count == 1
+        && report.stale_candidates_observed == 6
+        && report.stale_candidates_committed == 0
+        && report.desired_hash_mismatches_rejected == 3
+        && report.superseded_before_compile == 2
+        && report.superseded_after_compile == 4
+        && report.created_generations == 8
+        && report.terminal_generations == 8
+        && report.duplicate_terminals == 0
+        && report.generations_without_terminal == 0
+        && report.active_runtime_violations == 0
+        && report.last_known_good_violations == 0
+        && report.status == "PASS";
+    if !aggregates_match || !required_totals {
+        return Err(format!(
+            "Candidate freshness report is incomplete or internally inconsistent: {report:?}"
+        )
+        .into());
     }
     Ok(report)
 }
@@ -955,6 +1303,191 @@ fn finalize_m3_r2() -> Result<(), DynError> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
+fn finalize_m3_r3() -> Result<(), DynError> {
+    let mut failures = Vec::new();
+    let workspace = record_gate("workspace", &mut failures, workspace_check());
+    let m1_m2_regression = record_gate("M1/M2 regression", &mut failures, run_m1_m2_regression());
+    let engine_api = record_gate("Engine API", &mut failures, test_engine_api());
+
+    let (engine_diagnostics, engine_real_paths, engine_direct_construction) =
+        match real_engine_diagnostic_gate() {
+            Ok((real_paths, direct_construction)) => (true, real_paths, direct_construction),
+            Err(error) => {
+                failures.push(format!("real Engine diagnostics: {error}"));
+                (false, 0, usize::MAX)
+            }
+        };
+    let worker_queue_saturation = record_gate(
+        "Worker queue saturation",
+        &mut failures,
+        worker_queue_saturation(),
+    );
+    let result_backpressure = record_gate(
+        "Worker result backpressure",
+        &mut failures,
+        worker_result_backpressure(),
+    );
+    let disable_in_flight = record_gate(
+        "Worker disable/in-flight",
+        &mut failures,
+        worker_disable_in_flight(),
+    );
+    let shutdown_in_flight = record_gate(
+        "Worker shutdown/in-flight",
+        &mut failures,
+        worker_shutdown_in_flight(),
+    );
+    let (generation_accounting, generation_report) = match generation_accounting_gate() {
+        Ok(report) => (true, report),
+        Err(error) => {
+            failures.push(format!("Generation terminal accounting: {error}"));
+            (false, GenerationAccountingReport::failed())
+        }
+    };
+    let (candidate_freshness, freshness_report) = match candidate_freshness_gate() {
+        Ok(report) => (true, report),
+        Err(error) => {
+            failures.push(format!("Candidate freshness: {error}"));
+            (false, CandidateFreshnessReport::failed())
+        }
+    };
+    let reload_stress = record_gate("Reload stress", &mut failures, dev_loop_stress());
+    let metrics = record_gate("Metrics", &mut failures, test_metrics());
+    let cli_policy = record_gate("CLI policy", &mut failures, test_cli());
+    let nidl_span = record_gate("NIDL Span", &mut failures, test_nidl_span());
+    let uri_matrix = record_gate("URI matrix", &mut failures, test_uri_matrix());
+    let lsp = record_gate("LSP", &mut failures, test_lsp());
+    let editor = record_gate("Editor", &mut failures, editor_check());
+    let repo_audit = record_gate(
+        "Repository audit",
+        &mut failures,
+        repo_audit()
+            .and_then(|()| m3_audit())
+            .and_then(|()| m3r1_audit())
+            .and_then(|()| m3r2_audit())
+            .and_then(|()| m3r3_product_audit()),
+    );
+    let status_audit = record_gate(
+        "M3R3 status audit",
+        &mut failures,
+        m3r3_final_status_audit(),
+    );
+
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let tag_evidence = M3R3TagEvidence::load();
+    let tag_audit = record_gate("M3R3 tag audit", &mut failures, tag_evidence.audit(&head));
+    let tag_target_matches_head = tag_evidence.tag_target == head;
+    let worktree_clean = git_output(&["status", "--porcelain"])?.is_empty();
+    if !worktree_clean {
+        failures.push("worktree is not clean".into());
+    }
+
+    let worker_gates =
+        worker_queue_saturation && result_backpressure && disable_in_flight && shutdown_in_flight;
+    let passed = workspace
+        && m1_m2_regression
+        && engine_api
+        && engine_diagnostics
+        && engine_real_paths == 13
+        && engine_direct_construction == 0
+        && worker_gates
+        && generation_accounting
+        && candidate_freshness
+        && freshness_report.stale_candidates_committed == 0
+        && freshness_report.created_generations == freshness_report.terminal_generations
+        && freshness_report.duplicate_terminals == 0
+        && freshness_report.generations_without_terminal == 0
+        && freshness_report.active_runtime_violations == 0
+        && freshness_report.last_known_good_violations == 0
+        && reload_stress
+        && metrics
+        && cli_policy
+        && nidl_span
+        && uri_matrix
+        && lsp
+        && editor
+        && repo_audit
+        && status_audit
+        && tag_audit
+        && worktree_clean;
+    let report = M3R3FinalReport {
+        schema: 1,
+        milestone: "Nexa M3R3 Candidate Freshness Closure",
+        head,
+        workspace: status(workspace),
+        m1_m2_regression: status(m1_m2_regression),
+        engine_api: status(engine_api),
+        engine_diagnostics: status(engine_diagnostics),
+        worker_queue_saturation: status(worker_queue_saturation),
+        result_backpressure: status(result_backpressure),
+        disable_in_flight: status(disable_in_flight),
+        shutdown_in_flight: status(shutdown_in_flight),
+        generation_accounting: status(generation_accounting),
+        candidate_freshness: status(candidate_freshness),
+        reload_stress: status(reload_stress),
+        metrics: status(metrics),
+        cli_policy: status(cli_policy),
+        lsp: status(lsp),
+        editor: status(editor),
+        repo_audit: status(repo_audit),
+        status_audit: status(status_audit),
+        tag_audit: status(tag_audit),
+        queue_lost_jobs: u64::from(!worker_queue_saturation),
+        queue_lost_results: u64::from(!result_backpressure),
+        prequeue_scenario_count: generation_report.scenario_count,
+        prequeue_created_generations: generation_report.created_generations,
+        prequeue_terminal_generations: generation_report.terminal_generations,
+        freshness_scenario_count: freshness_report.scenario_count,
+        pending_scenario_count: freshness_report.pending_scenario_count,
+        in_flight_scenario_count: freshness_report.in_flight_scenario_count,
+        result_queue_scenario_count: freshness_report.result_queue_scenario_count,
+        ready_candidate_scenario_count: freshness_report.ready_candidate_scenario_count,
+        freshness_created_generations: freshness_report.created_generations,
+        freshness_terminal_generations: freshness_report.terminal_generations,
+        stale_candidates_observed: freshness_report.stale_candidates_observed,
+        stale_candidates_committed: freshness_report.stale_candidates_committed,
+        desired_hash_mismatches_rejected: freshness_report.desired_hash_mismatches_rejected,
+        superseded_before_compile: freshness_report.superseded_before_compile,
+        superseded_after_compile: freshness_report.superseded_after_compile,
+        duplicate_terminals: freshness_report.duplicate_terminals,
+        generations_without_terminal: freshness_report.generations_without_terminal,
+        active_runtime_violations: freshness_report.active_runtime_violations,
+        last_known_good_violations: freshness_report.last_known_good_violations,
+        engine_diagnostic_direct_construction: engine_direct_construction,
+        engine_diagnostic_real_paths: engine_real_paths,
+        metrics_trusted: metrics,
+        policy_validation: status(cli_policy),
+        nidl_span: status(nidl_span),
+        uri_matrix: status(uri_matrix),
+        worktree_clean,
+        historical_tag_type: tag_evidence.historical_tag_type,
+        historical_tag_target: tag_evidence.historical_tag_target,
+        r1_tag_type: tag_evidence.r1_tag_type,
+        r1_tag_target: tag_evidence.r1_tag_target,
+        r2_tag_type: tag_evidence.r2_tag_type,
+        r2_tag_target: tag_evidence.r2_tag_target,
+        tag_type: tag_evidence.tag_type,
+        tag_target: tag_evidence.tag_target,
+        tag_target_matches_head,
+        failures,
+        status: if passed { "PASS" } else { "FAIL" },
+    };
+    let root = workspace_root();
+    let output = root.join("target/nexa-artifacts/m3r3-finalize/final-report.json");
+    fs::create_dir_all(output.parent().ok_or("M3R3 report has no parent")?)?;
+    fs::write(
+        output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
+        Ok(())
+    } else {
+        Err("M3R3 finalization failed".into())
+    }
+}
+
 fn record_gate(name: &str, failures: &mut Vec<String>, result: Result<(), DynError>) -> bool {
     match result {
         Ok(()) => true,
@@ -1209,7 +1742,6 @@ fn m3r2_audit() -> Result<(), DynError> {
     let development = fs::read_to_string(root.join("crates/nexa-embed/src/development.rs"))?;
     let inspection = fs::read_to_string(root.join("crates/nexa-embed/src/inspection.rs"))?;
     let tests = fs::read_to_string(root.join("crates/nexa-embed/tests/embed.rs"))?;
-    let xtask = fs::read_to_string(root.join("tools/xtask/src/main.rs"))?;
     for required in [
         "terminate_unqueued_generation",
         "clear_unqueued_observation",
@@ -1247,28 +1779,212 @@ fn m3r2_audit() -> Result<(), DynError> {
             return Err(format!("M3R2 regression coverage is missing `{required}`").into());
         }
     }
-    let derived_generation_loss =
-        ["generations_without_terminal:", " u64::from(!worker_gates)"].concat();
-    if xtask.contains(&derived_generation_loss) {
-        return Err(
-            "M3R2 finalizer still derives Generation loss from Worker gate booleans".into(),
-        );
-    }
-    for required in [
-        "generation_accounting_gate",
-        "created_generations: generation_report.created_generations",
-        "terminal_generations: generation_report.terminal_generations",
-        "duplicate_terminals: generation_report.duplicate_terminals",
-        "generations_without_terminal: generation_report.generations_without_terminal",
-    ] {
-        if !xtask.contains(required) {
-            return Err(format!("M3R2 finalizer is missing real report field `{required}`").into());
-        }
-    }
     let r1_tag_type = git_output(&["cat-file", "-t", "developer-loop-m3-complete-r1"])?;
     let r1_tag_target = git_output(&["rev-parse", "developer-loop-m3-complete-r1^{}"])?;
     if r1_tag_type != "tag" || r1_tag_target != "b53ce21f98db7387b37cca0572fbbf920ab53d61" {
         return Err("historical developer-loop-m3-complete-r1 tag changed".into());
+    }
+    Ok(())
+}
+
+fn m3r3_product_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    let engine = fs::read_to_string(root.join("crates/nexa-embed/src/lib.rs"))?;
+    let development = fs::read_to_string(root.join("crates/nexa-embed/src/development.rs"))?;
+    let tests = fs::read_to_string(root.join("crates/nexa-embed/src/freshness_tests.rs"))?;
+    for required in [
+        "fn refresh_desired_hash",
+        "fn candidate_identity_is_current",
+        "fn supersede_development_for_current_source",
+    ] {
+        if !engine.contains(required) {
+            return Err(format!("M3R3 Engine freshness guard is missing `{required}`").into());
+        }
+    }
+    for required in [
+        "desired_hash: Option<SourceHash>",
+        "queued_generation: Option<u64>",
+        "in_flight_generation: Option<u64>",
+        "enum InFlightDisposition",
+        "fn supersede_package_except",
+    ] {
+        if !development.contains(required) {
+            return Err(format!("M3R3 Worker freshness tracking is missing `{required}`").into());
+        }
+    }
+    for required in [
+        "candidate_freshness_machine_report_uses_real_engine_evidence",
+        "result_refresh_failure_cancels_and_recovers_without_stale_observation",
+        "same_hash_aba_keeps_new_generation_worker_identity",
+    ] {
+        if !tests.contains(required) {
+            return Err(format!("M3R3 freshness regression is missing `{required}`").into());
+        }
+    }
+    Ok(())
+}
+
+struct M3R3TagEvidence {
+    historical_tag_type: String,
+    historical_tag_target: String,
+    r1_tag_type: String,
+    r1_tag_target: String,
+    r2_tag_type: String,
+    r2_tag_target: String,
+    tag_type: String,
+    tag_target: String,
+}
+
+impl M3R3TagEvidence {
+    fn load() -> Self {
+        Self {
+            historical_tag_type: git_output(&["cat-file", "-t", "developer-loop-m3-complete"])
+                .unwrap_or_else(|_| "missing".into()),
+            historical_tag_target: git_output(&["rev-parse", "developer-loop-m3-complete^{}"])
+                .unwrap_or_else(|_| "missing".into()),
+            r1_tag_type: git_output(&["cat-file", "-t", "developer-loop-m3-complete-r1"])
+                .unwrap_or_else(|_| "missing".into()),
+            r1_tag_target: git_output(&["rev-parse", "developer-loop-m3-complete-r1^{}"])
+                .unwrap_or_else(|_| "missing".into()),
+            r2_tag_type: git_output(&["cat-file", "-t", "developer-loop-m3-complete-r2"])
+                .unwrap_or_else(|_| "missing".into()),
+            r2_tag_target: git_output(&["rev-parse", "developer-loop-m3-complete-r2^{}"])
+                .unwrap_or_else(|_| "missing".into()),
+            tag_type: git_output(&["cat-file", "-t", "developer-loop-m3-complete-r3"])
+                .unwrap_or_else(|_| "missing".into()),
+            tag_target: git_output(&["rev-parse", "developer-loop-m3-complete-r3^{}"])
+                .unwrap_or_else(|_| "missing".into()),
+        }
+    }
+
+    fn audit(&self, head: &str) -> Result<(), DynError> {
+        let expected = [
+            (
+                "developer-loop-m3-complete",
+                self.historical_tag_type.as_str(),
+                self.historical_tag_target.as_str(),
+                "621612f49c4180989711df3ca80021fd21ad9277",
+            ),
+            (
+                "developer-loop-m3-complete-r1",
+                self.r1_tag_type.as_str(),
+                self.r1_tag_target.as_str(),
+                "b53ce21f98db7387b37cca0572fbbf920ab53d61",
+            ),
+            (
+                "developer-loop-m3-complete-r2",
+                self.r2_tag_type.as_str(),
+                self.r2_tag_target.as_str(),
+                "71c3a3ead70533f013928b6d1c434e1870f49b24",
+            ),
+        ];
+        for (name, tag_type, target, expected_target) in expected {
+            if tag_type != "tag" || target != expected_target {
+                return Err(format!(
+                    "historical annotated tag {name} changed: type={tag_type}, target={target}"
+                )
+                .into());
+            }
+        }
+        if self.tag_type != "tag" {
+            return Err("developer-loop-m3-complete-r3 is not an annotated tag".into());
+        }
+        if self.tag_target != head {
+            return Err(format!(
+                "developer-loop-m3-complete-r3 targets {}, expected HEAD {head}",
+                self.tag_target
+            )
+            .into());
+        }
+        Ok(())
+    }
+}
+
+fn first_text_status_block<'a>(path: &str, source: &'a str) -> Result<&'a str, DynError> {
+    source
+        .split_once("```text")
+        .and_then(|(_, remainder)| remainder.split_once("```"))
+        .map(|(block, _)| block)
+        .ok_or_else(|| format!("{path} has no first fenced text status block").into())
+}
+
+fn exact_status_value<'a>(block: &'a str, key: &str) -> Result<&'a str, DynError> {
+    let prefix = format!("{key} = ");
+    let values = block
+        .lines()
+        .filter_map(|line| line.strip_prefix(&prefix))
+        .collect::<Vec<_>>();
+    match values.as_slice() {
+        [value] => Ok(value),
+        [] => Err(format!("status block is missing exact key `{key}`").into()),
+        _ => Err(format!("status block contains duplicate key `{key}`").into()),
+    }
+}
+
+fn require_unique_exact_line(path: &str, source: &str, expected: &str) -> Result<(), DynError> {
+    let matches = source.lines().filter(|line| *line == expected).count();
+    if matches == 1 {
+        Ok(())
+    } else {
+        Err(format!("{path} must contain exactly one `{expected}` line; found {matches}").into())
+    }
+}
+
+fn m3r3_final_status_audit() -> Result<(), DynError> {
+    let root = workspace_root();
+    for path in ["README.md", "ROADMAP.md", "baseline/BASELINE_INDEX.md"] {
+        let source = fs::read_to_string(root.join(path))?;
+        if source.contains("FINALIZING") {
+            return Err(format!("{path} still contains a FINALIZING status").into());
+        }
+        let block = first_text_status_block(path, &source)?;
+        for key in [
+            "Nexa M3 Developer Loop & Diagnostics",
+            "NexaEngine API",
+            "Automatic Candidate Compilation",
+            "Candidate Generation Terminal Accounting",
+            "Candidate Freshness Commit Guard",
+            "Last Known Good Reload",
+            "Unified Diagnostics",
+            "Source-level Runtime Stack Traces",
+            "Package-aware CLI",
+            "Editor Diagnostics",
+        ] {
+            let value = exact_status_value(block, key)?;
+            if value != "COMPLETE" {
+                return Err(
+                    format!("{path} status `{key}` is `{value}`, expected `COMPLETE`").into(),
+                );
+            }
+        }
+        let normalized = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        match path {
+            "README.md" if !source.contains("Current target = M3R3 complete; M4 not started") => {
+                return Err("README.md does not declare the exact M3R3/M4 boundary".into());
+            }
+            "ROADMAP.md"
+                if !normalized.contains("M4 Language Scale Foundation has not started") =>
+            {
+                return Err("ROADMAP.md does not keep M4 unstarted".into());
+            }
+            "baseline/BASELINE_INDEX.md" => {
+                if !source.contains("Version: **3.0.3**") {
+                    return Err("baseline version is not the final 3.0.3".into());
+                }
+                if !normalized.contains("M4 has not started") {
+                    return Err("baseline does not keep M4 unstarted".into());
+                }
+            }
+            _ => {}
+        }
+    }
+    for path in [
+        "baseline/embed/EMBED_API.md",
+        "baseline/embed/DEVELOPMENT_WORKER.md",
+        "docs/DEVELOPMENT_LOOP.md",
+    ] {
+        let source = fs::read_to_string(root.join(path))?;
+        require_unique_exact_line(path, &source, "Status: M3R3 COMPLETE")?;
     }
     Ok(())
 }

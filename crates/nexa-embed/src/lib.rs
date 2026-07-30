@@ -10,6 +10,8 @@ mod diagnostic_evidence;
 mod directory_source;
 mod dispatch;
 mod entitlement;
+#[cfg(test)]
+mod freshness_tests;
 mod inspection;
 mod lifecycle;
 mod manifest;
@@ -325,6 +327,7 @@ impl NexaEngine {
             Ok(runtime) => {
                 let artifact = runtime.artifact.clone();
                 self.packages[index].development.active_hash = Some(artifact.source_hash);
+                self.packages[index].development.desired_hash = Some(artifact.source_hash);
                 self.packages[index].development.terminal_hash = None;
                 let epoch = runtime
                     .realm
@@ -397,6 +400,30 @@ impl NexaEngine {
                 source: source.id().clone(),
                 message: format!("package {} disappeared", record.candidate.manifest.id),
             })
+    }
+
+    fn refresh_desired_hash(&mut self, index: usize) -> Option<SourceHash> {
+        match self.fresh_candidate(index) {
+            Ok(candidate) => {
+                let desired_hash = candidate_source_hash(&candidate);
+                self.packages[index].development.desired_hash = Some(desired_hash);
+                Some(desired_hash)
+            }
+            Err(error) => {
+                self.packages[index].development.desired_hash = None;
+                self.mark_source_missing(index, &error.to_string());
+                None
+            }
+        }
+    }
+
+    fn candidate_identity_is_current(
+        &mut self,
+        index: usize,
+        data: &CandidateTerminalData,
+    ) -> bool {
+        data.generation == self.packages[index].development.latest_generation
+            && self.refresh_desired_hash(index) == Some(data.source_hash)
     }
 
     fn build_runtime(&mut self, index: usize) -> Result<PackageRuntime, EngineError> {
@@ -1019,6 +1046,7 @@ impl NexaEngine {
                 let hash_started = std::time::Instant::now();
                 let source_hash = candidate_source_hash(&candidate);
                 self.packages[index].development.last_source_hash_duration = hash_started.elapsed();
+                self.packages[index].development.desired_hash = Some(source_hash);
                 if self.packages[index].development.state == DevelopmentState::SourceMissing {
                     self.packages[index].development.state = DevelopmentState::Idle;
                     self.packages[index].development.terminal_hash = None;
@@ -1028,16 +1056,12 @@ impl NexaEngine {
                 let matches_terminal =
                     self.packages[index].development.terminal_hash == Some(source_hash);
                 if matches_active || matches_terminal {
-                    self.terminate_unqueued_generation(
-                        index,
-                        CandidateTerminalKind::SupersededBeforeCompile,
-                    );
+                    self.supersede_development_for_current_source(index, Some(source_hash));
                     self.clear_unqueued_observation(index);
-                    self.packages[index].development.terminal_hash = if matches_terminal {
-                        Some(source_hash)
-                    } else {
-                        None
-                    };
+                    if matches_active {
+                        self.packages[index].development.state = DevelopmentState::Idle;
+                        self.packages[index].development.terminal_hash = None;
+                    }
                     continue;
                 }
 
@@ -1047,18 +1071,8 @@ impl NexaEngine {
                         .stable_scans
                         .saturating_add(1);
                 } else {
-                    self.terminate_unqueued_generation(
-                        index,
-                        CandidateTerminalKind::SupersededBeforeCompile,
-                    );
-                    if let Some(job) = self.packages[index].awaiting_job.take() {
-                        self.process_candidate_terminal(job.supersede_before_compile());
-                    }
-                    if let Some(ready) = self.packages[index].ready_candidate.take() {
-                        self.process_candidate_terminal(CandidateTerminal::SupersededAfterCompile(
-                            ready.terminal_data,
-                        ));
-                    }
+                    self.supersede_development_for_current_source(index, Some(source_hash));
+                    self.clear_unqueued_observation(index);
                     self.packages[index].development.observed_hash = Some(source_hash);
                     self.packages[index].development.stable_hash = None;
                     self.packages[index].development.stable_scans = 1;
@@ -1112,8 +1126,10 @@ impl NexaEngine {
                 }
                 if self.packages[index].awaiting_job.is_some()
                     || self.packages[index].ready_candidate.is_some()
-                    || self.packages[index].development.queued_hash == Some(source_hash)
-                    || self.packages[index].development.in_flight_hash == Some(source_hash)
+                    || (self.packages[index].development.queued_generation == Some(generation)
+                        && self.packages[index].development.queued_hash == Some(source_hash))
+                    || (self.packages[index].development.in_flight_generation == Some(generation)
+                        && self.packages[index].development.in_flight_hash == Some(source_hash))
                 {
                     continue;
                 }
@@ -1141,6 +1157,7 @@ impl NexaEngine {
     }
 
     fn mark_source_missing(&mut self, index: usize, message: &str) {
+        self.packages[index].development.desired_hash = None;
         if self.packages[index].development.state == DevelopmentState::SourceMissing {
             return;
         }
@@ -1214,6 +1231,7 @@ impl NexaEngine {
         source_hash: SourceHash,
     ) {
         self.packages[index].development.queued_hash = Some(source_hash);
+        self.packages[index].development.queued_generation = Some(generation);
         self.packages[index].development.state = DevelopmentState::CompileQueued;
         self.publish_event(DevelopmentEvent::CompileQueued(development_event_data(
             package_id,
@@ -1231,6 +1249,14 @@ impl NexaEngine {
         self.process_worker_drain(drain);
     }
 
+    #[cfg(test)]
+    fn worker_test_control(&self) -> development::WorkerTestControl {
+        self.development_worker
+            .as_ref()
+            .expect("the development Worker is enabled")
+            .test_control()
+    }
+
     fn process_worker_drain(&mut self, drain: development::WorkerDrain) {
         for event in drain.events {
             match event {
@@ -1244,12 +1270,18 @@ impl NexaEngine {
                     if let Some(index) = self.packages.iter().position(|record| {
                         record.candidate.manifest.id == package_id && record.source_id == source_id
                     }) {
-                        if self.packages[index].development.queued_hash == Some(source_hash) {
+                        if self.packages[index].development.queued_generation == Some(generation)
+                            && self.packages[index].development.queued_hash == Some(source_hash)
+                        {
                             self.packages[index].development.queued_hash = None;
+                            self.packages[index].development.queued_generation = None;
                         }
                         self.packages[index].development.in_flight_hash = Some(source_hash);
+                        self.packages[index].development.in_flight_generation = Some(generation);
                         self.packages[index].development.last_queue_duration = queue_duration;
-                        if generation == self.packages[index].development.latest_generation {
+                        if generation == self.packages[index].development.latest_generation
+                            && self.packages[index].development.desired_hash == Some(source_hash)
+                        {
                             self.packages[index].development.state = DevelopmentState::Compiling;
                         }
                     }
@@ -1273,15 +1305,29 @@ impl NexaEngine {
         }) else {
             return;
         };
-        let terminal = if matches!(
-            terminal,
+        let completed_attempt = matches!(
+            &terminal,
             CandidateTerminal::Compiled { .. }
                 | CandidateTerminal::CompileFailed { .. }
                 | CandidateTerminal::VerifyFailed { .. }
-        ) && data.generation != self.packages[index].development.latest_generation
-        {
-            CandidateTerminal::SupersededAfterCompile(data.clone())
-        } else if matches!(terminal, CandidateTerminal::Compiled { .. })
+        );
+        let current_identity =
+            !completed_attempt || self.candidate_identity_is_current(index, &data);
+        let terminal = if completed_attempt && !current_identity {
+            if self.packages[index].development.state == DevelopmentState::SourceMissing {
+                CandidateTerminal::CancelledBySourceRemoval(data.clone())
+            } else {
+                if self.packages[index].development.desired_hash != Some(data.source_hash) {
+                    self.packages[index]
+                        .development
+                        .desired_hash_mismatch_rejection_count = self.packages[index]
+                        .development
+                        .desired_hash_mismatch_rejection_count
+                        .saturating_add(1);
+                }
+                CandidateTerminal::SupersededAfterCompile(data.clone())
+            }
+        } else if matches!(&terminal, CandidateTerminal::Compiled { .. })
             && !matches!(
                 self.packages[index].lifecycle.status(),
                 PackageStatus::Enabled | PackageStatus::Faulted
@@ -1448,7 +1494,18 @@ impl NexaEngine {
         outcome: ReloadReportOutcome,
         superseded: bool,
     ) {
+        let settles_stale_latest = data.generation
+            == self.packages[index].development.latest_generation
+            && self.packages[index].development.desired_hash != Some(data.source_hash);
+        let source_is_missing =
+            self.packages[index].development.state == DevelopmentState::SourceMissing;
         self.record_generation_terminal(index, &data, kind);
+        if settles_stale_latest {
+            self.clear_unqueued_observation(index);
+            if !source_is_missing {
+                self.packages[index].development.state = DevelopmentState::Idle;
+            }
+        }
         self.publish_event(if superseded {
             DevelopmentEvent::CandidateSuperseded(development_event_data(
                 data.package_id.clone(),
@@ -1486,6 +1543,10 @@ impl NexaEngine {
         candidate: PackageCandidate,
         compilation: CandidateCompilation,
     ) {
+        if !self.candidate_identity_is_current(index, &data) {
+            self.finish_candidate_rejected_by_freshness(index, data);
+            return;
+        }
         self.packages[index].development.last_compile_duration = Some(compilation.compile_duration);
         self.packages[index].development.last_verify_duration = compilation.verify_duration;
         self.publish_event(DevelopmentEvent::CompileSucceeded(development_event_data(
@@ -1509,7 +1570,6 @@ impl NexaEngine {
             });
             return;
         }
-        self.record_generation_terminal(index, &data, CandidateTerminalKind::Compiled);
         self.commit_compiled_from_tick(index, data, candidate, compilation);
     }
 
@@ -1520,6 +1580,11 @@ impl NexaEngine {
         candidate: PackageCandidate,
         compilation: CandidateCompilation,
     ) {
+        if !self.candidate_identity_is_current(index, &data) {
+            self.finish_candidate_rejected_by_freshness(index, data);
+            return;
+        }
+        self.record_generation_terminal(index, &data, CandidateTerminalKind::Compiled);
         self.packages[index].development.state = DevelopmentState::ReloadPending;
         self.publish_event(DevelopmentEvent::ReloadStarted(development_event_data(
             data.package_id.clone(),
@@ -1626,6 +1691,38 @@ impl NexaEngine {
             .last_total_change_to_visible_duration = report.total_change_to_visible_duration;
     }
 
+    fn finish_candidate_rejected_by_freshness(
+        &mut self,
+        index: usize,
+        data: CandidateTerminalData,
+    ) {
+        if self.packages[index].development.state == DevelopmentState::SourceMissing {
+            self.finish_noncompiled_terminal(
+                index,
+                data,
+                CandidateTerminalKind::CancelledBySourceRemoval,
+                ReloadReportOutcome::Superseded,
+                false,
+            );
+        } else {
+            if self.packages[index].development.desired_hash != Some(data.source_hash) {
+                self.packages[index]
+                    .development
+                    .desired_hash_mismatch_rejection_count = self.packages[index]
+                    .development
+                    .desired_hash_mismatch_rejection_count
+                    .saturating_add(1);
+            }
+            self.finish_noncompiled_terminal(
+                index,
+                data,
+                CandidateTerminalKind::SupersededAfterCompile,
+                ReloadReportOutcome::Superseded,
+                true,
+            );
+        }
+    }
+
     fn record_generation_terminal(
         &mut self,
         index: usize,
@@ -1666,13 +1763,29 @@ impl NexaEngine {
                 .terminal_generations
                 .remove(&oldest);
         }
-        if self.packages[index].development.queued_hash == Some(data.source_hash) {
+        if self.packages[index].development.queued_generation == Some(data.generation)
+            && self.packages[index].development.queued_hash == Some(data.source_hash)
+        {
             self.packages[index].development.queued_hash = None;
+            self.packages[index].development.queued_generation = None;
         }
-        if self.packages[index].development.in_flight_hash == Some(data.source_hash) {
+        if self.packages[index].development.in_flight_generation == Some(data.generation)
+            && self.packages[index].development.in_flight_hash == Some(data.source_hash)
+        {
             self.packages[index].development.in_flight_hash = None;
+            self.packages[index].development.in_flight_generation = None;
         }
-        if data.generation == self.packages[index].development.latest_generation {
+        let records_terminal_hash = matches!(
+            kind,
+            CandidateTerminalKind::Compiled
+                | CandidateTerminalKind::CompileFailed
+                | CandidateTerminalKind::VerifyFailed
+                | CandidateTerminalKind::RejectedHostContractChange
+        ) && self.packages[index].development.desired_hash
+            == Some(data.source_hash);
+        if data.generation == self.packages[index].development.latest_generation
+            && records_terminal_hash
+        {
             self.packages[index].development.terminal_hash = Some(data.source_hash);
         }
     }
@@ -1710,6 +1823,59 @@ impl NexaEngine {
             DevelopmentState::ChangeObserved | DevelopmentState::WaitingForStableWrite
         ) {
             self.packages[index].development.state = DevelopmentState::Idle;
+        }
+    }
+
+    fn supersede_development_for_current_source(
+        &mut self,
+        index: usize,
+        desired_hash: Option<SourceHash>,
+    ) {
+        if self.packages[index]
+            .development
+            .unqueued_generation
+            .as_ref()
+            .is_some_and(|data| Some(data.source_hash) != desired_hash)
+        {
+            self.terminate_unqueued_generation(
+                index,
+                CandidateTerminalKind::SupersededBeforeCompile,
+            );
+        }
+        let package_id = self.packages[index].candidate.manifest.id.clone();
+        let mut terminals = self
+            .development_worker
+            .as_ref()
+            .map_or_else(Vec::new, |worker| {
+                worker.supersede_package_except(&package_id, desired_hash)
+            });
+        if self.packages[index]
+            .awaiting_job
+            .as_ref()
+            .is_some_and(|job| Some(job.source_hash) != desired_hash)
+        {
+            let job = self.packages[index]
+                .awaiting_job
+                .take()
+                .expect("the stale awaiting Job was observed");
+            terminals.push(job.supersede_before_compile());
+        }
+        if self.packages[index]
+            .ready_candidate
+            .as_ref()
+            .is_some_and(|ready| Some(ready.terminal_data.source_hash) != desired_hash)
+        {
+            let ready = self.packages[index]
+                .ready_candidate
+                .take()
+                .expect("the stale Ready Candidate was observed");
+            terminals.push(CandidateTerminal::SupersededAfterCompile(
+                ready.terminal_data,
+            ));
+            self.packages[index].ready_commit_requested = false;
+        }
+        for terminal in terminals {
+            self.process_candidate_terminal(terminal);
         }
     }
 
@@ -1763,11 +1929,6 @@ impl NexaEngine {
             let Some(ready) = self.packages[index].ready_candidate.take() else {
                 continue;
             };
-            self.record_generation_terminal(
-                index,
-                &ready.terminal_data,
-                CandidateTerminalKind::Compiled,
-            );
             self.commit_compiled_from_tick(
                 index,
                 ready.terminal_data,
@@ -2055,8 +2216,6 @@ impl NexaEngine {
             record.fuel_used_this_tick = 0;
             record.outputs_this_tick = 0;
         }
-        self.process_worker_activity();
-        self.retry_backpressured_jobs();
         if self.development.enabled
             && self.development.scan_interval_ticks != 0
             && self
@@ -2065,6 +2224,8 @@ impl NexaEngine {
         {
             self.scan_development_changes();
         }
+        self.process_worker_activity();
+        self.retry_backpressured_jobs();
         self.process_worker_activity();
         self.commit_requested_ready_candidates();
         let mut runtime_failures = Vec::new();
@@ -2234,6 +2395,7 @@ impl NexaEngine {
                         || candidate_source_hash(&record.candidate),
                         |known_good| known_good.source_hash,
                     ),
+                    desired_hash: record.development.desired_hash,
                     candidate_generation: record.development.latest_generation,
                     terminal_generations: record.development.terminal_count,
                     duplicate_terminals: record.development.duplicate_terminal_count,
@@ -2241,6 +2403,9 @@ impl NexaEngine {
                         .development
                         .latest_generation
                         .saturating_sub(record.development.terminal_count),
+                    desired_hash_mismatches_rejected: record
+                        .development
+                        .desired_hash_mismatch_rejection_count,
                     latest_terminal_generation: record
                         .development
                         .terminal_generations
@@ -2316,6 +2481,9 @@ impl NexaEngine {
                         .latest_generation
                         .saturating_sub(record.development.terminal_count),
                 )
+            }),
+            desired_hash_mismatches_rejected: self.packages.iter().fold(0_u64, |total, record| {
+                total.saturating_add(record.development.desired_hash_mismatch_rejection_count)
             }),
             worker: self
                 .development_worker

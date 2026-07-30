@@ -35,6 +35,7 @@ pub struct DevelopmentInspection {
     pub terminal_generations: u64,
     pub duplicate_terminals: u64,
     pub generations_without_terminal: u64,
+    pub desired_hash_mismatches_rejected: u64,
     pub worker: crate::WorkerInspection,
 }
 
@@ -47,10 +48,12 @@ pub struct PackageInspection {
     pub effective_capabilities: CapabilitySet,
     pub active_epoch: Option<u64>,
     pub source_hash: SourceHash,
+    pub desired_hash: Option<SourceHash>,
     pub candidate_generation: u64,
     pub terminal_generations: u64,
     pub duplicate_terminals: u64,
     pub generations_without_terminal: u64,
+    pub desired_hash_mismatches_rejected: u64,
     pub latest_terminal_generation: Option<u64>,
     pub latest_terminal_kind: Option<crate::CandidateTerminalKind>,
     pub tasks: u64,

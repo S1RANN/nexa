@@ -21,11 +21,13 @@ cargo xtask test-lsp
 cargo xtask editor-check
 cargo xtask dev-loop-stress
 cargo xtask test-generation-accounting
+cargo xtask test-candidate-freshness
 cargo xtask check
 cargo xtask finalize-m1
 cargo xtask finalize-m2
 cargo xtask finalize-m3-r1
 cargo xtask finalize-m3-r2
+cargo xtask finalize-m3-r3
 ```
 
 Unit tests cover parser, type checking, bytecode, verifier, migration, and
@@ -56,6 +58,33 @@ and shutdown. It writes a machine report to
 terminal Generations, any duplicate terminal, or any unterminated Generation.
 Its final report is written to
 `target/nexa-artifacts/m3r2-finalize/final-report.json`.
+
+`test-candidate-freshness` executes six real Engine scenarios:
+
+1. pending Candidate B followed by a revert to active A;
+2. in-flight Candidate B followed by a revert to active A;
+3. queued Result B followed by a revert to active A;
+4. ready Candidate B with automatic Reload disabled followed by a revert to
+   active A;
+5. pending Candidate C followed by a return to previously terminal B;
+6. queued Result B while the desired source advances to C.
+
+The machine report is written to
+`target/nexa-artifacts/m3r3-candidate-freshness/report.json`. Every scenario
+must prove the stale Candidate never becomes active, Last Known Good is
+unchanged by stale work, terminal accounting remains balanced, and the
+aggregate `staleCandidatesCommitted` value is `0`.
+
+Additional unit regressions cover source-refresh failure followed by recovery
+and same-hash A → B → C → B Generation overlap. They verify that fail-closed
+refresh does not retain a stale observation and that an old terminal cannot
+clear a newer queued or in-flight identity.
+
+`finalize-m3-r3` independently reruns the M3R2 generation-accounting gate and
+the M3R3 freshness gate, checks the product freshness boundary, validates
+status documents and immutable predecessor tags, and requires the annotated
+`developer-loop-m3-complete-r3` tag at the final commit. Its report is written
+to `target/nexa-artifacts/m3r3-finalize/final-report.json`.
 
 `test-binding` includes all 20 textual IDL mutation crates against the
 handwritten `BusinessHostV1`. Every changed crate compiles its changed script

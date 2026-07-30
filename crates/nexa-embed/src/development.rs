@@ -242,17 +242,21 @@ pub struct WorkerInspection {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PackageDevelopment {
     pub state: DevelopmentState,
+    pub desired_hash: Option<SourceHash>,
     pub observed_hash: Option<SourceHash>,
     pub unqueued_generation: Option<CandidateTerminalData>,
     pub stable_hash: Option<SourceHash>,
     pub queued_hash: Option<SourceHash>,
+    pub queued_generation: Option<u64>,
     pub in_flight_hash: Option<SourceHash>,
+    pub in_flight_generation: Option<u64>,
     pub terminal_hash: Option<SourceHash>,
     pub active_hash: Option<SourceHash>,
     pub stable_scans: u8,
     pub latest_generation: u64,
     pub terminal_count: u64,
     pub duplicate_terminal_count: u64,
+    pub desired_hash_mismatch_rejection_count: u64,
     pub terminal_generations: BTreeMap<u64, CandidateTerminalKind>,
     pub change_observed_at: Option<Instant>,
     pub last_change_to_stable_duration: Duration,
@@ -383,7 +387,27 @@ pub enum CandidateCancellation {
 struct InFlightJob {
     job: CompileJob,
     queue_duration: Duration,
-    cancel_reason: Option<CandidateCancellation>,
+    disposition: InFlightDisposition,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum InFlightDisposition {
+    #[default]
+    Active,
+    Superseded,
+    Cancelled(CandidateCancellation),
+}
+
+impl InFlightDisposition {
+    fn supersede(&mut self) {
+        if matches!(self, Self::Active) {
+            *self = Self::Superseded;
+        }
+    }
+
+    fn cancel(&mut self, reason: CandidateCancellation) {
+        *self = Self::Cancelled(reason);
+    }
 }
 
 struct WorkerState {
@@ -407,11 +431,143 @@ struct WorkerShared {
     result_space_available: Condvar,
     queue_capacity: usize,
     result_capacity: usize,
+    #[cfg(test)]
+    test_control: WorkerTestControl,
 }
 
 pub(crate) struct DevelopmentWorker {
     shared: Arc<WorkerShared>,
     thread: Option<JoinHandle<()>>,
+}
+
+#[cfg(test)]
+const WORKER_TEST_CONTROL_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct WorkerTestControl {
+    shared: Arc<WorkerTestControlShared>,
+}
+
+#[cfg(test)]
+struct WorkerTestControlShared {
+    state: Mutex<WorkerTestControlState>,
+    changed: Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct WorkerTestControlState {
+    targets: VecDeque<(PackageId, u64)>,
+    blocked: Option<(PackageId, u64)>,
+    released: bool,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl WorkerTestControl {
+    fn new() -> Self {
+        Self {
+            shared: Arc::new(WorkerTestControlShared {
+                state: Mutex::new(WorkerTestControlState::default()),
+                changed: Condvar::new(),
+            }),
+        }
+    }
+
+    pub(crate) fn block_before_compile(&self, package_id: PackageId, generation: u64) {
+        self.block_before_compile_sequence([(package_id, generation)]);
+    }
+
+    pub(crate) fn block_before_compile_sequence(
+        &self,
+        targets: impl IntoIterator<Item = (PackageId, u64)>,
+    ) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.targets = targets.into_iter().collect();
+        state.blocked = None;
+        state.released = false;
+        self.shared.changed.notify_all();
+    }
+
+    pub(crate) fn wait_until_blocked(&self, timeout: Duration) -> bool {
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| state.blocked.is_none())
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.blocked.is_some()
+    }
+
+    pub(crate) fn wait_until_blocked_for(
+        &self,
+        package_id: &PackageId,
+        generation: u64,
+        timeout: Duration,
+    ) -> bool {
+        let target = (package_id.clone(), generation);
+        let state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, timeout, |state| {
+                state.blocked.as_ref() != Some(&target)
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.blocked.as_ref() == Some(&target)
+    }
+
+    pub(crate) fn release(&self) {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.shared.changed.notify_all();
+    }
+
+    fn release_for_shutdown(&self) {
+        self.release();
+    }
+
+    fn before_compile(&self, package_id: &PackageId, generation: u64) {
+        let target = (package_id.clone(), generation);
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.targets.front() != Some(&target) {
+            return;
+        }
+        state.blocked = Some(target.clone());
+        self.shared.changed.notify_all();
+        let (mut state, _) = self
+            .shared
+            .changed
+            .wait_timeout_while(state, WORKER_TEST_CONTROL_TIMEOUT, |state| !state.released)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.targets.front() == Some(&target) {
+            state.targets.pop_front();
+        }
+        state.blocked = None;
+        state.released = false;
+        self.shared.changed.notify_all();
+    }
 }
 
 pub struct DevelopmentCompiler {
@@ -504,6 +660,8 @@ impl DevelopmentWorker {
             result_space_available: Condvar::new(),
             queue_capacity: config.compile_queue_capacity.max(1),
             result_capacity: config.result_queue_capacity.max(1),
+            #[cfg(test)]
+            test_control: WorkerTestControl::new(),
         });
         let worker_shared = Arc::clone(&shared);
         let thread = thread::Builder::new()
@@ -514,6 +672,12 @@ impl DevelopmentWorker {
             shared,
             thread: Some(thread),
         })
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn test_control(&self) -> WorkerTestControl {
+        self.shared.test_control.clone()
     }
 
     pub fn enqueue(&self, job: CompileJob) -> EnqueueOutcome {
@@ -590,7 +754,7 @@ impl DevelopmentWorker {
         if let Some(in_flight) = state.in_flight.as_mut()
             && in_flight.job.package_id == *package_id
         {
-            in_flight.cancel_reason = Some(reason);
+            in_flight.disposition.cancel(reason);
         }
         let mut converted = 0_u64;
         for terminal in &mut state.results {
@@ -601,6 +765,56 @@ impl DevelopmentWorker {
             }
         }
         state.cancelled_count = state.cancelled_count.saturating_add(converted);
+        terminals
+    }
+
+    pub fn supersede_package_except(
+        &self,
+        package_id: &PackageId,
+        desired_hash: Option<SourceHash>,
+    ) -> Vec<CandidateTerminal> {
+        let mut state = self
+            .shared
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut terminals = Vec::new();
+        if state
+            .pending_by_package
+            .get(package_id)
+            .is_some_and(|job| Some(job.source_hash) != desired_hash)
+        {
+            let job = state
+                .pending_by_package
+                .remove(package_id)
+                .expect("the stale pending Job was observed while holding the Worker lock");
+            state.pending_order.retain(|queued| queued != package_id);
+            state.pending_superseded_count = state.pending_superseded_count.saturating_add(1);
+            terminals.push(job.supersede_before_compile());
+        }
+        if let Some(in_flight) = state.in_flight.as_mut()
+            && in_flight.job.package_id == *package_id
+            && Some(in_flight.job.source_hash) != desired_hash
+        {
+            in_flight.disposition.supersede();
+        }
+        let mut converted = 0_u64;
+        for terminal in &mut state.results {
+            if terminal.data().package_id == *package_id
+                && Some(terminal.data().source_hash) != desired_hash
+                && matches!(
+                    terminal,
+                    CandidateTerminal::Compiled { .. }
+                        | CandidateTerminal::CompileFailed { .. }
+                        | CandidateTerminal::VerifyFailed { .. }
+                )
+            {
+                let data = terminal.data().clone();
+                *terminal = CandidateTerminal::SupersededAfterCompile(data);
+                converted = converted.saturating_add(1);
+            }
+        }
+        state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(converted);
         terminals
     }
 
@@ -678,13 +892,17 @@ impl DevelopmentWorker {
                 ));
             }
             if let Some(in_flight) = state.in_flight.as_mut() {
-                in_flight.cancel_reason = Some(CandidateCancellation::Shutdown);
+                in_flight
+                    .disposition
+                    .cancel(CandidateCancellation::Shutdown);
             }
             immediate.extend(state.results.drain(..));
             state.result_count = 0;
             self.shared.job_available.notify_all();
             self.shared.result_space_available.notify_all();
         }
+        #[cfg(test)]
+        self.shared.test_control.release_for_shutdown();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -746,10 +964,15 @@ fn worker_loop(shared: &WorkerShared) {
             state.in_flight = Some(InFlightJob {
                 job: job.clone(),
                 queue_duration,
-                cancel_reason: None,
+                disposition: InFlightDisposition::Active,
             });
             job
         };
+
+        #[cfg(test)]
+        shared
+            .test_control
+            .before_compile(&job.package_id, job.generation);
 
         let work_started = Instant::now();
         let result = compile_package_candidate(
@@ -782,18 +1005,25 @@ fn worker_loop(shared: &WorkerShared) {
                 .push(CandidateTerminal::CancelledByShutdown(data));
             return;
         }
-        let terminal = if let Some(reason) = in_flight.cancel_reason {
-            state.cancelled_count = state.cancelled_count.saturating_add(1);
-            cancelled_terminal(reason, data)
-        } else if state
-            .pending_by_package
-            .get(&job.package_id)
-            .is_some_and(|pending| pending.generation > job.generation)
-        {
-            state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(1);
-            CandidateTerminal::SupersededAfterCompile(data)
-        } else {
-            match result {
+        let terminal = match in_flight.disposition {
+            InFlightDisposition::Cancelled(reason) => {
+                state.cancelled_count = state.cancelled_count.saturating_add(1);
+                cancelled_terminal(reason, data)
+            }
+            InFlightDisposition::Superseded => {
+                state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(1);
+                CandidateTerminal::SupersededAfterCompile(data)
+            }
+            InFlightDisposition::Active
+                if state
+                    .pending_by_package
+                    .get(&job.package_id)
+                    .is_some_and(|pending| pending.generation > job.generation) =>
+            {
+                state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(1);
+                CandidateTerminal::SupersededAfterCompile(data)
+            }
+            InFlightDisposition::Active => match result {
                 Ok(compilation) => CandidateTerminal::Compiled {
                     data,
                     candidate: job.candidate,
@@ -813,7 +1043,7 @@ fn worker_loop(shared: &WorkerShared) {
                     compile_duration: failure.compile_duration,
                     verify_duration: failure.verify_duration,
                 },
-            }
+            },
         };
         state.results.push_back(terminal);
         state.result_count = state.result_count.saturating_add(1);

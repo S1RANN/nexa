@@ -7,6 +7,7 @@ Nexa M3 Developer Loop & Diagnostics = COMPLETE
 NexaEngine API = COMPLETE
 Automatic Candidate Compilation = COMPLETE
 Candidate Generation Terminal Accounting = COMPLETE
+Candidate Freshness Commit Guard = COMPLETE
 Last Known Good Reload = COMPLETE
 Unified Diagnostics = COMPLETE
 Source-level Runtime Stack Traces = COMPLETE
@@ -59,6 +60,9 @@ shutdown failures share one bounded `EngineDiagnostic` model. `nexa check`,
 The revision specifically requires lossless Worker backpressure and terminal
 accounting, Engine diagnostics observed through real product paths, trustworthy
 phase metrics, real project source policies, and exact NIDL/LSP locations.
+M3R3 adds the remaining freshness boundary: the Engine refreshes the desired
+source identity immediately before commit and rejects stale Candidate work at
+every development-pipeline stage.
 
 M1 final closure includes the generated-registry
 positive path, real invalid-event Runtime calls, deterministic fuzz corpus
@@ -143,9 +147,21 @@ M3R2 changes only Candidate Generation terminal accounting before Worker
 admission and its finalization evidence. It adds no language, Runtime, Package,
 LSP, editor, or optimization capability. The immutable M3R1 tag is retained.
 
+## M3R3 scope
+
+M3R3 changes only Candidate freshness and its finalization evidence. Each
+Package tracks a fail-closed `desired_hash`; source removal or unreadable source
+clears that identity. The Engine refreshes the source at the Runtime commit
+safe point and requires both the latest Generation and exact desired hash.
+Stale unqueued, awaiting, pending, in-flight, result-queue, and ready
+Candidates terminate as superseded and cannot replace the active Runtime or
+Last Known Good artifact.
+
+The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M3R3 adds no
+language, Runtime, Package, LSP, editor, or optimization capability.
+
 ## Next review
 
-M3R1 remains immutable. M3R2 closes pre-queue Candidate Generation terminal
-accounting and completes M3. M4 Language Scale Foundation has not started; it
-may begin only from the immutable M3R2 completion tag under a separately
-frozen milestone.
+M3R3 completes Candidate freshness and commit safety. M4 Language Scale
+Foundation has not started and may begin only from the immutable M3R3
+completion tag under a separately frozen milestone.
