@@ -1813,7 +1813,7 @@ fn m3r3_product_audit() -> Result<(), DynError> {
     let development = fs::read_to_string(root.join("crates/nexa-embed/src/development.rs"))?;
     let tests = fs::read_to_string(root.join("crates/nexa-embed/src/freshness_tests.rs"))?;
     for required in [
-        "fn refresh_desired_hash",
+        "fn refresh_desired_build_fingerprint",
         "fn candidate_identity_is_current",
         "fn supersede_development_for_current_source",
     ] {
@@ -1822,7 +1822,7 @@ fn m3r3_product_audit() -> Result<(), DynError> {
         }
     }
     for required in [
-        "desired_hash: Option<SourceHash>",
+        "desired_build_fingerprint: Option<nexa_analysis::BuildFingerprint>",
         "queued_generation: Option<u64>",
         "in_flight_generation: Option<u64>",
         "enum InFlightDisposition",
@@ -3172,5 +3172,11 @@ mod audit_tests {
     #[test]
     fn m3r1_audit_tracks_the_build_fingerprint_lifecycle_names() {
         super::m3r1_audit().expect("the current Engine must satisfy the M3R1 lifecycle audit");
+    }
+
+    #[test]
+    fn m3r3_audit_tracks_the_build_fingerprint_freshness_names() {
+        super::m3r3_product_audit()
+            .expect("the current Engine must satisfy the M3R3 freshness audit");
     }
 }
