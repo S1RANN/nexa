@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 
 #[test]
+#[ignore = "spawns a nested cargo build; run by cargo xtask test-task"]
 fn task_lifecycle_bypasses_are_not_available_to_external_crates() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../target/nexa-artifacts/public-api-compile");

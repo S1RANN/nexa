@@ -31,12 +31,14 @@ jobs:
         run: rustup show active-toolchain
       - name: Check formatting
         run: cargo fmt --check
-      - name: Check workspace
-        run: cargo check --workspace --all-targets
       - name: Lint workspace
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test workspace
         run: cargo test --workspace --all-targets
+      - name: Test binding gate
+        run: cargo test -p nexa-idl --test e2e_mutations -- --include-ignored
+      - name: Test public API compile gate
+        run: cargo test -p nexa-runtime --test public_api_compile -- --include-ignored
       - name: Test documentation
         run: cargo test --doc --workspace
       - name: Run combat integration

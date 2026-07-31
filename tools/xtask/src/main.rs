@@ -2330,7 +2330,8 @@ fn run_check_summary() -> CheckSummary {
 
 fn workspace_check() -> Result<(), DynError> {
     cargo(&["fmt", "--all", "--", "--check"])?;
-    cargo(&["check", "--workspace", "--all-targets"])?;
+    // `cargo clippy --all-targets` performs the full `cargo check` work, so a
+    // separate check pass would only recompile the workspace a second time.
     cargo(&[
         "clippy",
         "--workspace",
@@ -2349,7 +2350,15 @@ fn workspace_check() -> Result<(), DynError> {
 
 fn test_task() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "task_lifecycle"])?;
-    cargo(&["test", "-p", "nexa-runtime", "--test", "public_api_compile"])
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "public_api_compile",
+        "--",
+        "--include-ignored",
+    ])
 }
 
 fn test_core() -> Result<(), DynError> {
@@ -2369,6 +2378,15 @@ fn test_core() -> Result<(), DynError> {
 fn test_binding() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-idl"])?;
     cargo(&[
+        "test",
+        "-p",
+        "nexa-idl",
+        "--test",
+        "e2e_mutations",
+        "--",
+        "--include-ignored",
+    ])?;
+    cargo(&[
         "run",
         "-p",
         "nexa-cli",
@@ -2386,6 +2404,13 @@ fn fuzz_smoke() -> Result<(), DynError> {
 }
 
 fn fuzz_build() -> Result<(), DynError> {
+    // The fuzz directories are independent workspaces over the same crate
+    // graph; one shared target directory compiles that graph once instead of
+    // ten times.
+    let shared_target = workspace_root().join("target/fuzz-check");
+    let shared_target = shared_target
+        .to_str()
+        .ok_or("fuzz shared target directory is not UTF-8")?;
     for directory in [
         "fuzz/bytecode",
         "fuzz/bytecode-decode",
@@ -2398,12 +2423,15 @@ fn fuzz_build() -> Result<(), DynError> {
         "fuzz/idl",
         "fuzz/realm-events",
     ] {
-        cargo(&[
-            "check",
-            "--quiet",
-            "--manifest-path",
-            &format!("{directory}/Cargo.toml"),
-        ])?;
+        cargo_with_environment(
+            &[
+                "check",
+                "--quiet",
+                "--manifest-path",
+                &format!("{directory}/Cargo.toml"),
+            ],
+            &[("CARGO_TARGET_DIR", shared_target)],
+        )?;
     }
     Ok(())
 }

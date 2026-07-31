@@ -11,6 +11,7 @@ use e2e_support::{
 use nexa_core::StableId;
 
 #[test]
+#[ignore = "spawns nested cargo builds; run by cargo xtask test-binding"]
 fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
     let root = artifact_root();
     clear_case_artifacts(&root);
