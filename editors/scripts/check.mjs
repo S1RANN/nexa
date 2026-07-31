@@ -12,6 +12,7 @@ import vscodeTextmate from "vscode-textmate";
 import {
   editorsDirectory,
   grammarDirectory,
+  idlGrammarDirectory,
   readSyntax,
   renderZedManifest,
   repositoryDirectory,
@@ -31,53 +32,85 @@ const require = createRequire(import.meta.url);
 const { OnigScanner, OnigString, loadWASM } = vscodeOniguruma;
 const { INITIAL, Registry, parseRawGrammar } = vscodeTextmate;
 
-const exampleFiles = [
+const nexaExamples = [
+  "editors/fixtures/m4-language.nexa",
   "examples/add.nexa",
   "examples/combat-runtime/gameplay.nexa",
   "examples/combat-runtime/reload/activation_fault.nexa",
   "examples/combat-runtime/reload/invalid.nexa",
   "examples/combat-runtime/reload/v1.nexa",
   "examples/combat-runtime/reload/v2.nexa",
+];
+const nidlExamples = [
+  "editors/fixtures/m4-language.nidl",
   "examples/combat-runtime/combat_api.nidl",
   "crates/nexa-idl/tests/fixtures/business_host/interface.nidl",
+];
+const invalidNidlExamples = [
+  "editors/fixtures/nidl-comment-invalid.nidl",
+  "editors/fixtures/nidl-enum-comment-invalid.nidl",
 ];
 
 const queryChecks = [
   [
+    grammarDirectory,
     "tree-sitter-nexa/queries/highlights.scm",
-    "examples/combat-runtime/gameplay.nexa",
+    "editors/fixtures/m4-language.nexa",
+    ["keyword", "function", "attribute", "comment.documentation"],
   ],
   [
+    grammarDirectory,
     "zed/languages/nexa/highlights.scm",
-    "examples/combat-runtime/gameplay.nexa",
+    "editors/fixtures/m4-language.nexa",
+    ["keyword", "function", "attribute", "comment.documentation"],
   ],
   [
+    grammarDirectory,
     "zed/languages/nexa/indents.scm",
-    "examples/combat-runtime/gameplay.nexa",
+    "editors/fixtures/m4-language.nexa",
+    ["indent", "end"],
   ],
   [
+    grammarDirectory,
     "zed/languages/nexa/brackets.scm",
-    "examples/combat-runtime/gameplay.nexa",
+    "editors/fixtures/m4-language.nexa",
+    ["open", "close"],
   ],
   [
+    grammarDirectory,
     "zed/languages/nexa/outline.scm",
-    "examples/combat-runtime/gameplay.nexa",
+    "editors/fixtures/m4-language.nexa",
+    ["item", "name", "context"],
   ],
   [
+    idlGrammarDirectory,
+    "tree-sitter-nexa-idl/queries/highlights.scm",
+    "editors/fixtures/m4-language.nidl",
+    ["keyword", "function", "type", "type.builtin"],
+  ],
+  [
+    idlGrammarDirectory,
     "zed/languages/nexa-idl/highlights.scm",
-    "examples/combat-runtime/combat_api.nidl",
+    "editors/fixtures/m4-language.nidl",
+    ["keyword", "function", "type", "type.builtin"],
   ],
   [
+    idlGrammarDirectory,
     "zed/languages/nexa-idl/indents.scm",
-    "examples/combat-runtime/combat_api.nidl",
+    "editors/fixtures/m4-language.nidl",
+    ["indent", "end"],
   ],
   [
+    idlGrammarDirectory,
     "zed/languages/nexa-idl/brackets.scm",
-    "examples/combat-runtime/combat_api.nidl",
+    "editors/fixtures/m4-language.nidl",
+    ["open", "close"],
   ],
   [
+    idlGrammarDirectory,
     "zed/languages/nexa-idl/outline.scm",
-    "examples/combat-runtime/combat_api.nidl",
+    "editors/fixtures/m4-language.nidl",
+    ["item", "name", "context"],
   ],
 ];
 
@@ -124,6 +157,10 @@ function validateJsonFiles() {
     "tree-sitter-nexa/tree-sitter.json",
     "tree-sitter-nexa/src/grammar.json",
     "tree-sitter-nexa/src/node-types.json",
+    "tree-sitter-nexa-idl/package.json",
+    "tree-sitter-nexa-idl/tree-sitter.json",
+    "tree-sitter-nexa-idl/src/grammar.json",
+    "tree-sitter-nexa-idl/src/node-types.json",
     "vscode/package.json",
     "vscode/language-configuration/nexa.json",
     "vscode/language-configuration/nexa-idl.json",
@@ -135,18 +172,58 @@ function validateJsonFiles() {
   }
 }
 
+function validatePackageScripts() {
+  const packageJson = parseJson(path.join(editorsDirectory, "package.json"));
+  const scripts = packageJson.scripts ?? {};
+  assert(
+    scripts.generate === "node scripts/generate.mjs" &&
+      scripts.check === "node scripts/check.mjs" &&
+      scripts["package:vscode"] === "node scripts/package-vscode.mjs" &&
+      scripts["prepare:zed"] === "node scripts/prepare-zed.mjs" &&
+      scripts["build:zed"] === "node scripts/build-zed.mjs" &&
+      scripts["verify:package"] === "node scripts/verify-package.mjs",
+    "editor package scripts must use the checked-in generation and packaging pipeline",
+  );
+  assert(
+    scripts.package ===
+      "pnpm run generate && pnpm run check && pnpm run package:vscode && pnpm run prepare:zed && pnpm run build:zed && pnpm run verify:package",
+    "editor package must generate, check, package VS Code, prepare/build Zed, and verify both artifacts",
+  );
+}
+
 function validateContributions() {
   const extension = parseJson(path.join(vscodeDirectory, "package.json"));
+  const extensionSource = read(path.join(vscodeDirectory, "extension.js"));
   assert(
     extension.main === "./extension.js",
     "VS Code must activate the Nexa language server client",
   );
   assert(
-    read(path.join(vscodeDirectory, "extension.js")).includes(
-      'cp.spawn(executable, ["lsp"]',
-    ),
+    extensionSource.includes('cp.spawn(executable, ["lsp"]'),
     "VS Code must launch `nexa lsp`",
   );
+  for (const required of [
+    "BUILD_INPUT_GLOB",
+    "*.nexa",
+    "*.nidl",
+    "package.toml",
+    "nexa.lock",
+    "nexa.dev.toml",
+    "createFileSystemWatcher",
+    "workspace/didChangeWatchedFiles",
+    "onDidRenameFiles",
+    "workspace/didChangeWorkspaceFolders",
+    "onDidChangeWorkspaceFolders",
+    "workspaceFolders.map(workspaceFolder)",
+    "return isBuildInputUri(document.uri)",
+    "dynamicRegistration: false",
+  ]) {
+    assert(
+      extensionSource.includes(required),
+      `VS Code build-input synchronization is missing ${required}`,
+    );
+  }
+
   const languages = new Map(
     extension.contributes.languages.map((language) => [language.id, language]),
   );
@@ -175,11 +252,27 @@ function validateContributions() {
     "VS Code Nexa IDL scope is invalid",
   );
 
-  for (const language of ["nexa", "nexa-idl"]) {
-    const config = parseJson(
-      path.join(vscodeDirectory, "language-configuration", `${language}.json`),
-    );
-    assert(!("comments" in config), `${language} must not declare comments`);
+  const nexaConfig = parseJson(
+    path.join(vscodeDirectory, "language-configuration", "nexa.json"),
+  );
+  assert(
+    nexaConfig.comments?.lineComment === "//" &&
+      nexaConfig.comments?.blockComment?.[0] === "/*" &&
+      nexaConfig.comments?.blockComment?.[1] === "*/",
+    "Nexa must register its line and block comments",
+  );
+  const nidlConfig = parseJson(
+    path.join(vscodeDirectory, "language-configuration", "nexa-idl.json"),
+  );
+  assert(
+    !Object.hasOwn(nidlConfig, "comments"),
+    "NIDL must not register comments",
+  );
+
+  for (const [language, config] of [
+    ["nexa", nexaConfig],
+    ["nexa-idl", nidlConfig],
+  ]) {
     const configuredPairs = [
       ...config.brackets,
       ...config.autoClosingPairs.map((pair) => [pair.open, pair.close]),
@@ -193,35 +286,46 @@ function validateContributions() {
 }
 
 function validateZedFiles() {
-  const template = read(path.join(zedDirectory, "extension.toml.in"));
-  TOML.parse(template);
+  TOML.parse(read(path.join(zedDirectory, "extension.toml.in")));
 
-  for (const directory of ["nexa", "nexa-idl"]) {
-    const configFile = path.join(
-      zedDirectory,
-      "languages",
-      directory,
-      "config.toml",
-    );
-    const source = read(configFile);
-    const config = TOML.parse(source);
-    assert(config.grammar === "nexa", `${directory} must use grammar nexa`);
-    assert(
-      !Object.hasOwn(config, "line_comments") && !source.includes("line_comments"),
-      `${directory} must not declare line comments`,
-    );
-  }
-
-  const manifestSource = renderZedManifest();
-  const manifest = TOML.parse(manifestSource);
-  const expectedUrl = pathToFileURL(grammarDirectory).href;
+  const nexaSource = read(
+    path.join(zedDirectory, "languages", "nexa", "config.toml"),
+  );
+  const nexaConfig = TOML.parse(nexaSource);
+  assert(nexaConfig.grammar === "nexa", "Nexa must use grammar nexa");
   assert(
-    manifest.grammars.nexa.repository === expectedUrl,
-    "Zed grammar URL is not the canonical absolute file URL",
+    nexaConfig.line_comments?.includes("// "),
+    "Nexa must register line comments in Zed",
+  );
+
+  const idlSource = read(
+    path.join(zedDirectory, "languages", "nexa-idl", "config.toml"),
+  );
+  const idlConfig = TOML.parse(idlSource);
+  assert(
+    idlConfig.grammar === "nexa_idl",
+    "Nexa IDL must use grammar nexa_idl",
   );
   assert(
-    manifest.grammars.nexa.rev === "local",
-    "Zed local grammar revision is invalid",
+    !Object.hasOwn(idlConfig, "line_comments") &&
+      !idlSource.includes("line_comments"),
+    "Nexa IDL must not register line comments",
+  );
+
+  const manifest = TOML.parse(renderZedManifest());
+  assert(
+    manifest.grammars.nexa.repository === pathToFileURL(grammarDirectory).href,
+    "Zed Nexa grammar URL is not the canonical absolute file URL",
+  );
+  assert(
+    manifest.grammars.nexa_idl.repository ===
+      pathToFileURL(idlGrammarDirectory).href,
+    "Zed NIDL grammar URL is not the canonical absolute file URL",
+  );
+  assert(
+    manifest.grammars.nexa.rev === "local" &&
+      manifest.grammars.nexa_idl.rev === "local",
+    "Zed local grammar revisions are invalid",
   );
   assert(
     manifest.language_servers?.nexa?.languages?.includes("Nexa") &&
@@ -234,21 +338,37 @@ function validateZedFiles() {
     ),
     "Zed must launch `nexa lsp`",
   );
-  assert(
-    read(path.join(zedDirectory, "Cargo.lock")).includes(
-      'name = "zed_extension_api"',
-    ),
-    "Zed extension dependencies must be locked",
-  );
 }
 
 function validateSyntaxContract() {
   const syntax = readSyntax();
-  const grammar = parseJson(path.join(grammarDirectory, "src", "grammar.json"));
-  assert(!grammar.rules.comment, "Tree-sitter grammar must not define comments");
+  const nexaGrammar = parseJson(
+    path.join(grammarDirectory, "src", "grammar.json"),
+  );
+  const idlGrammar = parseJson(
+    path.join(idlGrammarDirectory, "src", "grammar.json"),
+  );
   assert(
-    syntax.nexa.migrationIntrinsics.length > 0,
-    "Nexa migration intrinsic list must not be empty",
+    nexaGrammar.rules.line_comment &&
+      nexaGrammar.rules.block_comment &&
+      nexaGrammar.rules.doc_comment,
+    "Nexa Tree-sitter grammar must define all M4 comments",
+  );
+  assert(
+    !idlGrammar.rules.line_comment &&
+      !idlGrammar.rules.block_comment &&
+      !idlGrammar.rules.doc_comment,
+    "NIDL Tree-sitter grammar must reject comments",
+  );
+  assert(
+    syntax.nexa.attributeKeywords.includes("stable") &&
+      syntax.nexa.attributeKeywords.includes("test"),
+    "M4 Nexa attributes are missing",
+  );
+  assert(
+    syntax.nexa.statementKeywords.includes("break") &&
+      syntax.nexa.statementKeywords.includes("continue"),
+    "M4 loop control keywords are missing",
   );
   assert(
     syntax.nidl.builtinTypes.includes("void"),
@@ -258,16 +378,23 @@ function validateSyntaxContract() {
   const nexaTextMate = parseJson(
     path.join(vscodeDirectory, "syntaxes", "nexa.tmLanguage.json"),
   );
+  const idlTextMate = parseJson(
+    path.join(vscodeDirectory, "syntaxes", "nexa-idl.tmLanguage.json"),
+  );
+  assert(
+    Object.hasOwn(nexaTextMate.repository, "comments"),
+    "Nexa TextMate grammar must define comments",
+  );
+  assert(
+    !Object.hasOwn(idlTextMate.repository, "comments"),
+    "NIDL TextMate grammar must reject comments",
+  );
   const operatorPatterns = nexaTextMate.repository.operators.patterns.map(
     (pattern) => pattern.match,
   );
   assert(
     operatorPatterns.some((pattern) => pattern.includes("/")),
     "TextMate grammar must highlight / as an operator",
-  );
-  assert(
-    !Object.hasOwn(nexaTextMate.repository, "comments"),
-    "TextMate grammar must not define comments",
   );
 }
 
@@ -304,13 +431,13 @@ async function validateTextMateTokenization() {
   const cases = [
     {
       scopeName: "source.nexa",
-      line: "fn add(a: i32, b: i32) -> i32 {",
-      arrows: [["->", "keyword.operator.arrow.nexa"]],
+      line: "pub fn add(a: i32, b: i32) -> i32 {",
+      operators: [["->", "keyword.operator.arrow.nexa"]],
     },
     {
       scopeName: "source.nexa",
       line: "Some(found) => found, None => 0,",
-      arrows: [
+      operators: [
         ["=>", "keyword.operator.arrow.nexa"],
         ["=>", "keyword.operator.arrow.nexa"],
       ],
@@ -318,7 +445,7 @@ async function validateTextMateTokenization() {
     {
       scopeName: "source.nexa-idl",
       line: "sync fn log(message: string) -> i32;",
-      arrows: [["->", "keyword.operator.arrow.nexa-idl"]],
+      operators: [["->", "keyword.operator.arrow.nexa-idl"]],
     },
   ];
 
@@ -327,9 +454,9 @@ async function validateTextMateTokenization() {
     assert(grammar, `failed to load ${testCase.scopeName}`);
     const tokens = grammar.tokenizeLine(testCase.line, INITIAL).tokens;
     let searchOffset = 0;
-    for (const [arrow, expectedScope] of testCase.arrows) {
-      const start = testCase.line.indexOf(arrow, searchOffset);
-      const end = start + arrow.length;
+    for (const [operator, expectedScope] of testCase.operators) {
+      const start = testCase.line.indexOf(operator, searchOffset);
+      const end = start + operator.length;
       const matches = tokens.filter(
         (token) => token.startIndex < end && token.endIndex > start,
       );
@@ -338,27 +465,23 @@ async function validateTextMateTokenization() {
           matches[0].startIndex === start &&
           matches[0].endIndex === end &&
           matches[0].scopes.includes(expectedScope),
-        `${testCase.scopeName} must tokenize ${arrow} as one arrow operator`,
+        `${testCase.scopeName} must tokenize ${operator} as one operator`,
       );
       searchOffset = end;
     }
   }
 }
 
-function checkGeneratedFiles(temporaryDirectory) {
-  const temporaryGrammar = path.join(temporaryDirectory, "tree-sitter-nexa");
+function generateAndCompare(source, temporaryDirectory) {
+  const name = path.basename(source);
+  const temporaryGrammar = path.join(temporaryDirectory, name);
   fs.mkdirSync(temporaryGrammar, { recursive: true });
-  fs.copyFileSync(
-    path.join(editorsDirectory, "language-syntax.json"),
-    path.join(temporaryDirectory, "language-syntax.json"),
-  );
   for (const file of ["grammar.js", "package.json", "tree-sitter.json"]) {
     fs.copyFileSync(
-      path.join(grammarDirectory, file),
+      path.join(source, file),
       path.join(temporaryGrammar, file),
     );
   }
-
   run("tree-sitter", ["generate"], {
     cwd: temporaryGrammar,
     env: {
@@ -368,11 +491,20 @@ function checkGeneratedFiles(temporaryDirectory) {
   });
   for (const file of generatedGrammarFiles) {
     assertFileEquals(
-      path.join(grammarDirectory, file),
+      path.join(source, file),
       path.join(temporaryGrammar, file),
-      file,
+      `${name}/${file}`,
     );
   }
+}
+
+function checkGeneratedFiles(temporaryDirectory) {
+  fs.copyFileSync(
+    path.join(editorsDirectory, "language-syntax.json"),
+    path.join(temporaryDirectory, "language-syntax.json"),
+  );
+  generateAndCompare(grammarDirectory, temporaryDirectory);
+  generateAndCompare(idlGrammarDirectory, temporaryDirectory);
 
   for (const [file, grammar] of textMateGrammars()) {
     const actual = read(path.join(vscodeDirectory, "syntaxes", file));
@@ -383,45 +515,81 @@ function checkGeneratedFiles(temporaryDirectory) {
   }
 }
 
+function parseExamples(grammar, files, environment, expectedSuccess) {
+  const result = spawnSync(
+    "tree-sitter",
+    [
+      "parse",
+      "--grammar-path",
+      grammar,
+      "--json-summary",
+      ...files,
+    ],
+    {
+      cwd: repositoryDirectory,
+      encoding: "utf8",
+      maxBuffer: 16 * 1024 * 1024,
+      env: environment,
+    },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  const jsonStart = result.stdout.indexOf('{\n  "parse_summaries"');
+  assert(jsonStart >= 0, "Tree-sitter did not emit a JSON parse summary");
+  const summary = JSON.parse(result.stdout.slice(jsonStart));
+  assert(
+    summary.source_count === files.length,
+    "Tree-sitter did not parse every required example",
+  );
+  const matchesExpectation = summary.parse_summaries.every(
+    (item) => item.successful === expectedSuccess,
+  );
+  assert(
+    matchesExpectation,
+    expectedSuccess
+      ? "A required example contains ERROR or MISSING nodes"
+      : "NIDL unexpectedly accepted comment syntax in at least one invalid fixture",
+  );
+}
+
 function validateExamplesAndQueries(temporaryDirectory) {
   const environment = {
     ...process.env,
     XDG_CACHE_HOME: path.join(temporaryDirectory, "cache"),
   };
-  const parse = run(
-    "tree-sitter",
-    [
-      "parse",
-      "--grammar-path",
-      grammarDirectory,
-      "--json-summary",
-      ...exampleFiles,
-    ],
-    { env: environment },
-  );
-  const summary = JSON.parse(parse.stdout);
-  assert(
-    summary.source_count === exampleFiles.length,
-    "Tree-sitter did not parse every required example",
-  );
-  assert(
-    summary.parse_summaries.every((item) => item.successful),
-    "A required example contains ERROR or MISSING nodes",
+  parseExamples(grammarDirectory, nexaExamples, environment, true);
+  parseExamples(idlGrammarDirectory, nidlExamples, environment, true);
+  parseExamples(
+    idlGrammarDirectory,
+    invalidNidlExamples,
+    environment,
+    false,
   );
 
-  for (const [query, example] of queryChecks) {
-    run(
+  for (const [grammar, query, example, expectedCaptures] of queryChecks) {
+    const result = run(
       "tree-sitter",
       [
         "query",
         "--grammar-path",
-        grammarDirectory,
-        "--quiet",
+        grammar,
         path.join(editorsDirectory, query),
         example,
       ],
       { env: environment },
     );
+    const observedCaptures = new Set(
+      [...result.stdout.matchAll(/^\s*capture:\s+\d+\s+-\s+([\w.-]+),/gm)].map(
+        (match) => match[1],
+      ),
+    );
+    for (const capture of expectedCaptures) {
+      assert(
+        observedCaptures.has(capture),
+        `${query} did not emit expected @${capture} capture for ${example}`,
+      );
+    }
   }
 }
 
@@ -430,6 +598,7 @@ const temporaryDirectory = fs.mkdtempSync(
 );
 try {
   validateJsonFiles();
+  validatePackageScripts();
   validateContributions();
   validateZedFiles();
   validateSyntaxContract();
@@ -437,7 +606,7 @@ try {
   checkGeneratedFiles(temporaryDirectory);
   validateExamplesAndQueries(temporaryDirectory);
   console.log(
-    `Nexa editor support check passed (${exampleFiles.length} examples, ${queryChecks.length} queries).`,
+    `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${nidlExamples.length} NIDL examples, ${invalidNidlExamples.length} rejected NIDL comment fixtures, ${queryChecks.length} queries).`,
   );
 } finally {
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });

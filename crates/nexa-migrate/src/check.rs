@@ -1,7 +1,7 @@
 use std::fmt;
 
 use nexa_bytecode::{DecodeLimits, ValueType};
-use nexa_core::StableId;
+use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     MigrationLimits, OfflineStateField, OfflineStateObject, OfflineStateValue, StateHandle,
     StatefulDomainId, run_offline_migration,
@@ -26,8 +26,8 @@ pub struct MigrateCheckConfig {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct MigrateCheckResult {
-    pub old_schema_hash: u64,
-    pub new_schema_hash: u64,
+    pub old_schema_fingerprint: StateSchemaFingerprint,
+    pub new_schema_fingerprint: StateSchemaFingerprint,
     pub migration_entry: u32,
     pub migration_hash: u64,
     pub final_state_hash: u64,
@@ -142,8 +142,8 @@ pub fn run_migrate_check(
         .then(|| diff_state(&fixture, &output_state));
     let final_object_count = output_state.objects.len();
     Ok(MigrateCheckResult {
-        old_schema_hash: old_module.module().state_schema.stable_hash().0,
-        new_schema_hash: new_module.module().state_schema.stable_hash().0,
+        old_schema_fingerprint: old_module.module().state_schema_fingerprint,
+        new_schema_fingerprint: new_module.module().state_schema_fingerprint,
         migration_entry,
         migration_hash: output.migration_hash.0,
         final_state_hash: output.final_state_hash.0,
@@ -407,21 +407,33 @@ mod tests {
         .unwrap();
         let new = nexa_compiler::compile(
             "@stateful class Store { value: i32; }
-             migration fn migrate() -> bool {
+             pub migration fn migrate() -> bool {
                  finish_migration();
                  return true;
              }",
         )
         .unwrap();
+        let store_type = old
+            .module()
+            .state_schema
+            .types
+            .first()
+            .expect("compiled Store state type");
+        let store_type_id = store_type.stable_id;
+        let value_field_id = store_type
+            .fields
+            .first()
+            .expect("compiled Store.value state field")
+            .stable_id;
         let fixture = serde_json::to_vec(&json!({
             "format_version": 1,
             "stateful_domain": 7,
             "objects": [{
                 "stable_id": StableId::from_name("store").0,
-                "type_id": StableId::from_name("Store").0,
+                "type_id": store_type_id.0,
                 "generation": 0,
                 "fields": [{
-                    "stable_id": StableId::from_parts(&["Store", "::", "value"]).0,
+                    "stable_id": value_field_id.0,
                     "value": {"type": "i32", "value": 41}
                 }]
             }]
@@ -439,7 +451,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.old_schema_hash, result.new_schema_hash);
+        assert_eq!(result.old_schema_fingerprint, result.new_schema_fingerprint);
         assert_eq!(result.migration_entry, 0);
         assert_eq!(result.output_state.as_ref().unwrap().objects.len(), 1);
         assert_eq!(

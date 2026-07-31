@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::contract::{ExportRequirement, HostContract};
 use crate::development::DevelopmentConfig;
@@ -15,9 +16,10 @@ pub struct NexaEngineBuilder {
     pub(crate) entitlements: Box<dyn EntitlementResolver>,
     pub(crate) storage_dir: Option<PathBuf>,
     pub(crate) runtime_host_capacity: usize,
-    pub(crate) runtime_host: Option<nexa_runtime::RuntimeHost>,
+    pub(crate) runtime_host: Option<nexa::prelude::RuntimeHost>,
     pub(crate) development: DevelopmentConfig,
     pub(crate) required_exports: Vec<ExportRequirement>,
+    pub(crate) host_contract_source: Option<(nexa::SourceIdentity, Arc<str>)>,
 }
 
 impl NexaEngineBuilder {
@@ -35,6 +37,7 @@ impl NexaEngineBuilder {
                 ..DevelopmentConfig::default()
             },
             required_exports: Vec::new(),
+            host_contract_source: None,
         }
     }
 
@@ -70,7 +73,7 @@ impl NexaEngineBuilder {
 
     pub(crate) fn runtime_host_for_evidence(
         mut self,
-        runtime_host: nexa_runtime::RuntimeHost,
+        runtime_host: nexa::prelude::RuntimeHost,
     ) -> Self {
         self.runtime_host = Some(runtime_host);
         self
@@ -83,8 +86,22 @@ impl NexaEngineBuilder {
     }
 
     #[must_use]
-    pub fn require_export<E: nexa_runtime::ScriptExport>(mut self) -> Self {
+    pub fn require_export<E: nexa::ScriptExport>(mut self) -> Self {
         self.required_exports.push(ExportRequirement::of::<E>());
+        self
+    }
+
+    /// Uses the exact standalone `.nidl` source snapshot for fingerprints and compilation.
+    ///
+    /// [`Self::build`] rejects a source which is not standalone or does not parse to the
+    /// generated [`HostContract`] supplied to [`crate::NexaEngine::builder`].
+    #[must_use]
+    pub fn host_contract_source(
+        mut self,
+        identity: nexa::SourceIdentity,
+        text: impl Into<Arc<str>>,
+    ) -> Self {
+        self.host_contract_source = Some((identity, text.into()));
         self
     }
 

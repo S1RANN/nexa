@@ -1,8 +1,10 @@
 //! Minimal high-level Nexa embedding example.
 
+use std::sync::Arc;
+
 use nexa_embed::{
-    ActivationPolicy, ActivationSet, CapabilitySet, MemorySource, NexaEngine, PackageId,
-    PackagePolicy, PackageRuntimeLimits, SourceId, TrustLevel,
+    ActivationPolicy, ActivationSet, CapabilitySet, MemoryPackage, MemorySource, NexaEngine,
+    PackageId, PackagePolicy, PackageRuntimeLimits, SourceId, SourceIdentity, TrustLevel,
 };
 
 #[allow(dead_code)]
@@ -38,11 +40,19 @@ fn policy() -> PackagePolicy {
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let source = MemorySource::new(SourceId::new("hello")?, policy()).package(
-        "schema=1\nid='example.hello'\nname='Hello'\nversion='1.0.0'\n\
-         entry='hello.nexa'\nactivation='required'\ncapabilities=[]\nhandler_fuel=1024\n",
-        include_str!("../hello.nexa"),
+        MemoryPackage::new(
+            "hello",
+            "schema=2\nkind='application'\nid='example.hello'\nname='Hello'\nversion='1.0.0'\n\
+             source_root='src'\nentry='examples.hello'\nactivation='required'\npriority=0\n\
+             capabilities=[]\nhandler_fuel=1024\n",
+        )
+        .source("src/examples/hello.nexa", include_str!("../hello.nexa")),
     );
     let mut engine = NexaEngine::builder(generated::contract())
+        .host_contract_source(
+            SourceIdentity::standalone("examples/hello-runtime/hello_api.nidl"),
+            Arc::<str>::from(include_str!("../hello_api.nidl")),
+        )
         .host_factory(|_: &nexa_embed::PackageContext| generated::registry(StdoutConsole))
         .package_source(source)
         .require_export::<generated::Main>()

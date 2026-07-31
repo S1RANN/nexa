@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2703","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2703","expected":{"primary_text":"missing.target","secondary_count":0,"message_contains":"unknown module import","notes":[]}}

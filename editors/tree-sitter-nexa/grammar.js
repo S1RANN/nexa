@@ -3,17 +3,11 @@ const syntax = require("../language-syntax.json");
 const nexaKeywords = Object.fromEntries(
   [
     ...syntax.nexa.declarationKeywords,
+    ...syntax.nexa.visibilityKeywords,
     ...syntax.nexa.effectKeywords,
     ...syntax.nexa.statementKeywords,
     ...syntax.nexa.attributeKeywords,
     ...syntax.nexa.literalKeywords,
-  ].map((keyword) => [keyword, keyword]),
-);
-const nidlKeywords = Object.fromEntries(
-  [
-    ...syntax.nidl.declarationKeywords,
-    ...syntax.nidl.modeKeywords,
-    ...syntax.nidl.policyKeywords,
   ].map((keyword) => [keyword, keyword]),
 );
 const dottedMigrationIntrinsics = syntax.nexa.migrationIntrinsics.filter(
@@ -24,58 +18,69 @@ const bareMigrationIntrinsics = syntax.nexa.migrationIntrinsics.filter(
 );
 
 const PREC = {
-  EQUALITY: 1,
-  ADDITIVE: 2,
-  MULTIPLICATIVE: 3,
-  AWAIT: 4,
-  WITH: 5,
-  TRY: 6,
-  CALL: 7,
+  LOGICAL_OR: 1,
+  LOGICAL_AND: 2,
+  EQUALITY: 3,
+  COMPARISON: 4,
+  ADDITIVE: 5,
+  MULTIPLICATIVE: 6,
+  UNARY: 7,
+  AWAIT: 8,
+  WITH: 9,
+  TRY: 10,
+  CALL: 11,
 };
 
 module.exports = grammar({
   name: "nexa",
 
-  extras: ($) => [/\s/],
+  extras: ($) => [
+    /[\s\uFEFF\u2060\u200B]/,
+    $.doc_comment,
+    $.line_comment,
+    $.block_comment,
+  ],
 
   word: ($) => $.lower_identifier,
 
-  supertypes: ($) => [
-    $.declaration,
-    $.statement,
-    $.expression,
-    $.type,
-    $.nidl_member,
-    $.nidl_type,
-  ],
+  supertypes: ($) => [$.declaration, $.statement, $.expression, $.type],
 
   rules: {
-    source_file: ($) => choice($.nexa_module, $.nidl_document),
-
-    nexa_module: ($) =>
-      choice(
-        seq(
-          $.module_declaration,
-          repeat($.import_declaration),
-          repeat($.declaration),
-        ),
-        seq(repeat1($.import_declaration), repeat($.declaration)),
-        repeat1($.declaration),
+    source_file: ($) =>
+      seq(
+        optional($.module_declaration),
+        repeat($.import_declaration),
+        repeat($.declaration),
       ),
+
+    doc_comment: (_) => token(prec(2, /\/\/\/[^\n\r]*/)),
+    line_comment: (_) => token(prec(1, /\/\/[^\n\r]*/)),
+    block_comment: (_) => token(seq("/*", /[^*]*\*+([^/*][^*]*\*+)*/, "/")),
 
     module_declaration: ($) =>
       seq(
         field("keyword", $.module_keyword),
-        field("name", choice($.identifier, $.qualified_identifier)),
+        field("name", $.module_path),
         ";",
       ),
 
     import_declaration: ($) =>
       seq(
         field("keyword", $.import_keyword),
-        field("name", choice($.identifier, $.qualified_identifier)),
+        field("name", choice($.module_path, $.host_module)),
+        optional(
+          seq(
+            field("alias_keyword", $.as_keyword),
+            field("alias", $.lower_identifier),
+          ),
+        ),
         ";",
       ),
+
+    module_path: ($) =>
+      prec.left(seq($.lower_identifier, repeat(seq(".", $.lower_identifier)))),
+
+    host_module: (_) => "host",
 
     declaration: ($) =>
       choice(
@@ -83,30 +88,15 @@ module.exports = grammar({
         $.enum_declaration,
         $.class_declaration,
         $.function_declaration,
+        $.const_declaration,
       ),
 
-    struct_declaration: ($) =>
-      seq(
-        optional($.stateful_attribute),
-        field("keyword", $.struct_keyword),
-        field("name", $.type_identifier),
-        field("body", $.field_declaration_block),
-      ),
-
-    class_declaration: ($) =>
-      seq(
-        optional($.stateful_attribute),
-        field("keyword", $.class_keyword),
-        field("name", $.type_identifier),
-        field("body", $.field_declaration_block),
-      ),
-
-    enum_declaration: ($) =>
-      seq(
-        optional($.stateful_attribute),
-        field("keyword", $.enum_keyword),
-        field("name", $.type_identifier),
-        field("body", $.enum_variant_block),
+    attribute: ($) =>
+      choice(
+        $.stateful_attribute,
+        $.activation_attribute,
+        $.stable_attribute,
+        $.test_attribute,
       ),
 
     stateful_attribute: ($) =>
@@ -119,11 +109,69 @@ module.exports = grammar({
     activation_attribute: ($) =>
       seq("@", field("name", $.activation_keyword)),
 
+    stable_attribute: ($) =>
+      seq(
+        "@",
+        field("name", $.stable_keyword),
+        "(",
+        field("identity", $.string_literal),
+        ")",
+      ),
+
+    test_attribute: ($) => seq("@", field("name", $.test_keyword)),
+
+    visibility: ($) =>
+      choice(
+        $.pub_keyword,
+        seq($.pub_keyword, "(", $.package_keyword, ")"),
+      ),
+
+    struct_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional(field("visibility", $.visibility)),
+        field("keyword", $.struct_keyword),
+        field("name", $.type_identifier),
+        field("body", $.field_declaration_block),
+      ),
+
+    class_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional(field("visibility", $.visibility)),
+        field("keyword", $.class_keyword),
+        field("name", $.type_identifier),
+        field("body", $.field_declaration_block),
+      ),
+
+    enum_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional(field("visibility", $.visibility)),
+        field("keyword", $.enum_keyword),
+        field("name", $.type_identifier),
+        field("body", $.enum_variant_block),
+      ),
+
+    const_declaration: ($) =>
+      seq(
+        repeat($.attribute),
+        optional(field("visibility", $.visibility)),
+        field("keyword", $.const_keyword),
+        field("name", $.identifier),
+        ":",
+        field("type", $.type),
+        "=",
+        field("value", $.expression),
+        ";",
+      ),
+
     field_declaration_block: ($) =>
       seq("{", repeat($.field_declaration), "}"),
 
     field_declaration: ($) =>
       seq(
+        repeat($.stable_attribute),
         field("name", $.identifier),
         ":",
         field("type", $.type),
@@ -141,7 +189,8 @@ module.exports = grammar({
 
     function_declaration: ($) =>
       seq(
-        optional($.activation_attribute),
+        repeat($.attribute),
+        optional(field("visibility", $.visibility)),
         optional(field("effect", $.effect_keyword)),
         field("keyword", $.function_keyword),
         field("name", $.identifier),
@@ -151,15 +200,10 @@ module.exports = grammar({
         field("body", $.block),
       ),
 
-    parameter_list: ($) =>
-      seq("(", optional(commaSep1($.parameter)), ")"),
+    parameter_list: ($) => seq("(", optional(commaSep1($.parameter)), ")"),
 
     parameter: ($) =>
-      seq(
-        field("name", $.identifier),
-        ":",
-        field("type", $.type),
-      ),
+      seq(field("name", $.identifier), ":", field("type", $.type)),
 
     block: ($) => seq("{", repeat($.statement), "}"),
 
@@ -170,6 +214,8 @@ module.exports = grammar({
         $.if_statement,
         $.for_statement,
         $.while_statement,
+        $.break_statement,
+        $.continue_statement,
         $.yield_statement,
         $.defer_statement,
         $.assignment_statement,
@@ -196,7 +242,10 @@ module.exports = grammar({
           field("condition", $.expression),
           field("consequence", $.block),
           optional(
-            seq($.else_keyword, field("alternative", $.block)),
+            seq(
+              $.else_keyword,
+              field("alternative", choice($.block, $.if_statement)),
+            ),
           ),
         ),
       ),
@@ -206,9 +255,9 @@ module.exports = grammar({
         $.for_keyword,
         field("variable", $.identifier),
         $.in_keyword,
-        field("start", $.integer_literal),
+        field("start", $.expression),
         "..",
-        field("end", $.integer_literal),
+        field("end", $.expression),
         field("body", $.block),
       ),
 
@@ -219,6 +268,8 @@ module.exports = grammar({
         field("body", $.block),
       ),
 
+    break_statement: ($) => seq($.break_keyword, ";"),
+    continue_statement: ($) => seq($.continue_keyword, ";"),
     yield_statement: ($) => seq($.yield_keyword, ";"),
 
     defer_statement: ($) =>
@@ -247,6 +298,7 @@ module.exports = grammar({
         $.with_expression,
         $.try_expression,
         $.binary_expression,
+        $.unary_expression,
         $.call_expression,
         $.generic_name,
         $.member_expression,
@@ -260,10 +312,7 @@ module.exports = grammar({
       ),
 
     await_expression: ($) =>
-      prec(
-        PREC.AWAIT,
-        seq($.await_keyword, field("value", $.expression)),
-      ),
+      prec(PREC.AWAIT, seq($.await_keyword, field("value", $.expression))),
 
     match_expression: ($) =>
       prec.right(
@@ -314,15 +363,9 @@ module.exports = grammar({
             ...dottedMigrationIntrinsics.map((intrinsic) => {
               const [namespace, functionName] = intrinsic.split(".");
               return seq(
-                field(
-                  "namespace",
-                  alias(namespace, $.migration_namespace),
-                ),
+                field("namespace", alias(namespace, $.migration_namespace)),
                 ".",
-                field(
-                  "function",
-                  alias(functionName, $.migration_function),
-                ),
+                field("function", alias(functionName, $.migration_function)),
               );
             }),
           ),
@@ -331,21 +374,21 @@ module.exports = grammar({
         ),
       ),
 
-    collection_type: ($) =>
+    collection_type: (_) =>
       choice(
         ...syntax.nexa.builtinTypes.filter((type) =>
           ["Array", "Map"].includes(type),
         ),
       ),
 
-    migration_namespace: ($) =>
+    migration_namespace: (_) =>
       choice(
         ...new Set(
           dottedMigrationIntrinsics.map((intrinsic) => intrinsic.split(".")[0]),
         ),
       ),
 
-    migration_function: ($) =>
+    migration_function: (_) =>
       choice(
         ...new Set(
           dottedMigrationIntrinsics.map((intrinsic) => intrinsic.split(".")[1]),
@@ -362,7 +405,7 @@ module.exports = grammar({
         ),
       ),
 
-    migration_intrinsic_name: ($) => choice(...bareMigrationIntrinsics),
+    migration_intrinsic_name: (_) => choice(...bareMigrationIntrinsics),
 
     constructor_expression: ($) =>
       prec(
@@ -388,7 +431,7 @@ module.exports = grammar({
         ),
       ),
 
-    constructor_name: ($) => choice(...syntax.nexa.constructors),
+    constructor_name: (_) => choice(...syntax.nexa.constructors),
 
     struct_literal: ($) =>
       prec(
@@ -424,30 +467,18 @@ module.exports = grammar({
 
     binary_expression: ($) =>
       choice(
-        prec.left(
-          PREC.EQUALITY,
-          seq(
-            field("left", $.expression),
-            field("operator", alias("==", $.operator)),
-            field("right", $.expression),
-          ),
-        ),
-        prec.left(
-          PREC.ADDITIVE,
-          seq(
-            field("left", $.expression),
-            field("operator", alias(choice("+", "-"), $.operator)),
-            field("right", $.expression),
-          ),
-        ),
-        prec.left(
-          PREC.MULTIPLICATIVE,
-          seq(
-            field("left", $.expression),
-            field("operator", alias(choice("*", "/"), $.operator)),
-            field("right", $.expression),
-          ),
-        ),
+        binary($, PREC.LOGICAL_OR, "||"),
+        binary($, PREC.LOGICAL_AND, "&&"),
+        binary($, PREC.EQUALITY, choice("==", "!=")),
+        binary($, PREC.COMPARISON, choice("<", "<=", ">", ">=")),
+        binary($, PREC.ADDITIVE, choice("+", "-")),
+        binary($, PREC.MULTIPLICATIVE, choice("*", "/")),
+      ),
+
+    unary_expression: ($) =>
+      prec(
+        PREC.UNARY,
+        seq(field("operator", alias(choice("!", "-"), $.operator)), $.expression),
       ),
 
     call_expression: ($) =>
@@ -467,8 +498,7 @@ module.exports = grammar({
         ),
       ),
 
-    argument_list: ($) =>
-      seq("(", optional(commaSep1($.expression)), ")"),
+    argument_list: ($) => seq("(", optional(commaSep1($.expression)), ")"),
 
     generic_name: ($) =>
       prec(
@@ -498,224 +528,135 @@ module.exports = grammar({
     parenthesized_expression: ($) => seq("(", $.expression, ")"),
 
     type: ($) =>
-      choice($.builtin_type, $.generic_type, $.type_identifier),
+      choice(
+        $.builtin_type,
+        $.generic_type,
+        $.type_identifier,
+        $.qualified_type_identifier,
+      ),
 
     generic_type: ($) =>
       seq(
-        field("name", choice($.builtin_type, $.type_identifier)),
+        field(
+          "name",
+          choice(
+            $.builtin_type,
+            $.type_identifier,
+            $.qualified_type_identifier,
+          ),
+        ),
         field("arguments", $.type_argument_list),
       ),
 
     type_argument_list: ($) => seq("<", commaSep1($.type), ">"),
 
-    qualified_identifier: ($) =>
+    qualified_type_identifier: ($) =>
       prec.left(
-        seq($.identifier, repeat1(seq(".", $.identifier))),
+        seq($.lower_identifier, repeat1(seq(".", $.identifier))),
       ),
+
+    qualified_identifier: ($) =>
+      prec.left(seq($.identifier, repeat1(seq(".", $.identifier)))),
 
     type_identifier: ($) => $.identifier,
-
     identifier: ($) => choice($.lower_identifier, $.upper_identifier),
-
-    lower_identifier: ($) => /[a-z_][A-Za-z0-9_]*/,
-
-    upper_identifier: ($) => /[A-Z][A-Za-z0-9_]*/,
-
-    builtin_type: ($) => choice(...syntax.nexa.builtinTypes),
-
-    boolean_literal: ($) => choice(...syntax.nexa.literalKeywords),
-
-    integer_literal: ($) => /[0-9]+/,
-
-    float_literal: ($) => /[0-9]+\.[0-9]+/,
+    lower_identifier: (_) => /[a-z_][A-Za-z0-9_]*/,
+    upper_identifier: (_) => /[A-Z][A-Za-z0-9_]*/,
+    builtin_type: (_) => choice(...syntax.nexa.builtinTypes),
+    boolean_literal: (_) => choice(...syntax.nexa.literalKeywords),
+    integer_literal: (_) => /[0-9]+/,
+    float_literal: (_) => /[0-9]+\.[0-9]+/,
 
     string_literal: ($) =>
-      token(seq('"', repeat(choice(/[^"\\]/, /\\[nrt\\"]/)), '"')),
+      seq(
+        '"',
+        repeat(
+          choice(
+            $.string_content,
+            $.escape_sequence,
+            $.interpolation,
+            alias("$", $.string_content),
+          ),
+        ),
+        '"',
+      ),
 
-    rune_literal: ($) =>
+    string_content: (_) => token.immediate(prec(1, /[^"\\$]+/)),
+    escape_sequence: (_) =>
+      token.immediate(/\\(?:[nrt\\"']|\$\{)/),
+    interpolation: ($) =>
+      seq(
+        token.immediate("${"),
+        field("expression", $.expression),
+        "}",
+      ),
+
+    rune_literal: (_) =>
       token(seq("'", choice(/[^'\\]/, /\\[nrt\\']/), "'")),
 
-    module_keyword: ($) => nexaKeywords.module,
-    import_keyword: ($) => nexaKeywords.import,
-    function_keyword: ($) => nexaKeywords.fn,
-    struct_keyword: ($) => nexaKeywords.struct,
-    enum_keyword: ($) => nexaKeywords.enum,
-    class_keyword: ($) => nexaKeywords.class,
-    effect_keyword: ($) => choice(...syntax.nexa.effectKeywords),
-    stateful_keyword: ($) => nexaKeywords.stateful,
-    activation_keyword: ($) => nexaKeywords.activation,
-    return_keyword: ($) => nexaKeywords.return,
-    let_keyword: ($) => nexaKeywords.let,
-    var_keyword: ($) => nexaKeywords.var,
-    if_keyword: ($) => nexaKeywords.if,
-    else_keyword: ($) => nexaKeywords.else,
-    while_keyword: ($) => nexaKeywords.while,
-    match_keyword: ($) => nexaKeywords.match,
-    with_keyword: ($) => nexaKeywords.with,
-    new_keyword: ($) => nexaKeywords.new,
-    await_keyword: ($) => nexaKeywords.await,
-    yield_keyword: ($) => nexaKeywords.yield,
-    defer_keyword: ($) => nexaKeywords.defer,
-    for_keyword: ($) => nexaKeywords.for,
-    in_keyword: ($) => nexaKeywords.in,
+    module_keyword: (_) => nexaKeywords.module,
+    import_keyword: (_) => nexaKeywords.import,
+    as_keyword: (_) => nexaKeywords.as,
+    function_keyword: (_) => nexaKeywords.fn,
+    struct_keyword: (_) => nexaKeywords.struct,
+    enum_keyword: (_) => nexaKeywords.enum,
+    class_keyword: (_) => nexaKeywords.class,
+    const_keyword: (_) => nexaKeywords.const,
+    pub_keyword: (_) => nexaKeywords.pub,
+    package_keyword: (_) => nexaKeywords.package,
+    effect_keyword: (_) => choice(...syntax.nexa.effectKeywords),
+    stateful_keyword: (_) => nexaKeywords.stateful,
+    activation_keyword: (_) => nexaKeywords.activation,
+    stable_keyword: (_) => nexaKeywords.stable,
+    test_keyword: (_) => nexaKeywords.test,
+    return_keyword: (_) => nexaKeywords.return,
+    let_keyword: (_) => nexaKeywords.let,
+    var_keyword: (_) => nexaKeywords.var,
+    if_keyword: (_) => nexaKeywords.if,
+    else_keyword: (_) => nexaKeywords.else,
+    while_keyword: (_) => nexaKeywords.while,
+    match_keyword: (_) => nexaKeywords.match,
+    with_keyword: (_) => nexaKeywords.with,
+    new_keyword: (_) => nexaKeywords.new,
+    await_keyword: (_) => nexaKeywords.await,
+    yield_keyword: (_) => nexaKeywords.yield,
+    defer_keyword: (_) => nexaKeywords.defer,
+    for_keyword: (_) => nexaKeywords.for,
+    in_keyword: (_) => nexaKeywords.in,
+    break_keyword: (_) => nexaKeywords.break,
+    continue_keyword: (_) => nexaKeywords.continue,
 
-    nidl_document: ($) =>
-      seq(
-        field("keyword", $.interface_keyword),
-        field("name", $.nidl_type_identifier),
-        "{",
-        repeat($.nidl_member),
-        "}",
-      ),
-
-    nidl_member: ($) =>
+    return_arrow_operator: (_) => "->",
+    match_arrow_operator: (_) => "=>",
+    operator: (_) =>
       choice(
-        $.opaque_declaration,
-        $.nidl_struct_declaration,
-        $.nidl_enum_declaration,
-        $.host_function_declaration,
-        $.export_declaration,
+        "||",
+        "&&",
+        "==",
+        "!=",
+        "<",
+        "<=",
+        ">",
+        ">=",
+        "+",
+        "-",
+        "*",
+        "/",
+        "!",
       ),
-
-    opaque_declaration: ($) =>
-      seq(
-        field("keyword", $.opaque_keyword),
-        field("name", $.nidl_type_identifier),
-        ";",
-      ),
-
-    nidl_struct_declaration: ($) =>
-      seq(
-        field("keyword", $.nidl_struct_keyword),
-        field("name", $.nidl_type_identifier),
-        "{",
-        repeat($.nidl_field_declaration),
-        "}",
-      ),
-
-    nidl_field_declaration: ($) =>
-      seq(
-        field("name", $.nidl_identifier),
-        ":",
-        field("type", $.nidl_type),
-        ";",
-      ),
-
-    nidl_enum_declaration: ($) =>
-      seq(
-        field("keyword", $.nidl_enum_keyword),
-        field("name", $.nidl_type_identifier),
-        "{",
-        repeat(seq($.nidl_enum_variant, optional(","))),
-        "}",
-      ),
-
-    nidl_enum_variant: ($) =>
-      seq(
-        field("name", $.nidl_identifier),
-        optional(seq("(", field("payload", $.nidl_type), ")")),
-      ),
-
-    host_function_declaration: ($) =>
-      seq(
-        field("mode", $.host_mode_keyword),
-        optional($.request_policy),
-        optional($.fuel_clause),
-        field("keyword", $.nidl_function_keyword),
-        field("name", $.nidl_identifier),
-        field("parameters", $.nidl_parameter_list),
-        field("arrow", $.return_arrow_operator),
-        field("return_type", $.nidl_type),
-        ";",
-      ),
-
-    request_policy: ($) =>
-      seq(
-        "(",
-        field("cancel", $.cancel_policy_keyword),
-        ",",
-        field("abandon", $.abandon_policy_keyword),
-        ")",
-      ),
-
-    fuel_clause: ($) =>
-      seq($.fuel_keyword, field("amount", $.integer_literal)),
-
-    nidl_parameter_list: ($) =>
-      seq("(", optional(commaSep1($.nidl_parameter)), ")"),
-
-    nidl_parameter: ($) =>
-      seq(
-        field("name", $.nidl_identifier),
-        ":",
-        field("type", $.nidl_type),
-      ),
-
-    export_declaration: ($) =>
-      seq(
-        field("keyword", $.export_keyword),
-        field("name", $.nidl_identifier),
-        field("parameters", $.nidl_parameter_list),
-        field("arrow", $.return_arrow_operator),
-        field("return_type", choice($.nidl_type, $.void_type)),
-        ";",
-      ),
-
-    nidl_type: ($) =>
-      choice(
-        $.nidl_builtin_type,
-        $.nidl_generic_type,
-        $.nidl_type_identifier,
-      ),
-
-    nidl_generic_type: ($) =>
-      seq(
-        field("name", choice($.nidl_builtin_type, $.nidl_type_identifier)),
-        field("arguments", $.nidl_type_argument_list),
-      ),
-
-    nidl_type_argument_list: ($) =>
-      seq("<", commaSep1($.nidl_type), ">"),
-
-    nidl_type_identifier: ($) => $.nidl_identifier,
-
-    nidl_identifier: ($) => /[^{}(),:;<>\s-]+/,
-
-    interface_keyword: ($) => nidlKeywords.interface,
-    opaque_keyword: ($) => nidlKeywords.opaque,
-    nidl_struct_keyword: ($) => nidlKeywords.struct,
-    nidl_enum_keyword: ($) => nidlKeywords.enum,
-    nidl_function_keyword: ($) => nidlKeywords.fn,
-    export_keyword: ($) => nidlKeywords.export,
-    host_mode_keyword: ($) =>
-      choice(
-        ...syntax.nidl.modeKeywords.filter((keyword) => keyword !== "fuel"),
-      ),
-    fuel_keyword: ($) => nidlKeywords.fuel,
-    cancel_policy_keyword: ($) =>
-      choice(
-        ...syntax.nidl.policyKeywords.filter((keyword) => keyword !== "trap"),
-      ),
-    abandon_policy_keyword: ($) =>
-      choice(
-        ...syntax.nidl.policyKeywords.filter(
-          (keyword) => keyword !== "cancel_task",
-        ),
-      ),
-    nidl_builtin_type: ($) =>
-      choice(
-        ...syntax.nidl.builtinTypes.filter((type) => type !== "void"),
-      ),
-    void_type: ($) =>
-      syntax.nidl.builtinTypes.find((type) => type === "void"),
-
-    return_arrow_operator: ($) => "->",
-
-    match_arrow_operator: ($) => "=>",
-
-    operator: ($) => choice("==", "+", "-", "*", "/"),
   },
 });
+
+function binary($, precedence, operator) {
+  return prec.left(
+    precedence,
+    seq(
+      field("left", $.expression),
+      field("operator", alias(operator, $.operator)),
+      field("right", $.expression),
+    ),
+  );
+}
 
 function commaSep1(rule) {
   return seq(rule, repeat(seq(",", rule)));

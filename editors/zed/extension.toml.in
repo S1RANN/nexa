@@ -1,6 +1,6 @@
 id = "nexa"
 name = "Nexa"
-version = "0.1.2"
+version = "0.2.0"
 schema_version = 1
 authors = ["Nexa Contributors"]
 description = "Syntax highlighting and structural editing for Nexa and Nexa IDL."
@@ -10,6 +10,10 @@ languages = ["languages/nexa", "languages/nexa-idl"]
 [grammars.nexa]
 repository = "{{GRAMMAR_REPOSITORY}}"
 rev = "{{GRAMMAR_REVISION}}"
+
+[grammars.nexa_idl]
+repository = "{{IDL_GRAMMAR_REPOSITORY}}"
+rev = "{{IDL_GRAMMAR_REVISION}}"
 
 [language_servers.nexa]
 name = "Nexa Language Server"

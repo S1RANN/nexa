@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use nexa_bytecode::ValueType;
 use nexa_core::StableId;
@@ -8,7 +9,20 @@ use nexa_core::StableId;
 use crate::allocation::{AllocationBoundary, MigrationAllocationPhase, observe_migration};
 use crate::interpreter::InterpreterMigration;
 use crate::reload::ReloadError;
-use crate::{GcRef, RuntimeMessage, RuntimeValue};
+use crate::{
+    GcRef, MigrationOldObjectHandle, MigrationStagingObjectHandle, RuntimeMessage, RuntimeValue,
+};
+
+static NEXT_MIGRATION_CONTEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+fn next_migration_context_token() -> u64 {
+    loop {
+        let token = NEXT_MIGRATION_CONTEXT_TOKEN.fetch_add(1, Ordering::Relaxed);
+        if token != 0 {
+            return token;
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatefulDomainId(u64);
@@ -1274,6 +1288,7 @@ pub(crate) struct MigrationContext {
     old: Arc<StatefulRegistry>,
     arena: MigrationArena,
     domain: StatefulDomainId,
+    context_token: u64,
     schema: nexa_bytecode::StateSchema,
     flags: u8,
     invalid: Option<ReloadError>,
@@ -1310,6 +1325,7 @@ impl MigrationContext {
             old: old.into(),
             arena,
             domain,
+            context_token: next_migration_context_token(),
             schema,
             flags: u8::from(schema_unchanged) * SCHEMA_UNCHANGED,
             invalid: None,
@@ -1515,7 +1531,7 @@ impl InterpreterMigration for MigrationContext {
         let _observation = self.observe_opcode(MigrationAllocationPhase::OldGet);
         self.ensure_open()?;
         let slot = self.old_slot(stable_id)?;
-        let value = slot_to_runtime_value(slot);
+        let value = slot_to_runtime_value(self.context_token, slot);
         if runtime_state_type(value) != expected {
             return Err("old state type does not match migration opcode".into());
         }
@@ -1532,15 +1548,15 @@ impl InterpreterMigration for MigrationContext {
     ) -> Result<RuntimeValue, RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::OldFieldGet);
         self.ensure_open()?;
-        let RuntimeValue::Opaque {
-            type_id,
-            value: stable_id,
-        } = object
-        else {
+        let RuntimeValue::MigrationOldObject(object) = object else {
             return Err("STATE_OLD_FIELD_GET requires an old state object".into());
         };
-        let slot = self.old_slot(StableId(stable_id))?;
-        if slot.scalar.is_some() || slot.type_id != type_id {
+        let (context, stable_id, type_id, generation) = object.parts();
+        if context != self.context_token {
+            return Err("old state object belongs to another migration".into());
+        }
+        let slot = self.old_slot(stable_id)?;
+        if slot.scalar.is_some() || slot.type_id != type_id || slot.generation != generation {
             return Err("old state object type mismatch".into());
         }
         let fields = self.old.object_fields(slot);
@@ -1590,10 +1606,10 @@ impl InterpreterMigration for MigrationContext {
         self.set_flag(TOUCHED);
         self.arena.usage_report.objects_created =
             self.arena.usage_report.objects_created.saturating_add(1);
-        Ok(RuntimeValue::Opaque {
-            type_id,
-            value: stable_id.0,
-        })
+        let generation = self.arena.objects[index].generation;
+        Ok(RuntimeValue::MigrationStagingObject(
+            MigrationStagingObjectHandle::new(self.context_token, stable_id, type_id, generation),
+        ))
     }
 
     fn new_set(
@@ -1604,22 +1620,22 @@ impl InterpreterMigration for MigrationContext {
     ) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::NewSet);
         self.ensure_open()?;
-        let RuntimeValue::Opaque {
-            type_id,
-            value: object_id,
-        } = object
-        else {
+        let RuntimeValue::MigrationStagingObject(object) = object else {
             return Err("STATE_NEW_SET requires a staging object".into());
         };
-        let value = runtime_to_state_value(value, &self.arena, self.domain)?;
+        let (context, object_id, type_id, generation) = object.parts();
+        if context != self.context_token {
+            return Err("staging object belongs to another migration".into());
+        }
         let object_index = self
             .arena
-            .object_index(StableId(object_id))
+            .object_index(object_id)
             .map_err(|_| RuntimeMessage::Static("staging object does not exist"))?;
         let slot = &self.arena.objects[object_index];
-        if slot.scalar.is_some() || slot.type_id != type_id {
+        if slot.scalar.is_some() || slot.type_id != type_id || slot.generation != generation {
             return Err("staging object type mismatch".into());
         }
+        let value = runtime_to_state_value(value, &self.arena, self.domain)?;
         let expected = self
             .schema
             .types
@@ -1764,19 +1780,22 @@ impl InterpreterMigration for MigrationContext {
     fn replace(&mut self, old_id: StableId, target: RuntimeValue) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::Replace);
         self.ensure_open()?;
-        let RuntimeValue::Opaque {
-            value: target_id, ..
-        } = target
-        else {
+        let RuntimeValue::MigrationStagingObject(target) = target else {
             return Err("STATE_REPLACE requires a staging object".into());
         };
-        let target_id = StableId(target_id);
+        let (context, target_id, type_id, generation) = target.parts();
+        if context != self.context_token {
+            return Err("staging object belongs to another migration".into());
+        }
         let target_index = self
             .arena
             .object_index(target_id)
             .map_err(|_| RuntimeMessage::Static("remap target does not exist"))?;
-        if self.arena.objects[target_index].scalar.is_some() {
-            return Err("remap target is not an object".into());
+        if self.arena.objects[target_index].scalar.is_some()
+            || self.arena.objects[target_index].type_id != type_id
+            || self.arena.objects[target_index].generation != generation
+        {
+            return Err("remap target is not a matching staging object".into());
         }
         let Err(forwarding_index) = self.arena.forwarding_index(old_id) else {
             self.invalid = Some(ReloadError::DuplicateForwarding);
@@ -1866,12 +1885,14 @@ impl MigrationContext {
     }
 }
 
-fn slot_to_runtime_value(slot: &MigrationObjectSlot) -> RuntimeValue {
+fn slot_to_runtime_value(context: u64, slot: &MigrationObjectSlot) -> RuntimeValue {
     slot.scalar.as_ref().map_or(
-        RuntimeValue::Opaque {
-            type_id: slot.type_id,
-            value: slot.stable_id.0,
-        },
+        RuntimeValue::MigrationOldObject(MigrationOldObjectHandle::new(
+            context,
+            slot.stable_id,
+            slot.type_id,
+            slot.generation,
+        )),
         |value| state_to_runtime_value(slot.stable_id, value),
     )
 }
@@ -1990,6 +2011,9 @@ fn runtime_to_state_value(
             stable_id,
             generation,
         })),
+        RuntimeValue::MigrationOldObject(_) | RuntimeValue::MigrationStagingObject(_) => {
+            Err("migration object handles cannot be stored in state".into())
+        }
         RuntimeValue::HostRequest(_)
         | RuntimeValue::ResourceToken(_)
         | RuntimeValue::Snapshot(_)
@@ -2010,6 +2034,12 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::Ref(_) => nexa_bytecode::ValueType::Ref,
         RuntimeValue::NamedRef { type_id, .. } | RuntimeValue::Opaque { type_id, .. } => {
             nexa_bytecode::ValueType::Named(type_id)
+        }
+        RuntimeValue::MigrationOldObject(object) => {
+            nexa_bytecode::ValueType::Named(object.parts().2)
+        }
+        RuntimeValue::MigrationStagingObject(object) => {
+            nexa_bytecode::ValueType::Named(object.parts().2)
         }
         RuntimeValue::StateHandle { handle_type, .. } => {
             nexa_bytecode::ValueType::Named(handle_type)
@@ -2140,8 +2170,8 @@ pub fn run_offline_migration(
         old,
         domain,
         new_module.module().state_schema.clone(),
-        old_module.module().state_schema.stable_hash()
-            == new_module.module().state_schema.stable_hash(),
+        old_module.module().state_schema_fingerprint
+            == new_module.module().state_schema_fingerprint,
         limits,
     )
     .map_err(OfflineMigrationError::Migration)?;
@@ -2353,8 +2383,8 @@ pub fn fuzz_migration_arena(data: &[u8]) {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, StateField,
-        StateSchema, StateType, ValueType,
+        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, StandardIntrinsic,
+        StateField, StateSchema, StateType, ValueType,
     };
     use nexa_verifier::{VerifierLimits, verify};
 
@@ -2505,15 +2535,11 @@ mod tests {
 
         let mut migration =
             MigrationContext::new(registry, domain, state_schema, false, limits()).unwrap();
+        let old_link = migration
+            .old_get(link_id, ValueType::Named(link_type))
+            .unwrap();
         let old_value = migration
-            .old_field_get(
-                RuntimeValue::Opaque {
-                    type_id: link_type,
-                    value: link_id.0,
-                },
-                next_field,
-                ValueType::Named(handle_type),
-            )
+            .old_field_get(old_link, next_field, ValueType::Named(handle_type))
             .unwrap();
         assert!(matches!(
             old_value,
@@ -2612,6 +2638,51 @@ mod tests {
         verify(module.finish(), VerifierLimits::default()).unwrap()
     }
 
+    fn heapless_scalar_helper_migration_module() -> nexa_verifier::VerifiedModule {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::Call {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+
+        let mut scalar_helper = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::F32),
+            },
+            2,
+        );
+        scalar_helper
+            .emit(Instruction::LoadF32 {
+                dst: 0,
+                bits: 3.75_f32.to_bits(),
+            })
+            .emit(Instruction::StandardIntrinsic {
+                intrinsic: StandardIntrinsic::F32Floor,
+                args_base: 0,
+                args_count: 1,
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
+
+        let mut module = ModuleBuilder::new();
+        module.function(migration.finish().unwrap());
+        module.function(scalar_helper.finish().unwrap());
+        verify(module.finish(), VerifierLimits::default()).unwrap()
+    }
+
     fn generation_context(old_generation: u32) -> (MigrationContext, StableId, RuntimeValue) {
         let type_id = StableId::from_name("GenerationLimit");
         let old_id = StableId::from_name("GenerationLimit::old");
@@ -2637,6 +2708,239 @@ mod tests {
         .unwrap();
         let target = migration.new_create(target_id, type_id).unwrap();
         (migration, old_id, target)
+    }
+
+    fn verified_object_migration(
+        state_schema: &StateSchema,
+        type_id: StableId,
+        field_id: StableId,
+        object_id: StableId,
+    ) -> nexa_verifier::VerifiedModule {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            3,
+        );
+        function
+            .effect(FunctionEffect::Migration)
+            .set_root(0)
+            .unwrap()
+            .set_root(2)
+            .unwrap()
+            .emit(Instruction::StateOldGet {
+                stable_id: object_id,
+                ty: ValueType::Named(type_id),
+                dst: 0,
+            })
+            .emit(Instruction::StateOldFieldGet {
+                object: 0,
+                field_id,
+                ty: ValueType::I32,
+                dst: 1,
+            })
+            .emit(Instruction::StateNewCreate {
+                stable_id: object_id,
+                type_id,
+                dst: 2,
+            })
+            .emit(Instruction::StateNewSet {
+                object: 2,
+                field_id,
+                source: 1,
+            })
+            .emit(Instruction::StateReplace {
+                old_id: object_id,
+                target: 2,
+            })
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+        let mut function = function.finish().unwrap();
+        function.root_maps = vec![
+            nexa_bytecode::RootMap {
+                pc: 0,
+                bitmap: vec![false, false, false],
+            },
+            nexa_bytecode::RootMap {
+                pc: 6,
+                bitmap: vec![true, false, true],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.state_schema(state_schema.clone());
+        module.function(function);
+        module.reload_entries(Some(0), None);
+        verify(module.finish(), VerifierLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn verified_migration_bytecode_executes_the_complete_object_staging_protocol() {
+        let domain = StatefulDomainId::new(1);
+        let type_id = StableId::from_name("VerifiedMigration");
+        let field_id = StableId::from_name("VerifiedMigration::value");
+        let object_id = StableId::from_name("VerifiedMigration::root");
+        let state_schema = schema(type_id, &[(field_id, ValueType::I32)]);
+        let mut old = StatefulRegistry::new(domain);
+        let old_handle = old
+            .insert(
+                object_id,
+                StateValue::Object(StateObject {
+                    type_id,
+                    version: 1,
+                    fields: BTreeMap::from([(field_id, StateValue::I32(17))]),
+                }),
+            )
+            .unwrap();
+
+        let module = verified_object_migration(&state_schema, type_id, field_id, object_id);
+        let mut migration =
+            MigrationContext::new(old, domain, state_schema, false, limits()).unwrap();
+
+        assert!(matches!(
+            CheckedInterpreter::run_migration(
+                &module,
+                0,
+                &[],
+                limits().max_fuel,
+                FrameLimits {
+                    max_call_depth: u32::from(limits().max_call_depth),
+                    ..FrameLimits::default()
+                },
+                &mut migration,
+            )
+            .unwrap(),
+            InterpreterOutcome::Returned { .. }
+        ));
+        let MigrationOutput::Owned {
+            registry, usage, ..
+        } = migration.finish().unwrap()
+        else {
+            panic!("the complete migration protocol must produce owned staging state");
+        };
+        assert_eq!(usage.objects_read, 2);
+        assert_eq!(usage.objects_created, 1);
+        assert_eq!(usage.fields_written, 1);
+        assert_eq!(usage.replaced, 1);
+        assert_eq!(
+            registry.resolve(old_handle),
+            Err(StatefulError::StaleGeneration)
+        );
+        let replacement = registry
+            .objects
+            .iter()
+            .find(|object| object.stable_id == object_id)
+            .expect("replacement object");
+        assert_eq!(replacement.generation, old_handle.generation() + 1);
+        let fields = registry.object_fields(replacement);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].field_id, field_id);
+        assert_eq!(fields[0].value, StateValue::I32(17));
+    }
+
+    #[test]
+    fn rejected_migration_object_operands_do_not_mutate_staging_state() {
+        let domain = StatefulDomainId::new(1);
+        let type_id = StableId::from_name("OperandValidation");
+        let other_type = StableId::from_name("OperandValidationOther");
+        let field_id = StableId::from_name("OperandValidation::value");
+        let old_id = StableId::from_name("OperandValidation::old");
+        let target_id = StableId::from_name("OperandValidation::target");
+        let missing_id = StableId::from_name("OperandValidation::missing");
+        let state_schema = StateSchema {
+            types: vec![
+                StateType {
+                    stable_id: type_id,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: field_id,
+                        ty: ValueType::I32,
+                    }],
+                },
+                StateType {
+                    stable_id: other_type,
+                    version: 1,
+                    fields: Vec::new(),
+                },
+            ],
+        };
+        let mut old = StatefulRegistry::new(domain);
+        old.insert(
+            old_id,
+            StateValue::Object(StateObject {
+                type_id,
+                version: 1,
+                fields: BTreeMap::from([(field_id, StateValue::I32(9))]),
+            }),
+        )
+        .unwrap();
+        let mut migration =
+            MigrationContext::new(old, domain, state_schema, false, limits()).unwrap();
+        let old_object = migration
+            .old_get(old_id, ValueType::Named(type_id))
+            .unwrap();
+        let target = migration.new_create(target_id, type_id).unwrap();
+        let usage = migration.arena.usage();
+        let report = migration.usage_report();
+        let forwarding_len = migration.arena.forwarding.len();
+        let target_generation = migration.arena.objects[0].generation;
+
+        assert!(
+            migration
+                .new_set(
+                    RuntimeValue::Opaque {
+                        type_id,
+                        value: missing_id.0,
+                    },
+                    field_id,
+                    RuntimeValue::I32(1),
+                )
+                .is_err(),
+            "an object not produced in the staging arena must be rejected"
+        );
+        assert!(
+            migration
+                .new_set(
+                    RuntimeValue::Opaque {
+                        type_id: other_type,
+                        value: target_id.0,
+                    },
+                    field_id,
+                    RuntimeValue::I32(1),
+                )
+                .is_err(),
+            "a forged nominal owner must be rejected"
+        );
+        assert!(
+            migration
+                .new_set(target, field_id, RuntimeValue::Bool(true))
+                .is_err(),
+            "the candidate field value must have its declared type"
+        );
+        assert!(
+            migration
+                .old_field_get(old_object, field_id, ValueType::Bool)
+                .is_err(),
+            "the old field result type must match the stored field"
+        );
+        assert!(
+            migration
+                .replace(
+                    old_id,
+                    RuntimeValue::Opaque {
+                        type_id: other_type,
+                        value: target_id.0,
+                    },
+                )
+                .is_err(),
+            "replace must reject a forged target nominal"
+        );
+
+        assert_eq!(migration.arena.usage(), usage);
+        assert_eq!(migration.usage_report(), report);
+        assert_eq!(migration.arena.forwarding.len(), forwarding_len);
+        assert_eq!(migration.arena.objects[0].generation, target_generation);
+        assert!(migration.arena.fields.is_empty());
     }
 
     #[test]
@@ -2702,6 +3006,78 @@ mod tests {
         );
         assert_eq!(registry.object_count(), 1);
         assert_eq!(registry.objects.capacity(), 1);
+    }
+
+    #[test]
+    fn migration_object_handles_reject_kind_context_and_stale_generation_confusion() {
+        let domain = StatefulDomainId::new(7);
+        let type_id = StableId::from_name("ProvenanceState");
+        let field_id = StableId::from_name("ProvenanceState::value");
+        let shared_id = StableId::from_name("ProvenanceState::shared");
+        let state_schema = schema(type_id, &[(field_id, ValueType::I32)]);
+        let mut old = StatefulRegistry::new(domain);
+        old.insert(
+            shared_id,
+            StateValue::Object(StateObject {
+                type_id,
+                version: 1,
+                fields: BTreeMap::from([(field_id, StateValue::I32(3))]),
+            }),
+        )
+        .unwrap();
+        let old = Arc::new(old);
+        let mut first = MigrationContext::new(
+            Arc::clone(&old),
+            domain,
+            state_schema.clone(),
+            false,
+            limits(),
+        )
+        .unwrap();
+        let mut second = MigrationContext::new(old, domain, state_schema, false, limits()).unwrap();
+
+        let old_object = first.old_get(shared_id, ValueType::Named(type_id)).unwrap();
+        let staging_object = first.new_create(shared_id, type_id).unwrap();
+
+        assert!(
+            first
+                .old_field_get(staging_object, field_id, ValueType::I32)
+                .is_err(),
+            "an equal stable ID must not turn a staging handle into an old-state handle"
+        );
+        assert!(
+            first
+                .new_set(old_object, field_id, RuntimeValue::I32(4))
+                .is_err(),
+            "an equal stable ID must not turn an old-state handle into a staging handle"
+        );
+        assert!(
+            second
+                .old_field_get(old_object, field_id, ValueType::I32)
+                .is_err(),
+            "old-state handles must be scoped to their MigrationContext"
+        );
+        assert!(
+            second
+                .new_set(staging_object, field_id, RuntimeValue::I32(4))
+                .is_err(),
+            "staging handles must be scoped to their MigrationContext"
+        );
+        assert!(
+            second.replace(shared_id, staging_object).is_err(),
+            "replace must reject a target from another MigrationContext"
+        );
+
+        first
+            .new_set(staging_object, field_id, RuntimeValue::I32(5))
+            .unwrap();
+        first.replace(shared_id, staging_object).unwrap();
+        assert!(
+            first
+                .new_set(staging_object, field_id, RuntimeValue::I32(6))
+                .is_err(),
+            "replace must invalidate the pre-replacement staging generation"
+        );
     }
 
     #[test]
@@ -3188,6 +3564,19 @@ mod tests {
             Err(InterpreterError::ContinuationLimit(
                 FrameError::CallDepthLimit
             ))
+        ));
+    }
+
+    #[test]
+    fn verified_heapless_migration_helper_executes_without_heap_unavailable() {
+        let result = run_migration(&heapless_scalar_helper_migration_module(), 16, 8);
+        assert!(
+            !matches!(result, Err(InterpreterError::HeapUnavailable)),
+            "a verified heapless migration must never reach a missing Heap"
+        );
+        assert!(matches!(
+            result.unwrap(),
+            InterpreterOutcome::Returned { .. }
         ));
     }
 }

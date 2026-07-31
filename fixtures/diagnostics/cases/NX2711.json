@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2711","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2711","expected":{"primary_text":"same-id","primary_occurrence":2,"secondary_count":1,"related_messages":["first use of this stable identity"],"related_texts":["same-id"],"message_contains":"duplicate @stable name","notes":[]}}

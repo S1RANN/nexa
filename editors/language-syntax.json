@@ -3,10 +3,16 @@
     "declarationKeywords": [
       "module",
       "import",
+      "as",
       "fn",
       "struct",
       "enum",
-      "class"
+      "class",
+      "const"
+    ],
+    "visibilityKeywords": [
+      "pub",
+      "package"
     ],
     "effectKeywords": [
       "task",
@@ -28,11 +34,15 @@
       "yield",
       "defer",
       "for",
-      "in"
+      "in",
+      "break",
+      "continue"
     ],
     "attributeKeywords": [
       "stateful",
-      "activation"
+      "activation",
+      "stable",
+      "test"
     ],
     "literalKeywords": [
       "true",

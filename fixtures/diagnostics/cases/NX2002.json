@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2002","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2002.nexa","expected":{"primary_text":"Missing","secondary_count":0,"message_contains":"unknown type","notes":[]}}
+{"version":1,"code":"NX2002","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2002.nexa","expected":{"primary_text":"Missing","secondary_count":0,"message_contains":"Unknown type","notes":[]}}

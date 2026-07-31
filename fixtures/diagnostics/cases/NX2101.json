@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2101","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2101.nexa","expected":{"primary_text":"true","secondary_count":0,"message_contains":"type mismatch","notes":["expected type: I32","actual type: Bool"]}}
+{"version":1,"code":"NX2101","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2101.nexa","expected":{"primary_text":"true","secondary_count":0,"message_contains":"Type mismatch","notes":["expected type: I32","actual type: Bool"]}}

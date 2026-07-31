@@ -1,0 +1,4 @@
+interface LanguageScaleHost {
+    sync fn log(message: string) -> i32;
+    export OnEvent(value: i32) -> string;
+}

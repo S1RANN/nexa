@@ -1,0 +1,7 @@
+module main;
+
+import missing.target;
+
+pub fn entry() -> i32 {
+    return 1;
+}

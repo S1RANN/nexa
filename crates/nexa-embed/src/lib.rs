@@ -27,9 +27,17 @@ use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+// Keep implementation paths descriptive while routing every public runtime/IDL/core type through
+// the stable `nexa` facade.
+use nexa as nexa_diagnostics;
+use nexa as nexa_idl;
+use nexa as nexa_verifier;
+use nexa::prelude as nexa_core;
+use nexa::prelude as nexa_runtime;
+
 pub use artifact::{
-    CandidateCompilation, CompiledPackageArtifact, FunctionDebugInfo, LastKnownGood, ManifestHash,
-    ModuleDebugInfo, SourceHash, compile_package,
+    CandidateCompilation, CompiledPackageArtifact, FunctionDebugInfo, LastKnownGood,
+    ModuleDebugInfo, compile_package,
 };
 pub use builder::NexaEngineBuilder;
 pub use capability::CapabilitySet;
@@ -42,10 +50,11 @@ pub use development::{
 };
 pub use diagnostic::{
     DiagnosticRenderer, EngineDiagnostic, EngineDiagnosticContext, EngineDiagnosticStage,
-    EngineDiagnosticSummary, EngineTaskId, RelatedDiagnostic,
+    EngineDiagnosticSummary, EngineSourceSnapshot, EngineTaskId, RelatedDiagnostic,
 };
 pub use diagnostic_evidence::{
-    EngineDiagnosticEvidence, run_engine_diagnostic_cases, run_engine_diagnostic_evidence,
+    EngineDiagnosticEvidence, EngineDiagnosticObservation, EngineRenderEvidence,
+    run_engine_diagnostic_cases, run_engine_diagnostic_evidence,
 };
 pub use directory_source::DirectorySource;
 pub use entitlement::{EntitlementResolver, NoEntitlements, StaticEntitlements};
@@ -55,15 +64,24 @@ pub use inspection::{
 };
 pub use lifecycle::{LifecycleError, PackageLifecycle, PackageStatus};
 pub use manifest::{
-    CapabilityId, EntitlementId, ManifestError, PackageId, PackageManifest, PackagePath,
-    PackageVersion, SourceId,
+    CapabilityId, EntitlementId, ManifestError, PackageId, PackageManifest, PackageVersion,
+    SourceId,
 };
-pub use memory_source::MemorySource;
+pub use memory_source::{MemoryPackage, MemorySource};
+pub use nexa::SourceIdentity;
+pub use nexa_analysis::{
+    BuildFingerprint, CandidateIdentity, CompilationLimits, DependencyAlias,
+    LinkedStateFingerprint, ModulePath, NormalizedPackagePath, PackageKind, PublicApiFingerprint,
+    ResolvedBuildInput, ResolvedDependencyGraph, SourceKey, SourceSetFingerprint,
+    StateSchemaFingerprint,
+};
 pub use package::{EngineHealth, PackageInfo, PackageOutput};
 pub use policy::{
     ActivationPolicy, ActivationSet, PackagePolicy, PackageRuntimeLimits, TrustLevel,
 };
-pub use source::{PackageCandidate, PackageSource, PackageSourceError};
+pub use source::{
+    CandidateBuildContext, DiscoveredPackage, PackageCandidate, PackageSource, PackageSourceError,
+};
 pub use source_file::{
     SourceFile, SourceFileRegistry, SourceFileRegistryError, SourcePosition, SourceRange,
 };
@@ -98,6 +116,8 @@ where
 pub struct NexaEngine {
     contract: HostContract,
     idl: nexa_idl::Idl,
+    host_contract_source_identity: nexa::SourceIdentity,
+    host_contract_source: std::sync::Arc<str>,
     host_factory: Box<dyn HostRegistryFactory>,
     sources: Vec<Box<dyn PackageSource>>,
     entitlements: Box<dyn EntitlementResolver>,
@@ -108,6 +128,8 @@ pub struct NexaEngine {
     required_exports: Vec<ExportRequirement>,
     persisted: BTreeMap<PackageId, bool>,
     development: DevelopmentConfig,
+    development_coordinator: nexa_analysis::DevelopmentCoordinator,
+    build_session: development::SharedPackageBuildSession,
     development_worker: Option<DevelopmentWorker>,
     development_events: VecDeque<DevelopmentEvent>,
     pending_development_events: Vec<DevelopmentEvent>,
@@ -118,6 +140,7 @@ pub struct NexaEngine {
     ticks: u64,
     next_realm_id: u32,
     delivered_release_records: u64,
+    discovered: bool,
     shutdown: bool,
 }
 
@@ -135,6 +158,18 @@ impl NexaEngine {
                 "generated interface hash mismatch".into(),
             ));
         }
+        let (host_contract_source_identity, host_contract_source) =
+            if let Some((identity, text)) = builder.host_contract_source {
+                nexa::HostContractInput::with_source(&idl, identity.clone(), text.clone())
+                    .map_err(|error| EngineError::Contract(error.to_string()))?;
+                (identity, text)
+            } else {
+                let contract = nexa::HostContractInput::canonical(&idl);
+                (
+                    contract.source().identity().clone(),
+                    std::sync::Arc::clone(contract.source().text()),
+                )
+            };
         let persisted = builder
             .storage_dir
             .as_deref()
@@ -142,10 +177,24 @@ impl NexaEngine {
             .transpose()
             .map_err(|error| EngineError::Persistence(error.to_string()))?
             .unwrap_or_default();
-        let development_worker = DevelopmentWorker::start(&builder.development);
+        let build_session =
+            std::sync::Arc::new(std::sync::Mutex::new(nexa::PackageBuildSession::new()));
+        let development_worker = DevelopmentWorker::start_with_session(
+            &builder.development,
+            std::sync::Arc::clone(&build_session),
+        );
+        let development_coordinator = nexa_analysis::DevelopmentCoordinator::new(
+            nexa_analysis::DevelopmentCoordinatorConfig {
+                stable_scan_count: builder.development.stable_scan_count,
+                queue_capacity: builder.development.compile_queue_capacity,
+                retain_terminal_generations: 128,
+            },
+        );
         Ok(Self {
             contract: builder.contract,
             idl,
+            host_contract_source_identity,
+            host_contract_source,
             host_factory: builder
                 .host_factory
                 .ok_or(EngineError::MissingHostFactory)?,
@@ -160,6 +209,8 @@ impl NexaEngine {
             required_exports: builder.required_exports,
             persisted,
             development: builder.development,
+            development_coordinator,
+            build_session,
             development_worker,
             development_events: VecDeque::new(),
             pending_development_events: Vec::new(),
@@ -170,37 +221,33 @@ impl NexaEngine {
             ticks: 0,
             next_realm_id: 1,
             delivered_release_records: 0,
+            discovered: false,
             shutdown: false,
         })
     }
 
     pub fn discover(&mut self) -> Result<Vec<PackageInfo>, EngineError> {
         self.require_open()?;
+        if self.discovered {
+            return Err(EngineError::DiscoveryAlreadyCompleted);
+        }
+        let build_context = self.candidate_build_context();
         let mut records = Vec::new();
         for source in &self.sources {
             let source_id = source.id().clone();
-            let candidates = match source.discover() {
+            let candidates = match source.discover(&build_context) {
                 Ok(candidates) => candidates,
                 Err(error) => {
                     let message = error.to_string();
-                    let (stage, code) = match &error {
-                        PackageSourceError::Manifest(
-                            ManifestError::ActivationNotAllowed
-                            | ManifestError::CapabilityCeiling
-                            | ManifestError::RuntimeLimit
-                            | ManifestError::EntitlementNotAllowed,
-                        )
-                        | PackageSourceError::EscapedRoot
-                        | PackageSourceError::TooManyPackages => {
-                            (EngineDiagnosticStage::Policy, nexa::ErrorCode::NX7003)
-                        }
-                        PackageSourceError::Manifest(_) => {
-                            (EngineDiagnosticStage::Manifest, nexa::ErrorCode::NX7002)
-                        }
-                        PackageSourceError::Io(_) => (
+                    let (stage, code) = if error.is_policy() {
+                        (EngineDiagnosticStage::Policy, nexa::ErrorCode::NX7003)
+                    } else if error.is_manifest() {
+                        (EngineDiagnosticStage::Manifest, nexa::ErrorCode::NX7002)
+                    } else {
+                        (
                             EngineDiagnosticStage::SourceDiscovery,
                             nexa::ErrorCode::NX7001,
-                        ),
+                        )
                     };
                     self.diagnostics.push(EngineDiagnostic::without_source(
                         None,
@@ -215,10 +262,18 @@ impl NexaEngine {
                     });
                 }
             };
-            for candidate in candidates {
+            for discovered in candidates {
+                let candidate = discovered.candidate;
+                let build_input = discovered.build_input;
+                let effective =
+                    manifest::apply_package_policy(&candidate.manifest, source.policy()).map_err(
+                        |error| EngineError::Source {
+                            source: source_id.clone(),
+                            message: error.to_string(),
+                        },
+                    )?;
                 let mut lifecycle = PackageLifecycle::discovered();
-                let locked = candidate
-                    .manifest
+                let locked = effective
                     .entitlement
                     .as_ref()
                     .is_some_and(|id| !self.entitlements.contains(id));
@@ -230,7 +285,9 @@ impl NexaEngine {
                 records.push(PackageRecord {
                     source_id: source.id().clone(),
                     policy: source.policy().clone(),
+                    effective,
                     candidate,
+                    build_input,
                     lifecycle,
                     runtime: None,
                     last_diagnostic: None,
@@ -246,13 +303,23 @@ impl NexaEngine {
                 });
             }
         }
+        self.mark_duplicate_package_ids(&mut records)?;
+        self.packages = records;
+        self.discovered = true;
+        Ok(self.packages())
+    }
+
+    fn mark_duplicate_package_ids(
+        &mut self,
+        records: &mut [PackageRecord],
+    ) -> Result<(), EngineError> {
         let mut counts = BTreeMap::<PackageId, usize>::new();
-        for record in &records {
+        for record in records.iter() {
             *counts
                 .entry(record.candidate.manifest.id.clone())
                 .or_default() += 1;
         }
-        for record in &mut records {
+        for record in records {
             if counts
                 .get(&record.candidate.manifest.id)
                 .is_some_and(|count| *count > 1)
@@ -268,8 +335,7 @@ impl NexaEngine {
                 record.last_diagnostic = Some(diagnostic.summary());
             }
         }
-        self.packages = records;
-        Ok(self.packages())
+        Ok(())
     }
 
     pub fn enable_defaults(&mut self) -> Result<(), EngineError> {
@@ -278,8 +344,8 @@ impl NexaEngine {
             .iter()
             .filter(|record| {
                 let manifest = &record.candidate.manifest;
-                manifest.activation == ActivationPolicy::Required
-                    || (manifest.activation == ActivationPolicy::DefaultEnabled
+                record.effective.activation == ActivationPolicy::Required
+                    || (record.effective.activation == ActivationPolicy::DefaultEnabled
                         && self.persisted.get(&manifest.id).copied().unwrap_or(true))
                     || self.persisted.get(&manifest.id).copied() == Some(true)
             })
@@ -312,7 +378,20 @@ impl NexaEngine {
             .lifecycle
             .transition(PackageStatus::Enabling)?;
         match self.fresh_candidate(index) {
-            Ok(candidate) => self.packages[index].candidate = candidate,
+            Ok(discovered) => {
+                let candidate = discovered.candidate;
+                let effective = manifest::apply_package_policy(
+                    &candidate.manifest,
+                    &self.packages[index].policy,
+                )
+                .map_err(|error| EngineError::Source {
+                    source: self.packages[index].source_id.clone(),
+                    message: error.to_string(),
+                })?;
+                self.packages[index].candidate = candidate;
+                self.packages[index].build_input = discovered.build_input;
+                self.packages[index].effective = effective;
+            }
             Err(error) => {
                 self.packages[index]
                     .lifecycle
@@ -326,26 +405,16 @@ impl NexaEngine {
         match result {
             Ok(runtime) => {
                 let artifact = runtime.artifact.clone();
-                self.packages[index].development.active_hash = Some(artifact.source_hash);
-                self.packages[index].development.desired_hash = Some(artifact.source_hash);
-                self.packages[index].development.terminal_hash = None;
+                self.packages[index].development.active_build_fingerprint =
+                    Some(artifact.identity.build_fingerprint);
+                self.packages[index].development.desired_build_fingerprint =
+                    Some(artifact.identity.build_fingerprint);
+                self.packages[index].development.terminal_build_fingerprint = None;
                 let epoch = runtime
                     .realm
                     .active_module_epoch(runtime.module)
                     .unwrap_or_default();
-                let manifest = &self.packages[index].candidate.manifest;
-                self.packages[index].last_known_good = Some(LastKnownGood {
-                    source_hash: artifact.source_hash,
-                    state_schema_hash: nexa_core::StableId::from_parts(&[
-                        manifest.id.as_str(),
-                        "::",
-                        &manifest.state_schema,
-                    ]),
-                    host_interface_hash: self.contract.interface_hash,
-                    artifact,
-                    epoch,
-                    committed_generation: 0,
-                });
+                self.commit_last_known_good(index, artifact, epoch);
                 self.packages[index].runtime = Some(runtime);
                 self.packages[index].last_diagnostic = None;
                 self.packages[index]
@@ -378,8 +447,9 @@ impl NexaEngine {
         }
     }
 
-    fn fresh_candidate(&self, index: usize) -> Result<PackageCandidate, EngineError> {
+    fn fresh_candidate(&self, index: usize) -> Result<DiscoveredPackage, EngineError> {
         let record = &self.packages[index];
+        let build_context = self.candidate_build_context();
         let source = self
             .sources
             .iter()
@@ -389,28 +459,44 @@ impl NexaEngine {
                 message: "package source is no longer registered".into(),
             })?;
         source
-            .discover()
+            .discover(&build_context)
             .map_err(|error| EngineError::Source {
                 source: source.id().clone(),
                 message: error.to_string(),
             })?
             .into_iter()
-            .find(|candidate| candidate.manifest.id == record.candidate.manifest.id)
+            .find(|discovered| discovered.candidate.manifest.id == record.candidate.manifest.id)
             .ok_or_else(|| EngineError::Source {
                 source: source.id().clone(),
                 message: format!("package {} disappeared", record.candidate.manifest.id),
             })
     }
 
-    fn refresh_desired_hash(&mut self, index: usize) -> Option<SourceHash> {
+    fn candidate_build_context(&self) -> CandidateBuildContext {
+        CandidateBuildContext::with_source(
+            self.host_contract_source_identity.clone(),
+            self.host_contract_source.as_bytes().to_vec(),
+        )
+    }
+
+    fn host_contract_input(&self) -> nexa::HostContractInput<'_> {
+        nexa::HostContractInput::with_source(
+            &self.idl,
+            self.host_contract_source_identity.clone(),
+            std::sync::Arc::clone(&self.host_contract_source),
+        )
+        .expect("the Engine validates its immutable Host source while building")
+    }
+
+    fn refresh_desired_build_fingerprint(&mut self, index: usize) -> Option<BuildFingerprint> {
         match self.fresh_candidate(index) {
-            Ok(candidate) => {
-                let desired_hash = candidate_source_hash(&candidate);
-                self.packages[index].development.desired_hash = Some(desired_hash);
-                Some(desired_hash)
+            Ok(discovered) => {
+                let desired = discovered.candidate.build_fingerprint;
+                self.packages[index].development.desired_build_fingerprint = Some(desired);
+                Some(desired)
             }
             Err(error) => {
-                self.packages[index].development.desired_hash = None;
+                self.packages[index].development.desired_build_fingerprint = None;
                 self.mark_source_missing(index, &error.to_string());
                 None
             }
@@ -422,13 +508,28 @@ impl NexaEngine {
         index: usize,
         data: &CandidateTerminalData,
     ) -> bool {
-        data.generation == self.packages[index].development.latest_generation
-            && self.refresh_desired_hash(index) == Some(data.source_hash)
+        data.identity.generation == self.packages[index].development.latest_generation
+            && self.refresh_desired_build_fingerprint(index)
+                == Some(data.identity.build_fingerprint)
     }
 
     fn build_runtime(&mut self, index: usize) -> Result<PackageRuntime, EngineError> {
-        let artifact =
-            self.compile_candidate(&self.packages[index], &self.packages[index].candidate)?;
+        let generation = self.packages[index]
+            .development
+            .latest_generation
+            .saturating_add(1)
+            .max(1);
+        let identity = self.packages[index]
+            .candidate
+            .identity(generation)
+            .map_err(|error| EngineError::Candidate(error.to_string()))?;
+        let artifact = self.compile_candidate(index, identity.clone())?;
+        let fresh = self.fresh_candidate(index)?;
+        if fresh.candidate.build_fingerprint != identity.build_fingerprint
+            || fresh.build_input.build_fingerprint != artifact.build_fingerprint
+        {
+            return Err(EngineError::StaleCandidate(identity));
+        }
         self.instantiate_runtime(index, artifact)
     }
 
@@ -439,26 +540,30 @@ impl NexaEngine {
     ) -> Result<PackageRuntime, EngineError> {
         let record = &self.packages[index];
         let manifest = &record.candidate.manifest;
-        let schema_hash =
-            nexa_core::StableId::from_parts(&[manifest.id.as_str(), "::", &manifest.state_schema]);
+        artifact.verify_integrity().map_err(|error| {
+            EngineError::Load(
+                manifest.id.clone(),
+                format!("artifact integrity check failed: {error}"),
+            )
+        })?;
         self.validate_exports(manifest.id.clone(), &artifact.verified)?;
         let context = PackageContext {
             package_id: manifest.id.clone(),
             source_id: record.source_id.clone(),
             trust: record.policy.trust,
-            capabilities: manifest.capabilities.clone(),
+            capabilities: record.effective.capabilities.clone(),
             data_namespace: format!("{}.{}", record.source_id, manifest.id),
             version: manifest.version.clone(),
         };
         let registry = self.host_factory.create(&context);
         let config = nexa_runtime::RealmConfig {
             realm_id: self.next_realm_id,
-            max_heap_objects: manifest.heap_objects,
-            max_host_resources: manifest.host_resources,
-            release_capacity: manifest.release_records,
+            max_heap_objects: record.effective.runtime_limits.heap_objects,
+            max_host_resources: record.effective.runtime_limits.host_resources,
+            release_capacity: record.effective.runtime_limits.release_records,
             runtime_limits: nexa_runtime::RuntimeLimits {
-                max_tasks: manifest.tasks,
-                max_scheduler_tokens: manifest.tasks,
+                max_tasks: record.effective.runtime_limits.tasks,
+                max_scheduler_tokens: record.effective.runtime_limits.tasks,
                 ..nexa_runtime::RuntimeLimits::default()
             },
             ..nexa_runtime::RealmConfig::default()
@@ -474,7 +579,7 @@ impl NexaEngine {
             .load_module(
                 artifact.verified.clone(),
                 self.contract.interface_hash,
-                schema_hash,
+                artifact.state_schema_fingerprint,
             )
             .map_err(|error| EngineError::Load(manifest.id.clone(), error.to_string()))?;
         let root_scope = realm
@@ -489,18 +594,37 @@ impl NexaEngine {
     }
 
     fn compile_candidate(
-        &self,
-        record: &PackageRecord,
-        candidate: &PackageCandidate,
+        &mut self,
+        index: usize,
+        identity: CandidateIdentity,
     ) -> Result<CompiledPackageArtifact, EngineError> {
-        artifact::compile_package_candidate(
-            &self.idl,
-            &self.required_exports,
-            &record.source_id,
-            candidate,
-        )
-        .map(|compilation| compilation.artifact)
-        .map_err(|failure| EngineError::Diagnostic(Box::new(failure.diagnostic)))
+        let source_id = self.packages[index].source_id.clone();
+        let build_input = std::sync::Arc::clone(&self.packages[index].build_input);
+        let host_contract = self.host_contract_input();
+        let compilation = {
+            let mut build_session = self
+                .build_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            artifact::compile_package_candidate(
+                &mut build_session,
+                &host_contract,
+                &self.required_exports,
+                &source_id,
+                identity,
+                &build_input,
+            )
+        };
+        match compilation {
+            Ok(compilation) => Ok(compilation.artifact),
+            Err(failure) => {
+                let diagnostic = self.diagnostics.push(failure.diagnostic);
+                for additional in failure.additional_diagnostics {
+                    self.diagnostics.push(additional);
+                }
+                Err(EngineError::Diagnostic(Box::new(diagnostic)))
+            }
+        }
     }
 
     fn validate_exports(
@@ -526,7 +650,7 @@ impl NexaEngine {
 
     pub fn disable(&mut self, id: &PackageId) -> Result<(), EngineError> {
         let index = self.unique_index(id)?;
-        if self.packages[index].candidate.manifest.activation == ActivationPolicy::Required {
+        if self.packages[index].effective.activation == ActivationPolicy::Required {
             return Err(EngineError::RequiredPackage(id.clone()));
         }
         self.disable_index(index, true)
@@ -565,6 +689,11 @@ impl NexaEngine {
         if self.packages[index].lifecycle.status() == PackageStatus::Locked {
             return Ok(());
         }
+        let package_id = self.packages[index].candidate.manifest.id.clone();
+        let _ = self.development_coordinator.invalidate(
+            &package_id,
+            nexa_analysis::DevelopmentInvalidation::Transient,
+        );
         self.cancel_development(index, CandidateCancellation::Disable);
         let id = self.packages[index].candidate.manifest.id.clone();
         self.packages[index]
@@ -605,8 +734,15 @@ impl NexaEngine {
                 self.packages[index].lifecycle.status(),
             ));
         }
-        let candidate = self.fresh_candidate(index)?;
-        self.reload_candidate(index, candidate)
+        let discovered = match self.fresh_candidate(index) {
+            Ok(discovered) => discovered,
+            Err(error) => {
+                let summary = self.record_error(index, &error);
+                self.packages[index].last_diagnostic = Some(summary);
+                return Err(error);
+            }
+        };
+        self.reload_candidate(index, discovered)
     }
 
     pub fn request_ready_commit(&mut self, id: &PackageId) -> Result<bool, EngineError> {
@@ -616,32 +752,83 @@ impl NexaEngine {
         Ok(ready)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reload_candidate(
         &mut self,
         index: usize,
-        candidate: PackageCandidate,
+        discovered: DiscoveredPackage,
     ) -> Result<(), EngineError> {
-        let compilation = match artifact::compile_package_candidate(
-            &self.idl,
-            &self.required_exports,
-            &self.packages[index].source_id,
-            &candidate,
-        ) {
+        let candidate = discovered.candidate;
+        let build_input = discovered.build_input;
+        self.supersede_development_for_current_source(index, None);
+        let (identity, _) = self
+            .development_coordinator
+            .begin(candidate.manifest.id.clone(), candidate.build_fingerprint);
+        self.packages[index].development.latest_generation = identity.generation;
+        self.packages[index].development.desired_build_fingerprint =
+            Some(candidate.build_fingerprint);
+        let source_id = self.packages[index].source_id.clone();
+        let host_contract = self.host_contract_input();
+        let compilation = {
+            let mut build_session = self
+                .build_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            artifact::compile_package_candidate(
+                &mut build_session,
+                &host_contract,
+                &self.required_exports,
+                &source_id,
+                identity.clone(),
+                &build_input,
+            )
+        };
+        let compilation = match compilation {
             Ok(compilation) => compilation,
             Err(failure) => {
-                let diagnostic = failure.diagnostic;
+                let mut diagnostic = failure.diagnostic;
+                let additional_diagnostics = failure.additional_diagnostics;
+                let requested_terminal = if diagnostic.stage == EngineDiagnosticStage::Verify {
+                    CandidateTerminalKind::VerifyFailed
+                } else {
+                    CandidateTerminalKind::CompileFailed
+                };
+                let terminal_data = CandidateTerminalData {
+                    source_id: self.packages[index].source_id.clone(),
+                    identity: identity.clone(),
+                    build_input: std::sync::Arc::clone(&build_input),
+                    queue_duration: Duration::ZERO,
+                    work_duration: failure
+                        .compile_duration
+                        .saturating_add(failure.verify_duration),
+                };
+                let terminal_kind =
+                    self.record_generation_terminal(index, &terminal_data, requested_terminal);
+                if terminal_kind != requested_terminal {
+                    self.finish_recorded_candidate_rejection(
+                        index,
+                        terminal_data,
+                        terminal_kind,
+                        failure.compile_duration,
+                        failure.verify_duration,
+                    );
+                    return Err(EngineError::StaleCandidate(identity));
+                }
+                diagnostic.context.candidate_generation = Some(identity.generation);
                 let diagnostic = self.diagnostics.push(diagnostic);
                 self.packages[index].last_diagnostic = Some(diagnostic.summary());
+                for mut additional in additional_diagnostics {
+                    additional.context.candidate_generation = Some(identity.generation);
+                    self.diagnostics.push(additional);
+                }
                 let report = reload_report(
-                    self.packages[index].candidate.manifest.id.clone(),
-                    0,
+                    identity,
                     self.packages[index]
                         .runtime
                         .as_ref()
                         .and_then(|runtime| runtime.realm.active_module_epoch(runtime.module).ok())
                         .unwrap_or_default(),
                     None,
-                    candidate_source_hash(&candidate),
                     failure.compile_duration,
                     failure.verify_duration,
                     nexa_runtime::RestartReloadMetrics::default(),
@@ -657,11 +844,32 @@ impl NexaEngine {
                 return Err(EngineError::Diagnostic(Box::new(diagnostic)));
             }
         };
+        let terminal_data = CandidateTerminalData {
+            source_id: self.packages[index].source_id.clone(),
+            identity: identity.clone(),
+            build_input: std::sync::Arc::clone(&build_input),
+            queue_duration: Duration::ZERO,
+            work_duration: compilation
+                .compile_duration
+                .saturating_add(compilation.verify_duration),
+        };
+        let terminal_kind =
+            self.record_generation_terminal(index, &terminal_data, CandidateTerminalKind::Compiled);
+        if terminal_kind != CandidateTerminalKind::Compiled {
+            self.finish_recorded_candidate_rejection(
+                index,
+                terminal_data,
+                terminal_kind,
+                compilation.compile_duration,
+                compilation.verify_duration,
+            );
+            return Err(EngineError::StaleCandidate(identity));
+        }
         match self.commit_compiled_candidate(
             index,
             candidate,
+            build_input,
             compilation.artifact,
-            0,
             compilation.compile_duration,
             compilation.verify_duration,
         ) {
@@ -681,34 +889,121 @@ impl NexaEngine {
         &mut self,
         index: usize,
         candidate: PackageCandidate,
+        build_input: std::sync::Arc<nexa_analysis::ResolvedBuildInput>,
         artifact: CompiledPackageArtifact,
-        generation: u64,
         compile_duration: std::time::Duration,
         verify_duration: std::time::Duration,
     ) -> Result<ReloadReport, ReloadFailure> {
         let id = self.packages[index].candidate.manifest.id.clone();
-        let source_hash = artifact.source_hash;
+        let identity = artifact.identity.clone();
+        let generation = identity.generation;
+        let next_effective =
+            manifest::apply_package_policy(&candidate.manifest, &self.packages[index].policy)
+                .map_err(|error| {
+                    ReloadFailure::new(
+                        reload_report(
+                            identity.clone(),
+                            0,
+                            None,
+                            compile_duration,
+                            verify_duration,
+                            nexa_runtime::RestartReloadMetrics::default(),
+                            ReloadReportOutcome::RolledBackBeforeCommit,
+                            0,
+                            0,
+                        ),
+                        EngineError::Candidate(error.to_string()),
+                    )
+                })?;
+        if next_effective
+            .entitlement
+            .as_ref()
+            .is_some_and(|entitlement| !self.entitlements.contains(entitlement))
+        {
+            return Err(ReloadFailure::new(
+                reload_report(
+                    identity.clone(),
+                    0,
+                    None,
+                    compile_duration,
+                    verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    ReloadReportOutcome::RolledBackBeforeCommit,
+                    0,
+                    0,
+                ),
+                EngineError::Locked(id.clone()),
+            ));
+        }
         let old_epoch = self.packages[index]
             .runtime
             .as_ref()
             .and_then(|runtime| runtime.realm.active_module_epoch(runtime.module).ok())
             .unwrap_or_default();
+        let commit_identity_matches = artifact.identity.package_id.eq(&candidate.manifest.id)
+            && artifact.identity.package_id.eq(build_input.root_package())
+            && artifact.identity.build_fingerprint == artifact.build_fingerprint
+            && artifact.build_fingerprint == candidate.build_fingerprint
+            && artifact.build_fingerprint == build_input.build_fingerprint;
+        if !commit_identity_matches {
+            return Err(ReloadFailure::new(
+                reload_report(
+                    identity.clone(),
+                    old_epoch,
+                    None,
+                    compile_duration,
+                    verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    ReloadReportOutcome::RolledBackBeforeCommit,
+                    0,
+                    0,
+                ),
+                EngineError::StaleCandidate(identity),
+            ));
+        }
+        debug_assert_eq!(
+            self.packages[index].development.latest_generation, generation,
+            "the commit caller terminalizes freshness immediately before entering Runtime"
+        );
+        if let Err(error) = artifact.verify_integrity() {
+            return Err(ReloadFailure::new(
+                reload_report(
+                    identity.clone(),
+                    old_epoch,
+                    None,
+                    compile_duration,
+                    verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    ReloadReportOutcome::RolledBackBeforeCommit,
+                    0,
+                    0,
+                ),
+                EngineError::Load(
+                    id.clone(),
+                    format!("artifact integrity check failed: {error}"),
+                ),
+            ));
+        }
         let reload_started = std::time::Instant::now();
         if self.packages[index].lifecycle.status() == PackageStatus::Faulted {
             let old_candidate = std::mem::replace(&mut self.packages[index].candidate, candidate);
+            let old_build_input =
+                std::mem::replace(&mut self.packages[index].build_input, build_input);
+            let old_effective =
+                std::mem::replace(&mut self.packages[index].effective, next_effective.clone());
             if let Err(error) = self.packages[index]
                 .lifecycle
                 .transition(PackageStatus::Enabling)
             {
                 self.packages[index].candidate = old_candidate;
+                self.packages[index].build_input = old_build_input;
+                self.packages[index].effective = old_effective;
                 let engine_error = EngineError::Lifecycle(error);
                 return Err(ReloadFailure::new(
                     reload_report(
-                        id,
-                        generation,
+                        identity,
                         old_epoch,
                         None,
-                        source_hash,
                         compile_duration,
                         verify_duration,
                         nexa_runtime::RestartReloadMetrics {
@@ -729,19 +1024,12 @@ impl NexaEngine {
                     let _ = self.packages[index]
                         .lifecycle
                         .transition(PackageStatus::Enabled);
-                    self.commit_last_known_good(
-                        index,
-                        artifact,
-                        generation,
-                        new_epoch.unwrap_or(0),
-                    );
+                    self.commit_last_known_good(index, artifact, new_epoch.unwrap_or(0));
                     self.packages[index].last_diagnostic = None;
                     Ok(reload_report(
-                        id,
-                        generation,
+                        identity,
                         old_epoch,
                         new_epoch,
-                        source_hash,
                         compile_duration,
                         verify_duration,
                         nexa_runtime::RestartReloadMetrics {
@@ -755,6 +1043,8 @@ impl NexaEngine {
                 }
                 Err(error) => {
                     self.packages[index].candidate = old_candidate;
+                    self.packages[index].build_input = old_build_input;
+                    self.packages[index].effective = old_effective;
                     let _ = self.packages[index]
                         .lifecycle
                         .transition(PackageStatus::Faulted);
@@ -762,11 +1052,9 @@ impl NexaEngine {
                     self.packages[index].last_diagnostic = Some(summary);
                     Err(ReloadFailure::new(
                         reload_report(
-                            id,
-                            generation,
+                            identity,
                             old_epoch,
                             None,
-                            source_hash,
                             compile_duration,
                             verify_duration,
                             nexa_runtime::RestartReloadMetrics {
@@ -788,11 +1076,9 @@ impl NexaEngine {
         {
             return Err(ReloadFailure::new(
                 reload_report(
-                    id,
-                    generation,
+                    identity,
                     old_epoch,
                     None,
-                    source_hash,
                     compile_duration,
                     verify_duration,
                     nexa_runtime::RestartReloadMetrics::default(),
@@ -807,11 +1093,9 @@ impl NexaEngine {
             let runtime = self.packages[index].runtime.as_mut().ok_or_else(|| {
                 ReloadFailure::new(
                     reload_report(
-                        id.clone(),
-                        generation,
+                        identity.clone(),
                         old_epoch,
                         None,
-                        source_hash,
                         compile_duration,
                         verify_duration,
                         nexa_runtime::RestartReloadMetrics::default(),
@@ -847,6 +1131,8 @@ impl NexaEngine {
                     None
                 };
                 self.packages[index].candidate = candidate;
+                self.packages[index].build_input = build_input;
+                self.packages[index].effective = next_effective;
                 let _ = self.packages[index]
                     .lifecycle
                     .transition(PackageStatus::Enabled);
@@ -854,16 +1140,13 @@ impl NexaEngine {
                 self.commit_last_known_good(
                     index,
                     artifact,
-                    generation,
                     new_epoch.unwrap_or(old_epoch.saturating_add(1)),
                 );
                 self.drain_releases();
                 Ok(reload_report(
-                    id,
-                    generation,
+                    identity,
                     old_epoch,
                     new_epoch,
-                    source_hash,
                     compile_duration,
                     verify_duration,
                     reload_metrics,
@@ -883,11 +1166,9 @@ impl NexaEngine {
                 self.drain_releases();
                 Err(ReloadFailure::new(
                     reload_report(
-                        id,
-                        generation,
+                        identity,
                         old_epoch,
                         None,
-                        source_hash,
                         compile_duration,
                         verify_duration,
                         reload_metrics,
@@ -909,11 +1190,9 @@ impl NexaEngine {
                 self.drain_releases();
                 Err(ReloadFailure::new(
                     reload_report(
-                        id,
-                        generation,
+                        identity,
                         old_epoch,
                         None,
-                        source_hash,
                         compile_duration,
                         verify_duration,
                         reload_metrics,
@@ -931,55 +1210,273 @@ impl NexaEngine {
         &mut self,
         index: usize,
         artifact: CompiledPackageArtifact,
-        generation: u64,
         epoch: u64,
     ) {
-        let manifest = &self.packages[index].candidate.manifest;
         self.packages[index].last_known_good = Some(LastKnownGood {
-            source_hash: artifact.source_hash,
-            state_schema_hash: nexa_core::StableId::from_parts(&[
-                manifest.id.as_str(),
-                "::",
-                &manifest.state_schema,
-            ]),
+            identity: artifact.identity.clone(),
+            source_set_fingerprint: artifact.source_set_fingerprint,
+            public_api_fingerprint: artifact.public_api_fingerprint,
+            state_schema_fingerprint: artifact.state_schema_fingerprint,
+            linked_state_fingerprint: artifact.linked_state_fingerprint,
+            dependency_closure: std::sync::Arc::clone(&artifact.dependency_closure),
             host_interface_hash: self.contract.interface_hash,
             artifact,
             epoch,
-            committed_generation: generation,
         });
-        self.packages[index].development.active_hash = self.packages[index]
+        self.packages[index].development.active_build_fingerprint = self.packages[index]
             .last_known_good
             .as_ref()
-            .map(|known_good| known_good.source_hash);
+            .map(|known_good| known_good.identity.build_fingerprint);
+        if let Some(identity) = self.packages[index]
+            .last_known_good
+            .as_ref()
+            .map(|known_good| known_good.identity.clone())
+        {
+            self.development_coordinator
+                .retain_active(identity.package_id, identity.build_fingerprint);
+        }
     }
 
     pub fn reload_changed(&mut self) -> Result<usize, EngineError> {
-        let mut changed = Vec::new();
-        for source in &self.sources {
-            for candidate in source.discover().map_err(|error| EngineError::Source {
-                source: source.id().clone(),
-                message: error.to_string(),
-            })? {
-                if let Some(index) = self.packages.iter().position(|record| {
-                    record.source_id == *source.id()
-                        && record.candidate.manifest.id == candidate.manifest.id
-                        && record.lifecycle.status() == PackageStatus::Enabled
-                        && (record.candidate.entry_hash != candidate.entry_hash
-                            || record.candidate.manifest_hash != candidate.manifest_hash)
-                }) {
-                    changed.push((index, candidate));
-                }
-            }
+        self.require_open()?;
+        if !self.discovered {
+            return Err(EngineError::DiscoveryRequired);
         }
-        let count = changed.len();
-        for (index, candidate) in changed {
-            self.reload_candidate(index, candidate)?;
+        let mut changed = Vec::new();
+        let mut added = Vec::new();
+        let build_context = self.candidate_build_context();
+        let discoveries = self
+            .sources
+            .iter()
+            .map(|source| {
+                (
+                    source.id().clone(),
+                    source.policy().clone(),
+                    source.discover(&build_context),
+                )
+            })
+            .collect::<Vec<_>>();
+        let discoveries = self.validate_reload_discoveries(discoveries)?;
+        let mut topology_changes = 0_usize;
+        for (source_id, policy, candidates) in discoveries {
+            topology_changes = topology_changes.saturating_add(self.reconcile_discovered_source(
+                &source_id,
+                &policy,
+                candidates,
+                &mut changed,
+                &mut added,
+            )?);
+        }
+        let count = topology_changes.saturating_add(changed.len());
+        for (index, discovered) in changed {
+            self.reload_candidate(index, discovered)?;
+        }
+        for package_id in added {
+            self.enable(&package_id)?;
         }
         Ok(count)
     }
 
+    fn validate_reload_discoveries(
+        &mut self,
+        discoveries: Vec<(
+            SourceId,
+            PackagePolicy,
+            Result<Vec<DiscoveredPackage>, PackageSourceError>,
+        )>,
+    ) -> Result<Vec<(SourceId, PackagePolicy, Vec<DiscoveredPackage>)>, EngineError> {
+        let mut validated = Vec::with_capacity(discoveries.len());
+        for (source_id, policy, result) in discoveries {
+            let candidates = match result {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    let message = error.to_string();
+                    let indexes = self
+                        .packages
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, record)| record.source_id == source_id)
+                        .map(|(index, _)| index)
+                        .collect::<Vec<_>>();
+                    for index in indexes {
+                        self.mark_source_missing(index, &message);
+                    }
+                    return Err(EngineError::Source {
+                        source: source_id,
+                        message,
+                    });
+                }
+            };
+            for discovered in &candidates {
+                let package_id = &discovered.candidate.manifest.id;
+                if self.packages.iter().any(|record| {
+                    record.source_id != source_id && record.candidate.manifest.id == *package_id
+                }) || validated.iter().any(
+                    |(validated_source, _, validated_candidates): &(
+                        SourceId,
+                        PackagePolicy,
+                        Vec<DiscoveredPackage>,
+                    )| {
+                        validated_source != &source_id
+                            && validated_candidates
+                                .iter()
+                                .any(|candidate| candidate.candidate.manifest.id == *package_id)
+                    },
+                ) {
+                    return Err(EngineError::Source {
+                        source: source_id,
+                        message: format!(
+                            "newly discovered Package {package_id} duplicates an existing Package ID"
+                        ),
+                    });
+                }
+                manifest::apply_package_policy(&discovered.candidate.manifest, &policy).map_err(
+                    |error| EngineError::Source {
+                        source: source_id.clone(),
+                        message: error.to_string(),
+                    },
+                )?;
+            }
+            let mut ids = candidates
+                .iter()
+                .map(|candidate| candidate.candidate.manifest.id.clone())
+                .collect::<Vec<_>>();
+            ids.sort();
+            if let Some(duplicate) = ids
+                .windows(2)
+                .find_map(|ids| (ids[0] == ids[1]).then(|| ids[0].clone()))
+            {
+                return Err(EngineError::Source {
+                    source: source_id,
+                    message: format!(
+                        "newly discovered Package {duplicate} appears more than once in one source"
+                    ),
+                });
+            }
+            validated.push((source_id, policy, candidates));
+        }
+        Ok(validated)
+    }
+
+    fn reconcile_discovered_source(
+        &mut self,
+        source_id: &SourceId,
+        policy: &PackagePolicy,
+        candidates: Vec<DiscoveredPackage>,
+        changed: &mut Vec<(usize, DiscoveredPackage)>,
+        added: &mut Vec<PackageId>,
+    ) -> Result<usize, EngineError> {
+        let mut topology_changes = 0_usize;
+        let indexes = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(_, record)| record.source_id == *source_id)
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        for index in indexes {
+            let package_id = self.packages[index].candidate.manifest.id.clone();
+            let Some(discovered) = candidates
+                .iter()
+                .find(|candidate| candidate.candidate.manifest.id == package_id)
+                .cloned()
+            else {
+                if self.packages[index].development.state != DevelopmentState::SourceMissing {
+                    topology_changes = topology_changes.saturating_add(1);
+                }
+                self.mark_source_missing(
+                    index,
+                    &format!(
+                        "Package {package_id} disappeared from source {source_id}; \
+                         the Last Known Good version remains loaded when available"
+                    ),
+                );
+                continue;
+            };
+            let build_fingerprint = discovered.candidate.build_fingerprint;
+            self.packages[index].development.desired_build_fingerprint = Some(build_fingerprint);
+            if self.packages[index].development.state == DevelopmentState::SourceMissing
+                && self.packages[index].development.active_build_fingerprint
+                    == Some(build_fingerprint)
+            {
+                self.development_coordinator
+                    .retain_active(package_id.clone(), build_fingerprint);
+                self.packages[index].development.state = DevelopmentState::Idle;
+                self.packages[index].development.terminal_build_fingerprint = None;
+                self.packages[index].last_diagnostic = None;
+                self.clear_unqueued_observation(index);
+            }
+            if self.packages[index].candidate.build_fingerprint != build_fingerprint {
+                changed.push((index, discovered));
+            }
+        }
+        for discovered in candidates {
+            if let Some((package_id, should_enable)) =
+                self.insert_discovered_package(source_id, policy, discovered)?
+            {
+                topology_changes = topology_changes.saturating_add(1);
+                if should_enable {
+                    added.push(package_id);
+                }
+            }
+        }
+        Ok(topology_changes)
+    }
+
+    fn insert_discovered_package(
+        &mut self,
+        source_id: &SourceId,
+        policy: &PackagePolicy,
+        discovered: DiscoveredPackage,
+    ) -> Result<Option<(PackageId, bool)>, EngineError> {
+        let package_id = discovered.candidate.manifest.id.clone();
+        if self.packages.iter().any(|record| {
+            record.source_id == *source_id && record.candidate.manifest.id == package_id
+        }) {
+            return Ok(None);
+        }
+        let effective = manifest::apply_package_policy(&discovered.candidate.manifest, policy)
+            .expect("reload discovery policy was validated before reconciliation");
+        let mut lifecycle = PackageLifecycle::discovered();
+        let locked = effective
+            .entitlement
+            .as_ref()
+            .is_some_and(|id| !self.entitlements.contains(id));
+        lifecycle.transition(if locked {
+            PackageStatus::Locked
+        } else {
+            PackageStatus::Disabled
+        })?;
+        let should_enable = !locked
+            && (effective.activation == ActivationPolicy::Required
+                || (effective.activation == ActivationPolicy::DefaultEnabled
+                    && self.persisted.get(&package_id).copied().unwrap_or(true))
+                || self.persisted.get(&package_id).copied() == Some(true));
+        self.packages.push(PackageRecord {
+            source_id: source_id.clone(),
+            policy: policy.clone(),
+            effective,
+            candidate: discovered.candidate,
+            build_input: discovered.build_input,
+            lifecycle,
+            runtime: None,
+            last_diagnostic: None,
+            last_known_good: None,
+            development: development::PackageDevelopment::default(),
+            awaiting_job: None,
+            handler_calls_this_tick: 0,
+            handler_instructions_this_tick: 0,
+            fuel_used_this_tick: 0,
+            outputs_this_tick: 0,
+            ready_candidate: None,
+            ready_commit_requested: false,
+        });
+        Ok(Some((package_id, should_enable)))
+    }
+
     #[allow(clippy::too_many_lines)]
     fn scan_development_changes(&mut self) {
+        let build_context = self.candidate_build_context();
         let discoveries = self
             .sources
             .iter()
@@ -987,7 +1484,9 @@ impl NexaEngine {
                 let started = std::time::Instant::now();
                 (
                     source.id().clone(),
-                    source.discover().map_err(|error| error.to_string()),
+                    source
+                        .discover(&build_context)
+                        .map_err(|error| error.to_string()),
                     started.elapsed(),
                 )
             })
@@ -1031,9 +1530,9 @@ impl NexaEngine {
             for index in indexes {
                 self.packages[index].development.last_discovery_duration = discovery_duration;
                 let package_id = self.packages[index].candidate.manifest.id.clone();
-                let Some(candidate) = candidates
+                let Some(discovered) = candidates
                     .iter()
-                    .find(|candidate| candidate.manifest.id == package_id)
+                    .find(|discovered| discovered.candidate.manifest.id == package_id)
                     .cloned()
                 else {
                     self.mark_source_missing(
@@ -1042,62 +1541,75 @@ impl NexaEngine {
                     );
                     continue;
                 };
+                let candidate = discovered.candidate;
+                let build_input = discovered.build_input;
 
-                let hash_started = std::time::Instant::now();
-                let source_hash = candidate_source_hash(&candidate);
-                self.packages[index].development.last_source_hash_duration = hash_started.elapsed();
-                self.packages[index].development.desired_hash = Some(source_hash);
+                let fingerprint_started = std::time::Instant::now();
+                let build_fingerprint = candidate.build_fingerprint;
+                self.packages[index]
+                    .development
+                    .last_build_fingerprint_duration = fingerprint_started.elapsed();
+                self.packages[index].development.desired_build_fingerprint =
+                    Some(build_fingerprint);
                 if self.packages[index].development.state == DevelopmentState::SourceMissing {
+                    if self.packages[index].development.active_build_fingerprint
+                        == Some(build_fingerprint)
+                    {
+                        self.development_coordinator
+                            .retain_active(package_id, build_fingerprint);
+                        self.packages[index].development.state = DevelopmentState::Idle;
+                        self.packages[index].development.terminal_build_fingerprint = None;
+                        self.packages[index].last_diagnostic = None;
+                        self.clear_unqueued_observation(index);
+                        continue;
+                    }
                     self.packages[index].development.state = DevelopmentState::Idle;
-                    self.packages[index].development.terminal_hash = None;
+                    self.packages[index].development.terminal_build_fingerprint = None;
                 }
-                let matches_active =
-                    self.packages[index].development.active_hash == Some(source_hash);
-                let matches_terminal =
-                    self.packages[index].development.terminal_hash == Some(source_hash);
+                let observation = self
+                    .development_coordinator
+                    .observe(package_id, build_fingerprint);
+                let matches_active = observation.matched_active;
+                let matches_terminal = observation.matched_terminal;
                 if matches_active || matches_terminal {
-                    self.supersede_development_for_current_source(index, Some(source_hash));
+                    self.supersede_development_for_current_source(index, Some(build_fingerprint));
                     self.clear_unqueued_observation(index);
                     if matches_active {
                         self.packages[index].development.state = DevelopmentState::Idle;
-                        self.packages[index].development.terminal_hash = None;
+                        self.packages[index].development.terminal_build_fingerprint = None;
                     }
                     continue;
                 }
 
-                if self.packages[index].development.observed_hash == Some(source_hash) {
-                    self.packages[index].development.stable_scans = self.packages[index]
-                        .development
-                        .stable_scans
-                        .saturating_add(1);
+                if self.packages[index].development.observed_build_fingerprint
+                    == Some(build_fingerprint)
+                {
+                    self.packages[index].development.stable_scans = observation.stable_scans;
                 } else {
-                    self.supersede_development_for_current_source(index, Some(source_hash));
+                    self.supersede_development_for_current_source(index, Some(build_fingerprint));
                     self.clear_unqueued_observation(index);
-                    self.packages[index].development.observed_hash = Some(source_hash);
-                    self.packages[index].development.stable_hash = None;
-                    self.packages[index].development.stable_scans = 1;
+                    self.packages[index].development.observed_build_fingerprint =
+                        Some(build_fingerprint);
+                    self.packages[index].development.stable_build_fingerprint = None;
+                    self.packages[index].development.stable_scans = observation.stable_scans;
                     self.packages[index].development.change_observed_at =
                         Some(std::time::Instant::now());
                     self.packages[index].development.state = DevelopmentState::ChangeObserved;
-                    self.packages[index].development.latest_generation = self.packages[index]
-                        .development
-                        .latest_generation
-                        .saturating_add(1);
-                    let generation = self.packages[index].development.latest_generation;
+                    let identity = observation
+                        .identity
+                        .clone()
+                        .expect("a changed development observation creates a Generation");
+                    self.packages[index].development.latest_generation = identity.generation;
                     self.packages[index].development.unqueued_generation =
                         Some(CandidateTerminalData {
-                            package_id: package_id.clone(),
                             source_id: source_id.clone(),
-                            generation,
-                            source_hash,
+                            identity: identity.clone(),
+                            build_input: std::sync::Arc::clone(&build_input),
                             queue_duration: Duration::ZERO,
                             work_duration: Duration::ZERO,
                         });
                     self.publish_event(DevelopmentEvent::ChangeDetected(development_event_data(
-                        package_id.clone(),
-                        generation,
-                        source_hash,
-                        None,
+                        identity, None,
                     )));
                 }
 
@@ -1109,8 +1621,28 @@ impl NexaEngine {
                     continue;
                 }
                 let generation = self.packages[index].development.latest_generation;
-                if self.packages[index].development.stable_hash != Some(source_hash) {
-                    self.packages[index].development.stable_hash = Some(source_hash);
+                if self.packages[index].awaiting_job.is_some()
+                    || self.packages[index].ready_candidate.is_some()
+                    || (self.packages[index].development.queued_generation == Some(generation)
+                        && self.packages[index].development.queued_build_fingerprint
+                            == Some(build_fingerprint))
+                    || (self.packages[index].development.in_flight_generation == Some(generation)
+                        && self.packages[index].development.in_flight_build_fingerprint
+                            == Some(build_fingerprint))
+                {
+                    continue;
+                }
+                let identity = self.packages[index]
+                    .development
+                    .unqueued_generation
+                    .as_ref()
+                    .map(|data| data.identity.clone())
+                    .expect("a stable Candidate retains its immutable Generation identity");
+                if self.packages[index].development.stable_build_fingerprint
+                    != Some(build_fingerprint)
+                {
+                    self.packages[index].development.stable_build_fingerprint =
+                        Some(build_fingerprint);
                     self.packages[index]
                         .development
                         .last_change_to_stable_duration = self.packages[index]
@@ -1118,38 +1650,27 @@ impl NexaEngine {
                         .change_observed_at
                         .map_or(Duration::ZERO, |observed| observed.elapsed());
                     self.publish_event(DevelopmentEvent::ChangeStabilized(development_event_data(
-                        package_id.clone(),
-                        generation,
-                        source_hash,
+                        identity.clone(),
                         None,
                     )));
-                }
-                if self.packages[index].awaiting_job.is_some()
-                    || self.packages[index].ready_candidate.is_some()
-                    || (self.packages[index].development.queued_generation == Some(generation)
-                        && self.packages[index].development.queued_hash == Some(source_hash))
-                    || (self.packages[index].development.in_flight_generation == Some(generation)
-                        && self.packages[index].development.in_flight_hash == Some(source_hash))
-                {
-                    continue;
                 }
                 let unqueued = self.packages[index]
                     .development
                     .unqueued_generation
                     .take()
                     .expect("a stable unqueued Candidate has a Generation ledger entry");
-                assert_eq!(unqueued.generation, generation);
-                assert_eq!(unqueued.source_hash, source_hash);
+                assert_eq!(unqueued.identity.generation, generation);
+                assert_eq!(unqueued.identity, identity);
                 self.try_enqueue_job(
                     index,
                     CompileJob::new(
-                        package_id,
                         source_id.clone(),
-                        generation,
-                        source_hash,
-                        candidate,
+                        unqueued.identity,
+                        build_input,
                         self.idl.clone(),
                         self.required_exports.clone(),
+                        self.host_contract_source_identity.clone(),
+                        std::sync::Arc::clone(&self.host_contract_source),
                     ),
                 );
             }
@@ -1157,15 +1678,59 @@ impl NexaEngine {
     }
 
     fn mark_source_missing(&mut self, index: usize, message: &str) {
-        self.packages[index].development.desired_hash = None;
+        self.packages[index].development.desired_build_fingerprint = None;
         if self.packages[index].development.state == DevelopmentState::SourceMissing {
             return;
         }
-        self.cancel_development(index, CandidateCancellation::SourceRemoval);
-        self.packages[index].development.state = DevelopmentState::SourceMissing;
-        self.packages[index].development.observed_hash = None;
-        self.packages[index].development.stable_hash = None;
         let package_id = self.packages[index].candidate.manifest.id.clone();
+        self.packages[index].development.state = DevelopmentState::SourceMissing;
+        self.packages[index].development.observed_build_fingerprint = None;
+        self.packages[index].development.stable_build_fingerprint = None;
+        let coordinator_terminals = self.development_coordinator.invalidate(
+            &package_id,
+            nexa_analysis::DevelopmentInvalidation::SourceRemoval,
+        );
+        let mut event_identity = coordinator_terminals
+            .iter()
+            .max_by_key(|terminal| terminal.identity.generation)
+            .map(|terminal| terminal.identity.clone());
+        self.cancel_development(index, CandidateCancellation::SourceRemoval);
+        if event_identity.is_none() {
+            let active_build_fingerprint = self.packages[index].candidate.build_fingerprint;
+            let next_generation = self
+                .development_coordinator
+                .inspection()
+                .packages
+                .get(&package_id)
+                .map_or(1, |package| package.latest_generation.saturating_add(1));
+            let mut fingerprint =
+                nexa_analysis::FingerprintBuilder::new("nexa.engine.source-missing", 1);
+            fingerprint.field_str("package", package_id.as_str());
+            fingerprint.field_u64("generation", next_generation);
+            fingerprint.field_bytes("active-build", active_build_fingerprint.as_bytes());
+            let source_missing_fingerprint =
+                BuildFingerprint::from_bytes(fingerprint.finish_bytes());
+            let (identity, superseded) = self
+                .development_coordinator
+                .begin(package_id.clone(), source_missing_fingerprint);
+            debug_assert!(superseded.is_empty());
+            self.packages[index].development.latest_generation = identity.generation;
+            let terminal = self.development_coordinator.invalidate(
+                &package_id,
+                nexa_analysis::DevelopmentInvalidation::SourceRemoval,
+            );
+            debug_assert_eq!(terminal.len(), 1);
+            self.process_candidate_terminal(CandidateTerminal::CancelledBySourceRemoval(
+                CandidateTerminalData {
+                    source_id: self.packages[index].source_id.clone(),
+                    identity: identity.clone(),
+                    build_input: std::sync::Arc::clone(&self.packages[index].build_input),
+                    queue_duration: Duration::ZERO,
+                    work_duration: Duration::ZERO,
+                },
+            ));
+            event_identity = Some(identity);
+        }
         let source_id = self.packages[index].source_id.clone();
         let diagnostic = self.diagnostics.push(EngineDiagnostic::without_source(
             Some(package_id.clone()),
@@ -1176,9 +1741,7 @@ impl NexaEngine {
         ));
         self.packages[index].last_diagnostic = Some(diagnostic.summary());
         self.publish_event(DevelopmentEvent::SourceMissing(development_event_data(
-            package_id,
-            self.packages[index].development.latest_generation,
-            SourceHash::default(),
+            event_identity.expect("source removal always terminalizes a unique Generation"),
             Some(diagnostic),
         )));
     }
@@ -1198,20 +1761,31 @@ impl NexaEngine {
     }
 
     fn try_enqueue_job(&mut self, index: usize, job: CompileJob) {
-        let package_id = job.package_id.clone();
-        let generation = job.generation;
-        let source_hash = job.source_hash;
+        let identity = job.identity.clone();
+        match self.development_coordinator.enqueue(identity.clone()) {
+            nexa_analysis::DevelopmentQueueOutcome::Accepted
+            | nexa_analysis::DevelopmentQueueOutcome::AlreadyQueued => {}
+            nexa_analysis::DevelopmentQueueOutcome::Backpressured(_) => {
+                self.packages[index].development.state = DevelopmentState::AwaitingQueue;
+                self.packages[index].awaiting_job = Some(job);
+                return;
+            }
+            nexa_analysis::DevelopmentQueueOutcome::Stale(_) => {
+                self.process_candidate_terminal(job.supersede_before_compile());
+                return;
+            }
+        }
         let Some(worker) = self.development_worker.as_ref() else {
             self.process_candidate_terminal(job.cancel(CandidateCancellation::Shutdown));
             return;
         };
         match worker.enqueue(job) {
             EnqueueOutcome::Accepted => {
-                self.mark_job_queued(index, package_id, generation, source_hash);
+                self.mark_job_queued(index, identity);
             }
             EnqueueOutcome::ReplacedPending { terminal, .. } => {
                 self.process_candidate_terminal(terminal);
-                self.mark_job_queued(index, package_id, generation, source_hash);
+                self.mark_job_queued(index, identity);
             }
             EnqueueOutcome::Backpressured { job } => {
                 self.packages[index].development.state = DevelopmentState::AwaitingQueue;
@@ -1223,21 +1797,13 @@ impl NexaEngine {
         }
     }
 
-    fn mark_job_queued(
-        &mut self,
-        index: usize,
-        package_id: PackageId,
-        generation: u64,
-        source_hash: SourceHash,
-    ) {
-        self.packages[index].development.queued_hash = Some(source_hash);
-        self.packages[index].development.queued_generation = Some(generation);
+    fn mark_job_queued(&mut self, index: usize, identity: CandidateIdentity) {
+        self.packages[index].development.queued_build_fingerprint =
+            Some(identity.build_fingerprint);
+        self.packages[index].development.queued_generation = Some(identity.generation);
         self.packages[index].development.state = DevelopmentState::CompileQueued;
         self.publish_event(DevelopmentEvent::CompileQueued(development_event_data(
-            package_id,
-            generation,
-            source_hash,
-            None,
+            identity, None,
         )));
     }
 
@@ -1261,33 +1827,38 @@ impl NexaEngine {
         for event in drain.events {
             match event {
                 WorkerEvent::CompileStarted {
-                    package_id,
                     source_id,
-                    generation,
-                    source_hash,
+                    identity,
                     queue_duration,
                 } => {
+                    let _ = self.development_coordinator.start(&identity);
                     if let Some(index) = self.packages.iter().position(|record| {
-                        record.candidate.manifest.id == package_id && record.source_id == source_id
+                        record.candidate.manifest.id == identity.package_id
+                            && record.source_id == source_id
                     }) {
-                        if self.packages[index].development.queued_generation == Some(generation)
-                            && self.packages[index].development.queued_hash == Some(source_hash)
+                        if self.packages[index].development.queued_generation
+                            == Some(identity.generation)
+                            && self.packages[index].development.queued_build_fingerprint
+                                == Some(identity.build_fingerprint)
                         {
-                            self.packages[index].development.queued_hash = None;
+                            self.packages[index].development.queued_build_fingerprint = None;
                             self.packages[index].development.queued_generation = None;
                         }
-                        self.packages[index].development.in_flight_hash = Some(source_hash);
-                        self.packages[index].development.in_flight_generation = Some(generation);
+                        self.packages[index].development.in_flight_build_fingerprint =
+                            Some(identity.build_fingerprint);
+                        self.packages[index].development.in_flight_generation =
+                            Some(identity.generation);
                         self.packages[index].development.last_queue_duration = queue_duration;
-                        if generation == self.packages[index].development.latest_generation
-                            && self.packages[index].development.desired_hash == Some(source_hash)
+                        if identity.generation == self.packages[index].development.latest_generation
+                            && self.packages[index].development.desired_build_fingerprint
+                                == Some(identity.build_fingerprint)
                         {
                             self.packages[index].development.state = DevelopmentState::Compiling;
                         }
                     }
                     self.publish_event(DevelopmentEvent::CompileStarted(DevelopmentEventData {
                         queue_duration: Some(queue_duration),
-                        ..development_event_data(package_id, generation, source_hash, None)
+                        ..development_event_data(identity, None)
                     }));
                 }
             }
@@ -1301,7 +1872,8 @@ impl NexaEngine {
     fn process_candidate_terminal(&mut self, terminal: CandidateTerminal) {
         let data = terminal.data().clone();
         let Some(index) = self.packages.iter().position(|record| {
-            record.candidate.manifest.id == data.package_id && record.source_id == data.source_id
+            record.candidate.manifest.id == data.identity.package_id
+                && record.source_id == data.source_id
         }) else {
             return;
         };
@@ -1317,12 +1889,14 @@ impl NexaEngine {
             if self.packages[index].development.state == DevelopmentState::SourceMissing {
                 CandidateTerminal::CancelledBySourceRemoval(data.clone())
             } else {
-                if self.packages[index].development.desired_hash != Some(data.source_hash) {
+                if self.packages[index].development.desired_build_fingerprint
+                    != Some(data.identity.build_fingerprint)
+                {
                     self.packages[index]
                         .development
-                        .desired_hash_mismatch_rejection_count = self.packages[index]
+                        .desired_build_fingerprint_mismatch_rejection_count = self.packages[index]
                         .development
-                        .desired_hash_mismatch_rejection_count
+                        .desired_build_fingerprint_mismatch_rejection_count
                         .saturating_add(1);
                 }
                 CandidateTerminal::SupersededAfterCompile(data.clone())
@@ -1341,25 +1915,31 @@ impl NexaEngine {
         match terminal {
             CandidateTerminal::Compiled {
                 data,
-                candidate,
+                build_input,
                 compilation,
-            } => self.process_compiled_candidate(index, data, candidate, compilation),
+            } => self.process_compiled_candidate(index, data, build_input, compilation),
             CandidateTerminal::CompileFailed {
                 data,
                 mut diagnostic,
+                additional_diagnostics,
                 compile_duration,
                 verify_duration,
             }
             | CandidateTerminal::VerifyFailed {
                 data,
                 mut diagnostic,
+                additional_diagnostics,
                 compile_duration,
                 verify_duration,
             } => {
                 let verify = diagnostic.stage == EngineDiagnosticStage::Verify;
-                diagnostic.context.candidate_generation = Some(data.generation);
+                diagnostic.context.candidate_generation = Some(data.identity.generation);
                 let diagnostic = self.diagnostics.push(diagnostic);
                 self.packages[index].last_diagnostic = Some(diagnostic.summary());
+                for mut additional in additional_diagnostics {
+                    additional.context.candidate_generation = Some(data.identity.generation);
+                    self.diagnostics.push(additional);
+                }
                 self.packages[index].development.last_compile_duration = Some(compile_duration);
                 self.packages[index].development.last_verify_duration = verify_duration;
                 self.packages[index].development.state = if verify {
@@ -1378,25 +1958,19 @@ impl NexaEngine {
                 );
                 self.publish_event(if verify {
                     DevelopmentEvent::VerifyFailed(development_event_data(
-                        data.package_id.clone(),
-                        data.generation,
-                        data.source_hash,
+                        data.identity.clone(),
                         Some(diagnostic),
                     ))
                 } else {
                     DevelopmentEvent::CompileFailed(development_event_data(
-                        data.package_id.clone(),
-                        data.generation,
-                        data.source_hash,
+                        data.identity.clone(),
                         Some(diagnostic),
                     ))
                 });
                 self.publish_reload(reload_report(
-                    data.package_id,
-                    data.generation,
+                    data.identity,
                     0,
                     None,
-                    data.source_hash,
                     compile_duration,
                     verify_duration,
                     nexa_runtime::RestartReloadMetrics::default(),
@@ -1462,19 +2036,12 @@ impl NexaEngine {
                     CandidateTerminalKind::RejectedHostContractChange,
                 );
                 self.publish_event(DevelopmentEvent::HostRebuildRequired(
-                    development_event_data(
-                        data.package_id.clone(),
-                        data.generation,
-                        data.source_hash,
-                        None,
-                    ),
+                    development_event_data(data.identity.clone(), None),
                 ));
                 self.publish_reload(reload_report(
-                    data.package_id,
-                    data.generation,
+                    data.identity,
                     0,
                     None,
-                    data.source_hash,
                     data.work_duration,
                     Duration::ZERO,
                     nexa_runtime::RestartReloadMetrics::default(),
@@ -1494,9 +2061,10 @@ impl NexaEngine {
         outcome: ReloadReportOutcome,
         superseded: bool,
     ) {
-        let settles_stale_latest = data.generation
+        let settles_stale_latest = data.identity.generation
             == self.packages[index].development.latest_generation
-            && self.packages[index].development.desired_hash != Some(data.source_hash);
+            && self.packages[index].development.desired_build_fingerprint
+                != Some(data.identity.build_fingerprint);
         let source_is_missing =
             self.packages[index].development.state == DevelopmentState::SourceMissing;
         self.record_generation_terminal(index, &data, kind);
@@ -1508,25 +2076,19 @@ impl NexaEngine {
         }
         self.publish_event(if superseded {
             DevelopmentEvent::CandidateSuperseded(development_event_data(
-                data.package_id.clone(),
-                data.generation,
-                data.source_hash,
+                data.identity.clone(),
                 None,
             ))
         } else {
             DevelopmentEvent::CandidateCancelled(development_event_data(
-                data.package_id.clone(),
-                data.generation,
-                data.source_hash,
+                data.identity.clone(),
                 None,
             ))
         });
         self.publish_reload(reload_report(
-            data.package_id,
-            data.generation,
+            data.identity,
             0,
             None,
-            data.source_hash,
             data.work_duration,
             Duration::ZERO,
             nexa_runtime::RestartReloadMetrics::default(),
@@ -1540,7 +2102,7 @@ impl NexaEngine {
         &mut self,
         index: usize,
         data: CandidateTerminalData,
-        candidate: PackageCandidate,
+        build_input: std::sync::Arc<nexa_analysis::ResolvedBuildInput>,
         compilation: CandidateCompilation,
     ) {
         if !self.candidate_identity_is_current(index, &data) {
@@ -1550,55 +2112,63 @@ impl NexaEngine {
         self.packages[index].development.last_compile_duration = Some(compilation.compile_duration);
         self.packages[index].development.last_verify_duration = compilation.verify_duration;
         self.publish_event(DevelopmentEvent::CompileSucceeded(development_event_data(
-            data.package_id.clone(),
-            data.generation,
-            data.source_hash,
+            data.identity.clone(),
             None,
         )));
         self.packages[index].development.state = DevelopmentState::CandidateReady;
         self.publish_event(DevelopmentEvent::CandidateReady(development_event_data(
-            data.package_id.clone(),
-            data.generation,
-            data.source_hash,
+            data.identity.clone(),
             None,
         )));
         if !self.development.auto_reload {
             self.packages[index].ready_candidate = Some(development::ReadyCandidate {
-                candidate,
+                build_input,
                 compilation,
                 terminal_data: data,
             });
             return;
         }
-        self.commit_compiled_from_tick(index, data, candidate, compilation);
+        self.commit_compiled_from_tick(index, data, build_input, compilation);
     }
 
     fn commit_compiled_from_tick(
         &mut self,
         index: usize,
         data: CandidateTerminalData,
-        candidate: PackageCandidate,
+        build_input: std::sync::Arc<nexa_analysis::ResolvedBuildInput>,
         compilation: CandidateCompilation,
     ) {
         if !self.candidate_identity_is_current(index, &data) {
             self.finish_candidate_rejected_by_freshness(index, data);
             return;
         }
-        self.record_generation_terminal(index, &data, CandidateTerminalKind::Compiled);
+        let terminal_kind =
+            self.record_generation_terminal(index, &data, CandidateTerminalKind::Compiled);
+        if terminal_kind != CandidateTerminalKind::Compiled {
+            self.finish_recorded_candidate_rejection(
+                index,
+                data,
+                terminal_kind,
+                compilation.compile_duration,
+                compilation.verify_duration,
+            );
+            return;
+        }
         self.packages[index].development.state = DevelopmentState::ReloadPending;
         self.publish_event(DevelopmentEvent::ReloadStarted(development_event_data(
-            data.package_id.clone(),
-            data.generation,
-            data.source_hash,
+            data.identity.clone(),
             None,
         )));
         self.packages[index].development.state = DevelopmentState::Reloading;
         let reload_started = std::time::Instant::now();
+        let candidate = build_input
+            .candidate()
+            .expect("a resolved build input always yields its canonical candidate");
         match self.commit_compiled_candidate(
             index,
             candidate,
+            build_input,
             compilation.artifact,
-            data.generation,
             compilation.compile_duration,
             compilation.verify_duration,
         ) {
@@ -1614,12 +2184,7 @@ impl NexaEngine {
                     report.activation_duration;
                 self.publish_event(DevelopmentEvent::ReloadCommitted(DevelopmentEventData {
                     reload: Some(report.summary()),
-                    ..development_event_data(
-                        data.package_id,
-                        data.generation,
-                        data.source_hash,
-                        None,
-                    )
+                    ..development_event_data(data.identity, None)
                 }));
                 self.publish_reload(report);
             }
@@ -1638,12 +2203,7 @@ impl NexaEngine {
                 };
                 let event_data = DevelopmentEventData {
                     reload: Some(failure.report.summary()),
-                    ..development_event_data(
-                        data.package_id,
-                        data.generation,
-                        data.source_hash,
-                        None,
-                    )
+                    ..development_event_data(data.identity, None)
                 };
                 self.publish_event(if activation {
                     DevelopmentEvent::ActivationFaulted(event_data)
@@ -1691,6 +2251,79 @@ impl NexaEngine {
             .last_total_change_to_visible_duration = report.total_change_to_visible_duration;
     }
 
+    fn finish_recorded_candidate_rejection(
+        &mut self,
+        index: usize,
+        data: CandidateTerminalData,
+        kind: CandidateTerminalKind,
+        compile_duration: Duration,
+        verify_duration: Duration,
+    ) {
+        let host_rebuild = kind == CandidateTerminalKind::RejectedHostContractChange;
+        let source_missing = kind == CandidateTerminalKind::CancelledBySourceRemoval;
+        self.packages[index].development.state = if host_rebuild {
+            DevelopmentState::HostRebuildRequired
+        } else if source_missing {
+            DevelopmentState::SourceMissing
+        } else {
+            DevelopmentState::Idle
+        };
+        if source_missing {
+            self.packages[index].development.desired_build_fingerprint = None;
+            self.packages[index].development.observed_build_fingerprint = None;
+            self.packages[index].development.stable_build_fingerprint = None;
+            let diagnostic = self.diagnostics.push(EngineDiagnostic::without_source(
+                Some(data.identity.package_id.clone()),
+                Some(data.source_id.clone()),
+                EngineDiagnosticStage::SourceDiscovery,
+                nexa::ErrorCode::NX7001,
+                "Package source disappeared during the final Candidate freshness check",
+            ));
+            self.packages[index].last_diagnostic = Some(diagnostic.summary());
+            self.publish_event(DevelopmentEvent::SourceMissing(development_event_data(
+                data.identity.clone(),
+                Some(diagnostic),
+            )));
+        } else {
+            self.publish_event(if host_rebuild {
+                DevelopmentEvent::HostRebuildRequired(development_event_data(
+                    data.identity.clone(),
+                    None,
+                ))
+            } else if matches!(
+                kind,
+                CandidateTerminalKind::CancelledByDisable
+                    | CandidateTerminalKind::CancelledBySourceRemoval
+                    | CandidateTerminalKind::CancelledByShutdown
+            ) {
+                DevelopmentEvent::CandidateCancelled(development_event_data(
+                    data.identity.clone(),
+                    None,
+                ))
+            } else {
+                DevelopmentEvent::CandidateSuperseded(development_event_data(
+                    data.identity.clone(),
+                    None,
+                ))
+            });
+        }
+        self.publish_reload(reload_report(
+            data.identity,
+            0,
+            None,
+            compile_duration,
+            verify_duration,
+            nexa_runtime::RestartReloadMetrics::default(),
+            if host_rebuild {
+                ReloadReportOutcome::HostRebuildRequired
+            } else {
+                ReloadReportOutcome::Superseded
+            },
+            0,
+            0,
+        ));
+    }
+
     fn finish_candidate_rejected_by_freshness(
         &mut self,
         index: usize,
@@ -1705,12 +2338,14 @@ impl NexaEngine {
                 false,
             );
         } else {
-            if self.packages[index].development.desired_hash != Some(data.source_hash) {
+            if self.packages[index].development.desired_build_fingerprint
+                != Some(data.identity.build_fingerprint)
+            {
                 self.packages[index]
                     .development
-                    .desired_hash_mismatch_rejection_count = self.packages[index]
+                    .desired_build_fingerprint_mismatch_rejection_count = self.packages[index]
                     .development
-                    .desired_hash_mismatch_rejection_count
+                    .desired_build_fingerprint_mismatch_rejection_count
                     .saturating_add(1);
             }
             self.finish_noncompiled_terminal(
@@ -1723,16 +2358,57 @@ impl NexaEngine {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record_generation_terminal(
         &mut self,
         index: usize,
         data: &CandidateTerminalData,
         kind: CandidateTerminalKind,
-    ) {
+    ) -> CandidateTerminalKind {
+        self.record_shared_generation_terminal(index, data, kind);
+        let kind = if matches!(
+            kind,
+            CandidateTerminalKind::Compiled
+                | CandidateTerminalKind::CompileFailed
+                | CandidateTerminalKind::VerifyFailed
+                | CandidateTerminalKind::RejectedHostContractChange
+        ) {
+            self.development_coordinator
+                .terminal(&data.identity)
+                .map_or(kind, |terminal| match terminal.kind {
+                    nexa_analysis::DevelopmentTerminalKind::Compiled => {
+                        CandidateTerminalKind::Compiled
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::CompileFailed => {
+                        CandidateTerminalKind::CompileFailed
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::VerifyFailed => {
+                        CandidateTerminalKind::VerifyFailed
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::SupersededBeforeCompile => {
+                        CandidateTerminalKind::SupersededBeforeCompile
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::SupersededInFlight
+                    | nexa_analysis::DevelopmentTerminalKind::CancelledByInvalidation => {
+                        CandidateTerminalKind::SupersededAfterCompile
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::CancelledBySourceRemoval => {
+                        CandidateTerminalKind::CancelledBySourceRemoval
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::CancelledByShutdown => {
+                        CandidateTerminalKind::CancelledByShutdown
+                    }
+                    nexa_analysis::DevelopmentTerminalKind::RejectedHostContractChange => {
+                        CandidateTerminalKind::RejectedHostContractChange
+                    }
+                })
+        } else {
+            kind
+        };
         let previous = self.packages[index]
             .development
             .terminal_generations
-            .insert(data.generation, kind);
+            .insert(data.identity.generation, kind);
         if previous.is_some() {
             self.packages[index].development.duplicate_terminal_count = self.packages[index]
                 .development
@@ -1742,8 +2418,8 @@ impl NexaEngine {
         assert!(
             previous.is_none(),
             "Candidate generation {} for {} received two terminal outcomes",
-            data.generation,
-            data.package_id
+            data.identity.generation,
+            data.identity.package_id
         );
         self.packages[index].development.terminal_count = self.packages[index]
             .development
@@ -1763,31 +2439,104 @@ impl NexaEngine {
                 .terminal_generations
                 .remove(&oldest);
         }
-        if self.packages[index].development.queued_generation == Some(data.generation)
-            && self.packages[index].development.queued_hash == Some(data.source_hash)
+        if self.packages[index].development.queued_generation == Some(data.identity.generation)
+            && self.packages[index].development.queued_build_fingerprint
+                == Some(data.identity.build_fingerprint)
         {
-            self.packages[index].development.queued_hash = None;
+            self.packages[index].development.queued_build_fingerprint = None;
             self.packages[index].development.queued_generation = None;
         }
-        if self.packages[index].development.in_flight_generation == Some(data.generation)
-            && self.packages[index].development.in_flight_hash == Some(data.source_hash)
+        if self.packages[index].development.in_flight_generation == Some(data.identity.generation)
+            && self.packages[index].development.in_flight_build_fingerprint
+                == Some(data.identity.build_fingerprint)
         {
-            self.packages[index].development.in_flight_hash = None;
+            self.packages[index].development.in_flight_build_fingerprint = None;
             self.packages[index].development.in_flight_generation = None;
         }
-        let records_terminal_hash = matches!(
-            kind,
-            CandidateTerminalKind::Compiled
-                | CandidateTerminalKind::CompileFailed
-                | CandidateTerminalKind::VerifyFailed
-                | CandidateTerminalKind::RejectedHostContractChange
-        ) && self.packages[index].development.desired_hash
-            == Some(data.source_hash);
-        if data.generation == self.packages[index].development.latest_generation
-            && records_terminal_hash
+        let records_terminal_build_fingerprint =
+            matches!(
+                kind,
+                CandidateTerminalKind::Compiled
+                    | CandidateTerminalKind::CompileFailed
+                    | CandidateTerminalKind::VerifyFailed
+                    | CandidateTerminalKind::RejectedHostContractChange
+            ) && self.packages[index].development.desired_build_fingerprint
+                == Some(data.identity.build_fingerprint);
+        if data.identity.generation == self.packages[index].development.latest_generation
+            && records_terminal_build_fingerprint
         {
-            self.packages[index].development.terminal_hash = Some(data.source_hash);
+            self.packages[index].development.terminal_build_fingerprint =
+                Some(data.identity.build_fingerprint);
         }
+        kind
+    }
+
+    fn record_shared_generation_terminal(
+        &mut self,
+        index: usize,
+        data: &CandidateTerminalData,
+        kind: CandidateTerminalKind,
+    ) {
+        if self
+            .development_coordinator
+            .terminal(&data.identity)
+            .is_some()
+        {
+            return;
+        }
+        let (completion, retained_host_contract_changed) = match kind {
+            CandidateTerminalKind::Compiled => {
+                (nexa_analysis::DevelopmentCompletionKind::Compiled, false)
+            }
+            CandidateTerminalKind::CompileFailed => (
+                nexa_analysis::DevelopmentCompletionKind::CompileFailed,
+                false,
+            ),
+            CandidateTerminalKind::VerifyFailed => (
+                nexa_analysis::DevelopmentCompletionKind::VerifyFailed,
+                false,
+            ),
+            CandidateTerminalKind::RejectedHostContractChange => {
+                (nexa_analysis::DevelopmentCompletionKind::Compiled, true)
+            }
+            CandidateTerminalKind::SupersededBeforeCompile
+            | CandidateTerminalKind::SupersededAfterCompile
+            | CandidateTerminalKind::CancelledByDisable => {
+                let package_id = data.identity.package_id.clone();
+                let _ = self.development_coordinator.invalidate(
+                    &package_id,
+                    nexa_analysis::DevelopmentInvalidation::Transient,
+                );
+                return;
+            }
+            CandidateTerminalKind::CancelledBySourceRemoval => {
+                let package_id = data.identity.package_id.clone();
+                let _ = self.development_coordinator.invalidate(
+                    &package_id,
+                    nexa_analysis::DevelopmentInvalidation::SourceRemoval,
+                );
+                return;
+            }
+            CandidateTerminalKind::CancelledByShutdown => {
+                let _ = self.development_coordinator.shutdown();
+                return;
+            }
+        };
+        let Ok(current) = self.fresh_candidate(index) else {
+            let package_id = data.identity.package_id.clone();
+            let _ = self.development_coordinator.invalidate(
+                &package_id,
+                nexa_analysis::DevelopmentInvalidation::SourceRemoval,
+            );
+            return;
+        };
+        let _ = self.development_coordinator.complete(
+            data.identity.clone(),
+            &data.build_input,
+            &current.build_input,
+            completion,
+            retained_host_contract_changed,
+        );
     }
 
     fn terminate_unqueued_generation(&mut self, index: usize, kind: CandidateTerminalKind) -> bool {
@@ -1814,8 +2563,8 @@ impl NexaEngine {
     }
 
     fn clear_unqueued_observation(&mut self, index: usize) {
-        self.packages[index].development.observed_hash = None;
-        self.packages[index].development.stable_hash = None;
+        self.packages[index].development.observed_build_fingerprint = None;
+        self.packages[index].development.stable_build_fingerprint = None;
         self.packages[index].development.stable_scans = 0;
         self.packages[index].development.change_observed_at = None;
         if matches!(
@@ -1829,13 +2578,13 @@ impl NexaEngine {
     fn supersede_development_for_current_source(
         &mut self,
         index: usize,
-        desired_hash: Option<SourceHash>,
+        desired_build_fingerprint: Option<BuildFingerprint>,
     ) {
         if self.packages[index]
             .development
             .unqueued_generation
             .as_ref()
-            .is_some_and(|data| Some(data.source_hash) != desired_hash)
+            .is_some_and(|data| Some(data.identity.build_fingerprint) != desired_build_fingerprint)
         {
             self.terminate_unqueued_generation(
                 index,
@@ -1847,12 +2596,12 @@ impl NexaEngine {
             .development_worker
             .as_ref()
             .map_or_else(Vec::new, |worker| {
-                worker.supersede_package_except(&package_id, desired_hash)
+                worker.supersede_package_except(&package_id, desired_build_fingerprint)
             });
         if self.packages[index]
             .awaiting_job
             .as_ref()
-            .is_some_and(|job| Some(job.source_hash) != desired_hash)
+            .is_some_and(|job| Some(job.identity.build_fingerprint) != desired_build_fingerprint)
         {
             let job = self.packages[index]
                 .awaiting_job
@@ -1863,7 +2612,9 @@ impl NexaEngine {
         if self.packages[index]
             .ready_candidate
             .as_ref()
-            .is_some_and(|ready| Some(ready.terminal_data.source_hash) != desired_hash)
+            .is_some_and(|ready| {
+                Some(ready.terminal_data.identity.build_fingerprint) != desired_build_fingerprint
+            })
         {
             let ready = self.packages[index]
                 .ready_candidate
@@ -1932,7 +2683,7 @@ impl NexaEngine {
             self.commit_compiled_from_tick(
                 index,
                 ready.terminal_data,
-                ready.candidate,
+                ready.build_input,
                 ready.compilation,
             );
         }
@@ -1975,8 +2726,8 @@ impl NexaEngine {
         }
         let manifest = &record.candidate.manifest;
         let policy = nexa_runtime::MustCompletePolicy {
-            fuel: manifest.handler_fuel,
-            cumulative_budget: manifest.cumulative_budget,
+            fuel: record.effective.runtime_limits.handler_fuel,
+            cumulative_budget: record.effective.runtime_limits.cumulative_budget,
         };
         let runtime = record.runtime.as_mut().ok_or_else(|| {
             EngineError::InvalidState(manifest.id.clone(), PackageStatus::Enabled)
@@ -1999,7 +2750,7 @@ impl NexaEngine {
                     package_id: manifest.id.clone(),
                     source_id: record.source_id.clone(),
                     trust: record.policy.trust,
-                    capabilities: manifest.capabilities.clone(),
+                    capabilities: record.effective.capabilities.clone(),
                     value,
                 })
             }
@@ -2047,7 +2798,7 @@ impl NexaEngine {
             .map(|(index, record)| {
                 (
                     index,
-                    record.candidate.manifest.priority,
+                    record.effective.priority,
                     record.candidate.manifest.id.clone(),
                 )
             })
@@ -2073,7 +2824,7 @@ impl NexaEngine {
             .map(|(index, record)| {
                 (
                     index,
-                    record.candidate.manifest.priority,
+                    record.effective.priority,
                     record.candidate.manifest.id.clone(),
                 )
             })
@@ -2112,16 +2863,36 @@ impl NexaEngine {
             .runtime
             .as_mut()
             .ok_or_else(|| EngineError::InvalidState(id.clone(), PackageStatus::Enabled))?;
+        let state_type = runtime
+            .artifact
+            .unique_state_type_named(type_name)
+            .filter(|state| state.version == version)
+            .ok_or_else(|| {
+                EngineError::State(
+                    id.clone(),
+                    format!("unknown or ambiguous state type {type_name} at version {version}"),
+                )
+            })?;
+        let field = state_type
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+            .ok_or_else(|| {
+                EngineError::State(
+                    id.clone(),
+                    format!("unknown state field {type_name}.{field_name}"),
+                )
+            })?;
         runtime
             .realm
             .insert_state(
                 runtime.module,
                 nexa_core::StableId::from_name(state_key),
                 nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
-                    type_id: nexa_core::StableId::from_name(type_name),
+                    type_id: state_type.stable_id.0,
                     version,
                     fields: BTreeMap::from([(
-                        nexa_core::StableId::from_parts(&[type_name, "::", field_name]),
+                        field.stable_id.0,
                         nexa_runtime::StateValue::I32(value),
                     )]),
                 }),
@@ -2143,6 +2914,16 @@ impl NexaEngine {
         let Some(runtime) = &record.runtime else {
             return Ok(None);
         };
+        let Some(state_type) = runtime.artifact.unique_state_type_named(type_name) else {
+            return Ok(None);
+        };
+        let Some(field) = state_type
+            .fields
+            .iter()
+            .find(|field| field.name == field_name)
+        else {
+            return Ok(None);
+        };
         let stable_id = nexa_core::StableId::from_name(state_key);
         let Some(handle) = runtime
             .realm
@@ -2160,17 +2941,13 @@ impl NexaEngine {
         let nexa_runtime::StateValue::Object(object) = value else {
             return Ok(None);
         };
-        if object.type_id != nexa_core::StableId::from_name(type_name) {
+        if object.type_id != state_type.stable_id.0 {
             return Ok(None);
         }
-        Ok(
-            match object.fields.get(&nexa_core::StableId::from_parts(&[
-                type_name, "::", field_name,
-            ])) {
-                Some(nexa_runtime::StateValue::I32(value)) => Some(*value),
-                _ => None,
-            },
-        )
+        Ok(match object.fields.get(&field.stable_id.0) {
+            Some(nexa_runtime::StateValue::I32(value)) => Some(*value),
+            _ => None,
+        })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2190,7 +2967,7 @@ impl NexaEngine {
             record.development.recent_metrics.push_back(PackageMetric {
                 tick: self.ticks,
                 discovery_duration: record.development.last_discovery_duration,
-                source_hash_duration: record.development.last_source_hash_duration,
+                build_fingerprint_duration: record.development.last_build_fingerprint_duration,
                 change_to_stable_duration: record.development.last_change_to_stable_duration,
                 candidate_queue_duration: record.development.last_queue_duration,
                 compile_duration: record.development.last_compile_duration.unwrap_or_default(),
@@ -2216,6 +2993,12 @@ impl NexaEngine {
             record.fuel_used_this_tick = 0;
             record.outputs_this_tick = 0;
         }
+        // Drain only work that was already complete at the tick boundary. Jobs admitted by this
+        // tick's scan are deliberately not observed until a later tick, so a fast compiler cannot
+        // collapse change detection, admission, compilation, and terminal delivery into one
+        // scheduler turn.
+        self.process_worker_activity();
+        self.commit_requested_ready_candidates();
         if self.development.enabled
             && self.development.scan_interval_ticks != 0
             && self
@@ -2224,10 +3007,7 @@ impl NexaEngine {
         {
             self.scan_development_changes();
         }
-        self.process_worker_activity();
         self.retry_backpressured_jobs();
-        self.process_worker_activity();
-        self.commit_requested_ready_candidates();
         let mut runtime_failures = Vec::new();
         for (index, record) in self.packages.iter_mut().enumerate() {
             if let Some(runtime) = record.runtime.as_mut()
@@ -2283,8 +3063,7 @@ impl NexaEngine {
     pub fn refresh_entitlements(&mut self) -> Result<(), EngineError> {
         for index in 0..self.packages.len() {
             let locked = self.packages[index]
-                .candidate
-                .manifest
+                .effective
                 .entitlement
                 .as_ref()
                 .is_some_and(|id| !self.entitlements.contains(id));
@@ -2389,13 +3168,18 @@ impl NexaEngine {
                     source_id: record.source_id.clone(),
                     status: record.lifecycle.status(),
                     version: record.candidate.manifest.version.clone(),
-                    effective_capabilities: record.candidate.manifest.capabilities.clone(),
+                    effective_capabilities: record.effective.capabilities.clone(),
                     active_epoch,
-                    source_hash: record.last_known_good.as_ref().map_or_else(
-                        || candidate_source_hash(&record.candidate),
-                        |known_good| known_good.source_hash,
-                    ),
-                    desired_hash: record.development.desired_hash,
+                    active_identity: record
+                        .last_known_good
+                        .as_ref()
+                        .map(|known_good| known_good.identity.clone()),
+                    active_linked_state_fingerprint: record
+                        .last_known_good
+                        .as_ref()
+                        .map(|known_good| known_good.linked_state_fingerprint),
+                    build_fingerprint: record.candidate.build_fingerprint,
+                    desired_build_fingerprint: record.development.desired_build_fingerprint,
                     candidate_generation: record.development.latest_generation,
                     terminal_generations: record.development.terminal_count,
                     duplicate_terminals: record.development.duplicate_terminal_count,
@@ -2403,9 +3187,9 @@ impl NexaEngine {
                         .development
                         .latest_generation
                         .saturating_sub(record.development.terminal_count),
-                    desired_hash_mismatches_rejected: record
+                    desired_build_fingerprint_mismatches_rejected: record
                         .development
-                        .desired_hash_mismatch_rejection_count,
+                        .desired_build_fingerprint_mismatch_rejection_count,
                     latest_terminal_generation: record
                         .development
                         .terminal_generations
@@ -2457,34 +3241,26 @@ impl NexaEngine {
     }
 
     fn development_inspection(&self) -> DevelopmentInspection {
+        let coordinator = self.development_coordinator.inspection();
         DevelopmentInspection {
             enabled: self.development.enabled,
             worker_running: self.development_worker.is_some(),
-            queued_candidates: self
-                .development_worker
-                .as_ref()
-                .map_or(0, |worker| worker.inspection().queued_packages),
+            queued_candidates: coordinator.queued_candidates,
             retained_events: self.development_events.len(),
-            created_generations: self.packages.iter().fold(0_u64, |total, record| {
-                total.saturating_add(record.development.latest_generation)
-            }),
-            terminal_generations: self.packages.iter().fold(0_u64, |total, record| {
-                total.saturating_add(record.development.terminal_count)
-            }),
-            duplicate_terminals: self.packages.iter().fold(0_u64, |total, record| {
-                total.saturating_add(record.development.duplicate_terminal_count)
-            }),
-            generations_without_terminal: self.packages.iter().fold(0_u64, |total, record| {
-                total.saturating_add(
-                    record
-                        .development
-                        .latest_generation
-                        .saturating_sub(record.development.terminal_count),
-                )
-            }),
-            desired_hash_mismatches_rejected: self.packages.iter().fold(0_u64, |total, record| {
-                total.saturating_add(record.development.desired_hash_mismatch_rejection_count)
-            }),
+            created_generations: coordinator.created_generations,
+            terminal_generations: coordinator.terminal_generations,
+            duplicate_terminals: coordinator.duplicate_terminals,
+            generations_without_terminal: coordinator.generations_without_terminal,
+            desired_build_fingerprint_mismatches_rejected: self.packages.iter().fold(
+                0_u64,
+                |total, record| {
+                    total.saturating_add(
+                        record
+                            .development
+                            .desired_build_fingerprint_mismatch_rejection_count,
+                    )
+                },
+            ),
             worker: self
                 .development_worker
                 .as_ref()
@@ -2496,6 +3272,7 @@ impl NexaEngine {
         if self.shutdown {
             return Ok(());
         }
+        let _ = self.development_coordinator.shutdown();
         for index in 0..self.packages.len() {
             self.cancel_development(index, CandidateCancellation::Shutdown);
         }
@@ -2571,6 +3348,9 @@ impl NexaEngine {
         let package_id = Some(record.candidate.manifest.id.clone());
         let source_id = Some(record.source_id.clone());
         let diagnostic = if let EngineError::Diagnostic(diagnostic) = error {
+            if diagnostic.sequence != 0 {
+                return diagnostic.summary();
+            }
             diagnostic.as_ref().clone()
         } else {
             let (stage, code) = match error {
@@ -2665,7 +3445,11 @@ pub enum EngineError {
     State(PackageId, String),
     Reload(PackageId, String),
     Activation(PackageId, String),
+    Candidate(String),
+    StaleCandidate(CandidateIdentity),
     RealmIdExhausted,
+    DiscoveryRequired,
+    DiscoveryAlreadyCompleted,
     Shutdown(String),
 }
 
@@ -2696,11 +3480,9 @@ impl ReloadFailure {
 
 #[allow(clippy::too_many_arguments)]
 fn reload_report(
-    package_id: PackageId,
-    candidate_generation: u64,
+    identity: CandidateIdentity,
     old_epoch: u64,
     new_epoch: Option<u64>,
-    source_hash: SourceHash,
     compile_duration: std::time::Duration,
     verify_duration: std::time::Duration,
     reload_metrics: nexa_runtime::RestartReloadMetrics,
@@ -2714,11 +3496,9 @@ fn reload_report(
         .saturating_add(reload_metrics.commit_duration)
         .saturating_add(reload_metrics.activation_duration);
     ReloadReport {
-        package_id,
-        candidate_generation,
+        identity,
         old_epoch,
         new_epoch,
-        source_hash,
         change_to_stable_duration: Duration::ZERO,
         queue_duration: Duration::ZERO,
         compile_duration,
@@ -2738,24 +3518,12 @@ fn reload_report(
     }
 }
 
-fn candidate_source_hash(candidate: &PackageCandidate) -> SourceHash {
-    SourceHash(nexa_core::StableId::from_parts(&[
-        &candidate.manifest_source,
-        "\0",
-        &candidate.entry_source,
-    ]))
-}
-
 fn development_event_data(
-    package_id: PackageId,
-    candidate_generation: u64,
-    source_hash: SourceHash,
+    identity: CandidateIdentity,
     diagnostic: Option<EngineDiagnostic>,
 ) -> DevelopmentEventData {
     DevelopmentEventData {
-        package_id,
-        candidate_generation,
-        source_hash,
+        identity,
         diagnostic,
         reload: None,
         queue_duration: None,
@@ -2799,12 +3567,12 @@ fn runtime_trap_diagnostic(
             )
         },
     );
-    let mut diagnostic = EngineDiagnostic::from_leaf(
+    let mut diagnostic = EngineDiagnostic::from_package_snapshot(
         Some(record.candidate.manifest.id.clone()),
         Some(record.source_id.clone()),
         EngineDiagnosticStage::Runtime,
         leaf,
-        Some(&runtime.artifact.source_files),
+        &runtime.artifact.source_files,
     );
     diagnostic
         .diagnostic
@@ -2827,12 +3595,12 @@ fn runtime_trap_diagnostic(
                 || format!("<function #{}>", frame.function),
                 |function| function.name.clone(),
             );
+        let source_identity = frame
+            .source_span
+            .and_then(|span| diagnostic.source_identity(span.file).cloned());
         diagnostic.related.push(RelatedDiagnostic {
             message: format!("at {name}"),
-            file: frame
-                .source_span
-                .and_then(|span| runtime.artifact.source_files.file(span.file))
-                .cloned(),
+            file: source_identity,
             span: frame.source_span,
         });
     }
@@ -2842,12 +3610,12 @@ fn runtime_trap_diagnostic(
             || format!("<host import #{}>", boundary.import),
             |function| format!("{}::{}", contract.interface_name, function.name),
         );
+        let source_identity = boundary
+            .source_span
+            .and_then(|span| diagnostic.source_identity(span.file).cloned());
         diagnostic.related.push(RelatedDiagnostic {
             message: format!("while calling Host function {function_name}"),
-            file: boundary
-                .source_span
-                .and_then(|span| runtime.artifact.source_files.file(span.file))
-                .cloned(),
+            file: source_identity,
             span: boundary.source_span,
         });
         if let Some(function) = function
@@ -2862,6 +3630,12 @@ fn runtime_trap_diagnostic(
                 .find(&function.name)
                 .unwrap_or_default();
             let end = start.saturating_add(function.name.len());
+            let identity = diagnostic.attach_related_source(
+                nexa_diagnostics::SourceIdentity::standalone(std::sync::Arc::<str>::from(
+                    file.path.as_str(),
+                )),
+                contract.canonical_idl,
+            );
             diagnostic.related.push(RelatedDiagnostic {
                 message: format!("Host function {function_name} is declared here"),
                 span: Some(nexa_core::SourceSpan::new(
@@ -2869,7 +3643,7 @@ fn runtime_trap_diagnostic(
                     u32::try_from(start).unwrap_or(u32::MAX),
                     u32::try_from(end).unwrap_or(u32::MAX),
                 )),
-                file: Some(file),
+                file: Some(identity),
             });
         }
     }

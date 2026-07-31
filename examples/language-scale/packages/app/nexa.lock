@@ -1,0 +1,17 @@
+schema = 1
+root = "example.language-scale"
+
+[[packages]]
+id = "example.language-common"
+version = "1.0.0"
+path = "snake-common"
+
+[[packages]]
+id = "example.language-scale"
+version = "1.0.0"
+path = "app"
+
+[[edges]]
+from = "example.language-scale"
+alias = "scale_common"
+to = "example.language-common"

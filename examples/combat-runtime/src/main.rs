@@ -1,7 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use nexa_core::StableId;
+use nexa_core::{CanonicalSymbolIdentity, StableId, SymbolKind};
+use nexa_embed::{
+    ActivationPolicy, ActivationSet, CandidateBuildContext, CapabilitySet, MemoryPackage,
+    MemorySource, PackagePolicy, PackageRuntimeLimits, PackageSource, SourceId, TrustLevel,
+};
 use nexa_runtime::{
     HostPayload, ModuleLifecycle, RealmConfig, RealmRuntime, ReleaseKind, ResourceContext,
     RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostDomain,
@@ -17,6 +21,70 @@ struct EngineHost {
     last_request: Arc<Mutex<Option<nexa_runtime::PendingHostRequest>>>,
     last_token: Arc<Mutex<Option<nexa_runtime::ResourceTokenHandle>>>,
     last_snapshot: Arc<Mutex<Option<nexa_runtime::SnapshotHandle>>>,
+}
+
+const COMBAT_PACKAGE_ID: &str = "example.combat";
+const COMBAT_HOST_SOURCE: &str = "examples/combat-runtime/combat_api.nidl";
+
+fn combat_symbol(kind: SymbolKind, name: &str) -> StableId {
+    CanonicalSymbolIdentity::automatic(COMBAT_PACKAGE_ID, "game.combat", kind, name)
+        .runtime_id()
+        .0
+}
+
+fn compile_combat_candidate(
+    session: &mut nexa::PackageBuildSession,
+    contract: &nexa::HostContractInput<'_>,
+    generation: u64,
+    source_text: &str,
+) -> Result<nexa::CompiledPackageArtifact, Box<dyn std::error::Error>> {
+    let package_id = nexa::PackageId::new(COMBAT_PACKAGE_ID)?;
+    let policy = PackagePolicy {
+        trust: TrustLevel::FirstParty,
+        capability_ceiling: CapabilitySet::default(),
+        allowed_activation: ActivationSet::new([ActivationPolicy::Programmatic]),
+        max_packages: 1,
+        runtime_limits: PackageRuntimeLimits::default(),
+        allow_entitlement: false,
+    };
+    let source = MemorySource::new(SourceId::new("combat-runtime")?, policy).package(
+        MemoryPackage::new(
+            "combat",
+            format!(
+                "schema = 2\n\
+                 kind = \"application\"\n\
+                 id = \"{COMBAT_PACKAGE_ID}\"\n\
+                 name = \"Combat Runtime\"\n\
+                 version = \"1.0.0\"\n\
+                 source_root = \"src\"\n\
+                 entry = \"game.combat\"\n\
+                 activation = \"programmatic\"\n\
+                 capabilities = []\n\
+                 handler_fuel = 20000\n"
+            ),
+        )
+        .source("src/game/combat.nexa", source_text),
+    );
+    let context = CandidateBuildContext::with_source(
+        contract.source().identity().clone(),
+        contract.source().text().as_bytes().to_vec(),
+    );
+    let discovered = source
+        .discover(&context)?
+        .into_iter()
+        .next()
+        .ok_or(HostFailure(
+            "combat Package discovery returned no application",
+        ))?;
+    let identity = discovered.candidate.identity(generation)?;
+    if identity.package_id != package_id {
+        return Err(Box::new(HostFailure(
+            "combat Package identity was not preserved",
+        )));
+    }
+    session
+        .compile_package_with_contract(&discovered.build_input, contract, identity)
+        .map_err(Into::into)
 }
 
 impl generated::GameHost for EngineHost {
@@ -182,19 +250,50 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
     let host_hash = generated::INTERFACE_HASH;
     assert_eq!(host_hash, nexa_idl::exact_hash(&idl));
-    let schema_hash = StableId::from_name("combat-state-v1");
-    let schema_hash_v2 = StableId::from_name("combat-state-v2");
-    let verified =
-        nexa_compiler::compile_with_interface(include_str!("../gameplay.nexa"), &idl, schema_hash)?;
-    let combat_buffer = verified
+    let host_source = Arc::<str>::from(include_str!("../combat_api.nidl"));
+    let host_contract = nexa::HostContractInput::with_source(
+        &idl,
+        nexa::SourceIdentity::standalone(COMBAT_HOST_SOURCE),
+        Arc::clone(&host_source),
+    )?;
+    let mut build_session = nexa::PackageBuildSession::new();
+    let initial = compile_combat_candidate(
+        &mut build_session,
+        &host_contract,
+        1,
+        include_str!("../gameplay.nexa"),
+    )?;
+    let state_schema_fingerprint = initial.module().state_schema_fingerprint;
+    let combat_buffer = initial
         .module()
         .buffer_types
         .iter()
         .find(|buffer| buffer.element == nexa_bytecode::ValueType::I32)
         .copied()
         .ok_or(HostFailure("combat buffer metadata was not emitted"))?;
+    let function_index = |name: &str| {
+        initial
+            .debug_info
+            .functions
+            .iter()
+            .find(|function| {
+                function.package_id == COMBAT_PACKAGE_ID
+                    && function.module_path == "game.combat"
+                    && function.name == name
+            })
+            .map(|function| function.function_index)
+    };
+    let animation_checked = function_index("animation_checked").ok_or(HostFailure(
+        "animation_checked debug metadata was not emitted",
+    ))?;
+    let update = function_index("Update").ok_or(HostFailure("Update metadata was not emitted"))?;
+    let feature_probe = function_index("feature_probe")
+        .ok_or(HostFailure("feature_probe debug metadata was not emitted"))?;
+    let state_probe = function_index("state_probe")
+        .ok_or(HostFailure("state_probe debug metadata was not emitted"))?;
+    let verified = initial.verified;
     let state_handle_type = nexa_bytecode::state_handle_type(nexa_bytecode::ValueType::Named(
-        StableId::from_name("EnemyBrain"),
+        combat_symbol(SymbolKind::Type, "EnemyBrain"),
     ));
     let last_request = Arc::new(Mutex::new(None));
     let last_token = Arc::new(Mutex::new(None));
@@ -210,21 +309,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_host.clone(),
         Box::new(registry),
     )?;
-    let module = realm.load_module(verified, host_hash, schema_hash)?;
+    let module = realm.load_module(verified, host_hash, state_schema_fingerprint)?;
     let enemy_brain = StableId::from_name("boss");
     let replaced_handle = realm.insert_state(
         module,
         enemy_brain,
         nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
-            type_id: StableId::from_name("EnemyBrain"),
+            type_id: combat_symbol(SymbolKind::Type, "EnemyBrain"),
             version: 1,
             fields: BTreeMap::from([
                 (
-                    StableId::from_name("EnemyBrain::phase"),
+                    combat_symbol(SymbolKind::Field, "EnemyBrain.phase"),
                     nexa_runtime::StateValue::I32(3),
                 ),
                 (
-                    StableId::from_name("EnemyBrain::legacy_target"),
+                    combat_symbol(SymbolKind::Field, "EnemyBrain.legacy_target"),
                     nexa_runtime::StateValue::I32(17),
                 ),
             ]),
@@ -235,10 +334,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         module,
         preserved_brain,
         nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
-            type_id: StableId::from_name("StableBrain"),
+            type_id: combat_symbol(SymbolKind::Type, "StableBrain"),
             version: 1,
             fields: BTreeMap::from([(
-                StableId::from_name("StableBrain::phase"),
+                combat_symbol(SymbolKind::Field, "StableBrain.phase"),
                 nexa_runtime::StateValue::I32(5),
             )]),
         }),
@@ -248,15 +347,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         module,
         deleted_brain,
         nexa_runtime::StateValue::Object(nexa_runtime::StateObject {
-            type_id: StableId::from_name("EnemyBrain"),
+            type_id: combat_symbol(SymbolKind::Type, "EnemyBrain"),
             version: 1,
             fields: BTreeMap::from([
                 (
-                    StableId::from_name("EnemyBrain::phase"),
+                    combat_symbol(SymbolKind::Field, "EnemyBrain.phase"),
                     nexa_runtime::StateValue::I32(9),
                 ),
                 (
-                    StableId::from_name("EnemyBrain::legacy_target"),
+                    combat_symbol(SymbolKind::Field, "EnemyBrain.legacy_target"),
                     nexa_runtime::StateValue::I32(23),
                 ),
             ]),
@@ -274,7 +373,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let feature_task = realm.spawn_task(
         module,
-        5,
+        feature_probe,
         &[buffer],
         StepConfig {
             owner: scope,
@@ -290,7 +389,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let state_task = realm.spawn_task(
         module,
-        6,
+        state_probe,
         &[RuntimeValue::StateHandle {
             handle_type: state_handle_type,
             domain: replaced_handle.domain.get(),
@@ -311,7 +410,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let checked = realm.spawn_task(
         module,
-        3,
+        animation_checked,
         &[RuntimeValue::I32(7)],
         StepConfig {
             owner: scope,
@@ -344,7 +443,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
     let checked_error = realm.spawn_task(
         module,
-        3,
+        animation_checked,
         &[RuntimeValue::I32(8)],
         StepConfig {
             owner: scope,
@@ -381,7 +480,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let task = realm.spawn_task(
         module,
-        4,
+        update,
         &[RuntimeValue::I32(41)],
         StepConfig {
             owner: scope,
@@ -425,7 +524,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let cancelled = realm.spawn_task(
         module,
-        4,
+        update,
         &[RuntimeValue::I32(12)],
         StepConfig {
             owner: scope,
@@ -463,7 +562,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let live = realm.spawn_task(
         module,
-        4,
+        update,
         &[RuntimeValue::I32(10)],
         StepConfig {
             owner: scope,
@@ -480,11 +579,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .take()
         .expect("late animation request was captured by the host");
-    let v2 = nexa_compiler::compile_with_metadata(
+    let v2_artifact = compile_combat_candidate(
+        &mut build_session,
+        &host_contract,
+        2,
         include_str!("../reload/v2.nexa"),
-        host_hash,
-        schema_hash_v2,
     )?;
+    let v2_update = v2_artifact
+        .debug_info
+        .functions
+        .iter()
+        .find(|function| {
+            function.package_id == COMBAT_PACKAGE_ID
+                && function.module_path == "game.combat"
+                && function.name == "Update"
+        })
+        .map(|function| function.function_index)
+        .ok_or(HostFailure("reloaded Update metadata was not emitted"))?;
+    let v2 = v2_artifact.verified;
     let RestartReloadOutcome::Committed(v2) = realm.restart_reload(
         module,
         v2,
@@ -521,20 +633,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(
         migrated
             .fields
-            .get(&StableId::from_name("EnemyBrain::phase")),
+            .get(&combat_symbol(SymbolKind::Field, "EnemyBrain.phase")),
         Some(&nexa_runtime::StateValue::I32(3))
     );
     assert_eq!(
         migrated
             .fields
-            .get(&StableId::from_name("EnemyBrain::aggression")),
+            .get(&combat_symbol(SymbolKind::Field, "EnemyBrain.aggression")),
         Some(&nexa_runtime::StateValue::I32(0))
     );
-    assert!(
-        !migrated
-            .fields
-            .contains_key(&StableId::from_name("EnemyBrain::legacy_target"))
-    );
+    assert!(!migrated.fields.contains_key(&combat_symbol(
+        SymbolKind::Field,
+        "EnemyBrain.legacy_target"
+    )));
     assert!(matches!(
         realm.terminal_record(live).map(|record| &record.reason),
         Some(nexa_runtime::TaskTerminalReason::Cancelled(
@@ -542,17 +653,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ))
     ));
     assert!(
-        nexa_compiler::compile_with_metadata(
+        compile_combat_candidate(
+            &mut build_session,
+            &host_contract,
+            3,
             include_str!("../reload/invalid.nexa"),
-            host_hash,
-            schema_hash
         )
         .is_err()
     );
 
     let rollback_task = realm.spawn_task(
         v2,
-        2,
+        v2_update,
         &[RuntimeValue::I32(4)],
         StepConfig {
             owner: scope,
@@ -566,7 +678,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "finish_migration();\n    return value;",
         "let failure: i32 = 1 / 0;\n    finish_migration();\n    return value + failure;",
     );
-    let failing = nexa_compiler::compile_with_metadata(&failing_source, host_hash, schema_hash_v2)?;
+    let failing =
+        compile_combat_candidate(&mut build_session, &host_contract, 4, &failing_source)?.verified;
     assert!(matches!(
         realm.restart_reload(
             v2,
@@ -592,7 +705,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cancelled_scope = realm.create_scope(None)?;
     let cancelled_task = realm.spawn_task(
         v2,
-        2,
+        v2_update,
         &[RuntimeValue::I32(5)],
         StepConfig {
             owner: cancelled_scope,
@@ -618,7 +731,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let live = realm.spawn_task(
         v2,
-        2,
+        v2_update,
         &[RuntimeValue::I32(1)],
         StepConfig {
             owner: scope,
@@ -628,11 +741,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             limits: TaskLimits::default(),
         },
     )?;
-    let fault = nexa_compiler::compile_with_metadata(
+    let fault = compile_combat_candidate(
+        &mut build_session,
+        &host_contract,
+        5,
         include_str!("../reload/activation_fault.nexa"),
-        host_hash,
-        schema_hash_v2,
-    )?;
+    )?
+    .verified;
     let activation_probe = realm
         .failure_injector()
         .arm_once(RuntimeFailurePoint::ActivationTrap);

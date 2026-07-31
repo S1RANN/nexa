@@ -1,21 +1,26 @@
 use crate::capability::CapabilitySet;
 use crate::lifecycle::{PackageLifecycle, PackageStatus};
-use crate::manifest::{EntitlementId, PackageId, PackageVersion, SourceId};
+use crate::manifest::{
+    EffectiveApplicationSettings, EntitlementId, PackageId, PackageVersion, SourceId,
+};
 use crate::policy::{ActivationPolicy, PackagePolicy, TrustLevel};
 use crate::source::PackageCandidate;
 use crate::{EngineDiagnosticSummary, LastKnownGood};
+use std::sync::Arc;
 
 pub(crate) struct PackageRuntime {
-    pub realm: nexa_runtime::RealmRuntime,
-    pub module: nexa_runtime::ModuleHandle,
-    pub root_scope: nexa_runtime::ScopeHandle,
+    pub realm: nexa::prelude::RealmRuntime,
+    pub module: nexa::prelude::ModuleHandle,
+    pub root_scope: nexa::prelude::ScopeHandle,
     pub artifact: crate::CompiledPackageArtifact,
 }
 
 pub(crate) struct PackageRecord {
     pub source_id: SourceId,
     pub policy: PackagePolicy,
+    pub effective: EffectiveApplicationSettings,
     pub candidate: PackageCandidate,
+    pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
     pub lifecycle: PackageLifecycle,
     pub runtime: Option<PackageRuntime>,
     pub last_diagnostic: Option<EngineDiagnosticSummary>,
@@ -39,11 +44,11 @@ impl PackageRecord {
             name: self.candidate.manifest.name.clone(),
             version: self.candidate.manifest.version.clone(),
             trust: self.policy.trust,
-            capabilities: self.candidate.manifest.capabilities.clone(),
-            activation: self.candidate.manifest.activation,
-            entitlement: self.candidate.manifest.entitlement.clone(),
+            capabilities: self.effective.capabilities.clone(),
+            activation: self.effective.activation,
+            entitlement: self.effective.entitlement.clone(),
             status: self.lifecycle.status(),
-            priority: self.candidate.manifest.priority,
+            priority: self.effective.priority,
             last_diagnostic: self.last_diagnostic.clone(),
         }
     }

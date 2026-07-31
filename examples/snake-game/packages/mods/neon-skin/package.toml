@@ -1,10 +1,11 @@
-schema = 1
+schema = 2
+kind = "application"
 id = "community.neon-skin"
 name = "Neon Skin"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "snake.neon_skin"
 priority = 150
 activation = "user-controlled"
-state_schema = "v1"
 handler_fuel = 20000
 capabilities = ["skin.register"]

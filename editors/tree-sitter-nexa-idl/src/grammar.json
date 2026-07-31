@@ -1,0 +1,773 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/grammar.schema.json",
+  "name": "nexa_idl",
+  "word": "nidl_identifier",
+  "rules": {
+    "source_file": {
+      "type": "SYMBOL",
+      "name": "nidl_document"
+    },
+    "nidl_document": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "interface_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_member"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "nidl_member": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "opaque_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_struct_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_enum_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "host_function_declaration"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "export_declaration"
+        }
+      ]
+    },
+    "opaque_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "opaque_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "nidl_struct_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_struct_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_field_declaration"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "nidl_field_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ":"
+        },
+        {
+          "type": "FIELD",
+          "name": "type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "nidl_enum_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_enum_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SEQ",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "nidl_enum_variant"
+              },
+              {
+                "type": "CHOICE",
+                "members": [
+                  {
+                    "type": "STRING",
+                    "value": ","
+                  },
+                  {
+                    "type": "BLANK"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "nidl_enum_variant": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "("
+                },
+                {
+                  "type": "FIELD",
+                  "name": "payload",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "nidl_type"
+                  }
+                },
+                {
+                  "type": "STRING",
+                  "value": ")"
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "host_function_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "mode",
+          "content": {
+            "type": "SYMBOL",
+            "name": "host_mode_keyword"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "request_policy"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "fuel_clause"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_function_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "parameters",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_parameter_list"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "return_arrow_operator"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "return_type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "request_policy": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "FIELD",
+          "name": "cancel",
+          "content": {
+            "type": "SYMBOL",
+            "name": "cancel_policy_keyword"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ","
+        },
+        {
+          "type": "FIELD",
+          "name": "abandon",
+          "content": {
+            "type": "SYMBOL",
+            "name": "abandon_policy_keyword"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ")"
+        }
+      ]
+    },
+    "fuel_clause": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "fuel_keyword"
+        },
+        {
+          "type": "FIELD",
+          "name": "amount",
+          "content": {
+            "type": "SYMBOL",
+            "name": "integer_literal"
+          }
+        }
+      ]
+    },
+    "nidl_parameter_list": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "("
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "nidl_parameter"
+                },
+                {
+                  "type": "REPEAT",
+                  "content": {
+                    "type": "SEQ",
+                    "members": [
+                      {
+                        "type": "STRING",
+                        "value": ","
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "nidl_parameter"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": ")"
+        }
+      ]
+    },
+    "nidl_parameter": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ":"
+        },
+        {
+          "type": "FIELD",
+          "name": "type",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type"
+          }
+        }
+      ]
+    },
+    "export_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "export_keyword"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "parameters",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_parameter_list"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "arrow",
+          "content": {
+            "type": "SYMBOL",
+            "name": "return_arrow_operator"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "return_type",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "nidl_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "void_type"
+              }
+            ]
+          }
+        },
+        {
+          "type": "STRING",
+          "value": ";"
+        }
+      ]
+    },
+    "nidl_type": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "nidl_builtin_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_generic_type"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_type_identifier"
+        }
+      ]
+    },
+    "nidl_generic_type": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "nidl_builtin_type"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "nidl_type_identifier"
+              }
+            ]
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "arguments",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_type_argument_list"
+          }
+        }
+      ]
+    },
+    "nidl_type_argument_list": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "<"
+        },
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "SYMBOL",
+              "name": "nidl_type"
+            },
+            {
+              "type": "REPEAT",
+              "content": {
+                "type": "SEQ",
+                "members": [
+                  {
+                    "type": "STRING",
+                    "value": ","
+                  },
+                  {
+                    "type": "SYMBOL",
+                    "name": "nidl_type"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "STRING",
+          "value": ">"
+        }
+      ]
+    },
+    "nidl_type_identifier": {
+      "type": "SYMBOL",
+      "name": "nidl_identifier"
+    },
+    "nidl_identifier": {
+      "type": "PATTERN",
+      "value": "[^/*{}(),:;<>\\s-]+"
+    },
+    "interface_keyword": {
+      "type": "STRING",
+      "value": "interface"
+    },
+    "opaque_keyword": {
+      "type": "STRING",
+      "value": "opaque"
+    },
+    "nidl_struct_keyword": {
+      "type": "STRING",
+      "value": "struct"
+    },
+    "nidl_enum_keyword": {
+      "type": "STRING",
+      "value": "enum"
+    },
+    "nidl_function_keyword": {
+      "type": "STRING",
+      "value": "fn"
+    },
+    "export_keyword": {
+      "type": "STRING",
+      "value": "export"
+    },
+    "host_mode_keyword": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "sync"
+        },
+        {
+          "type": "STRING",
+          "value": "request"
+        }
+      ]
+    },
+    "fuel_keyword": {
+      "type": "STRING",
+      "value": "fuel"
+    },
+    "cancel_policy_keyword": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "return_error"
+        },
+        {
+          "type": "STRING",
+          "value": "cancel_task"
+        }
+      ]
+    },
+    "abandon_policy_keyword": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "return_error"
+        },
+        {
+          "type": "STRING",
+          "value": "trap"
+        }
+      ]
+    },
+    "nidl_builtin_type": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "i32"
+        },
+        {
+          "type": "STRING",
+          "value": "i64"
+        },
+        {
+          "type": "STRING",
+          "value": "f32"
+        },
+        {
+          "type": "STRING",
+          "value": "f64"
+        },
+        {
+          "type": "STRING",
+          "value": "bool"
+        },
+        {
+          "type": "STRING",
+          "value": "rune"
+        },
+        {
+          "type": "STRING",
+          "value": "string"
+        },
+        {
+          "type": "STRING",
+          "value": "host_request"
+        },
+        {
+          "type": "STRING",
+          "value": "request"
+        },
+        {
+          "type": "STRING",
+          "value": "resource_token"
+        },
+        {
+          "type": "STRING",
+          "value": "token"
+        },
+        {
+          "type": "STRING",
+          "value": "snapshot"
+        },
+        {
+          "type": "STRING",
+          "value": "array"
+        },
+        {
+          "type": "STRING",
+          "value": "buffer"
+        },
+        {
+          "type": "STRING",
+          "value": "Option"
+        },
+        {
+          "type": "STRING",
+          "value": "Result"
+        }
+      ]
+    },
+    "void_type": {
+      "type": "STRING",
+      "value": "void"
+    },
+    "integer_literal": {
+      "type": "PATTERN",
+      "value": "[0-9]+"
+    },
+    "return_arrow_operator": {
+      "type": "STRING",
+      "value": "->"
+    }
+  },
+  "extras": [
+    {
+      "type": "PATTERN",
+      "value": "\\s"
+    }
+  ],
+  "conflicts": [],
+  "precedences": [],
+  "externals": [],
+  "inline": [],
+  "supertypes": [
+    "nidl_member",
+    "nidl_type"
+  ],
+  "reserved": {}
+}

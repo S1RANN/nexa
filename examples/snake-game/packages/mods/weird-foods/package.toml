@@ -1,10 +1,11 @@
-schema = 1
+schema = 2
+kind = "application"
 id = "community.weird-foods"
 name = "Weird Foods"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "snake.weird_foods"
 priority = 140
 activation = "user-controlled"
-state_schema = "v1"
 handler_fuel = 30000
 capabilities = ["food.register", "game.resize", "game.score"]

@@ -1,6 +1,14 @@
 const cp = require("node:child_process");
 const vscode = require("vscode");
 
+const BUILD_INPUT_GLOB =
+  "**/{*.nexa,*.nidl,package.toml,nexa.lock,nexa.dev.toml}";
+const BUILD_INPUT_NAMES = new Set([
+  "package.toml",
+  "nexa.lock",
+  "nexa.dev.toml",
+]);
+
 let server;
 let diagnostics;
 let output;
@@ -8,8 +16,18 @@ let receiveBuffer = Buffer.alloc(0);
 let nextRequestId = 1;
 let initializeRequestId;
 
+function isBuildInputUri(uri) {
+  if (uri.scheme !== "file") return false;
+  const name = uri.path.slice(uri.path.lastIndexOf("/") + 1);
+  return (
+    name.endsWith(".nexa") ||
+    name.endsWith(".nidl") ||
+    BUILD_INPUT_NAMES.has(name)
+  );
+}
+
 function supports(document) {
-  return document.languageId === "nexa" || document.languageId === "nexa-idl";
+  return isBuildInputUri(document.uri);
 }
 
 function write(message) {
@@ -50,6 +68,26 @@ function changeDocument(event) {
     },
     contentChanges: [{ text: event.document.getText() }],
   });
+}
+
+function notifyWatchedFiles(changes) {
+  const buildInputChanges = changes
+    .filter((change) => isBuildInputUri(change.uri))
+    .map((change) => ({
+      uri: change.uri.toString(),
+      type: change.type,
+    }));
+  if (buildInputChanges.length === 0) return;
+  notify("workspace/didChangeWatchedFiles", {
+    changes: buildInputChanges,
+  });
+}
+
+function workspaceFolder(folder) {
+  return {
+    uri: folder.uri.toString(),
+    name: folder.name,
+  };
 }
 
 function parseMessages(chunk) {
@@ -147,10 +185,19 @@ function start() {
   server.on("exit", (code, signal) => {
     output.appendLine(`Nexa language server exited: code=${code} signal=${signal}`);
   });
+  const workspaceFolders = vscode.workspace.workspaceFolders || [];
   initializeRequestId = request("initialize", {
     processId: process.pid,
-    rootUri: vscode.workspace.workspaceFolders?.[0]?.uri.toString() || null,
-    capabilities: {},
+    rootUri: workspaceFolders[0]?.uri.toString() || null,
+    workspaceFolders: workspaceFolders.map(workspaceFolder),
+    capabilities: {
+      workspace: {
+        workspaceFolders: true,
+        didChangeWatchedFiles: {
+          dynamicRegistration: false,
+        },
+      },
+    },
   });
 }
 
@@ -175,7 +222,9 @@ async function stop() {
 function activate(context) {
   diagnostics = vscode.languages.createDiagnosticCollection("nexa");
   output = vscode.window.createOutputChannel("Nexa");
-  context.subscriptions.push(diagnostics, output);
+  const buildInputWatcher =
+    vscode.workspace.createFileSystemWatcher(BUILD_INPUT_GLOB);
+  context.subscriptions.push(diagnostics, output, buildInputWatcher);
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument(openDocument),
     vscode.workspace.onDidChangeTextDocument(changeDocument),
@@ -191,6 +240,31 @@ function activate(context) {
       diagnostics.delete(document.uri);
       notify("textDocument/didClose", {
         textDocument: { uri: document.uri.toString() },
+      });
+    }),
+    buildInputWatcher.onDidCreate((uri) => {
+      notifyWatchedFiles([{ uri, type: 1 }]);
+    }),
+    buildInputWatcher.onDidChange((uri) => {
+      notifyWatchedFiles([{ uri, type: 2 }]);
+    }),
+    buildInputWatcher.onDidDelete((uri) => {
+      notifyWatchedFiles([{ uri, type: 3 }]);
+    }),
+    vscode.workspace.onDidRenameFiles((event) => {
+      notifyWatchedFiles(
+        event.files.flatMap((file) => [
+          { uri: file.oldUri, type: 3 },
+          { uri: file.newUri, type: 1 },
+        ]),
+      );
+    }),
+    vscode.workspace.onDidChangeWorkspaceFolders((event) => {
+      notify("workspace/didChangeWorkspaceFolders", {
+        event: {
+          added: event.added.map(workspaceFolder),
+          removed: event.removed.map(workspaceFolder),
+        },
       });
     }),
     vscode.commands.registerCommand("nexa.restartLanguageServer", async () => {

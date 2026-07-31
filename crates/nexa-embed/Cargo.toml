@@ -7,11 +7,8 @@ publish.workspace = true
 
 [dependencies]
 nexa = { path = "../nexa" }
-nexa-compiler = { path = "../nexa-compiler" }
-nexa-core = { path = "../nexa-core" }
-nexa-idl = { path = "../nexa-idl" }
-nexa-runtime = { path = "../nexa-runtime" }
-nexa-verifier = { path = "../nexa-verifier" }
+nexa-analysis = { path = "../nexa-analysis" }
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

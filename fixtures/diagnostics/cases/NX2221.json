@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2221","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2221.nexa","expected":{"primary_text":"?","secondary_count":0,"message_contains":"error type mismatch","notes":["function error type: Bool","expression error type: I32"]}}
+{"version":1,"code":"NX2221","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2221.nexa","expected":{"primary_text":"?","secondary_count":0,"message_contains":"? error mismatch","notes":["function error type: Bool","expression error type: I32"]}}

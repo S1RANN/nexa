@@ -5,9 +5,10 @@ edition = "2024"
 publish = false
 
 [dependencies]
+nexa = { path = "../../crates/nexa" }
 nexa-bytecode = { path = "../../crates/nexa-bytecode" }
-nexa-compiler = { path = "../../crates/nexa-compiler" }
 nexa-core = { path = "../../crates/nexa-core" }
+nexa-embed = { path = "../../crates/nexa-embed" }
 nexa-idl = { path = "../../crates/nexa-idl" }
 nexa-runtime = { path = "../../crates/nexa-runtime" }
 

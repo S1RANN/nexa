@@ -1,0 +1,6 @@
+module language_scale.text;
+
+pub(package) fn message(score: i32) -> string {
+    let label: string = "score";
+    return "${label}: ${score}";
+}

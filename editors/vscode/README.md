@@ -7,10 +7,11 @@ language identification, and real-time Problems diagnostics for:
 - Nexa interface definition files (`.nidl`)
 
 The extension follows the syntax accepted by the Nexa compiler and IDL parser.
-Neither language currently defines line or block comments, so comment commands
-are intentionally not registered.
+Nexa supports `//`, `///`, and non-nested `/* ... */` comments. Nexa IDL
+deliberately has no comment syntax, so comment commands are registered only for
+`.nexa` files.
 
 The extension starts `nexa lsp` from `PATH`. Set `nexa.server.path` when the
 CLI is installed elsewhere. The language server intentionally provides only
 diagnostics; completion, navigation, formatting, refactoring, semantic tokens,
-and debugging remain outside M3.
+and debugging remain outside M4.

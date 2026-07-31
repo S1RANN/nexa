@@ -1,0 +1,5 @@
+module types;
+
+pub(package) struct Secret {
+    value: i32;
+}

@@ -1,0 +1,149 @@
+module std.math;
+
+pub struct Vec2 {
+    x: f32;
+    y: f32;
+}
+
+pub struct Vec3 {
+    x: f32;
+    y: f32;
+    z: f32;
+}
+
+pub fn clamp_i32(value: i32, low: i32, high: i32) -> i32 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn abs_i32(value: i32) -> i32 {
+    if value < 0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn clamp_i64(value: i64, low: i64, high: i64) -> i64 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn abs_i64(value: i64) -> i64 {
+    if value < 0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn clamp_f32(value: f32, low: f32, high: f32) -> f32 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn abs_f32(value: f32) -> f32 {
+    if value < 0.0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn clamp_f64(value: f64, low: f64, high: f64) -> f64 {
+    if value < low {
+        return low;
+    }
+    if value > high {
+        return high;
+    }
+    return value;
+}
+
+pub fn abs_f64(value: f64) -> f64 {
+    if value < 0.0 {
+        return -value;
+    }
+    return value;
+}
+
+pub fn vec2(x: f32, y: f32) -> Vec2 {
+    return Vec2 { x: x, y: y };
+}
+
+pub fn vec2_add(left: Vec2, right: Vec2) -> Vec2 {
+    return Vec2 {
+        x: left.x + right.x,
+        y: left.y + right.y,
+    };
+}
+
+pub fn vec2_sub(left: Vec2, right: Vec2) -> Vec2 {
+    return Vec2 {
+        x: left.x - right.x,
+        y: left.y - right.y,
+    };
+}
+
+pub fn vec2_scale(value: Vec2, factor: f32) -> Vec2 {
+    return Vec2 {
+        x: value.x * factor,
+        y: value.y * factor,
+    };
+}
+
+pub fn vec2_dot(left: Vec2, right: Vec2) -> f32 {
+    return left.x * right.x + left.y * right.y;
+}
+
+pub fn vec2_length(value: Vec2) -> f32 {
+    return sqrt_f32(vec2_dot(value, value));
+}
+
+pub fn vec3(x: f32, y: f32, z: f32) -> Vec3 {
+    return Vec3 { x: x, y: y, z: z };
+}
+
+pub fn vec3_add(left: Vec3, right: Vec3) -> Vec3 {
+    return Vec3 {
+        x: left.x + right.x,
+        y: left.y + right.y,
+        z: left.z + right.z,
+    };
+}
+
+pub fn vec3_sub(left: Vec3, right: Vec3) -> Vec3 {
+    return Vec3 {
+        x: left.x - right.x,
+        y: left.y - right.y,
+        z: left.z - right.z,
+    };
+}
+
+pub fn vec3_scale(value: Vec3, factor: f32) -> Vec3 {
+    return Vec3 {
+        x: value.x * factor,
+        y: value.y * factor,
+        z: value.z * factor,
+    };
+}
+
+pub fn vec3_dot(left: Vec3, right: Vec3) -> f32 {
+    return left.x * right.x + left.y * right.y + left.z * right.z;
+}
+
+pub fn vec3_length(value: Vec3) -> f32 {
+    return sqrt_f32(vec3_dot(value, value));
+}

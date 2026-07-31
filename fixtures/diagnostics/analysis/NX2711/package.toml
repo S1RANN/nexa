@@ -1,0 +1,8 @@
+schema = 2
+kind = "application"
+id = "diagnostic.nx2711"
+name = "NX2711"
+version = "1.0.0"
+source_root = "src"
+entry = "main"
+activation = "programmatic"

@@ -1,20 +1,12 @@
 use std::collections::BTreeSet;
 
 use crate::capability::CapabilitySet;
+pub use nexa_analysis::ActivationPolicy;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TrustLevel {
     FirstParty,
     Trusted,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ActivationPolicy {
-    Required,
-    DefaultEnabled,
-    UserControlled,
-    Programmatic,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -52,6 +44,18 @@ impl Default for PackageRuntimeLimits {
             tasks: 128,
             release_records: 2_048,
         }
+    }
+}
+
+impl PackageRuntimeLimits {
+    #[must_use]
+    pub const fn within(self, ceiling: Self) -> bool {
+        self.handler_fuel <= ceiling.handler_fuel
+            && self.cumulative_budget <= ceiling.cumulative_budget
+            && self.heap_objects <= ceiling.heap_objects
+            && self.host_resources <= ceiling.host_resources
+            && self.tasks <= ceiling.tasks
+            && self.release_records <= ceiling.release_records
     }
 }
 

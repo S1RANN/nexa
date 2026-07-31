@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, MigrationLimitRequirements, ValueType,
 };
-use nexa_core::{RawHandle, StableId};
+use nexa_core::{RawHandle, StableId, StateSchemaFingerprint};
 use nexa_verifier::VerifiedModule;
 
 use crate::heap::HeapReservation;
@@ -17,9 +17,9 @@ use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
     FuelState, GcRef, GcRoots, Heap, HeapError, HostCallOutcome, HostCompletionDelivery,
-    HostCompletionResult, HostPayload, HostRegistry, HostRequestError, HostRequestHandle, HostTrap,
-    InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
-    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
+    HostCompletionResult, HostErrorPayload, HostPayload, HostRegistry, HostRequestError,
+    HostRequestHandle, HostTrap, InterpreterError, InterpreterHost, InterpreterHostOutcome,
+    InterpreterOutcome, InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
     ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
     RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue,
     ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
@@ -660,6 +660,12 @@ pub enum TaskTerminalReason {
 pub struct TaskTerminalRecord {
     pub state: TaskState,
     pub reason: TaskTerminalReason,
+    /// Exact callee-to-caller script stack captured at the terminal boundary.
+    ///
+    /// Budget cancellation records this before cleanup consumes the active
+    /// continuation, allowing package tests and diagnostics to report the real
+    /// fuel-exhaustion location without manufacturing a root-only frame.
+    pub script_call_stack: Option<crate::ScriptCallStack>,
     pub module_epoch: u64,
     pub continuation_resume_count: u32,
     pub final_charge: ExecutionCharge,
@@ -1210,7 +1216,7 @@ impl RealmRuntime {
         &mut self,
         verified: VerifiedModule,
         host_hash: StableId,
-        schema_hash: StableId,
+        state_schema_fingerprint: StateSchemaFingerprint,
     ) -> Result<ModuleHandle, RealmError> {
         if self.runtime_host.is_none() && module_requires_host_capabilities(verified.module()) {
             return Err(RealmError::HostCapabilitiesUnavailable);
@@ -1224,7 +1230,7 @@ impl RealmRuntime {
         if verified.module().host_interface_hash != Some(host_hash) {
             return Err(RealmError::HostHashMismatch);
         }
-        if verified.module().schema_hash != Some(schema_hash) {
+        if verified.module().state_schema_fingerprint != state_schema_fingerprint {
             return Err(RealmError::SchemaHashMismatch);
         }
         let epoch = self.next_epoch;
@@ -1282,10 +1288,7 @@ impl RealmRuntime {
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
-        let candidate_schema = candidate
-            .module()
-            .schema_hash
-            .ok_or(RealmError::SchemaHashMismatch)?;
+        let candidate_schema = candidate.module().state_schema_fingerprint;
         if nexa_verifier::verify_reload_transition(&old.verified, &candidate).is_err() {
             return Err(
                 ReloadError::Migration("schema changes require a migration entry".into()).into(),
@@ -1860,24 +1863,26 @@ impl RealmRuntime {
         match self.poll_task(task, policy.fuel) {
             Ok(TaskPoll::Completed(value)) => {
                 let reader = crate::ScriptOutputReader::new(&self.heap);
-                let output = E::decode_output(&reader, value)?;
+                let output = E::decode_output(&reader, value);
                 let charge = self
-                    .terminal_record(task)
+                    .take_terminal_record(task)
                     .map_or_else(ExecutionCharge::default, |record| record.final_charge);
-                Ok((output, charge))
+                Ok((output?, charge))
             }
             Ok(TaskPoll::Yielded(_)) => {
                 let _ = self.cancel_task(task, CancelReason::HostCancelled);
+                let _ = self.take_terminal_record(task);
                 Err(crate::ScriptCallError::HandlerDidNotComplete)
             }
             Ok(TaskPoll::Waiting(_)) => {
                 let _ = self.cancel_task(task, CancelReason::HostCancelled);
+                let _ = self.take_terminal_record(task);
                 Err(crate::ScriptCallError::HostWaitNotAllowed)
             }
             Ok(TaskPoll::Trapped(error)) => self
-                .terminal_record(task)
-                .and_then(|record| match &record.reason {
-                    TaskTerminalReason::Trapped(trap) => Some(trap.clone()),
+                .take_terminal_record(task)
+                .and_then(|record| match record.reason {
+                    TaskTerminalReason::Trapped(trap) => Some(trap),
                     _ => None,
                 })
                 .map_or_else(
@@ -1885,9 +1890,12 @@ impl RealmRuntime {
                     |trap| Err(crate::ScriptCallError::HandlerTrapped(Box::new(trap))),
                 ),
             Err(error) => Err(crate::ScriptCallError::Runtime(error.to_string())),
-            Ok(TaskPoll::Cancelled(reason)) => Err(crate::ScriptCallError::Runtime(format!(
-                "handler cancelled: {reason:?}"
-            ))),
+            Ok(TaskPoll::Cancelled(reason)) => {
+                let _ = self.take_terminal_record(task);
+                Err(crate::ScriptCallError::Runtime(format!(
+                    "handler cancelled: {reason:?}"
+                )))
+            }
         }
     }
 
@@ -2015,12 +2023,17 @@ impl RealmRuntime {
                 let final_charge = self.tasks.record_charge(task, charge)?;
                 crate::allocation::record(crate::allocation::AllocationPhase::Promotion, 0);
                 if continuation.cumulative_exhausted() {
+                    let script_call_stack =
+                        crate::ScriptCallStack::from_continuation(&module.verified, &continuation);
+                    self.tasks
+                        .put_execution(task, TaskExecution::Running(continuation), fuel)?;
                     if let Some(trap) = self.cancel_task_internal(
                         task,
                         CancelReason::BudgetExceeded,
                         snapshot.module_epoch,
                         trace_start,
                         final_charge,
+                        Some(script_call_stack),
                     )? {
                         return Ok(PollResult::Trapped(trap));
                     }
@@ -2171,6 +2184,7 @@ impl RealmRuntime {
                 snapshot.module_epoch,
                 trace_start,
                 snapshot.charge,
+                None,
             )
             .map_err(RuntimeError::from)?;
         Ok(trap.map_or(TaskPoll::Cancelled(reason), |trap| {
@@ -2239,6 +2253,14 @@ impl RealmRuntime {
                 .suspended_tasks
                 .extend(continuation.checked_gc_roots(&module.verified)?);
         }
+        roots
+            .suspended_tasks
+            .extend(self.tombstones.iter().filter_map(|(_, record)| {
+                let TaskTerminalReason::Completed(Some(value)) = &record.reason else {
+                    return None;
+                };
+                terminal_value_gc_root(*value)
+            }));
         for raw in self.modules.occupied_handles() {
             let module = self
                 .modules
@@ -2754,6 +2776,14 @@ impl RealmRuntime {
             .find_map(|(terminal_task, record)| (*terminal_task == task).then_some(record))
     }
 
+    fn take_terminal_record(&mut self, task: TaskHandle) -> Option<TaskTerminalRecord> {
+        let position = self
+            .tombstones
+            .iter()
+            .position(|(terminal_task, _)| *terminal_task == task)?;
+        self.tombstones.remove(position).map(|(_, record)| record)
+    }
+
     #[must_use]
     pub fn trace(&self) -> &RuntimeTrace {
         self.tasks.trace()
@@ -2931,10 +2961,31 @@ impl RealmRuntime {
                     ResultWritebackAction::ResumeDirect(RuntimeValue::Unit)
                 }
             }
-            HostCompletionResult::Error(error) => match async_result {
-                Some(result) => self.preflight_async_error(snapshot, result, error.code)?,
-                None => ResultWritebackAction::TrapFailure(error.code),
+            HostCompletionResult::Error(HostErrorPayload::Code(code)) => match async_result {
+                Some(result) => self.preflight_async_error(snapshot, result, *code)?,
+                None => ResultWritebackAction::TrapFailure(*code),
             },
+            HostCompletionResult::Error(HostErrorPayload::Value(payload)) => {
+                let Some(result) = async_result else {
+                    return Ok(ResultWritebackPreflight {
+                        action: ResultWritebackAction::TrapMessage(
+                            "typed Host error requires async Result metadata",
+                        ),
+                    });
+                };
+                let payload = {
+                    let module = self.module_for_task(snapshot)?.verified.module();
+                    plan_host_payload(
+                        payload,
+                        result.error,
+                        &module.enum_types,
+                        &module.struct_types,
+                        &module.array_types,
+                        &module.buffer_types,
+                    )?
+                };
+                self.preflight_async_result(result, false, payload)?
+            }
             HostCompletionResult::Cancelled => match async_result {
                 Some(result) if result.cancel_policy == CancelPolicy::ReturnError => self
                     .preflight_async_error(
@@ -3135,6 +3186,7 @@ impl RealmRuntime {
             snapshot.module_epoch,
             self.trace_cursor(),
             snapshot.charge,
+            None,
         )?;
         Ok(())
     }
@@ -3200,6 +3252,7 @@ impl RealmRuntime {
             TaskTerminalRecord {
                 state: TaskState::Completed,
                 reason: TaskTerminalReason::Completed(value),
+                script_call_stack: None,
                 module_epoch: epoch,
                 continuation_resume_count,
                 final_charge: charge,
@@ -3225,6 +3278,7 @@ impl RealmRuntime {
             task,
             TaskTerminalRecord {
                 state: TaskState::Trapped,
+                script_call_stack: Some(trap.script_call_stack.clone()),
                 reason: TaskTerminalReason::Trapped(trap),
                 module_epoch: epoch,
                 continuation_resume_count,
@@ -3242,6 +3296,7 @@ impl RealmRuntime {
         epoch: u64,
         trace_start: usize,
         mut charge: ExecutionCharge,
+        script_call_stack: Option<crate::ScriptCallStack>,
     ) -> Result<Option<Trap>, RealmError> {
         self.scheduler.cancel_task(task);
         self.tasks.request_task_cancel(task)?;
@@ -3306,6 +3361,7 @@ impl RealmRuntime {
                     task,
                     TaskTerminalRecord {
                         state: TaskState::Trapped,
+                        script_call_stack: Some(trap.script_call_stack.clone()),
                         reason: TaskTerminalReason::Trapped(trap.clone()),
                         module_epoch: epoch,
                         continuation_resume_count: snapshot.continuation_resume_count,
@@ -3330,6 +3386,7 @@ impl RealmRuntime {
             TaskTerminalRecord {
                 state: TaskState::Cancelled,
                 reason: TaskTerminalReason::Cancelled(reason),
+                script_call_stack,
                 module_epoch: epoch,
                 continuation_resume_count: snapshot.continuation_resume_count,
                 final_charge: charge,
@@ -3556,21 +3613,37 @@ fn reservation_for_module(
         .max()
         .unwrap_or(1)
         .max(1);
-    let cleanup_depth = u32::from(module.module().functions.iter().any(|function| {
-        function
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, nexa_bytecode::Instruction::DeferPush { .. }))
-    }));
-    let reserved_depth = max_depth.saturating_add(cleanup_depth);
     ContinuationReservation {
-        frame_capacity: limits.max_call_depth.min(reserved_depth),
+        frame_capacity: limits.max_call_depth.min(max_depth),
         register_capacity: u32::try_from(
             limits.max_frame_bytes / std::mem::size_of::<RuntimeValue>(),
         )
         .unwrap_or(u32::MAX)
-        .min(max_registers.saturating_mul(reserved_depth)),
+        .min(max_registers.saturating_mul(max_depth)),
         defer_capacity: limits.max_defer_records,
+    }
+}
+
+const fn terminal_value_gc_root(value: RuntimeValue) -> Option<GcRef> {
+    match value {
+        RuntimeValue::String { reference, .. }
+        | RuntimeValue::Struct { reference, .. }
+        | RuntimeValue::Ref(reference)
+        | RuntimeValue::NamedRef { reference, .. } => Some(reference),
+        RuntimeValue::I32(_)
+        | RuntimeValue::I64(_)
+        | RuntimeValue::F32(_)
+        | RuntimeValue::F64(_)
+        | RuntimeValue::Bool(_)
+        | RuntimeValue::Rune(_)
+        | RuntimeValue::HostRequest(_)
+        | RuntimeValue::ResourceToken(_)
+        | RuntimeValue::Snapshot(_)
+        | RuntimeValue::Opaque { .. }
+        | RuntimeValue::MigrationOldObject(_)
+        | RuntimeValue::MigrationStagingObject(_)
+        | RuntimeValue::StateHandle { .. }
+        | RuntimeValue::Unit => None,
     }
 }
 

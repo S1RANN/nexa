@@ -1,6 +1,6 @@
 # Internal Language Scope
 
-Version: **1.0.0**
+Version: **2.0.0-dev**
 
 Status: **ACTIVE**
 
@@ -16,14 +16,23 @@ In scope:
 - Pure state migration with Preserve, Replace, and Delete.
 - Stop-the-module Restart Reload with commit-before-activation semantics.
 - Differential models, fuzzing, allocation budgets, and the Combat dogfood app.
+- Compile-time Source Modules linked into one deterministic Package Artifact.
+- Controlled, lockfile-pinned local static Library dependencies.
+- Shared incremental analysis and source-level cross-file diagnostics.
+- Pure, deterministic Package Tests with a rejecting Host.
 
 Out of scope:
 
 - General-purpose language or stable third-party ABI.
 - Seamless continuation migration, Completion Buffers, or old-task resume.
 - Concurrent old/new business epochs or public retired-epoch routing.
-- AOT/JIT, package manager, hostile-bytecode sandbox, LSP/DAP, and multi-module
-  transactions.
+- AOT/JIT, remote registries, dependency version solving, hostile-bytecode
+  sandbox, full semantic LSP/DAP, and runtime multi-module transactions.
+
+Source Modules and Library Packages are compile-time concepts. They do not
+create extra Realms or independently reloadable Runtime Modules: an Application
+and its resolved static dependency closure always produce one Artifact, one
+Realm, one Epoch, and one Package-level Restart Reload boundary.
 
 The former general-product MVR ended with `Gate 1 v2.9 = STOP`. Its complete
 record is the annotated tag `gate1-v2.9-stop`.

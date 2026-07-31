@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2720","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2720","expected":{"primary_text":"helper()","primary_occurrence":2,"secondary_count":0,"message_contains":"constant expressions cannot call","notes":[]}}

@@ -1,0 +1,5 @@
+module hidden;
+
+fn private_value() -> i32 {
+    return 7;
+}

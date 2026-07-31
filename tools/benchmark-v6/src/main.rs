@@ -27,8 +27,6 @@ const DEFAULT_SAMPLES: usize = 1_000;
 const SMOKE_SAMPLES: usize = 20;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
-const SCHEMA_V1: StableId = StableId(0x4245_4e43_4853_4331);
-const SCHEMA_V2: StableId = StableId(0x4245_4e43_4853_4332);
 
 struct CountingAllocator;
 
@@ -280,7 +278,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         snapshot_host.clone(),
         Box::new(NullRegistry),
     )?;
-    let snapshot_module = snapshot_realm.load_module(fast.clone(), HOST, SCHEMA_V1)?;
+    let snapshot_module =
+        snapshot_realm.load_module(fast.clone(), HOST, fast.module().state_schema_fingerprint)?;
     let snapshot_scope = snapshot_realm.create_scope(None)?;
     let snapshot_task = call(&mut snapshot_realm, snapshot_module, snapshot_scope, 1)?;
     let snapshot = snapshot_realm.create_typed_snapshot(
@@ -326,7 +325,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             pending: Arc::clone(&pending),
         }),
     )?;
-    let async_module = async_realm.load_module(async_module(), HOST, SCHEMA_V1)?;
+    let async_verified = async_module();
+    let async_schema = async_verified.module().state_schema_fingerprint;
+    let async_module = async_realm.load_module(async_verified, HOST, async_schema)?;
     let async_scope = async_realm.create_scope(None)?;
     let async_instructions = 3;
     cases.push(bench(
@@ -429,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || {
             let mut realm = RealmRuntime::isolated(RealmConfig::default());
             let module = realm
-                .load_module(fast.clone(), HOST, SCHEMA_V1)
+                .load_module(fast.clone(), HOST, fast.module().state_schema_fingerprint)
                 .expect("drop module");
             let scope = realm.create_scope(None).expect("drop scope");
             let task = call(&mut realm, module, scope, 1).expect("drop task");
@@ -472,7 +473,7 @@ enum BenchEvent { Idle, Value(i32) }
 
 immediate fn immediate_call(value: i32) -> i32 { return value + 1; }
 fn result_ok(value: i32) -> Result<i32, BenchError> { return Ok(value); }
-fn result_err() -> Result<i32, BenchError> { return Err(Failed); }
+fn result_err() -> Result<i32, BenchError> { return Err(BenchError.Failed); }
 task fn fuel_work(value: i32) -> i32 {
     let first: i32 = value + 1;
     let second: i32 = first + 1;
@@ -493,8 +494,11 @@ fn class_allocation() -> i32 {
     return value.value;
 }
 fn enum_match() -> i32 {
-    let event: BenchEvent = Value(7);
-    return match event { Idle => 0, Value(value) => value };
+    let event: BenchEvent = BenchEvent.Value(7);
+    return match event {
+        BenchEvent.Idle => 0,
+        BenchEvent.Value(value) => value,
+    };
 }
 fn array_operations() -> i32 {
     let values: Array<i32> = Array.new<i32>();
@@ -620,7 +624,7 @@ fn explicit_resume_module() -> VerifiedModule {
         .emit(Instruction::Yield)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA_V1);
+    module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
     module.function(function.finish().expect("explicit resume function"));
     verify(module.finish(), VerifierLimits::default()).expect("explicit resume module")
 }
@@ -637,7 +641,7 @@ fn fast_module() -> VerifiedModule {
         .effect(FunctionEffect::Task)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA_V1);
+    module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
     module.function(function.finish().expect("fast function"));
     verify(module.finish(), VerifierLimits::default()).expect("fast module")
 }
@@ -665,7 +669,7 @@ fn async_module() -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 2 });
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA_V1);
+    module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
     let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
     let async_result = nexa_bytecode::AsyncResultType {
         result_type: async_enum.type_id,
@@ -791,22 +795,23 @@ struct MigrationInputs {
 }
 
 fn migration_inputs() -> Result<MigrationInputs, Box<dyn std::error::Error>> {
-    let old_module = nexa_compiler::compile_with_metadata(MIGRATION_V1, HOST, SCHEMA_V1)?;
-    let new_module = nexa_compiler::compile_with_metadata(MIGRATION_V2, HOST, SCHEMA_V2)?;
+    let old_module = nexa_compiler::compile_with_metadata(MIGRATION_V1, HOST)?;
+    let new_module = nexa_compiler::compile_with_metadata(MIGRATION_V2, HOST)?;
+    let state_ids = bench_state_ids(&old_module, &new_module);
     let fixture = StateFixture {
         format_version: nexa_migrate::STATE_FIXTURE_FORMAT_VERSION,
         stateful_domain: 1,
         objects: vec![StateFixtureObject {
             stable_id: StableId::from_name("bench").0,
-            type_id: StableId::from_name("BenchState").0,
+            type_id: state_ids.ty.0,
             generation: 1,
             fields: vec![
                 StateFixtureField {
-                    stable_id: StableId::from_name("BenchState::value").0,
+                    stable_id: state_ids.value_field.0,
                     value: StateFixtureValue::I32 { value: 7 },
                 },
                 StateFixtureField {
-                    stable_id: StableId::from_name("BenchState::legacy").0,
+                    stable_id: state_ids.legacy_field.0,
                     value: StateFixtureValue::I32 { value: 9 },
                 },
             ],
@@ -828,7 +833,7 @@ task fn update(value: i32) -> i32 { return value; }
 
 const MIGRATION_V2: &str = r#"
 @stateful(2) class BenchState { value: i32; total: i32; }
-migration fn migrate() -> bool {
+pub migration fn migrate() -> bool {
     let old_state: BenchState = old.get<BenchState>(bench);
     let old_value: i32 = old.field<i32>(old_state, BenchState.value);
     let state: BenchState = new.create<BenchState>(bench);
@@ -839,8 +844,51 @@ migration fn migrate() -> bool {
     return true;
 }
 task fn update(value: i32) -> i32 { return value + 1; }
-@activation fn activate() -> bool { return true; }
+@activation pub fn activate() -> bool { return true; }
 "#;
+
+#[derive(Clone, Copy)]
+struct BenchStateIds {
+    ty: StableId,
+    value_field: StableId,
+    legacy_field: StableId,
+}
+
+fn bench_state_ids(old: &VerifiedModule, new: &VerifiedModule) -> BenchStateIds {
+    let old_state = old
+        .module()
+        .state_schema
+        .types
+        .first()
+        .expect("old benchmark state type");
+    let new_state = new
+        .module()
+        .state_schema
+        .types
+        .first()
+        .expect("new benchmark state type");
+    let retained = |field: &&nexa_bytecode::StateField| {
+        new_state
+            .fields
+            .iter()
+            .any(|candidate| candidate.stable_id == field.stable_id)
+    };
+    BenchStateIds {
+        ty: old_state.stable_id,
+        value_field: old_state
+            .fields
+            .iter()
+            .find(retained)
+            .expect("retained benchmark value field")
+            .stable_id,
+        legacy_field: old_state
+            .fields
+            .iter()
+            .find(|field| !retained(field))
+            .expect("removed benchmark legacy field")
+            .stable_id,
+    }
+}
 
 struct PreparedReload {
     realm: RealmRuntime,
@@ -850,22 +898,20 @@ struct PreparedReload {
 
 fn prepared_reload(old: &VerifiedModule, new: &VerifiedModule) -> PreparedReload {
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
+    let state_ids = bench_state_ids(old, new);
     let old_handle = realm
-        .load_module(old.clone(), HOST, SCHEMA_V1)
+        .load_module(old.clone(), HOST, old.module().state_schema_fingerprint)
         .expect("old reload module");
     realm
         .insert_state(
             old_handle,
             StableId::from_name("bench"),
             StateValue::Object(StateObject {
-                type_id: StableId::from_name("BenchState"),
+                type_id: state_ids.ty,
                 version: 1,
                 fields: std::collections::BTreeMap::from([
-                    (StableId::from_name("BenchState::value"), StateValue::I32(7)),
-                    (
-                        StableId::from_name("BenchState::legacy"),
-                        StateValue::I32(9),
-                    ),
+                    (state_ids.value_field, StateValue::I32(7)),
+                    (state_ids.legacy_field, StateValue::I32(9)),
                 ]),
             }),
         )

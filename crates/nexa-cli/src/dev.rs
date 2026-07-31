@@ -1,384 +1,603 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use nexa_embed::{
-    CandidateTerminal, CompileJob, DevelopmentCompileRequest, DevelopmentCompiler,
-    DevelopmentConfig, EnqueueOutcome, PackageId, SourceHash, WorkerEvent,
+use nexa_analysis::{
+    CandidateIdentity, DevelopmentCompletionKind, DevelopmentCompletionOutcome,
+    DevelopmentCoordinator, DevelopmentCoordinatorConfig, DevelopmentInvalidation,
+    DevelopmentQueueOutcome, DevelopmentTerminal, DevelopmentTerminalKind, FingerprintBuilder,
+    PackageId, ResolvedBuildInput,
 };
 use serde_json::json;
 
-use crate::{DiagnosticFormat, project, render_engine_diagnostics};
-
-#[derive(Default)]
-struct WatchedPackage {
-    observed_hash: Option<SourceHash>,
-    stable_hash: Option<SourceHash>,
-    queued_hash: Option<SourceHash>,
-    terminal_hash: Option<SourceHash>,
-    stable_scans: u8,
-    generation: u64,
-}
+use crate::{CliError, CliErrorKind, CliResult, DiagnosticFormat, finish_resolved_build, project};
 
 #[allow(clippy::too_many_lines)]
-pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
     let mut project_path = None;
     let mut once = false;
     let mut index = 0;
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--project" => {
-                project_path = Some(PathBuf::from(
-                    arguments
-                        .get(index + 1)
-                        .ok_or("missing value for `--project`")?,
-                ));
+                project_path =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--project`"),
+                    )?));
                 index += 2;
             }
             "--once" => {
                 once = true;
                 index += 1;
             }
-            option => return Err(format!("unknown dev option `{option}`")),
+            option => {
+                return Err(CliError::usage(format!("unknown dev option `{option}`")));
+            }
         }
     }
-    let project_path = project_path.ok_or("usage: nexa dev --project nexa.dev.toml")?;
-    let mut project = project::LoadedProject::load(&project_path)?;
-    let config = DevelopmentConfig {
-        auto_reload: false,
-        scan_interval_ticks: 1,
-        stable_scan_count: 2,
-        ..DevelopmentConfig::default()
-    };
-    let mut compiler = DevelopmentCompiler::start(&config).map_err(str::to_owned)?;
+    let project_path =
+        project_path.ok_or_else(|| CliError::usage("usage: nexa dev --project nexa.dev.toml"))?;
+    let initial_project = project::LoadedProject::load(&project_path)?;
     let running = Arc::new(AtomicBool::new(true));
-    let signal = Arc::clone(&running);
-    ctrlc::set_handler(move || signal.store(false, Ordering::Release))
-        .map_err(|error| format!("could not install Ctrl+C handler: {error}"))?;
-    let mut watched = BTreeMap::<PathBuf, WatchedPackage>::new();
-    let mut awaiting = BTreeMap::<PackageId, CompileJob>::new();
-    let mut contract_hash = stable_hash(&project.contract_source);
-    let mut successful = BTreeMap::new();
-    let mut scans = 0_u64;
-    while running.load(Ordering::Acquire) {
-        retry_awaiting(&compiler, &mut awaiting, &mut watched, format)?;
-        emit_worker_events(&compiler, format);
+    if !once {
+        let signal = Arc::clone(&running);
+        ctrlc::set_handler(move || signal.store(false, Ordering::Release)).map_err(|error| {
+            CliError::internal(format!("could not install Ctrl+C handler: {error}"))
+        })?;
+    }
 
-        let current_contract = std::fs::read_to_string(project.root.join(&project.config.contract))
-            .map_err(|error| format!("could not read Host contract: {error}"))?;
-        let current_contract_hash = stable_hash(&current_contract);
-        if current_contract_hash != contract_hash {
+    let mut coordinator = DevelopmentCoordinator::new(DevelopmentCoordinatorConfig {
+        stable_scan_count: 2,
+        queue_capacity: 16,
+        retain_terminal_generations: 128,
+    });
+    let mut build_session = nexa::PackageBuildSession::new();
+    let mut snapshots = BTreeMap::<CandidateIdentity, project::ResolvedBuild>::new();
+    let mut awaiting = BTreeSet::<CandidateIdentity>::new();
+    let mut directories = BTreeMap::<PackageId, PathBuf>::new();
+    let mut successful = BTreeMap::<PackageId, CandidateIdentity>::new();
+    let mut successful_inputs = BTreeMap::<PackageId, Arc<ResolvedBuildInput>>::new();
+    let mut missing = BTreeSet::<PackageId>::new();
+    let mut contract_identity = nexa::canonical_idl(&initial_project.idl);
+    let mut rendered_failure = false;
+    let mut deferred_error = None;
+
+    'watch: while running.load(Ordering::Acquire) {
+        let current_project = match project::LoadedProject::load(&project_path) {
+            Ok(project) => project,
+            Err(error) => {
+                invalidate_all(
+                    &mut coordinator,
+                    &mut snapshots,
+                    &mut awaiting,
+                    &directories,
+                    format,
+                    DevelopmentInvalidation::Transient,
+                    &error.to_string(),
+                );
+                if once {
+                    deferred_error = Some(error);
+                    break 'watch;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        let current_contract_identity = nexa::canonical_idl(&current_project.idl);
+        if current_contract_identity != contract_identity {
+            contract_identity = current_contract_identity;
             emit_event(
                 format,
                 "host-rebuild-required",
                 None,
-                0,
-                "Host contract changed; rebuild the Rust Host before Runtime reload",
+                None,
+                "Host Contract changed; rebuild the Rust Host before Runtime reload",
             );
-            contract_hash = current_contract_hash;
-            if let Ok(updated) = project::LoadedProject::load(&project_path) {
-                project = updated;
-            }
         }
-        for package in project.package_directories()? {
-            let loaded = project::load_package_candidate(
-                &package.directory,
-                &package.source_id,
-                &package.policy,
-            );
-            let (source_id, candidate) = match loaded {
-                Ok(candidate) => candidate,
-                Err(diagnostic) => {
-                    render_engine_diagnostics(&[diagnostic], format)?;
-                    continue;
+
+        let current_builds = match current_project.resolved_builds(true) {
+            Ok(builds) => builds,
+            Err(error) => {
+                invalidate_all(
+                    &mut coordinator,
+                    &mut snapshots,
+                    &mut awaiting,
+                    &directories,
+                    format,
+                    DevelopmentInvalidation::Transient,
+                    &error.to_string(),
+                );
+                if once {
+                    deferred_error = Some(error);
+                    break 'watch;
                 }
-            };
-            let hash = SourceHash(nexa_core::StableId::from_parts(&[
-                &candidate.manifest_source,
-                "\0",
-                &candidate.entry_source,
-            ]));
-            let state = watched.entry(package.directory.clone()).or_default();
-            if state.terminal_hash == Some(hash) || state.queued_hash == Some(hash) {
+                std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            if state.observed_hash != Some(hash) {
-                state.observed_hash = Some(hash);
-                state.stable_scans = 1;
+        };
+
+        let mut seen = BTreeSet::new();
+        let mut current_scan_settled = true;
+        for build in current_builds {
+            let package_id = build.package_id().clone();
+            let directory = build.root.directory.clone();
+            directories.insert(package_id.clone(), directory.clone());
+            seen.insert(package_id.clone());
+            missing.remove(&package_id);
+            let observation = coordinator.observe(package_id, build.build_fingerprint);
+            current_scan_settled &= observation.matched_active || observation.matched_terminal;
+            for terminal in observation.terminals {
+                consume_terminal(
+                    &terminal,
+                    &mut snapshots,
+                    &mut awaiting,
+                    &directories,
+                    format,
+                );
+            }
+            if let Some(identity) = observation.identity {
+                snapshots.insert(identity.clone(), build);
+                if observation.change_detected {
+                    emit_event(
+                        format,
+                        "change-detected",
+                        Some(&identity),
+                        Some(&directory),
+                        "complete Package/dependency/lock/contract snapshot changed",
+                    );
+                }
+                if observation.stable {
+                    awaiting.insert(identity.clone());
+                    emit_event(
+                        format,
+                        "change-stabilized",
+                        Some(&identity),
+                        Some(&directory),
+                        "complete Build Fingerprint was stable for two scans",
+                    );
+                }
+            }
+        }
+
+        let known = coordinator
+            .inspection()
+            .packages
+            .keys()
+            .filter(|package| !seen.contains(*package))
+            .cloned()
+            .collect::<Vec<_>>();
+        for package_id in known {
+            if missing.insert(package_id.clone()) {
+                invalidate_candidate(
+                    &mut coordinator,
+                    &package_id,
+                    &mut snapshots,
+                    &mut awaiting,
+                    &directories,
+                    format,
+                    DevelopmentInvalidation::SourceRemoval,
+                    &format!("Package `{package_id}` left the configured source set"),
+                );
+                successful.remove(&package_id);
+                successful_inputs.remove(&package_id);
+                directories.remove(&package_id);
+            }
+        }
+
+        loop {
+            retry_awaiting(&mut coordinator, &mut awaiting, &directories, format);
+            while let Some(identity) = coordinator.start_next() {
+                let Some(build) = snapshots.get(&identity).cloned() else {
+                    deferred_error = Some(CliError::internal(format!(
+                        "DevelopmentCoordinator started unknown Candidate {identity:?}"
+                    )));
+                    break 'watch;
+                };
+                let directory = build.root.directory.clone();
                 emit_event(
                     format,
-                    "change-detected",
-                    Some(candidate.manifest.id.as_str()),
-                    state.generation.saturating_add(1),
-                    &package.directory.display().to_string(),
+                    "compile-started",
+                    Some(&identity),
+                    Some(&directory),
+                    "stable immutable ResolvedBuildInput",
                 );
-                continue;
+                let compilation = build.compile_with_session(
+                    &mut build_session,
+                    identity.generation,
+                    None,
+                    build.host_contract.required_exports.as_ref(),
+                    false,
+                );
+
+                let refreshed_project = match project::LoadedProject::load(&project_path) {
+                    Ok(project) => project,
+                    Err(error) => {
+                        invalidate_candidate(
+                            &mut coordinator,
+                            &identity.package_id,
+                            &mut snapshots,
+                            &mut awaiting,
+                            &directories,
+                            format,
+                            DevelopmentInvalidation::Transient,
+                            &format!("Build input became invalid before commit: {error}"),
+                        );
+                        if once {
+                            deferred_error = Some(error);
+                            break 'watch;
+                        }
+                        continue;
+                    }
+                };
+                let refreshed_builds = match refreshed_project.resolved_builds(true) {
+                    Ok(builds) => builds,
+                    Err(error) => {
+                        invalidate_candidate(
+                            &mut coordinator,
+                            &identity.package_id,
+                            &mut snapshots,
+                            &mut awaiting,
+                            &directories,
+                            format,
+                            DevelopmentInvalidation::Transient,
+                            &format!("Build input became invalid before commit: {error}"),
+                        );
+                        if once {
+                            deferred_error = Some(error);
+                            break 'watch;
+                        }
+                        continue;
+                    }
+                };
+                let refreshed = refreshed_builds.into_iter().find(|candidate| {
+                    candidate.package_id() == &identity.package_id
+                        && candidate.root.directory == directory
+                });
+                let Some(refreshed) = refreshed else {
+                    invalidate_candidate(
+                        &mut coordinator,
+                        &identity.package_id,
+                        &mut snapshots,
+                        &mut awaiting,
+                        &directories,
+                        format,
+                        DevelopmentInvalidation::SourceRemoval,
+                        "Package was removed or renamed during compilation",
+                    );
+                    continue;
+                };
+
+                let completion_kind = match &compilation {
+                    Ok(_) => DevelopmentCompletionKind::Compiled,
+                    Err(project::BuildCompileError::Facade(nexa::PackageBuildError::Verify(_))) => {
+                        DevelopmentCompletionKind::VerifyFailed
+                    }
+                    Err(_) => DevelopmentCompletionKind::CompileFailed,
+                };
+                let retained_host_contract_changed = successful_inputs
+                    .get(&identity.package_id)
+                    .is_some_and(|retained| {
+                        retained.canonical_host_contract != build.input.canonical_host_contract
+                    });
+                let outcome = coordinator.complete(
+                    identity.clone(),
+                    &build.input,
+                    &refreshed.input,
+                    completion_kind,
+                    retained_host_contract_changed,
+                );
+                match outcome {
+                    DevelopmentCompletionOutcome::Accepted(terminal) => {
+                        consume_terminal(
+                            &terminal,
+                            &mut snapshots,
+                            &mut awaiting,
+                            &directories,
+                            format,
+                        );
+                        match compilation {
+                            Ok(_) => {
+                                successful.insert(identity.package_id.clone(), identity.clone());
+                                successful_inputs
+                                    .insert(identity.package_id.clone(), Arc::clone(&build.input));
+                                coordinator.retain_active(
+                                    identity.package_id.clone(),
+                                    identity.build_fingerprint,
+                                );
+                                emit_event(
+                                    format,
+                                    "candidate-ready",
+                                    Some(&identity),
+                                    Some(&directory),
+                                    "latest successful Candidate retained",
+                                );
+                            }
+                            Err(error) => {
+                                let error = finish_resolved_build(&build, Err(error), format)
+                                    .expect_err("an accepted failed compilation remains an error");
+                                if error.kind == CliErrorKind::WorkerIoOrInternal {
+                                    deferred_error = Some(error);
+                                    break 'watch;
+                                }
+                                rendered_failure = true;
+                                let message = if error.already_rendered() {
+                                    "Last Known Good Candidate retained".to_owned()
+                                } else {
+                                    error.to_string()
+                                };
+                                emit_event(
+                                    format,
+                                    if terminal.kind == DevelopmentTerminalKind::VerifyFailed {
+                                        "verify-failed"
+                                    } else {
+                                        "compile-failed"
+                                    },
+                                    Some(&identity),
+                                    Some(&directory),
+                                    &message,
+                                );
+                            }
+                        }
+                    }
+                    DevelopmentCompletionOutcome::Rejected {
+                        terminal,
+                        freshness,
+                    } => {
+                        consume_terminal(
+                            &terminal,
+                            &mut snapshots,
+                            &mut awaiting,
+                            &directories,
+                            format,
+                        );
+                        emit_event(
+                            format,
+                            if terminal.kind == DevelopmentTerminalKind::RejectedHostContractChange
+                            {
+                                "host-rebuild-required"
+                            } else {
+                                "candidate-superseded"
+                            },
+                            Some(&identity),
+                            Some(&directory),
+                            &format!("Candidate commit rejected by freshness gate: {freshness:?}"),
+                        );
+                    }
+                    DevelopmentCompletionOutcome::AlreadyTerminal { kind, .. } => {
+                        deferred_error = Some(CliError::internal(format!(
+                            "duplicate Development Candidate terminal: {kind:?}"
+                        )));
+                        break 'watch;
+                    }
+                    DevelopmentCompletionOutcome::Stale(stale) => {
+                        snapshots.remove(&stale);
+                        awaiting.remove(&stale);
+                        emit_event(
+                            format,
+                            "candidate-superseded",
+                            Some(&stale),
+                            Some(&directory),
+                            "Candidate was no longer desired at completion",
+                        );
+                    }
+                }
             }
-            state.stable_scans = state.stable_scans.saturating_add(1);
-            if state.stable_scans < config.stable_scan_count || state.stable_hash == Some(hash) {
-                continue;
+            if awaiting.is_empty() {
+                break;
             }
-            state.stable_hash = Some(hash);
-            state.generation = state.generation.saturating_add(1);
-            let package_id = candidate.manifest.id.clone();
-            let generation = state.generation;
-            let request = DevelopmentCompileRequest {
-                package_id: package_id.clone(),
-                source_id,
-                generation,
-                candidate,
-                idl: project.idl.clone(),
-                required_exports: project.required_exports.clone(),
-            };
-            handle_enqueue(
-                compiler.submit(request),
-                &package_id,
-                generation,
-                hash,
-                &package.directory,
-                &mut watched,
-                &mut awaiting,
-                format,
-            )?;
         }
-        std::thread::sleep(Duration::from_millis(25));
-        emit_worker_events(&compiler, format);
-        process_terminals(compiler.poll(), &mut watched, &mut successful, format)?;
-        scans = scans.saturating_add(1);
-        if once && scans >= 3 {
-            break;
+
+        if once && current_scan_settled && awaiting.is_empty() {
+            let inspection = coordinator.inspection();
+            if inspection.generations_without_terminal == 0
+                && inspection.queued_candidates == 0
+                && inspection.in_flight_candidates == 0
+            {
+                break;
+            }
         }
-        std::thread::sleep(Duration::from_millis(75));
+        std::thread::sleep(Duration::from_millis(if once { 10 } else { 100 }));
     }
-    let terminals = compiler.shutdown();
-    process_terminals(terminals, &mut watched, &mut successful, format)?;
+
+    for terminal in coordinator.shutdown() {
+        consume_terminal(
+            &terminal,
+            &mut snapshots,
+            &mut awaiting,
+            &directories,
+            format,
+        );
+    }
+    let inspection = coordinator.inspection();
+    if inspection.generations_without_terminal != 0 || inspection.duplicate_terminals != 0 {
+        return Err(CliError::internal(format!(
+            "DevelopmentCoordinator terminal invariant failed: {} missing, {} duplicate",
+            inspection.generations_without_terminal, inspection.duplicate_terminals
+        )));
+    }
+    if let Some(error) = deferred_error {
+        return Err(error);
+    }
     emit_event(
         format,
         "shutdown",
         None,
-        0,
+        None,
         &format!("{} successful Candidates retained", successful.len()),
     );
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_enqueue(
-    outcome: EnqueueOutcome,
-    package_id: &PackageId,
-    generation: u64,
-    hash: SourceHash,
-    directory: &PathBuf,
-    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
-    awaiting: &mut BTreeMap<PackageId, CompileJob>,
-    format: DiagnosticFormat,
-) -> Result<(), String> {
-    match outcome {
-        EnqueueOutcome::Accepted => {
-            let state = watched
-                .get_mut(directory)
-                .ok_or("development state disappeared before enqueue")?;
-            state.queued_hash = Some(hash);
-            emit_event(
-                format,
-                "compile-queued",
-                Some(package_id.as_str()),
-                generation,
-                "stable source snapshot",
-            );
-        }
-        EnqueueOutcome::ReplacedPending { terminal, .. } => {
-            mark_terminal(watched, terminal.data().source_hash);
-            emit_terminal_event(&terminal, format);
-            let state = watched
-                .get_mut(directory)
-                .ok_or("development state disappeared before enqueue")?;
-            state.queued_hash = Some(hash);
-            emit_event(
-                format,
-                "compile-queued",
-                Some(package_id.as_str()),
-                generation,
-                "newest stable source replaced this Package's pending Candidate",
-            );
-        }
-        EnqueueOutcome::Backpressured { job } => {
-            emit_event(
-                format,
-                "compile-backpressured",
-                Some(package_id.as_str()),
-                generation,
-                "Worker queue is full; the Candidate will be retried",
-            );
-            awaiting.insert(package_id.clone(), job);
-        }
-        EnqueueOutcome::Stopping { .. } => {
-            return Err("development compiler stopped while accepting a Candidate".into());
-        }
+    if rendered_failure {
+        Err(CliError::rendered_diagnostic(
+            "one or more development Candidates failed",
+        ))
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn retry_awaiting(
-    compiler: &DevelopmentCompiler,
-    awaiting: &mut BTreeMap<PackageId, CompileJob>,
-    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
+    coordinator: &mut DevelopmentCoordinator,
+    awaiting: &mut BTreeSet<CandidateIdentity>,
+    directories: &BTreeMap<PackageId, PathBuf>,
     format: DiagnosticFormat,
-) -> Result<(), String> {
-    let jobs = std::mem::take(awaiting);
-    for (package_id, job) in jobs {
-        let generation = job.generation;
-        let hash = job.source_hash;
-        match compiler.retry(job) {
-            EnqueueOutcome::Accepted => {
-                if let Some(state) = watched
-                    .values_mut()
-                    .find(|state| state.stable_hash == Some(hash))
-                {
-                    state.queued_hash = Some(hash);
-                }
+) {
+    for identity in awaiting.iter().cloned().collect::<Vec<_>>() {
+        match coordinator.enqueue(identity.clone()) {
+            DevelopmentQueueOutcome::Accepted => {
+                awaiting.remove(&identity);
                 emit_event(
                     format,
                     "compile-queued",
-                    Some(package_id.as_str()),
-                    generation,
-                    "backpressured Candidate accepted",
+                    Some(&identity),
+                    directories.get(&identity.package_id),
+                    "stable Candidate admitted to the bounded compile queue",
                 );
             }
-            EnqueueOutcome::ReplacedPending { terminal, .. } => {
-                mark_terminal(watched, terminal.data().source_hash);
-                emit_terminal_event(&terminal, format);
-                if let Some(state) = watched
-                    .values_mut()
-                    .find(|state| state.stable_hash == Some(hash))
-                {
-                    state.queued_hash = Some(hash);
-                }
+            DevelopmentQueueOutcome::AlreadyQueued => {
+                awaiting.remove(&identity);
             }
-            EnqueueOutcome::Backpressured { job } => {
-                awaiting.insert(package_id, job);
+            DevelopmentQueueOutcome::Backpressured(_) => {
+                emit_event(
+                    format,
+                    "compile-backpressured",
+                    Some(&identity),
+                    directories.get(&identity.package_id),
+                    "bounded compile queue is full; Candidate remains pending",
+                );
             }
-            EnqueueOutcome::Stopping { .. } => {
-                return Err("development compiler stopped while retrying a Candidate".into());
+            DevelopmentQueueOutcome::Stale(stale) => {
+                awaiting.remove(&stale);
             }
-        }
-    }
-    Ok(())
-}
-
-fn emit_worker_events(compiler: &DevelopmentCompiler, format: DiagnosticFormat) {
-    for event in compiler.poll_events() {
-        match event {
-            WorkerEvent::CompileStarted {
-                package_id,
-                generation,
-                queue_duration,
-                ..
-            } => emit_event(
-                format,
-                "compile-started",
-                Some(package_id.as_str()),
-                generation,
-                &format!("queued for {} μs", queue_duration.as_micros()),
-            ),
         }
     }
 }
 
-fn process_terminals(
-    terminals: Vec<CandidateTerminal>,
-    watched: &mut BTreeMap<PathBuf, WatchedPackage>,
-    successful: &mut BTreeMap<PackageId, nexa_embed::CompiledPackageArtifact>,
+fn invalidate_all(
+    coordinator: &mut DevelopmentCoordinator,
+    snapshots: &mut BTreeMap<CandidateIdentity, project::ResolvedBuild>,
+    awaiting: &mut BTreeSet<CandidateIdentity>,
+    directories: &BTreeMap<PackageId, PathBuf>,
     format: DiagnosticFormat,
-) -> Result<(), String> {
+    reason: DevelopmentInvalidation,
+    message: &str,
+) {
+    let packages = coordinator
+        .inspection()
+        .packages
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    for package in packages {
+        invalidate_candidate(
+            coordinator,
+            &package,
+            snapshots,
+            awaiting,
+            directories,
+            format,
+            reason,
+            message,
+        );
+    }
+    emit_event(format, "build-input-invalid", None, None, message);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn invalidate_candidate(
+    coordinator: &mut DevelopmentCoordinator,
+    package: &PackageId,
+    snapshots: &mut BTreeMap<CandidateIdentity, project::ResolvedBuild>,
+    awaiting: &mut BTreeSet<CandidateIdentity>,
+    directories: &BTreeMap<PackageId, PathBuf>,
+    format: DiagnosticFormat,
+    reason: DevelopmentInvalidation,
+    message: &str,
+) {
+    let inspection = coordinator.inspection();
+    let package_inspection = inspection.packages.get(package);
+    let next_generation =
+        package_inspection.map_or(1, |package| package.latest_generation.saturating_add(1));
+    let active = package_inspection.and_then(|package| package.active_build_fingerprint);
+    let mut terminals = coordinator.invalidate(package, reason);
+    if reason == DevelopmentInvalidation::SourceRemoval && terminals.is_empty() {
+        let mut fingerprint = FingerprintBuilder::new("nexa.cli.source-missing", 1);
+        fingerprint.field_str("package", package.as_str());
+        fingerprint.field_u64("generation", next_generation);
+        if let Some(active) = active {
+            fingerprint.field_bytes("active-build", active.as_bytes());
+        }
+        let source_missing =
+            nexa_analysis::BuildFingerprint::from_bytes(fingerprint.finish_bytes());
+        let (identity, superseded) = coordinator.begin(package.clone(), source_missing);
+        debug_assert!(superseded.is_empty());
+        terminals = coordinator.invalidate(package, DevelopmentInvalidation::SourceRemoval);
+        debug_assert_eq!(
+            terminals.first().map(|terminal| &terminal.identity),
+            Some(&identity)
+        );
+    }
     for terminal in terminals {
-        mark_terminal(watched, terminal.data().source_hash);
-        match terminal {
-            CandidateTerminal::Compiled {
-                data, compilation, ..
-            } => {
-                successful.insert(data.package_id.clone(), compilation.artifact);
-                emit_event(
-                    format,
-                    "candidate-ready",
-                    Some(data.package_id.as_str()),
-                    data.generation,
-                    "latest successful Candidate retained",
-                );
-            }
-            CandidateTerminal::CompileFailed {
-                data, diagnostic, ..
-            }
-            | CandidateTerminal::VerifyFailed {
-                data, diagnostic, ..
-            } => {
-                emit_event(
-                    format,
-                    "compile-failed",
-                    Some(data.package_id.as_str()),
-                    data.generation,
-                    "Last Known Good Candidate retained",
-                );
-                render_engine_diagnostics(&[diagnostic], format)?;
-            }
-            terminal => emit_terminal_event(&terminal, format),
-        }
+        consume_terminal(&terminal, snapshots, awaiting, directories, format);
     }
-    Ok(())
-}
-
-fn mark_terminal(watched: &mut BTreeMap<PathBuf, WatchedPackage>, hash: SourceHash) {
-    if let Some(state) = watched
-        .values_mut()
-        .find(|state| state.queued_hash == Some(hash) || state.stable_hash == Some(hash))
-    {
-        state.terminal_hash = Some(hash);
-        if state.queued_hash == Some(hash) {
-            state.queued_hash = None;
-        }
+    if reason == DevelopmentInvalidation::Transient {
+        emit_event(
+            format,
+            "candidate-superseded",
+            None,
+            directories.get(package),
+            message,
+        );
     }
 }
 
-fn emit_terminal_event(terminal: &CandidateTerminal, format: DiagnosticFormat) {
-    let data = terminal.data();
-    emit_event(
-        format,
-        match terminal.kind() {
-            nexa_embed::CandidateTerminalKind::SupersededBeforeCompile
-            | nexa_embed::CandidateTerminalKind::SupersededAfterCompile => "candidate-superseded",
-            nexa_embed::CandidateTerminalKind::CancelledByDisable
-            | nexa_embed::CandidateTerminalKind::CancelledBySourceRemoval
-            | nexa_embed::CandidateTerminalKind::CancelledByShutdown => "candidate-cancelled",
-            nexa_embed::CandidateTerminalKind::RejectedHostContractChange => {
-                "host-rebuild-required"
-            }
-            nexa_embed::CandidateTerminalKind::Compiled => "candidate-ready",
-            nexa_embed::CandidateTerminalKind::CompileFailed => "compile-failed",
-            nexa_embed::CandidateTerminalKind::VerifyFailed => "verify-failed",
-        },
-        Some(data.package_id.as_str()),
-        data.generation,
-        &format!("{:?}", terminal.kind()),
-    );
-}
-
-fn stable_hash(source: &str) -> nexa_core::StableId {
-    nexa_core::StableId::from_name(source)
+fn consume_terminal(
+    terminal: &DevelopmentTerminal,
+    snapshots: &mut BTreeMap<CandidateIdentity, project::ResolvedBuild>,
+    awaiting: &mut BTreeSet<CandidateIdentity>,
+    directories: &BTreeMap<PackageId, PathBuf>,
+    format: DiagnosticFormat,
+) {
+    snapshots.remove(&terminal.identity);
+    awaiting.remove(&terminal.identity);
+    if matches!(
+        terminal.kind,
+        DevelopmentTerminalKind::SupersededBeforeCompile
+            | DevelopmentTerminalKind::SupersededInFlight
+            | DevelopmentTerminalKind::CancelledByInvalidation
+            | DevelopmentTerminalKind::CancelledBySourceRemoval
+            | DevelopmentTerminalKind::CancelledByShutdown
+    ) {
+        emit_event(
+            format,
+            match terminal.kind {
+                DevelopmentTerminalKind::CancelledBySourceRemoval => "source-missing",
+                DevelopmentTerminalKind::CancelledByShutdown => "candidate-cancelled",
+                _ => "candidate-superseded",
+            },
+            Some(&terminal.identity),
+            directories.get(&terminal.identity.package_id),
+            &format!("Development terminal: {:?}", terminal.kind),
+        );
+    }
 }
 
 fn emit_event(
     format: DiagnosticFormat,
     kind: &str,
-    package_id: Option<&str>,
-    generation: u64,
+    identity: Option<&CandidateIdentity>,
+    directory: Option<&PathBuf>,
     message: &str,
 ) {
     match format {
         DiagnosticFormat::Human => {
-            let package = package_id.map_or_else(String::new, |id| format!(" [{id}]"));
-            println!("{kind}{package} generation={generation}: {message}");
+            let package = identity.map_or_else(String::new, |identity| {
+                format!(
+                    " [{}] generation={} fingerprint={}",
+                    identity.package_id, identity.generation, identity.build_fingerprint
+                )
+            });
+            println!("{kind}{package}: {message}");
         }
         DiagnosticFormat::Json | DiagnosticFormat::Ndjson => println!(
             "{}",
@@ -386,8 +605,10 @@ fn emit_event(
                 "schema": 1,
                 "type": "development-event",
                 "event": kind,
-                "packageId": package_id,
-                "candidateGeneration": generation,
+                "packageId": identity.map(|identity| identity.package_id.as_str()),
+                "candidateGeneration": identity.map(|identity| identity.generation),
+                "buildFingerprint": identity.map(|identity| identity.build_fingerprint),
+                "directory": directory,
                 "message": message,
             }))
             .expect("development event JSON serialization does not fail")

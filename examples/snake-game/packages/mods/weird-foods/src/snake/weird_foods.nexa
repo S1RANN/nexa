@@ -1,0 +1,46 @@
+module snake.weird_foods;
+import host as snake;
+import std.collections as collections;
+
+fn empty() -> Array<snake.SnakeCommand> {
+    return [];
+}
+
+fn register() -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "shrink", length_delta: 0 - 1, score_delta: 0, speed_delta: 0 }));
+    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "double", length_delta: 2, score_delta: 0, speed_delta: 0 }));
+    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "score-bomb", length_delta: 0, score_delta: 50, speed_delta: 0 }));
+    return commands;
+}
+
+fn effect(snapshot: snake.GameSnapshot) -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    let kind: string = match snapshot.food {
+        Some(food) => food.kind,
+        None => "classic",
+    };
+    if kind == "community.weird-foods:shrink" {
+        collections.array_push(commands, snake.ResizeSnake(0 - 1));
+    }
+    if kind == "community.weird-foods:double" {
+        collections.array_push(commands, snake.ResizeSnake(2));
+    }
+    if kind == "community.weird-foods:score-bomb" {
+        collections.array_push(commands, snake.AddScore(50));
+    }
+    return commands;
+}
+
+pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+    return match event {
+        snake.PackageEnabled(snapshot) => register(),
+        snake.GameStarted(snapshot) => empty(),
+        snake.GameTick(snapshot) => empty(),
+        snake.ScoreChanged(snapshot) => empty(),
+        snake.FoodSpawnRequested(snapshot) => empty(),
+        snake.FoodEaten(snapshot) => effect(snapshot),
+        snake.GameEnded(snapshot) => empty(),
+        snake.SettingsChanged(snapshot) => empty(),
+    };
+}

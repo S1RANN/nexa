@@ -1,8 +1,14 @@
 use std::fmt;
 
 use nexa_bytecode::DecodeError;
-use nexa_compiler::CompileError;
+use nexa_compiler::{
+    AnalysisDiagnostic as CompilerAnalysisDiagnostic, AnalysisDiagnosticSource, CompileError,
+};
 use nexa_core::{FileId, ModuleId, RawHandle, SourceSpan};
+use nexa_diagnostics::{
+    ByteRange, Diagnostic as LeafDiagnostic, Label as LeafLabel, SourceIdentity,
+};
+pub use nexa_diagnostics::{ERROR_CODE_TABLE, ErrorCode, ErrorCodeDefinition, Severity};
 use nexa_runtime::{
     HostCompletionProtocolError, HostRequestError, HostTrap, InterpreterError, MigrationLimitError,
     RealmError, ReloadError, RuntimeError, RuntimeHostCloseError, RuntimeMessage, ScopeError,
@@ -11,146 +17,7 @@ use nexa_runtime::{
 use nexa_verifier::{VerifyError, VerifyErrorKind};
 use serde::Serialize;
 
-/// A stable, machine-readable public error code.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ErrorCode(&'static str);
-
 pub type DiagnosticCode = ErrorCode;
-
-impl ErrorCode {
-    pub const NX1001: Self = Self::new("NX1001");
-    pub const NX1002: Self = Self::new("NX1002");
-    pub const NX2001: Self = Self::new("NX2001");
-    pub const NX2002: Self = Self::new("NX2002");
-    pub const NX2101: Self = Self::new("NX2101");
-    pub const NX2201: Self = Self::new("NX2201");
-    pub const NX2202: Self = Self::new("NX2202");
-    pub const NX2210: Self = Self::new("NX2210");
-    pub const NX2220: Self = Self::new("NX2220");
-    pub const NX2221: Self = Self::new("NX2221");
-    pub const NX2301: Self = Self::new("NX2301");
-    pub const NX2302: Self = Self::new("NX2302");
-    pub const NX2401: Self = Self::new("NX2401");
-    pub const NX2501: Self = Self::new("NX2501");
-    pub const NX2601: Self = Self::new("NX2601");
-    pub const NX2602: Self = Self::new("NX2602");
-    pub const NX2603: Self = Self::new("NX2603");
-    pub const NX2604: Self = Self::new("NX2604");
-    pub const NX3001: Self = Self::new("NX3001");
-    pub const NX3002: Self = Self::new("NX3002");
-    pub const NX3003: Self = Self::new("NX3003");
-    pub const NX3004: Self = Self::new("NX3004");
-    pub const NX4001: Self = Self::new("NX4001");
-    pub const NX4002: Self = Self::new("NX4002");
-    pub const NX4003: Self = Self::new("NX4003");
-    pub const NX5001: Self = Self::new("NX5001");
-    pub const NX5002: Self = Self::new("NX5002");
-    pub const NX5003: Self = Self::new("NX5003");
-    pub const NX5004: Self = Self::new("NX5004");
-    pub const NX6001: Self = Self::new("NX6001");
-    pub const NX6002: Self = Self::new("NX6002");
-    pub const NX6003: Self = Self::new("NX6003");
-    pub const NX6005: Self = Self::new("NX6005");
-    pub const NX7001: Self = Self::new("NX7001");
-    pub const NX7002: Self = Self::new("NX7002");
-    pub const NX7003: Self = Self::new("NX7003");
-    pub const NX7004: Self = Self::new("NX7004");
-    pub const NX7010: Self = Self::new("NX7010");
-    pub const NX7011: Self = Self::new("NX7011");
-    pub const NX7101: Self = Self::new("NX7101");
-    pub const NX7102: Self = Self::new("NX7102");
-    pub const NX7103: Self = Self::new("NX7103");
-    pub const NX7201: Self = Self::new("NX7201");
-    pub const NX7202: Self = Self::new("NX7202");
-    pub const NX7302: Self = Self::new("NX7302");
-    pub const NX7303: Self = Self::new("NX7303");
-
-    #[must_use]
-    pub const fn new(value: &'static str) -> Self {
-        Self(value)
-    }
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        self.0
-    }
-
-    #[must_use]
-    pub fn definition(self) -> Option<&'static ErrorCodeDefinition> {
-        ERROR_CODE_TABLE
-            .iter()
-            .find(|definition| definition.code == self)
-    }
-}
-
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
-    }
-}
-
-/// One immutable entry in Nexa's public diagnostic-code registry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ErrorCodeDefinition {
-    pub code: ErrorCode,
-    pub summary: &'static str,
-}
-
-impl ErrorCodeDefinition {
-    const fn new(code: ErrorCode, summary: &'static str) -> Self {
-        Self { code, summary }
-    }
-}
-
-/// The complete Milestone 4.0 stable error-code registry, ordered by code.
-pub static ERROR_CODE_TABLE: &[ErrorCodeDefinition] = &[
-    ErrorCodeDefinition::new(ErrorCode::NX1001, "Unexpected character"),
-    ErrorCodeDefinition::new(ErrorCode::NX1002, "Unexpected token"),
-    ErrorCodeDefinition::new(ErrorCode::NX2001, "Unknown name"),
-    ErrorCodeDefinition::new(ErrorCode::NX2002, "Unknown type"),
-    ErrorCodeDefinition::new(ErrorCode::NX2101, "Type mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX2201, "Non-exhaustive match"),
-    ErrorCodeDefinition::new(ErrorCode::NX2202, "Duplicate match variant"),
-    ErrorCodeDefinition::new(ErrorCode::NX2210, "Cannot infer constructor type"),
-    ErrorCodeDefinition::new(ErrorCode::NX2220, "? requires Result"),
-    ErrorCodeDefinition::new(ErrorCode::NX2221, "? error mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX2301, "Await outside Task"),
-    ErrorCodeDefinition::new(ErrorCode::NX2302, "Missing await"),
-    ErrorCodeDefinition::new(ErrorCode::NX2401, "Invalid numeric conversion"),
-    ErrorCodeDefinition::new(ErrorCode::NX2501, "Invalid field access"),
-    ErrorCodeDefinition::new(ErrorCode::NX2601, "Migration intrinsic outside Migration"),
-    ErrorCodeDefinition::new(ErrorCode::NX2602, "Missing finish_migration"),
-    ErrorCodeDefinition::new(ErrorCode::NX2603, "Missing forwarding"),
-    ErrorCodeDefinition::new(ErrorCode::NX2604, "Duplicate forwarding"),
-    ErrorCodeDefinition::new(ErrorCode::NX3001, "Invalid bytecode section"),
-    ErrorCodeDefinition::new(ErrorCode::NX3002, "Invalid register range"),
-    ErrorCodeDefinition::new(ErrorCode::NX3003, "Invalid root map"),
-    ErrorCodeDefinition::new(ErrorCode::NX3004, "Invalid SourceMap"),
-    ErrorCodeDefinition::new(ErrorCode::NX4001, "Host interface mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX4002, "Host capability unavailable"),
-    ErrorCodeDefinition::new(ErrorCode::NX4003, "Host argument mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX5001, "Host result mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX5002, "Host abandoned"),
-    ErrorCodeDefinition::new(ErrorCode::NX5003, "Unknown host error code"),
-    ErrorCodeDefinition::new(ErrorCode::NX5004, "Runtime resource capacity"),
-    ErrorCodeDefinition::new(ErrorCode::NX6001, "Migration limit"),
-    ErrorCodeDefinition::new(ErrorCode::NX6002, "Migration graph failure"),
-    ErrorCodeDefinition::new(ErrorCode::NX6003, "Activation failure"),
-    ErrorCodeDefinition::new(ErrorCode::NX6005, "Invalid ReloadMetadata"),
-    ErrorCodeDefinition::new(ErrorCode::NX7001, "Package source failure"),
-    ErrorCodeDefinition::new(ErrorCode::NX7002, "Invalid package manifest"),
-    ErrorCodeDefinition::new(ErrorCode::NX7003, "Package policy rejection"),
-    ErrorCodeDefinition::new(ErrorCode::NX7004, "Entitlement unavailable"),
-    ErrorCodeDefinition::new(ErrorCode::NX7010, "Missing required export"),
-    ErrorCodeDefinition::new(ErrorCode::NX7011, "Export signature mismatch"),
-    ErrorCodeDefinition::new(ErrorCode::NX7101, "Handler yielded under MustComplete"),
-    ErrorCodeDefinition::new(ErrorCode::NX7102, "Handler waited under MustComplete"),
-    ErrorCodeDefinition::new(ErrorCode::NX7103, "Handler trapped"),
-    ErrorCodeDefinition::new(ErrorCode::NX7201, "Reload rolled back before commit"),
-    ErrorCodeDefinition::new(ErrorCode::NX7202, "Activation faulted after commit"),
-    ErrorCodeDefinition::new(ErrorCode::NX7302, "Persistence failed"),
-    ErrorCodeDefinition::new(ErrorCode::NX7303, "Engine shutdown incomplete"),
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ErrorEmissionDefinition {
@@ -192,71 +59,177 @@ macro_rules! emission {
 pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(
         NX1001,
-        "nexa-compiler::lexer",
-        "UnexpectedCharacter",
+        "nexa-syntax::lexer",
+        "SyntaxErrorKind::UnexpectedCharacter",
         ".nexa"
     ),
-    emission!(NX1002, "nexa-compiler::parser", "UnexpectedToken", ".nexa"),
-    emission!(NX2001, "nexa-compiler::resolver", "UnknownName", ".nexa"),
-    emission!(NX2002, "nexa-compiler::resolver", "UnknownType", ".nexa"),
-    emission!(NX2101, "nexa-compiler::typecheck", "TypeMismatch", ".nexa"),
+    emission!(
+        NX1002,
+        "nexa-syntax::tree",
+        "SyntaxErrorKind::UnmatchedDelimiter",
+        ".nexa"
+    ),
+    emission!(
+        NX2001,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2001",
+        ".nexa"
+    ),
+    emission!(
+        NX2002,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2002",
+        ".nexa"
+    ),
+    emission!(
+        NX2101,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2101",
+        ".nexa"
+    ),
     emission!(
         NX2201,
-        "nexa-compiler::match",
-        "NonExhaustiveMatch",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2201",
         ".nexa"
     ),
     emission!(
         NX2202,
-        "nexa-compiler::match",
-        "DuplicateMatchVariant",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2202",
         ".nexa"
     ),
     emission!(
         NX2210,
-        "nexa-compiler::typecheck",
-        "CannotInferType",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2210",
         ".nexa"
     ),
-    emission!(NX2220, "nexa-compiler::try", "TryRequiresResult", ".nexa"),
-    emission!(NX2221, "nexa-compiler::try", "TryErrorMismatch", ".nexa"),
-    emission!(NX2301, "nexa-compiler::effect", "AwaitOutsideTask", ".nexa"),
-    emission!(NX2302, "nexa-compiler::effect", "MissingAwait", ".nexa"),
+    emission!(
+        NX2220,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2220",
+        ".nexa"
+    ),
+    emission!(
+        NX2221,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2221",
+        ".nexa"
+    ),
+    emission!(
+        NX2301,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2301",
+        ".nexa"
+    ),
+    emission!(
+        NX2302,
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2302",
+        ".nexa"
+    ),
     emission!(
         NX2401,
-        "nexa-compiler::numeric",
-        "InvalidNumericConversion",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2401",
         ".nexa"
     ),
     emission!(
         NX2501,
-        "nexa-compiler::field",
-        "InvalidFieldAccess",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2501",
         ".nexa"
     ),
     emission!(
         NX2601,
-        "nexa-compiler::migration",
-        "MigrationIntrinsicOutsideMigration",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2601",
         ".nexa"
     ),
     emission!(
         NX2602,
-        "nexa-compiler::migration",
-        "MissingMigrationFinish",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2602",
         ".nexa"
     ),
     emission!(
         NX2603,
-        "nexa-compiler::migration",
-        "MissingForwarding",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2603",
         ".nexa"
     ),
     emission!(
         NX2604,
-        "nexa-compiler::migration",
-        "DuplicateForwarding",
+        "nexa-analysis::analyzer",
+        "ErrorCode::NX2604",
         ".nexa"
+    ),
+    emission!(
+        NX2701,
+        "nexa-analysis::module_graph",
+        "ModulePathMismatch",
+        ".analysis"
+    ),
+    emission!(
+        NX2702,
+        "nexa-analysis::module_graph",
+        "ModuleCycle",
+        ".analysis"
+    ),
+    emission!(
+        NX2703,
+        "nexa-analysis::resolver",
+        "UnknownImport",
+        ".analysis"
+    ),
+    emission!(
+        NX2704,
+        "nexa-analysis::resolver",
+        "DuplicateOrAmbiguousNamespace",
+        ".analysis"
+    ),
+    emission!(
+        NX2705,
+        "nexa-analysis::visibility",
+        "PrivateAccess",
+        ".analysis"
+    ),
+    emission!(
+        NX2706,
+        "nexa-analysis::visibility",
+        "InvalidPublicApiExposure",
+        ".analysis"
+    ),
+    emission!(
+        NX2710,
+        "nexa-analysis::stable_identity",
+        "InvalidStableAttribute",
+        ".analysis"
+    ),
+    emission!(
+        NX2711,
+        "nexa-analysis::stable_identity",
+        "StableIdentityConflict",
+        ".analysis"
+    ),
+    emission!(
+        NX2720,
+        "nexa-analysis::const_eval",
+        "InvalidConstExpression",
+        ".analysis"
+    ),
+    emission!(
+        NX2730,
+        "nexa-analysis::package_test",
+        "InvalidPackageTest",
+        ".analysis"
+    ),
+    emission!(
+        NX2740,
+        "nexa-analysis::lifecycle",
+        "InvalidLifecycleExportLocation",
+        ".analysis"
     ),
     emission!(NX3001, "nexa-bytecode::decode", "InvalidMagic", ".bin"),
     emission!(NX3002, "nexa-verifier", "RegisterOutOfRange", ".bin"),
@@ -384,29 +357,23 @@ pub trait ClassifiedError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Severity {
-    Error,
-    Warning,
-    Note,
-    Help,
-}
-
-impl Severity {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warning => "warning",
-            Self::Note => "note",
-            Self::Help => "help",
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Label {
     pub span: SourceSpan,
     pub message: RuntimeMessage,
+}
+
+/// The compiler stage which produced a facade diagnostic.
+///
+/// This is carried separately from the stable error code so hosts never need to infer a phase
+/// from the textual shape of a code such as `NX2xxx`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiagnosticPhase {
+    Lex,
+    Parse,
+    Resolve,
+    TypeCheck,
+    Lower,
+    Verify,
 }
 
 /// One source-backed diagnostic representation shared by human and JSON renderers.
@@ -418,38 +385,39 @@ pub struct Diagnostic {
     pub primary: Option<Label>,
     pub secondary: Vec<Label>,
     pub notes: Vec<RuntimeMessage>,
+    primary_source: Option<SourceIdentity>,
+    secondary_sources: Vec<Option<SourceIdentity>>,
+    phase: Option<DiagnosticPhase>,
 }
 
 impl Diagnostic {
     #[must_use]
-    pub fn new(error: &CompileError, file: FileId) -> Self {
+    pub fn new(error: &CompileError, _file: FileId) -> Self {
+        if let CompileError::AnalysisDiagnostic(diagnostic) = error {
+            return Self::from_analysis(diagnostic);
+        }
         let message = RuntimeMessage::inline(&CompileErrorMessage(error).to_string());
         let mut diagnostic = Self {
             code: compile_error_code(error),
             severity: Severity::Error,
             message,
-            primary: compile_error_span(error, file).map(|span| Label {
+            primary: error.source_span().map(|span| Label {
                 span,
                 message: RuntimeMessage::Static("primary source location"),
             }),
             secondary: Vec::new(),
             notes: Vec::new(),
+            primary_source: None,
+            secondary_sources: Vec::new(),
+            phase: Some(compile_error_phase(error)),
         };
         match error {
             CompileError::DuplicateName { first, .. } => {
                 diagnostic.secondary.push(Label {
-                    span: SourceSpan { file, ..*first },
+                    span: *first,
                     message: RuntimeMessage::Static("first declaration"),
                 });
-            }
-            CompileError::DuplicateMatchVariant { first, variant, .. } => {
-                diagnostic.secondary.push(Label {
-                    span: SourceSpan { file, ..*first },
-                    message: RuntimeMessage::Static("first matching arm"),
-                });
-                diagnostic.notes.push(RuntimeMessage::inline(&format!(
-                    "duplicate variant: {variant:?}"
-                )));
+                diagnostic.secondary_sources.push(None);
             }
             CompileError::TypeMismatch {
                 expected, actual, ..
@@ -465,34 +433,50 @@ impl Diagnostic {
                         .push(RuntimeMessage::inline(&format!("actual type: {actual:?}")));
                 }
             }
-            CompileError::NonExhaustiveMatch { missing, .. } => {
-                diagnostic.notes.extend(missing.iter().map(|variant| {
-                    RuntimeMessage::inline(&format!("missing variant: {variant:?}"))
-                }));
-            }
-            CompileError::TryRequiresResult { actual, .. } => {
-                diagnostic
-                    .notes
-                    .push(RuntimeMessage::inline(&format!("actual type: {actual:?}")));
-            }
-            CompileError::TryErrorMismatch {
-                expected, actual, ..
-            } => {
-                diagnostic.notes.push(RuntimeMessage::inline(&format!(
-                    "function error type: {expected:?}"
-                )));
-                diagnostic.notes.push(RuntimeMessage::inline(&format!(
-                    "expression error type: {actual:?}"
-                )));
-            }
-            CompileError::MissingForwarding { stable_id, .. } => {
-                diagnostic.notes.push(RuntimeMessage::inline(&format!(
-                    "missing stable ID: {stable_id:?}"
-                )));
-            }
             _ => {}
         }
         diagnostic
+    }
+
+    #[must_use]
+    fn from_analysis(diagnostic: &CompilerAnalysisDiagnostic) -> Self {
+        let message = diagnostic.code.definition().map_or_else(
+            || diagnostic.message.clone(),
+            |definition| format!("{}: {}", definition.summary, diagnostic.message),
+        );
+        let secondary = diagnostic
+            .secondary
+            .iter()
+            .chain(&diagnostic.related)
+            .map(|label| Label {
+                span: label.span,
+                message: RuntimeMessage::inline(&label.message),
+            })
+            .collect::<Vec<_>>();
+        let secondary_sources = diagnostic
+            .secondary
+            .iter()
+            .chain(&diagnostic.related)
+            .map(|label| canonical_analysis_source(&label.source))
+            .collect();
+        Self {
+            code: diagnostic.code,
+            severity: Severity::Error,
+            message: RuntimeMessage::inline(&message),
+            primary: Some(Label {
+                span: diagnostic.primary.span,
+                message: RuntimeMessage::inline(&diagnostic.primary.message),
+            }),
+            secondary,
+            notes: diagnostic
+                .notes
+                .iter()
+                .map(|note| RuntimeMessage::inline(note))
+                .collect(),
+            primary_source: canonical_analysis_source(&diagnostic.primary.source),
+            secondary_sources,
+            phase: Some(analysis_diagnostic_phase(diagnostic.code)),
+        }
     }
 
     #[must_use]
@@ -509,6 +493,9 @@ impl Diagnostic {
             primary: Some(primary),
             secondary: Vec::new(),
             notes: Vec::new(),
+            primary_source: None,
+            secondary_sources: Vec::new(),
+            phase: None,
         }
     }
 
@@ -525,11 +512,92 @@ impl Diagnostic {
             primary: None,
             secondary: Vec::new(),
             notes: Vec::new(),
+            primary_source: None,
+            secondary_sources: Vec::new(),
+            phase: None,
         }
+    }
+
+    /// Returns the compiler phase attached by [`Diagnostic::new`].
+    #[must_use]
+    pub const fn phase(&self) -> Option<DiagnosticPhase> {
+        self.phase
+    }
+
+    /// Returns the canonical source identity carried by an external/compiler-provided primary
+    /// label. Caller-owned virtual-snippet labels deliberately return `None` and retain the
+    /// caller's numeric [`FileId`] instead.
+    #[must_use]
+    pub const fn primary_source_identity(&self) -> Option<&SourceIdentity> {
+        self.primary_source.as_ref()
+    }
+
+    /// Returns the canonical source identity carried by one external/compiler-provided secondary
+    /// label.
+    #[must_use]
+    pub fn secondary_source_identity(&self, index: usize) -> Option<&SourceIdentity> {
+        self.secondary_sources.get(index).and_then(Option::as_ref)
+    }
+
+    /// Converts the compiler facade into the shared leaf diagnostic representation.
+    ///
+    /// Numeric `FileId`s are revision-local, so callers with a source registry should prefer
+    /// [`Diagnostic::to_leaf_with_source_identities`].
+    #[must_use]
+    pub fn to_leaf(&self) -> LeafDiagnostic {
+        self.to_leaf_with_source_identities(|file| {
+            SourceIdentity::standalone(format!("<file:{}>", file.0))
+        })
+    }
+
+    /// Converts the compiler facade into a leaf diagnostic while preserving the independent
+    /// source identity of every primary and secondary label.
+    #[must_use]
+    pub fn to_leaf_with_source_identities(
+        &self,
+        mut source_identity: impl FnMut(FileId) -> SourceIdentity,
+    ) -> LeafDiagnostic {
+        let mut leaf = LeafDiagnostic::new(self.code, self.severity, self.message.to_string());
+        if let Some(primary) = &self.primary {
+            leaf.labels.push(LeafLabel::primary(
+                self.primary_source
+                    .clone()
+                    .unwrap_or_else(|| source_identity(primary.span.file)),
+                ByteRange::new(primary.span.start, primary.span.end),
+                primary.message.to_string(),
+            ));
+        }
+        leaf.labels
+            .extend(self.secondary.iter().enumerate().map(|(index, secondary)| {
+                LeafLabel::secondary(
+                    self.secondary_sources
+                        .get(index)
+                        .and_then(Clone::clone)
+                        .unwrap_or_else(|| source_identity(secondary.span.file)),
+                    ByteRange::new(secondary.span.start, secondary.span.end),
+                    secondary.message.to_string(),
+                )
+            }));
+        leaf.notes
+            .extend(self.notes.iter().map(|note| note.to_string().into()));
+        leaf
     }
 
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string_pretty(&DiagnosticOutput::from(self))
+    }
+}
+
+fn canonical_analysis_source(source: &AnalysisDiagnosticSource) -> Option<SourceIdentity> {
+    match source {
+        AnalysisDiagnosticSource::Caller => None,
+        AnalysisDiagnosticSource::Canonical(identity) => Some(identity.clone()),
+    }
+}
+
+impl From<&Diagnostic> for LeafDiagnostic {
+    fn from(diagnostic: &Diagnostic) -> Self {
+        diagnostic.to_leaf()
     }
 }
 
@@ -582,6 +650,8 @@ struct DiagnosticOutput {
 
 #[derive(Serialize)]
 struct LabelOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source: Option<String>,
     file: u32,
     start: u32,
     end: u32,
@@ -594,20 +664,30 @@ impl From<&Diagnostic> for DiagnosticOutput {
             code: diagnostic.code.as_str(),
             severity: diagnostic.severity.as_str(),
             message: diagnostic.message.to_string(),
-            primary: diagnostic.primary.as_ref().map(LabelOutput::from),
-            secondary: diagnostic.secondary.iter().map(LabelOutput::from).collect(),
+            primary: diagnostic.primary.as_ref().map(|label| LabelOutput {
+                source: diagnostic.primary_source.as_ref().map(ToString::to_string),
+                file: label.span.file.0,
+                start: label.span.start,
+                end: label.span.end,
+                message: label.message.to_string(),
+            }),
+            secondary: diagnostic
+                .secondary
+                .iter()
+                .enumerate()
+                .map(|(index, label)| LabelOutput {
+                    source: diagnostic
+                        .secondary_sources
+                        .get(index)
+                        .and_then(Option::as_ref)
+                        .map(ToString::to_string),
+                    file: label.span.file.0,
+                    start: label.span.start,
+                    end: label.span.end,
+                    message: label.message.to_string(),
+                })
+                .collect(),
             notes: diagnostic.notes.iter().map(ToString::to_string).collect(),
-        }
-    }
-}
-
-impl From<&Label> for LabelOutput {
-    fn from(label: &Label) -> Self {
-        Self {
-            file: label.span.file.0,
-            start: label.span.start,
-            end: label.span.end,
-            message: label.message.to_string(),
         }
     }
 }
@@ -1102,93 +1182,58 @@ impl ClassifiedError for MigrationLimitError {
     }
 }
 
-fn compile_error_span(error: &CompileError, file: FileId) -> Option<SourceSpan> {
-    error.source_span().map(|span| SourceSpan { file, ..span })
-}
-
 fn compile_error_code(error: &CompileError) -> ErrorCode {
     match error {
-        CompileError::UnexpectedCharacter { .. } => ErrorCode::NX1001,
-        CompileError::UnexpectedToken { .. } | CompileError::UnexpectedEnd { .. } => {
-            ErrorCode::NX1002
-        }
+        CompileError::AnalysisDiagnostic(diagnostic) => diagnostic.code,
         CompileError::UnknownName { .. } | CompileError::DuplicateName { .. } => ErrorCode::NX2001,
         CompileError::UnknownType { .. }
         | CompileError::MissingReturn { .. }
-        | CompileError::SuspendingDefer { .. }
         | CompileError::DeferCaptureLimit { .. }
         | CompileError::InvalidEffect { .. }
         | CompileError::TooManyRegisters { .. }
         | CompileError::Verify { .. } => ErrorCode::NX2002,
         CompileError::InvalidReloadMetadata { .. } => ErrorCode::NX6005,
         CompileError::TypeMismatch { .. } => ErrorCode::NX2101,
-        CompileError::InvalidNumericConversion { .. } => ErrorCode::NX2401,
-        CompileError::CannotInferType { .. } => ErrorCode::NX2210,
-        CompileError::NonExhaustiveMatch { .. } => ErrorCode::NX2201,
-        CompileError::DuplicateMatchVariant { .. } => ErrorCode::NX2202,
-        CompileError::TryRequiresResult { .. } => ErrorCode::NX2220,
-        CompileError::TryErrorMismatch { .. } => ErrorCode::NX2221,
-        CompileError::AwaitOutsideTask { .. } => ErrorCode::NX2301,
-        CompileError::MissingAwait { .. } => ErrorCode::NX2302,
-        CompileError::InvalidFieldAccess { .. } => ErrorCode::NX2501,
-        CompileError::MigrationIntrinsicOutsideMigration { .. } => ErrorCode::NX2601,
-        CompileError::MissingMigrationFinish { .. } => ErrorCode::NX2602,
-        CompileError::MissingForwarding { .. } => ErrorCode::NX2603,
-        CompileError::DuplicateForwarding { .. } => ErrorCode::NX2604,
+    }
+}
+
+fn compile_error_phase(error: &CompileError) -> DiagnosticPhase {
+    match error {
+        CompileError::AnalysisDiagnostic(diagnostic) => analysis_diagnostic_phase(diagnostic.code),
+        CompileError::UnknownName { .. }
+        | CompileError::DuplicateName { .. }
+        | CompileError::UnknownType { .. } => DiagnosticPhase::Resolve,
+        CompileError::InvalidReloadMetadata { .. } | CompileError::TooManyRegisters { .. } => {
+            DiagnosticPhase::Lower
+        }
+        CompileError::Verify { .. } => DiagnosticPhase::Verify,
+        CompileError::TypeMismatch { .. }
+        | CompileError::MissingReturn { .. }
+        | CompileError::DeferCaptureLimit { .. }
+        | CompileError::InvalidEffect { .. } => DiagnosticPhase::TypeCheck,
+    }
+}
+
+fn analysis_diagnostic_phase(code: ErrorCode) -> DiagnosticPhase {
+    match code.as_str() {
+        "NX1001" => DiagnosticPhase::Lex,
+        "NX1002" => DiagnosticPhase::Parse,
+        "NX2001" | "NX2002" | "NX2701" | "NX2702" | "NX2703" | "NX2704" | "NX2705" | "NX2706"
+        | "NX2710" | "NX2711" => DiagnosticPhase::Resolve,
+        "NX3001" | "NX3002" | "NX3003" | "NX3004" => DiagnosticPhase::Verify,
+        "NX6005" => DiagnosticPhase::Lower,
+        _ => DiagnosticPhase::TypeCheck,
     }
 }
 
 fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
     match error {
-        CompileError::UnexpectedCharacter { offset, character } => {
-            write!(
-                formatter,
-                "unexpected character `{character}` at byte {offset}"
-            )
-        }
-        CompileError::UnexpectedToken { offset, expected } => {
-            write!(
-                formatter,
-                "unexpected token at byte {offset}; expected {expected}"
-            )
-        }
-        CompileError::UnexpectedEnd { .. } => formatter.write_str("unexpected end of input"),
+        CompileError::AnalysisDiagnostic(diagnostic) => formatter.write_str(&diagnostic.message),
         CompileError::DuplicateName { name, .. } => write!(formatter, "duplicate name `{name}`"),
         CompileError::UnknownName { name, .. } => write!(formatter, "unknown name `{name}`"),
         CompileError::UnknownType { name, .. } => write!(formatter, "unknown type `{name}`"),
         CompileError::TypeMismatch { .. } => formatter.write_str("type mismatch"),
-        CompileError::InvalidNumericConversion { .. } => {
-            formatter.write_str("invalid implicit numeric conversion")
-        }
-        CompileError::CannotInferType { .. } => formatter.write_str("cannot infer type"),
-        CompileError::NonExhaustiveMatch { .. } => formatter.write_str("non-exhaustive match"),
-        CompileError::DuplicateMatchVariant { .. } => {
-            formatter.write_str("duplicate match variant")
-        }
-        CompileError::TryRequiresResult { .. } => formatter.write_str("`?` requires Result"),
-        CompileError::TryErrorMismatch { .. } => formatter.write_str("`?` error type mismatch"),
-        CompileError::AwaitOutsideTask { .. } => formatter.write_str("await outside Task"),
-        CompileError::MissingAwait { .. } => formatter.write_str("missing await"),
-        CompileError::MigrationIntrinsicOutsideMigration { intrinsic, .. } => {
-            write!(
-                formatter,
-                "migration intrinsic `{intrinsic}` outside Migration"
-            )
-        }
-        CompileError::MissingMigrationFinish { .. } => {
-            formatter.write_str("missing finish_migration")
-        }
-        CompileError::DuplicateForwarding { stable_id, .. } => {
-            write!(formatter, "duplicate forwarding for {stable_id:?}")
-        }
-        CompileError::MissingForwarding { stable_id, .. } => {
-            write!(formatter, "missing forwarding for {stable_id:?}")
-        }
-        CompileError::InvalidFieldAccess { type_id, field, .. } => {
-            write!(formatter, "invalid field `{field}` on {type_id:?}")
-        }
         CompileError::MissingReturn { .. } => formatter.write_str("missing return"),
-        CompileError::SuspendingDefer { .. } => formatter.write_str("defer body may suspend"),
         CompileError::DeferCaptureLimit { .. } => {
             formatter.write_str("defer capture limit exceeded")
         }
@@ -1271,7 +1316,9 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::DecodeError;
-    use nexa_compiler::CompileError;
+    use nexa_compiler::{
+        AnalysisDiagnostic, AnalysisDiagnosticLabel, AnalysisDiagnosticSource, CompileError,
+    };
     use nexa_core::{FileId, SourceSpan};
     use nexa_runtime::{
         HostRequestError, HostTrap, MigrationLimitError, ReloadError, RuntimeError,
@@ -1283,6 +1330,21 @@ mod tests {
         ClassifiedError, Diagnostic, ERROR_CODE_TABLE, ERROR_EMISSION_TABLE, ErrorCategory,
         ErrorCode, HostError, Label, MigrationError, NexaError, Severity,
     };
+
+    fn analysis_compile_error(code: ErrorCode, message: &str, span: SourceSpan) -> CompileError {
+        CompileError::AnalysisDiagnostic(Box::new(AnalysisDiagnostic {
+            code,
+            message: message.into(),
+            primary: AnalysisDiagnosticLabel {
+                source: AnalysisDiagnosticSource::Caller,
+                span,
+                message: "primary source location".into(),
+            },
+            secondary: Vec::new(),
+            related: Vec::new(),
+            notes: Vec::new(),
+        }))
+    }
 
     #[test]
     fn stable_error_code_table_is_complete_ordered_and_unique() {
@@ -1305,6 +1367,17 @@ mod tests {
             ("NX2602", "Missing finish_migration"),
             ("NX2603", "Missing forwarding"),
             ("NX2604", "Duplicate forwarding"),
+            ("NX2701", "Module path mismatch"),
+            ("NX2702", "Module cycle"),
+            ("NX2703", "Unknown import"),
+            ("NX2704", "Duplicate/ambiguous namespace"),
+            ("NX2705", "Private access"),
+            ("NX2706", "Invalid public API exposure"),
+            ("NX2710", "Invalid @stable"),
+            ("NX2711", "Duplicate/colliding stable identity"),
+            ("NX2720", "Invalid const expression"),
+            ("NX2730", "Invalid package test"),
+            ("NX2740", "Invalid lifecycle/export location"),
             ("NX3001", "Invalid bytecode section"),
             ("NX3002", "Invalid register range"),
             ("NX3003", "Invalid root map"),
@@ -1363,13 +1436,46 @@ mod tests {
             .map(|definition| definition.code)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(registered, emitted);
-        assert_eq!(ERROR_CODE_TABLE.len(), 46);
         assert_eq!(ERROR_EMISSION_TABLE.len(), ERROR_CODE_TABLE.len());
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for definition in ERROR_EMISSION_TABLE {
             assert!(!definition.module.is_empty());
             assert!(!definition.variant.is_empty());
             assert!(!definition.test.is_empty());
+            if matches!(
+                definition.code,
+                ErrorCode::NX1001
+                    | ErrorCode::NX1002
+                    | ErrorCode::NX2001
+                    | ErrorCode::NX2002
+                    | ErrorCode::NX2101
+                    | ErrorCode::NX2201
+                    | ErrorCode::NX2202
+                    | ErrorCode::NX2210
+                    | ErrorCode::NX2220
+                    | ErrorCode::NX2221
+                    | ErrorCode::NX2301
+                    | ErrorCode::NX2302
+                    | ErrorCode::NX2401
+                    | ErrorCode::NX2501
+                    | ErrorCode::NX2601
+                    | ErrorCode::NX2602
+                    | ErrorCode::NX2603
+                    | ErrorCode::NX2604
+            ) {
+                assert!(
+                    definition.module.starts_with("nexa-syntax::")
+                        || definition.module == "nexa-analysis::analyzer",
+                    "{} still names a removed source frontend: {}",
+                    definition.code,
+                    definition.module
+                );
+                assert!(
+                    !definition.module.starts_with("nexa-compiler::"),
+                    "{} must be emitted by the canonical syntax/analysis frontend",
+                    definition.code
+                );
+            }
             assert!(
                 root.join(definition.fixture).is_file(),
                 "{}",
@@ -1382,10 +1488,11 @@ mod tests {
     fn every_public_error_class_has_structured_metadata() {
         let errors = [
             NexaError::Diagnostic(Box::new(Diagnostic::new(
-                &CompileError::UnexpectedCharacter {
-                    offset: 4,
-                    character: '#',
-                },
+                &analysis_compile_error(
+                    ErrorCode::NX1001,
+                    "unexpected character `#`",
+                    SourceSpan::new(FileId(7), 4, 5),
+                ),
                 FileId(7),
             ))),
             NexaError::Decode(DecodeError::InvalidMagic),
@@ -1415,17 +1522,17 @@ mod tests {
             assert_eq!(error.category(), category);
             assert_eq!(error.code().as_str(), code);
             assert_eq!(error.metadata().category, category);
-            assert!(!error.to_string().contains("UnexpectedCharacter"));
         }
     }
 
     #[test]
     fn diagnostic_carries_source_span_without_parsing_display_output() {
         let error = NexaError::from(Diagnostic::new(
-            &CompileError::UnexpectedCharacter {
-                offset: 4,
-                character: '界',
-            },
+            &analysis_compile_error(
+                ErrorCode::NX1001,
+                "unexpected character `界`",
+                SourceSpan::new(FileId(9), 4, 7),
+            ),
             FileId(9),
         ));
         assert_eq!(error.context().span, Some(SourceSpan::new(FileId(9), 4, 7)));
@@ -1434,9 +1541,11 @@ mod tests {
         assert!(error.to_string().contains("primary 9:4..7"));
 
         let numeric = NexaError::from(Diagnostic::new(
-            &CompileError::InvalidNumericConversion {
-                span: SourceSpan::new(FileId(9), 12, 17),
-            },
+            &analysis_compile_error(
+                ErrorCode::NX2401,
+                "invalid implicit numeric conversion",
+                SourceSpan::new(FileId(9), 12, 17),
+            ),
             FileId(9),
         ));
         assert_eq!(numeric.code(), ErrorCode::NX2401);
@@ -1447,28 +1556,165 @@ mod tests {
     }
 
     #[test]
+    fn analyzer_diagnostic_survives_the_compiler_facade_losslessly() {
+        let error = CompileError::AnalysisDiagnostic(Box::new(AnalysisDiagnostic {
+            code: ErrorCode::NX2202,
+            message: "variant `A` is matched more than once".into(),
+            primary: AnalysisDiagnosticLabel {
+                source: AnalysisDiagnosticSource::Caller,
+                span: SourceSpan::new(FileId(2), 20, 26),
+                message: "duplicate arm".into(),
+            },
+            secondary: vec![AnalysisDiagnosticLabel {
+                source: AnalysisDiagnosticSource::Canonical(
+                    nexa_diagnostics::SourceIdentity::package(
+                        "nexa.stdlib",
+                        "stdlib/std/core.nexa",
+                    ),
+                ),
+                span: SourceSpan::new(FileId(3), 4, 10),
+                message: "first arm".into(),
+            }],
+            related: vec![AnalysisDiagnosticLabel {
+                source: AnalysisDiagnosticSource::Canonical(
+                    nexa_diagnostics::SourceIdentity::standalone("contracts/game.nidl"),
+                ),
+                span: SourceSpan::new(FileId(4), 12, 18),
+                message: "variant declaration".into(),
+            }],
+            notes: vec!["duplicate variant: A".into()],
+        }));
+
+        let diagnostic = Diagnostic::new(&error, FileId(99));
+        assert_eq!(diagnostic.code, ErrorCode::NX2202);
+        assert_eq!(
+            diagnostic.message.to_string(),
+            "Duplicate match variant: variant `A` is matched more than once"
+        );
+        assert_eq!(
+            diagnostic.primary,
+            Some(Label {
+                span: SourceSpan::new(FileId(2), 20, 26),
+                message: nexa_runtime::RuntimeMessage::inline("duplicate arm"),
+            })
+        );
+        assert_eq!(
+            diagnostic
+                .secondary
+                .iter()
+                .map(|label| (label.span, label.message.to_string()))
+                .collect::<Vec<_>>(),
+            vec![
+                (SourceSpan::new(FileId(3), 4, 10), "first arm".to_owned()),
+                (
+                    SourceSpan::new(FileId(4), 12, 18),
+                    "variant declaration".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            diagnostic
+                .notes
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["duplicate variant: A"]
+        );
+        assert_eq!(diagnostic.primary_source_identity(), None);
+        assert_eq!(
+            diagnostic
+                .secondary_source_identity(0)
+                .map(ToString::to_string),
+            Some("nexa.stdlib:stdlib/std/core.nexa".into())
+        );
+        assert_eq!(
+            diagnostic
+                .secondary_source_identity(1)
+                .map(ToString::to_string),
+            Some("contracts/game.nidl".into())
+        );
+        let leaf = diagnostic.to_leaf_with_source_identities(|file| {
+            nexa_diagnostics::SourceIdentity::standalone(format!("caller/{}.nexa", file.0))
+        });
+        assert_eq!(leaf.labels[0].source.path(), "caller/2.nexa");
+        assert_eq!(
+            leaf.labels[1].source.to_string(),
+            "nexa.stdlib:stdlib/std/core.nexa"
+        );
+        assert_eq!(leaf.labels[2].source.path(), "contracts/game.nidl");
+        let json: serde_json::Value = serde_json::from_str(&diagnostic.to_json().unwrap()).unwrap();
+        assert_eq!(
+            json["secondary"][0]["source"],
+            "nexa.stdlib:stdlib/std/core.nexa"
+        );
+        assert_eq!(json["secondary"][1]["source"], "contracts/game.nidl");
+        assert_eq!(diagnostic.phase(), Some(super::DiagnosticPhase::TypeCheck));
+    }
+
+    #[test]
+    fn compile_diagnostic_preserves_cross_file_labels_and_leaf_identities() {
+        let diagnostic = Diagnostic::new(
+            &CompileError::DuplicateName {
+                name: "shared".into(),
+                first: SourceSpan::new(FileId(31), 4, 10),
+                duplicate: SourceSpan::new(FileId(47), 12, 18),
+            },
+            FileId(99),
+        );
+
+        assert_eq!(
+            diagnostic.primary.as_ref().map(|label| label.span),
+            Some(SourceSpan::new(FileId(47), 12, 18))
+        );
+        assert_eq!(
+            diagnostic.secondary[0].span,
+            SourceSpan::new(FileId(31), 4, 10)
+        );
+        assert_eq!(diagnostic.phase(), Some(super::DiagnosticPhase::Resolve));
+
+        let leaf = diagnostic.to_leaf_with_source_identities(|file| {
+            nexa_diagnostics::SourceIdentity::standalone(format!("src/{}.nexa", file.0))
+        });
+        assert_eq!(leaf.labels[0].source.path(), "src/47.nexa");
+        assert_eq!(
+            leaf.labels[0].range,
+            nexa_diagnostics::ByteRange::new(12, 18)
+        );
+        assert_eq!(leaf.labels[1].source.path(), "src/31.nexa");
+        assert_eq!(
+            leaf.labels[1].range,
+            nexa_diagnostics::ByteRange::new(4, 10)
+        );
+    }
+
+    #[test]
     fn source_backed_diagnostics_have_no_zero_zero_spans() {
         let cases = [
-            CompileError::UnexpectedCharacter {
-                offset: 4,
-                character: '#',
-            },
-            CompileError::UnexpectedToken {
-                offset: 8,
-                expected: "identifier",
-            },
-            CompileError::UnexpectedEnd {
-                span: SourceSpan::new(FileId(2), 11, 12),
-            },
+            analysis_compile_error(
+                ErrorCode::NX1001,
+                "unexpected character",
+                SourceSpan::new(FileId(2), 4, 5),
+            ),
+            analysis_compile_error(
+                ErrorCode::NX1002,
+                "unexpected token",
+                SourceSpan::new(FileId(2), 8, 9),
+            ),
+            analysis_compile_error(
+                ErrorCode::NX1002,
+                "unexpected end",
+                SourceSpan::new(FileId(2), 11, 12),
+            ),
             CompileError::TypeMismatch {
                 expected: Some(nexa_bytecode::ValueType::I32),
                 actual: Some(nexa_bytecode::ValueType::Bool),
                 span: SourceSpan::new(FileId(2), 15, 19),
             },
-            CompileError::TryRequiresResult {
-                actual: nexa_bytecode::ValueType::I32,
-                span: SourceSpan::new(FileId(2), 21, 23),
-            },
+            analysis_compile_error(
+                ErrorCode::NX2220,
+                "`?` requires Result",
+                SourceSpan::new(FileId(2), 21, 23),
+            ),
         ];
         for error in cases {
             let diagnostic = Diagnostic::new(&error, FileId(2));

@@ -37,12 +37,17 @@ pub use kernel::{RuntimeError, RuntimeLimits, RuntimeTrap, StepConfig, TaskLimit
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
 pub use nexa_bytecode::{Signature, ValueType};
-pub use nexa_core::StableId;
+pub use nexa_core::{
+    CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, CANONICAL_NAN_POLICY_VERSION,
+    OPCODE_COST_TABLE_VERSION, RUNTIME_LIBM_VERSION, RUNTIME_MATH_BACKEND_ID,
+    RUNTIME_SEMANTICS_VERSION, StableId,
+};
 
 #[cfg(test)]
 mod micro;
 pub use frame::{
-    ContinuationReservation, DeferAction, Frame, FrameArena, FrameError, FrameLimits, RuntimeValue,
+    ContinuationReservation, DeferAction, Frame, FrameArena, FrameError, FrameLimits,
+    MigrationOldObjectHandle, MigrationStagingObjectHandle, RuntimeValue,
 };
 pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
@@ -98,3 +103,57 @@ pub use stateful::{
 pub use stateful::{fuzz_migration_arena, fuzz_stateful_registry};
 pub use task::{TaskError, TaskHandle, TaskSnapshot, TaskState};
 pub use trace::{RuntimeTrace, TraceRecords};
+
+#[cfg(test)]
+mod fingerprint_authority_tests {
+    use nexa_core::{CANONICAL_NAN_POLICY_VERSION, RUNTIME_LIBM_VERSION};
+
+    #[test]
+    fn public_constants_reexport_core_and_drive_the_opcode_cost_table() {
+        assert_eq!(
+            super::RUNTIME_SEMANTICS_VERSION,
+            nexa_core::RUNTIME_SEMANTICS_VERSION
+        );
+        assert_eq!(
+            super::OPCODE_COST_TABLE_VERSION,
+            nexa_core::OPCODE_COST_TABLE_VERSION
+        );
+        assert_eq!(
+            super::RUNTIME_MATH_BACKEND_ID,
+            nexa_core::RUNTIME_MATH_BACKEND_ID
+        );
+        assert_eq!(
+            super::OpcodeCostTable::default().version,
+            nexa_core::OPCODE_COST_TABLE_VERSION
+        );
+    }
+
+    #[test]
+    fn math_backend_identity_matches_the_exact_workspace_libm_pin() {
+        let expected_identity = format!(
+            "pure-rust-libm-{RUNTIME_LIBM_VERSION}-canonical-nan-v{CANONICAL_NAN_POLICY_VERSION}"
+        );
+        assert_eq!(super::RUNTIME_MATH_BACKEND_ID, expected_identity);
+
+        let workspace_manifest = include_str!("../../../Cargo.toml");
+        let exact_pin = format!(r#"libm = "={RUNTIME_LIBM_VERSION}""#);
+        assert!(
+            workspace_manifest
+                .lines()
+                .any(|line| line.trim() == exact_pin),
+            "workspace libm dependency must stay exactly pinned to the version in the runtime math identity"
+        );
+        assert!(
+            include_str!("../../nexa-core/Cargo.toml")
+                .lines()
+                .any(|line| line.trim() == "libm.workspace = true"),
+            "nexa-core must consume the workspace libm authority"
+        );
+        assert!(
+            include_str!("../Cargo.toml")
+                .lines()
+                .any(|line| line.trim() == r#"nexa-core = { path = "../nexa-core" }"#),
+            "nexa-runtime must consume deterministic math through nexa-core"
+        );
+    }
+}

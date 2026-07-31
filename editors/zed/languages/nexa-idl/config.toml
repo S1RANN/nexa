@@ -1,5 +1,5 @@
 name = "Nexa IDL"
-grammar = "nexa"
+grammar = "nexa_idl"
 path_suffixes = ["nidl"]
 tab_size = 4
 hard_tabs = false

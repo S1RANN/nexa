@@ -1,0 +1,6 @@
+schema = 2
+kind = "library"
+id = "example.language-common"
+name = "Language Scale Common"
+version = "1.0.0"
+source_root = "src"

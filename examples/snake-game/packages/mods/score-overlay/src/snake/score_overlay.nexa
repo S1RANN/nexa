@@ -1,0 +1,38 @@
+module snake.score_overlay;
+import host as snake;
+import std.collections as collections;
+
+@stateful(1) class OverlayState {
+    foods: i32;
+}
+
+fn empty() -> Array<snake.SnakeCommand> {
+    return [];
+}
+
+fn register() -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    collections.array_push(commands, snake.RegisterWidget("stats"));
+    return commands;
+}
+
+fn update(snapshot: snake.GameSnapshot) -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    let stats: snake.GameStats = snapshot.stats;
+    let text: string = snake.format_stats(stats.score, stats.total_plays, stats.foods);
+    collections.array_push(commands, snake.SetWidgetText(snake.WidgetText { local_id: "stats", text: text }));
+    return commands;
+}
+
+pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+    return match event {
+        snake.PackageEnabled(snapshot) => register(),
+        snake.GameStarted(snapshot) => empty(),
+        snake.GameTick(snapshot) => update(snapshot),
+        snake.ScoreChanged(snapshot) => update(snapshot),
+        snake.FoodSpawnRequested(snapshot) => empty(),
+        snake.FoodEaten(snapshot) => empty(),
+        snake.GameEnded(snapshot) => empty(),
+        snake.SettingsChanged(snapshot) => update(snapshot),
+    };
+}

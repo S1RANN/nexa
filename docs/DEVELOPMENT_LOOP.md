@@ -1,6 +1,6 @@
 # Nexa development loop
 
-Status: M3R3 COMPLETE
+Status: M3R3 COMPLETE; M4 COMPLETE
 
 `NexaEngine` owns the package development loop. Applications opt in with
 `DevelopmentConfig`; they do not create compiler threads or mutate a Realm
@@ -41,10 +41,12 @@ Failure states are `CompileFailed`, `VerifyFailed`, `MigrationFailed`,
 `AwaitingQueue` is an explicit backpressure state. Every transition produces
 a bounded `DevelopmentEvent`.
 
-The scanner uses modification metadata only as a possible prefilter. The
-commit identity is a deterministic hash of the package manifest and entry
-source. A change must produce the same content for `stable_scan_count`
-consecutive scans before compilation is queued.
+The scanner uses modification metadata only as a possible prefilter. M4
+observes one immutable resolved build input containing the Manifest, Lockfile,
+all Source Modules, the full local Library closure, and Host Contract. Its
+commit identity is a 256-bit `BuildFingerprint`. A change must produce the same
+complete input for `stable_scan_count` consecutive scans before compilation is
+queued.
 
 One bounded worker reads an immutable Candidate snapshot and performs parse,
 type checking, bytecode generation, verification, required-export checks, and
@@ -66,12 +68,17 @@ terminates that entry as `SupersededBeforeCompile`. Source removal keeps the
 active Runtime running and permits a new Generation after the source
 reappears. Only the newest verified Candidate can enter Restart Reload.
 
-Development identity is split into `observed_hash`, `stable_hash`,
-`queued_hash`, `in_flight_hash`, `terminal_hash`, `active_hash`, and the
-fail-closed `desired_hash`. `desired_hash` is the source content the Engine
-currently intends to run; it becomes `None` when source discovery fails or the
-source is missing. Backpressure does not advance queued or terminal identity,
-so a stable version cannot be forgotten before compilation.
+Every stage carries one `CandidateIdentity`:
+
+```text
+Package ID + Generation + Build Fingerprint
+```
+
+Observed, stable, queued, in-flight, terminal, active, and fail-closed desired
+states compare that complete identity. Desired identity becomes absent when
+source, dependency, lock, or contract discovery fails. Backpressure does not
+advance queued or terminal identity, so a stable version cannot be forgotten
+before compilation.
 
 Changing or reverting source triggers unified supersession across
 `unqueued_generation`, `AwaitingQueue`, Worker pending and in-flight Jobs,
@@ -79,16 +86,17 @@ queued Results, and retained ready Candidates. Stale work receives exactly one
 terminal outcome and cannot become the active Runtime. Disable, removal, and
 shutdown cancellation still take precedence over supersession.
 
-Queued and in-flight bookkeeping compares both Generation and hash. Reusing
-identical source content in a later Generation cannot let an older Worker event
-or terminal clear the newer Candidate identity.
+Queued and in-flight bookkeeping compares the complete Candidate identity.
+Reusing identical source content in a later Generation cannot let an older
+Worker event or terminal clear the newer Candidate identity.
 
 `NexaEngine::tick()` refreshes the source immediately before Runtime mutation.
 Commit requires both the latest Candidate Generation and equality between the
-Candidate source hash and the refreshed `desired_hash`. This check is
-independent of ordinary scan cadence and therefore rejects a compiled Result or
-manual ready Candidate even when its source changed between scanning and
-commit. A refresh failure closes the gate.
+Candidate Build Fingerprint and the newly resolved desired build input. This
+check is independent of ordinary scan cadence and therefore rejects stale
+Initial Enable, Manual Reload, automatic Results, and CLI retained Candidates
+after add/delete/rename/ABA, dependency, Lockfile, Manifest, or Host Contract
+changes. A refresh failure closes the gate.
 
 `EngineInspection` reports real cumulative `created_generations`,
 `terminal_generations`, `duplicate_terminals`, and
@@ -100,8 +108,9 @@ and terminal counts to match with zero duplicates and zero missing terminals.
 The active Runtime, registered package contribution, and `LastKnownGood` are
 unchanged when discovery, parse, type checking, compilation, verification,
 export checking, migration, or pre-commit Reload fails. Successful commit
-records the artifact, epoch, source hash, schema hash, Host interface hash, and
-generation in memory.
+records the Artifact, Epoch, Source Set/Public API/State Schema/Build
+Fingerprints, dependency closure, Host interface hash, and Generation in
+memory.
 
 An activation failure is post-commit and faults the package. A later valid
 source generation is allowed to construct a fresh Runtime and restore the
@@ -145,5 +154,6 @@ cargo run -p nexa-cli -- check path/to/package \
 Their structured output reports `manifest-only`, `contract`, or
 `full-policy`. Project checks always report `full-policy`.
 
-The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 has not
-started.
+The immutable M3, M3R1, M3R2, and M3R3 completion tags remain unchanged. M4 is
+complete at the annotated `language-scale-m4-complete` tag and does not rewrite
+those historical commits.

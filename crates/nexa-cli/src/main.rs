@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use nexa_machine::{MachineSpec, stable_id_map};
 use nexa_model::artifact::{
@@ -37,10 +38,112 @@ const REQUIRED_BASELINE: &[&str] = &[
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DiagnosticFormat {
+pub(crate) enum DiagnosticFormat {
     Human,
     Json,
     Ndjson,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CliErrorKind {
+    DiagnosticOrTestFailure,
+    UsageOrEnvironment,
+    WorkerIoOrInternal,
+}
+
+impl CliErrorKind {
+    const fn exit_code(self) -> i32 {
+        match self {
+            Self::DiagnosticOrTestFailure => 1,
+            Self::UsageOrEnvironment => 2,
+            Self::WorkerIoOrInternal => 3,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CliError {
+    kind: CliErrorKind,
+    message: String,
+    already_rendered: bool,
+}
+
+impl CliError {
+    pub(crate) fn diagnostic(message: impl Into<String>) -> Self {
+        Self {
+            kind: CliErrorKind::DiagnosticOrTestFailure,
+            message: message.into(),
+            already_rendered: false,
+        }
+    }
+
+    pub(crate) fn rendered_diagnostic(message: impl Into<String>) -> Self {
+        Self {
+            kind: CliErrorKind::DiagnosticOrTestFailure,
+            message: message.into(),
+            already_rendered: true,
+        }
+    }
+
+    pub(crate) fn environment(message: impl Into<String>) -> Self {
+        Self {
+            kind: CliErrorKind::UsageOrEnvironment,
+            message: message.into(),
+            already_rendered: false,
+        }
+    }
+
+    pub(crate) fn usage(message: impl Into<String>) -> Self {
+        Self::environment(message)
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            kind: CliErrorKind::WorkerIoOrInternal,
+            message: message.into(),
+            already_rendered: false,
+        }
+    }
+
+    const fn exit_code(&self) -> i32 {
+        self.kind.exit_code()
+    }
+
+    pub(crate) const fn already_rendered(&self) -> bool {
+        self.already_rendered
+    }
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for CliError {}
+
+pub(crate) type CliResult<T> = Result<T, CliError>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CommandOutcome {
+    Success,
+    Failure(CliError),
+}
+
+impl CommandOutcome {
+    fn from_result(result: CliResult<()>) -> Self {
+        match result {
+            Ok(()) => Self::Success,
+            Err(error) => Self::Failure(error),
+        }
+    }
+
+    const fn exit_code(&self) -> i32 {
+        match self {
+            Self::Success => 0,
+            Self::Failure(error) => error.exit_code(),
+        }
+    }
 }
 
 fn main() {
@@ -48,11 +151,12 @@ fn main() {
     let (diagnostic_format, arguments) = match extract_diagnostic_format(&raw_arguments) {
         Ok(parsed) => parsed,
         Err(error) => {
-            eprintln!("nexa: {error}");
-            std::process::exit(2);
+            let outcome = CommandOutcome::Failure(CliError::usage(error));
+            render_cli_outcome(&outcome, DiagnosticFormat::Human);
+            std::process::exit(outcome.exit_code());
         }
     };
-    let result = match arguments.as_slice() {
+    let result: CliResult<()> = match arguments.as_slice() {
         [command, arguments @ ..] if command == "check" => {
             check_command(arguments, diagnostic_format)
         }
@@ -60,7 +164,7 @@ fn main() {
             build_command(arguments, diagnostic_format)
         }
         [command, arguments @ ..] if command == "verify" => {
-            verify_command(arguments, diagnostic_format)
+            legacy_result(verify_command(arguments, diagnostic_format))
         }
         [command, arguments @ ..] if command == "run" => {
             run_command(arguments, diagnostic_format, false)
@@ -71,32 +175,53 @@ fn main() {
         [command, arguments @ ..] if command == "dev" => {
             dev::dev_command(arguments, diagnostic_format)
         }
-        [command] if command == "lsp" => lsp::run(),
-        [command] if command == "model-check" => check_models(),
-        [command] if command == "diagnostic-corpus-check" => diagnostic_corpus_check(false),
+        [command, arguments @ ..] if command == "lock" => {
+            lock_command(arguments, diagnostic_format)
+        }
+        [command, arguments @ ..] if command == "test" => {
+            test_command(arguments, diagnostic_format)
+        }
+        [command] if command == "lsp" => legacy_result(lsp::run()),
+        [command] if command == "model-check" => legacy_result(check_models()),
+        [command] if command == "diagnostic-corpus-check" => {
+            legacy_result(diagnostic_corpus_check(false))
+        }
         [command, flag, format]
             if command == "diagnostic-corpus-check" && flag == "--format" && format == "json" =>
         {
-            diagnostic_corpus_check(true)
+            legacy_result(diagnostic_corpus_check(true))
         }
-        [command, path] if command == "model-replay" => model_replay(Path::new(path)),
+        [command, path] if command == "model-replay" => {
+            legacy_result(model_replay(Path::new(path)))
+        }
         [command, arguments @ ..] if command == "fixture-check" => {
-            fixture_check(arguments, diagnostic_format)
+            legacy_result(fixture_check(arguments, diagnostic_format))
         }
-        [area, command] if area == "baseline" && command == "check" => check_baseline(),
-        [area, command] if area == "machine" && command == "check" => check_machines(),
-        [area, command] if area == "model" && command == "check" => check_models(),
-        [command, arguments @ ..] if command == "migrate-check" => migrate_check(arguments),
-        [command, arguments @ ..] if command == "dump" => dump_module(arguments),
-        [command, path] if command == "compile" => compile_file(Path::new(path)),
-        [area, command, path] if area == "idl" && command == "check" => check_idl(Path::new(path)),
+        [area, command] if area == "baseline" && command == "check" => {
+            legacy_result(check_baseline())
+        }
+        [area, command] if area == "machine" && command == "check" => {
+            legacy_result(check_machines())
+        }
+        [area, command] if area == "model" && command == "check" => legacy_result(check_models()),
+        [command, arguments @ ..] if command == "migrate-check" => {
+            legacy_result(migrate_check(arguments))
+        }
+        [command, arguments @ ..] if command == "dump" => legacy_result(dump_module(arguments)),
+        [command, path] if command == "compile" => compile_file(Path::new(path), diagnostic_format),
+        [area, command, path] if area == "idl" && command == "check" => {
+            legacy_result(check_idl(Path::new(path)))
+        }
         [area, command, path] if area == "idl" && command == "generate" => {
-            generate_idl(Path::new(path))
+            legacy_result(generate_idl(Path::new(path)))
         }
-        _ => Err("usage: nexa check|build|verify|dump|run|trace ... | \
+        _ => Err(CliError::usage(
+            "usage: nexa check|build|test|lock|verify|dump|run|trace ... | \
              nexa check <package-directory> --manifest-only | \
              nexa check <package-directory> --contract <app_api.nidl> [--policy <policy.toml>] | \
-             nexa check --project <nexa.dev.toml> | nexa dev --project <nexa.dev.toml> | \
+             nexa check|test|lock --project <nexa.dev.toml> | \
+             nexa test <package-directory> --contract <app_api.nidl> | \
+             nexa lock <package-directory> | nexa dev --project <nexa.dev.toml> | \
              nexa lsp | \
              nexa model-check | nexa diagnostic-corpus-check | nexa model-replay <artifact.json> | \
              nexa migrate-check ... | nexa fixture-check <fixture-or-directory> | \
@@ -104,50 +229,68 @@ fn main() {
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
              [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
              [MigrationLimits] [--diagnostic-format human|json|ndjson]"
-            .to_owned()),
+                .to_owned(),
+        )),
     };
-    if let Err(error) = result {
-        match diagnostic_format {
-            DiagnosticFormat::Human => eprintln!("nexa: {error}"),
-            DiagnosticFormat::Json => eprintln!(
-                "{}",
-                serde_json::to_string(&json!({
-                    "status": "error",
-                    "message": error,
-                }))
-                .expect("diagnostic JSON serialization does not fail")
-            ),
-            DiagnosticFormat::Ndjson => eprintln!(
-                "{}",
-                serde_json::to_string(&json!({
-                    "schema": 1,
-                    "status": "error",
-                    "message": error,
-                }))
-                .expect("diagnostic JSON serialization does not fail")
-            ),
-        }
-        std::process::exit(exit_code_for(&error));
+    let outcome = CommandOutcome::from_result(result);
+    render_cli_outcome(&outcome, diagnostic_format);
+    if outcome.exit_code() != 0 {
+        std::process::exit(outcome.exit_code());
     }
 }
 
-fn exit_code_for(error: &str) -> i32 {
+fn render_cli_outcome(outcome: &CommandOutcome, diagnostic_format: DiagnosticFormat) {
+    let CommandOutcome::Failure(error) = outcome else {
+        return;
+    };
+    if error.already_rendered {
+        return;
+    }
+    match diagnostic_format {
+        DiagnosticFormat::Human => eprintln!("nexa: {error}"),
+        DiagnosticFormat::Json => eprintln!(
+            "{}",
+            serde_json::to_string(&json!({
+                "status": "error",
+                "message": error.message,
+                "exitCode": error.exit_code(),
+            }))
+            .expect("diagnostic JSON serialization does not fail")
+        ),
+        DiagnosticFormat::Ndjson => eprintln!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schema": 1,
+                "status": "error",
+                "message": error.message,
+                "exitCode": error.exit_code(),
+            }))
+            .expect("diagnostic JSON serialization does not fail")
+        ),
+    }
+}
+
+fn legacy_result(result: Result<(), String>) -> CliResult<()> {
+    result.map_err(classify_legacy_error)
+}
+
+fn classify_legacy_error(error: String) -> CliError {
     let lower = error.to_ascii_lowercase();
     if lower.starts_with("usage:")
         || lower.starts_with("unknown ")
         || lower.starts_with("unexpected ")
         || lower.contains("missing value for")
     {
-        2
+        CliError::usage(error)
     } else if lower.contains("could not read")
         || lower.contains("could not write")
         || lower.contains("could not resolve")
         || lower.contains("worker")
         || lower.contains("lsp ")
     {
-        3
+        CliError::internal(error)
     } else {
-        1
+        CliError::diagnostic(error)
     }
 }
 
@@ -207,30 +350,39 @@ fn extract_diagnostic_format(
 }
 
 #[allow(clippy::too_many_lines)]
-fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+fn check_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
     if let [flag, project] = arguments
         && flag == "--project"
     {
         let project = project::LoadedProject::load(Path::new(project))?;
-        let report = project.check()?;
-        if !report.diagnostics.is_empty() {
-            render_engine_diagnostics(&report.diagnostics, format)?;
-            return Err(format!(
-                "{} package diagnostics emitted",
-                report.diagnostics.len()
-            ));
+        let builds = project.resolved_builds(true)?;
+        let mut modules = 0_usize;
+        let mut session = nexa::PackageBuildSession::new();
+        for build in &builds {
+            let compiled = compile_resolved_build_with_session(
+                &mut session,
+                build,
+                1,
+                None,
+                &project.required_exports,
+                false,
+                format,
+            )?;
+            modules = modules.saturating_add(compiled.module_count);
         }
         print_success(
             format,
             "check",
             &json!({
                 "project": project.config_path,
-                "packages": report.checked_packages,
+                "packages": builds.len(),
+                "modules": modules,
                 "validationLevel": "full-policy",
             }),
             &format!(
-                "checked {} packages from {}",
-                report.checked_packages,
+                "checked {} packages ({} Modules) from {}",
+                builds.len(),
+                modules,
                 project.config_path.display()
             ),
         );
@@ -239,11 +391,16 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
     if let Some(package) = parse_package_check(arguments)? {
         if package.manifest_only {
             let manifest_path = package.directory.join("package.toml");
-            let manifest_source = std::fs::read_to_string(&manifest_path)
-                .map_err(|error| format!("could not read {}: {error}", manifest_path.display()))?;
-            let policy = project::manifest_validation_policy(&manifest_source)?;
-            let manifest = nexa_embed::PackageManifest::parse(&manifest_source, &policy)
-                .map_err(|error| format!("invalid {}: {error}", manifest_path.display()))?;
+            let manifest_source = std::fs::read_to_string(&manifest_path).map_err(|error| {
+                CliError::internal(format!(
+                    "could not read {}: {error}",
+                    manifest_path.display()
+                ))
+            })?;
+            let manifest =
+                nexa_analysis::PackageManifest::parse(&manifest_source).map_err(|error| {
+                    CliError::diagnostic(format!("invalid {}: {error}", manifest_path.display()))
+                })?;
             print_success(
                 format,
                 "check",
@@ -256,117 +413,112 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
             );
             return Ok(());
         }
-        let contract = package
-            .contract
-            .as_ref()
-            .ok_or("package check requires `--contract` or `--manifest-only`")?;
-        let contract_source = std::fs::read_to_string(contract)
-            .map_err(|error| format!("could not read {}: {error}", contract.display()))?;
-        let idl = nexa_idl::parse(&contract_source)
-            .map_err(|error| format!("invalid {}: {error}", contract.display()))?;
-        let manifest_source = std::fs::read_to_string(package.directory.join("package.toml"))
-            .map_err(|error| {
-                format!(
-                    "could not read {}: {error}",
-                    package.directory.join("package.toml").display()
-                )
-            })?;
+        let contract = package.contract.as_ref().ok_or_else(|| {
+            CliError::usage("Package check requires `--contract` or `--manifest-only`")
+        })?;
+        let contract_source = std::fs::read_to_string(contract).map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", contract.display()))
+        })?;
+        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+        })?;
+        let host_contract = project::HostContractSnapshot::with_source(
+            &idl,
+            nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
+            Arc::<str>::from(contract_source),
+        )?;
         let (source_id, policy, validation_level) = if let Some(policy_path) = &package.policy {
             let (source_id, policy) = project::load_policy(policy_path)?;
-            (source_id, policy, "full-policy")
+            (source_id, Some(policy), "full-policy")
         } else {
             (
-                nexa_embed::SourceId::new("contract-check").map_err(|error| error.to_string())?,
-                project::manifest_validation_policy(&manifest_source)?,
+                nexa_analysis::SourceId::new("contract-check")
+                    .map_err(|error| CliError::internal(error.to_string()))?,
+                None,
                 "contract",
             )
         };
-        match project::check_package(&package.directory, &idl, &[], &source_id, &policy) {
-            Ok(artifact) => {
-                print_success(
-                    format,
-                    "check",
-                    &json!({
-                        "package": package.directory,
-                        "contract": contract,
-                        "functions": artifact.verified.module().functions.len(),
-                        "validationLevel": validation_level,
-                    }),
-                    &format!("checked package {}", package.directory.display()),
-                );
-                return Ok(());
-            }
-            Err(diagnostic) => {
-                render_engine_diagnostics(&[diagnostic], format)?;
-                return Err("package check failed".into());
-            }
-        }
+        let build = project::resolve_direct_package(
+            &package.directory,
+            source_id,
+            policy.as_ref(),
+            &host_contract,
+            true,
+        )?;
+        let compiled = compile_resolved_build(
+            &build,
+            1,
+            None,
+            build.host_contract.required_exports.as_ref(),
+            false,
+            format,
+        )?;
+        let functions = compiled.function_count();
+        print_success(
+            format,
+            "check",
+            &json!({
+                "package": package.directory,
+                "packageId": build.package_id().as_str(),
+                "contract": contract,
+                "functions": functions,
+                "modules": compiled.module_count,
+                "buildFingerprint": compiled.identity.build_fingerprint,
+                "validationLevel": validation_level,
+            }),
+            &functions.map_or_else(
+                || {
+                    format!(
+                        "checked Library Package {}: {} Modules",
+                        build.package_id(),
+                        compiled.module_count
+                    )
+                },
+                |functions| {
+                    format!(
+                        "checked Application Package {}: {} Modules, {} functions",
+                        build.package_id(),
+                        compiled.module_count,
+                        functions
+                    )
+                },
+            ),
+        );
+        return Ok(());
     }
-    let (path, limits) = parse_input_and_limits(arguments, "check")?;
-    let verified = compile_source_diagnostic(&path, format)?;
-    verify_with_limits(verified.module().clone(), limits)?;
+    let (path, limits) =
+        parse_input_and_limits(arguments, "check").map_err(classify_legacy_error)?;
+    let source = std::fs::read_to_string(&path).map_err(|error| {
+        CliError::internal(format!("could not read {}: {error}", path.display()))
+    })?;
+    let build = project::virtual_snippet(&source, &path)?;
+    let compiled = compile_resolved_build_with_limits(
+        &build,
+        1,
+        None,
+        build.host_contract.required_exports.as_ref(),
+        false,
+        limits,
+        format,
+    )?;
+    let artifact = compiled_product(&compiled)?;
     print_success(
         format,
         "check",
         &json!({
             "source": path,
-            "functions": verified.module().functions.len(),
+            "packageId": "nexa.snippet",
+            "module": "main",
+            "functions": artifact.module().functions.len(),
+            "buildFingerprint": compiled.identity.build_fingerprint,
         }),
         &format!(
-            "checked {}: {} functions",
+            "checked {} as nexa.snippet::main: {} functions",
             path.display(),
-            verified.module().functions.len()
+            artifact.module().functions.len()
         ),
     );
     Ok(())
-}
-
-fn compile_source_diagnostic(
-    path: &Path,
-    format: DiagnosticFormat,
-) -> Result<nexa_verifier::VerifiedModule, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("main.nexa");
-    let registry = nexa_embed::SourceFileRegistry::from_files([(file_name, source.clone())])
-        .map_err(|error| error.to_string())?;
-    let file = registry
-        .file_id(file_name)
-        .ok_or("source file was not registered")?;
-    match nexa::compile_file(&source, file) {
-        Ok(verified) => Ok(verified),
-        Err(nexa::NexaError::Diagnostic(diagnostic)) => {
-            let stage = match diagnostic.code.as_str().as_bytes().get(2).copied() {
-                Some(b'1') => nexa_embed::EngineDiagnosticStage::Parse,
-                Some(b'2') => nexa_embed::EngineDiagnosticStage::TypeCheck,
-                Some(b'3') => nexa_embed::EngineDiagnosticStage::Verify,
-                _ => nexa_embed::EngineDiagnosticStage::Compile,
-            };
-            let diagnostic = nexa_embed::EngineDiagnostic::from_leaf(
-                None,
-                nexa_embed::SourceId::new("cli").ok(),
-                stage,
-                *diagnostic,
-                Some(&registry),
-            );
-            render_engine_diagnostics(&[diagnostic], format)?;
-            Err("source check failed".into())
-        }
-        Err(error) => {
-            let diagnostic = nexa_embed::EngineDiagnostic::without_source(
-                None,
-                nexa_embed::SourceId::new("cli").ok(),
-                nexa_embed::EngineDiagnosticStage::Verify,
-                error.code(),
-                error.to_string(),
-            );
-            render_engine_diagnostics(&[diagnostic], format)?;
-            Err("source verification failed".into())
-        }
-    }
 }
 
 struct PackageCheckArguments {
@@ -376,7 +528,7 @@ struct PackageCheckArguments {
     manifest_only: bool,
 }
 
-fn parse_package_check(arguments: &[String]) -> Result<Option<PackageCheckArguments>, String> {
+fn parse_package_check(arguments: &[String]) -> CliResult<Option<PackageCheckArguments>> {
     let Some(first) = arguments.first() else {
         return Ok(None);
     };
@@ -391,36 +543,42 @@ fn parse_package_check(arguments: &[String]) -> Result<Option<PackageCheckArgume
     while index < arguments.len() {
         match arguments[index].as_str() {
             "--contract" => {
-                contract = Some(PathBuf::from(
-                    arguments
-                        .get(index + 1)
-                        .ok_or("missing value for `--contract`")?,
-                ));
+                contract =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--contract`"),
+                    )?));
                 index += 2;
             }
             "--policy" => {
-                policy = Some(PathBuf::from(
-                    arguments
-                        .get(index + 1)
-                        .ok_or("missing value for `--policy`")?,
-                ));
+                policy =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--policy`"),
+                    )?));
                 index += 2;
             }
             "--manifest-only" => {
                 manifest_only = true;
                 index += 1;
             }
-            option => return Err(format!("unknown package check option `{option}`")),
+            option => {
+                return Err(CliError::usage(format!(
+                    "unknown package check option `{option}`"
+                )));
+            }
         }
     }
     if manifest_only && (contract.is_some() || policy.is_some()) {
-        return Err("`--manifest-only` cannot be combined with `--contract` or `--policy`".into());
+        return Err(CliError::usage(
+            "`--manifest-only` cannot be combined with `--contract` or `--policy`",
+        ));
     }
     if policy.is_some() && contract.is_none() {
-        return Err("`--policy` requires `--contract`".into());
+        return Err(CliError::usage("`--policy` requires `--contract`"));
     }
     if !manifest_only && contract.is_none() {
-        return Err("package check requires `--contract` or `--manifest-only`".into());
+        return Err(CliError::usage(
+            "Package check requires `--contract` or `--manifest-only`",
+        ));
     }
     Ok(Some(PackageCheckArguments {
         directory,
@@ -430,44 +588,195 @@ fn parse_package_check(arguments: &[String]) -> Result<Option<PackageCheckArgume
     }))
 }
 
-fn render_engine_diagnostics(
-    diagnostics: &[nexa_embed::EngineDiagnostic],
+fn render_diagnostic_batch(
+    batch: &nexa::DiagnosticBatch,
     format: DiagnosticFormat,
-) -> Result<(), String> {
-    match format {
-        DiagnosticFormat::Human => {
-            for diagnostic in diagnostics {
-                eprintln!("{}", nexa_embed::DiagnosticRenderer::human(diagnostic));
-            }
-        }
-        DiagnosticFormat::Json => {
-            let values = diagnostics
-                .iter()
-                .map(nexa_embed::DiagnosticRenderer::json)
-                .map(|value| {
-                    value
-                        .and_then(|value| serde_json::from_str::<Value>(&value))
-                        .map_err(|error| error.to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            eprintln!(
-                "{}",
-                serde_json::to_string_pretty(&values).map_err(|error| error.to_string())?
-            );
-        }
-        DiagnosticFormat::Ndjson => {
-            eprint!(
-                "{}",
-                nexa_embed::DiagnosticRenderer::ndjson(diagnostics)
-                    .map_err(|error| error.to_string())?
-            );
-        }
-    }
+) -> CliResult<()> {
+    let rendered = match format {
+        DiagnosticFormat::Human => nexa::LeafDiagnosticRenderer::human(batch),
+        DiagnosticFormat::Json => nexa::LeafDiagnosticRenderer::json(batch)
+            .map_err(|error| CliError::internal(error.to_string()))?,
+        DiagnosticFormat::Ndjson => nexa::LeafDiagnosticRenderer::ndjson(batch)
+            .map_err(|error| CliError::internal(error.to_string()))?,
+    };
+    eprintln!("{rendered}");
     Ok(())
 }
 
-fn build_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
+fn diagnostics_for_build(
+    build: &project::ResolvedBuild,
+    batch: &nexa::DiagnosticBatch,
+) -> CliResult<nexa::DiagnosticBatch> {
+    let Some(origin) = &build.virtual_source_origin else {
+        return Ok(batch.clone());
+    };
+    if !origin.source_text_is_original {
+        return Ok(batch.clone());
+    }
+    let internal = nexa::SourceIdentity::package(
+        origin.source_key.package_id.as_str(),
+        origin.source_key.path.as_str(),
+    );
+    let mut sources = nexa::SourceSnapshotRegistry::builder();
+    for (identity, snapshot) in batch.sources().iter() {
+        if identity == &internal {
+            sources
+                .insert(
+                    origin.display_identity.clone(),
+                    Arc::clone(&origin.original_text),
+                )
+                .map_err(|error| CliError::internal(error.to_string()))?;
+        } else {
+            sources
+                .insert(identity.clone(), Arc::<str>::from(snapshot.text()))
+                .map_err(|error| CliError::internal(error.to_string()))?;
+        }
+    }
+    let mut remapped = nexa::DiagnosticBatch::with_default_limits(sources.build());
+    for diagnostic in batch.diagnostics() {
+        let mut diagnostic = diagnostic.clone();
+        for label in &mut diagnostic.labels {
+            if label.source == internal {
+                label.source = origin.display_identity.clone();
+            }
+        }
+        for related in &mut diagnostic.related {
+            if related.source == internal {
+                related.source = origin.display_identity.clone();
+            }
+        }
+        for fix in &mut diagnostic.fixes {
+            if fix.source.as_ref() == Some(&internal) {
+                fix.source = Some(origin.display_identity.clone());
+            }
+        }
+        remapped.push(diagnostic);
+    }
+    Ok(remapped)
+}
+
+fn classify_facade_build_error(error: nexa::PackageBuildError) -> CliError {
+    match error {
+        error @ (nexa::PackageBuildError::Compile(_)
+        | nexa::PackageBuildError::Environment(_)
+        | nexa::PackageBuildError::Verify(_)
+        | nexa::PackageBuildError::MissingRequiredExport(_)
+        | nexa::PackageBuildError::ExportSignatureMismatch { .. }) => {
+            CliError::diagnostic(error.to_string())
+        }
+        error => CliError::internal(error.to_string()),
+    }
+}
+
+fn compile_resolved_build(
+    build: &project::ResolvedBuild,
+    generation: u64,
+    idl: Option<&nexa::Idl>,
+    required_exports: &[String],
+    include_tests: bool,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledBuild> {
+    finish_resolved_build(
+        build,
+        build.compile(generation, idl, required_exports, include_tests),
+        format,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_resolved_build_with_limits(
+    build: &project::ResolvedBuild,
+    generation: u64,
+    idl: Option<&nexa::Idl>,
+    required_exports: &[String],
+    include_tests: bool,
+    verifier_limits: nexa::VerifierLimits,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledBuild> {
+    finish_resolved_build(
+        build,
+        build.compile_with_limits(
+            generation,
+            idl,
+            required_exports,
+            include_tests,
+            verifier_limits,
+        ),
+        format,
+    )
+}
+
+fn compile_resolved_build_with_session(
+    session: &mut nexa::PackageBuildSession,
+    build: &project::ResolvedBuild,
+    generation: u64,
+    idl: Option<&nexa::Idl>,
+    required_exports: &[String],
+    include_tests: bool,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledBuild> {
+    finish_resolved_build(
+        build,
+        build.compile_with_session(session, generation, idl, required_exports, include_tests),
+        format,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_resolved_build_with_session_and_limits(
+    session: &mut nexa::PackageBuildSession,
+    build: &project::ResolvedBuild,
+    generation: u64,
+    idl: Option<&nexa::Idl>,
+    required_exports: &[String],
+    include_tests: bool,
+    verifier_limits: nexa::VerifierLimits,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledBuild> {
+    finish_resolved_build(
+        build,
+        build.compile_with_session_and_limits(
+            session,
+            generation,
+            idl,
+            required_exports,
+            include_tests,
+            verifier_limits,
+        ),
+        format,
+    )
+}
+
+fn finish_resolved_build(
+    build: &project::ResolvedBuild,
+    result: Result<project::CompiledBuild, project::BuildCompileError>,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledBuild> {
+    match result {
+        Ok(compiled) => Ok(compiled),
+        Err(project::BuildCompileError::Cli(error)) => Err(error),
+        Err(project::BuildCompileError::Facade(nexa::PackageBuildError::AnalysisFailed(batch))) => {
+            let batch = diagnostics_for_build(build, &batch)?;
+            render_diagnostic_batch(&batch, format)?;
+            Err(CliError::rendered_diagnostic("Package analysis failed"))
+        }
+        Err(project::BuildCompileError::Facade(error)) => Err(classify_facade_build_error(error)),
+    }
+}
+
+fn compiled_product(
+    compiled: &project::CompiledBuild,
+) -> CliResult<&nexa::CompiledPackageArtifact> {
+    compiled.product().ok_or_else(|| {
+        CliError::internal("Application compilation did not return a product artifact")
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn build_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
     let mut source = None;
+    let mut project_path = None;
+    let mut contract = None;
     let mut output = None;
     let mut limits_file = None;
     let mut dump_source_map = false;
@@ -475,19 +784,31 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
     while index < arguments.len() {
         match arguments[index].as_str() {
             "-o" | "--output" => {
-                output = Some(PathBuf::from(
-                    arguments
-                        .get(index + 1)
-                        .ok_or("missing value for build output")?,
-                ));
+                output =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for build output"),
+                    )?));
+                index += 2;
+            }
+            "--project" => {
+                project_path =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--project`"),
+                    )?));
+                index += 2;
+            }
+            "--contract" => {
+                contract =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--contract`"),
+                    )?));
                 index += 2;
             }
             "--limits-file" => {
-                limits_file = Some(PathBuf::from(
-                    arguments
-                        .get(index + 1)
-                        .ok_or("missing value for `--limits-file`")?,
-                ));
+                limits_file =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--limits-file`"),
+                    )?));
                 index += 2;
             }
             "--dump-source-map" => {
@@ -495,34 +816,600 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), S
                 index += 1;
             }
             option if option.starts_with('-') => {
-                return Err(format!("unknown build option `{option}`"));
+                return Err(CliError::usage(format!("unknown build option `{option}`")));
             }
             path if source.is_none() => {
                 source = Some(PathBuf::from(path));
                 index += 1;
             }
-            path => return Err(format!("unexpected build argument `{path}`")),
+            path => {
+                return Err(CliError::usage(format!(
+                    "unexpected build argument `{path}`"
+                )));
+            }
         }
     }
-    let source = source.ok_or("usage: nexa build <source.nexa> [-o module.nxb]")?;
-    let verified = compile_source(&source)?;
-    let limits = load_verifier_limits(limits_file.as_deref())?;
-    verify_with_limits(verified.module().clone(), limits)?;
+    if project_path.is_some() && (source.is_some() || contract.is_some()) {
+        return Err(CliError::usage(
+            "`--project` cannot be combined with a source path or `--contract`",
+        ));
+    }
+    if output
+        .as_ref()
+        .is_some_and(|path| path.file_name().is_some_and(|name| name == "nexa.lock"))
+    {
+        return Err(CliError::usage(
+            "only `nexa lock` may write a file named `nexa.lock`",
+        ));
+    }
+    let limits = load_verifier_limits(limits_file.as_deref()).map_err(classify_legacy_error)?;
+
+    if let Some(project_path) = project_path {
+        let project = project::LoadedProject::load(&project_path)?;
+        let builds = project.resolved_builds(true)?;
+        let application_builds = builds
+            .iter()
+            .filter(|build| build.root.manifest.is_application())
+            .collect::<Vec<_>>();
+        if application_builds.len() > 1
+            && output
+                .as_ref()
+                .is_some_and(|path| path.extension().is_some_and(|extension| extension == "nxb"))
+        {
+            return Err(CliError::usage(
+                "project build output must be a directory when multiple Applications are present",
+            ));
+        }
+        let output_root = output.unwrap_or_else(|| project.root.join("target/nexa"));
+        if application_builds.len() != 1 || output_root.extension().is_none() {
+            std::fs::create_dir_all(&output_root).map_err(|error| {
+                CliError::internal(format!(
+                    "could not create build output {}: {error}",
+                    output_root.display()
+                ))
+            })?;
+        }
+        let mut outputs = Vec::new();
+        let mut session = nexa::PackageBuildSession::new();
+        for build in application_builds {
+            let compiled = compile_resolved_build_with_session_and_limits(
+                &mut session,
+                build,
+                1,
+                None,
+                &project.required_exports,
+                false,
+                limits,
+                format,
+            )?;
+            let artifact = compiled_product(&compiled)?;
+            let destination = if output_root.extension().is_some() {
+                output_root.clone()
+            } else {
+                output_root.join(format!("{}.nxb", build.package_id()))
+            };
+            write_bytecode(&destination, artifact)?;
+            outputs.push(destination);
+            if dump_source_map {
+                let mut rendered = String::new();
+                render_source_map(&mut rendered, artifact.module());
+                print!("{rendered}");
+            }
+        }
+        print_success(
+            format,
+            "build",
+            &json!({
+                "project": project.config_path,
+                "outputs": outputs,
+                "packages": outputs.len(),
+            }),
+            &format!("built {} project Applications", outputs.len()),
+        );
+        return Ok(());
+    }
+
+    let source = source
+        .ok_or_else(|| CliError::usage("usage: nexa build <source-or-package> [-o module.nxb]"))?;
+    if source.is_dir() {
+        let contract = contract
+            .ok_or_else(|| CliError::usage("Package build requires `--contract <app_api.nidl>`"))?;
+        let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", contract.display()))
+        })?;
+        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+        })?;
+        let host_contract = project::HostContractSnapshot::with_source(
+            &idl,
+            nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
+            Arc::<str>::from(contract_source),
+        )?;
+        let source_id = nexa_analysis::SourceId::new("contract-build")
+            .map_err(|error| CliError::internal(error.to_string()))?;
+        let build =
+            project::resolve_direct_package(&source, source_id, None, &host_contract, true)?;
+        if !build.root.manifest.is_application() {
+            return Err(CliError::usage(
+                "`nexa build` accepts only Application Packages",
+            ));
+        }
+        let compiled = compile_resolved_build_with_limits(
+            &build,
+            1,
+            None,
+            build.host_contract.required_exports.as_ref(),
+            false,
+            limits,
+            format,
+        )?;
+        let artifact = compiled_product(&compiled)?;
+        let output = output.unwrap_or_else(|| {
+            source.join(format!(
+                "{}.nxb",
+                build.package_id().as_str().replace('.', "-")
+            ))
+        });
+        write_bytecode(&output, artifact)?;
+        if dump_source_map {
+            let mut rendered = String::new();
+            render_source_map(&mut rendered, artifact.module());
+            print!("{rendered}");
+        }
+        print_success(
+            format,
+            "build",
+            &json!({
+                "package": source,
+                "packageId": build.package_id().as_str(),
+                "output": output,
+                "modules": compiled.module_count,
+                "buildFingerprint": compiled.identity.build_fingerprint,
+            }),
+            &format!(
+                "built Package {} -> {}",
+                build.package_id(),
+                output.display()
+            ),
+        );
+        return Ok(());
+    }
+    if contract.is_some() {
+        return Err(CliError::usage(
+            "`--contract` is accepted only for Package-directory builds",
+        ));
+    }
+    let source_text = std::fs::read_to_string(&source).map_err(|error| {
+        CliError::internal(format!("could not read {}: {error}", source.display()))
+    })?;
+    let build = project::virtual_snippet(&source_text, &source)?;
+    let compiled = compile_resolved_build_with_limits(
+        &build,
+        1,
+        None,
+        build.host_contract.required_exports.as_ref(),
+        false,
+        limits,
+        format,
+    )?;
+    let artifact = compiled_product(&compiled)?;
     let output = output.unwrap_or_else(|| source.with_extension("nxb"));
-    std::fs::write(&output, verified.module().encode())
-        .map_err(|error| format!("could not write {}: {error}", output.display()))?;
+    write_bytecode(&output, artifact)?;
     if dump_source_map {
         let mut rendered = String::new();
-        render_source_map(&mut rendered, verified.module());
+        render_source_map(&mut rendered, artifact.module());
         print!("{rendered}");
     }
     print_success(
         format,
         "build",
-        &json!({"source": source, "output": output}),
-        &format!("built {} -> {}", source.display(), output.display()),
+        &json!({
+            "source": source,
+            "packageId": "nexa.snippet",
+            "module": "main",
+            "output": output,
+            "buildFingerprint": compiled.identity.build_fingerprint,
+        }),
+        &format!(
+            "built {} as nexa.snippet::main -> {}",
+            source.display(),
+            output.display()
+        ),
     );
     Ok(())
+}
+
+fn write_bytecode(path: &Path, artifact: &nexa::CompiledPackageArtifact) -> CliResult<()> {
+    if path.file_name().is_some_and(|name| name == "nexa.lock") {
+        return Err(CliError::usage(
+            "only `nexa lock` may write a file named `nexa.lock`",
+        ));
+    }
+    std::fs::write(path, artifact.encode_module())
+        .map_err(|error| CliError::internal(format!("could not write {}: {error}", path.display())))
+}
+
+fn lock_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
+    let builds = match arguments {
+        [flag, path] if flag == "--project" => {
+            let project = project::LoadedProject::load(Path::new(path))?;
+            let mut builds = Vec::new();
+            for package in project.package_directories()? {
+                if package.directory.join("package.toml").is_file() {
+                    builds.push(project.resolve_package_for_lock(&package)?);
+                }
+            }
+            builds
+        }
+        [directory] => {
+            let source_id = nexa_analysis::SourceId::new("cli-lock")
+                .map_err(|error| CliError::internal(error.to_string()))?;
+            vec![project::resolve_direct_package_for_lock(
+                Path::new(directory),
+                source_id,
+            )?]
+        }
+        _ => {
+            return Err(CliError::usage(
+                "usage: nexa lock <package-directory> | nexa lock --project <nexa.dev.toml>",
+            ));
+        }
+    };
+
+    let project_mode = matches!(arguments, [flag, _] if flag == "--project");
+    let mut written = Vec::new();
+    for build in builds {
+        if project_mode && build.root.manifest.dependencies.is_empty() {
+            continue;
+        }
+        let lock_path = build.root.directory.join("nexa.lock");
+        std::fs::write(&lock_path, build.canonical_lock.canonical_bytes()).map_err(|error| {
+            CliError::internal(format!("could not write {}: {error}", lock_path.display()))
+        })?;
+        written.push(json!({
+            "packageId": build.package_id().as_str(),
+            "path": lock_path,
+            "packages": build.dependency_graph.packages.len(),
+            "edges": build.dependency_graph.edges.len(),
+        }));
+    }
+    let written_count = written.len();
+    print_success(
+        format,
+        "lock",
+        &json!({
+            "locks": written,
+            "written": written_count,
+        }),
+        &format!("wrote {written_count} canonical nexa.lock file(s)"),
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn test_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
+    let mut project_path = None;
+    let mut directory = None;
+    let mut contract = None;
+    let mut fuel = 1_000_000_u64;
+    let mut index = 0;
+    while index < arguments.len() {
+        match arguments[index].as_str() {
+            "--project" => {
+                project_path =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--project`"),
+                    )?));
+                index += 2;
+            }
+            "--contract" => {
+                contract =
+                    Some(PathBuf::from(arguments.get(index + 1).ok_or_else(
+                        || CliError::usage("missing value for `--contract`"),
+                    )?));
+                index += 2;
+            }
+            "--fuel" => {
+                let parsed = arguments
+                    .get(index + 1)
+                    .ok_or_else(|| CliError::usage("missing value for `--fuel`"))?
+                    .parse()
+                    .map_err(|_| CliError::usage("`--fuel` must be an unsigned integer"))?;
+                if parsed == 0 {
+                    return Err(CliError::usage("`--fuel` must be greater than zero"));
+                }
+                fuel = parsed;
+                index += 2;
+            }
+            option if option.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown test option `{option}`")));
+            }
+            path if directory.is_none() => {
+                directory = Some(PathBuf::from(path));
+                index += 1;
+            }
+            value => {
+                return Err(CliError::usage(format!(
+                    "unexpected test argument `{value}`"
+                )));
+            }
+        }
+    }
+    if project_path.is_some() == directory.is_some() {
+        return Err(CliError::usage(
+            "usage: nexa test <package-directory> --contract <app_api.nidl> | \
+             nexa test --project <nexa.dev.toml>",
+        ));
+    }
+    if project_path.is_some() && contract.is_some() {
+        return Err(CliError::usage(
+            "`--contract` cannot be combined with `--project`",
+        ));
+    }
+
+    let mut results = Vec::new();
+    if let Some(project_path) = project_path {
+        let project = project::LoadedProject::load(&project_path)?;
+        let mut session = nexa::PackageBuildSession::new();
+        for build in project.resolved_builds(true)? {
+            let compiled = compile_resolved_build_with_session(
+                &mut session,
+                &build,
+                1,
+                None,
+                &project.required_exports,
+                true,
+                format,
+            )?;
+            results.extend(run_compiled_tests(&compiled, fuel)?);
+        }
+    } else {
+        let directory = directory.expect("exclusive target was checked");
+        let contract = contract
+            .ok_or_else(|| CliError::usage("Package test requires `--contract <app_api.nidl>`"))?;
+        let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", contract.display()))
+        })?;
+        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+            CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
+        })?;
+        let host_contract = project::HostContractSnapshot::with_source(
+            &idl,
+            nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
+            Arc::<str>::from(contract_source),
+        )?;
+        let source_id = nexa_analysis::SourceId::new("contract-test")
+            .map_err(|error| CliError::internal(error.to_string()))?;
+        let build =
+            project::resolve_direct_package(&directory, source_id, None, &host_contract, true)?;
+        let compiled = compile_resolved_build(
+            &build,
+            1,
+            None,
+            build.host_contract.required_exports.as_ref(),
+            true,
+            format,
+        )?;
+        results.extend(run_compiled_tests(&compiled, fuel)?);
+    }
+    results.sort_by(|left, right| {
+        (
+            left.package.as_str(),
+            left.module.as_str(),
+            left.name.as_str(),
+            &left.span,
+        )
+            .cmp(&(
+                right.package.as_str(),
+                right.module.as_str(),
+                right.name.as_str(),
+                &right.span,
+            ))
+    });
+    let passed = results
+        .iter()
+        .filter(|result| result.status == nexa::TestStatus::Pass)
+        .count();
+    let failed = results
+        .iter()
+        .filter(|result| result.status == nexa::TestStatus::Fail)
+        .count();
+    let errors = results
+        .iter()
+        .filter(|result| result.status == nexa::TestStatus::Error)
+        .count();
+    render_test_results(&results, passed, failed, errors, format)?;
+    if failed != 0 || errors != 0 {
+        Err(CliError::rendered_diagnostic(format!(
+            "{failed} Package test(s) failed and {errors} errored"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn run_compiled_tests(
+    compiled: &project::CompiledBuild,
+    fuel: u64,
+) -> CliResult<Vec<nexa::TestResult>> {
+    let artifact = compiled.tests().ok_or_else(|| {
+        CliError::internal("Package test compilation did not return a test artifact")
+    })?;
+    artifact
+        .run(nexa::PackageTestOptions { fuel_limit: fuel })
+        .map(|run| run.results)
+        .map_err(|error| match error {
+            nexa::PackageTestRunError::InvalidOptions(message) => CliError::usage(message),
+            other => CliError::diagnostic(format_package_test_error(&other)),
+        })
+}
+
+fn format_package_test_error(error: &nexa::PackageTestRunError) -> String {
+    match error {
+        nexa::PackageTestRunError::InvalidDeclarations(declarations) => declarations
+            .iter()
+            .map(|declaration| {
+                format!(
+                    "{}::{}::{} at {}: {}",
+                    declaration.package,
+                    declaration.module,
+                    declaration.name,
+                    declaration.span,
+                    declaration.reason
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        nexa::PackageTestRunError::Ineligible(violations) => violations
+            .iter()
+            .map(|violation| {
+                let path = violation
+                    .path
+                    .iter()
+                    .map(|function| {
+                        format!(
+                            "{}::{}::{} at {}",
+                            function.package, function.module, function.name, function.span
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" -> ");
+                format!(
+                    "{}::{}::{} at {} reaches forbidden {:?} effect in \
+                     {}::{}::{} at {}; call path: {path}",
+                    violation.test.package,
+                    violation.test.module,
+                    violation.test.name,
+                    violation.test.span,
+                    violation.reason,
+                    violation.function.package,
+                    violation.function.module,
+                    violation.function.name,
+                    violation.function.span,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other => other.to_string(),
+    }
+}
+
+fn render_test_results(
+    results: &[nexa::TestResult],
+    passed: usize,
+    failed: usize,
+    errors: usize,
+    format: DiagnosticFormat,
+) -> CliResult<()> {
+    let values = results.iter().map(test_result_json).collect::<Vec<_>>();
+    match format {
+        DiagnosticFormat::Human => {
+            for result in results {
+                println!(
+                    "{} {} at {} (instructions={}, fuel={})",
+                    result.status,
+                    result.qualified_name(),
+                    result.span,
+                    result.instructions,
+                    result.fuel
+                );
+                if let Some(error) = &result.error {
+                    println!("  {error:?}");
+                }
+                for frame in &result.stack {
+                    println!(
+                        "  at {}::{}::{}{}",
+                        frame.package,
+                        frame.module,
+                        frame.function,
+                        frame
+                            .span
+                            .as_ref()
+                            .map_or_else(String::new, |span| format!(" ({span})"))
+                    );
+                }
+            }
+            println!(
+                "test result: {}. {} passed; {} failed; {} errors",
+                if failed == 0 && errors == 0 {
+                    "ok"
+                } else {
+                    "FAILED"
+                },
+                passed,
+                failed,
+                errors
+            );
+        }
+        DiagnosticFormat::Json => println!(
+            "{}",
+            serde_json::to_string(&json!({
+                "schema": 1,
+                "command": "test",
+                "status": if failed == 0 && errors == 0 { "ok" } else { "failed" },
+                "results": values,
+                "summary": {
+                    "total": results.len(),
+                    "passed": passed,
+                    "failed": failed,
+                    "errors": errors,
+                },
+            }))
+            .map_err(|error| CliError::internal(error.to_string()))?
+        ),
+        DiagnosticFormat::Ndjson => {
+            for value in values {
+                println!(
+                    "{}",
+                    serde_json::to_string(&json!({
+                        "schema": 1,
+                        "type": "test-result",
+                        "result": value,
+                    }))
+                    .map_err(|error| CliError::internal(error.to_string()))?
+                );
+            }
+            println!(
+                "{}",
+                serde_json::to_string(&json!({
+                    "schema": 1,
+                    "type": "test-summary",
+                    "total": results.len(),
+                    "passed": passed,
+                    "failed": failed,
+                    "errors": errors,
+                    "status": if failed == 0 && errors == 0 { "ok" } else { "failed" },
+                }))
+                .map_err(|error| CliError::internal(error.to_string()))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn test_result_json(result: &nexa::TestResult) -> Value {
+    json!({
+        "package": result.package,
+        "module": result.module,
+        "name": result.name,
+        "qualifiedName": result.qualified_name(),
+        "source": result.span.source,
+        "span": {"start": result.span.start, "end": result.span.end},
+        "status": result.status.as_str(),
+        "error": result.error.as_ref().map(|error| format!("{error:?}")),
+        "stack": result.stack.iter().map(|frame| json!({
+            "package": frame.package,
+            "module": frame.module,
+            "function": frame.function,
+            "source": frame.span.as_ref().map(|span| span.source.clone()),
+            "span": frame.span.as_ref().map(|span| json!({
+                "start": span.start,
+                "end": span.end,
+            })),
+        })).collect::<Vec<_>>(),
+        "instructions": result.instructions,
+        "fuel": result.fuel,
+    })
 }
 
 fn verify_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), String> {
@@ -537,7 +1424,7 @@ fn verify_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), 
     Ok(())
 }
 
-fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> Result<(), String> {
+fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> CliResult<()> {
     let mut input = None;
     let mut limits_file = None;
     let mut trace_output = None;
@@ -551,36 +1438,43 @@ fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> R
             "--limits-file" | "--trace-output" | "--fuel" | "--function" | "--arg-i32" => {
                 let value = arguments
                     .get(index + 1)
-                    .ok_or_else(|| format!("missing value for `{option}`"))?;
+                    .ok_or_else(|| CliError::usage(format!("missing value for `{option}`")))?;
                 match option {
                     "--limits-file" => limits_file = Some(PathBuf::from(value)),
                     "--trace-output" => trace_output = Some(PathBuf::from(value)),
-                    "--fuel" => fuel = parse_limit(option, value)?,
-                    "--function" => function = parse_limit(option, value)?,
+                    "--fuel" => {
+                        fuel = parse_limit(option, value).map_err(CliError::usage)?;
+                    }
+                    "--function" => {
+                        function = parse_limit(option, value).map_err(CliError::usage)?;
+                    }
                     "--arg-i32" => {
-                        runtime_arguments
-                            .push(nexa_runtime::RuntimeValue::I32(parse_limit(option, value)?));
+                        runtime_arguments.push(nexa::prelude::RuntimeValue::I32(
+                            parse_limit(option, value).map_err(CliError::usage)?,
+                        ));
                     }
                     _ => unreachable!(),
                 }
                 index += 2;
             }
             option if option.starts_with('-') => {
-                return Err(format!("unknown run option `{option}`"));
+                return Err(CliError::usage(format!("unknown run option `{option}`")));
             }
             path if input.is_none() => {
                 input = Some(PathBuf::from(path));
                 index += 1;
             }
-            path => return Err(format!("unexpected run argument `{path}`")),
+            path => {
+                return Err(CliError::usage(format!("unexpected run argument `{path}`")));
+            }
         }
     }
-    let input = input.ok_or("usage: nexa run|trace <source.nexa|module.nxb>")?;
-    let limits = load_verifier_limits(limits_file.as_deref())?;
-    let verified = load_verified(&input, limits)?;
-    let outcome =
-        nexa_runtime::CheckedInterpreter::run(&verified, function, &runtime_arguments, fuel)
-            .map_err(|error| format!("execution failed: {error}"))?;
+    let input =
+        input.ok_or_else(|| CliError::usage("usage: nexa run|trace <source.nexa|module.nxb>"))?;
+    let limits = load_verifier_limits(limits_file.as_deref()).map_err(classify_legacy_error)?;
+    let verified = load_verified(&input, limits, format)?;
+    let outcome = nexa::CheckedInterpreter::run(&verified, function, &runtime_arguments, fuel)
+        .map_err(|error| CliError::diagnostic(format!("execution failed: {error}")))?;
     let record = json!({
         "input": input,
         "function": function,
@@ -590,10 +1484,11 @@ fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> R
     });
     if trace {
         let rendered = serde_json::to_string_pretty(&record)
-            .map_err(|error| format!("could not serialize trace: {error}"))?;
+            .map_err(|error| CliError::internal(format!("could not serialize trace: {error}")))?;
         if let Some(path) = trace_output {
-            std::fs::write(&path, rendered)
-                .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+            std::fs::write(&path, rendered).map_err(|error| {
+                CliError::internal(format!("could not write {}: {error}", path.display()))
+            })?;
         } else {
             println!("{rendered}");
         }
@@ -676,7 +1571,7 @@ fn model_replay(path: &Path) -> Result<(), String> {
 fn parse_input_and_limits(
     arguments: &[String],
     command: &str,
-) -> Result<(PathBuf, nexa_verifier::VerifierLimits), String> {
+) -> Result<(PathBuf, nexa::VerifierLimits), String> {
     let mut path = None;
     let mut limits_file = None;
     let mut index = 0;
@@ -706,9 +1601,9 @@ fn parse_input_and_limits(
     ))
 }
 
-fn load_verifier_limits(path: Option<&Path>) -> Result<nexa_verifier::VerifierLimits, String> {
+fn load_verifier_limits(path: Option<&Path>) -> Result<nexa::VerifierLimits, String> {
     let Some(path) = path else {
-        return Ok(nexa_verifier::VerifierLimits::default());
+        return Ok(nexa::VerifierLimits::default());
     };
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
@@ -722,52 +1617,59 @@ fn load_verifier_limits(path: Option<&Path>) -> Result<nexa_verifier::VerifierLi
                 .ok_or_else(|| format!("limits field `{name}` must be a u32"))
         })
     };
-    let defaults = nexa_verifier::VerifierLimits::default();
-    Ok(nexa_verifier::VerifierLimits {
+    let defaults = nexa::VerifierLimits::default();
+    Ok(nexa::VerifierLimits {
         max_frame_bytes: number("max_frame_bytes", defaults.max_frame_bytes)?,
         max_immediate_cost: number("max_immediate_cost", defaults.max_immediate_cost)?,
         max_wcet_states: number("max_wcet_states", defaults.max_wcet_states)?,
     })
 }
 
-fn compile_source(path: &Path) -> Result<nexa_verifier::VerifiedModule, String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    nexa_compiler::compile(&source).map_err(|error| error.to_string())
-}
-
 fn load_verified(
     path: &Path,
-    limits: nexa_verifier::VerifierLimits,
-) -> Result<nexa_verifier::VerifiedModule, String> {
+    limits: nexa::VerifierLimits,
+    format: DiagnosticFormat,
+) -> CliResult<nexa::VerifiedModule> {
     if path.extension().is_some_and(|extension| extension == "nxb") {
-        let bytes = std::fs::read(path)
-            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-        let module = nexa_bytecode::Module::decode(&bytes)
-            .map_err(|error| format!("bytecode decode failed: {error}"))?;
-        verify_with_limits(module, limits)
+        let bytes = std::fs::read(path).map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", path.display()))
+        })?;
+        let module = nexa::decode_module(&bytes, nexa::DecodeLimits::default())
+            .map_err(|error| CliError::diagnostic(format!("bytecode decode failed: {error}")))?;
+        nexa::verify_module(module, limits)
+            .map_err(|error| CliError::diagnostic(format!("bytecode verification failed: {error}")))
     } else {
-        let verified = compile_source(path)?;
-        verify_with_limits(verified.module().clone(), limits)
+        let source = std::fs::read_to_string(path).map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", path.display()))
+        })?;
+        let build = project::virtual_snippet(&source, path)?;
+        let compiled = compile_resolved_build_with_limits(
+            &build,
+            1,
+            None,
+            build.host_contract.required_exports.as_ref(),
+            false,
+            limits,
+            format,
+        )?;
+        let artifact = compiled_product(&compiled)?;
+        Ok(artifact.verified.clone())
     }
 }
 
 fn verify_with_limits(
-    module: nexa_bytecode::Module,
-    limits: nexa_verifier::VerifierLimits,
-) -> Result<nexa_verifier::VerifiedModule, String> {
-    nexa_verifier::verify(module, limits)
+    module: nexa::Module,
+    limits: nexa::VerifierLimits,
+) -> Result<nexa::VerifiedModule, String> {
+    nexa::verify_module(module, limits)
         .map_err(|error| format!("bytecode verification failed: {error}"))
 }
 
-fn verify_module_with_limits(
-    path: &Path,
-    limits: nexa_verifier::VerifierLimits,
-) -> Result<(), String> {
+fn verify_module_with_limits(path: &Path, limits: nexa::VerifierLimits) -> Result<(), String> {
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let module = nexa_bytecode::Module::decode(&bytes)
-        .map_err(|error| format!("bytecode decode failed: {error}"))?;
+    let module =
+        nexa::Module::decode(&bytes).map_err(|error| format!("bytecode decode failed: {error}"))?;
     verify_with_limits(module, limits)?;
     Ok(())
 }
@@ -802,7 +1704,7 @@ fn dump_module(arguments: &[String]) -> Result<(), String> {
         [path] => (None, false, Path::new(path)),
         [option, section, path] if option == "--section" => (
             Some(
-                nexa_bytecode::SectionKind::from_name(section)
+                nexa::SectionKind::from_name(section)
                     .ok_or_else(|| format!("unknown bytecode section `{section}`"))?,
             ),
             false,
@@ -819,8 +1721,8 @@ fn dump_module(arguments: &[String]) -> Result<(), String> {
     };
     let bytes = std::fs::read(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let module = nexa_bytecode::Module::decode(&bytes)
-        .map_err(|error| format!("bytecode decode failed: {error}"))?;
+    let module =
+        nexa::Module::decode(&bytes).map_err(|error| format!("bytecode decode failed: {error}"))?;
     let rendered = render_module_dump(&bytes, &module, section, source_map_only)?;
     print!("{rendered}");
     Ok(())
@@ -829,17 +1731,14 @@ fn dump_module(arguments: &[String]) -> Result<(), String> {
 #[allow(clippy::too_many_lines)]
 fn render_module_dump(
     bytes: &[u8],
-    module: &nexa_bytecode::Module,
-    selected: Option<nexa_bytecode::SectionKind>,
+    module: &nexa::Module,
+    selected: Option<nexa::SectionKind>,
     source_map_only: bool,
 ) -> Result<String, String> {
     use std::fmt::Write as _;
 
-    let directory = nexa_bytecode::Module::inspect_section_directory(
-        bytes,
-        nexa_bytecode::DecodeLimits::default(),
-    )
-    .map_err(|error| format!("bytecode directory inspection failed: {error}"))?;
+    let directory = nexa::Module::inspect_section_directory(bytes, nexa::DecodeLimits::default())
+        .map_err(|error| format!("bytecode directory inspection failed: {error}"))?;
     let mut output = String::new();
     if source_map_only {
         render_source_map(&mut output, module);
@@ -848,15 +1747,15 @@ fn render_module_dump(
     writeln!(
         output,
         "header magic=NXBC version={} sections={}",
-        nexa_bytecode::BYTECODE_VERSION,
+        nexa::BYTECODE_VERSION,
         directory.len()
     )
     .expect("String writes do not fail");
     for entry in &directory {
-        let name = nexa_bytecode::SectionKind::ALL
+        let name = nexa::SectionKind::ALL
             .into_iter()
             .find(|kind| *kind as u16 == entry.kind)
-            .map_or("unknown", nexa_bytecode::SectionKind::name);
+            .map_or("unknown", nexa::SectionKind::name);
         if selected.is_none_or(|kind| kind as u16 == entry.kind) {
             writeln!(
                 output,
@@ -867,12 +1766,12 @@ fn render_module_dump(
         }
     }
     let render = |kind| selected.is_none_or(|selected| selected == kind);
-    if render(nexa_bytecode::SectionKind::Strings) {
+    if render(nexa::SectionKind::Strings) {
         for (index, string) in module.strings.iter().enumerate() {
             writeln!(output, "string {index} {string:?}").expect("String writes do not fail");
         }
     }
-    if render(nexa_bytecode::SectionKind::Types) {
+    if render(nexa::SectionKind::Types) {
         let mut handles = module.state_handle_types.iter().collect::<Vec<_>>();
         handles.sort_by_key(|handle| handle.type_id);
         for handle in handles {
@@ -924,7 +1823,7 @@ fn render_module_dump(
             .expect("String writes do not fail");
         }
     }
-    if render(nexa_bytecode::SectionKind::Functions) {
+    if render(nexa::SectionKind::Functions) {
         for (index, function) in module.functions.iter().enumerate() {
             writeln!(
                 output,
@@ -934,7 +1833,7 @@ fn render_module_dump(
             .expect("String writes do not fail");
         }
     }
-    if render(nexa_bytecode::SectionKind::Code) {
+    if render(nexa::SectionKind::Code) {
         for (function, body) in module.functions.iter().enumerate() {
             writeln!(output, "code function={function}").expect("String writes do not fail");
             for (pc, instruction) in body.code.iter().enumerate() {
@@ -942,7 +1841,7 @@ fn render_module_dump(
             }
         }
     }
-    if render(nexa_bytecode::SectionKind::Enums) {
+    if render(nexa::SectionKind::Enums) {
         let mut enums = module.enum_types.iter().collect::<Vec<_>>();
         enums.sort_by_key(|enum_type| enum_type.type_id);
         for enum_type in enums {
@@ -960,7 +1859,7 @@ fn render_module_dump(
             }
         }
     }
-    if render(nexa_bytecode::SectionKind::Structs) {
+    if render(nexa::SectionKind::Structs) {
         let mut structs = module.struct_types.iter().collect::<Vec<_>>();
         structs.sort_by_key(|struct_type| struct_type.type_id);
         for struct_type in structs {
@@ -976,7 +1875,7 @@ fn render_module_dump(
             }
         }
     }
-    if render(nexa_bytecode::SectionKind::Classes) {
+    if render(nexa::SectionKind::Classes) {
         let mut classes = module.class_types.iter().collect::<Vec<_>>();
         classes.sort_by_key(|class_type| class_type.type_id);
         for class_type in classes {
@@ -992,7 +1891,7 @@ fn render_module_dump(
             }
         }
     }
-    if render(nexa_bytecode::SectionKind::StateSchemas) {
+    if render(nexa::SectionKind::StateSchemas) {
         let mut state_types = module.state_schema.types.iter().collect::<Vec<_>>();
         state_types.sort_by_key(|state_type| state_type.stable_id);
         for state_type in state_types {
@@ -1014,13 +1913,13 @@ fn render_module_dump(
             }
         }
     }
-    if render(nexa_bytecode::SectionKind::SourceMap) {
+    if render(nexa::SectionKind::SourceMap) {
         render_source_map(&mut output, module);
     }
     Ok(output)
 }
 
-fn render_source_map(output: &mut String, module: &nexa_bytecode::Module) {
+fn render_source_map(output: &mut String, module: &nexa::Module) {
     use std::fmt::Write as _;
 
     let mut entries = module.source_map.clone();
@@ -1145,8 +2044,8 @@ fn render_migrate_result(
         MigrateOutputFormat::Human => {
             let mut rendered = format!(
                 "migration check passed\n\
-             old schema: {:016x}\n\
-             new schema: {:016x}\n\
+             old schema fingerprint: {}\n\
+             new schema fingerprint: {}\n\
              migration entry: {}\n\
              migration hash: {:016x}\n\
              final state hash: {:016x}\n\
@@ -1160,8 +2059,8 @@ fn render_migrate_result(
              peak state bytes/GC roots: {}/{}\n\
              fuel: {}\n\
              call depth: {}\n",
-                result.old_schema_hash,
-                result.new_schema_hash,
+                result.old_schema_fingerprint,
+                result.new_schema_fingerprint,
                 result.migration_entry,
                 result.migration_hash,
                 result.final_state_hash,
@@ -1238,14 +2137,35 @@ where
         .map_err(|_| format!("invalid numeric value for `{option}`: `{value}`"))
 }
 
-fn compile_file(path: &Path) -> Result<(), String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let module = nexa_compiler::compile(&source).map_err(|error| error.to_string())?;
-    println!(
-        "compiled and verified {}: {} functions",
-        path.display(),
-        module.module().functions.len()
+fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
+    let source = std::fs::read_to_string(path).map_err(|error| {
+        CliError::internal(format!("could not read {}: {error}", path.display()))
+    })?;
+    let build = project::virtual_snippet(&source, path)?;
+    let compiled = compile_resolved_build(
+        &build,
+        1,
+        None,
+        build.host_contract.required_exports.as_ref(),
+        false,
+        format,
+    )?;
+    let artifact = compiled_product(&compiled)?;
+    print_success(
+        format,
+        "compile",
+        &json!({
+            "source": path,
+            "packageId": "nexa.snippet",
+            "module": "main",
+            "functions": artifact.module().functions.len(),
+            "buildFingerprint": compiled.identity.build_fingerprint,
+        }),
+        &format!(
+            "compiled and verified {} as nexa.snippet::main: {} functions",
+            path.display(),
+            artifact.module().functions.len()
+        ),
     );
     Ok(())
 }
@@ -1253,11 +2173,11 @@ fn compile_file(path: &Path) -> Result<(), String> {
 fn check_idl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let idl = nexa_idl::parse(&source).map_err(|error| error.to_string())?;
+    let idl = nexa::parse_idl(&source).map_err(|error| error.to_string())?;
     println!(
         "IDL {} is valid; exact hash {}",
         path.display(),
-        nexa_idl::exact_hash(&idl)
+        nexa::exact_idl_hash(&idl)
     );
     Ok(())
 }
@@ -1265,8 +2185,8 @@ fn check_idl(path: &Path) -> Result<(), String> {
 fn generate_idl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let idl = nexa_idl::parse(&source).map_err(|error| error.to_string())?;
-    print!("{}", nexa_idl::generate_rust(&idl));
+    let idl = nexa::parse_idl(&source).map_err(|error| error.to_string())?;
+    print!("{}", nexa::prelude::generate_rust_bindings(&idl));
     Ok(())
 }
 
@@ -1777,12 +2697,12 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use nexa_bytecode::{
+    use nexa::prelude::{
         ArrayType, BufferType, ClassType, FunctionBuilder, Instruction, MapType, ModuleBuilder,
-        SectionKind, Signature, SnapshotType, SourceMapEntry, StateField, StateHandleType,
-        StateSchema, StateType, StructField, StructType, ValueType,
+        SectionKind, Signature, SnapshotType, SourceMapEntry, SourceSpan, StateField,
+        StateHandleType, StateSchema, StateType, StructField, StructType, ValueType,
     };
-    use nexa_core::{FileId, SourceSpan, StableId};
+    use nexa::{FileId, StableId};
 
     use nexa_model::artifact::{
         MODEL_FAILURE_ARTIFACT_VERSION, ModelFailureArtifact, write_model_failure_artifact,
@@ -1914,10 +2834,19 @@ mod tests {
             ])
             .is_err()
         );
-        assert_eq!(super::exit_code_for("type mismatch"), 1);
-        assert_eq!(super::exit_code_for("usage: nexa check <path>"), 2);
-        assert_eq!(super::exit_code_for("could not read project"), 3);
-        assert_eq!(super::exit_code_for("worker terminated"), 3);
+        assert_eq!(super::CliError::diagnostic("type mismatch").exit_code(), 1);
+        assert_eq!(
+            super::CliError::usage("usage: nexa check <path>").exit_code(),
+            2
+        );
+        assert_eq!(
+            super::CliError::internal("could not read project").exit_code(),
+            3
+        );
+        assert_eq!(
+            super::CliError::internal("worker terminated").exit_code(),
+            3
+        );
     }
 
     #[test]
@@ -1989,7 +2918,7 @@ mod tests {
             full,
             render_module_dump(&bytes, &module, None, false).unwrap()
         );
-        assert!(full.contains("header magic=NXBC version=4 sections=16"));
+        assert!(full.contains("header magic=NXBC version=5 sections=16"));
         assert!(full.contains("000000 LoadI32"));
         assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(full.contains("struct "));

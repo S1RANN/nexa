@@ -1,0 +1,8 @@
+module main;
+
+import left.shared as shared;
+import right.shared as shared;
+
+pub fn entry() -> i32 {
+    return shared.value();
+}

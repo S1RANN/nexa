@@ -1,0 +1,14 @@
+schema = 2
+kind = "application"
+id = "example.language-scale"
+name = "Language Scale"
+version = "1.0.0"
+source_root = "src"
+entry = "language_scale.app"
+activation = "default-enabled"
+priority = 100
+handler_fuel = 20000
+capabilities = ["diagnostics.log"]
+
+[dependencies]
+scale_common = { path = "../snake-common" }

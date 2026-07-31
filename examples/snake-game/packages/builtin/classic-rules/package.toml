@@ -1,10 +1,11 @@
-schema = 1
+schema = 2
+kind = "application"
 id = "builtin.classic-rules"
 name = "Classic Rules"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "snake.classic_rules"
 priority = 400
 activation = "default-enabled"
-state_schema = "v1"
 handler_fuel = 20000
 capabilities = ["diagnostics.log"]

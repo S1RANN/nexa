@@ -1,0 +1,26 @@
+module snake.neon_skin;
+import host as snake;
+import std.collections as collections;
+
+fn empty() -> Array<snake.SnakeCommand> {
+    return [];
+}
+
+fn register() -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    collections.array_push(commands, snake.RegisterSkin("neon"));
+    return commands;
+}
+
+pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+    return match event {
+        snake.PackageEnabled(snapshot) => register(),
+        snake.GameStarted(snapshot) => empty(),
+        snake.GameTick(snapshot) => empty(),
+        snake.ScoreChanged(snapshot) => empty(),
+        snake.FoodSpawnRequested(snapshot) => empty(),
+        snake.FoodEaten(snapshot) => empty(),
+        snake.GameEnded(snapshot) => empty(),
+        snake.SettingsChanged(snapshot) => empty(),
+    };
+}

@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2601","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2601.nexa","expected":{"primary_text":"old.get<i32>(legacy)","secondary_count":0,"message_contains":"outside Migration","notes":[]}}
+{"version":1,"code":"NX2601","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2601.nexa","expected":{"primary_text":"old.get<i32>(legacy)","secondary_count":0,"message_contains":"Migration intrinsic outside Migration","notes":[]}}

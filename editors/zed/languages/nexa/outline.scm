@@ -25,3 +25,7 @@
   name: (_) @name
   parameters: (_) @context
   body: (_)) @item
+
+(const_declaration
+  keyword: (_) @context
+  name: (_) @name) @item

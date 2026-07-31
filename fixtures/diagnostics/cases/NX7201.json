@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7201","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"reload rolled back before commit","notes":[]}}
+{"version":1,"code":"NX7201","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"schema changes require a migration entry","notes":[]}}

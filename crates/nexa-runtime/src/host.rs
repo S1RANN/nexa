@@ -2007,9 +2007,16 @@ impl Default for MustCompletePolicy {
     }
 }
 
+/// Typed error value delivered by an asynchronous Host request.
+///
+/// `Code` remains available to low-level registries that deliberately use the compact numeric
+/// completion protocol. Generated NIDL bindings use `Value`, preserving the declared
+/// `Result<Success, Error>` error payload without narrowing nominal or aggregate values to a
+/// `u32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HostErrorPayload {
-    pub code: u32,
+pub enum HostErrorPayload {
+    Code(u32),
+    Value(HostPayload),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2039,8 +2046,10 @@ pub fn validate_host_completion(
     known_error_codes: &[u32],
 ) -> Result<(), HostCompletionProtocolError> {
     match completion {
-        HostCompletionResult::Error(error) if !known_error_codes.contains(&error.code) => {
-            Err(HostCompletionProtocolError::UnknownErrorCode(error.code))
+        HostCompletionResult::Error(HostErrorPayload::Code(code))
+            if !known_error_codes.contains(code) =>
+        {
+            Err(HostCompletionProtocolError::UnknownErrorCode(*code))
         }
         HostCompletionResult::Abandoned => Err(HostCompletionProtocolError::Abandoned),
         HostCompletionResult::Success(_)
@@ -3778,7 +3787,7 @@ pub fn fuzz_completion_ticket_terminal_race(data: &[u8]) {
         ticket_barrier.wait();
         match operation {
             0 => ticket.complete(HostPayload::I32(1)),
-            1 => ticket.fail(HostErrorPayload { code: 7 }),
+            1 => ticket.fail(HostErrorPayload::Code(7)),
             2 => ticket.cancelled(),
             _ => ticket.abandon(),
         }
@@ -3814,10 +3823,11 @@ pub fn fuzz_completion_ticket_terminal_race(data: &[u8]) {
 
 #[cfg(feature = "fuzzing")]
 pub fn fuzz_release_intrusive_list(data: &[u8]) {
+    const CAPACITY: usize = 16;
+
     if data.len() > 128 {
         return;
     }
-    const CAPACITY: usize = 16;
     let host = RuntimeHost::new(CAPACITY);
     let mut queue = host.release_queue(CAPACITY);
     let mut reservations = Vec::with_capacity(CAPACITY);
@@ -4175,7 +4185,7 @@ mod tests {
         );
         assert_eq!(releases.drain().count(), COUNT as usize);
         let mut pending = requests.create_for_module(3, 9, &mut releases).unwrap();
-        pending.ticket.fail(HostErrorPayload { code: 7 }).unwrap();
+        pending.ticket.fail(HostErrorPayload::Code(7)).unwrap();
         assert_eq!(
             pending.ticket.cancelled(),
             Err(HostRequestError::AlreadyCompleted)
@@ -4203,7 +4213,7 @@ mod tests {
         assert_eq!(requests.completion_accounting().reserved, 5);
 
         success.ticket.complete(HostPayload::I32(1)).unwrap();
-        failure.ticket.fail(HostErrorPayload { code: 42 }).unwrap();
+        failure.ticket.fail(HostErrorPayload::Code(42)).unwrap();
         cancelled.ticket.cancelled().unwrap();
         abandoned.ticket.abandon().unwrap();
         drop(dropped);

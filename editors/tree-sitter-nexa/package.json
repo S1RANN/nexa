@@ -1,20 +1,18 @@
 {
   "name": "tree-sitter-nexa",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "private": true,
-  "description": "Tree-sitter grammar for Nexa source and Nexa IDL.",
+  "description": "Tree-sitter grammar for Nexa source.",
   "license": "MIT OR Apache-2.0",
   "keywords": [
     "tree-sitter",
-    "nexa",
-    "nidl"
+    "nexa"
   ],
   "tree-sitter": [
     {
       "scope": "source.nexa",
       "file-types": [
-        "nexa",
-        "nidl"
+        "nexa"
       ],
       "highlights": "queries/highlights.scm"
     }

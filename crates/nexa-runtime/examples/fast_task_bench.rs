@@ -6,7 +6,7 @@ use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap,
     Signature, ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, RealmConfig,
     RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeValue,
@@ -17,7 +17,10 @@ use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 const DEFAULT_SAMPLES: usize = 1_000;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(11);
-const SCHEMA: StableId = StableId(12);
+
+fn schema() -> StateSchemaFingerprint {
+    nexa_bytecode::StateSchema::default().fingerprint()
+}
 
 #[derive(Clone)]
 struct Stats {
@@ -140,7 +143,7 @@ fn main() {
         Box::new(AddRegistry),
     )
     .unwrap();
-    let host_module = host_realm.load_module(host_module, HOST, SCHEMA).unwrap();
+    let host_module = host_realm.load_module(host_module, HOST, schema()).unwrap();
     let host_scope = host_realm.create_scope(None).unwrap();
     results.push(bench("nexa_host_call_opcode_immediate", samples, || {
         let task = host_realm
@@ -178,7 +181,7 @@ fn main() {
         )
         .unwrap();
         let module = realm
-            .load_module(async_module.clone(), HOST, SCHEMA)
+            .load_module(async_module.clone(), HOST, schema())
             .unwrap();
         let scope = realm.create_scope(None).unwrap();
         let task = call(&mut realm, module, scope, 1);
@@ -325,7 +328,7 @@ fn host_call_module() -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 2 });
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA);
+    module.metadata(HOST, schema());
     module.host_import(HostImport {
         stable_id: StableId::from_name("BenchHost::add"),
         parameters: vec![ValueType::I32, ValueType::I32],
@@ -361,7 +364,7 @@ fn async_host_call_module() -> VerifiedModule {
         })
         .emit(Instruction::Return { source: 2 });
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA);
+    module.metadata(HOST, schema());
     let async_enum = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
     let async_result = nexa_bytecode::AsyncResultType {
         result_type: async_enum.type_id,
@@ -421,7 +424,7 @@ fn build_module(
     }
     let mut module = ModuleBuilder::new();
     module
-        .metadata(HOST, SCHEMA)
+        .metadata(HOST, schema())
         .function(function.finish().unwrap());
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
@@ -453,7 +456,7 @@ fn nested_module() -> VerifiedModule {
     identity_function.emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
     module
-        .metadata(HOST, SCHEMA)
+        .metadata(HOST, schema())
         .function(caller.finish().unwrap());
     module.function(identity_function.finish().unwrap());
     verify(module.finish(), VerifierLimits::default()).unwrap()
@@ -492,7 +495,7 @@ fn reload_module() -> VerifiedModule {
         .emit(Instruction::ReturnVoid);
     let mut module = ModuleBuilder::new();
     module
-        .metadata(HOST, SCHEMA)
+        .metadata(HOST, schema())
         .function(migration.finish().unwrap());
     module.function(task.finish().unwrap());
     module.function(activation.finish().unwrap());
@@ -507,7 +510,7 @@ fn loaded(
     nexa_runtime::ScopeHandle,
 ) {
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
-    let module = realm.load_module(verified, HOST, SCHEMA).unwrap();
+    let module = realm.load_module(verified, HOST, schema()).unwrap();
     let scope = realm.create_scope(None).unwrap();
     (realm, module, scope)
 }
@@ -523,7 +526,7 @@ fn loaded_hosted(
     let host = RuntimeHost::new(1_024);
     let mut realm =
         RealmRuntime::hosted(RealmConfig::default(), host.clone(), Box::new(AddRegistry)).unwrap();
-    let module = realm.load_module(verified, HOST, SCHEMA).unwrap();
+    let module = realm.load_module(verified, HOST, schema()).unwrap();
     let scope = realm.create_scope(None).unwrap();
     (realm, module, scope, host)
 }

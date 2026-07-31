@@ -1,0 +1,6 @@
+interface InvalidHost {
+    enum State {
+        // NIDL comments must be rejected even where an identifier is valid.
+        Ready
+    }
+}

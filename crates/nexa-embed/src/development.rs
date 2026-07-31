@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use crate::artifact::{CandidateCompilation, compile_package_candidate};
 use crate::contract::ExportRequirement;
 use crate::{
-    EngineDiagnostic, EngineDiagnosticStage, PackageCandidate, PackageId, ReloadReportSummary,
-    SourceHash, SourceId,
+    CandidateIdentity, EngineDiagnostic, EngineDiagnosticStage, PackageId, ReloadReportSummary,
+    SourceId,
 };
+
+pub(crate) type SharedPackageBuildSession = Arc<Mutex<nexa::PackageBuildSession>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DevelopmentConfig {
@@ -58,9 +60,7 @@ pub enum DevelopmentState {
 
 #[derive(Clone, Debug)]
 pub struct DevelopmentEventData {
-    pub package_id: PackageId,
-    pub candidate_generation: u64,
-    pub source_hash: SourceHash,
+    pub identity: CandidateIdentity,
     pub diagnostic: Option<EngineDiagnostic>,
     pub reload: Option<ReloadReportSummary>,
     pub queue_duration: Option<Duration>,
@@ -147,10 +147,9 @@ pub enum CandidateTerminalKind {
 
 #[derive(Clone, Debug)]
 pub struct CandidateTerminalData {
-    pub package_id: PackageId,
     pub source_id: SourceId,
-    pub generation: u64,
-    pub source_hash: SourceHash,
+    pub identity: CandidateIdentity,
+    pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
     pub queue_duration: Duration,
     pub work_duration: Duration,
 }
@@ -160,18 +159,20 @@ pub struct CandidateTerminalData {
 pub enum CandidateTerminal {
     Compiled {
         data: CandidateTerminalData,
-        candidate: PackageCandidate,
+        build_input: Arc<nexa_analysis::ResolvedBuildInput>,
         compilation: CandidateCompilation,
     },
     CompileFailed {
         data: CandidateTerminalData,
         diagnostic: EngineDiagnostic,
+        additional_diagnostics: Vec<EngineDiagnostic>,
         compile_duration: Duration,
         verify_duration: Duration,
     },
     VerifyFailed {
         data: CandidateTerminalData,
         diagnostic: EngineDiagnostic,
+        additional_diagnostics: Vec<EngineDiagnostic>,
         compile_duration: Duration,
         verify_duration: Duration,
     },
@@ -220,10 +221,8 @@ impl CandidateTerminal {
 #[derive(Clone, Debug)]
 pub enum WorkerEvent {
     CompileStarted {
-        package_id: PackageId,
         source_id: SourceId,
-        generation: u64,
-        source_hash: SourceHash,
+        identity: CandidateIdentity,
         queue_duration: Duration,
     },
 }
@@ -242,21 +241,21 @@ pub struct WorkerInspection {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PackageDevelopment {
     pub state: DevelopmentState,
-    pub desired_hash: Option<SourceHash>,
-    pub observed_hash: Option<SourceHash>,
+    pub desired_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
+    pub observed_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     pub unqueued_generation: Option<CandidateTerminalData>,
-    pub stable_hash: Option<SourceHash>,
-    pub queued_hash: Option<SourceHash>,
+    pub stable_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
+    pub queued_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     pub queued_generation: Option<u64>,
-    pub in_flight_hash: Option<SourceHash>,
+    pub in_flight_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     pub in_flight_generation: Option<u64>,
-    pub terminal_hash: Option<SourceHash>,
-    pub active_hash: Option<SourceHash>,
+    pub terminal_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
+    pub active_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     pub stable_scans: u8,
     pub latest_generation: u64,
     pub terminal_count: u64,
     pub duplicate_terminal_count: u64,
-    pub desired_hash_mismatch_rejection_count: u64,
+    pub desired_build_fingerprint_mismatch_rejection_count: u64,
     pub terminal_generations: BTreeMap<u64, CandidateTerminalKind>,
     pub change_observed_at: Option<Instant>,
     pub last_change_to_stable_duration: Duration,
@@ -267,7 +266,7 @@ pub(crate) struct PackageDevelopment {
     pub last_compile_duration: Option<Duration>,
     pub last_reload_duration: Option<Duration>,
     pub last_discovery_duration: Duration,
-    pub last_source_hash_duration: Duration,
+    pub last_build_fingerprint_duration: Duration,
     pub last_queue_duration: Duration,
     pub last_verify_duration: Duration,
     pub last_migration_duration: Duration,
@@ -277,59 +276,61 @@ pub(crate) struct PackageDevelopment {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReadyCandidate {
-    pub candidate: PackageCandidate,
+    pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
     pub compilation: CandidateCompilation,
     pub terminal_data: CandidateTerminalData,
 }
 
 #[derive(Clone)]
 pub struct CompileJob {
-    pub package_id: PackageId,
     pub source_id: SourceId,
-    pub generation: u64,
-    pub source_hash: SourceHash,
-    pub candidate: PackageCandidate,
-    pub idl: nexa_idl::Idl,
+    pub identity: CandidateIdentity,
+    pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
+    pub idl: nexa::Idl,
     pub required_exports: Vec<ExportRequirement>,
+    host_contract_source_identity: nexa::SourceIdentity,
+    host_contract_source: Arc<str>,
     queued_at: Instant,
 }
 
 impl CompileJob {
     pub(crate) fn new(
-        package_id: PackageId,
         source_id: SourceId,
-        generation: u64,
-        source_hash: SourceHash,
-        candidate: PackageCandidate,
-        idl: nexa_idl::Idl,
+        identity: CandidateIdentity,
+        build_input: Arc<nexa_analysis::ResolvedBuildInput>,
+        idl: nexa::Idl,
         required_exports: Vec<ExportRequirement>,
+        host_contract_source_identity: nexa::SourceIdentity,
+        host_contract_source: Arc<str>,
     ) -> Self {
         Self {
-            package_id,
             source_id,
-            generation,
-            source_hash,
-            candidate,
+            identity,
+            build_input,
             idl,
             required_exports,
+            host_contract_source_identity,
+            host_contract_source,
             queued_at: Instant::now(),
         }
     }
 
     fn from_request(request: DevelopmentCompileRequest) -> Self {
-        let source_hash = SourceHash(nexa_core::StableId::from_parts(&[
-            &request.candidate.manifest_source,
-            "\0",
-            &request.candidate.entry_source,
-        ]));
+        let (host_contract_source_identity, host_contract_source) = {
+            let contract = nexa::HostContractInput::canonical(&request.idl);
+            (
+                contract.source().identity().clone(),
+                Arc::clone(contract.source().text()),
+            )
+        };
         Self::new(
-            request.package_id,
             request.source_id,
-            request.generation,
-            source_hash,
-            request.candidate,
+            request.identity,
+            request.build_input,
             request.idl,
             request.required_exports,
+            host_contract_source_identity,
+            host_contract_source,
         )
     }
 
@@ -339,10 +340,9 @@ impl CompileJob {
         work_duration: Duration,
     ) -> CandidateTerminalData {
         CandidateTerminalData {
-            package_id: self.package_id.clone(),
             source_id: self.source_id.clone(),
-            generation: self.generation,
-            source_hash: self.source_hash,
+            identity: self.identity.clone(),
+            build_input: Arc::clone(&self.build_input),
             queue_duration,
             work_duration,
         }
@@ -396,6 +396,7 @@ enum InFlightDisposition {
     Active,
     Superseded,
     Cancelled(CandidateCancellation),
+    Terminalized,
 }
 
 impl InFlightDisposition {
@@ -406,7 +407,18 @@ impl InFlightDisposition {
     }
 
     fn cancel(&mut self, reason: CandidateCancellation) {
-        *self = Self::Cancelled(reason);
+        if !matches!(self, Self::Terminalized) {
+            *self = Self::Cancelled(reason);
+        }
+    }
+
+    fn terminalize(&mut self) -> bool {
+        if matches!(self, Self::Terminalized) {
+            false
+        } else {
+            *self = Self::Terminalized;
+            true
+        }
     }
 }
 
@@ -427,6 +439,7 @@ struct WorkerState {
 
 struct WorkerShared {
     state: Mutex<WorkerState>,
+    build_session: SharedPackageBuildSession,
     job_available: Condvar,
     result_space_available: Condvar,
     queue_capacity: usize,
@@ -576,11 +589,10 @@ pub struct DevelopmentCompiler {
 
 #[derive(Clone)]
 pub struct DevelopmentCompileRequest {
-    pub package_id: PackageId,
     pub source_id: SourceId,
-    pub generation: u64,
-    pub candidate: PackageCandidate,
-    pub idl: nexa_idl::Idl,
+    pub identity: CandidateIdentity,
+    pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
+    pub idl: nexa::Idl,
     pub required_exports: Vec<ExportRequirement>,
 }
 
@@ -638,6 +650,17 @@ impl DevelopmentCompiler {
 impl DevelopmentWorker {
     #[must_use]
     pub fn start(config: &DevelopmentConfig) -> Option<Self> {
+        Self::start_with_session(
+            config,
+            Arc::new(Mutex::new(nexa::PackageBuildSession::new())),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn start_with_session(
+        config: &DevelopmentConfig,
+        build_session: SharedPackageBuildSession,
+    ) -> Option<Self> {
         if !config.enabled {
             return None;
         }
@@ -656,6 +679,7 @@ impl DevelopmentWorker {
                 compiled_superseded_count: 0,
                 cancelled_count: 0,
             }),
+            build_session,
             job_available: Condvar::new(),
             result_space_available: Condvar::new(),
             queue_capacity: config.compile_queue_capacity.max(1),
@@ -689,11 +713,11 @@ impl DevelopmentWorker {
         if state.stopping {
             return EnqueueOutcome::Stopping { job };
         }
-        let package_id = job.package_id.clone();
+        let package_id = job.identity.package_id.clone();
         let mut completed_superseded = 0_u64;
         for terminal in &mut state.results {
-            if terminal.data().package_id == package_id
-                && terminal.data().generation < job.generation
+            if terminal.data().identity.package_id == package_id
+                && terminal.data().identity.generation < job.identity.generation
                 && matches!(
                     terminal,
                     CandidateTerminal::Compiled { .. }
@@ -712,7 +736,7 @@ impl DevelopmentWorker {
         if let Some(old) = state.pending_by_package.get_mut(&package_id) {
             let old = std::mem::replace(old, job);
             state.pending_superseded_count = state.pending_superseded_count.saturating_add(1);
-            let superseded_generation = old.generation;
+            let superseded_generation = old.identity.generation;
             let terminal = CandidateTerminal::SupersededBeforeCompile(
                 old.terminal_data(old.queued_at.elapsed(), Duration::ZERO),
             );
@@ -751,27 +775,46 @@ impl DevelopmentWorker {
                 job.terminal_data(job.queued_at.elapsed(), Duration::ZERO),
             ));
         }
-        if let Some(in_flight) = state.in_flight.as_mut()
-            && in_flight.job.package_id == *package_id
-        {
-            in_flight.disposition.cancel(reason);
+        let in_flight_terminal = state.in_flight.as_mut().and_then(|in_flight| {
+            (in_flight.job.identity.package_id == *package_id
+                && in_flight.disposition.terminalize())
+            .then(|| {
+                cancelled_terminal(
+                    reason,
+                    in_flight
+                        .job
+                        .terminal_data(in_flight.queue_duration, Duration::ZERO),
+                )
+            })
+        });
+        if let Some(terminal) = in_flight_terminal {
+            state.cancelled_count = state.cancelled_count.saturating_add(1);
+            terminals.push(terminal);
         }
         let mut converted = 0_u64;
-        for terminal in &mut state.results {
-            if terminal.data().package_id == *package_id {
+        let completed = std::mem::take(&mut state.results);
+        state.result_count = 0;
+        for terminal in completed {
+            if terminal.data().identity.package_id == *package_id {
                 let data = terminal.data().clone();
-                *terminal = cancelled_terminal(reason, data);
+                terminals.push(cancelled_terminal(reason, data));
                 converted = converted.saturating_add(1);
+            } else {
+                state.results.push_back(terminal);
+                state.result_count = state.result_count.saturating_add(1);
             }
         }
         state.cancelled_count = state.cancelled_count.saturating_add(converted);
+        if !terminals.is_empty() {
+            self.shared.result_space_available.notify_all();
+        }
         terminals
     }
 
     pub fn supersede_package_except(
         &self,
         package_id: &PackageId,
-        desired_hash: Option<SourceHash>,
+        desired_build_fingerprint: Option<nexa_analysis::BuildFingerprint>,
     ) -> Vec<CandidateTerminal> {
         let mut state = self
             .shared
@@ -782,7 +825,7 @@ impl DevelopmentWorker {
         if state
             .pending_by_package
             .get(package_id)
-            .is_some_and(|job| Some(job.source_hash) != desired_hash)
+            .is_some_and(|job| Some(job.identity.build_fingerprint) != desired_build_fingerprint)
         {
             let job = state
                 .pending_by_package
@@ -793,15 +836,15 @@ impl DevelopmentWorker {
             terminals.push(job.supersede_before_compile());
         }
         if let Some(in_flight) = state.in_flight.as_mut()
-            && in_flight.job.package_id == *package_id
-            && Some(in_flight.job.source_hash) != desired_hash
+            && in_flight.job.identity.package_id == *package_id
+            && Some(in_flight.job.identity.build_fingerprint) != desired_build_fingerprint
         {
             in_flight.disposition.supersede();
         }
         let mut converted = 0_u64;
         for terminal in &mut state.results {
-            if terminal.data().package_id == *package_id
-                && Some(terminal.data().source_hash) != desired_hash
+            if terminal.data().identity.package_id == *package_id
+                && Some(terminal.data().identity.build_fingerprint) != desired_build_fingerprint
                 && matches!(
                     terminal,
                     CandidateTerminal::Compiled { .. }
@@ -865,7 +908,7 @@ impl DevelopmentWorker {
             in_flight_package: state
                 .in_flight
                 .as_ref()
-                .map(|in_flight| in_flight.job.package_id.clone()),
+                .map(|in_flight| in_flight.job.identity.package_id.clone()),
             completed_results: state.result_count,
             backpressure_count: state.backpressure_count,
             pending_superseded_count: state.pending_superseded_count,
@@ -955,10 +998,8 @@ fn worker_loop(shared: &WorkerShared) {
                 .expect("pending order and map remain consistent");
             let queue_duration = job.queued_at.elapsed();
             state.events.push_back(WorkerEvent::CompileStarted {
-                package_id: job.package_id.clone(),
                 source_id: job.source_id.clone(),
-                generation: job.generation,
-                source_hash: job.source_hash,
+                identity: job.identity.clone(),
                 queue_duration,
             });
             state.in_flight = Some(InFlightJob {
@@ -972,22 +1013,42 @@ fn worker_loop(shared: &WorkerShared) {
         #[cfg(test)]
         shared
             .test_control
-            .before_compile(&job.package_id, job.generation);
+            .before_compile(&job.identity.package_id, job.identity.generation);
 
         let work_started = Instant::now();
-        let result = compile_package_candidate(
+        let host_contract = nexa::HostContractInput::with_source(
             &job.idl,
-            &job.required_exports,
-            &job.source_id,
-            &job.candidate,
-        );
+            job.host_contract_source_identity.clone(),
+            Arc::clone(&job.host_contract_source),
+        )
+        .expect("compile jobs retain a validated immutable Host source");
+        let result = {
+            let mut build_session = shared
+                .build_session
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            compile_package_candidate(
+                &mut build_session,
+                &host_contract,
+                &job.required_exports,
+                &job.source_id,
+                job.identity.clone(),
+                &job.build_input,
+            )
+        };
         let work_duration = work_started.elapsed();
 
         let mut state = shared
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while state.result_count >= shared.result_capacity && !state.stopping {
+        while state.result_count >= shared.result_capacity
+            && state
+                .in_flight
+                .as_ref()
+                .is_some_and(|in_flight| in_flight.disposition != InFlightDisposition::Terminalized)
+            && !state.stopping
+        {
             state = shared
                 .result_space_available
                 .wait(state)
@@ -999,13 +1060,16 @@ fn worker_loop(shared: &WorkerShared) {
             .expect("the Worker owns exactly one in-flight Job");
         let data = job.terminal_data(in_flight.queue_duration, work_duration);
         if state.stopping {
-            state.cancelled_count = state.cancelled_count.saturating_add(1);
-            state
-                .shutdown_terminals
-                .push(CandidateTerminal::CancelledByShutdown(data));
+            if in_flight.disposition != InFlightDisposition::Terminalized {
+                state.cancelled_count = state.cancelled_count.saturating_add(1);
+                state
+                    .shutdown_terminals
+                    .push(CandidateTerminal::CancelledByShutdown(data));
+            }
             return;
         }
         let terminal = match in_flight.disposition {
+            InFlightDisposition::Terminalized => continue,
             InFlightDisposition::Cancelled(reason) => {
                 state.cancelled_count = state.cancelled_count.saturating_add(1);
                 cancelled_terminal(reason, data)
@@ -1017,8 +1081,10 @@ fn worker_loop(shared: &WorkerShared) {
             InFlightDisposition::Active
                 if state
                     .pending_by_package
-                    .get(&job.package_id)
-                    .is_some_and(|pending| pending.generation > job.generation) =>
+                    .get(&job.identity.package_id)
+                    .is_some_and(|pending| {
+                        pending.identity.generation > job.identity.generation
+                    }) =>
             {
                 state.compiled_superseded_count = state.compiled_superseded_count.saturating_add(1);
                 CandidateTerminal::SupersededAfterCompile(data)
@@ -1026,13 +1092,14 @@ fn worker_loop(shared: &WorkerShared) {
             InFlightDisposition::Active => match result {
                 Ok(compilation) => CandidateTerminal::Compiled {
                     data,
-                    candidate: job.candidate,
+                    build_input: job.build_input,
                     compilation,
                 },
                 Err(failure) if failure.diagnostic.stage == EngineDiagnosticStage::Verify => {
                     CandidateTerminal::VerifyFailed {
                         data,
                         diagnostic: failure.diagnostic,
+                        additional_diagnostics: failure.additional_diagnostics,
                         compile_duration: failure.compile_duration,
                         verify_duration: failure.verify_duration,
                     }
@@ -1040,6 +1107,7 @@ fn worker_loop(shared: &WorkerShared) {
                 Err(failure) => CandidateTerminal::CompileFailed {
                     data,
                     diagnostic: failure.diagnostic,
+                    additional_diagnostics: failure.additional_diagnostics,
                     compile_duration: failure.compile_duration,
                     verify_duration: failure.verify_duration,
                 },

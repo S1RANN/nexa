@@ -7,6 +7,9 @@
   ],
   "patterns": [
     {
+      "include": "#comments"
+    },
+    {
       "include": "#strings"
     },
     {
@@ -50,6 +53,23 @@
     }
   ],
   "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.nexa",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.nexa",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.nexa",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
     "strings": {
       "name": "string.quoted.double.nexa",
       "begin": "\"",
@@ -57,7 +77,27 @@
       "patterns": [
         {
           "name": "constant.character.escape.nexa",
-          "match": "\\\\[nrt\\\\\"]"
+          "match": "\\\\(?:[nrt\\\\\"]|\\$\\{)"
+        },
+        {
+          "name": "meta.interpolation.nexa",
+          "begin": "\\$\\{",
+          "beginCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.begin.nexa"
+            }
+          },
+          "end": "\\}",
+          "endCaptures": {
+            "0": {
+              "name": "punctuation.section.interpolation.end.nexa"
+            }
+          },
+          "patterns": [
+            {
+              "include": "$self"
+            }
+          ]
         }
       ]
     },
@@ -85,7 +125,7 @@
       ]
     },
     "attributes": {
-      "match": "(@)(stateful|activation)\\b",
+      "match": "(@)(stateful|activation|stable|test)\\b",
       "captures": {
         "1": {
           "name": "punctuation.definition.annotation.nexa"
@@ -98,12 +138,18 @@
     "declarations": {
       "patterns": [
         {
-          "match": "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)",
+          "match": "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
           "captures": {
             "1": {
               "name": "keyword.control.module.nexa"
             },
             "2": {
+              "name": "entity.name.namespace.nexa"
+            },
+            "3": {
+              "name": "keyword.control.module.nexa"
+            },
+            "4": {
               "name": "entity.name.namespace.nexa"
             }
           }
@@ -129,6 +175,17 @@
               "name": "entity.name.function.nexa"
             }
           }
+        },
+        {
+          "match": "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "captures": {
+            "1": {
+              "name": "storage.modifier.nexa"
+            },
+            "2": {
+              "name": "constant.other.nexa"
+            }
+          }
         }
       ]
     },
@@ -148,7 +205,7 @@
       "patterns": [
         {
           "name": "keyword.control.nexa",
-          "match": "\\b(?:module|import|fn|struct|enum|class|task|immediate|migration|cleanup|return|let|var|if|else|while|match|with|new|await|yield|defer|for|in)\\b"
+          "match": "\\b(?:module|import|as|fn|struct|enum|class|const|pub|package|task|immediate|migration|cleanup|return|let|var|if|else|while|match|with|new|await|yield|defer|for|in|break|continue)\\b"
         },
         {
           "name": "constant.language.boolean.nexa",
@@ -176,7 +233,7 @@
         },
         {
           "name": "keyword.operator.nexa",
-          "match": "==|\\.\\.|[+*/=<>?:@-]"
+          "match": "&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]"
         }
       ]
     },

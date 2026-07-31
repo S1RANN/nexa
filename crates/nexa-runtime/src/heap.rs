@@ -55,6 +55,31 @@ pub enum MapSetOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct StringSplitFuelShape {
+    pub source_bytes: usize,
+    pub delimiter_bytes: usize,
+    pub parts: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MapFuelShape {
+    pub current_slots: usize,
+    pub old_slots: usize,
+    pub new_slots: usize,
+    pub rehash_remaining: usize,
+    pub next_rehash_slots: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MapKeyFuelShape {
+    pub string_bytes: usize,
+    pub string_objects: usize,
+    pub structural_objects: usize,
+    pub fields_per_object: usize,
+    pub hash_structural_objects: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MapLocation {
     Current(usize),
     RehashOld(usize),
@@ -474,6 +499,44 @@ impl Heap {
         Ok(self.commit(&mut reservation, Object::String(value)))
     }
 
+    pub(crate) fn copy_string_range(
+        &mut self,
+        source: GcRef,
+        start: usize,
+        end: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let length = {
+            let value = self.string(source)?;
+            value
+                .get(start..end)
+                .ok_or(HeapError::IndexOutOfBounds {
+                    index: end,
+                    length: value.len(),
+                })?
+                .len()
+        };
+        self.validate_string_length(length)?;
+        let mut reservation = self.preflight(1)?;
+        // The source object cannot move while this instruction executes. Make
+        // the only owned copy after every fallible VM capacity check.
+        let value = self
+            .string(source)?
+            .get(start..end)
+            .expect("validated string range remains valid")
+            .to_owned();
+        self.commit_owned_string(&mut reservation, value)
+    }
+
+    pub(crate) fn trim_string(&mut self, source: GcRef) -> Result<RuntimeValue, HeapError> {
+        let (start, end) = {
+            let value = self.string(source)?;
+            let start = value.len() - value.trim_start().len();
+            let end = value.trim_end().len();
+            (start, end.max(start))
+        };
+        self.copy_string_range(source, start, end)
+    }
+
     pub fn string(&self, reference: GcRef) -> Result<&str, HeapError> {
         match self.resolve(reference)? {
             Object::String(value) => Ok(value),
@@ -496,6 +559,102 @@ impl Heap {
             hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
         Ok(hash)
+    }
+
+    pub(crate) fn split_string(
+        &mut self,
+        value: GcRef,
+        delimiter: GcRef,
+    ) -> Result<RuntimeValue, HeapError> {
+        let part_count = {
+            let value = self.string(value)?;
+            let delimiter = self.string(delimiter)?;
+            let mut count = 0_usize;
+            for part in value.split(delimiter) {
+                if count == self.max_collection_length {
+                    return Err(HeapError::CollectionTooLarge {
+                        length: self.max_collection_length.saturating_add(1),
+                        max_length: self.max_collection_length,
+                    });
+                }
+                self.validate_string_length(part.len())?;
+                count += 1;
+            }
+            count
+        };
+        self.validate_collection_length(part_count)?;
+
+        // Reserve both arenas before publishing any VM object. In
+        // particular, splitting on an empty delimiter cannot partially fill
+        // the heap, or even allocate owned part strings, before hitting a
+        // resource limit.
+        let object_count = part_count
+            .checked_add(1)
+            .ok_or(HeapError::CapacityExhausted)?;
+        let mut objects = self.preflight(object_count)?;
+        let mut collection = self.preflight_collection(part_count)?;
+        let mut parts = Vec::new();
+        if parts.try_reserve_exact(part_count).is_err() {
+            self.release_collection_reservation(&mut collection);
+            return Err(HeapError::CapacityExhausted);
+        }
+        {
+            let value = self.string(value)?;
+            let delimiter = self.string(delimiter)?;
+            parts.extend(value.split(delimiter).map(str::to_owned));
+        }
+        debug_assert_eq!(parts.len(), part_count);
+        for part in parts {
+            let value = match self.commit_owned_string(&mut objects, part) {
+                Ok(value) => value,
+                Err(error) => {
+                    self.release_collection_reservation(&mut collection);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = self.commit_collection_value(&mut collection, value) {
+                self.release_collection_reservation(&mut collection);
+                return Err(error);
+            }
+        }
+        let range = collection.range;
+        Self::complete_collection_reservation(&mut collection)?;
+        self.commit_array_reserved(
+            &mut objects,
+            nexa_bytecode::array_type(nexa_bytecode::ValueType::String),
+            nexa_bytecode::ValueType::String,
+            range,
+        )
+    }
+
+    pub(crate) fn split_fuel_shape(
+        &self,
+        value: GcRef,
+        delimiter: GcRef,
+    ) -> Result<StringSplitFuelShape, HeapError> {
+        let value = self.string(value)?;
+        let delimiter = self.string(delimiter)?;
+        // Use only O(1) metadata before fuel settlement. Counting actual
+        // matches here would let an underfunded task repeatedly scan an
+        // arbitrarily large string for free.
+        let upper_bound = if delimiter.is_empty() {
+            value.len().checked_add(2)
+        } else {
+            value
+                .len()
+                .checked_div(delimiter.len())
+                .and_then(|parts| parts.checked_add(1))
+        }
+        .ok_or(HeapError::CollectionTooLarge {
+            length: usize::MAX,
+            max_length: self.max_collection_length,
+        })?;
+        let charged_parts = upper_bound.min(self.max_collection_length.saturating_add(1));
+        Ok(StringSplitFuelShape {
+            source_bytes: value.len(),
+            delimiter_bytes: delimiter.len(),
+            parts: charged_parts,
+        })
     }
 
     pub(crate) fn validate_string_length(&self, bytes: usize) -> Result<(), HeapError> {
@@ -1394,6 +1553,9 @@ impl Heap {
         let (type_id, element_type) = self.buffer_metadata(value)?;
         let values = self.buffer_values(value)?;
         let end = checked_collection_end(start, length, values.len())?;
+        // Reserve the object slot before claiming/copying collection storage,
+        // so a full heap cannot strand an otherwise unreachable arena range.
+        let mut heap = self.preflight(1)?;
         let mut collection = self.preflight_collection(length)?;
         for index in start..end {
             let item = self.buffer_values(value)?[index];
@@ -1401,7 +1563,6 @@ impl Heap {
         }
         let range = collection.range;
         Self::complete_collection_reservation(&mut collection)?;
-        let mut heap = self.preflight(1)?;
         self.commit_buffer_reserved(&mut heap, type_id, element_type, range)
     }
 
@@ -1489,20 +1650,96 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         let initial_capacity = self.max_collection_length.min(8);
+        let mut reservation = self.preflight(1)?;
         let slots = empty_map_slots(initial_capacity)?;
-        let reference = self.allocate(Object::Map(VmMap {
-            type_id,
-            key_type,
-            value_type,
-            slots,
-            length: 0,
-            rehash: None,
-        }))?;
+        let reference = self.commit(
+            &mut reservation,
+            Object::Map(VmMap {
+                type_id,
+                key_type,
+                value_type,
+                slots,
+                length: 0,
+                rehash: None,
+            }),
+        );
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
 
     pub fn map_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
         Ok(self.map(value)?.length)
+    }
+
+    pub(crate) fn map_fuel_shape(&self, value: RuntimeValue) -> Result<MapFuelShape, HeapError> {
+        const REHASH_CHUNK: usize = 8;
+        let map = self.map(value)?;
+        let (old_slots, new_slots, rehash_remaining) =
+            map.rehash.as_ref().map_or((0, 0, 0), |rehash| {
+                (
+                    rehash.old_slots.len(),
+                    rehash.new_slots.len(),
+                    rehash
+                        .old_slots
+                        .len()
+                        .saturating_sub(rehash.cursor)
+                        .min(REHASH_CHUNK),
+                )
+            });
+        let next_rehash_slots = if map.rehash.is_none() {
+            next_map_capacity(map, self.max_collection_length)
+                .filter(|capacity| *capacity > map.slots.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Ok(MapFuelShape {
+            current_slots: map.slots.len(),
+            old_slots,
+            new_slots,
+            rehash_remaining,
+            next_rehash_slots,
+        })
+    }
+
+    pub(crate) fn map_key_fuel_shape(
+        &self,
+        key: RuntimeValue,
+    ) -> Result<MapKeyFuelShape, HeapError> {
+        let shape = match key {
+            RuntimeValue::String { reference, .. } => MapKeyFuelShape {
+                string_bytes: self.string(reference)?.len(),
+                string_objects: 1,
+                structural_objects: 0,
+                fields_per_object: 0,
+                hash_structural_objects: 0,
+            },
+            RuntimeValue::Struct { .. } => MapKeyFuelShape {
+                string_bytes: self.max_string_bytes,
+                string_objects: self.max_objects as usize,
+                structural_objects: self.max_objects as usize,
+                fields_per_object: nexa_bytecode::MAX_STRUCT_FIELDS,
+                hash_structural_objects: 0,
+            },
+            RuntimeValue::NamedRef { reference, .. }
+                if matches!(self.resolve(reference)?, Object::Enum { .. }) =>
+            {
+                MapKeyFuelShape {
+                    string_bytes: self.max_string_bytes,
+                    string_objects: self.max_objects as usize,
+                    structural_objects: self.max_objects as usize,
+                    fields_per_object: nexa_bytecode::MAX_STRUCT_FIELDS,
+                    hash_structural_objects: self.max_objects as usize,
+                }
+            }
+            _ => MapKeyFuelShape {
+                string_bytes: 0,
+                string_objects: 0,
+                structural_objects: 0,
+                fields_per_object: 0,
+                hash_structural_objects: 0,
+            },
+        };
+        Ok(shape)
     }
 
     pub fn map_get(
@@ -1527,6 +1764,14 @@ impl Heap {
         key: RuntimeValue,
         replacement: RuntimeValue,
     ) -> Result<MapSetOutcome, HeapError> {
+        // A retry resumes only the bounded rehash chunk. Looking up the key
+        // again here would repeat an entire map scan on every retry and make
+        // deterministic attempt-based fuel either free or overcharged.
+        if self.map(value)?.rehash.is_some() {
+            progress_map_rehash(self.map_mut(value)?)?;
+            return Ok(MapSetOutcome::RehashPending);
+        }
+
         let hash = self.runtime_value_hash(key)?;
         let location = {
             let map = self.map(value)?;
@@ -1543,18 +1788,10 @@ impl Heap {
                 max_length: self.max_collection_length,
             });
         }
-        if self.map(value)?.rehash.is_some() {
-            progress_map_rehash(self.map_mut(value)?)?;
-            return Ok(MapSetOutcome::RehashPending);
-        }
         if map_needs_rehash(self.map(value)?) {
             let old_capacity = self.map(value)?.slots.len();
-            let maximum_capacity = self
-                .max_collection_length
-                .saturating_mul(2)
-                .checked_next_power_of_two()
-                .unwrap_or(usize::MAX);
-            let new_capacity = old_capacity.saturating_mul(2).max(1).min(maximum_capacity);
+            let new_capacity = next_map_capacity(self.map(value)?, self.max_collection_length)
+                .expect("map needs rehash");
             if new_capacity > old_capacity {
                 let new_slots = empty_map_slots(new_capacity)?;
                 let map = self.map_mut(value)?;
@@ -1772,6 +2009,12 @@ impl Heap {
                 write_hash(&mut hash, &handle_type.0.to_le_bytes());
             }
             RuntimeValue::Unit => write_hash(&mut hash, &[15]),
+            RuntimeValue::MigrationOldObject(object) => {
+                write_migration_object_hash(&mut hash, 16, object.parts());
+            }
+            RuntimeValue::MigrationStagingObject(object) => {
+                write_migration_object_hash(&mut hash, 17, object.parts());
+            }
         }
         Ok(hash)
     }
@@ -1990,6 +2233,23 @@ fn map_needs_rehash(map: &VmMap) -> bool {
         || map.length.saturating_add(1).saturating_mul(4) > map.slots.len().saturating_mul(3)
 }
 
+fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize> {
+    if !map_needs_rehash(map) {
+        return None;
+    }
+    let maximum_capacity = max_collection_length
+        .saturating_mul(2)
+        .checked_next_power_of_two()
+        .unwrap_or(usize::MAX);
+    Some(
+        map.slots
+            .len()
+            .saturating_mul(2)
+            .max(1)
+            .min(maximum_capacity),
+    )
+}
+
 fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<(), HeapError> {
     if slots.is_empty() {
         return Err(HeapError::CapacityExhausted);
@@ -2091,6 +2351,17 @@ fn write_hash(hash: &mut u64, bytes: &[u8]) {
     }
 }
 
+fn write_migration_object_hash(
+    hash: &mut u64,
+    tag: u8,
+    (_, stable_id, type_id, generation): (u64, StableId, StableId, u32),
+) {
+    write_hash(hash, &[tag]);
+    write_hash(hash, &stable_id.0.to_le_bytes());
+    write_hash(hash, &type_id.0.to_le_bytes());
+    write_hash(hash, &generation.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     use nexa_core::StableId;
@@ -2132,6 +2403,19 @@ mod tests {
         );
         assert_eq!(heap.live_len(), before);
         assert_eq!(heap.string(lhs), Ok("ab"));
+    }
+
+    #[test]
+    fn string_copy_capacity_is_checked_before_owned_result_allocation() {
+        let mut heap = Heap::new_with_string_limit(1, 64);
+        let source = heap.allocate_string("  rooted  ").unwrap();
+        assert_eq!(
+            heap.copy_string_range(source, 2, 8),
+            Err(HeapError::CapacityExhausted)
+        );
+        assert_eq!(heap.trim_string(source), Err(HeapError::CapacityExhausted));
+        assert_eq!(heap.live_len(), 1);
+        assert_eq!(heap.string(source), Ok("  rooted  "));
     }
 
     #[test]
@@ -2324,6 +2608,22 @@ mod tests {
                 max_length: 4,
             })
         );
+
+        let mut full_heap = Heap::new_with_arena_limits(2, 64, 4, 16, 4);
+        let source = full_heap
+            .allocate_buffer(
+                type_id,
+                element,
+                &[RuntimeValue::I32(1), RuntimeValue::I32(2)],
+            )
+            .unwrap();
+        full_heap.allocate_string("full").unwrap();
+        let before = full_heap.collection_inspection();
+        assert_eq!(
+            full_heap.buffer_slice(source, 0, 1),
+            Err(HeapError::CapacityExhausted)
+        );
+        assert_eq!(full_heap.collection_inspection(), before);
     }
 
     #[test]

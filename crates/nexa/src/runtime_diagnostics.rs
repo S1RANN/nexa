@@ -1,6 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
+use nexa_analysis::{
+    CandidateIdentity, CompilationLimits, NormalizedPackagePath, PackageManifest, PackageSourceSet,
+    ResolvedBuildInput, ResolvedDependencyGraph, ResolvedPackage, SourceId, SourceRole,
+    SourceSetBuilder,
+};
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, FunctionBuilder,
     FunctionEffect, HostCallMode, HostImport, Instruction, MigrationLimitRequirements, Module,
@@ -9,6 +14,10 @@ use nexa_bytecode::{
     result_type,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
+use nexa_diagnostics::{
+    ByteRange, Diagnostic as LeafDiagnostic, DiagnosticBatch, DiagnosticRenderer,
+    ErrorCode as LeafErrorCode, Label as LeafLabel, RelatedLocation, Severity as LeafSeverity,
+};
 use nexa_runtime::{
     GcRef, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
     ModuleHandle, PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext,
@@ -20,7 +29,7 @@ use nexa_verifier::{VerifiedModule, VerifierLimits};
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::NexaError;
+use crate::{NexaError, SourceIdentity};
 
 const RUNTIME_CODES: [&str; 10] = [
     "NX4001", "NX4002", "NX4003", "NX5001", "NX5002", "NX5003", "NX5004", "NX6001", "NX6002",
@@ -51,7 +60,7 @@ impl RuntimeDiagnosticHarness {
         registry: DiagnosticRegistry,
     ) -> Result<(Self, PendingRequestSlot), String> {
         let pending = Arc::clone(&registry.pending);
-        let host = RuntimeHost::new(config.max_host_resources.max(1) as usize);
+        let host = RuntimeHost::new(config.release_capacity);
         let realm = RealmRuntime::hosted(config, host.clone(), Box::new(registry))
             .map_err(|error| error.to_string())?;
         Ok((
@@ -67,7 +76,7 @@ impl RuntimeDiagnosticHarness {
     }
 
     fn isolated(config: RealmConfig) -> Self {
-        let host = RuntimeHost::new(config.max_host_resources.max(1) as usize);
+        let host = RuntimeHost::new(config.release_capacity);
         Self {
             host,
             realm: RealmRuntime::isolated(config),
@@ -81,9 +90,11 @@ impl RuntimeDiagnosticHarness {
         &mut self,
         module: VerifiedModule,
         host_hash: StableId,
-        schema_hash: StableId,
     ) -> Result<ModuleHandle, nexa_runtime::RealmError> {
-        let module = self.realm.load_module(module, host_hash, schema_hash)?;
+        let state_schema_fingerprint = module.module().state_schema_fingerprint;
+        let module = self
+            .realm
+            .load_module(module, host_hash, state_schema_fingerprint)?;
         self.modules.push(module);
         Ok(module)
     }
@@ -193,12 +204,45 @@ pub struct RuntimeDiagnosticCaseEvidence {
 pub struct RuntimeDiagnosticEndToEndReport {
     pub schema_version: u32,
     pub cases: BTreeMap<String, RuntimeDiagnosticCaseEvidence>,
+    pub multi_file_source_evidence: MultiFileRuntimeDiagnosticEvidence,
     pub observed_codes: Vec<String>,
     pub missing_codes: Vec<String>,
     pub failures: Vec<String>,
     pub deterministic_cases: usize,
     pub nondeterministic_cases: Vec<String>,
     pub independent_harnesses: usize,
+}
+
+/// Runtime-source evidence produced by the canonical package build and a real hosted Realm.
+///
+/// The stack is recorded in its public callee-to-caller order. Numeric `FileId` values are
+/// included only to prove that the runtime did not collapse the frames; stable source identity is
+/// carried separately by `stack_sources`.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MultiFileRuntimeDiagnosticEvidence {
+    pub deterministic: bool,
+    pub passed: bool,
+    pub source_keys: Vec<String>,
+    pub file_ids: Vec<u32>,
+    pub stack_functions: Vec<String>,
+    pub stack_sources: Vec<String>,
+    pub stack_source_text: Vec<String>,
+    pub call_site_pcs: Vec<Option<u32>>,
+    pub true_call_site_pcs: bool,
+    pub true_host_call_boundary: bool,
+    pub host_boundary_source: String,
+    pub host_boundary_text: String,
+    pub nidl_origin: String,
+    pub nidl_origin_text: String,
+    pub nidl_binding_verified: bool,
+    pub nidl_exact_source_preserved: bool,
+    pub crlf_preserved: bool,
+    pub astral_utf16_verified: bool,
+    pub human_position: [u32; 2],
+    pub utf16_position: [u32; 2],
+    pub human_output: String,
+    pub json_output: String,
 }
 
 #[derive(Clone, Copy)]
@@ -280,6 +324,13 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
         first.passed = first.passed && first.deterministic && first.observed == code;
         cases.insert(code.to_owned(), first);
     }
+    let first_multi_file = execute_multi_file_runtime_diagnostic()?;
+    let second_multi_file = execute_multi_file_runtime_diagnostic()?;
+    let multi_file_deterministic = first_multi_file == second_multi_file;
+    let mut multi_file_source_evidence = first_multi_file;
+    multi_file_source_evidence.deterministic = multi_file_deterministic;
+    multi_file_source_evidence.passed =
+        multi_file_source_evidence.passed && multi_file_deterministic;
     let observed_codes = cases
         .values()
         .map(|case| case.observed.clone())
@@ -290,7 +341,7 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let missing_codes = expected.difference(&observed).cloned().collect::<Vec<_>>();
-    let failures = cases
+    let mut failures = cases
         .iter()
         .filter(|(_, case)| !case.passed || !case.unexpected_mutations.is_empty())
         .map(|(code, case)| {
@@ -305,16 +356,467 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
                 .map(|code| format!("{code} is nondeterministic")),
         )
         .collect::<Vec<_>>();
+    if !multi_file_source_evidence.passed {
+        failures.push("multi-file runtime source diagnostic evidence failed".to_owned());
+    }
     Ok(RuntimeDiagnosticEndToEndReport {
         schema_version: 1,
         deterministic_cases: cases.values().filter(|case| case.deterministic).count(),
         independent_harnesses: cases.len(),
         cases,
+        multi_file_source_evidence,
         observed_codes,
         missing_codes,
         failures,
         nondeterministic_cases,
     })
+}
+
+#[allow(clippy::too_many_lines)]
+fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticEvidence, String> {
+    const IDL_SOURCE: &str =
+        "interface DiagnosticStackHost {\r\n    sync fn fail() -> i32;\r\n}\r\n";
+    const IDL_PATH: &str = "diagnostic_stack_api.nidl";
+    const ENTRY_SOURCE: &str = concat!(
+        "module diagnostic_stack.entry;\r\n",
+        "import diagnostic_stack.middle as middle;\r\n",
+        "pub fn entry() -> i32 { let marker: string = \"🚀\"; return middle.forward(); }\r\n",
+    );
+    const MIDDLE_SOURCE: &str = concat!(
+        "module diagnostic_stack.middle;\n",
+        "import diagnostic_stack.leaf as leaf;\n",
+        "pub(package) fn forward() -> i32 { return leaf.crash(); }\n",
+    );
+    const LEAF_SOURCE: &str = concat!(
+        "module diagnostic_stack.leaf;\n",
+        "import host as test_host;\n",
+        "pub(package) fn crash() -> i32 { return test_host.fail(); }\n",
+    );
+
+    let idl = nexa_idl::parse(IDL_SOURCE).map_err(|error| error.to_string())?;
+    let contract = crate::HostContractInput::with_source(
+        &idl,
+        SourceIdentity::standalone(IDL_PATH),
+        IDL_SOURCE,
+    )
+    .map_err(|error| error.to_string())?;
+    let input = multi_file_diagnostic_input(
+        &contract,
+        [
+            ("src/diagnostic_stack/entry.nexa", ENTRY_SOURCE),
+            ("src/diagnostic_stack/middle.nexa", MIDDLE_SOURCE),
+            ("src/diagnostic_stack/leaf.nexa", LEAF_SOURCE),
+        ],
+    )?;
+    let identity =
+        CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
+            .map_err(|error| error.to_string())?;
+    let artifact =
+        crate::compile_package_with_contract(&input, &contract, identity).map_err(|error| {
+            match error {
+                crate::PackageBuildError::AnalysisFailed(diagnostics) => {
+                    DiagnosticRenderer::human(&diagnostics)
+                }
+                error => error.to_string(),
+            }
+        })?;
+    let verified = artifact.verified.clone();
+    let bytecode = artifact.module().clone();
+    let entry_function = artifact
+        .debug_info
+        .functions
+        .iter()
+        .find(|function| {
+            function.package_id == input.root_manifest.id.as_str()
+                && function.module_path == "diagnostic_stack.entry"
+                && function.name == "entry"
+        })
+        .map(|function| function.function_index)
+        .ok_or("compiled artifact has no entry debug function")?;
+
+    let host_hash = nexa_idl::exact_hash(&idl);
+    let registry = DiagnosticRegistry::new(host_hash, RegistryMode::StrictArity);
+    let (mut harness, _) = RuntimeDiagnosticHarness::hosted(RealmConfig::default(), registry)?;
+    let module = harness
+        .load(verified, host_hash)
+        .map_err(|error| error.to_string())?;
+    let task = harness.call(module, entry_function)?;
+    let TaskPoll::Trapped(error) = harness
+        .realm
+        .poll_task(task, 1_024)
+        .map_err(|error| error.to_string())?
+    else {
+        return Err("multi-file Host argument mismatch did not trap".to_owned());
+    };
+    if runtime_error_code(&error) != "NX4003" {
+        return Err(format!(
+            "multi-file Host argument mismatch produced {} instead of NX4003",
+            runtime_error_code(&error)
+        ));
+    }
+    let trap = terminal_trap(&harness.realm, task)?;
+    let frames = trap.script_call_stack.as_slice();
+    let mut stack_functions = Vec::new();
+    let mut stack_sources = Vec::new();
+    let mut stack_source_text = Vec::new();
+    let mut call_site_pcs = Vec::new();
+    let mut true_call_site_pcs = true;
+    for (depth, frame) in frames.iter().enumerate() {
+        let function_name = artifact
+            .debug_info
+            .functions
+            .iter()
+            .find(|function| function.function_index == frame.function)
+            .map_or_else(
+                || format!("<function #{}>", frame.function),
+                |function| function.name.clone(),
+            );
+        let span = frame
+            .source_span
+            .ok_or_else(|| format!("{function_name} has no source span"))?;
+        let source = artifact
+            .source_files
+            .source(span.file)
+            .ok_or_else(|| format!("stack frame refers to unknown FileId {}", span.file.0))?;
+        let text = source
+            .text
+            .get(span.start as usize..span.end as usize)
+            .ok_or_else(|| format!("{function_name} span is out of bounds"))?
+            .to_owned();
+        stack_functions.push(function_name);
+        stack_sources.push(source.identity.to_string());
+        stack_source_text.push(text);
+        call_site_pcs.push(frame.call_site_pc);
+        if depth > 0 {
+            let call_site = frame.call_site_pc;
+            let instruction = call_site
+                .and_then(|pc| {
+                    bytecode
+                        .functions
+                        .get(frame.function as usize)
+                        .and_then(|function| function.code.get(pc as usize))
+                })
+                .is_some_and(|instruction| matches!(instruction, Instruction::Call { .. }));
+            let mapped = call_site
+                .is_some_and(|pc| bytecode.source_span(frame.function, pc) == frame.source_span);
+            true_call_site_pcs &= instruction && mapped;
+        } else {
+            true_call_site_pcs &= frame.call_site_pc.is_none();
+        }
+    }
+
+    let boundary = trap
+        .host_call_boundary
+        .ok_or("runtime trap has no Host call boundary")?;
+    let boundary_span = boundary
+        .source_span
+        .ok_or("Host call boundary has no source span")?;
+    let boundary_source = artifact
+        .source_files
+        .source(boundary_span.file)
+        .ok_or("Host boundary refers to an unknown source")?;
+    let host_boundary_text = boundary_source
+        .text
+        .get(boundary_span.start as usize..boundary_span.end as usize)
+        .ok_or("Host boundary span is out of bounds")?
+        .to_owned();
+    let true_host_call_boundary = bytecode
+        .functions
+        .get(boundary.function as usize)
+        .and_then(|function| function.code.get(boundary.pc as usize))
+        .is_some_and(|instruction| {
+            matches!(
+                instruction,
+                Instruction::HostCall { import, .. } if *import == boundary.import
+            )
+        })
+        && bytecode.source_span(boundary.function, boundary.pc) == Some(boundary_span)
+        && frames
+            .first()
+            .is_some_and(|frame| frame.function == boundary.function);
+
+    let host_import_debug = artifact
+        .debug_info
+        .host_imports
+        .iter()
+        .find(|import| import.import_index == boundary.import)
+        .ok_or("Host boundary has no package debug origin")?;
+    let host_import = bytecode
+        .host_imports
+        .get(boundary.import as usize)
+        .ok_or("Host boundary import index is out of bounds")?;
+    let nidl_span = host_import_debug.declaration_span;
+    let expected_nidl_identity = SourceIdentity::standalone(IDL_PATH);
+    let nidl_source = artifact
+        .source_files
+        .source(nidl_span.file)
+        .ok_or("compiled artifact did not retain the canonical NIDL source origin")?;
+    let nidl_origin_text = nidl_source
+        .text
+        .get(nidl_span.start as usize..nidl_span.end as usize)
+        .ok_or("NIDL declaration span is out of bounds")?
+        .to_owned();
+    let interface_source = artifact
+        .source_files
+        .source(host_import_debug.interface_span.file)
+        .ok_or("Host interface debug span refers to an unknown source")?;
+    let interface_text = interface_source
+        .text
+        .get(
+            host_import_debug.interface_span.start as usize
+                ..host_import_debug.interface_span.end as usize,
+        )
+        .ok_or("Host interface debug span is out of bounds")?;
+    let nidl_binding_verified = host_import_debug.stable_id == host_import.stable_id
+        && host_import_debug.interface_id == host_hash
+        && host_import_debug.interface_name == "DiagnosticStackHost"
+        && host_import_debug.function_name == "fail"
+        && bytecode.host_interface_hash == Some(host_import_debug.interface_id)
+        && nidl_source.key.is_none()
+        && nidl_source.identity == expected_nidl_identity
+        && nidl_source.text.as_ref() == IDL_SOURCE
+        && interface_source.identity == expected_nidl_identity
+        && interface_text.contains("DiagnosticStackHost")
+        && nidl_origin_text.contains("fn fail(");
+    let nidl_exact_source_preserved =
+        nidl_source.text.as_ref() == IDL_SOURCE && nidl_source.text.contains("\r\n");
+    let nidl_range = byte_range(nidl_span);
+
+    let trap_span = trap.source_span.ok_or("runtime trap has no primary span")?;
+    let trap_source = artifact
+        .source_files
+        .source(trap_span.file)
+        .ok_or("runtime trap refers to an unknown source")?;
+    let mut diagnostic = LeafDiagnostic::new(
+        LeafErrorCode::NX4003,
+        LeafSeverity::Error,
+        trap.message.to_string(),
+    )
+    .with_label(LeafLabel::primary(
+        trap_source.identity.clone(),
+        byte_range(trap_span),
+        "Host argument mismatch",
+    ));
+    for (function, frame) in stack_functions.iter().zip(frames) {
+        let span = frame
+            .source_span
+            .expect("stack spans were validated before rendering");
+        let source = artifact
+            .source_files
+            .source(span.file)
+            .expect("stack source was validated before rendering");
+        diagnostic = diagnostic.with_related(RelatedLocation::new(
+            source.identity.clone(),
+            byte_range(span),
+            format!("at {function}"),
+        ));
+    }
+    diagnostic = diagnostic
+        .with_related(RelatedLocation::new(
+            boundary_source.identity.clone(),
+            byte_range(boundary_span),
+            "while calling Host function DiagnosticStackHost::fail",
+        ))
+        .with_related(RelatedLocation::new(
+            nidl_source.identity.clone(),
+            nidl_range,
+            "Host function DiagnosticStackHost::fail is declared here",
+        ));
+    let mut batch = DiagnosticBatch::with_default_limits(Arc::clone(
+        artifact.source_files.diagnostic_sources(),
+    ));
+    batch.push(diagnostic);
+    let human_output = DiagnosticRenderer::human(&batch);
+    let json_output = DiagnosticRenderer::json(&batch).map_err(|error| error.to_string())?;
+
+    let root_frame = frames
+        .last()
+        .ok_or("runtime trap has an empty script call stack")?;
+    let root_span = root_frame
+        .source_span
+        .ok_or("entry caller has no call-site source span")?;
+    let root_source = artifact
+        .source_files
+        .source(root_span.file)
+        .ok_or("entry caller refers to an unknown source")?;
+    let root_snapshot = batch
+        .sources()
+        .get(&root_source.identity)
+        .ok_or("entry caller source is absent from diagnostic snapshots")?;
+    let human = root_snapshot.human_range(byte_range(root_span));
+    let utf16 = root_snapshot.utf16_range(byte_range(root_span));
+    let line_start = root_source.text[..root_span.start as usize]
+        .rfind('\n')
+        .map_or(0, |index| index.saturating_add(1));
+    let line_prefix = &root_source.text[line_start..root_span.start as usize];
+    let astral_utf16_verified = line_prefix.contains('🚀')
+        && human.start.column
+            == u32::try_from(line_prefix.chars().count().saturating_add(1)).unwrap_or(u32::MAX)
+        && utf16.start.character
+            == u32::try_from(line_prefix.encode_utf16().count()).unwrap_or(u32::MAX)
+        && human.start.column == utf16.start.character;
+
+    let source_keys = artifact
+        .source_files
+        .files()
+        .iter()
+        .filter_map(|source| {
+            source
+                .key
+                .as_ref()
+                .filter(|key| key.package_id == input.root_manifest.id)
+                .map(|key| format!("{}:{}", key.package_id, key.path))
+        })
+        .collect::<Vec<_>>();
+    let file_ids = frames
+        .iter()
+        .filter_map(|frame| frame.source_span.map(|span| span.file.0))
+        .collect::<Vec<_>>();
+    let source_key_set = source_keys.iter().collect::<BTreeSet<_>>();
+    let stack_source_set = stack_sources.iter().collect::<BTreeSet<_>>();
+    let file_id_set = file_ids.iter().collect::<BTreeSet<_>>();
+    let expected_stack = ["crash", "forward", "entry"];
+    let expected_text = ["test_host.fail()", "leaf.crash()", "middle.forward()"];
+    let nidl_identity = nidl_source.identity.to_string();
+    let human_has_all_sources = stack_sources
+        .iter()
+        .chain(std::iter::once(&nidl_identity))
+        .all(|source| human_output.contains(source));
+    let json_has_all_paths = stack_sources
+        .iter()
+        .map(|source| {
+            source
+                .split_once(':')
+                .map_or(source.as_str(), |(_, path)| path)
+        })
+        .chain(std::iter::once(nidl_source.identity.path()))
+        .all(|path| json_output.contains(path));
+    let passed = trap.diagnostic_code() == "NX4003"
+        && source_keys.len() >= 3
+        && source_key_set.len() >= 3
+        && stack_functions
+            .iter()
+            .map(String::as_str)
+            .eq(expected_stack)
+        && stack_source_text
+            .iter()
+            .zip(expected_text)
+            .all(|(actual, expected)| actual.contains(expected))
+        && stack_source_set.len() == 3
+        && file_id_set.len() == 3
+        && true_call_site_pcs
+        && true_host_call_boundary
+        && boundary_source.identity.to_string() == stack_sources[0]
+        && host_boundary_text.contains("test_host.fail()")
+        && nidl_range.start < nidl_range.end
+        && nidl_binding_verified
+        && nidl_exact_source_preserved
+        && root_source.text.contains("\r\n")
+        && astral_utf16_verified
+        && human_output.contains("NX4003")
+        && serde_json::from_str::<Value>(&json_output).is_ok()
+        && human_has_all_sources
+        && json_has_all_paths;
+
+    Ok(MultiFileRuntimeDiagnosticEvidence {
+        deterministic: false,
+        passed,
+        source_keys,
+        file_ids,
+        stack_functions,
+        stack_sources,
+        stack_source_text,
+        call_site_pcs,
+        true_call_site_pcs,
+        true_host_call_boundary,
+        host_boundary_source: boundary_source.identity.to_string(),
+        host_boundary_text,
+        nidl_origin: nidl_identity,
+        nidl_origin_text,
+        nidl_binding_verified,
+        nidl_exact_source_preserved,
+        crlf_preserved: root_source.text.contains("\r\n"),
+        astral_utf16_verified,
+        human_position: [human.start.line, human.start.column],
+        utf16_position: [utf16.start.line, utf16.start.character],
+        human_output,
+        json_output,
+    })
+}
+
+fn multi_file_diagnostic_input(
+    contract: &crate::HostContractInput<'_>,
+    sources: [(&str, &str); 3],
+) -> Result<ResolvedBuildInput, String> {
+    let manifest = Arc::new(
+        PackageManifest::parse(
+            r#"schema = 2
+kind = "application"
+id = "diagnostic.runtime-stack"
+name = "Runtime Stack Diagnostic"
+version = "1.0.0"
+source_root = "src"
+entry = "diagnostic_stack.entry"
+activation = "programmatic"
+"#,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let limits = CompilationLimits::default();
+    let mut builder = SourceSetBuilder::new(manifest.id.clone(), limits);
+    for (path, source) in sources {
+        builder
+            .add(
+                NormalizedPackagePath::new(path).map_err(|error| error.to_string())?,
+                source,
+                SourceRole::Production,
+            )
+            .map_err(|error| error.to_string())?;
+    }
+    let source_set: Arc<PackageSourceSet> =
+        Arc::new(builder.build().map_err(|error| error.to_string())?);
+    let graph = Arc::new(ResolvedDependencyGraph {
+        root: manifest.id.clone(),
+        packages: BTreeMap::from([(
+            manifest.id.clone(),
+            ResolvedPackage {
+                id: manifest.id.clone(),
+                version: manifest.version.clone(),
+                source_id: SourceId::new("runtime-diagnostic")
+                    .map_err(|error| error.to_string())?,
+                directory: NormalizedPackagePath::new("diagnostic/runtime-stack")
+                    .map_err(|error| error.to_string())?,
+                kind: manifest.kind,
+            },
+        )]),
+        edges: BTreeSet::new(),
+    });
+    let fingerprint = crate::canonical_package_build_fingerprint_input_with_contract(
+        &manifest,
+        &source_set,
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        contract,
+        None,
+    );
+    ResolvedBuildInput::new(
+        manifest,
+        source_set,
+        BTreeMap::new(),
+        BTreeMap::new(),
+        graph,
+        None,
+        fingerprint.host_contract.clone(),
+        fingerprint.host_contract_source.clone(),
+        fingerprint.host_required_exports.clone(),
+        nexa_analysis::CompilationOptions::default(),
+        fingerprint,
+    )
+    .map_err(|error| error.to_string())
+}
+
+const fn byte_range(span: SourceSpan) -> ByteRange {
+    ByteRange::new(span.start, span.end)
 }
 
 fn execute_case(code: &str) -> Result<RuntimeDiagnosticCaseEvidence, String> {
@@ -383,13 +885,14 @@ fn ledger_delta(before: &Value, after: &Value, field: &str) -> String {
 fn host_hash_mismatch_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let registry_hash = StableId::from_name("r3-host-a");
     let module_hash = StableId::from_name("r3-host-b");
-    let schema = StableId::from_name("r3-schema");
     let registry = DiagnosticRegistry::new(registry_hash, RegistryMode::ResultMismatch);
     let (mut harness, _) = RuntimeDiagnosticHarness::hosted(RealmConfig::default(), registry)?;
     let before = harness.snapshot();
+    let module = simple_module(module_hash);
+    let state_schema_fingerprint = module.module().state_schema_fingerprint;
     let error = harness
         .realm
-        .load_module(simple_module(module_hash, schema), module_hash, schema)
+        .load_module(module, module_hash, state_schema_fingerprint)
         .expect_err("host mismatch must fail");
     let after = harness.snapshot();
     let unexpected = atomic_snapshot_failures(&before, &after);
@@ -412,8 +915,7 @@ fn host_hash_mismatch_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
 
 fn host_capability_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let host = StableId::from_name("r3-capability-host");
-    let schema = StableId::from_name("r3-capability-schema");
-    let modules = host_capability_modules(host, schema)?;
+    let modules = host_capability_modules(host)?;
     let mut results = Vec::new();
     let mut last_error = None;
     let mut first_before = Value::Null;
@@ -421,9 +923,10 @@ fn host_capability_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     for module in modules {
         let mut harness = RuntimeDiagnosticHarness::isolated(RealmConfig::default());
         let before = harness.snapshot();
+        let state_schema_fingerprint = module.module().state_schema_fingerprint;
         let error = harness
             .realm
-            .load_module(module, host, schema)
+            .load_module(module, host, state_schema_fingerprint)
             .expect_err("isolated realm must reject host capability");
         let after = harness.snapshot();
         results.push(
@@ -637,7 +1140,7 @@ fn unknown_host_error_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     harness.observed_requests.push(request.request);
     request
         .ticket
-        .fail(HostErrorPayload { code: 77 })
+        .fail(HostErrorPayload::Code(77))
         .map_err(|error| error.to_string())?;
     harness
         .realm
@@ -671,15 +1174,16 @@ fn unknown_host_error_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
 
 fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let host = StableId::from_name("r3-capacity-host");
-    let schema = StableId::from_name("r3-capacity-schema");
     let mut module_harness = RuntimeDiagnosticHarness::isolated(RealmConfig {
         max_modules: 0,
         ..RealmConfig::default()
     });
     let before = module_harness.snapshot();
+    let module = simple_module(host);
+    let state_schema_fingerprint = module.module().state_schema_fingerprint;
     let module_error = module_harness
         .realm
-        .load_module(simple_module(host, schema), host, schema)
+        .load_module(module, host, state_schema_fingerprint)
         .expect_err("zero module capacity must fail");
     let after = module_harness.snapshot();
 
@@ -692,7 +1196,7 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         ..RealmConfig::default()
     });
     let module = task_harness
-        .load(simple_module(host, schema), host, schema)
+        .load(simple_module(host), host)
         .map_err(|error| error.to_string())?;
     let scope = task_harness
         .realm
@@ -768,7 +1272,6 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
 
 fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let host = StableId::from_name("r3-migration-limit-host");
-    let schema = StableId::from_name("r3-migration-limit-schema");
     let limit_kinds = [
         "objects",
         "fields",
@@ -782,16 +1285,16 @@ fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         let (config, required) = migration_limit_config(kind);
         let mut harness = RuntimeDiagnosticHarness::isolated(config);
         let old = harness
-            .load(simple_module(host, schema), host, schema)
+            .load(simple_module(host), host)
             .map_err(|error| error.to_string())?;
         let error = expected_restart_failure(harness.realm.restart_reload(
             old,
-            migration_module(host, schema, false, required),
+            migration_module(host, false, required),
             RestartReloadPolicy::default(),
         ))?;
         observed.push((kind, NexaError::from(error).code().as_str()));
     }
-    let fuel_candidate = migration_fuel_module(host, schema);
+    let fuel_candidate = migration_fuel_module(host);
     let minimum_fuel = fuel_candidate
         .module()
         .reload_metadata
@@ -805,7 +1308,7 @@ fn migration_limit_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         ..RealmConfig::default()
     });
     let old = harness
-        .load(simple_module(host, schema), host, schema)
+        .load(simple_module(host), host)
         .map_err(|error| error.to_string())?;
     let before = harness.snapshot();
     let error = expected_restart_failure(harness.realm.restart_reload(
@@ -897,7 +1400,6 @@ impl GraphFault {
 
 fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let host = StableId::from_name("r3-graph-host");
-    let schema = StableId::from_name("r3-graph-schema");
     let faults = [
         GraphFault::NestedStateObject,
         GraphFault::CrossDomainHandle,
@@ -912,7 +1414,7 @@ fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     for fault in faults {
         let mut harness = RuntimeDiagnosticHarness::isolated(RealmConfig::default());
         let old = harness
-            .load(simple_module(host, schema), host, schema)
+            .load(simple_module(host), host)
             .map_err(|error| error.to_string())?;
         let domain = harness
             .realm
@@ -921,7 +1423,7 @@ fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         let before = harness.snapshot();
         let error = expected_restart_failure(harness.realm.restart_reload(
             old,
-            migration_graph_module(host, schema, fault),
+            migration_graph_module(host, fault),
             RestartReloadPolicy {
                 migration_arguments: vec![fault.argument(domain)],
                 ..RestartReloadPolicy::default()
@@ -963,17 +1465,16 @@ fn migration_graph_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
 
 fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let host = StableId::from_name("r3-activation-host");
-    let schema = StableId::from_name("r3-activation-schema");
     let mut harness = RuntimeDiagnosticHarness::isolated(RealmConfig::default());
     let old = harness
-        .load(simple_module(host, schema), host, schema)
+        .load(simple_module(host), host)
         .map_err(|error| error.to_string())?;
     let before = harness.snapshot();
     let outcome = harness
         .realm
         .restart_reload(
             old,
-            activation_trap_module(host, schema),
+            activation_trap_module(host),
             RestartReloadPolicy {
                 activation_fuel: 128,
                 ..RestartReloadPolicy::default()
@@ -1062,6 +1563,7 @@ fn terminal_trap_stack(terminal: &nexa_runtime::TaskTerminalRecord) -> Vec<Value
             json!({
                 "function": frame.function,
                 "pc": frame.pc,
+                "call_site_pc": frame.call_site_pc,
                 "source_span": frame.source_span.map(|span| [span.start, span.end]),
             })
         })
@@ -1083,21 +1585,20 @@ fn hosted_host_call_with_config(
     config: RealmConfig,
 ) -> Result<HostedHarness, String> {
     let host = StableId::from_name("r3-diagnostic-host");
-    let schema = StableId::from_name("r3-diagnostic-schema");
     let registry = DiagnosticRegistry::new(host, mode);
     let (mut harness, pending) = RuntimeDiagnosticHarness::hosted(config, registry)?;
     let module = if asynchronous {
-        async_module(host, schema, typed_error)
+        async_module(host, typed_error)
     } else {
-        host_call_module(host, schema)
+        host_call_module(host)
     };
     let module = harness
-        .load(module, host, schema)
+        .load(module, host)
         .map_err(|error| error.to_string())?;
     Ok((harness, module, pending))
 }
 
-fn simple_module(host: StableId, schema: StableId) -> VerifiedModule {
+fn simple_module(host: StableId) -> VerifiedModule {
     let mut function = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -1110,12 +1611,12 @@ fn simple_module(host: StableId, schema: StableId) -> VerifiedModule {
         .emit(Instruction::ReturnVoid);
     let mut module = ModuleBuilder::new();
     module
-        .metadata(host, schema)
+        .metadata(host, StateSchema::default().fingerprint())
         .function(function.finish().expect("simple diagnostic function"));
     verify_round_trip(module.finish())
 }
 
-fn host_call_module(host: StableId, schema: StableId) -> VerifiedModule {
+fn host_call_module(host: StableId) -> VerifiedModule {
     let mut function = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -1145,7 +1646,7 @@ fn host_call_module(host: StableId, schema: StableId) -> VerifiedModule {
         },
     ];
     let mut module = ModuleBuilder::new();
-    module.metadata(host, schema);
+    module.metadata(host, StateSchema::default().fingerprint());
     module.host_import(HostImport {
         stable_id: StableId::from_name("R3::immediate"),
         parameters: Vec::new(),
@@ -1172,7 +1673,7 @@ fn host_call_module(host: StableId, schema: StableId) -> VerifiedModule {
     verify_round_trip(module.finish())
 }
 
-fn async_module(host: StableId, schema: StableId, typed_error: bool) -> VerifiedModule {
+fn async_module(host: StableId, typed_error: bool) -> VerifiedModule {
     let error = if typed_error {
         EnumType {
             type_id: StableId::from_name("KnownHostError"),
@@ -1232,7 +1733,7 @@ fn async_module(host: StableId, schema: StableId, typed_error: bool) -> Verified
         },
     ];
     let mut module = ModuleBuilder::new();
-    module.metadata(host, schema);
+    module.metadata(host, StateSchema::default().fingerprint());
     module.enum_type(error);
     module.enum_type(result);
     module.host_import(HostImport {
@@ -1263,7 +1764,6 @@ fn async_module(host: StableId, schema: StableId, typed_error: bool) -> Verified
 
 fn migration_module(
     host: StableId,
-    schema: StableId,
     finished: bool,
     minimum: MigrationLimitRequirements,
 ) -> VerifiedModule {
@@ -1280,7 +1780,7 @@ fn migration_module(
     }
     migration.emit(Instruction::ReturnVoid);
     let mut module = ModuleBuilder::new();
-    module.metadata(host, schema);
+    module.metadata(host, StateSchema::default().fingerprint());
     let entry = module.function(migration.finish().expect("migration diagnostic function"));
     let mut module = module.finish();
     let required = nexa_bytecode::minimum_migration_limits(&module, Some(entry));
@@ -1298,13 +1798,13 @@ fn migration_module(
     module.reload_metadata = ReloadMetadata {
         migration_entry: Some(entry),
         activation_entry: None,
-        stateful_schema_hash: module.state_schema.stable_hash(),
+        state_schema_fingerprint: module.state_schema.fingerprint(),
         minimum_migration_limits: minimum,
     };
     verify_round_trip(module)
 }
 
-fn migration_fuel_module(host: StableId, schema: StableId) -> VerifiedModule {
+fn migration_fuel_module(host: StableId) -> VerifiedModule {
     let mut migration = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -1347,19 +1847,19 @@ fn migration_fuel_module(host: StableId, schema: StableId) -> VerifiedModule {
         },
     ];
     let mut module = ModuleBuilder::new();
-    module.metadata(host, schema);
+    module.metadata(host, StateSchema::default().fingerprint());
     let entry = module.function(migration);
     let mut module = module.finish();
     module.reload_metadata = ReloadMetadata {
         migration_entry: Some(entry),
         activation_entry: None,
-        stateful_schema_hash: module.state_schema.stable_hash(),
+        state_schema_fingerprint: module.state_schema.fingerprint(),
         minimum_migration_limits: nexa_bytecode::minimum_migration_limits(&module, Some(entry)),
     };
     verify_round_trip(module)
 }
 
-fn migration_graph_module(host: StableId, schema: StableId, fault: GraphFault) -> VerifiedModule {
+fn migration_graph_module(host: StableId, fault: GraphFault) -> VerifiedModule {
     let root_type = StableId::from_name("R3GraphRoot");
     let root_id = StableId::from_name("R3GraphRootObject");
     let child_type = StableId::from_name("R3GraphChild");
@@ -1406,8 +1906,7 @@ fn migration_graph_module(host: StableId, schema: StableId, fault: GraphFault) -
             bitmap: vec![true, true],
         },
     ];
-    let mut module = ModuleBuilder::new();
-    module.metadata(host, schema).state_schema(StateSchema {
+    let state_schema = StateSchema {
         types: vec![
             StateType {
                 stable_id: root_type,
@@ -1423,7 +1922,12 @@ fn migration_graph_module(host: StableId, schema: StableId, fault: GraphFault) -
                 fields: Vec::new(),
             },
         ],
-    });
+    };
+    let state_schema_fingerprint = state_schema.fingerprint();
+    let mut module = ModuleBuilder::new();
+    module
+        .metadata(host, state_schema_fingerprint)
+        .state_schema(state_schema);
     if !matches!(fault, GraphFault::IllegalStrongReference) {
         module.state_handle_type(handle);
     }
@@ -1432,13 +1936,13 @@ fn migration_graph_module(host: StableId, schema: StableId, fault: GraphFault) -
     module.reload_metadata = ReloadMetadata {
         migration_entry: Some(entry),
         activation_entry: None,
-        stateful_schema_hash: module.state_schema.stable_hash(),
+        state_schema_fingerprint: module.state_schema.fingerprint(),
         minimum_migration_limits: nexa_bytecode::minimum_migration_limits(&module, Some(entry)),
     };
     verify_round_trip(module)
 }
 
-fn activation_trap_module(host: StableId, schema: StableId) -> VerifiedModule {
+fn activation_trap_module(host: StableId) -> VerifiedModule {
     let mut activation = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -1450,20 +1954,17 @@ fn activation_trap_module(host: StableId, schema: StableId) -> VerifiedModule {
         .effect(FunctionEffect::Immediate)
         .emit(Instruction::Trap);
     let mut module = ModuleBuilder::new();
-    module.metadata(host, schema);
+    module.metadata(host, StateSchema::default().fingerprint());
     let entry = module.function(activation.finish().expect("activation diagnostic function"));
     module.reload_entries(None, Some(entry));
     verify_round_trip(module.finish())
 }
 
-fn host_capability_modules(
-    host: StableId,
-    schema: StableId,
-) -> Result<Vec<VerifiedModule>, String> {
+fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String> {
     let mut modules = Vec::new();
 
     let mut direct = ModuleBuilder::new();
-    direct.metadata(host, schema);
+    direct.metadata(host, StateSchema::default().fingerprint());
     direct.host_import(HostImport {
         stable_id: StableId::from_name("R3::capability"),
         parameters: Vec::new(),
@@ -1479,7 +1980,7 @@ fn host_capability_modules(
     let option = option_type(request_type);
     let mut option_module = ModuleBuilder::new();
     option_module
-        .metadata(host, schema)
+        .metadata(host, StateSchema::default().fingerprint())
         .enum_type(option.clone());
     add_void_function(&mut option_module, vec![ValueType::Named(option.type_id)]);
     modules.push(verify_round_trip(option_module.finish()));
@@ -1488,7 +1989,7 @@ fn host_capability_modules(
     let result = result_type(ValueType::I32, host_error);
     let mut result_module = ModuleBuilder::new();
     result_module
-        .metadata(host, schema)
+        .metadata(host, StateSchema::default().fingerprint())
         .enum_type(result.clone());
     add_void_function(&mut result_module, vec![ValueType::Named(result.type_id)]);
     modules.push(verify_round_trip(result_module.finish()));
@@ -1508,7 +2009,7 @@ fn host_capability_modules(
     };
     let mut struct_module = ModuleBuilder::new();
     struct_module
-        .metadata(host, schema)
+        .metadata(host, StateSchema::default().fingerprint())
         .struct_type(snapshot_content)
         .snapshot_type(snapshot)
         .struct_type(structure.clone());
@@ -1529,7 +2030,7 @@ fn host_capability_modules(
     };
     let mut enum_module = ModuleBuilder::new();
     enum_module
-        .metadata(host, schema)
+        .metadata(host, StateSchema::default().fingerprint())
         .enum_type(enumeration.clone());
     add_void_function(
         &mut enum_module,

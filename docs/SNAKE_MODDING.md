@@ -2,11 +2,24 @@
 
 Snake M2 accepts trusted local packages placed under
 `examples/snake-game/packages/mods/<package>/`. Each package contains
-`package.toml` and a Nexa entry source, uses the shared `snake_api.nidl`, and
+`package.toml` and a `src/` Source Module tree, uses the shared
+`snake_api.nidl`, and
 exports:
 
 ```nidl
-export OnEvent(event: SnakeEvent) -> Array<SnakeCommand>;
+export OnEvent(event: SnakeEvent) -> array<SnakeCommand>;
+```
+
+The corresponding Entry Module keeps every Host symbol behind the imported
+namespace and exposes the Required Export publicly:
+
+```nexa
+module community.example;
+import host as snake;
+
+pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+    return [];
+}
 ```
 
 This is a reviewed developer extension mechanism, not a hostile-code sandbox
@@ -37,17 +50,22 @@ ID as your own.
 ## Manifest
 
 ```toml
-schema = 1
+schema = 2
+kind = "application"
 id = "community.example"
 name = "Example"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "community.example"
 priority = 100
 activation = "user-controlled"
-state_schema = "v1"
 handler_fuel = 20000
 capabilities = ["ui.register", "ui.update"]
 ```
+
+The Entry above maps to `src/community/example.nexa`, whose first declaration
+is `module community.example;`. Host access is explicit:
+`import host as snake;`.
 
 Local Mods cannot request entitlements and cannot exceed the public Mod
 capability ceiling.

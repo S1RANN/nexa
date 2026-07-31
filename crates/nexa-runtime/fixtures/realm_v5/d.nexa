@@ -1,5 +1,5 @@
 module realm.v5.d;
-import host;
+import host as fixture_host;
 
 @stateful(4) class ModelState {
     value: i32;
@@ -8,7 +8,7 @@ import host;
     final_value: i32;
 }
 
-cleanup fn finalize(value: i32) -> i32 {
+pub cleanup fn finalize(value: i32) -> i32 {
     return value;
 }
 
@@ -31,17 +31,17 @@ task fn explicit(value: i32) -> i32 {
     return value;
 }
 
-task fn request(value: i32) -> Result<i32, WaitError> {
+task fn request(value: i32) -> Result<i32, fixture_host.WaitError> {
     defer finalize(value);
     for index in 0..8 {
         value + index;
     }
     yield;
-    let completed: i32 = await host.wait(value)?;
+    let completed: i32 = await fixture_host.wait(value)?;
     return Ok(completed);
 }
 
-migration fn migrate() -> bool {
+pub migration fn migrate() -> bool {
     let old_state: ModelState = old.get<ModelState>(seed);
     let value: i32 = old.field<i32>(old_state, ModelState.value);
     let replacement: i32 = old.field<i32>(old_state, ModelState.replacement);
@@ -56,7 +56,7 @@ migration fn migrate() -> bool {
     return true;
 }
 
-@activation fn activate(fail: bool) -> bool {
+@activation pub fn activate(fail: bool) -> bool {
     if fail {
         let trapped: i32 = 1 / 0;
     }

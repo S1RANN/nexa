@@ -191,7 +191,7 @@ pub fn draw_settings(extensions: &SnakeExtensions, selected_item: usize, opened_
             package.name.clone(),
             package.id.to_string(),
             format!("Source: {source}"),
-            format!("Version: {}", package.version.as_str()),
+            format!("Version: {}", package.version),
             if package.activation == nexa_embed::ActivationPolicy::Required {
                 "Activation: Required (cannot disable)".to_owned()
             } else {

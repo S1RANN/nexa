@@ -1,0 +1,8 @@
+schema = 2
+kind = "application"
+id = "diagnostic.nx2702"
+name = "NX2702"
+version = "1.0.0"
+source_root = "src"
+entry = "cycle.a"
+activation = "programmatic"

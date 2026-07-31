@@ -7,12 +7,20 @@ const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
 export const editorsDirectory = path.resolve(scriptsDirectory, "..");
 export const repositoryDirectory = path.resolve(editorsDirectory, "..");
 export const grammarDirectory = path.join(editorsDirectory, "tree-sitter-nexa");
+export const idlGrammarDirectory = path.join(
+  editorsDirectory,
+  "tree-sitter-nexa-idl",
+);
 export const vscodeDirectory = path.join(editorsDirectory, "vscode");
 export const zedDirectory = path.join(editorsDirectory, "zed");
 export const artifactDirectory = path.join(
   repositoryDirectory,
   "target",
   "nexa-editor-support",
+);
+export const packageReportPath = path.join(
+  artifactDirectory,
+  "editor-package-report.json",
 );
 
 export function readSyntax() {
@@ -42,6 +50,7 @@ export function textMateGrammars(syntax = readSyntax()) {
   const nidl = syntax.nidl;
   const nexaKeywordGroups = [
     nexa.declarationKeywords,
+    nexa.visibilityKeywords,
     nexa.effectKeywords,
     nexa.statementKeywords,
   ].flat();
@@ -53,6 +62,7 @@ export function textMateGrammars(syntax = readSyntax()) {
     scopeName: "source.nexa",
     fileTypes: ["nexa"],
     patterns: [
+      { include: "#comments" },
       { include: "#strings" },
       { include: "#runes" },
       { include: "#numbers" },
@@ -69,6 +79,23 @@ export function textMateGrammars(syntax = readSyntax()) {
       { include: "#punctuation" },
     ],
     repository: {
+      comments: {
+        patterns: [
+          {
+            name: "comment.line.documentation.nexa",
+            match: "///.*$",
+          },
+          {
+            name: "comment.line.double-slash.nexa",
+            match: "//.*$",
+          },
+          {
+            name: "comment.block.nexa",
+            begin: "/\\*",
+            end: "\\*/",
+          },
+        ],
+      },
       strings: {
         name: "string.quoted.double.nexa",
         begin: '"',
@@ -76,7 +103,19 @@ export function textMateGrammars(syntax = readSyntax()) {
         patterns: [
           {
             name: "constant.character.escape.nexa",
-            match: "\\\\[nrt\\\\\"]",
+            match: "\\\\(?:[nrt\\\\\"]|\\$\\{)",
+          },
+          {
+            name: "meta.interpolation.nexa",
+            begin: "\\$\\{",
+            beginCaptures: {
+              0: capture("punctuation.section.interpolation.begin.nexa"),
+            },
+            end: "\\}",
+            endCaptures: {
+              0: capture("punctuation.section.interpolation.end.nexa"),
+            },
+            patterns: [{ include: "$self" }],
           },
         ],
       },
@@ -114,10 +153,12 @@ export function textMateGrammars(syntax = readSyntax()) {
         patterns: [
           {
             match:
-              "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)",
+              "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
             captures: {
               1: capture("keyword.control.module.nexa"),
               2: capture("entity.name.namespace.nexa"),
+              3: capture("keyword.control.module.nexa"),
+              4: capture("entity.name.namespace.nexa"),
             },
           },
           {
@@ -134,6 +175,14 @@ export function textMateGrammars(syntax = readSyntax()) {
             captures: {
               1: capture("storage.type.function.nexa"),
               2: capture("entity.name.function.nexa"),
+            },
+          },
+          {
+            match:
+              "\\b(const)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+            captures: {
+              1: capture("storage.modifier.nexa"),
+              2: capture("constant.other.nexa"),
             },
           },
         ],
@@ -185,7 +234,7 @@ export function textMateGrammars(syntax = readSyntax()) {
           },
           {
             name: "keyword.operator.nexa",
-            match: "==|\\.\\.|[+*/=<>?:@-]",
+            match: "&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]",
           },
         ],
       },
@@ -307,7 +356,9 @@ export function copyDirectory(source, destination) {
 
 export function renderZedManifest({
   grammarRepository = grammarDirectory,
+  idlGrammarRepository = idlGrammarDirectory,
   grammarRevision = "local",
+  idlGrammarRevision = "local",
 } = {}) {
   const template = fs.readFileSync(
     path.join(zedDirectory, "extension.toml.in"),
@@ -318,5 +369,10 @@ export function renderZedManifest({
       "{{GRAMMAR_REPOSITORY}}",
       pathToFileURL(grammarRepository).href,
     )
-    .replaceAll("{{GRAMMAR_REVISION}}", grammarRevision);
+    .replaceAll("{{GRAMMAR_REVISION}}", grammarRevision)
+    .replaceAll(
+      "{{IDL_GRAMMAR_REPOSITORY}}",
+      pathToFileURL(idlGrammarRepository).href,
+    )
+    .replaceAll("{{IDL_GRAMMAR_REVISION}}", idlGrammarRevision);
 }

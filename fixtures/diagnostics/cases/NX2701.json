@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2701","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2701","expected":{"primary_text":"wrong.name","secondary_count":0,"message_contains":"module declaration","notes":[]}}

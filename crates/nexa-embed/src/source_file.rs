@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Component, Path};
 
-use nexa_core::{FileId, SourceSpan};
+use nexa::prelude::{FileId, SourceSpan};
 
 /// One immutable source file captured for a package candidate.
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -1,7 +1,7 @@
 use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     HostCallOutcome, HostRegistry, HostTrap, ModuleHandle, RealmConfig, RealmRuntime,
     ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StepConfig,
@@ -10,13 +10,11 @@ use nexa_runtime::{
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 pub const HOST_NAME: &str = "baseline-host";
-pub const SCHEMA_NAME: &str = "baseline-schema";
-
 #[must_use]
-pub fn hashes() -> (StableId, StableId) {
+pub fn hashes() -> (StableId, StateSchemaFingerprint) {
     (
         StableId::from_name(HOST_NAME),
-        StableId::from_name(SCHEMA_NAME),
+        nexa_bytecode::StateSchema::default().fingerprint(),
     )
 }
 
@@ -33,7 +31,12 @@ pub fn verified(functions: Vec<nexa_bytecode::Function>) -> VerifiedModule {
 
 pub fn realm_with(
     code: impl IntoIterator<Item = Instruction>,
-) -> (RealmRuntime, nexa_runtime::ModuleHandle, StableId, StableId) {
+) -> (
+    RealmRuntime,
+    nexa_runtime::ModuleHandle,
+    StableId,
+    StateSchemaFingerprint,
+) {
     let (host, schema) = hashes();
     let mut function = FunctionBuilder::new(
         Signature {

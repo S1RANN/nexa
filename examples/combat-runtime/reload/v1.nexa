@@ -1,4 +1,6 @@
-task fn update(value: i32) -> i32 {
+module game.combat;
+
+pub task fn Update(value: i32) -> i32 {
     return value;
 }
 @stateful(1) class EnemyBrain {

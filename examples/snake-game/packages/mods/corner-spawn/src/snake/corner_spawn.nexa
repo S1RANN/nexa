@@ -1,0 +1,32 @@
+module snake.corner_spawn;
+import host as snake;
+import std.collections as collections;
+
+fn empty() -> Array<snake.SnakeCommand> {
+    return [];
+}
+
+fn register() -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    collections.array_push(commands, snake.RegisterSpawnPolicy("corner"));
+    return commands;
+}
+
+fn propose() -> Array<snake.SnakeCommand> {
+    let commands: Array<snake.SnakeCommand> = [];
+    collections.array_push(commands, snake.ProposeFoodSpawn(snake.Cell { x: 0, y: 0 }));
+    return commands;
+}
+
+pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+    return match event {
+        snake.PackageEnabled(snapshot) => register(),
+        snake.GameStarted(snapshot) => empty(),
+        snake.GameTick(snapshot) => empty(),
+        snake.ScoreChanged(snapshot) => empty(),
+        snake.FoodSpawnRequested(snapshot) => propose(),
+        snake.FoodEaten(snapshot) => empty(),
+        snake.GameEnded(snapshot) => empty(),
+        snake.SettingsChanged(snapshot) => empty(),
+    };
+}

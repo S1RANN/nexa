@@ -1,0 +1,7 @@
+module main;
+
+fn helper() -> i32 {
+    return 1;
+}
+
+pub const VALUE: i32 = helper();

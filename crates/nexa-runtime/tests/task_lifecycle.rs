@@ -2,20 +2,24 @@ use std::sync::{Arc, Mutex};
 
 use nexa_bytecode::{
     AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-    ModuleBuilder, RootMap, Signature, ValueType,
+    ModuleBuilder, RootMap, Signature, SourceMapEntry, StandardIntrinsic, StructField, StructType,
+    ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{FileId, SourceSpan, StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostRegistry,
-    HostRequestError, HostTrap, PendingHostRequest, RealmConfig, RealmError, RealmRuntime,
-    ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs,
-    RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
-    YieldReason,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostPayload,
+    HostRegistry, HostRequestError, HostTrap, Object, PendingHostRequest, RealmConfig, RealmError,
+    RealmRuntime, ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint, RuntimeHost,
+    RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
+    TaskTerminalReason, TickBudget, YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const HOST: StableId = StableId(0x5441_534b_484f_5354);
-const SCHEMA: StableId = StableId(0x5441_534b_5354_4154);
+
+fn schema() -> StateSchemaFingerprint {
+    nexa_bytecode::StateSchema::default().fingerprint()
+}
 
 struct AsyncRegistry {
     pending: Arc<Mutex<Option<PendingHostRequest>>>,
@@ -90,7 +94,7 @@ fn async_module() -> VerifiedModule {
         },
     ];
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA).enum_type(result);
+    module.metadata(HOST, schema()).enum_type(result);
     module.host_import(HostImport {
         stable_id: StableId::from_name("TaskHost::request"),
         parameters: Vec::new(),
@@ -101,6 +105,93 @@ fn async_module() -> VerifiedModule {
     });
     module.function(function);
     verify(module.finish(), VerifierLimits::default()).expect("verified async module")
+}
+
+fn async_nominal_result_module() -> VerifiedModule {
+    let trace_type = StableId::from_name("Trace");
+    let payload_type = StableId::from_name("Payload");
+    let failure_type = StableId::from_name("Failure");
+    let payload = ValueType::Named(payload_type);
+    let failure = ValueType::Named(failure_type);
+    let result = nexa_bytecode::result_type(payload, failure);
+    let async_result = AsyncResultType {
+        result_type: result.type_id,
+        success: payload,
+        error: failure,
+        cancel_policy: nexa_bytecode::CancelPolicy::CancelTask,
+        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+        cancel_error: None,
+        abandon_error: None,
+    };
+    let mut function = FunctionBuilder::new(
+        Signature {
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(result.type_id)),
+        },
+        1,
+    );
+    function
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::HostCall {
+            import: 0,
+            args_base: 0,
+            args_count: 0,
+            dst: 0,
+        })
+        .emit(Instruction::Return { source: 0 });
+    let mut function = function.finish().expect("async nominal error function");
+    function.root_bitmap[0] = true;
+    function.safepoints = vec![0, 1];
+    function.root_maps = vec![
+        RootMap {
+            pc: 0,
+            bitmap: vec![false],
+        },
+        RootMap {
+            pc: 1,
+            bitmap: vec![true],
+        },
+    ];
+    let mut module = ModuleBuilder::new();
+    module
+        .metadata(HOST, schema())
+        .struct_type(StructType {
+            type_id: payload_type,
+            fields: vec![
+                StructField {
+                    stable_id: StableId::from_parts(&["Payload", "::ticket"]),
+                    ty: ValueType::Named(trace_type),
+                },
+                StructField {
+                    stable_id: StableId::from_parts(&["Payload", "::label"]),
+                    ty: ValueType::String,
+                },
+            ],
+        })
+        .struct_type(StructType {
+            type_id: failure_type,
+            fields: vec![
+                StructField {
+                    stable_id: StableId::from_parts(&["Failure", "::trace"]),
+                    ty: ValueType::Named(trace_type),
+                },
+                StructField {
+                    stable_id: StableId::from_parts(&["Failure", "::message"]),
+                    ty: ValueType::String,
+                },
+            ],
+        })
+        .enum_type(result)
+        .host_import(HostImport {
+            stable_id: StableId::from_name("TaskHost::typed_error"),
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(async_result.result_type)),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+            async_result: Some(async_result),
+        });
+    module.function(function);
+    verify(module.finish(), VerifierLimits::default()).expect("verified nominal-result module")
 }
 
 fn immediate_module() -> VerifiedModule {
@@ -116,7 +207,7 @@ fn immediate_module() -> VerifiedModule {
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
     module
-        .metadata(HOST, SCHEMA)
+        .metadata(HOST, schema())
         .function(function.finish().expect("immediate function"));
     verify(module.finish(), VerifierLimits::default()).expect("verified immediate module")
 }
@@ -135,9 +226,71 @@ fn yielding_module() -> VerifiedModule {
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
     module
-        .metadata(HOST, SCHEMA)
+        .metadata(HOST, schema())
         .function(function.finish().expect("yielding function"));
     verify(module.finish(), VerifierLimits::default()).expect("verified yielding module")
+}
+
+fn nested_budget_module() -> VerifiedModule {
+    let mut entry = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::F64],
+            result: Some(ValueType::F64),
+        },
+        2,
+    );
+    entry
+        .effect(FunctionEffect::Task)
+        .emit(Instruction::Call {
+            function: 1,
+            args_base: 0,
+            args_count: 1,
+            dst: 1,
+        })
+        .emit(Instruction::Return { source: 1 });
+    let mut callee = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::F64],
+            result: Some(ValueType::F64),
+        },
+        2,
+    );
+    callee
+        .emit(Instruction::StandardIntrinsic {
+            intrinsic: StandardIntrinsic::F64Sin,
+            args_base: 0,
+            args_count: 1,
+            dst: 1,
+        })
+        .emit(Instruction::Return { source: 1 });
+    let caller_call = SourceSpan::new(FileId(4), 10, 20);
+    let caller_return = SourceSpan::new(FileId(4), 21, 27);
+    let callee_intrinsic = SourceSpan::new(FileId(5), 40, 52);
+    let mut module = ModuleBuilder::new();
+    module.metadata(HOST, schema());
+    module.function(entry.finish().expect("entry"));
+    module.function(callee.finish().expect("callee"));
+    module.source_map([
+        SourceMapEntry {
+            function: 0,
+            pc_start: 0,
+            pc_end: 1,
+            span: caller_call,
+        },
+        SourceMapEntry {
+            function: 0,
+            pc_start: 1,
+            pc_end: 2,
+            span: caller_return,
+        },
+        SourceMapEntry {
+            function: 1,
+            pc_start: 0,
+            pc_end: 1,
+            span: callee_intrinsic,
+        },
+    ]);
+    verify(module.finish(), VerifierLimits::default()).expect("verified budget module")
 }
 
 fn config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
@@ -148,6 +301,60 @@ fn config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
         cumulative_budget: 1_024,
         limits: TaskLimits::default(),
     }
+}
+
+#[test]
+fn budget_exhaustion_retains_exact_leaf_to_root_stack_and_final_charge() {
+    let (mut realm, module, _, _) = hosted(nested_budget_module(), RealmConfig::default(), false);
+    let scope = realm.create_scope(None).expect("scope");
+    let task = realm
+        .spawn_task(
+            module,
+            0,
+            &[RuntimeValue::F64(0.5_f64.to_bits())],
+            StepConfig {
+                owner: scope,
+                priority: 1,
+                fuel_slice: 64,
+                cumulative_budget: 8,
+                limits: TaskLimits::default(),
+            },
+        )
+        .expect("task");
+    assert_eq!(
+        realm.poll_task(task, 64),
+        Ok(TaskPoll::Cancelled(CancelReason::BudgetExceeded))
+    );
+
+    let terminal = realm.terminal_record(task).expect("terminal record");
+    assert_eq!(
+        terminal.reason,
+        TaskTerminalReason::Cancelled(CancelReason::BudgetExceeded)
+    );
+    assert_eq!(terminal.final_charge.instructions, 1);
+    assert_eq!(terminal.final_charge.fuel_used, 1);
+    let stack = terminal
+        .script_call_stack
+        .as_ref()
+        .expect("budget exhaustion stack")
+        .as_slice();
+    assert_eq!(
+        stack,
+        [
+            nexa_runtime::ScriptFrame {
+                function: 1,
+                pc: 0,
+                call_site_pc: None,
+                source_span: Some(SourceSpan::new(FileId(5), 40, 52)),
+            },
+            nexa_runtime::ScriptFrame {
+                function: 0,
+                pc: 1,
+                call_site_pc: Some(0),
+                source_span: Some(SourceSpan::new(FileId(4), 10, 20)),
+            },
+        ]
+    );
 }
 
 fn hosted(
@@ -172,7 +379,7 @@ fn hosted(
     )
     .expect("hosted realm");
     let module = realm
-        .load_module(module, HOST, SCHEMA)
+        .load_module(module, HOST, schema())
         .expect("loaded module");
     (realm, module, host, pending)
 }
@@ -186,6 +393,108 @@ fn spawn(
     realm
         .spawn_task(module, 0, arguments, config(scope))
         .expect("task")
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RetainedNominalResult {
+    task: TaskHandle,
+    result: nexa_runtime::GcRef,
+    payload: nexa_runtime::GcRef,
+    text: nexa_runtime::GcRef,
+}
+
+fn complete_nominal_result_and_collect(
+    realm: &mut RealmRuntime,
+    module: nexa_runtime::ModuleHandle,
+    ticket: u64,
+    label: &str,
+) -> (RetainedNominalResult, nexa_runtime::CollectionStats) {
+    let task = spawn(realm, module, &[]);
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait for nominal result")
+    else {
+        panic!("nominal result task must wait for its Host request");
+    };
+    assert_eq!(
+        realm
+            .complete_request(
+                request,
+                HostCompletionResult::Success(HostPayload::structure([
+                    HostPayload::Opaque(ticket),
+                    HostPayload::String(label.into()),
+                ])),
+            )
+            .expect("complete nominal result"),
+        nexa_runtime::CompletionDisposition::Delivered
+    );
+    let report = realm
+        .tick(TickBudget {
+            max_tasks: 1,
+            frame_fuel_budget: 64,
+            collect_garbage: true,
+        })
+        .expect("complete and collect nominal result");
+    assert_eq!(report.completed, 1);
+    let collection = report.collection.expect("tick requested collection");
+
+    let value = match &realm
+        .terminal_record(task)
+        .expect("completed task retains a tombstone")
+        .reason
+    {
+        TaskTerminalReason::Completed(Some(value)) => *value,
+        reason => panic!("unexpected nominal terminal reason: {reason:?}"),
+    };
+    let RuntimeValue::NamedRef {
+        reference: result, ..
+    } = value
+    else {
+        panic!("nominal task must return its Result object");
+    };
+    let Object::Enum {
+        payload: Some(RuntimeValue::Struct {
+            reference: payload, ..
+        }),
+        ..
+    } = realm
+        .resolve_heap_object(result)
+        .expect("retained Result remains resolvable")
+    else {
+        panic!("Result::Ok must retain its Struct payload");
+    };
+    let payload = *payload;
+    let Object::Struct {
+        fields,
+        field_count,
+        ..
+    } = realm
+        .resolve_heap_object(payload)
+        .expect("retained Struct remains resolvable")
+    else {
+        panic!("Result payload must be a Struct");
+    };
+    assert_eq!(*field_count, 2);
+    let RuntimeValue::String {
+        reference: text, ..
+    } = fields[1]
+    else {
+        panic!("Struct payload must retain its String field");
+    };
+    assert!(matches!(
+        realm
+            .resolve_heap_object(text)
+            .expect("retained String remains resolvable"),
+        Object::String(value) if value == label
+    ));
+
+    (
+        RetainedNominalResult {
+            task,
+            result,
+            payload,
+            text,
+        },
+        collection,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -284,7 +593,7 @@ fn host_error_is_a_typed_completion() {
         realm
             .complete_request(
                 request,
-                HostCompletionResult::Error(HostErrorPayload { code: 7 }),
+                HostCompletionResult::Error(HostErrorPayload::Code(7)),
             )
             .expect("host error"),
         nexa_runtime::CompletionDisposition::Delivered
@@ -294,6 +603,197 @@ fn host_error_is_a_typed_completion() {
         Ok(TaskPoll::Completed(_))
     ));
     assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
+}
+
+#[test]
+fn host_error_preserves_the_declared_nominal_payload() {
+    let (mut realm, module, host, _) =
+        hosted(async_nominal_result_module(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
+        panic!("request handle must only come from Waiting");
+    };
+    realm
+        .complete_request(
+            request,
+            HostCompletionResult::Error(HostErrorPayload::Value(HostPayload::structure([
+                HostPayload::Opaque(41),
+                HostPayload::String("typed failure".into()),
+            ]))),
+        )
+        .expect("typed Host error");
+    let TaskPoll::Completed(RuntimeValue::NamedRef { reference, type_id }) = realm
+        .poll_task(task, 64)
+        .expect("completed typed Host error")
+    else {
+        panic!("typed Host error must complete with Result::Err");
+    };
+    let Object::Enum {
+        type_id: stored_result_type,
+        tag,
+        payload:
+            Some(RuntimeValue::Struct {
+                reference: failure,
+                type_id: failure_type,
+                ..
+            }),
+        ..
+    } = realm.resolve_heap_object(reference).expect("Result object")
+    else {
+        panic!("typed Host error must materialize the verified Result and struct layouts");
+    };
+    assert_eq!(*stored_result_type, type_id);
+    assert_eq!(*tag, 1);
+    let Object::Struct {
+        type_id: stored_failure_type,
+        fields,
+        field_count,
+        ..
+    } = realm.resolve_heap_object(*failure).expect("Failure object")
+    else {
+        panic!("Result::Err payload must retain the nominal Failure struct");
+    };
+    assert_eq!(*stored_failure_type, *failure_type);
+    assert_eq!(*field_count, 2);
+    assert_eq!(
+        fields[0],
+        RuntimeValue::Opaque {
+            value: 41,
+            type_id: StableId::from_name("Trace"),
+        }
+    );
+    assert!(matches!(fields[1], RuntimeValue::String { .. }));
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
+}
+
+#[test]
+fn host_success_preserves_the_declared_nominal_payload() {
+    let (mut realm, module, host, _) =
+        hosted(async_nominal_result_module(), RealmConfig::default(), false);
+    let task = spawn(&mut realm, module, &[]);
+    let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
+        panic!("request handle must only come from Waiting");
+    };
+    realm
+        .complete_request(
+            request,
+            HostCompletionResult::Success(HostPayload::structure([
+                HostPayload::Opaque(73),
+                HostPayload::String("typed success".into()),
+            ])),
+        )
+        .expect("typed Host success");
+    let TaskPoll::Completed(RuntimeValue::NamedRef { reference, type_id }) = realm
+        .poll_task(task, 64)
+        .expect("completed typed Host success")
+    else {
+        panic!("typed Host success must complete with Result::Ok");
+    };
+    let Object::Enum {
+        type_id: stored_result_type,
+        tag,
+        payload:
+            Some(RuntimeValue::Struct {
+                reference: payload,
+                type_id: payload_type,
+                ..
+            }),
+        ..
+    } = realm.resolve_heap_object(reference).expect("Result object")
+    else {
+        panic!("typed Host success must materialize the verified Result and struct layouts");
+    };
+    assert_eq!(*stored_result_type, type_id);
+    assert_eq!(*tag, 0);
+    let Object::Struct {
+        type_id: stored_payload_type,
+        fields,
+        field_count,
+        ..
+    } = realm.resolve_heap_object(*payload).expect("Payload object")
+    else {
+        panic!("Result::Ok payload must retain the nominal Payload struct");
+    };
+    assert_eq!(*stored_payload_type, *payload_type);
+    assert_eq!(*field_count, 2);
+    assert_eq!(
+        fields[0],
+        RuntimeValue::Opaque {
+            value: 73,
+            type_id: StableId::from_name("Trace"),
+        }
+    );
+    assert!(matches!(fields[1], RuntimeValue::String { .. }));
+    assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
+}
+
+#[test]
+fn completed_tombstones_root_nested_results_until_eviction() {
+    let config = RealmConfig {
+        tombstone_capacity: 1,
+        ..RealmConfig::default()
+    };
+    let (mut realm, module, host, _) = hosted(async_nominal_result_module(), config, false);
+
+    let (first, first_collection) =
+        complete_nominal_result_and_collect(&mut realm, module, 11, "first retained result");
+    assert_eq!(
+        first_collection,
+        nexa_runtime::CollectionStats {
+            marked: 3,
+            reclaimed: 0,
+            live: 3,
+        }
+    );
+
+    let eviction_module = realm
+        .load_module(immediate_module(), HOST, schema())
+        .expect("load tombstone eviction module");
+    let eviction_task = spawn(&mut realm, eviction_module, &[RuntimeValue::I32(7)]);
+    let eviction_report = realm
+        .tick(TickBudget {
+            max_tasks: 1,
+            frame_fuel_budget: 64,
+            collect_garbage: true,
+        })
+        .expect("evict and collect the older tombstone");
+    assert_eq!(eviction_report.completed, 1);
+    assert_eq!(
+        eviction_report.collection,
+        Some(nexa_runtime::CollectionStats {
+            marked: 0,
+            reclaimed: 3,
+            live: 0,
+        })
+    );
+    assert!(matches!(
+        realm
+            .terminal_record(eviction_task)
+            .map(|record| &record.reason),
+        Some(TaskTerminalReason::Completed(Some(RuntimeValue::I32(7))))
+    ));
+    assert_eq!(
+        realm.collect_garbage().expect("repeat empty collection"),
+        nexa_runtime::CollectionStats {
+            marked: 0,
+            reclaimed: 0,
+            live: 0,
+        }
+    );
+    assert!(
+        realm.terminal_record(first.task).is_none(),
+        "capacity-one tombstones evict the older terminal result"
+    );
+    for reclaimed in [first.result, first.payload, first.text] {
+        assert!(
+            realm.resolve_heap_object(reclaimed).is_err(),
+            "the evicted terminal object graph must be reclaimable"
+        );
+    }
+    let _ = host.drain_releases();
+    drop(realm);
+    let _ = host.begin_close();
+    host.try_finish_close().expect("close runtime host");
 }
 
 #[test]
@@ -307,7 +807,7 @@ fn completion_is_idempotent_and_releases_once() {
         realm
             .complete_request(
                 request,
-                HostCompletionResult::Error(HostErrorPayload { code: 3 }),
+                HostCompletionResult::Error(HostErrorPayload::Code(3)),
             )
             .expect("first completion"),
         nexa_runtime::CompletionDisposition::Delivered
@@ -315,7 +815,7 @@ fn completion_is_idempotent_and_releases_once() {
     assert_request_error(
         realm.complete_request(
             request,
-            HostCompletionResult::Error(HostErrorPayload { code: 4 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(4)),
         ),
         HostRequestError::AlreadyCompleted,
     );
@@ -350,14 +850,14 @@ fn request_handle_errors_are_distinct() {
     assert_request_error(
         foreign.complete_request(
             first_request,
-            HostCompletionResult::Error(HostErrorPayload { code: 1 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(1)),
         ),
         HostRequestError::CrossRealmHostRequestHandle,
     );
     first
         .complete_request(
             first_request,
-            HostCompletionResult::Error(HostErrorPayload { code: 1 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(1)),
         )
         .expect("complete first");
     let mut first_physical = pending
@@ -379,7 +879,7 @@ fn request_handle_errors_are_distinct() {
     first
         .complete_request(
             second_request,
-            HostCompletionResult::Error(HostErrorPayload { code: 2 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(2)),
         )
         .expect("complete second");
     assert!(matches!(
@@ -389,7 +889,7 @@ fn request_handle_errors_are_distinct() {
     assert_request_error(
         first.complete_request(
             first_request,
-            HostCompletionResult::Error(HostErrorPayload { code: 9 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(9)),
         ),
         HostRequestError::StaleHostRequestHandle,
     );
@@ -433,7 +933,7 @@ fn reload_detached_request_is_reported_distinctly() {
     assert_request_error(
         realm.complete_request(
             request,
-            HostCompletionResult::Error(HostErrorPayload { code: 8 }),
+            HostCompletionResult::Error(HostErrorPayload::Code(8)),
         ),
         HostRequestError::DetachedByReload,
     );
@@ -569,8 +1069,7 @@ fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle, RuntimeHost) {
             return next;
         }
     ";
-    let module =
-        nexa_compiler::compile_with_metadata(source, HOST, SCHEMA).expect("cleanup module");
+    let module = nexa_compiler::compile_with_metadata(source, HOST).expect("cleanup module");
     let (realm, handle, host, _) = hosted(module, RealmConfig::default(), false);
     (realm, handle, host)
 }

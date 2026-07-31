@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2603","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2603.nexa","expected":{"primary_text":"{ old.get<i32>(legacy); finish_migration(); return true; }","secondary_count":0,"message_contains":"missing forwarding","notes":["missing stable ID:"]}}
+{"version":1,"code":"NX2603","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2603.nexa","expected":{"primary_text":"{ old.get<i32>(legacy); finish_migration(); return true; }","secondary_count":0,"message_contains":"Missing forwarding","notes":["missing stable ID:"]}}

@@ -35,4 +35,12 @@ if (result.status !== 0) {
   process.exit(result.status ?? 1);
 }
 
+const archive = fs.readFileSync(output);
+if (
+  archive.length < 1024 ||
+  !archive.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]))
+) {
+  throw new Error(`vsce did not produce a valid non-empty VSIX archive at ${output}`);
+}
+
 console.log(output);

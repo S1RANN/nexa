@@ -7,16 +7,11 @@ publish.workspace = true
 
 [dependencies]
 nexa = { path = "../nexa" }
-nexa-bytecode = { path = "../nexa-bytecode" }
-nexa-compiler = { path = "../nexa-compiler" }
-nexa-core = { path = "../nexa-core" }
-nexa-idl = { path = "../nexa-idl" }
+nexa-analysis = { path = "../nexa-analysis" }
 nexa-embed = { path = "../nexa-embed" }
 nexa-machine = { path = "../nexa-machine" }
 nexa-migrate = { path = "../nexa-migrate" }
 nexa-model = { path = "../nexa-model" }
-nexa-runtime = { path = "../nexa-runtime" }
-nexa-verifier = { path = "../nexa-verifier" }
 serde_json.workspace = true
 serde.workspace = true
 toml.workspace = true

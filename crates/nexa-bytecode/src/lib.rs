@@ -3,12 +3,29 @@
 use std::collections::BTreeSet;
 use std::fmt;
 
-use nexa_core::{FileId, SourceSpan, StableId};
+use nexa_core::{
+    CanonicalStateField, CanonicalStateSchema, CanonicalStateType, CanonicalValueType, FileId,
+    SourceSpan, StableId, StateSchemaFingerprint,
+};
 
 pub const MAGIC: [u8; 4] = *b"NXBC";
-pub const BYTECODE_VERSION: u16 = 4;
+/// Current wire-format version.
+///
+/// Version 5 adds deterministic scalar-to-string instructions for string
+/// interpolation. The decoder intentionally accepts only the current version:
+/// bytecode is an internal package artifact and has no cross-version decoding
+/// compatibility promise.
+pub use nexa_core::BYTECODE_VERSION;
 pub const MAX_STRUCT_FIELDS: usize = 16;
 pub const MAX_CLASS_FIELDS: usize = 16;
+/// Fixed stack buffer used by scalar-to-string lowering.
+///
+/// Fuel charges the complete buffer bound before formatting starts, so
+/// formatting, copying into the VM heap, and hashing the result cannot perform
+/// unmetered value-dependent work.
+pub const SCALAR_TO_STRING_BUFFER_BYTES: usize = 64;
+pub const SCALAR_TO_STRING_MAX_BYTES: u64 = 64;
+pub const SCALAR_TO_STRING_FUEL_PASSES: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -108,6 +125,420 @@ impl ValueType {
     #[must_use]
     pub const fn is_reference(self) -> bool {
         matches!(self, Self::String | Self::Ref | Self::Named(_))
+    }
+}
+
+/// A versioned, typed operation supplied by Nexa's capability-free standard
+/// library.
+///
+/// Generic source functions are monomorphized before bytecode emission. Their
+/// concrete types are retained here so the verifier can prove the complete
+/// register signature without trusting the compiler or resolving source-level
+/// names at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardIntrinsic {
+    OptionIsSome {
+        value: ValueType,
+    },
+    OptionIsNone {
+        value: ValueType,
+    },
+    ResultIsOk {
+        success: ValueType,
+        error: ValueType,
+    },
+    ResultIsErr {
+        success: ValueType,
+        error: ValueType,
+    },
+    OptionUnwrapOr {
+        value: ValueType,
+    },
+    ResultUnwrapOr {
+        success: ValueType,
+        error: ValueType,
+    },
+    F32Floor,
+    F64Floor,
+    F32Ceil,
+    F64Ceil,
+    F32Round,
+    F64Round,
+    F32Sqrt,
+    F64Sqrt,
+    F32Sin,
+    F64Sin,
+    F32Cos,
+    F64Cos,
+    StringContains,
+    StringStartsWith,
+    StringEndsWith,
+    StringLen,
+    StringByteLen,
+    StringSubstring,
+    StringTrim,
+    StringSplit,
+    ArrayLen {
+        element: ValueType,
+    },
+    ArrayIsEmpty {
+        element: ValueType,
+    },
+    ArrayGet {
+        element: ValueType,
+    },
+    ArrayPush {
+        element: ValueType,
+    },
+    ArrayPop {
+        element: ValueType,
+    },
+    MapLen {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapContains {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapGet {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapInsert {
+        key: ValueType,
+        value: ValueType,
+    },
+    MapRemove {
+        key: ValueType,
+        value: ValueType,
+    },
+    DebugAssert,
+    DebugTrap,
+}
+
+/// Runtime work that must be added to an intrinsic's fixed base fuel before
+/// the instruction is allowed to execute.
+///
+/// This policy is bytecode metadata rather than an interpreter detail: the
+/// verifier uses it to reject variable-work intrinsics from effects whose
+/// worst-case cost cannot be proven without a bound resource profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StandardIntrinsicFuelModel {
+    Fixed,
+    /// Scan one or more string arguments in 32-byte work blocks.
+    StringBytes {
+        argument_count: u8,
+        passes: u8,
+    },
+    /// Scan and copy a string split, including its bounded result objects.
+    StringSplit,
+    /// Copy the current array range in 8-element work blocks.
+    ArrayCopy,
+    /// Scan the current map storage in 8-slot work blocks.
+    MapLookup,
+    /// Charge only the work performed by the current insert/rehash attempt.
+    MapInsertAttempt,
+}
+
+impl StandardIntrinsicFuelModel {
+    #[must_use]
+    pub const fn is_variable(self) -> bool {
+        !matches!(self, Self::Fixed)
+    }
+}
+
+pub const STANDARD_STRING_FUEL_BLOCK_BYTES: u64 = 32;
+pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
+
+impl StandardIntrinsic {
+    #[must_use]
+    pub const fn canonical_name(self) -> &'static str {
+        match self {
+            Self::OptionIsSome { .. } => "intrinsic.option.is_some.v1",
+            Self::OptionIsNone { .. } => "intrinsic.option.is_none.v1",
+            Self::ResultIsOk { .. } => "intrinsic.result.is_ok.v1",
+            Self::ResultIsErr { .. } => "intrinsic.result.is_err.v1",
+            Self::OptionUnwrapOr { .. } => "intrinsic.option.unwrap_or.v1",
+            Self::ResultUnwrapOr { .. } => "intrinsic.result.unwrap_or.v1",
+            Self::F32Floor => "intrinsic.math.f32.floor.v1",
+            Self::F64Floor => "intrinsic.math.f64.floor.v1",
+            Self::F32Ceil => "intrinsic.math.f32.ceil.v1",
+            Self::F64Ceil => "intrinsic.math.f64.ceil.v1",
+            Self::F32Round => "intrinsic.math.f32.round.v1",
+            Self::F64Round => "intrinsic.math.f64.round.v1",
+            Self::F32Sqrt => "intrinsic.math.f32.sqrt.v1",
+            Self::F64Sqrt => "intrinsic.math.f64.sqrt.v1",
+            Self::F32Sin => "intrinsic.math.f32.sin.v1",
+            Self::F64Sin => "intrinsic.math.f64.sin.v1",
+            Self::F32Cos => "intrinsic.math.f32.cos.v1",
+            Self::F64Cos => "intrinsic.math.f64.cos.v1",
+            Self::StringContains => "intrinsic.string.contains.v1",
+            Self::StringStartsWith => "intrinsic.string.starts_with.v1",
+            Self::StringEndsWith => "intrinsic.string.ends_with.v1",
+            Self::StringLen => "intrinsic.string.len_scalar.v1",
+            Self::StringByteLen => "intrinsic.string.byte_len_utf8.v1",
+            Self::StringSubstring => "intrinsic.string.substring_scalar.v1",
+            Self::StringTrim => "intrinsic.string.trim_unicode.v1",
+            Self::StringSplit => "intrinsic.string.split_exact.v1",
+            Self::ArrayLen { .. } => "intrinsic.array.len.v1",
+            Self::ArrayIsEmpty { .. } => "intrinsic.array.is_empty.v1",
+            Self::ArrayGet { .. } => "intrinsic.array.get.v1",
+            Self::ArrayPush { .. } => "intrinsic.array.push.v1",
+            Self::ArrayPop { .. } => "intrinsic.array.pop.v1",
+            Self::MapLen { .. } => "intrinsic.map.len.v1",
+            Self::MapContains { .. } => "intrinsic.map.contains.v1",
+            Self::MapGet { .. } => "intrinsic.map.get.v1",
+            Self::MapInsert { .. } => "intrinsic.map.insert.v1",
+            Self::MapRemove { .. } => "intrinsic.map.remove.v1",
+            Self::DebugAssert => "intrinsic.debug.assert.v1",
+            Self::DebugTrap => "intrinsic.debug.trap.v1",
+        }
+    }
+
+    #[must_use]
+    pub const fn argument_count(self) -> u16 {
+        match self {
+            Self::OptionIsSome { .. }
+            | Self::OptionIsNone { .. }
+            | Self::ResultIsOk { .. }
+            | Self::ResultIsErr { .. }
+            | Self::F32Floor
+            | Self::F64Floor
+            | Self::F32Ceil
+            | Self::F64Ceil
+            | Self::F32Round
+            | Self::F64Round
+            | Self::F32Sqrt
+            | Self::F64Sqrt
+            | Self::F32Sin
+            | Self::F64Sin
+            | Self::F32Cos
+            | Self::F64Cos
+            | Self::StringLen
+            | Self::StringByteLen
+            | Self::StringTrim
+            | Self::ArrayLen { .. }
+            | Self::ArrayIsEmpty { .. }
+            | Self::ArrayPop { .. }
+            | Self::MapLen { .. }
+            | Self::DebugAssert
+            | Self::DebugTrap => 1,
+            Self::OptionUnwrapOr { .. }
+            | Self::ResultUnwrapOr { .. }
+            | Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith
+            | Self::StringSplit
+            | Self::ArrayGet { .. }
+            | Self::ArrayPush { .. }
+            | Self::MapContains { .. }
+            | Self::MapGet { .. }
+            | Self::MapRemove { .. } => 2,
+            Self::StringSubstring | Self::MapInsert { .. } => 3,
+        }
+    }
+
+    #[must_use]
+    pub fn argument_type(self, index: u16) -> Option<ValueType> {
+        let option = |value| ValueType::Named(option_type(value).type_id);
+        let result = |success, error| ValueType::Named(result_type(success, error).type_id);
+        let array = |element| ValueType::Named(array_type(element));
+        let map = |key, value| ValueType::Named(map_type(key, value));
+        match (self, index) {
+            (
+                Self::OptionIsSome { value }
+                | Self::OptionIsNone { value }
+                | Self::OptionUnwrapOr { value },
+                0,
+            ) => Some(option(value)),
+            (Self::ResultIsOk { success, error } | Self::ResultIsErr { success, error }, 0) => {
+                Some(result(success, error))
+            }
+            (Self::ResultUnwrapOr { success, error }, 0) => Some(result(success, error)),
+            (
+                Self::OptionUnwrapOr { value: ty }
+                | Self::ResultUnwrapOr { success: ty, .. }
+                | Self::ArrayPush { element: ty }
+                | Self::MapContains { key: ty, .. }
+                | Self::MapGet { key: ty, .. }
+                | Self::MapRemove { key: ty, .. }
+                | Self::MapInsert { key: ty, .. },
+                1,
+            )
+            | (Self::MapInsert { value: ty, .. }, 2) => Some(ty),
+            (
+                Self::F32Floor
+                | Self::F32Ceil
+                | Self::F32Round
+                | Self::F32Sqrt
+                | Self::F32Sin
+                | Self::F32Cos,
+                0,
+            ) => Some(ValueType::F32),
+            (
+                Self::F64Floor
+                | Self::F64Ceil
+                | Self::F64Round
+                | Self::F64Sqrt
+                | Self::F64Sin
+                | Self::F64Cos,
+                0,
+            ) => Some(ValueType::F64),
+            (
+                Self::StringContains
+                | Self::StringStartsWith
+                | Self::StringEndsWith
+                | Self::StringSplit,
+                0 | 1,
+            )
+            | (
+                Self::StringSubstring
+                | Self::StringLen
+                | Self::StringByteLen
+                | Self::StringTrim
+                | Self::DebugTrap,
+                0,
+            ) => Some(ValueType::String),
+            (Self::StringSubstring, 1 | 2) | (Self::ArrayGet { .. }, 1) => Some(ValueType::I32),
+            (
+                Self::ArrayLen { element }
+                | Self::ArrayIsEmpty { element }
+                | Self::ArrayGet { element }
+                | Self::ArrayPush { element }
+                | Self::ArrayPop { element },
+                0,
+            ) => Some(array(element)),
+            (
+                Self::MapLen { key, value }
+                | Self::MapContains { key, value }
+                | Self::MapGet { key, value }
+                | Self::MapRemove { key, value }
+                | Self::MapInsert { key, value },
+                0,
+            ) => Some(map(key, value)),
+            (Self::DebugAssert, 0) => Some(ValueType::Bool),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn result_type(self) -> ValueType {
+        match self {
+            Self::OptionIsSome { .. }
+            | Self::OptionIsNone { .. }
+            | Self::ResultIsOk { .. }
+            | Self::ResultIsErr { .. }
+            | Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith
+            | Self::ArrayIsEmpty { .. }
+            | Self::ArrayPush { .. }
+            | Self::MapContains { .. }
+            | Self::MapInsert { .. }
+            | Self::DebugAssert
+            | Self::DebugTrap => ValueType::Bool,
+            Self::OptionUnwrapOr { value } => value,
+            Self::ResultUnwrapOr { success, .. } => success,
+            Self::F32Floor
+            | Self::F32Ceil
+            | Self::F32Round
+            | Self::F32Sqrt
+            | Self::F32Sin
+            | Self::F32Cos => ValueType::F32,
+            Self::F64Floor
+            | Self::F64Ceil
+            | Self::F64Round
+            | Self::F64Sqrt
+            | Self::F64Sin
+            | Self::F64Cos => ValueType::F64,
+            Self::StringLen | Self::StringByteLen | Self::ArrayLen { .. } | Self::MapLen { .. } => {
+                ValueType::I32
+            }
+            Self::StringSubstring | Self::StringTrim => ValueType::String,
+            Self::StringSplit => ValueType::Named(array_type(ValueType::String)),
+            Self::ArrayGet { element } => ValueType::Named(option_type(element).type_id),
+            Self::ArrayPop { element } => element,
+            Self::MapGet { value, .. } | Self::MapRemove { value, .. } => {
+                ValueType::Named(option_type(value).type_id)
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn mutates_collection(self) -> bool {
+        matches!(
+            self,
+            Self::ArrayPush { .. }
+                | Self::ArrayPop { .. }
+                | Self::MapInsert { .. }
+                | Self::MapRemove { .. }
+        )
+    }
+
+    /// Version-1 deterministic base fuel cost.
+    ///
+    /// Variable work declared by [`Self::fuel_model`] is charged separately
+    /// from read-only register and heap metadata before any mutation.
+    #[must_use]
+    pub const fn base_fuel_cost(self) -> u16 {
+        match self {
+            Self::F32Sin | Self::F64Sin | Self::F32Cos | Self::F64Cos => 16,
+            Self::F32Sqrt | Self::F64Sqrt | Self::StringSplit => 12,
+            Self::StringContains
+            | Self::StringStartsWith
+            | Self::StringEndsWith
+            | Self::StringLen
+            | Self::StringByteLen
+            | Self::StringSubstring
+            | Self::StringTrim
+            | Self::MapContains { .. }
+            | Self::MapGet { .. }
+            | Self::MapInsert { .. }
+            | Self::MapRemove { .. } => 8,
+            Self::ArrayGet { .. } | Self::ArrayPush { .. } | Self::ArrayPop { .. } => 4,
+            Self::OptionUnwrapOr { .. }
+            | Self::ResultUnwrapOr { .. }
+            | Self::F32Floor
+            | Self::F64Floor
+            | Self::F32Ceil
+            | Self::F64Ceil
+            | Self::F32Round
+            | Self::F64Round
+            | Self::DebugTrap => 2,
+            _ => 1,
+        }
+    }
+
+    #[must_use]
+    pub const fn fuel_model(self) -> StandardIntrinsicFuelModel {
+        match self {
+            Self::StringContains | Self::StringStartsWith | Self::StringEndsWith => {
+                StandardIntrinsicFuelModel::StringBytes {
+                    argument_count: 2,
+                    passes: 1,
+                }
+            }
+            Self::StringLen => StandardIntrinsicFuelModel::StringBytes {
+                argument_count: 1,
+                passes: 1,
+            },
+            Self::StringSubstring => StandardIntrinsicFuelModel::StringBytes {
+                argument_count: 1,
+                passes: 4,
+            },
+            Self::StringTrim => StandardIntrinsicFuelModel::StringBytes {
+                argument_count: 1,
+                passes: 3,
+            },
+            Self::StringSplit => StandardIntrinsicFuelModel::StringSplit,
+            Self::ArrayPush { .. } | Self::ArrayPop { .. } => StandardIntrinsicFuelModel::ArrayCopy,
+            Self::MapContains { .. } | Self::MapGet { .. } | Self::MapRemove { .. } => {
+                StandardIntrinsicFuelModel::MapLookup
+            }
+            Self::MapInsert { .. } => StandardIntrinsicFuelModel::MapInsertAttempt,
+            _ => StandardIntrinsicFuelModel::Fixed,
+        }
     }
 }
 
@@ -392,49 +823,10 @@ pub fn state_handle_error_type() -> EnumType {
 
 #[must_use]
 pub fn parameterized_type_id(name: &str, arguments: &[ValueType]) -> StableId {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-    fn append(hash: &mut u64, bytes: impl IntoIterator<Item = u8>) {
-        for byte in bytes {
-            *hash ^= u64::from(byte);
-            *hash = hash.wrapping_mul(PRIME);
-        }
-    }
-
-    let mut hash = OFFSET;
-    append(&mut hash, name.bytes());
-    append(&mut hash, *b"<");
-    for (index, argument) in arguments.iter().enumerate() {
-        if index != 0 {
-            append(&mut hash, *b",");
-        }
-        match argument {
-            ValueType::I32 => append(&mut hash, b"i32".iter().copied()),
-            ValueType::I64 => append(&mut hash, b"i64".iter().copied()),
-            ValueType::F32 => append(&mut hash, b"f32".iter().copied()),
-            ValueType::F64 => append(&mut hash, b"f64".iter().copied()),
-            ValueType::Bool => append(&mut hash, b"bool".iter().copied()),
-            ValueType::Rune => append(&mut hash, b"rune".iter().copied()),
-            ValueType::String => append(&mut hash, b"string".iter().copied()),
-            ValueType::Ref => append(&mut hash, b"ref".iter().copied()),
-            ValueType::Named(id) => {
-                append(&mut hash, b"named:".iter().copied());
-                for shift in (0..16).rev().map(|index| index * 4) {
-                    let nibble = ((id.0 >> shift) & 0xf) as u8;
-                    append(
-                        &mut hash,
-                        [if nibble < 10 {
-                            b'0' + nibble
-                        } else {
-                            b'a' + nibble - 10
-                        }],
-                    );
-                }
-            }
-        }
-    }
-    append(&mut hash, *b">");
-    StableId(hash)
+    nexa_core::canonical_parameterized_type_id_iter(
+        name,
+        arguments.iter().copied().map(canonical_value_type),
+    )
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,25 +849,26 @@ pub struct StateSchema {
 
 impl StateSchema {
     #[must_use]
-    pub fn stable_hash(&self) -> StableId {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        hash_u64(
-            &mut hash,
-            u64::try_from(self.types.len()).unwrap_or(u64::MAX),
-        );
-        for state_type in &self.types {
-            hash_u64(&mut hash, state_type.stable_id.0);
-            hash_u64(&mut hash, u64::from(state_type.version));
-            hash_u64(
-                &mut hash,
-                u64::try_from(state_type.fields.len()).unwrap_or(u64::MAX),
-            );
-            for field in &state_type.fields {
-                hash_u64(&mut hash, field.stable_id.0);
-                hash_value_type(&mut hash, field.ty);
-            }
+    pub fn fingerprint(&self) -> StateSchemaFingerprint {
+        CanonicalStateSchema {
+            types: self
+                .types
+                .iter()
+                .map(|state_type| CanonicalStateType {
+                    stable_id: state_type.stable_id,
+                    version: state_type.version,
+                    fields: state_type
+                        .fields
+                        .iter()
+                        .map(|field| CanonicalStateField {
+                            stable_id: field.stable_id,
+                            ty: canonical_value_type(field.ty),
+                        })
+                        .collect(),
+                })
+                .collect(),
         }
-        StableId(hash)
+        .fingerprint()
     }
 }
 
@@ -507,7 +900,7 @@ impl MigrationLimitRequirements {
 pub struct ReloadMetadata {
     pub migration_entry: Option<u32>,
     pub activation_entry: Option<u32>,
-    pub stateful_schema_hash: StableId,
+    pub state_schema_fingerprint: StateSchemaFingerprint,
     pub minimum_migration_limits: MigrationLimitRequirements,
 }
 
@@ -572,6 +965,11 @@ pub enum Instruction {
         lhs: u16,
         rhs: u16,
     },
+    RemI32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
     AddI64 {
         dst: u16,
         lhs: u16,
@@ -588,6 +986,11 @@ pub enum Instruction {
         rhs: u16,
     },
     DivI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    RemI64 {
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -612,6 +1015,11 @@ pub enum Instruction {
         lhs: u16,
         rhs: u16,
     },
+    RemF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
     AddF64 {
         dst: u16,
         lhs: u16,
@@ -628,6 +1036,11 @@ pub enum Instruction {
         rhs: u16,
     },
     DivF64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    RemF64 {
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -659,7 +1072,61 @@ pub enum Instruction {
         dst: u16,
         source: u16,
     },
+    I32ToString {
+        dst: u16,
+        source: u16,
+    },
+    I64ToString {
+        dst: u16,
+        source: u16,
+    },
+    F32ToString {
+        dst: u16,
+        source: u16,
+    },
+    F64ToString {
+        dst: u16,
+        source: u16,
+    },
+    BoolToString {
+        dst: u16,
+        source: u16,
+    },
+    RuneToString {
+        dst: u16,
+        source: u16,
+    },
+    StringToString {
+        dst: u16,
+        source: u16,
+    },
+    StandardIntrinsic {
+        intrinsic: StandardIntrinsic,
+        args_base: u16,
+        args_count: u16,
+        dst: u16,
+    },
     CompareEq {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    CompareLtI32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    CompareLtI64 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    CompareLtF32 {
+        dst: u16,
+        lhs: u16,
+        rhs: u16,
+    },
+    CompareLtF64 {
         dst: u16,
         lhs: u16,
         rhs: u16,
@@ -950,7 +1417,7 @@ pub struct Module {
     pub exports: Vec<ScriptExport>,
     pub state_schema: StateSchema,
     pub host_interface_hash: Option<StableId>,
-    pub schema_hash: Option<StableId>,
+    pub state_schema_fingerprint: StateSchemaFingerprint,
     pub reload_metadata: ReloadMetadata,
     pub source_map: Vec<SourceMapEntry>,
 }
@@ -975,8 +1442,8 @@ pub fn minimum_migration_limits(
         }
         reachable[function_index] = true;
         for instruction in &module.functions[function_index].code {
-            if let Instruction::Call { function, .. } = instruction
-                && let Ok(callee) = usize::try_from(*function)
+            if let Some(function) = stack_callee(*instruction)
+                && let Ok(callee) = usize::try_from(function)
                 && callee < module.functions.len()
             {
                 pending.push(callee);
@@ -1046,10 +1513,8 @@ fn migration_call_depth(module: &Module, function: usize, visiting: &mut Vec<usi
     visiting.push(function);
     let mut depth = 1_u16;
     for instruction in &body.code {
-        if let Instruction::Call {
-            function: callee, ..
-        } = instruction
-            && let Ok(callee) = usize::try_from(*callee)
+        if let Some(callee) = stack_callee(*instruction)
+            && let Ok(callee) = usize::try_from(callee)
         {
             depth = depth.max(migration_call_depth(module, callee, visiting).saturating_add(1));
         }
@@ -1058,27 +1523,26 @@ fn migration_call_depth(module: &Module, function: usize, visiting: &mut Vec<usi
     depth
 }
 
-fn hash_u64(hash: &mut u64, value: u64) {
-    for byte in value.to_le_bytes() {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+const fn stack_callee(instruction: Instruction) -> Option<u32> {
+    match instruction {
+        Instruction::Call { function, .. } | Instruction::DeferPush { function, .. } => {
+            Some(function)
+        }
+        _ => None,
     }
 }
 
-fn hash_value_type(hash: &mut u64, value: ValueType) {
+const fn canonical_value_type(value: ValueType) -> CanonicalValueType {
     match value {
-        ValueType::I32 => hash_u64(hash, 0),
-        ValueType::I64 => hash_u64(hash, 1),
-        ValueType::F32 => hash_u64(hash, 2),
-        ValueType::F64 => hash_u64(hash, 3),
-        ValueType::Bool => hash_u64(hash, 4),
-        ValueType::Rune => hash_u64(hash, 5),
-        ValueType::String => hash_u64(hash, 6),
-        ValueType::Ref => hash_u64(hash, 7),
-        ValueType::Named(stable_id) => {
-            hash_u64(hash, 8);
-            hash_u64(hash, stable_id.0);
-        }
+        ValueType::I32 => CanonicalValueType::I32,
+        ValueType::I64 => CanonicalValueType::I64,
+        ValueType::F32 => CanonicalValueType::F32,
+        ValueType::F64 => CanonicalValueType::F64,
+        ValueType::Bool => CanonicalValueType::Bool,
+        ValueType::Rune => CanonicalValueType::Rune,
+        ValueType::String => CanonicalValueType::String,
+        ValueType::Ref => CanonicalValueType::Ref,
+        ValueType::Named(stable_id) => CanonicalValueType::Named(stable_id),
     }
 }
 
@@ -1089,6 +1553,7 @@ pub enum DecodeError {
     UnsupportedVersion(u16),
     InvalidType(u8),
     InvalidOpcode(u8),
+    InvalidStandardIntrinsic(u8),
     InvalidBoolean(u8),
     InvalidUtf8,
     TrailingBytes,
@@ -1100,6 +1565,7 @@ pub enum DecodeError {
     DuplicateRequiredSection(u16),
     UnknownMandatorySection(u16),
     CountMismatch(u16),
+    InconsistentSection(u16),
     InvalidSourceMap,
     ChecksumMismatch(u16),
     ResourceLimit(&'static str),
@@ -1213,10 +1679,10 @@ impl Module {
         let mut output = Vec::new();
         put_u32(&mut output, 1);
         put_optional_id(&mut output, self.host_interface_hash);
-        put_optional_id(&mut output, self.schema_hash);
+        output.extend_from_slice(self.state_schema_fingerprint.as_bytes());
         put_optional_u32(&mut output, self.reload_metadata.migration_entry);
         put_optional_u32(&mut output, self.reload_metadata.activation_entry);
-        put_u64(&mut output, self.reload_metadata.stateful_schema_hash.0);
+        output.extend_from_slice(self.reload_metadata.state_schema_fingerprint.as_bytes());
         let migration_limits = self.reload_metadata.minimum_migration_limits;
         put_u32(&mut output, migration_limits.max_objects);
         put_u32(&mut output, migration_limits.max_fields);
@@ -1601,6 +2067,10 @@ impl Module {
         for kind in SectionKind::ALL {
             required_section(&sections, kind)?;
         }
+        validate_empty_section(
+            required_section(&sections, SectionKind::Constants)?,
+            SectionKind::Constants,
+        )?;
         enforce_section_limit(
             &sections,
             SectionKind::Strings,
@@ -1613,12 +2083,6 @@ impl Module {
             .ok_or(DecodeError::SizeOverflow)?;
         enforce_limit(string_bytes, limits.max_string_bytes, "string bytes")?;
         enforce_section_limit(&sections, SectionKind::Types, limits.max_types, "types")?;
-        enforce_section_limit(
-            &sections,
-            SectionKind::Constants,
-            limits.max_constants,
-            "constants",
-        )?;
         enforce_section_limit(
             &sections,
             SectionKind::Structs,
@@ -1721,10 +2185,10 @@ impl Module {
             cursor: 0,
         };
         let host_interface_hash = read_optional_id(&mut reader)?;
-        let schema_hash = read_optional_id(&mut reader)?;
+        let state_schema_fingerprint = StateSchemaFingerprint::from_bytes(reader.array()?);
         let migration_entry = read_optional_u32(&mut reader)?;
         let activation_entry = read_optional_u32(&mut reader)?;
-        let stateful_schema_hash = StableId(reader.u64()?);
+        let reload_state_schema_fingerprint = StateSchemaFingerprint::from_bytes(reader.array()?);
         let minimum_migration_limits = MigrationLimitRequirements {
             max_objects: reader.u32()?,
             max_fields: reader.u32()?,
@@ -1737,7 +2201,7 @@ impl Module {
         let reload_metadata = ReloadMetadata {
             migration_entry,
             activation_entry,
-            stateful_schema_hash,
+            state_schema_fingerprint: reload_state_schema_fingerprint,
             minimum_migration_limits,
         };
         let host_import_count =
@@ -2078,6 +2542,19 @@ impl Module {
         if reader.cursor != function_bytes.len() {
             return Err(DecodeError::TrailingBytes);
         }
+        validate_code_section(required_section(&sections, SectionKind::Code)?, &functions)?;
+        validate_root_maps_section(
+            required_section(&sections, SectionKind::RootMaps)?,
+            &functions,
+        )?;
+        validate_safepoints_section(
+            required_section(&sections, SectionKind::Safepoints)?,
+            &functions,
+        )?;
+        validate_loop_bounds_section(
+            required_section(&sections, SectionKind::LoopBounds)?,
+            &functions,
+        )?;
         let mut reader = Reader {
             bytes: source_map_bytes,
             cursor: 0,
@@ -2121,7 +2598,7 @@ impl Module {
             exports,
             state_schema: StateSchema { types: state_types },
             host_interface_hash,
-            schema_hash,
+            state_schema_fingerprint,
             reload_metadata,
             source_map,
         })
@@ -2164,7 +2641,7 @@ fn encode_sections(sections: &[(SectionKind, Vec<u8>)]) -> Vec<u8> {
             u32::from_le_bytes(
                 bytes
                     .get(..4)
-                    .expect("every v4 section starts with a count")
+                    .expect("every v5 section starts with a count")
                     .try_into()
                     .expect("section count occupies four bytes"),
             ),
@@ -2296,6 +2773,135 @@ fn required_section<'a>(
         .ok_or(DecodeError::InvalidSectionDirectory)
 }
 
+fn validate_empty_section(bytes: &[u8], kind: SectionKind) -> Result<(), DecodeError> {
+    if bytes != 0_u32.to_le_bytes() {
+        return Err(DecodeError::InconsistentSection(kind as u16));
+    }
+    Ok(())
+}
+
+fn validate_section_function_count(
+    reader: &mut Reader<'_>,
+    kind: SectionKind,
+    functions: &[Function],
+) -> Result<(), DecodeError> {
+    let count = usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+    if count != functions.len() {
+        return Err(DecodeError::InconsistentSection(kind as u16));
+    }
+    Ok(())
+}
+
+fn validate_section_end(reader: &Reader<'_>, kind: SectionKind) -> Result<(), DecodeError> {
+    if reader.remaining() != 0 {
+        return Err(DecodeError::InconsistentSection(kind as u16));
+    }
+    Ok(())
+}
+
+fn validate_code_section(bytes: &[u8], functions: &[Function]) -> Result<(), DecodeError> {
+    let kind = SectionKind::Code;
+    let mut reader = Reader { bytes, cursor: 0 };
+    validate_section_function_count(&mut reader, kind, functions)?;
+    for function in functions {
+        let instruction_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if instruction_count != function.code.len() {
+            return Err(DecodeError::InconsistentSection(kind as u16));
+        }
+        for expected in &function.code {
+            if decode_instruction(&mut reader)? != *expected {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+        }
+    }
+    validate_section_end(&reader, kind)
+}
+
+fn validate_root_maps_section(bytes: &[u8], functions: &[Function]) -> Result<(), DecodeError> {
+    let kind = SectionKind::RootMaps;
+    let mut reader = Reader { bytes, cursor: 0 };
+    validate_section_function_count(&mut reader, kind, functions)?;
+    for function in functions {
+        let root_count = usize::from(reader.u16()?);
+        if root_count != function.root_bitmap.len() {
+            return Err(DecodeError::InconsistentSection(kind as u16));
+        }
+        for expected in &function.root_bitmap {
+            if decode_boolean(&mut reader)? != *expected {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+        }
+
+        let root_map_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if root_map_count != function.root_maps.len() {
+            return Err(DecodeError::InconsistentSection(kind as u16));
+        }
+        for expected in &function.root_maps {
+            if reader.u32()? != expected.pc {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+            let bitmap_len = usize::from(reader.u16()?);
+            if bitmap_len != expected.bitmap.len() {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+            for expected in &expected.bitmap {
+                if decode_boolean(&mut reader)? != *expected {
+                    return Err(DecodeError::InconsistentSection(kind as u16));
+                }
+            }
+        }
+    }
+    validate_section_end(&reader, kind)
+}
+
+fn validate_safepoints_section(bytes: &[u8], functions: &[Function]) -> Result<(), DecodeError> {
+    let kind = SectionKind::Safepoints;
+    let mut reader = Reader { bytes, cursor: 0 };
+    validate_section_function_count(&mut reader, kind, functions)?;
+    for function in functions {
+        let safepoint_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if safepoint_count != function.safepoints.len() {
+            return Err(DecodeError::InconsistentSection(kind as u16));
+        }
+        for expected in &function.safepoints {
+            if reader.u32()? != *expected {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+        }
+    }
+    validate_section_end(&reader, kind)
+}
+
+fn validate_loop_bounds_section(bytes: &[u8], functions: &[Function]) -> Result<(), DecodeError> {
+    let kind = SectionKind::LoopBounds;
+    let mut reader = Reader { bytes, cursor: 0 };
+    validate_section_function_count(&mut reader, kind, functions)?;
+    for function in functions {
+        let loop_bound_count =
+            usize::try_from(reader.u32()?).map_err(|_| DecodeError::SizeOverflow)?;
+        if loop_bound_count != function.loop_bounds.len() {
+            return Err(DecodeError::InconsistentSection(kind as u16));
+        }
+        for expected in &function.loop_bounds {
+            if reader.u32()? != expected.back_edge || reader.u32()? != expected.max_iterations {
+                return Err(DecodeError::InconsistentSection(kind as u16));
+            }
+        }
+    }
+    validate_section_end(&reader, kind)
+}
+
+fn decode_boolean(reader: &mut Reader<'_>) -> Result<bool, DecodeError> {
+    match reader.u8()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(DecodeError::InvalidBoolean(value)),
+    }
+}
+
 fn enforce_section_limit(
     sections: &[(u16, &[u8])],
     kind: SectionKind,
@@ -2384,6 +2990,139 @@ fn decode_type(reader: &mut Reader<'_>) -> Result<ValueType, DecodeError> {
     }
 }
 
+fn encode_standard_intrinsic(output: &mut Vec<u8>, intrinsic: StandardIntrinsic) {
+    let (tag, types): (u8, &[ValueType]) = match &intrinsic {
+        StandardIntrinsic::OptionIsSome { value } => (0, std::slice::from_ref(value)),
+        StandardIntrinsic::OptionIsNone { value } => (1, std::slice::from_ref(value)),
+        StandardIntrinsic::ResultIsOk { success, error } => (2, &[*success, *error]),
+        StandardIntrinsic::ResultIsErr { success, error } => (3, &[*success, *error]),
+        StandardIntrinsic::OptionUnwrapOr { value } => (4, std::slice::from_ref(value)),
+        StandardIntrinsic::ResultUnwrapOr { success, error } => (5, &[*success, *error]),
+        StandardIntrinsic::F32Floor => (6, &[]),
+        StandardIntrinsic::F64Floor => (7, &[]),
+        StandardIntrinsic::F32Ceil => (8, &[]),
+        StandardIntrinsic::F64Ceil => (9, &[]),
+        StandardIntrinsic::F32Round => (10, &[]),
+        StandardIntrinsic::F64Round => (11, &[]),
+        StandardIntrinsic::F32Sqrt => (12, &[]),
+        StandardIntrinsic::F64Sqrt => (13, &[]),
+        StandardIntrinsic::F32Sin => (14, &[]),
+        StandardIntrinsic::F64Sin => (15, &[]),
+        StandardIntrinsic::F32Cos => (16, &[]),
+        StandardIntrinsic::F64Cos => (17, &[]),
+        StandardIntrinsic::StringContains => (18, &[]),
+        StandardIntrinsic::StringStartsWith => (19, &[]),
+        StandardIntrinsic::StringEndsWith => (20, &[]),
+        StandardIntrinsic::StringSubstring => (21, &[]),
+        StandardIntrinsic::StringTrim => (22, &[]),
+        StandardIntrinsic::StringSplit => (23, &[]),
+        StandardIntrinsic::ArrayLen { element } => (24, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayIsEmpty { element } => (25, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayGet { element } => (26, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayPush { element } => (27, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayPop { element } => (28, std::slice::from_ref(element)),
+        StandardIntrinsic::MapLen { key, value } => (29, &[*key, *value]),
+        StandardIntrinsic::MapContains { key, value } => (30, &[*key, *value]),
+        StandardIntrinsic::MapGet { key, value } => (31, &[*key, *value]),
+        StandardIntrinsic::MapInsert { key, value } => (32, &[*key, *value]),
+        StandardIntrinsic::MapRemove { key, value } => (33, &[*key, *value]),
+        StandardIntrinsic::DebugAssert => (34, &[]),
+        StandardIntrinsic::DebugTrap => (35, &[]),
+        StandardIntrinsic::StringLen => (36, &[]),
+        StandardIntrinsic::StringByteLen => (37, &[]),
+    };
+    output.push(tag);
+    for ty in types {
+        encode_type(output, *ty);
+    }
+}
+
+fn decode_standard_intrinsic(reader: &mut Reader<'_>) -> Result<StandardIntrinsic, DecodeError> {
+    let unary = |reader: &mut Reader<'_>| decode_type(reader);
+    let binary = |reader: &mut Reader<'_>| Ok((decode_type(reader)?, decode_type(reader)?));
+    Ok(match reader.u8()? {
+        0 => StandardIntrinsic::OptionIsSome {
+            value: unary(reader)?,
+        },
+        1 => StandardIntrinsic::OptionIsNone {
+            value: unary(reader)?,
+        },
+        2 => {
+            let (success, error) = binary(reader)?;
+            StandardIntrinsic::ResultIsOk { success, error }
+        }
+        3 => {
+            let (success, error) = binary(reader)?;
+            StandardIntrinsic::ResultIsErr { success, error }
+        }
+        4 => StandardIntrinsic::OptionUnwrapOr {
+            value: unary(reader)?,
+        },
+        5 => {
+            let (success, error) = binary(reader)?;
+            StandardIntrinsic::ResultUnwrapOr { success, error }
+        }
+        6 => StandardIntrinsic::F32Floor,
+        7 => StandardIntrinsic::F64Floor,
+        8 => StandardIntrinsic::F32Ceil,
+        9 => StandardIntrinsic::F64Ceil,
+        10 => StandardIntrinsic::F32Round,
+        11 => StandardIntrinsic::F64Round,
+        12 => StandardIntrinsic::F32Sqrt,
+        13 => StandardIntrinsic::F64Sqrt,
+        14 => StandardIntrinsic::F32Sin,
+        15 => StandardIntrinsic::F64Sin,
+        16 => StandardIntrinsic::F32Cos,
+        17 => StandardIntrinsic::F64Cos,
+        18 => StandardIntrinsic::StringContains,
+        19 => StandardIntrinsic::StringStartsWith,
+        20 => StandardIntrinsic::StringEndsWith,
+        21 => StandardIntrinsic::StringSubstring,
+        22 => StandardIntrinsic::StringTrim,
+        23 => StandardIntrinsic::StringSplit,
+        24 => StandardIntrinsic::ArrayLen {
+            element: unary(reader)?,
+        },
+        25 => StandardIntrinsic::ArrayIsEmpty {
+            element: unary(reader)?,
+        },
+        26 => StandardIntrinsic::ArrayGet {
+            element: unary(reader)?,
+        },
+        27 => StandardIntrinsic::ArrayPush {
+            element: unary(reader)?,
+        },
+        28 => StandardIntrinsic::ArrayPop {
+            element: unary(reader)?,
+        },
+        29 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapLen { key, value }
+        }
+        30 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapContains { key, value }
+        }
+        31 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapGet { key, value }
+        }
+        32 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapInsert { key, value }
+        }
+        33 => {
+            let (key, value) = binary(reader)?;
+            StandardIntrinsic::MapRemove { key, value }
+        }
+        34 => StandardIntrinsic::DebugAssert,
+        35 => StandardIntrinsic::DebugTrap,
+        36 => StandardIntrinsic::StringLen,
+        37 => StandardIntrinsic::StringByteLen,
+        value => return Err(DecodeError::InvalidStandardIntrinsic(value)),
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
     match instruction {
@@ -2430,12 +3169,20 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
         Instruction::Add { dst, lhs, rhs }
         | Instruction::Sub { dst, lhs, rhs }
         | Instruction::Mul { dst, lhs, rhs }
-        | Instruction::CompareEq { dst, lhs, rhs } => {
+        | Instruction::CompareEq { dst, lhs, rhs }
+        | Instruction::CompareLtI32 { dst, lhs, rhs }
+        | Instruction::CompareLtI64 { dst, lhs, rhs }
+        | Instruction::CompareLtF32 { dst, lhs, rhs }
+        | Instruction::CompareLtF64 { dst, lhs, rhs } => {
             output.push(match instruction {
                 Instruction::Add { .. } => 3,
                 Instruction::Sub { .. } => 4,
                 Instruction::Mul { .. } => 5,
                 Instruction::CompareEq { .. } => 6,
+                Instruction::CompareLtI32 { .. } => 95,
+                Instruction::CompareLtI64 { .. } => 96,
+                Instruction::CompareLtF32 { .. } => 97,
+                Instruction::CompareLtF64 { .. } => 98,
                 _ => unreachable!(),
             });
             put_u16(output, dst);
@@ -2448,31 +3195,43 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, lhs);
             put_u16(output, rhs);
         }
+        Instruction::RemI32 { dst, lhs, rhs } => {
+            output.push(101);
+            put_u16(output, dst);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
+        }
         Instruction::AddI64 { dst, lhs, rhs }
         | Instruction::SubI64 { dst, lhs, rhs }
         | Instruction::MulI64 { dst, lhs, rhs }
         | Instruction::DivI64 { dst, lhs, rhs }
+        | Instruction::RemI64 { dst, lhs, rhs }
         | Instruction::AddF32 { dst, lhs, rhs }
         | Instruction::SubF32 { dst, lhs, rhs }
         | Instruction::MulF32 { dst, lhs, rhs }
         | Instruction::DivF32 { dst, lhs, rhs }
+        | Instruction::RemF32 { dst, lhs, rhs }
         | Instruction::AddF64 { dst, lhs, rhs }
         | Instruction::SubF64 { dst, lhs, rhs }
         | Instruction::MulF64 { dst, lhs, rhs }
-        | Instruction::DivF64 { dst, lhs, rhs } => {
+        | Instruction::DivF64 { dst, lhs, rhs }
+        | Instruction::RemF64 { dst, lhs, rhs } => {
             output.push(match instruction {
                 Instruction::AddI64 { .. } => 40,
                 Instruction::SubI64 { .. } => 41,
                 Instruction::MulI64 { .. } => 42,
                 Instruction::DivI64 { .. } => 43,
+                Instruction::RemI64 { .. } => 102,
                 Instruction::AddF32 { .. } => 45,
                 Instruction::SubF32 { .. } => 46,
                 Instruction::MulF32 { .. } => 47,
                 Instruction::DivF32 { .. } => 48,
+                Instruction::RemF32 { .. } => 103,
                 Instruction::AddF64 { .. } => 49,
                 Instruction::SubF64 { .. } => 50,
                 Instruction::MulF64 { .. } => 51,
                 Instruction::DivF64 { .. } => 52,
+                Instruction::RemF64 { .. } => 104,
                 _ => unreachable!(),
             });
             put_u16(output, dst);
@@ -2481,11 +3240,25 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
         }
         Instruction::StringLen { dst, source }
         | Instruction::StringByteLen { dst, source }
-        | Instruction::StringHash { dst, source } => {
+        | Instruction::StringHash { dst, source }
+        | Instruction::I32ToString { dst, source }
+        | Instruction::I64ToString { dst, source }
+        | Instruction::F32ToString { dst, source }
+        | Instruction::F64ToString { dst, source }
+        | Instruction::BoolToString { dst, source }
+        | Instruction::RuneToString { dst, source }
+        | Instruction::StringToString { dst, source } => {
             output.push(match instruction {
                 Instruction::StringLen { .. } => 54,
                 Instruction::StringByteLen { .. } => 55,
                 Instruction::StringHash { .. } => 59,
+                Instruction::I32ToString { .. } => 89,
+                Instruction::I64ToString { .. } => 90,
+                Instruction::F32ToString { .. } => 91,
+                Instruction::F64ToString { .. } => 92,
+                Instruction::BoolToString { .. } => 93,
+                Instruction::RuneToString { .. } => 94,
+                Instruction::StringToString { .. } => 99,
                 _ => unreachable!(),
             });
             put_u16(output, dst);
@@ -2507,6 +3280,18 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, dst);
             put_u16(output, lhs);
             put_u16(output, rhs);
+        }
+        Instruction::StandardIntrinsic {
+            intrinsic,
+            args_base,
+            args_count,
+            dst,
+        } => {
+            output.push(100);
+            encode_standard_intrinsic(output, intrinsic);
+            put_u16(output, args_base);
+            put_u16(output, args_count);
+            put_u16(output, dst);
         }
         Instruction::StructNew {
             type_id,
@@ -2948,7 +3733,7 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             dst: reader.u16()?,
             source: reader.u16()?,
         },
-        opcode @ 3..=6 => {
+        opcode @ (3..=6 | 95..=98) => {
             let dst = reader.u16()?;
             let lhs = reader.u16()?;
             let rhs = reader.u16()?;
@@ -2957,6 +3742,10 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 4 => Instruction::Sub { dst, lhs, rhs },
                 5 => Instruction::Mul { dst, lhs, rhs },
                 6 => Instruction::CompareEq { dst, lhs, rhs },
+                95 => Instruction::CompareLtI32 { dst, lhs, rhs },
+                96 => Instruction::CompareLtI64 { dst, lhs, rhs },
+                97 => Instruction::CompareLtF32 { dst, lhs, rhs },
+                98 => Instruction::CompareLtF64 { dst, lhs, rhs },
                 _ => unreachable!(),
             }
         }
@@ -3113,17 +3902,36 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 _ => unreachable!(),
             }
         }
+        opcode @ 101..=104 => {
+            let dst = reader.u16()?;
+            let lhs = reader.u16()?;
+            let rhs = reader.u16()?;
+            match opcode {
+                101 => Instruction::RemI32 { dst, lhs, rhs },
+                102 => Instruction::RemI64 { dst, lhs, rhs },
+                103 => Instruction::RemF32 { dst, lhs, rhs },
+                104 => Instruction::RemF64 { dst, lhs, rhs },
+                _ => unreachable!(),
+            }
+        }
         53 => Instruction::LoadString {
             dst: reader.u16()?,
             string: reader.u32()?,
         },
-        opcode @ (54..=55 | 59) => {
+        opcode @ (54..=55 | 59 | 89..=94 | 99) => {
             let dst = reader.u16()?;
             let source = reader.u16()?;
             match opcode {
                 54 => Instruction::StringLen { dst, source },
                 55 => Instruction::StringByteLen { dst, source },
                 59 => Instruction::StringHash { dst, source },
+                89 => Instruction::I32ToString { dst, source },
+                90 => Instruction::I64ToString { dst, source },
+                91 => Instruction::F32ToString { dst, source },
+                92 => Instruction::F64ToString { dst, source },
+                93 => Instruction::BoolToString { dst, source },
+                94 => Instruction::RuneToString { dst, source },
+                99 => Instruction::StringToString { dst, source },
                 _ => unreachable!(),
             }
         }
@@ -3142,6 +3950,12 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 _ => unreachable!(),
             }
         }
+        100 => Instruction::StandardIntrinsic {
+            intrinsic: decode_standard_intrinsic(reader)?,
+            args_base: reader.u16()?,
+            args_count: reader.u16()?,
+            dst: reader.u16()?,
+        },
         60 => Instruction::StructNew {
             type_id: StableId(reader.u64()?),
             fields_base: reader.u16()?,
@@ -3404,7 +4218,7 @@ pub struct ModuleBuilder {
     exports: Vec<ScriptExport>,
     state_schema: StateSchema,
     host_interface_hash: Option<StableId>,
-    schema_hash: Option<StableId>,
+    state_schema_fingerprint: Option<StateSchemaFingerprint>,
     reload_metadata: ReloadMetadata,
     source_map: Vec<SourceMapEntry>,
 }
@@ -3427,11 +4241,11 @@ impl ModuleBuilder {
             exports: Vec::new(),
             state_schema: StateSchema { types: Vec::new() },
             host_interface_hash: None,
-            schema_hash: None,
+            state_schema_fingerprint: None,
             reload_metadata: ReloadMetadata {
                 migration_entry: None,
                 activation_entry: None,
-                stateful_schema_hash: StableId(0),
+                state_schema_fingerprint: StateSchemaFingerprint::from_bytes([0; 32]),
                 minimum_migration_limits: MigrationLimitRequirements {
                     max_objects: 0,
                     max_fields: 0,
@@ -3446,9 +4260,13 @@ impl ModuleBuilder {
         }
     }
 
-    pub fn metadata(&mut self, host_interface_hash: StableId, schema_hash: StableId) -> &mut Self {
+    pub fn metadata(
+        &mut self,
+        host_interface_hash: StableId,
+        state_schema_fingerprint: StateSchemaFingerprint,
+    ) -> &mut Self {
         self.host_interface_hash = Some(host_interface_hash);
-        self.schema_hash = Some(schema_hash);
+        self.state_schema_fingerprint = Some(state_schema_fingerprint);
         self
     }
 
@@ -3546,6 +4364,7 @@ impl ModuleBuilder {
 
     #[must_use]
     pub fn finish(self) -> Module {
+        let computed_state_schema_fingerprint = self.state_schema.fingerprint();
         let mut module = Module {
             strings: self.strings,
             functions: self.functions,
@@ -3561,7 +4380,9 @@ impl ModuleBuilder {
             exports: self.exports,
             state_schema: self.state_schema,
             host_interface_hash: self.host_interface_hash,
-            schema_hash: self.schema_hash,
+            state_schema_fingerprint: self
+                .state_schema_fingerprint
+                .unwrap_or(computed_state_schema_fingerprint),
             reload_metadata: self.reload_metadata,
             source_map: self.source_map,
         };
@@ -3588,8 +4409,8 @@ impl ModuleBuilder {
         {
             module.reload_metadata.activation_entry = activation_entries.first().copied();
         }
-        if module.reload_metadata.stateful_schema_hash == StableId(0) {
-            module.reload_metadata.stateful_schema_hash = module.state_schema.stable_hash();
+        if module.reload_metadata.state_schema_fingerprint == StateSchemaFingerprint::default() {
+            module.reload_metadata.state_schema_fingerprint = computed_state_schema_fingerprint;
         }
         if module.reload_metadata.minimum_migration_limits == MigrationLimitRequirements::default()
         {
@@ -3656,6 +4477,7 @@ impl FunctionBuilder {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn finish(self) -> Result<Function, BuildError> {
         if self.code.is_empty() {
             return Err(BuildError::EmptyFunction);
@@ -3670,6 +4492,25 @@ impl FunctionBuilder {
                     instruction,
                     Instruction::Safepoint
                         | Instruction::Yield
+                        | Instruction::LoadString { .. }
+                        | Instruction::StringLen { .. }
+                        | Instruction::StringEqual { .. }
+                        | Instruction::StringConcat { .. }
+                        | Instruction::StringRuneAt { .. }
+                        | Instruction::StringHash { .. }
+                        | Instruction::I32ToString { .. }
+                        | Instruction::I64ToString { .. }
+                        | Instruction::F32ToString { .. }
+                        | Instruction::F64ToString { .. }
+                        | Instruction::BoolToString { .. }
+                        | Instruction::RuneToString { .. }
+                        | Instruction::StringToString { .. }
+                        | Instruction::StandardIntrinsic { .. }
+                        | Instruction::EnumNew { .. }
+                        | Instruction::StructNew { .. }
+                        | Instruction::StructWith { .. }
+                        | Instruction::StructEqual { .. }
+                        | Instruction::ClassNew { .. }
                         | Instruction::Call { .. }
                         | Instruction::HostCall { .. }
                         | Instruction::StateHandleResolve { .. }
@@ -3751,9 +4592,9 @@ mod tests {
     use super::{
         ArrayType, BufferType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant,
         FunctionBuilder, FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind,
-        Signature, SnapshotType, SourceMapEntry, StateField, StateHandleType, StateSchema,
-        StateType, StructField, StructType, ValueType, option_type, result_type,
-        state_handle_error_type, state_handle_type,
+        Signature, SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType,
+        StateSchema, StateType, StructField, StructType, ValueType, minimum_migration_limits,
+        option_type, result_type, state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -3902,6 +4743,157 @@ mod tests {
         assert_eq!(Module::decode(&trailing), Err(DecodeError::TrailingBytes));
     }
 
+    fn canonical_duplicate_section_fixture() -> Module {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        function.set_root(0).unwrap();
+        function
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::ReturnVoid)
+            .loop_bound(0, 3);
+        let mut builder = ModuleBuilder::new();
+        builder.function(function.finish().unwrap());
+        builder.finish()
+    }
+
+    fn mutate_section_payload(
+        encoded: &[u8],
+        kind: SectionKind,
+        relative_offset: usize,
+        replacement: &[u8],
+    ) -> Vec<u8> {
+        const DIRECTORY_START: usize = 8;
+        const DIRECTORY_ENTRY_BYTES: usize = 20;
+        const CHECKSUM_OFFSET: usize = 16;
+
+        let mut mutated = encoded.to_vec();
+        let entry = Module::inspect_section_directory(encoded, DecodeLimits::default())
+            .unwrap()
+            .into_iter()
+            .find(|entry| entry.kind == kind as u16)
+            .unwrap();
+        let section_start = entry.offset as usize;
+        let section_end = section_start + entry.length as usize;
+        let mutation_start = section_start + relative_offset;
+        let mutation_end = mutation_start + replacement.len();
+        mutated[mutation_start..mutation_end].copy_from_slice(replacement);
+
+        let directory_index = SectionKind::ALL
+            .iter()
+            .position(|candidate| *candidate == kind)
+            .unwrap();
+        let checksum_offset =
+            DIRECTORY_START + directory_index * DIRECTORY_ENTRY_BYTES + CHECKSUM_OFFSET;
+        let checksum = super::checksum(&mutated[section_start..section_end]);
+        mutated[checksum_offset..checksum_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+        mutated
+    }
+
+    fn replace_section_payload(encoded: &[u8], kind: SectionKind, replacement: &[u8]) -> Vec<u8> {
+        let directory =
+            Module::inspect_section_directory(encoded, DecodeLimits::default()).unwrap();
+        let sections = SectionKind::ALL
+            .into_iter()
+            .map(|candidate| {
+                let entry = directory
+                    .iter()
+                    .find(|entry| entry.kind == candidate as u16)
+                    .unwrap();
+                let start = entry.offset as usize;
+                let end = start + entry.length as usize;
+                (
+                    candidate,
+                    if candidate == kind {
+                        replacement.to_vec()
+                    } else {
+                        encoded[start..end].to_vec()
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        super::encode_sections(&sections)
+    }
+
+    #[test]
+    fn constants_section_is_the_canonical_four_byte_zero_count() {
+        let encoded = Module::default().encode();
+        assert_eq!(Module::decode(&encoded), Ok(Module::default()));
+
+        let nonzero =
+            replace_section_payload(&encoded, SectionKind::Constants, &1_u32.to_le_bytes());
+        assert_eq!(
+            Module::decode(&nonzero),
+            Err(DecodeError::InconsistentSection(
+                SectionKind::Constants as u16
+            ))
+        );
+
+        let trailing = replace_section_payload(&encoded, SectionKind::Constants, &[0, 0, 0, 0, 0]);
+        assert_eq!(
+            Module::decode(&trailing),
+            Err(DecodeError::InconsistentSection(
+                SectionKind::Constants as u16
+            ))
+        );
+    }
+
+    #[test]
+    fn code_section_must_match_functions_instruction_streams() {
+        let encoded = canonical_duplicate_section_fixture().encode();
+        let mutated = mutate_section_payload(&encoded, SectionKind::Code, 11, &8_i32.to_le_bytes());
+        assert_eq!(
+            Module::decode(&mutated),
+            Err(DecodeError::InconsistentSection(SectionKind::Code as u16))
+        );
+    }
+
+    #[test]
+    fn root_maps_section_must_match_functions_root_metadata() {
+        let encoded = canonical_duplicate_section_fixture().encode();
+        let mutated = mutate_section_payload(&encoded, SectionKind::RootMaps, 6, &[0]);
+        assert_eq!(
+            Module::decode(&mutated),
+            Err(DecodeError::InconsistentSection(
+                SectionKind::RootMaps as u16
+            ))
+        );
+    }
+
+    #[test]
+    fn safepoints_section_must_match_functions_safepoints() {
+        let encoded = canonical_duplicate_section_fixture().encode();
+        let mutated = mutate_section_payload(
+            &encoded,
+            SectionKind::Safepoints,
+            8,
+            &u32::MAX.to_le_bytes(),
+        );
+        assert_eq!(
+            Module::decode(&mutated),
+            Err(DecodeError::InconsistentSection(
+                SectionKind::Safepoints as u16
+            ))
+        );
+    }
+
+    #[test]
+    fn loop_bounds_section_must_match_functions_loop_bounds() {
+        let encoded = canonical_duplicate_section_fixture().encode();
+        let mutated =
+            mutate_section_payload(&encoded, SectionKind::LoopBounds, 12, &4_u32.to_le_bytes());
+        assert_eq!(
+            Module::decode(&mutated),
+            Err(DecodeError::InconsistentSection(
+                SectionKind::LoopBounds as u16
+            ))
+        );
+    }
+
     #[test]
     #[allow(
         clippy::items_after_statements,
@@ -4012,7 +5004,7 @@ mod tests {
             mutated
         }
 
-        let empty_section_limits: [(SectionKind, fn(&mut DecodeLimits), &'static str); 5] = [
+        let empty_section_limits: [(SectionKind, fn(&mut DecodeLimits), &'static str); 4] = [
             (
                 SectionKind::Strings,
                 |limits: &mut DecodeLimits| limits.max_strings = 0,
@@ -4022,11 +5014,6 @@ mod tests {
                 SectionKind::Types,
                 |limits: &mut DecodeLimits| limits.max_types = 0,
                 "types",
-            ),
-            (
-                SectionKind::Constants,
-                |limits: &mut DecodeLimits| limits.max_constants = 0,
-                "constants",
             ),
             (
                 SectionKind::Structs,
@@ -4080,7 +5067,68 @@ mod tests {
     }
 
     #[test]
-    fn state_handle_opcodes_round_trip_in_bytecode_v4() {
+    fn migration_requirements_follow_direct_and_nested_defer_stack_edges() {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::DeferPush {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+            })
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+
+        let mut direct_cleanup = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        direct_cleanup
+            .emit(Instruction::DeferPush {
+                function: 2,
+                args_base: 0,
+                args_count: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+
+        let mut nested_cleanup = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        nested_cleanup.emit(Instruction::ReturnVoid);
+
+        let mut builder = ModuleBuilder::new();
+        builder.function(migration.finish().unwrap());
+        builder.function(direct_cleanup.finish().unwrap());
+        builder.function(nested_cleanup.finish().unwrap());
+        let module = builder.finish();
+
+        assert_eq!(
+            module
+                .reload_metadata
+                .minimum_migration_limits
+                .max_call_depth,
+            3
+        );
+        assert_eq!(minimum_migration_limits(&module, Some(1)).max_call_depth, 2);
+        assert_eq!(minimum_migration_limits(&module, Some(2)).max_call_depth, 1);
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn state_handle_opcodes_round_trip_in_bytecode_v5() {
         let target = ValueType::Named(nexa_core::StableId::from_name("EnemyBrain"));
         let result = result_type(target, ValueType::Named(state_handle_error_type().type_id));
         let mut function = FunctionBuilder::new(
@@ -4142,7 +5190,7 @@ mod tests {
     }
 
     #[test]
-    fn array_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+    fn array_metadata_and_opcodes_round_trip_in_bytecode_v5() {
         let array = ArrayType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -4198,7 +5246,7 @@ mod tests {
     }
 
     #[test]
-    fn map_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+    fn map_metadata_and_opcodes_round_trip_in_bytecode_v5() {
         let map = MapType::new(ValueType::I32, ValueType::String);
         let option = option_type(ValueType::String);
         let mut function = FunctionBuilder::new(
@@ -4253,7 +5301,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v4() {
+    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v5() {
         let buffer = BufferType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -4302,7 +5350,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_snapshot_metadata_round_trips_in_bytecode_v4() {
+    fn typed_snapshot_metadata_round_trips_in_bytecode_v5() {
         let content_type = StableId::from_name("EnemyView");
         let snapshot = SnapshotType::new(content_type);
         let mut builder = ModuleBuilder::new();
@@ -4318,7 +5366,8 @@ mod tests {
     }
 
     #[test]
-    fn scalar_types_and_opcodes_round_trip_in_bytecode_v4() {
+    #[allow(clippy::too_many_lines)]
+    fn scalar_types_and_opcodes_round_trip_in_bytecode_v5() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: vec![
@@ -4354,6 +5403,11 @@ mod tests {
                 lhs: 0,
                 rhs: 0,
             })
+            .emit(Instruction::RemI32 {
+                dst: 0,
+                lhs: 0,
+                rhs: 0,
+            })
             .emit(Instruction::AddI64 {
                 dst: 1,
                 lhs: 1,
@@ -4370,6 +5424,11 @@ mod tests {
                 rhs: 5,
             })
             .emit(Instruction::DivI64 {
+                dst: 1,
+                lhs: 1,
+                rhs: 5,
+            })
+            .emit(Instruction::RemI64 {
                 dst: 1,
                 lhs: 1,
                 rhs: 5,
@@ -4394,6 +5453,11 @@ mod tests {
                 lhs: 2,
                 rhs: 6,
             })
+            .emit(Instruction::RemF32 {
+                dst: 2,
+                lhs: 2,
+                rhs: 6,
+            })
             .emit(Instruction::AddF64 {
                 dst: 3,
                 lhs: 3,
@@ -4414,6 +5478,11 @@ mod tests {
                 lhs: 3,
                 rhs: 7,
             })
+            .emit(Instruction::RemF64 {
+                dst: 9,
+                lhs: 3,
+                rhs: 7,
+            })
             .emit(Instruction::Return { source: 9 });
         let mut builder = ModuleBuilder::new();
         builder.function(function.finish().unwrap());
@@ -4422,7 +5491,70 @@ mod tests {
     }
 
     #[test]
-    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v4() {
+    fn scalar_to_string_opcodes_round_trip_in_bytecode_v5() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::I32,
+                    ValueType::I64,
+                    ValueType::F32,
+                    ValueType::F64,
+                    ValueType::Bool,
+                    ValueType::Rune,
+                    ValueType::String,
+                ],
+                result: Some(ValueType::String),
+            },
+            14,
+        );
+        function
+            .emit(Instruction::CompareLtI32 {
+                dst: 7,
+                lhs: 0,
+                rhs: 0,
+            })
+            .emit(Instruction::CompareLtI64 {
+                dst: 7,
+                lhs: 1,
+                rhs: 1,
+            })
+            .emit(Instruction::CompareLtF32 {
+                dst: 7,
+                lhs: 2,
+                rhs: 2,
+            })
+            .emit(Instruction::CompareLtF64 {
+                dst: 7,
+                lhs: 3,
+                rhs: 3,
+            })
+            .emit(Instruction::I32ToString { dst: 7, source: 0 })
+            .emit(Instruction::I64ToString { dst: 8, source: 1 })
+            .emit(Instruction::F32ToString { dst: 9, source: 2 })
+            .emit(Instruction::F64ToString { dst: 10, source: 3 })
+            .emit(Instruction::BoolToString { dst: 11, source: 4 })
+            .emit(Instruction::RuneToString { dst: 12, source: 5 })
+            .emit(Instruction::StringToString { dst: 13, source: 6 })
+            .emit(Instruction::Return { source: 13 });
+        let mut builder = ModuleBuilder::new();
+        builder.function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn bytecode_v5_rejects_a_v4_header() {
+        let module = ModuleBuilder::new().finish();
+        let mut bytes = module.encode();
+        bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        assert_eq!(
+            Module::decode(&bytes),
+            Err(DecodeError::UnsupportedVersion(4))
+        );
+    }
+
+    #[test]
+    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v5() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -4486,7 +5618,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v4() {
+    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v5() {
         let type_id = nexa_core::StableId::from_name("Position");
         let x = nexa_core::StableId::from_parts(&["Position", "::x"]);
         let fields = vec![
@@ -4550,7 +5682,7 @@ mod tests {
     }
 
     #[test]
-    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v4() {
+    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v5() {
         let type_id = nexa_core::StableId::from_name("Node");
         let value = nexa_core::StableId::from_parts(&["Node", "::value"]);
         let mut function = FunctionBuilder::new(
@@ -4606,5 +5738,158 @@ mod tests {
             ),
             Err(DecodeError::ResourceLimit("classes"))
         );
+    }
+
+    #[test]
+    fn every_standard_intrinsic_round_trips_in_bytecode_v5() {
+        let value = ValueType::I32;
+        let key = ValueType::String;
+        let intrinsics = vec![
+            StandardIntrinsic::OptionIsSome { value },
+            StandardIntrinsic::OptionIsNone { value },
+            StandardIntrinsic::ResultIsOk {
+                success: value,
+                error: ValueType::String,
+            },
+            StandardIntrinsic::ResultIsErr {
+                success: value,
+                error: ValueType::String,
+            },
+            StandardIntrinsic::OptionUnwrapOr { value },
+            StandardIntrinsic::ResultUnwrapOr {
+                success: value,
+                error: ValueType::String,
+            },
+            StandardIntrinsic::F32Floor,
+            StandardIntrinsic::F64Floor,
+            StandardIntrinsic::F32Ceil,
+            StandardIntrinsic::F64Ceil,
+            StandardIntrinsic::F32Round,
+            StandardIntrinsic::F64Round,
+            StandardIntrinsic::F32Sqrt,
+            StandardIntrinsic::F64Sqrt,
+            StandardIntrinsic::F32Sin,
+            StandardIntrinsic::F64Sin,
+            StandardIntrinsic::F32Cos,
+            StandardIntrinsic::F64Cos,
+            StandardIntrinsic::StringContains,
+            StandardIntrinsic::StringStartsWith,
+            StandardIntrinsic::StringEndsWith,
+            StandardIntrinsic::StringLen,
+            StandardIntrinsic::StringByteLen,
+            StandardIntrinsic::StringSubstring,
+            StandardIntrinsic::StringTrim,
+            StandardIntrinsic::StringSplit,
+            StandardIntrinsic::ArrayLen { element: value },
+            StandardIntrinsic::ArrayIsEmpty { element: value },
+            StandardIntrinsic::ArrayGet { element: value },
+            StandardIntrinsic::ArrayPush { element: value },
+            StandardIntrinsic::ArrayPop { element: value },
+            StandardIntrinsic::MapLen { key, value },
+            StandardIntrinsic::MapContains { key, value },
+            StandardIntrinsic::MapGet { key, value },
+            StandardIntrinsic::MapInsert { key, value },
+            StandardIntrinsic::MapRemove { key, value },
+            StandardIntrinsic::DebugAssert,
+            StandardIntrinsic::DebugTrap,
+        ];
+        assert_eq!(intrinsics.len(), 38);
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            4,
+        );
+        for intrinsic in intrinsics {
+            function.emit(Instruction::StandardIntrinsic {
+                intrinsic,
+                args_base: 0,
+                args_count: intrinsic.argument_count(),
+                dst: 3,
+            });
+        }
+        function.emit(Instruction::ReturnVoid);
+        let mut builder = ModuleBuilder::new();
+        builder.function(function.finish().unwrap());
+        let module = builder.finish();
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn state_schema_fingerprint_is_256_bit_and_enumeration_order_independent() {
+        let nested_core = nexa_core::canonical_array_type_id(nexa_core::CanonicalValueType::Named(
+            nexa_core::canonical_option_type_id(nexa_core::CanonicalValueType::I32),
+        ));
+        let nested_bytecode =
+            super::array_type(ValueType::Named(super::option_type(ValueType::I32).type_id));
+        assert_eq!(nested_core, nested_bytecode);
+
+        let type_a = StateType {
+            stable_id: StableId::from_name("A"),
+            version: 1,
+            fields: vec![
+                StateField {
+                    stable_id: StableId::from_name("A::z"),
+                    ty: ValueType::String,
+                },
+                StateField {
+                    stable_id: StableId::from_name("A::a"),
+                    ty: ValueType::I32,
+                },
+            ],
+        };
+        let type_b = StateType {
+            stable_id: StableId::from_name("B"),
+            version: 2,
+            fields: vec![StateField {
+                stable_id: StableId::from_name("B::value"),
+                ty: ValueType::Bool,
+            }],
+        };
+        let first = StateSchema {
+            types: vec![type_a.clone(), type_b.clone()],
+        }
+        .fingerprint();
+        let mut type_a_reordered = type_a.clone();
+        type_a_reordered.fields.reverse();
+        let reordered = StateSchema {
+            types: vec![type_b, type_a_reordered],
+        }
+        .fingerprint();
+        assert_eq!(first, reordered);
+        assert_eq!(first.as_bytes().len(), 32);
+
+        let mut changed = type_a;
+        changed.version = 2;
+        assert_ne!(
+            first,
+            StateSchema {
+                types: vec![changed]
+            }
+            .fingerprint()
+        );
+
+        let nested_state = StateSchema {
+            types: vec![StateType {
+                stable_id: StableId::from_name("Nested"),
+                version: 1,
+                fields: vec![StateField {
+                    stable_id: StableId::from_name("Nested::values"),
+                    ty: ValueType::Named(nested_bytecode),
+                }],
+            }],
+        };
+        let canonical = nexa_core::CanonicalStateSchema {
+            types: vec![nexa_core::CanonicalStateType {
+                stable_id: StableId::from_name("Nested"),
+                version: 1,
+                fields: vec![nexa_core::CanonicalStateField {
+                    stable_id: StableId::from_name("Nested::values"),
+                    ty: nexa_core::CanonicalValueType::Named(nested_core),
+                }],
+            }],
+        };
+        assert_eq!(nested_state.fingerprint(), canonical.fingerprint());
     }
 }

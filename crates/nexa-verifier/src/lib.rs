@@ -4,7 +4,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use nexa_bytecode::{
-    Function, FunctionEffect, HostCallMode, Instruction, Module, ValueType,
+    Function, FunctionEffect, HostCallMode, Instruction, Module, SCALAR_TO_STRING_FUEL_PASSES,
+    SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES, StandardIntrinsic, ValueType,
     minimum_migration_limits,
 };
 
@@ -51,6 +52,7 @@ pub enum VerifyErrorKind {
     MissingRoot(u16),
     ImmediateCostLimit,
     MissingSafepoint(u32),
+    InvalidSafepoint(u32),
     InvalidRootMap(u32),
     InvalidLoopBound(u32),
     InvalidEffect,
@@ -140,11 +142,22 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     for (function, depth) in module.functions.iter_mut().zip(depths) {
         function.max_static_call_depth = depth;
     }
+    let immediate_closure = immediate_call_closure(&module);
+    let restricted_closure = restricted_effect_call_closure(&module);
     for (index, function) in module.functions.iter().enumerate() {
-        verify_function(&module, index, function, limits)?;
+        verify_function(
+            &module,
+            index,
+            function,
+            limits,
+            immediate_closure[index],
+            restricted_closure[index],
+        )?;
+    }
+    let immediate_costs = immediate_wcets(&module, &immediate_closure, limits.max_wcet_states)?;
+    for (index, function) in module.functions.iter().enumerate() {
         if function.effect == FunctionEffect::Immediate
-            && immediate_wcet(&module, index, &mut Vec::new(), limits.max_wcet_states)?
-                > limits.max_immediate_cost
+            && immediate_costs[index].unwrap_or(u32::MAX) > limits.max_immediate_cost
         {
             return Err(VerifyError {
                 function: index,
@@ -518,21 +531,26 @@ fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
         let valid = match (import.mode, import.async_result) {
             (HostCallMode::Immediate, None) => true,
             (HostCallMode::Async, Some(async_result)) => {
+                let canonical =
+                    nexa_bytecode::result_type(async_result.success, async_result.error);
                 import.result == Some(ValueType::Named(async_result.result_type))
-                    && matches!(
-                        (async_result.cancel_policy, async_result.cancel_error),
-                        (nexa_bytecode::CancelPolicy::ReturnError, Some(_))
-                            | (nexa_bytecode::CancelPolicy::CancelTask, None)
+                    && async_result.result_type == canonical.type_id
+                    && host_policy_error_is_valid(
+                        module,
+                        async_result.error,
+                        async_result.cancel_policy == nexa_bytecode::CancelPolicy::ReturnError,
+                        async_result.cancel_error,
                     )
-                    && matches!(
-                        (async_result.abandon_policy, async_result.abandon_error),
-                        (nexa_bytecode::AbandonPolicy::ReturnError, Some(_))
-                            | (nexa_bytecode::AbandonPolicy::Trap, None)
+                    && host_policy_error_is_valid(
+                        module,
+                        async_result.error,
+                        async_result.abandon_policy == nexa_bytecode::AbandonPolicy::ReturnError,
+                        async_result.abandon_error,
                     )
-                    && module.enum_types.iter().any(|enum_type| {
-                        enum_type
-                            == &nexa_bytecode::result_type(async_result.success, async_result.error)
-                    })
+                    && module
+                        .enum_types
+                        .iter()
+                        .any(|enum_type| enum_type == &canonical)
             }
             _ => false,
         };
@@ -545,6 +563,29 @@ fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
         }
     }
     Ok(())
+}
+
+fn host_policy_error_is_valid(
+    module: &Module,
+    error: ValueType,
+    returns_error: bool,
+    code: Option<u32>,
+) -> bool {
+    match (returns_error, code) {
+        (false, None) => true,
+        (true, Some(_)) if error == ValueType::I32 => true,
+        (true, Some(code)) => match error {
+            ValueType::Named(error_type) => module.enum_types.iter().any(|enum_type| {
+                enum_type.type_id == error_type
+                    && enum_type
+                        .variants
+                        .iter()
+                        .any(|variant| variant.tag == code && variant.payload_type.is_none())
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
 }
 
 fn verify_source_map(module: &Module) -> Result<(), VerifyError> {
@@ -574,9 +615,9 @@ pub fn verify_reload_transition(
     old: &VerifiedModule,
     candidate: &VerifiedModule,
 ) -> Result<(), VerifyError> {
-    let old_hash = old.module().reload_metadata.stateful_schema_hash;
+    let old_fingerprint = old.module().reload_metadata.state_schema_fingerprint;
     let candidate_metadata = candidate.module().reload_metadata;
-    if old_hash != candidate_metadata.stateful_schema_hash
+    if old_fingerprint != candidate_metadata.state_schema_fingerprint
         && candidate_metadata.migration_entry.is_none()
     {
         return Err(VerifyError {
@@ -616,8 +657,10 @@ fn verify_reload_metadata(module: &Module) -> Result<(), VerifyError> {
             return Err(invalid(entry));
         }
     }
-    let expected_schema_hash = module.state_schema.stable_hash();
-    if module.reload_metadata.stateful_schema_hash != expected_schema_hash {
+    let expected_fingerprint = module.state_schema.fingerprint();
+    if module.state_schema_fingerprint != expected_fingerprint
+        || module.reload_metadata.state_schema_fingerprint != expected_fingerprint
+    {
         return Err(invalid(0));
     }
     let required = minimum_migration_limits(module, module.reload_metadata.migration_entry);
@@ -634,12 +677,148 @@ fn verify_reload_metadata(module: &Module) -> Result<(), VerifyError> {
     Ok(())
 }
 
+fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardIntrinsic) -> bool {
+    let has_enum = |expected: nexa_bytecode::EnumType| module.enum_types.contains(&expected);
+    let has_array = |element| {
+        module
+            .array_types
+            .contains(&nexa_bytecode::ArrayType::new(element))
+    };
+    let has_map = |key, value| {
+        module
+            .map_types
+            .contains(&nexa_bytecode::MapType::new(key, value))
+    };
+    match intrinsic {
+        StandardIntrinsic::OptionIsSome { value }
+        | StandardIntrinsic::OptionIsNone { value }
+        | StandardIntrinsic::OptionUnwrapOr { value } => {
+            has_enum(nexa_bytecode::option_type(value))
+        }
+        StandardIntrinsic::ResultIsOk { success, error }
+        | StandardIntrinsic::ResultIsErr { success, error }
+        | StandardIntrinsic::ResultUnwrapOr { success, error } => {
+            has_enum(nexa_bytecode::result_type(success, error))
+        }
+        StandardIntrinsic::StringSplit => has_array(ValueType::String),
+        StandardIntrinsic::ArrayGet { element } => {
+            has_array(element) && has_enum(nexa_bytecode::option_type(element))
+        }
+        StandardIntrinsic::ArrayLen { element }
+        | StandardIntrinsic::ArrayIsEmpty { element }
+        | StandardIntrinsic::ArrayPush { element }
+        | StandardIntrinsic::ArrayPop { element } => has_array(element),
+        StandardIntrinsic::MapGet { key, value } | StandardIntrinsic::MapRemove { key, value } => {
+            has_map(key, value) && has_enum(nexa_bytecode::option_type(value))
+        }
+        StandardIntrinsic::MapLen { key, value }
+        | StandardIntrinsic::MapContains { key, value }
+        | StandardIntrinsic::MapInsert { key, value } => has_map(key, value),
+        _ => true,
+    }
+}
+
+const fn standard_intrinsic_requires_heap(intrinsic: StandardIntrinsic) -> bool {
+    !matches!(
+        intrinsic,
+        StandardIntrinsic::F32Floor
+            | StandardIntrinsic::F64Floor
+            | StandardIntrinsic::F32Ceil
+            | StandardIntrinsic::F64Ceil
+            | StandardIntrinsic::F32Round
+            | StandardIntrinsic::F64Round
+            | StandardIntrinsic::F32Sqrt
+            | StandardIntrinsic::F64Sqrt
+            | StandardIntrinsic::F32Sin
+            | StandardIntrinsic::F64Sin
+            | StandardIntrinsic::F32Cos
+            | StandardIntrinsic::F64Cos
+            | StandardIntrinsic::DebugAssert
+    )
+}
+
+const fn string_instruction_requires_heap(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::LoadString { .. }
+            | Instruction::StringLen { .. }
+            | Instruction::StringByteLen { .. }
+            | Instruction::StringEqual { .. }
+            | Instruction::StringConcat { .. }
+            | Instruction::StringRuneAt { .. }
+            | Instruction::StringHash { .. }
+            | Instruction::I32ToString { .. }
+            | Instruction::I64ToString { .. }
+            | Instruction::F32ToString { .. }
+            | Instruction::F64ToString { .. }
+            | Instruction::BoolToString { .. }
+            | Instruction::RuneToString { .. }
+    )
+}
+
+const fn aggregate_instruction_requires_heap(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::StateHandleResolve { .. }
+            | Instruction::EnumNew { .. }
+            | Instruction::EnumTag { .. }
+            | Instruction::EnumPayload { .. }
+            | Instruction::StructNew { .. }
+            | Instruction::StructGet { .. }
+            | Instruction::StructWith { .. }
+            | Instruction::StructEqual { .. }
+            | Instruction::ClassNew { .. }
+            | Instruction::ClassGet { .. }
+            | Instruction::ClassSet { .. }
+            | Instruction::ClassEqual { .. }
+    )
+}
+
+const fn collection_instruction_requires_heap(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::ArrayNew { .. }
+            | Instruction::ArrayLen { .. }
+            | Instruction::ArrayGet { .. }
+            | Instruction::ArraySet { .. }
+            | Instruction::ArrayPush { .. }
+            | Instruction::ArrayPop { .. }
+            | Instruction::ArrayInsert { .. }
+            | Instruction::ArrayRemove { .. }
+            | Instruction::ArrayClear { .. }
+            | Instruction::MapNew { .. }
+            | Instruction::MapLen { .. }
+            | Instruction::MapGet { .. }
+            | Instruction::MapSet { .. }
+            | Instruction::MapRemove { .. }
+            | Instruction::MapContains { .. }
+            | Instruction::MapClear { .. }
+            | Instruction::BufferLen { .. }
+            | Instruction::BufferGet { .. }
+            | Instruction::BufferSet { .. }
+            | Instruction::BufferSlice { .. }
+            | Instruction::BufferCopy { .. }
+    )
+}
+
+const fn instruction_requires_heap(instruction: Instruction) -> bool {
+    if let Instruction::StandardIntrinsic { intrinsic, .. } = instruction {
+        standard_intrinsic_requires_heap(intrinsic)
+    } else {
+        string_instruction_requires_heap(instruction)
+            || aggregate_instruction_requires_heap(instruction)
+            || collection_instruction_requires_heap(instruction)
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
     function_index: usize,
     function: &Function,
     limits: VerifierLimits,
+    immediate_context: bool,
+    restricted_context: bool,
 ) -> Result<(), VerifyError> {
     let error = |instruction, kind| VerifyError {
         function: function_index,
@@ -723,6 +902,9 @@ fn verify_function(
                 .ok_or_else(|| error(Some(pc), VerifyErrorKind::BufferTypeOutOfRange(type_id.0)))
         };
         let mut successors = Vec::with_capacity(2);
+        if restricted_context && instruction_requires_heap(instruction) {
+            return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+        }
         if matches!(
             instruction,
             Instruction::ArrayNew { .. }
@@ -746,10 +928,28 @@ fn verify_function(
                 | Instruction::BufferSet { .. }
                 | Instruction::BufferSlice { .. }
                 | Instruction::BufferCopy { .. }
-        ) && matches!(
-            function.effect,
-            FunctionEffect::Immediate | FunctionEffect::Migration | FunctionEffect::Cleanup
-        ) {
+        ) && immediate_context
+        {
+            return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+        }
+        if let Instruction::StandardIntrinsic { intrinsic, .. } = instruction
+            && (intrinsic.mutates_collection() || intrinsic.fuel_model().is_variable())
+            && immediate_context
+        {
+            return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+        }
+        if matches!(
+            instruction,
+            Instruction::StringLen { .. }
+                | Instruction::StringEqual { .. }
+                | Instruction::StringConcat { .. }
+                | Instruction::StringRuneAt { .. }
+                | Instruction::StructEqual { .. }
+        ) && immediate_context
+        {
+            // These instructions depend on runtime-sized values. Until the
+            // verifier is bound to a Realm resource profile, no finite
+            // Immediate-effect WCET can be proven.
             return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
         }
         match instruction {
@@ -779,7 +979,8 @@ fn verify_function(
             Instruction::Add { dst, lhs, rhs }
             | Instruction::Sub { dst, lhs, rhs }
             | Instruction::Mul { dst, lhs, rhs }
-            | Instruction::Div { dst, lhs, rhs } => {
+            | Instruction::Div { dst, lhs, rhs }
+            | Instruction::RemI32 { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::I32)?;
                 require(&state, rhs, ValueType::I32)?;
                 state[register(dst)?] = Some(ValueType::I32);
@@ -787,7 +988,8 @@ fn verify_function(
             Instruction::AddI64 { dst, lhs, rhs }
             | Instruction::SubI64 { dst, lhs, rhs }
             | Instruction::MulI64 { dst, lhs, rhs }
-            | Instruction::DivI64 { dst, lhs, rhs } => {
+            | Instruction::DivI64 { dst, lhs, rhs }
+            | Instruction::RemI64 { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::I64)?;
                 require(&state, rhs, ValueType::I64)?;
                 state[register(dst)?] = Some(ValueType::I64);
@@ -795,7 +997,8 @@ fn verify_function(
             Instruction::AddF32 { dst, lhs, rhs }
             | Instruction::SubF32 { dst, lhs, rhs }
             | Instruction::MulF32 { dst, lhs, rhs }
-            | Instruction::DivF32 { dst, lhs, rhs } => {
+            | Instruction::DivF32 { dst, lhs, rhs }
+            | Instruction::RemF32 { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::F32)?;
                 require(&state, rhs, ValueType::F32)?;
                 state[register(dst)?] = Some(ValueType::F32);
@@ -803,7 +1006,8 @@ fn verify_function(
             Instruction::AddF64 { dst, lhs, rhs }
             | Instruction::SubF64 { dst, lhs, rhs }
             | Instruction::MulF64 { dst, lhs, rhs }
-            | Instruction::DivF64 { dst, lhs, rhs } => {
+            | Instruction::DivF64 { dst, lhs, rhs }
+            | Instruction::RemF64 { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::F64)?;
                 require(&state, rhs, ValueType::F64)?;
                 state[register(dst)?] = Some(ValueType::F64);
@@ -831,12 +1035,82 @@ fn verify_function(
                 require(&state, source, ValueType::String)?;
                 state[register(dst)?] = Some(ValueType::I64);
             }
+            Instruction::I32ToString { dst, source } => {
+                require(&state, source, ValueType::I32)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::I64ToString { dst, source } => {
+                require(&state, source, ValueType::I64)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::F32ToString { dst, source } => {
+                require(&state, source, ValueType::F32)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::F64ToString { dst, source } => {
+                require(&state, source, ValueType::F64)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::BoolToString { dst, source } => {
+                require(&state, source, ValueType::Bool)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::RuneToString { dst, source } => {
+                require(&state, source, ValueType::Rune)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::StringToString { dst, source } => {
+                require(&state, source, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::StandardIntrinsic {
+                intrinsic,
+                args_base,
+                args_count,
+                dst,
+            } => {
+                if args_count != intrinsic.argument_count()
+                    || !standard_intrinsic_metadata_is_complete(module, intrinsic)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                for argument in 0..args_count {
+                    let register_index = args_base.checked_add(argument).ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                    })?;
+                    let ty = intrinsic
+                        .argument_type(argument)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                    require(&state, register_index, ty)?;
+                }
+                state[register(dst)?] = Some(intrinsic.result_type());
+            }
             Instruction::CompareEq { dst, lhs, rhs } => {
                 let lhs = register(lhs)?;
                 let rhs = register(rhs)?;
                 if state[lhs].is_none() || state[lhs] != state[rhs] {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::CompareLtI32 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::I32)?;
+                require(&state, rhs, ValueType::I32)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::CompareLtI64 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::I64)?;
+                require(&state, rhs, ValueType::I64)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::CompareLtF32 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::F32)?;
+                require(&state, rhs, ValueType::F32)?;
+                state[register(dst)?] = Some(ValueType::Bool);
+            }
+            Instruction::CompareLtF64 { dst, lhs, rhs } => {
+                require(&state, lhs, ValueType::F64)?;
+                require(&state, rhs, ValueType::F64)?;
                 state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::Jump { target } => {
@@ -859,8 +1133,11 @@ fn verify_function(
                     .functions
                     .get(callee as usize)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(callee)))?;
-                if (function.effect == FunctionEffect::Immediate
-                    && callee.effect != FunctionEffect::Immediate)
+                if (immediate_context
+                    && !matches!(
+                        callee.effect,
+                        FunctionEffect::Ordinary | FunctionEffect::Immediate
+                    ))
                     || (callee.effect == FunctionEffect::Task
                         && function.effect != FunctionEffect::Task)
                     || (function.effect == FunctionEffect::Migration
@@ -898,10 +1175,7 @@ fn verify_function(
                     error(Some(pc), VerifyErrorKind::HostImportOutOfRange(import))
                 })?;
                 if usize::from(args_count) != host.parameters.len()
-                    || matches!(
-                        function.effect,
-                        FunctionEffect::Migration | FunctionEffect::Cleanup
-                    )
+                    || restricted_context
                     || (host.mode == HostCallMode::Async && function.effect != FunctionEffect::Task)
                 {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
@@ -925,12 +1199,32 @@ fn verify_function(
                 state[register(dst)?] = Some(ty);
             }
             Instruction::StateOldFieldGet {
-                object, ty, dst, ..
+                object,
+                field_id,
+                ty,
+                dst,
             } => {
-                if function.effect != FunctionEffect::Migration
-                    || !matches!(state[register(object)?], Some(ValueType::Named(_)))
-                {
+                if function.effect != FunctionEffect::Migration {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                let object = register(object)?;
+                let Some(ValueType::Named(type_id)) = state[object] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field = module
+                    .state_schema
+                    .types
+                    .iter()
+                    .find(|state_type| state_type.stable_id == type_id)
+                    .and_then(|state_type| {
+                        state_type
+                            .fields
+                            .iter()
+                            .find(|field| field.stable_id == field_id)
+                    })
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                if field.ty != ty {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
                 state[register(dst)?] = Some(ty);
             }
@@ -940,11 +1234,7 @@ fn verify_function(
                 result_type,
                 dst,
             } => {
-                if matches!(
-                    function.effect,
-                    FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) || !has_state_handle_type(module, target)
-                {
+                if restricted_context || !has_state_handle_type(module, target) {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -981,11 +1271,7 @@ fn verify_function(
                 target,
                 dst,
             } => {
-                if matches!(
-                    function.effect,
-                    FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) || !has_state_handle_type(module, target)
-                {
+                if restricted_context || !has_state_handle_type(module, target) {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -1006,11 +1292,7 @@ fn verify_function(
                 target,
                 dst,
             } => {
-                if matches!(
-                    function.effect,
-                    FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) || !has_state_handle_type(module, target)
-                {
+                if restricted_context || !has_state_handle_type(module, target) {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 require(
@@ -1026,11 +1308,7 @@ fn verify_function(
                 target,
                 dst,
             } => {
-                if matches!(
-                    function.effect,
-                    FunctionEffect::Migration | FunctionEffect::Cleanup
-                ) || !has_state_handle_type(module, target)
-                {
+                if restricted_context || !has_state_handle_type(module, target) {
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 let handle_type = ValueType::Named(nexa_bytecode::state_handle_type(target));
@@ -1081,7 +1359,15 @@ fn verify_function(
                     return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
                 }
                 let target = register(target)?;
-                if !matches!(state[target], Some(ValueType::Named(_))) {
+                let Some(ValueType::Named(type_id)) = state[target] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                if !module
+                    .state_schema
+                    .types
+                    .iter()
+                    .any(|state_type| state_type.stable_id == type_id)
+                {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
             }
@@ -1647,6 +1933,23 @@ fn verify_safepoints(
     function: &Function,
     states: &[Option<Vec<Option<ValueType>>>],
 ) -> Result<(), VerifyError> {
+    let mut previous = None;
+    for &safepoint in &function.safepoints {
+        let pc = usize::try_from(safepoint).unwrap_or(usize::MAX);
+        let required =
+            function.code.get(pc).copied().is_some_and(|instruction| {
+                instruction_requires_safepoint(function, pc, instruction)
+            });
+        if previous.is_some_and(|previous| previous >= safepoint) || !required {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: (pc < function.code.len()).then_some(pc),
+                kind: VerifyErrorKind::InvalidSafepoint(safepoint),
+            });
+        }
+        previous = Some(safepoint);
+    }
+
     let mut mapped = BTreeSet::new();
     for root_map in &function.root_maps {
         let pc = usize::try_from(root_map.pc).unwrap_or(usize::MAX);
@@ -1664,7 +1967,7 @@ fn verify_safepoints(
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
         let required = instruction_requires_safepoint(function, pc, instruction);
-        if required && !function.safepoints.contains(&pc_u32) {
+        if required && function.safepoints.binary_search(&pc_u32).is_err() {
             return Err(VerifyError {
                 function: function_index,
                 instruction: Some(pc),
@@ -1719,10 +2022,23 @@ fn instruction_requires_safepoint(
             Instruction::Safepoint
                 | Instruction::Yield
                 | Instruction::LoadString { .. }
+                | Instruction::StringLen { .. }
+                | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
+                | Instruction::StringRuneAt { .. }
+                | Instruction::StringHash { .. }
+                | Instruction::I32ToString { .. }
+                | Instruction::I64ToString { .. }
+                | Instruction::F32ToString { .. }
+                | Instruction::F64ToString { .. }
+                | Instruction::BoolToString { .. }
+                | Instruction::RuneToString { .. }
+                | Instruction::StringToString { .. }
+                | Instruction::StandardIntrinsic { .. }
                 | Instruction::EnumNew { .. }
                 | Instruction::StructNew { .. }
                 | Instruction::StructWith { .. }
+                | Instruction::StructEqual { .. }
                 | Instruction::ClassNew { .. }
                 | Instruction::ArrayNew { .. }
                 | Instruction::ArrayLen { .. }
@@ -1778,113 +2094,443 @@ fn target_index(
     }
 }
 
+fn immediate_call_closure(module: &Module) -> Vec<bool> {
+    let mut closure = module
+        .functions
+        .iter()
+        .map(|function| function.effect == FunctionEffect::Immediate)
+        .collect::<Vec<_>>();
+    let mut pending = closure
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reachable)| reachable.then_some(index))
+        .collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        for instruction in &module.functions[function].code {
+            let (callee, deferred) = match *instruction {
+                Instruction::Call {
+                    function: callee, ..
+                } => (callee, false),
+                Instruction::DeferPush {
+                    function: callee, ..
+                } => (callee, true),
+                _ => continue,
+            };
+            let callee = usize::try_from(callee).unwrap_or(usize::MAX);
+            let Some(callee_function) = module.functions.get(callee) else {
+                continue;
+            };
+            let allowed_effect = if deferred {
+                matches!(
+                    callee_function.effect,
+                    FunctionEffect::Ordinary | FunctionEffect::Cleanup
+                )
+            } else {
+                matches!(
+                    callee_function.effect,
+                    FunctionEffect::Ordinary | FunctionEffect::Immediate
+                )
+            };
+            if allowed_effect && !closure[callee] {
+                closure[callee] = true;
+                pending.push(callee);
+            }
+        }
+    }
+    closure
+}
+
+fn restricted_effect_call_closure(module: &Module) -> Vec<bool> {
+    let mut closure = module
+        .functions
+        .iter()
+        .map(|function| {
+            matches!(
+                function.effect,
+                FunctionEffect::Migration | FunctionEffect::Cleanup
+            )
+        })
+        .collect::<Vec<_>>();
+    for function in &module.functions {
+        for instruction in &function.code {
+            let Instruction::DeferPush {
+                function: cleanup, ..
+            } = instruction
+            else {
+                continue;
+            };
+            let cleanup = usize::try_from(*cleanup).unwrap_or(usize::MAX);
+            if let Some(restricted) = closure.get_mut(cleanup) {
+                *restricted = true;
+            }
+        }
+    }
+    let mut pending = closure
+        .iter()
+        .enumerate()
+        .filter_map(|(index, reachable)| reachable.then_some(index))
+        .collect::<Vec<_>>();
+    while let Some(function) = pending.pop() {
+        for instruction in &module.functions[function].code {
+            let callee = match instruction {
+                Instruction::Call {
+                    function: callee, ..
+                }
+                | Instruction::DeferPush {
+                    function: callee, ..
+                } => *callee,
+                _ => continue,
+            };
+            let callee = usize::try_from(callee).unwrap_or(usize::MAX);
+            if module.functions.get(callee).is_some() && !closure[callee] {
+                closure[callee] = true;
+                pending.push(callee);
+            }
+        }
+    }
+    closure
+}
+
 fn static_call_depths(module: &Module) -> Result<Vec<u16>, VerifyError> {
+    let mut memo = vec![[None; 2]; module.functions.len()];
     (0..module.functions.len())
-        .map(|function| call_depth(module, function, &mut Vec::new()))
+        .map(|function| call_depth(module, function, &mut memo))
         .collect()
+}
+
+struct CallDepthFrame {
+    function: usize,
+    next_instruction: usize,
+    depth: u16,
+    immediate_on_path: bool,
 }
 
 fn call_depth(
     module: &Module,
     function: usize,
-    visiting: &mut Vec<usize>,
+    memo: &mut [[Option<u16>; 2]],
 ) -> Result<u16, VerifyError> {
-    if visiting.contains(&function) {
-        if visiting
+    let immediate_on_path = module.functions[function].effect == FunctionEffect::Immediate;
+    let context = usize::from(immediate_on_path);
+    if let Some(depth) = memo[function][context] {
+        return Ok(depth);
+    }
+
+    let mut active = vec![false; module.functions.len()];
+    active[function] = true;
+    let mut frames = vec![CallDepthFrame {
+        function,
+        next_instruction: 0,
+        depth: 1,
+        immediate_on_path,
+    }];
+    loop {
+        let frame = frames
+            .last_mut()
+            .expect("the root call-depth frame returns instead of emptying the stack");
+        let next_call = module.functions[frame.function]
+            .code
             .iter()
-            .any(|index| module.functions[*index].effect == FunctionEffect::Immediate)
-        {
+            .copied()
+            .enumerate()
+            .skip(frame.next_instruction)
+            .find_map(|(pc, instruction)| {
+                frame.next_instruction = pc + 1;
+                let (Instruction::Call {
+                    function: callee, ..
+                }
+                | Instruction::DeferPush {
+                    function: callee, ..
+                }) = instruction
+                else {
+                    return None;
+                };
+                Some((pc, callee))
+            });
+        let Some((pc, callee)) = next_call else {
+            let completed = frames
+                .pop()
+                .expect("the call-depth work stack was checked as non-empty");
+            active[completed.function] = false;
+            let context = usize::from(completed.immediate_on_path);
+            memo[completed.function][context] = Some(completed.depth);
+            if let Some(parent) = frames.last_mut() {
+                parent.depth = parent.depth.max(completed.depth.saturating_add(1));
+                continue;
+            }
+            return Ok(completed.depth);
+        };
+
+        let callee = usize::try_from(callee).unwrap_or(usize::MAX);
+        if callee >= module.functions.len() {
             return Err(VerifyError {
-                function,
-                instruction: None,
-                kind: VerifyErrorKind::ImmediateRecursion,
+                function: frame.function,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::FunctionOutOfRange(
+                    u32::try_from(callee).unwrap_or(u32::MAX),
+                ),
             });
         }
-        return Ok(u16::MAX);
-    }
-    visiting.push(function);
-    let mut depth = 1_u16;
-    for instruction in &module.functions[function].code {
-        if let Instruction::Call {
-            function: callee, ..
-        } = instruction
-        {
-            let callee_depth = call_depth(module, *callee as usize, visiting)?;
-            depth = depth.max(callee_depth.saturating_add(1));
+        if active[callee] {
+            if frame.immediate_on_path {
+                return Err(VerifyError {
+                    function: callee,
+                    instruction: None,
+                    kind: VerifyErrorKind::ImmediateRecursion,
+                });
+            }
+            frame.depth = u16::MAX;
+            continue;
         }
-    }
-    visiting.pop();
-    Ok(depth)
-}
-
-fn immediate_wcet(
-    module: &Module,
-    function: usize,
-    visiting: &mut Vec<usize>,
-    max_states: u32,
-) -> Result<u32, VerifyError> {
-    if visiting.contains(&function) {
-        return Err(VerifyError {
-            function,
-            instruction: None,
-            kind: VerifyErrorKind::ImmediateRecursion,
+        let callee_immediate = module.functions[callee].effect == FunctionEffect::Immediate;
+        let child_immediate_on_path = frame.immediate_on_path || callee_immediate;
+        let context = usize::from(child_immediate_on_path);
+        if let Some(depth) = memo[callee][context] {
+            frame.depth = frame.depth.max(depth.saturating_add(1));
+            continue;
+        }
+        active[callee] = true;
+        frames.push(CallDepthFrame {
+            function: callee,
+            next_instruction: 0,
+            depth: 1,
+            immediate_on_path: child_immediate_on_path,
         });
     }
-    visiting.push(function);
-    let mut remaining = module.functions[function]
-        .loop_bounds
-        .iter()
-        .map(|loop_bound| (loop_bound.back_edge, loop_bound.max_iterations))
-        .collect::<Vec<_>>();
-    let mut memo = BTreeMap::new();
-    let mut explored = 0_u32;
-    let cost = longest_path(
-        module,
-        function,
-        0,
-        visiting,
-        &mut remaining,
-        &mut memo,
-        &mut explored,
-        max_states,
-    )?;
-    visiting.pop();
-    Ok(cost)
+}
+
+fn immediate_wcets(
+    module: &Module,
+    closure: &[bool],
+    max_states: u32,
+) -> Result<Vec<Option<u32>>, VerifyError> {
+    let order = immediate_wcet_order(module, closure)?;
+    let mut costs = vec![None; module.functions.len()];
+    for function in order {
+        let remaining = module.functions[function]
+            .loop_bounds
+            .iter()
+            .map(|loop_bound| (loop_bound.back_edge, loop_bound.max_iterations))
+            .collect::<Vec<_>>();
+        let mut memo = BTreeMap::new();
+        costs[function] = Some(longest_path(
+            module, function, remaining, &mut memo, &costs, max_states,
+        )?);
+    }
+    Ok(costs)
+}
+
+struct WcetCallFrame {
+    function: usize,
+    next_instruction: usize,
+}
+
+fn immediate_wcet_order(module: &Module, closure: &[bool]) -> Result<Vec<usize>, VerifyError> {
+    let mut marks = vec![0_u8; module.functions.len()];
+    let mut order = Vec::new();
+    for root in 0..module.functions.len() {
+        if !closure[root] || marks[root] != 0 {
+            continue;
+        }
+        marks[root] = 1;
+        let mut frames = vec![WcetCallFrame {
+            function: root,
+            next_instruction: 0,
+        }];
+        loop {
+            let frame = frames
+                .last_mut()
+                .expect("the root WCET call frame returns instead of emptying the stack");
+            let next_callee = module.functions[frame.function]
+                .code
+                .iter()
+                .copied()
+                .enumerate()
+                .skip(frame.next_instruction)
+                .find_map(|(pc, instruction)| {
+                    frame.next_instruction = pc + 1;
+                    let (Instruction::Call {
+                        function: callee, ..
+                    }
+                    | Instruction::DeferPush {
+                        function: callee, ..
+                    }) = instruction
+                    else {
+                        return None;
+                    };
+                    Some(usize::try_from(callee).unwrap_or(usize::MAX))
+                });
+            let Some(callee) = next_callee else {
+                let completed = frames
+                    .pop()
+                    .expect("the WCET call work stack was checked as non-empty");
+                marks[completed.function] = 2;
+                order.push(completed.function);
+                if frames.is_empty() {
+                    break;
+                }
+                continue;
+            };
+            if callee >= module.functions.len() || !closure[callee] {
+                continue;
+            }
+            match marks[callee] {
+                0 => {
+                    marks[callee] = 1;
+                    frames.push(WcetCallFrame {
+                        function: callee,
+                        next_instruction: 0,
+                    });
+                }
+                1 => {
+                    return Err(VerifyError {
+                        function: callee,
+                        instruction: None,
+                        kind: VerifyErrorKind::ImmediateRecursion,
+                    });
+                }
+                2 => {}
+                _ => unreachable!("WCET call marks have only three states"),
+            }
+        }
+    }
+    Ok(order)
 }
 
 type WcetMemo = BTreeMap<(usize, Vec<(u32, u32)>), u32>;
+type WcetState = (usize, Vec<(u32, u32)>);
 
-#[allow(clippy::too_many_arguments)]
+struct WcetFrame {
+    state: WcetState,
+    instruction_cost: u32,
+    successors: Vec<WcetState>,
+    next_successor: usize,
+    suffix_cost: u32,
+}
+
 fn longest_path(
     module: &Module,
     function: usize,
-    pc: usize,
-    visiting: &mut Vec<usize>,
-    remaining: &mut [(u32, u32)],
+    remaining: Vec<(u32, u32)>,
     memo: &mut WcetMemo,
-    explored: &mut u32,
+    callee_costs: &[Option<u32>],
     max_states: u32,
 ) -> Result<u32, VerifyError> {
-    let key = (pc, remaining.to_vec());
-    if let Some(cost) = memo.get(&key) {
-        return Ok(*cost);
+    let mut explored = 0_u32;
+    let mut frames = Vec::<WcetFrame>::new();
+    let mut pending = Some((0, remaining));
+    loop {
+        if let Some(state) = pending.take() {
+            if let Some(cost) = memo.get(&state).copied() {
+                if let Some(parent) = frames.last_mut() {
+                    parent.suffix_cost = parent.suffix_cost.max(cost);
+                    continue;
+                }
+                return Ok(cost);
+            }
+            explored = explored.saturating_add(1);
+            if explored > max_states {
+                return Err(VerifyError {
+                    function,
+                    instruction: Some(state.0),
+                    kind: VerifyErrorKind::WcetComplexityLimit,
+                });
+            }
+            frames.push(wcet_frame(module, function, state, callee_costs)?);
+        }
+
+        let Some(frame) = frames.last_mut() else {
+            unreachable!("the root WCET state returns instead of emptying the work stack");
+        };
+        if let Some(successor) = frame.successors.get(frame.next_successor).cloned() {
+            frame.next_successor += 1;
+            pending = Some(successor);
+            continue;
+        }
+
+        let frame = frames
+            .pop()
+            .expect("the WCET work stack was checked as non-empty");
+        let cost = frame
+            .instruction_cost
+            .checked_add(frame.suffix_cost)
+            .ok_or(VerifyError {
+                function,
+                instruction: Some(frame.state.0),
+                kind: VerifyErrorKind::ImmediateCostLimit,
+            })?;
+        memo.insert(frame.state, cost);
+        if let Some(parent) = frames.last_mut() {
+            parent.suffix_cost = parent.suffix_cost.max(cost);
+        } else {
+            return Ok(cost);
+        }
     }
-    *explored = explored.saturating_add(1);
-    if *explored > max_states {
-        return Err(VerifyError {
+}
+
+fn wcet_frame(
+    module: &Module,
+    function: usize,
+    state: WcetState,
+    callee_costs: &[Option<u32>],
+) -> Result<WcetFrame, VerifyError> {
+    let pc = state.0;
+    let instruction = *module.functions[function].code.get(pc).ok_or(VerifyError {
+        function,
+        instruction: Some(pc),
+        kind: VerifyErrorKind::WcetComplexityLimit,
+    })?;
+    let extra_cost = wcet_instruction_extra_cost(module, function, pc, instruction, callee_costs)?;
+    let successors = wcet_successors(module, function, pc, instruction, &state.1)?;
+    Ok(WcetFrame {
+        state,
+        instruction_cost: 1_u32.checked_add(extra_cost).ok_or(VerifyError {
             function,
             instruction: Some(pc),
-            kind: VerifyErrorKind::WcetComplexityLimit,
-        });
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })?,
+        successors,
+        next_successor: 0,
+        suffix_cost: 0,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn wcet_instruction_extra_cost(
+    module: &Module,
+    function: usize,
+    pc: usize,
+    instruction: Instruction,
+    callee_costs: &[Option<u32>],
+) -> Result<u32, VerifyError> {
+    if let Instruction::Call {
+        function: callee, ..
     }
-    let instruction = module.functions[function].code[pc];
-    let callee_cost = if let Instruction::Call {
+    | Instruction::DeferPush {
         function: callee, ..
     } = instruction
     {
-        immediate_wcet(module, callee as usize, visiting, max_states)?
+        let callee_cost =
+            callee_costs
+                .get(callee as usize)
+                .copied()
+                .flatten()
+                .ok_or(VerifyError {
+                    function,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::ImmediateRecursion,
+                })?;
+        if matches!(instruction, Instruction::DeferPush { .. }) {
+            callee_cost.checked_add(1).ok_or(VerifyError {
+                function,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::ImmediateCostLimit,
+            })
+        } else {
+            Ok(callee_cost)
+        }
     } else if let Instruction::HostCall { import, .. } = instruction {
-        module
+        Ok(module
             .host_imports
             .get(import as usize)
             .ok_or(VerifyError {
@@ -1892,11 +2538,82 @@ fn longest_path(
                 instruction: Some(pc),
                 kind: VerifyErrorKind::HostImportOutOfRange(import),
             })?
-            .fuel_cost
+            .fuel_cost)
+    } else if let Instruction::StandardIntrinsic { intrinsic, .. } = instruction {
+        u32::from(intrinsic.base_fuel_cost())
+            .checked_sub(1)
+            .ok_or(VerifyError {
+                function,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::ImmediateCostLimit,
+            })
+    } else if let Instruction::LoadString { string, .. } = instruction {
+        let bytes = module
+            .strings
+            .get(string as usize)
+            .ok_or(VerifyError {
+                function,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::StringOutOfRange(string),
+            })?
+            .len();
+        let bytes = u64::try_from(bytes).map_err(|_| VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })?;
+        let blocks = if bytes == 0 {
+            0
+        } else {
+            (bytes - 1) / STANDARD_STRING_FUEL_BLOCK_BYTES + 1
+        };
+        u32::try_from(blocks.checked_mul(2).ok_or(VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })?)
+        .map_err(|_| VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })
+    } else if matches!(
+        instruction,
+        Instruction::I32ToString { .. }
+            | Instruction::I64ToString { .. }
+            | Instruction::F32ToString { .. }
+            | Instruction::F64ToString { .. }
+            | Instruction::BoolToString { .. }
+            | Instruction::RuneToString { .. }
+    ) {
+        let blocks = (SCALAR_TO_STRING_MAX_BYTES - 1) / STANDARD_STRING_FUEL_BLOCK_BYTES + 1;
+        u32::try_from(
+            blocks
+                .checked_mul(SCALAR_TO_STRING_FUEL_PASSES)
+                .ok_or(VerifyError {
+                    function,
+                    instruction: Some(pc),
+                    kind: VerifyErrorKind::ImmediateCostLimit,
+                })?,
+        )
+        .map_err(|_| VerifyError {
+            function,
+            instruction: Some(pc),
+            kind: VerifyErrorKind::ImmediateCostLimit,
+        })
     } else {
-        0
-    };
-    let successors = match instruction {
+        Ok(0)
+    }
+}
+
+fn wcet_successors(
+    module: &Module,
+    function: usize,
+    pc: usize,
+    instruction: Instruction,
+    remaining: &[(u32, u32)],
+) -> Result<Vec<WcetState>, VerifyError> {
+    let raw_successors = match instruction {
         Instruction::Jump { target } => {
             vec![target as usize]
         }
@@ -1914,8 +2631,8 @@ fn longest_path(
         _ if pc + 1 < module.functions[function].code.len() => vec![pc + 1],
         _ => Vec::new(),
     };
-    let mut suffix = 0;
-    for successor in successors {
+    let mut successors = Vec::with_capacity(raw_successors.len());
+    for successor in raw_successors {
         let mut branch_remaining = remaining.to_vec();
         if successor <= pc {
             let back_edge = u32::try_from(pc).expect("bytecode position fits u32");
@@ -1934,40 +2651,117 @@ fn longest_path(
             }
             *budget -= 1;
         }
-        suffix = suffix.max(longest_path(
-            module,
-            function,
-            successor,
-            visiting,
-            &mut branch_remaining,
-            memo,
-            explored,
-            max_states,
-        )?);
+        successors.push((successor, branch_remaining));
     }
-    let cost = 1_u32
-        .checked_add(callee_cost)
-        .and_then(|value| value.checked_add(suffix))
-        .ok_or(VerifyError {
-            function,
-            instruction: Some(pc),
-            kind: VerifyErrorKind::ImmediateCostLimit,
-        })?;
-    memo.insert(key, cost);
-    Ok(cost)
+    Ok(successors)
 }
 
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        ArrayType, BufferType, ClassType, FunctionBuilder, FunctionEffect, HostCallMode,
-        HostImport, Instruction, MapType, ModuleBuilder, RootMap, Signature, SnapshotType,
-        SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+        AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
+        EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
+        Instruction, MapType, ModuleBuilder, RootMap, Signature, SnapshotType, SourceMapEntry,
+        StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType, StructField,
         StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
+
+    #[test]
+    fn unused_async_import_cannot_forge_its_result_type_identity() {
+        let canonical = nexa_bytecode::result_type(ValueType::I32, ValueType::String);
+        let forged = StableId::from_name("forged-result-type");
+        let mut module = ModuleBuilder::new();
+        module.enum_type(canonical);
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("Host::unused"),
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(forged)),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+            async_result: Some(AsyncResultType {
+                result_type: forged,
+                success: ValueType::I32,
+                error: ValueType::String,
+                cancel_policy: CancelPolicy::CancelTask,
+                abandon_policy: AbandonPolicy::Trap,
+                cancel_error: None,
+                abandon_error: None,
+            }),
+        });
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEnumMetadata
+        );
+    }
+
+    #[test]
+    fn async_return_error_policy_requires_a_representable_error_payload() {
+        let invalid_scalar = nexa_bytecode::result_type(ValueType::I32, ValueType::Bool);
+        let mut scalar_module = ModuleBuilder::new();
+        scalar_module.enum_type(invalid_scalar.clone());
+        scalar_module.host_import(HostImport {
+            stable_id: StableId::from_name("Host::invalid_scalar"),
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(invalid_scalar.type_id)),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+            async_result: Some(AsyncResultType {
+                result_type: invalid_scalar.type_id,
+                success: ValueType::I32,
+                error: ValueType::Bool,
+                cancel_policy: CancelPolicy::ReturnError,
+                abandon_policy: AbandonPolicy::Trap,
+                cancel_error: Some(0),
+                abandon_error: None,
+            }),
+        });
+        assert_eq!(
+            verify(scalar_module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEnumMetadata
+        );
+
+        let error_type = StableId::from_name("PayloadFailure");
+        let error = EnumType {
+            type_id: error_type,
+            variants: vec![EnumVariant {
+                stable_id: StableId::from_name("PayloadFailure::Cancelled"),
+                tag: 0,
+                payload_type: Some(ValueType::I32),
+            }],
+        };
+        let result = nexa_bytecode::result_type(ValueType::I32, ValueType::Named(error_type));
+        let mut payload_module = ModuleBuilder::new();
+        payload_module.enum_type(error).enum_type(result.clone());
+        payload_module.host_import(HostImport {
+            stable_id: StableId::from_name("Host::invalid_payload_variant"),
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(result.type_id)),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+            async_result: Some(AsyncResultType {
+                result_type: result.type_id,
+                success: ValueType::I32,
+                error: ValueType::Named(error_type),
+                cancel_policy: CancelPolicy::CancelTask,
+                abandon_policy: AbandonPolicy::ReturnError,
+                cancel_error: None,
+                abandon_error: Some(0),
+            }),
+        });
+        assert_eq!(
+            verify(payload_module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEnumMetadata
+        );
+    }
 
     #[test]
     fn class_metadata_rejects_duplicate_fields_and_named_type_collisions() {
@@ -2531,6 +3325,27 @@ mod tests {
                 .kind,
             VerifyErrorKind::RegisterOutOfRange(8)
         ));
+
+        let mut missing_callee = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        missing_callee
+            .emit(Instruction::Call {
+                function: 99,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+        let mut module = ModuleBuilder::new();
+        module.function(missing_callee.finish().unwrap());
+        let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.instruction, Some(0));
+        assert_eq!(error.kind, VerifyErrorKind::FunctionOutOfRange(99));
     }
 
     #[test]
@@ -2572,6 +3387,539 @@ mod tests {
             VerifyErrorKind::ImmediateCostLimit
         ));
         assert!(verify(immediate_loop(Some(3)), VerifierLimits::default()).is_ok());
+
+        let large_loop = immediate_loop(Some(1_025));
+        assert_eq!(
+            verify(large_loop.clone(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidLoopBound(4)
+        );
+        assert!(
+            verify(
+                large_loop,
+                VerifierLimits {
+                    max_immediate_cost: 10_000,
+                    ..VerifierLimits::default()
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn immediate_wcet_uses_a_bounded_work_stack_for_deep_control_flow() {
+        fn deep_immediate(instruction_count: u32) -> nexa_bytecode::Module {
+            assert!(instruction_count >= 2);
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: Some(ValueType::I32),
+                },
+                1,
+            );
+            function.effect(FunctionEffect::Immediate);
+            for value in 0..instruction_count - 1 {
+                function.emit(Instruction::LoadI32 {
+                    dst: 0,
+                    value: i32::try_from(value).unwrap(),
+                });
+            }
+            function.emit(Instruction::Return { source: 0 });
+            let mut module = ModuleBuilder::new();
+            module.function(function.finish().unwrap());
+            module.finish()
+        }
+
+        const DEEP_INSTRUCTIONS: u32 = 16_384;
+        const STATE_LIMIT: u32 = 4_096;
+        let module = deep_immediate(DEEP_INSTRUCTIONS);
+        assert_eq!(
+            verify(module.clone(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        );
+        assert!(
+            verify(
+                module.clone(),
+                VerifierLimits {
+                    max_immediate_cost: DEEP_INSTRUCTIONS,
+                    max_wcet_states: DEEP_INSTRUCTIONS,
+                    ..VerifierLimits::default()
+                },
+            )
+            .is_ok()
+        );
+
+        let error = verify(
+            module,
+            VerifierLimits {
+                max_immediate_cost: u32::MAX,
+                max_wcet_states: STATE_LIMIT,
+                ..VerifierLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.instruction, Some(STATE_LIMIT as usize));
+        assert_eq!(error.kind, VerifyErrorKind::WcetComplexityLimit);
+    }
+
+    fn deep_call_chain(
+        function_count: usize,
+        root_effect: FunctionEffect,
+        cycle: bool,
+    ) -> nexa_bytecode::Module {
+        assert!(function_count >= 2);
+        let mut module = ModuleBuilder::new();
+        for index in 0..function_count {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: Some(ValueType::I32),
+                },
+                1,
+            );
+            if index == 0 {
+                function.effect(root_effect);
+            }
+            let callee = if index + 1 < function_count {
+                Some(u32::try_from(index + 1).unwrap())
+            } else {
+                cycle.then_some(0)
+            };
+            if let Some(callee) = callee {
+                function.emit(Instruction::Call {
+                    function: callee,
+                    args_base: 0,
+                    args_count: 0,
+                    dst: 0,
+                });
+            } else {
+                function.emit(Instruction::LoadI32 { dst: 0, value: 7 });
+            }
+            function.emit(Instruction::Return { source: 0 });
+            module.function(function.finish().unwrap());
+        }
+        module.finish()
+    }
+
+    fn nested_defer_module(root_effect: FunctionEffect) -> nexa_bytecode::Module {
+        let mut root = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        root.effect(root_effect).emit(Instruction::DeferPush {
+            function: 1,
+            args_base: 0,
+            args_count: 0,
+        });
+        if root_effect == FunctionEffect::Migration {
+            root.emit(Instruction::StateFinish);
+        }
+        root.emit(Instruction::ReturnVoid);
+
+        let mut direct_cleanup = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        direct_cleanup
+            .emit(Instruction::DeferPush {
+                function: 2,
+                args_base: 0,
+                args_count: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+
+        let mut nested_cleanup = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        nested_cleanup
+            .effect(FunctionEffect::Cleanup)
+            .emit(Instruction::CleanupReturn);
+
+        let mut module = ModuleBuilder::new();
+        module.function(root.finish().unwrap());
+        module.function(direct_cleanup.finish().unwrap());
+        module.function(nested_cleanup.finish().unwrap());
+        module.finish()
+    }
+
+    #[test]
+    fn direct_and_nested_defer_edges_contribute_to_depth_and_immediate_wcet() {
+        let module = nested_defer_module(FunctionEffect::Immediate);
+        assert_eq!(
+            verify(
+                module.clone(),
+                VerifierLimits {
+                    max_immediate_cost: 6,
+                    ..VerifierLimits::default()
+                },
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        );
+
+        let verified = verify(
+            module,
+            VerifierLimits {
+                max_immediate_cost: 7,
+                ..VerifierLimits::default()
+            },
+        )
+        .expect("the exact nested-defer cost and depth must verify");
+        assert_eq!(verified.module().functions[0].max_static_call_depth, 3);
+        assert_eq!(verified.module().functions[1].max_static_call_depth, 2);
+        assert_eq!(verified.module().functions[2].max_static_call_depth, 1);
+    }
+
+    #[test]
+    fn deep_immediate_call_chain_uses_iterative_depth_and_wcet_evaluation() {
+        const FUNCTION_COUNT: usize = 10_000;
+        let module = deep_call_chain(FUNCTION_COUNT, FunctionEffect::Immediate, false);
+        assert_eq!(
+            verify(module.clone(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        );
+        let verified = verify(
+            module,
+            VerifierLimits {
+                max_immediate_cost: 25_000,
+                ..VerifierLimits::default()
+            },
+        )
+        .expect("a relaxed limit verifies the deep acyclic call chain");
+        assert_eq!(
+            verified.module().functions[0].max_static_call_depth,
+            u16::try_from(FUNCTION_COUNT).unwrap()
+        );
+        assert_eq!(
+            verified
+                .module()
+                .functions
+                .last()
+                .unwrap()
+                .max_static_call_depth,
+            1
+        );
+    }
+
+    #[test]
+    fn deep_call_cycles_preserve_ordinary_and_immediate_recursion_semantics() {
+        const FUNCTION_COUNT: usize = 10_000;
+        let ordinary = deep_call_chain(FUNCTION_COUNT, FunctionEffect::Ordinary, true);
+        let verified = verify(ordinary, VerifierLimits::default())
+            .expect("pure Ordinary recursion retains its saturated depth contract");
+        assert!(
+            verified
+                .module()
+                .functions
+                .iter()
+                .all(|function| function.max_static_call_depth == u16::MAX)
+        );
+
+        let immediate = deep_call_chain(FUNCTION_COUNT, FunctionEffect::Immediate, true);
+        let error = verify(immediate, VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.function, 0);
+        assert_eq!(error.instruction, None);
+        assert_eq!(error.kind, VerifyErrorKind::ImmediateRecursion);
+    }
+
+    #[test]
+    fn immediate_functions_accept_only_immediate_safe_ordinary_call_closures() {
+        let mut immediate = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        immediate
+            .effect(FunctionEffect::Immediate)
+            .emit(Instruction::Call {
+                function: 1,
+                args_base: 1,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut pure_ordinary = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        pure_ordinary
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::Return { source: 0 });
+        let mut module = ModuleBuilder::new();
+        module.function(immediate.finish().unwrap());
+        module.function(pure_ordinary.finish().unwrap());
+        assert!(verify(module.finish(), VerifierLimits::default()).is_ok());
+
+        let mut immediate = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::String],
+                result: Some(ValueType::I32),
+            },
+            2,
+        );
+        immediate
+            .effect(FunctionEffect::Immediate)
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::Call {
+                function: 1,
+                args_base: 0,
+                args_count: 1,
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
+        let mut runtime_sized_ordinary = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::String],
+                result: Some(ValueType::I32),
+            },
+            2,
+        );
+        runtime_sized_ordinary
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::StringLen { dst: 1, source: 0 })
+            .emit(Instruction::Return { source: 1 });
+        let mut module = ModuleBuilder::new();
+        module.function(immediate.finish().unwrap());
+        module.function(runtime_sized_ordinary.finish().unwrap());
+        let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.function, 1);
+        assert_eq!(error.instruction, Some(0));
+        assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
+    }
+
+    #[test]
+    fn migration_call_closure_cannot_reach_host_calls_indirectly() {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .emit(Instruction::Call {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+
+        let mut ordinary_helper = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        ordinary_helper
+            .emit(Instruction::HostCall {
+                import: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+
+        let mut module = ModuleBuilder::new();
+        module.function(
+            migration
+                .finish()
+                .expect("migration fixture is well formed"),
+        );
+        module.function(
+            ordinary_helper
+                .finish()
+                .expect("ordinary helper fixture is well formed"),
+        );
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("host.indirect"),
+            parameters: Vec::new(),
+            result: None,
+            mode: HostCallMode::Immediate,
+            fuel_cost: 1,
+            async_result: None,
+        });
+
+        let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.function, 1);
+        assert_eq!(error.instruction, Some(0));
+        assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
+    }
+
+    #[test]
+    fn migration_functions_reject_direct_heap_dependent_instructions() {
+        let mut migration = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        migration
+            .effect(FunctionEffect::Migration)
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::LoadString { dst: 0, string: 0 })
+            .emit(Instruction::StateFinish)
+            .emit(Instruction::ReturnVoid);
+        let mut migration = migration.finish().unwrap();
+        migration.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 2,
+                bitmap: vec![true],
+            },
+        ];
+
+        let mut module = ModuleBuilder::new();
+        module.string("migration cannot allocate");
+        module.function(migration);
+
+        let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.function, 0);
+        assert_eq!(error.instruction, Some(0));
+        assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
+    }
+
+    fn heap_dependent_struct_helper(type_id: StableId) -> Function {
+        let mut helper = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        helper
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::StructNew {
+                type_id,
+                fields_base: 0,
+                fields_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+        let mut helper = helper.finish().unwrap();
+        helper.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true],
+            },
+        ];
+        helper
+    }
+
+    #[test]
+    fn migration_call_and_defer_closures_reject_heap_dependent_ordinary_helpers() {
+        let type_id = StableId::from_name("HeapDependentHelperValue");
+        let helper = heap_dependent_struct_helper(type_id);
+        let struct_type = StructType {
+            type_id,
+            fields: Vec::new(),
+        };
+
+        let mut ordinary = ModuleBuilder::new();
+        ordinary
+            .struct_type(struct_type.clone())
+            .function(helper.clone());
+        verify(ordinary.finish(), VerifierLimits::default())
+            .expect("the helper is valid in an ordinary heap-backed execution");
+
+        for instruction in [
+            Instruction::Call {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            },
+            Instruction::DeferPush {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+            },
+        ] {
+            let mut migration = FunctionBuilder::new(
+                Signature {
+                    parameters: Vec::new(),
+                    result: None,
+                },
+                0,
+            );
+            migration
+                .effect(FunctionEffect::Migration)
+                .emit(instruction)
+                .emit(Instruction::StateFinish)
+                .emit(Instruction::ReturnVoid);
+
+            let mut module = ModuleBuilder::new();
+            module
+                .struct_type(struct_type.clone())
+                .function(migration.finish().unwrap());
+            module.function(helper.clone());
+
+            let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+            assert_eq!(error.function, 1);
+            assert_eq!(error.instruction, Some(0));
+            assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
+        }
+
+        let mut task = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            0,
+        );
+        task.effect(FunctionEffect::Task)
+            .emit(Instruction::DeferPush {
+                function: 1,
+                args_base: 0,
+                args_count: 0,
+            })
+            .emit(Instruction::ReturnVoid);
+        let mut module = ModuleBuilder::new();
+        module
+            .struct_type(struct_type)
+            .function(task.finish().unwrap());
+        module.function(helper);
+
+        let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
+        assert_eq!(error.function, 1);
+        assert_eq!(error.instruction, Some(0));
+        assert_eq!(error.kind, VerifyErrorKind::InvalidEffect);
     }
 
     #[test]
@@ -2642,28 +3990,51 @@ mod tests {
             VerifyErrorKind::InvalidReloadMetadata
         ));
 
-        let old_hash = nexa_bytecode::StateSchema::default().stable_hash();
-        let mut new_hash = old_hash;
-        new_hash.0 ^= 1;
+        let old_schema = nexa_bytecode::StateSchema::default();
+        let old_fingerprint = old_schema.fingerprint();
+        let host_hash = StableId::from_name("reload-test-host");
         let mut old = ModuleBuilder::new();
-        old.metadata(old_hash, old_hash).function(ordinary.clone());
+        old.metadata(host_hash, old_fingerprint)
+            .function(ordinary.clone());
         let old = verify(old.finish(), VerifierLimits::default()).unwrap();
         let mut candidate = ModuleBuilder::new();
+        let candidate_schema = StateSchema {
+            types: vec![StateType {
+                stable_id: StableId::from_name("reload-test-state"),
+                version: 1,
+                fields: Vec::new(),
+            }],
+        };
+        let candidate_fingerprint = candidate_schema.fingerprint();
         candidate
-            .metadata(new_hash, new_hash)
-            .state_schema(StateSchema {
-                types: vec![StateType {
-                    stable_id: old_hash,
-                    version: 1,
-                    fields: Vec::new(),
-                }],
-            })
+            .metadata(host_hash, candidate_fingerprint)
+            .state_schema(candidate_schema)
             .function(ordinary);
         let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
         assert!(matches!(
             verify_reload_transition(&old, &candidate).unwrap_err().kind,
             VerifyErrorKind::InvalidReloadMetadata
         ));
+    }
+
+    #[test]
+    fn reload_metadata_rejects_underreported_nested_defer_depth() {
+        let mut module = nested_defer_module(FunctionEffect::Migration);
+        assert_eq!(
+            module
+                .reload_metadata
+                .minimum_migration_limits
+                .max_call_depth,
+            3
+        );
+        module
+            .reload_metadata
+            .minimum_migration_limits
+            .max_call_depth = 2;
+        assert_eq!(
+            verify(module, VerifierLimits::default()).unwrap_err().kind,
+            VerifyErrorKind::InvalidReloadMetadata
+        );
     }
 
     #[test]
@@ -2706,5 +4077,997 @@ mod tests {
                 .kind,
             VerifyErrorKind::InvalidRootMap(0)
         ));
+    }
+
+    #[test]
+    fn safepoints_are_strictly_increasing_and_exactly_required() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: None,
+            },
+            1,
+        );
+        function
+            .emit(Instruction::LoadI32 { dst: 0, value: 7 })
+            .emit(Instruction::Move { dst: 0, source: 0 })
+            .emit(Instruction::ReturnVoid);
+        let function = function.finish().unwrap();
+        assert_eq!(function.safepoints, vec![0, 2]);
+
+        let verify_with = |safepoints| {
+            let mut candidate = function.clone();
+            candidate.safepoints = safepoints;
+            let mut module = ModuleBuilder::new();
+            module.function(candidate);
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind
+        };
+
+        assert_eq!(
+            verify_with(vec![0, 1, 2]),
+            VerifyErrorKind::InvalidSafepoint(1)
+        );
+        assert_eq!(
+            verify_with(vec![0, 0, 2]),
+            VerifyErrorKind::InvalidSafepoint(0)
+        );
+        assert_eq!(
+            verify_with(vec![2, 0]),
+            VerifyErrorKind::InvalidSafepoint(0)
+        );
+        assert_eq!(verify_with(vec![0]), VerifyErrorKind::MissingSafepoint(2));
+    }
+
+    #[test]
+    fn scalar_to_string_requires_the_exact_scalar_type_and_produces_a_gc_root() {
+        fn conversion_function(
+            source_type: ValueType,
+            instruction: Instruction,
+        ) -> nexa_bytecode::Function {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: vec![source_type],
+                    result: Some(ValueType::String),
+                },
+                2,
+            );
+            function
+                .emit(instruction)
+                .emit(Instruction::Return { source: 1 });
+            let mut function = function.finish().unwrap();
+            let source_is_root = source_type.is_reference();
+            function.root_bitmap[0] = source_is_root;
+            function.root_bitmap[1] = true;
+            function.root_maps = vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: vec![source_is_root, false],
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: vec![source_is_root, true],
+                },
+            ];
+            function
+        }
+
+        let cases = [
+            (
+                ValueType::I32,
+                Instruction::I32ToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::I64,
+                Instruction::I64ToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::F32,
+                Instruction::F32ToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::F64,
+                Instruction::F64ToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::Bool,
+                Instruction::BoolToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::Rune,
+                Instruction::RuneToString { dst: 1, source: 0 },
+            ),
+            (
+                ValueType::String,
+                Instruction::StringToString { dst: 1, source: 0 },
+            ),
+        ];
+        for (source_type, instruction) in cases {
+            let mut module = ModuleBuilder::new();
+            module.function(conversion_function(source_type, instruction));
+            assert!(verify(module.finish(), VerifierLimits::default()).is_ok());
+        }
+
+        let mut invalid = ModuleBuilder::new();
+        invalid.function(conversion_function(
+            ValueType::I32,
+            Instruction::I64ToString { dst: 1, source: 0 },
+        ));
+        assert_eq!(
+            verify(invalid.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+    }
+
+    #[test]
+    fn scalar_ordering_requires_matching_numeric_operands() {
+        fn ordering_function(
+            source_type: ValueType,
+            instruction: Instruction,
+        ) -> nexa_bytecode::Function {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: vec![source_type, source_type],
+                    result: Some(ValueType::Bool),
+                },
+                3,
+            );
+            function
+                .emit(instruction)
+                .emit(Instruction::Return { source: 2 });
+            function.finish().unwrap()
+        }
+
+        let cases = [
+            (
+                ValueType::I32,
+                Instruction::CompareLtI32 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::I64,
+                Instruction::CompareLtI64 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::F32,
+                Instruction::CompareLtF32 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::F64,
+                Instruction::CompareLtF64 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+        ];
+        for (source_type, instruction) in cases {
+            let mut module = ModuleBuilder::new();
+            module.function(ordering_function(source_type, instruction));
+            assert!(verify(module.finish(), VerifierLimits::default()).is_ok());
+        }
+
+        let mut invalid = ModuleBuilder::new();
+        invalid.function(ordering_function(
+            ValueType::I32,
+            Instruction::CompareLtI64 {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ));
+        assert_eq!(
+            verify(invalid.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+    }
+
+    #[test]
+    fn scalar_remainder_requires_matching_numeric_operands() {
+        fn remainder_function(
+            source_type: ValueType,
+            instruction: Instruction,
+        ) -> nexa_bytecode::Function {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: vec![source_type, source_type],
+                    result: Some(source_type),
+                },
+                3,
+            );
+            function
+                .emit(instruction)
+                .emit(Instruction::Return { source: 2 });
+            function.finish().unwrap()
+        }
+
+        let cases = [
+            (
+                ValueType::I32,
+                Instruction::RemI32 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::I64,
+                Instruction::RemI64 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::F32,
+                Instruction::RemF32 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+            (
+                ValueType::F64,
+                Instruction::RemF64 {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                },
+            ),
+        ];
+        for (source_type, instruction) in cases {
+            let mut module = ModuleBuilder::new();
+            module.function(remainder_function(source_type, instruction));
+            assert!(verify(module.finish(), VerifierLimits::default()).is_ok());
+        }
+
+        let mut invalid = ModuleBuilder::new();
+        invalid.function(remainder_function(
+            ValueType::I32,
+            Instruction::RemI64 {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+        ));
+        assert_eq!(
+            verify(invalid.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FrozenIntrinsicKind {
+        OptionIsSome,
+        OptionIsNone,
+        ResultIsOk,
+        ResultIsErr,
+        OptionUnwrapOr,
+        ResultUnwrapOr,
+        F32Floor,
+        F64Floor,
+        F32Ceil,
+        F64Ceil,
+        F32Round,
+        F64Round,
+        F32Sqrt,
+        F64Sqrt,
+        F32Sin,
+        F64Sin,
+        F32Cos,
+        F64Cos,
+        StringContains,
+        StringStartsWith,
+        StringEndsWith,
+        StringLen,
+        StringByteLen,
+        StringSubstring,
+        StringTrim,
+        StringSplit,
+        ArrayLen,
+        ArrayIsEmpty,
+        ArrayGet,
+        ArrayPush,
+        ArrayPop,
+        MapLen,
+        MapContains,
+        MapGet,
+        MapInsert,
+        MapRemove,
+        DebugAssert,
+        DebugTrap,
+    }
+
+    impl FrozenIntrinsicKind {
+        const ALL: [Self; 38] = [
+            Self::OptionIsSome,
+            Self::OptionIsNone,
+            Self::ResultIsOk,
+            Self::ResultIsErr,
+            Self::OptionUnwrapOr,
+            Self::ResultUnwrapOr,
+            Self::F32Floor,
+            Self::F64Floor,
+            Self::F32Ceil,
+            Self::F64Ceil,
+            Self::F32Round,
+            Self::F64Round,
+            Self::F32Sqrt,
+            Self::F64Sqrt,
+            Self::F32Sin,
+            Self::F64Sin,
+            Self::F32Cos,
+            Self::F64Cos,
+            Self::StringContains,
+            Self::StringStartsWith,
+            Self::StringEndsWith,
+            Self::StringLen,
+            Self::StringByteLen,
+            Self::StringSubstring,
+            Self::StringTrim,
+            Self::StringSplit,
+            Self::ArrayLen,
+            Self::ArrayIsEmpty,
+            Self::ArrayGet,
+            Self::ArrayPush,
+            Self::ArrayPop,
+            Self::MapLen,
+            Self::MapContains,
+            Self::MapGet,
+            Self::MapInsert,
+            Self::MapRemove,
+            Self::DebugAssert,
+            Self::DebugTrap,
+        ];
+    }
+
+    fn frozen_intrinsic_kind(intrinsic: StandardIntrinsic) -> FrozenIntrinsicKind {
+        match intrinsic {
+            StandardIntrinsic::OptionIsSome { .. } => FrozenIntrinsicKind::OptionIsSome,
+            StandardIntrinsic::OptionIsNone { .. } => FrozenIntrinsicKind::OptionIsNone,
+            StandardIntrinsic::ResultIsOk { .. } => FrozenIntrinsicKind::ResultIsOk,
+            StandardIntrinsic::ResultIsErr { .. } => FrozenIntrinsicKind::ResultIsErr,
+            StandardIntrinsic::OptionUnwrapOr { .. } => FrozenIntrinsicKind::OptionUnwrapOr,
+            StandardIntrinsic::ResultUnwrapOr { .. } => FrozenIntrinsicKind::ResultUnwrapOr,
+            StandardIntrinsic::F32Floor => FrozenIntrinsicKind::F32Floor,
+            StandardIntrinsic::F64Floor => FrozenIntrinsicKind::F64Floor,
+            StandardIntrinsic::F32Ceil => FrozenIntrinsicKind::F32Ceil,
+            StandardIntrinsic::F64Ceil => FrozenIntrinsicKind::F64Ceil,
+            StandardIntrinsic::F32Round => FrozenIntrinsicKind::F32Round,
+            StandardIntrinsic::F64Round => FrozenIntrinsicKind::F64Round,
+            StandardIntrinsic::F32Sqrt => FrozenIntrinsicKind::F32Sqrt,
+            StandardIntrinsic::F64Sqrt => FrozenIntrinsicKind::F64Sqrt,
+            StandardIntrinsic::F32Sin => FrozenIntrinsicKind::F32Sin,
+            StandardIntrinsic::F64Sin => FrozenIntrinsicKind::F64Sin,
+            StandardIntrinsic::F32Cos => FrozenIntrinsicKind::F32Cos,
+            StandardIntrinsic::F64Cos => FrozenIntrinsicKind::F64Cos,
+            StandardIntrinsic::StringContains => FrozenIntrinsicKind::StringContains,
+            StandardIntrinsic::StringStartsWith => FrozenIntrinsicKind::StringStartsWith,
+            StandardIntrinsic::StringEndsWith => FrozenIntrinsicKind::StringEndsWith,
+            StandardIntrinsic::StringLen => FrozenIntrinsicKind::StringLen,
+            StandardIntrinsic::StringByteLen => FrozenIntrinsicKind::StringByteLen,
+            StandardIntrinsic::StringSubstring => FrozenIntrinsicKind::StringSubstring,
+            StandardIntrinsic::StringTrim => FrozenIntrinsicKind::StringTrim,
+            StandardIntrinsic::StringSplit => FrozenIntrinsicKind::StringSplit,
+            StandardIntrinsic::ArrayLen { .. } => FrozenIntrinsicKind::ArrayLen,
+            StandardIntrinsic::ArrayIsEmpty { .. } => FrozenIntrinsicKind::ArrayIsEmpty,
+            StandardIntrinsic::ArrayGet { .. } => FrozenIntrinsicKind::ArrayGet,
+            StandardIntrinsic::ArrayPush { .. } => FrozenIntrinsicKind::ArrayPush,
+            StandardIntrinsic::ArrayPop { .. } => FrozenIntrinsicKind::ArrayPop,
+            StandardIntrinsic::MapLen { .. } => FrozenIntrinsicKind::MapLen,
+            StandardIntrinsic::MapContains { .. } => FrozenIntrinsicKind::MapContains,
+            StandardIntrinsic::MapGet { .. } => FrozenIntrinsicKind::MapGet,
+            StandardIntrinsic::MapInsert { .. } => FrozenIntrinsicKind::MapInsert,
+            StandardIntrinsic::MapRemove { .. } => FrozenIntrinsicKind::MapRemove,
+            StandardIntrinsic::DebugAssert => FrozenIntrinsicKind::DebugAssert,
+            StandardIntrinsic::DebugTrap => FrozenIntrinsicKind::DebugTrap,
+        }
+    }
+
+    struct FrozenIntrinsicSpec {
+        intrinsic: StandardIntrinsic,
+        arguments: Vec<ValueType>,
+        result: ValueType,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn frozen_intrinsic_specs() -> Vec<FrozenIntrinsicSpec> {
+        let value = ValueType::I32;
+        let key = ValueType::String;
+        let option = ValueType::Named(nexa_bytecode::option_type(value).type_id);
+        let result = ValueType::Named(nexa_bytecode::result_type(value, key).type_id);
+        let array = ValueType::Named(nexa_bytecode::array_type(value));
+        let string_array = ValueType::Named(nexa_bytecode::array_type(ValueType::String));
+        let map = ValueType::Named(nexa_bytecode::map_type(key, value));
+        let spec = |intrinsic, arguments, result| FrozenIntrinsicSpec {
+            intrinsic,
+            arguments,
+            result,
+        };
+        vec![
+            spec(
+                StandardIntrinsic::OptionIsSome { value },
+                vec![option],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::OptionIsNone { value },
+                vec![option],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ResultIsOk {
+                    success: value,
+                    error: key,
+                },
+                vec![result],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ResultIsErr {
+                    success: value,
+                    error: key,
+                },
+                vec![result],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::OptionUnwrapOr { value },
+                vec![option, value],
+                value,
+            ),
+            spec(
+                StandardIntrinsic::ResultUnwrapOr {
+                    success: value,
+                    error: key,
+                },
+                vec![result, value],
+                value,
+            ),
+            spec(
+                StandardIntrinsic::F32Floor,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Floor,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::F32Ceil,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Ceil,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::F32Round,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Round,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::F32Sqrt,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Sqrt,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::F32Sin,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Sin,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::F32Cos,
+                vec![ValueType::F32],
+                ValueType::F32,
+            ),
+            spec(
+                StandardIntrinsic::F64Cos,
+                vec![ValueType::F64],
+                ValueType::F64,
+            ),
+            spec(
+                StandardIntrinsic::StringContains,
+                vec![ValueType::String, ValueType::String],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::StringStartsWith,
+                vec![ValueType::String, ValueType::String],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::StringEndsWith,
+                vec![ValueType::String, ValueType::String],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::StringLen,
+                vec![ValueType::String],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::StringByteLen,
+                vec![ValueType::String],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::StringSubstring,
+                vec![ValueType::String, ValueType::I32, ValueType::I32],
+                ValueType::String,
+            ),
+            spec(
+                StandardIntrinsic::StringTrim,
+                vec![ValueType::String],
+                ValueType::String,
+            ),
+            spec(
+                StandardIntrinsic::StringSplit,
+                vec![ValueType::String, ValueType::String],
+                string_array,
+            ),
+            spec(
+                StandardIntrinsic::ArrayLen { element: value },
+                vec![array],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::ArrayIsEmpty { element: value },
+                vec![array],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayGet { element: value },
+                vec![array, ValueType::I32],
+                option,
+            ),
+            spec(
+                StandardIntrinsic::ArrayPush { element: value },
+                vec![array, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayPop { element: value },
+                vec![array],
+                value,
+            ),
+            spec(
+                StandardIntrinsic::MapLen { key, value },
+                vec![map],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::MapContains { key, value },
+                vec![map, key],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::MapGet { key, value },
+                vec![map, key],
+                option,
+            ),
+            spec(
+                StandardIntrinsic::MapInsert { key, value },
+                vec![map, key, value],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::MapRemove { key, value },
+                vec![map, key],
+                option,
+            ),
+            spec(
+                StandardIntrinsic::DebugAssert,
+                vec![ValueType::Bool],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::DebugTrap,
+                vec![ValueType::String],
+                ValueType::Bool,
+            ),
+        ]
+    }
+
+    fn frozen_intrinsic_spec(intrinsic: StandardIntrinsic) -> FrozenIntrinsicSpec {
+        frozen_intrinsic_specs()
+            .into_iter()
+            .find(|spec| spec.intrinsic == intrinsic)
+            .unwrap_or_else(|| panic!("missing frozen spec for {}", intrinsic.canonical_name()))
+    }
+
+    fn intrinsic_module(spec: &FrozenIntrinsicSpec, effect: FunctionEffect) -> ModuleBuilder {
+        let parameters = spec.arguments.clone();
+        let result = spec.result;
+        let dst = u16::try_from(parameters.len()).expect("frozen intrinsic arity fits in u16");
+        let registers = dst + 1;
+        let roots_at_entry = parameters
+            .iter()
+            .map(|ty| ty.is_reference())
+            .chain(std::iter::once(false))
+            .collect::<Vec<_>>();
+        let mut roots_at_return = roots_at_entry.clone();
+        roots_at_return[usize::from(dst)] = result.is_reference();
+        let root_bitmap = roots_at_entry
+            .iter()
+            .zip(&roots_at_return)
+            .map(|(entry, returned)| *entry || *returned)
+            .collect::<Vec<_>>();
+        let function = Function {
+            signature: Signature {
+                parameters,
+                result: Some(result),
+            },
+            registers,
+            frame_bytes: u32::from(registers) * 8,
+            root_bitmap,
+            root_maps: vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: roots_at_entry,
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: roots_at_return,
+                },
+            ],
+            safepoints: vec![0, 1],
+            loop_bounds: Vec::new(),
+            effect,
+            max_static_call_depth: 1,
+            code: vec![
+                Instruction::StandardIntrinsic {
+                    intrinsic: spec.intrinsic,
+                    args_base: 0,
+                    args_count: dst,
+                    dst,
+                },
+                Instruction::Return { source: dst },
+            ],
+        };
+        let mut module = ModuleBuilder::new();
+        module
+            .enum_type(nexa_bytecode::option_type(ValueType::I32))
+            .enum_type(nexa_bytecode::result_type(
+                ValueType::I32,
+                ValueType::String,
+            ))
+            .array_type(ArrayType::new(ValueType::I32))
+            .array_type(ArrayType::new(ValueType::String))
+            .map_type(MapType::new(ValueType::String, ValueType::I32))
+            .function(function);
+        module
+    }
+
+    #[test]
+    fn every_standard_intrinsic_has_verified_types_metadata_roots_and_fuel() {
+        let specs = frozen_intrinsic_specs();
+        assert_eq!(
+            specs
+                .iter()
+                .map(|spec| frozen_intrinsic_kind(spec.intrinsic))
+                .collect::<Vec<_>>(),
+            FrozenIntrinsicKind::ALL,
+            "the frozen verifier specs must cover each intrinsic variant exactly once"
+        );
+        for spec in &specs {
+            let intrinsic = spec.intrinsic;
+            assert_eq!(
+                usize::from(intrinsic.argument_count()),
+                spec.arguments.len(),
+                "{} arity changed from its independently frozen signature",
+                intrinsic.canonical_name()
+            );
+            for (index, expected) in spec.arguments.iter().copied().enumerate() {
+                assert_eq!(
+                    intrinsic.argument_type(u16::try_from(index).unwrap()),
+                    Some(expected),
+                    "{} argument {index} changed from its independently frozen signature",
+                    intrinsic.canonical_name()
+                );
+            }
+            assert_eq!(
+                intrinsic.argument_type(intrinsic.argument_count()),
+                None,
+                "{} exposes an argument beyond its frozen arity",
+                intrinsic.canonical_name()
+            );
+            assert_eq!(
+                intrinsic.result_type(),
+                spec.result,
+                "{} result changed from its independently frozen signature",
+                intrinsic.canonical_name()
+            );
+            assert_ne!(intrinsic.base_fuel_cost(), 0);
+            verify(
+                intrinsic_module(spec, FunctionEffect::Ordinary).finish(),
+                VerifierLimits::default(),
+            )
+            .unwrap_or_else(|error| panic!("{}: {error}", intrinsic.canonical_name()));
+        }
+    }
+
+    #[test]
+    fn standard_intrinsic_arity_effect_and_cost_guards_are_enforced() {
+        let string_contains = frozen_intrinsic_spec(StandardIntrinsic::StringContains);
+        let mut wrong_count = intrinsic_module(&string_contains, FunctionEffect::Ordinary).finish();
+        let Instruction::StandardIntrinsic { args_count, .. } =
+            &mut wrong_count.functions[0].code[0]
+        else {
+            unreachable!()
+        };
+        *args_count = 1;
+        assert_eq!(
+            verify(wrong_count, VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+
+        assert_eq!(
+            verify(
+                intrinsic_module(
+                    &frozen_intrinsic_spec(StandardIntrinsic::ArrayPush {
+                        element: ValueType::I32,
+                    }),
+                    FunctionEffect::Immediate,
+                )
+                .finish(),
+                VerifierLimits::default(),
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::InvalidEffect
+        );
+
+        assert_eq!(
+            verify(
+                intrinsic_module(
+                    &frozen_intrinsic_spec(StandardIntrinsic::StringContains),
+                    FunctionEffect::Immediate,
+                )
+                .finish(),
+                VerifierLimits::default(),
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::InvalidEffect
+        );
+
+        assert_eq!(
+            verify(
+                intrinsic_module(
+                    &frozen_intrinsic_spec(StandardIntrinsic::F64Sin),
+                    FunctionEffect::Immediate,
+                )
+                .finish(),
+                VerifierLimits {
+                    max_immediate_cost: 15,
+                    ..VerifierLimits::default()
+                },
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        );
+    }
+
+    #[test]
+    fn migration_fields_and_replace_targets_require_exact_state_schema_nominals() {
+        let owner = StableId::from_name("Owner");
+        let other_owner = StableId::from_name("OtherOwner");
+        let field = StableId::from_parts(&["Owner", "::value"]);
+        let schema = StateSchema {
+            types: vec![
+                StateType {
+                    stable_id: owner,
+                    version: 1,
+                    fields: vec![StateField {
+                        stable_id: field,
+                        ty: ValueType::I32,
+                    }],
+                },
+                StateType {
+                    stable_id: other_owner,
+                    version: 1,
+                    fields: Vec::new(),
+                },
+            ],
+        };
+
+        let old_field_module =
+            |object_type: StableId, value_type: ValueType| -> nexa_bytecode::Module {
+                let mut function = FunctionBuilder::new(
+                    Signature {
+                        parameters: vec![ValueType::Named(object_type)],
+                        result: None,
+                    },
+                    2,
+                );
+                function
+                    .set_root(0)
+                    .unwrap()
+                    .effect(FunctionEffect::Migration)
+                    .emit(Instruction::StateOldFieldGet {
+                        object: 0,
+                        field_id: field,
+                        ty: value_type,
+                        dst: 1,
+                    })
+                    .emit(Instruction::ReturnVoid);
+                let mut module = ModuleBuilder::new();
+                module
+                    .state_schema(schema.clone())
+                    .function(function.finish().unwrap());
+                module.reload_entries(Some(0), None);
+                module.finish()
+            };
+
+        verify(
+            old_field_module(owner, ValueType::I32),
+            VerifierLimits::default(),
+        )
+        .unwrap();
+        for forged in [
+            old_field_module(other_owner, ValueType::I32),
+            old_field_module(owner, ValueType::Bool),
+        ] {
+            assert_eq!(
+                verify(forged, VerifierLimits::default()).unwrap_err().kind,
+                VerifyErrorKind::TypeMismatch
+            );
+        }
+
+        let replace_module = |target_type: StableId, declare_struct: bool| {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: vec![ValueType::Named(target_type)],
+                    result: None,
+                },
+                1,
+            );
+            function
+                .set_root(0)
+                .unwrap()
+                .effect(FunctionEffect::Migration)
+                .emit(Instruction::StateReplace {
+                    old_id: StableId::from_name("old"),
+                    target: 0,
+                })
+                .emit(Instruction::ReturnVoid);
+            let mut module = ModuleBuilder::new();
+            module
+                .state_schema(schema.clone())
+                .function(function.finish().unwrap());
+            if declare_struct {
+                module.struct_type(StructType {
+                    type_id: target_type,
+                    fields: Vec::new(),
+                });
+            }
+            module.reload_entries(Some(0), None);
+            module.finish()
+        };
+
+        verify(replace_module(owner, false), VerifierLimits::default()).unwrap();
+        let non_state = StableId::from_name("PlainStruct");
+        assert_eq!(
+            verify(replace_module(non_state, true), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+    }
+
+    #[test]
+    fn immediate_string_work_is_static_or_rejected_without_a_resource_profile() {
+        let mut runtime_sized = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::String],
+                result: Some(ValueType::I32),
+            },
+            2,
+        );
+        runtime_sized
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::StringLen { dst: 1, source: 0 })
+            .emit(Instruction::Return { source: 1 })
+            .effect(FunctionEffect::Immediate);
+        let mut module = ModuleBuilder::new();
+        module.function(runtime_sized.finish().unwrap());
+        assert_eq!(
+            verify(module.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidEffect
+        );
+
+        let mut bounded = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::String),
+            },
+            1,
+        );
+        bounded
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::LoadString { dst: 0, string: 0 })
+            .emit(Instruction::Return { source: 0 })
+            .effect(FunctionEffect::Immediate);
+        let mut bounded = bounded.finish().unwrap();
+        bounded.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.string("123456789012345678901234567890123");
+        module.function(bounded);
+        let module = module.finish();
+        assert_eq!(
+            verify(
+                module.clone(),
+                VerifierLimits {
+                    max_immediate_cost: 5,
+                    ..VerifierLimits::default()
+                },
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::ImmediateCostLimit
+        );
+        assert!(
+            verify(
+                module,
+                VerifierLimits {
+                    max_immediate_cost: 6,
+                    ..VerifierLimits::default()
+                },
+            )
+            .is_ok()
+        );
     }
 }

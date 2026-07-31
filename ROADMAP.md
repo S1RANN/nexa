@@ -160,8 +160,20 @@ Last Known Good artifact.
 The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M3R3 adds no
 language, Runtime, Package, LSP, editor, or optimization capability.
 
-## Next review
+## Current milestone
 
 M3R3 completes Candidate freshness and commit safety. M4 Language Scale
-Foundation has not started and may begin only from the immutable M3R3
-completion tag under a separately frozen milestone.
+Foundation is complete from the immutable M3R3 completion commit `9d310645`.
+It adds compile-time Source Modules, deterministic static local libraries,
+shared incremental analysis, cross-file diagnostics and debugging, language
+ergonomics, a minimal standard library, and pure Package Tests.
+
+Source Modules are statically linked into one Package Artifact. Runtime
+isolation remains one Realm and one Epoch per Application Package, and Reload
+remains a Package-level Restart operation.
+
+The completion gates exercise a 129-Module, 1,379-symbol, 500-edge,
+20-Package closure, the nine canonical Snake Packages, and at least 100
+scenarios in each reload stress class. The completion marker is the annotated
+tag `language-scale-m4-complete`; the immutable M1 through M3R3 tags remain
+unchanged.

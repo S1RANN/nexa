@@ -5,7 +5,7 @@ use nexa_bytecode::{
     AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
     ModuleBuilder, RootMap, Signature, ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{CanonicalSymbolIdentity, StableId, SymbolKind};
 use nexa_runtime::{
     CancelReason, HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest,
     RealmConfig, RealmRuntime, ReleaseKind, ResourceContext, RestartReloadOutcome,
@@ -15,8 +15,8 @@ use nexa_runtime::{
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const HOST: StableId = StableId(0x5245_4c4f_4144_484f);
-const SCHEMA_V1: StableId = StableId(0x5245_4c4f_4144_5331);
-const SCHEMA_V2: StableId = StableId(0x5245_4c4f_4144_5332);
+const SNIPPET_PACKAGE: &str = "nexa.snippet";
+const COMBAT_MODULE: &str = "game.combat";
 
 const V1: &str = include_str!("../../../examples/combat-runtime/reload/v1.nexa");
 const V2: &str = include_str!("../../../examples/combat-runtime/reload/v2.nexa");
@@ -51,7 +51,8 @@ impl HostRegistry for Host {
     }
 }
 
-fn realm(module: VerifiedModule, schema: StableId) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+fn realm(module: VerifiedModule) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
+    let state_schema_fingerprint = module.module().state_schema_fingerprint;
     let host = RuntimeHost::new(128);
     let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
@@ -62,13 +63,30 @@ fn realm(module: VerifiedModule, schema: StableId) -> (RealmRuntime, nexa_runtim
     )
     .expect("hosted realm");
     let module = realm
-        .load_module(module, HOST, schema)
+        .load_module(module, HOST, state_schema_fingerprint)
         .expect("load module");
     (realm, module)
 }
 
-fn compile(source: &str, schema: StableId) -> VerifiedModule {
-    nexa_compiler::compile_with_metadata(source, HOST, schema).expect("compile reload module")
+fn compile(source: &str) -> VerifiedModule {
+    nexa_compiler::compile_with_metadata(source, HOST).expect("compile reload module")
+}
+
+fn state_type_id(name: &str) -> StableId {
+    CanonicalSymbolIdentity::automatic(SNIPPET_PACKAGE, COMBAT_MODULE, SymbolKind::Type, name)
+        .runtime_id()
+        .0
+}
+
+fn state_field_id(owner: &str, name: &str) -> StableId {
+    CanonicalSymbolIdentity::automatic(
+        SNIPPET_PACKAGE,
+        COMBAT_MODULE,
+        SymbolKind::Field,
+        format!("{owner}.{name}"),
+    )
+    .runtime_id()
+    .0
 }
 
 fn config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
@@ -101,21 +119,21 @@ struct StatefulScenario {
 }
 
 fn stateful_scenario() -> StatefulScenario {
-    let (mut realm, old) = realm(compile(V1, SCHEMA_V1), SCHEMA_V1);
+    let (mut realm, old) = realm(compile(V1));
     let boss = StableId::from_name("boss");
     let preserved = StableId::from_name("preserved");
     let deleted = StableId::from_name("deleted");
     let enemy = |phase, legacy| {
         StateValue::Object(StateObject {
-            type_id: StableId::from_name("EnemyBrain"),
+            type_id: state_type_id("EnemyBrain"),
             version: 1,
             fields: BTreeMap::from([
                 (
-                    StableId::from_name("EnemyBrain::phase"),
+                    state_field_id("EnemyBrain", "phase"),
                     StateValue::I32(phase),
                 ),
                 (
-                    StableId::from_name("EnemyBrain::legacy_target"),
+                    state_field_id("EnemyBrain", "legacy_target"),
                     StateValue::I32(legacy),
                 ),
             ]),
@@ -127,10 +145,10 @@ fn stateful_scenario() -> StatefulScenario {
             old,
             preserved,
             StateValue::Object(StateObject {
-                type_id: StableId::from_name("StableBrain"),
+                type_id: state_type_id("StableBrain"),
                 version: 1,
                 fields: BTreeMap::from([(
-                    StableId::from_name("StableBrain::phase"),
+                    state_field_id("StableBrain", "phase"),
                     StateValue::I32(5),
                 )]),
             }),
@@ -154,25 +172,22 @@ fn stateful_scenario() -> StatefulScenario {
 fn commit_stateful(scenario: &mut StatefulScenario) -> nexa_runtime::ModuleHandle {
     let outcome = scenario
         .realm
-        .restart_reload(scenario.old, compile(V2, SCHEMA_V2), policy())
+        .restart_reload(scenario.old, compile(V2), policy())
         .expect("stateful restart reload");
     let RestartReloadOutcome::Committed(candidate) = outcome else {
-        panic!("stateful reload must commit");
+        panic!("stateful reload must commit, got {outcome:?}");
     };
     candidate
 }
 
-fn simple_yielding(schema: StableId) -> VerifiedModule {
-    compile(
-        "task fn update(value: i32) -> i32 { yield; return value; }",
-        schema,
-    )
+fn simple_yielding() -> VerifiedModule {
+    compile("task fn update(value: i32) -> i32 { yield; return value; }")
 }
 
 #[test]
 fn schema_unchanged_commits() {
-    let module = simple_yielding(SCHEMA_V1);
-    let (mut realm, old) = realm(module.clone(), SCHEMA_V1);
+    let module = simple_yielding();
+    let (mut realm, old) = realm(module.clone());
     assert!(matches!(
         realm
             .restart_reload(old, module, RestartReloadPolicy::default())
@@ -183,31 +198,31 @@ fn schema_unchanged_commits() {
 
 #[test]
 fn schema_unchanged_restart_preserves_typed_state_without_migration_entry() {
-    let module = compile(V1, SCHEMA_V1);
-    let (mut realm, old) = realm(module.clone(), SCHEMA_V1);
+    let module = compile(V1);
+    let (mut realm, old) = realm(module.clone());
     let state_id = StableId::from_name("overlay");
     realm
         .insert_state(
             old,
             state_id,
             StateValue::Object(StateObject {
-                type_id: StableId::from_name("EnemyBrain"),
+                type_id: state_type_id("EnemyBrain"),
                 version: 1,
                 fields: BTreeMap::from([
-                    (StableId::from_name("EnemyBrain::phase"), StateValue::I32(7)),
+                    (state_field_id("EnemyBrain", "phase"), StateValue::I32(7)),
                     (
-                        StableId::from_name("EnemyBrain::legacy_target"),
+                        state_field_id("EnemyBrain", "legacy_target"),
                         StateValue::I32(11),
                     ),
                 ]),
             }),
         )
         .expect("insert state");
-    let RestartReloadOutcome::Committed(candidate) = realm
+    let outcome = realm
         .restart_reload(old, module, RestartReloadPolicy::default())
-        .expect("reload")
-    else {
-        panic!("schema-identical reload commits");
+        .expect("reload");
+    let RestartReloadOutcome::Committed(candidate) = outcome else {
+        panic!("schema-identical reload must commit, got {outcome:?}");
     };
     let handle = realm
         .state_handles(candidate)
@@ -222,7 +237,7 @@ fn schema_unchanged_restart_preserves_typed_state_without_migration_entry() {
         panic!("state remains typed object");
     };
     assert_eq!(
-        state.fields.get(&StableId::from_name("EnemyBrain::phase")),
+        state.fields.get(&state_field_id("EnemyBrain", "phase")),
         Some(&StateValue::I32(7))
     );
 }
@@ -248,7 +263,7 @@ fn appended_field_receives_migration_default() {
     assert_eq!(
         object
             .fields
-            .get(&StableId::from_name("EnemyBrain::aggression")),
+            .get(&state_field_id("EnemyBrain", "aggression")),
         Some(&StateValue::I32(0))
     );
 }
@@ -314,13 +329,12 @@ fn migration_error_rolls_back_before_commit() {
     let failing = compile(
         "@stateful(2) class EnemyBrain { phase: i32; aggression: i32; }
          @stateful(1) class StableBrain { phase: i32; }
-         migration fn migrate(value: i32) -> i32 {
+         pub migration fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
          task fn update(value: i32) -> i32 { return value; }",
-        SCHEMA_V2,
     );
     assert!(matches!(
         scenario
@@ -340,8 +354,8 @@ fn migration_error_rolls_back_before_commit() {
 
 #[test]
 fn restart_cancels_every_old_task() {
-    let module = simple_yielding(SCHEMA_V1);
-    let (mut realm, old) = realm(module.clone(), SCHEMA_V1);
+    let module = simple_yielding();
+    let (mut realm, old) = realm(module.clone());
     let scope = realm.create_scope(None).expect("scope");
     let first = realm
         .spawn_task(old, 0, &[RuntimeValue::I32(1)], config(scope))
@@ -409,7 +423,9 @@ fn async_module() -> VerifiedModule {
         },
     ];
     let mut module = ModuleBuilder::new();
-    module.metadata(HOST, SCHEMA_V1).enum_type(result);
+    module
+        .metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint())
+        .enum_type(result);
     module.host_import(HostImport {
         stable_id: StableId::from_name("ReloadHost::request"),
         parameters: Vec::new(),
@@ -438,8 +454,10 @@ fn async_realm() -> (
         }),
     )
     .expect("async realm");
+    let module = async_module();
+    let state_schema_fingerprint = module.module().state_schema_fingerprint;
     let module = realm
-        .load_module(async_module(), HOST, SCHEMA_V1)
+        .load_module(module, HOST, state_schema_fingerprint)
         .expect("async module");
     (realm, module, host, pending)
 }
@@ -470,12 +488,11 @@ fn late_completion_from_old_epoch_is_discarded() {
 
 #[test]
 fn activation_fault_is_observable_after_commit() {
-    let old_module = simple_yielding(SCHEMA_V1);
-    let (mut realm, old) = realm(old_module, SCHEMA_V1);
+    let old_module = simple_yielding();
+    let (mut realm, old) = realm(old_module);
     let candidate = compile(
         "task fn update(value: i32) -> i32 { return value; }
-         @activation fn activate() -> i32 { return 1; }",
-        SCHEMA_V1,
+         @activation pub fn activate() -> i32 { return 1; }",
     );
     let probe = realm
         .failure_injector()
@@ -539,8 +556,8 @@ fn old_request_releases_once_and_new_entry_starts() {
 
 #[test]
 fn migration_rollback_does_not_restore_cancelled_old_tasks() {
-    let old_definition = simple_yielding(SCHEMA_V1);
-    let (mut realm, old) = realm(old_definition, SCHEMA_V1);
+    let old_definition = simple_yielding();
+    let (mut realm, old) = realm(old_definition);
     let scope = realm.create_scope(None).expect("scope");
     let task = realm
         .spawn_task(old, 0, &[RuntimeValue::I32(1)], config(scope))
@@ -550,13 +567,12 @@ fn migration_rollback_does_not_restore_cancelled_old_tasks() {
         Ok(TaskPoll::Yielded(_))
     ));
     let failing = compile(
-        "migration fn migrate(value: i32) -> i32 {
+        "pub migration fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
          task fn update(value: i32) -> i32 { return value; }",
-        SCHEMA_V1,
     );
     assert!(matches!(
         realm
@@ -581,13 +597,12 @@ fn migration_rollback_discards_late_old_request_completion() {
         Ok(TaskPoll::Waiting(_))
     ));
     let failing = compile(
-        "migration fn migrate(value: i32) -> i32 {
+        "pub migration fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
          task fn update(value: i32) -> i32 { return value; }",
-        SCHEMA_V1,
     );
     assert!(matches!(
         realm
@@ -622,8 +637,8 @@ fn restart_implementation_has_no_intermediate_completion_queue() {
 
 #[test]
 fn old_module_slot_is_released_after_publication() {
-    let definition = simple_yielding(SCHEMA_V1);
-    let (mut realm, old) = realm(definition.clone(), SCHEMA_V1);
+    let definition = simple_yielding();
+    let (mut realm, old) = realm(definition.clone());
     assert!(matches!(
         realm
             .restart_reload(old, definition, RestartReloadPolicy::default())

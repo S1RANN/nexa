@@ -1,0 +1,7 @@
+module cycle.b;
+
+import cycle.a;
+
+pub(package) fn value() -> i32 {
+    return a.entry();
+}

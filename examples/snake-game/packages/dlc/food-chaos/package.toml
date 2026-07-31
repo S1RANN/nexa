@@ -1,11 +1,12 @@
-schema = 1
+schema = 2
+kind = "application"
 id = "official.food-chaos"
 name = "Food Chaos"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "snake.food_chaos"
 priority = 180
 activation = "user-controlled"
-state_schema = "v1"
 handler_fuel = 30000
 capabilities = ["food.register", "game.resize", "game.score", "game.speed", "diagnostics.log"]
 entitlement = "official.food-chaos"

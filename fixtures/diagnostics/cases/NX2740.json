@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2740","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2740","expected":{"primary_text":"Activate","secondary_count":0,"message_contains":"lifecycle","notes":[]}}

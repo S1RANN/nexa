@@ -1,0 +1,57 @@
+module std.core;
+
+pub fn min_i32(left: i32, right: i32) -> i32 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+pub fn max_i32(left: i32, right: i32) -> i32 {
+    if left > right {
+        return left;
+    }
+    return right;
+}
+
+pub fn min_i64(left: i64, right: i64) -> i64 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+pub fn max_i64(left: i64, right: i64) -> i64 {
+    if left > right {
+        return left;
+    }
+    return right;
+}
+
+pub fn min_f32(left: f32, right: f32) -> f32 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+pub fn max_f32(left: f32, right: f32) -> f32 {
+    if left > right {
+        return left;
+    }
+    return right;
+}
+
+pub fn min_f64(left: f64, right: f64) -> f64 {
+    if left < right {
+        return left;
+    }
+    return right;
+}
+
+pub fn max_f64(left: f64, right: f64) -> f64 {
+    if left > right {
+        return left;
+    }
+    return right;
+}

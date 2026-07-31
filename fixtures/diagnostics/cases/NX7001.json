@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7001","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"package source failure","notes":[]}}
+{"version":1,"code":"NX7001","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"diagnostic evidence source unavailable","notes":[]}}

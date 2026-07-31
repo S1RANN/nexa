@@ -1,0 +1,7 @@
+module main;
+
+import hidden;
+
+pub fn entry() -> i32 {
+    return hidden.private_value();
+}

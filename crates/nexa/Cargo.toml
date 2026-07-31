@@ -6,11 +6,15 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+nexa-analysis = { path = "../nexa-analysis" }
 nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-compiler = { path = "../nexa-compiler" }
 nexa-core = { path = "../nexa-core" }
+nexa-diagnostics = { path = "../nexa-diagnostics" }
 nexa-idl = { path = "../nexa-idl" }
 nexa-runtime = { path = "../nexa-runtime", features = ["model-adapter"] }
+nexa-stdlib = { path = "../nexa-stdlib" }
+nexa-test-runner = { path = "../nexa-test-runner" }
 nexa-verifier = { path = "../nexa-verifier" }
 serde.workspace = true
 serde_json.workspace = true

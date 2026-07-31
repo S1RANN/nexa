@@ -1,0 +1,41 @@
+/// Public score rules used by the game package.
+module demo.score_rules;
+
+import demo.food;
+import snake_common.score as score;
+import host as snake;
+
+// Public constants participate in the package API fingerprint.
+pub const MAX_SCORE: i32 = 100;
+
+/* Block comments are deliberately non-nested. */
+@stable("score-policy")
+pub(package) struct ScorePolicy {
+    @stable("score-policy.multiplier")
+    multiplier: i32;
+}
+
+@stateful(2)
+pub class PlayState {
+    @stable("play-state.total-games")
+    total_games: i32;
+}
+
+@test
+fn score_is_positive() -> bool {
+    for value in 0..3 {
+        if value == 1 {
+            continue;
+        }
+        break;
+    }
+
+    let escaped: string = "literal \${score}";
+    let rendered: string = "score ${MAX_SCORE}";
+    return true;
+}
+
+@activation
+pub task fn activate(value: i32) -> i32 {
+    return snake.update(value, MAX_SCORE);
+}

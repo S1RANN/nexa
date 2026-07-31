@@ -1,50 +1,32 @@
-use nexa_core::{SourceSpan, StableId};
-use nexa_verifier::VerifiedModule;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use nexa::{ClassifiedError, PackageBuildError};
+use nexa_analysis::{
+    CandidateIdentity, PublicApiFingerprint, ResolvedBuildInput, ResolvedDependencyGraph,
+    SourceSetFingerprint, StateSchemaFingerprint,
+};
 
 use crate::contract::ExportRequirement;
 use crate::diagnostic::{EngineDiagnostic, EngineDiagnosticStage};
 use crate::manifest::SourceId;
-use crate::source::PackageCandidate;
-use crate::source_file::SourceFileRegistry;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct SourceHash(pub StableId);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ManifestHash(pub StableId);
-
-#[derive(Clone, Debug)]
-pub struct CompiledPackageArtifact {
-    pub verified: VerifiedModule,
-    pub source_files: SourceFileRegistry,
-    pub debug_info: ModuleDebugInfo,
-    pub source_hash: SourceHash,
-    pub manifest_hash: ManifestHash,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModuleDebugInfo {
-    pub module_name: String,
-    pub functions: Vec<FunctionDebugInfo>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct FunctionDebugInfo {
-    pub function_index: u32,
-    pub name: String,
-    pub stable_id: StableId,
-    pub definition_span: Option<SourceSpan>,
-}
+pub use nexa::{
+    CompiledPackageArtifact, PackageDebugInfo as ModuleDebugInfo,
+    PackageFunctionDebugInfo as FunctionDebugInfo,
+};
 
 #[derive(Clone, Debug)]
 pub struct LastKnownGood {
     pub artifact: CompiledPackageArtifact,
     pub epoch: u64,
-    pub source_hash: SourceHash,
-    pub state_schema_hash: StableId,
-    pub host_interface_hash: StableId,
-    pub committed_generation: u64,
+    pub identity: CandidateIdentity,
+    pub source_set_fingerprint: SourceSetFingerprint,
+    pub public_api_fingerprint: PublicApiFingerprint,
+    pub state_schema_fingerprint: StateSchemaFingerprint,
+    pub linked_state_fingerprint: nexa::LinkedStateFingerprint,
+    pub dependency_closure: Arc<ResolvedDependencyGraph>,
+    pub host_interface_hash: nexa::StableId,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +38,7 @@ pub struct CandidateCompilation {
 
 pub(crate) struct CandidateCompilationFailure {
     pub diagnostic: EngineDiagnostic,
+    pub additional_diagnostics: Vec<EngineDiagnostic>,
     pub compile_duration: Duration,
     pub verify_duration: Duration,
 }
@@ -68,86 +51,73 @@ impl CandidateCompilationFailure {
     ) -> Self {
         Self {
             diagnostic,
+            additional_diagnostics: Vec::new(),
+            compile_duration,
+            verify_duration,
+        }
+    }
+
+    fn from_diagnostics(
+        mut diagnostics: Vec<EngineDiagnostic>,
+        compile_duration: Duration,
+        verify_duration: Duration,
+    ) -> Self {
+        let diagnostic = if diagnostics.is_empty() {
+            EngineDiagnostic::without_source(
+                None,
+                None,
+                EngineDiagnosticStage::Compile,
+                nexa::ErrorCode::NX7001,
+                "package build failed without a diagnostic",
+            )
+        } else {
+            let primary = diagnostics
+                .iter()
+                .position(|diagnostic| diagnostic.stage == EngineDiagnosticStage::Parse)
+                .or_else(|| {
+                    diagnostics
+                        .iter()
+                        .position(|diagnostic| diagnostic.stage == EngineDiagnosticStage::TypeCheck)
+                })
+                .unwrap_or(0);
+            diagnostics.remove(primary)
+        };
+        Self {
+            diagnostic,
+            additional_diagnostics: diagnostics,
             compile_duration,
             verify_duration,
         }
     }
 }
 
-#[allow(clippy::result_large_err, clippy::too_many_lines)]
+#[allow(clippy::result_large_err)]
 pub(crate) fn compile_package_candidate(
-    idl: &nexa_idl::Idl,
+    build_session: &mut nexa::PackageBuildSession,
+    host_contract: &nexa::HostContractInput<'_>,
     required_exports: &[ExportRequirement],
     source_id: &SourceId,
-    candidate: &PackageCandidate,
+    identity: CandidateIdentity,
+    build_input: &ResolvedBuildInput,
 ) -> Result<CandidateCompilation, CandidateCompilationFailure> {
-    let package_id = candidate.manifest.id.clone();
-    let entry_path = candidate.manifest.entry.as_path().to_string_lossy();
-    let Some(file) = candidate.source_files.file_id(&entry_path) else {
-        return Err(CandidateCompilationFailure::new(
-            EngineDiagnostic::without_source(
-                Some(package_id),
-                Some(source_id.clone()),
-                EngineDiagnosticStage::SourceDiscovery,
-                nexa::ErrorCode::NX7001,
-                format!("entry source is not registered: {entry_path}"),
-            ),
-            Duration::ZERO,
-            Duration::ZERO,
-        ));
-    };
-    let schema_hash = nexa_core::StableId::from_parts(&[
-        candidate.manifest.id.as_str(),
-        "::",
-        &candidate.manifest.state_schema,
-    ]);
-    let compile_started = Instant::now();
-    let module =
-        nexa::compile_module_with_interface_file(&candidate.entry_source, file, idl, schema_hash)
-            .map_err(|error| {
-            let diagnostic = match error {
-                nexa::NexaError::Diagnostic(diagnostic) => EngineDiagnostic::from_leaf(
-                    Some(package_id.clone()),
-                    Some(source_id.clone()),
-                    diagnostic_stage(diagnostic.code),
-                    *diagnostic,
-                    Some(&candidate.source_files),
-                ),
-                other => EngineDiagnostic::without_source(
-                    Some(package_id.clone()),
-                    Some(source_id.clone()),
-                    EngineDiagnosticStage::Compile,
-                    other.code(),
-                    other.to_string(),
-                ),
-            };
-            CandidateCompilationFailure::new(diagnostic, compile_started.elapsed(), Duration::ZERO)
-        })?;
-    let compile_duration = compile_started.elapsed();
-    let verify_started = Instant::now();
-    let verified =
-        nexa::verify_module(module, nexa_verifier::VerifierLimits::default()).map_err(|error| {
-            let diagnostic = match error {
-                nexa::NexaError::Diagnostic(diagnostic) => EngineDiagnostic::from_leaf(
-                    Some(package_id.clone()),
-                    Some(source_id.clone()),
-                    EngineDiagnosticStage::Verify,
-                    *diagnostic,
-                    Some(&candidate.source_files),
-                ),
-                other => EngineDiagnostic::without_source(
-                    Some(package_id.clone()),
-                    Some(source_id.clone()),
-                    EngineDiagnosticStage::Verify,
-                    other.code(),
-                    other.to_string(),
-                ),
-            };
-            CandidateCompilationFailure::new(diagnostic, compile_duration, verify_started.elapsed())
-        })?;
-    let verify_duration = verify_started.elapsed();
+    let package_id = identity.package_id.clone();
+    let observation =
+        build_session.compile_package_with_contract_observed(build_input, host_contract, identity);
+    let compile_duration = observation.durations.compile_duration;
+    let verify_duration = observation.durations.verify_duration;
+    let artifact = observation.result.map_err(|error| {
+        let diagnostics =
+            package_build_diagnostics(Some(package_id.clone()), Some(source_id.clone()), error);
+        CandidateCompilationFailure::from_diagnostics(
+            diagnostics,
+            compile_duration,
+            verify_duration,
+        )
+    })?;
+
+    let export_started = Instant::now();
     for requirement in required_exports {
-        let Some(found) = verified
+        let Some(found) = artifact
             .module()
             .exports
             .iter()
@@ -166,7 +136,7 @@ pub(crate) fn compile_package_candidate(
             ));
             return Err(CandidateCompilationFailure::new(
                 diagnostic,
-                compile_duration,
+                compile_duration.saturating_add(export_started.elapsed()),
                 verify_duration,
             ));
         };
@@ -184,86 +154,95 @@ pub(crate) fn compile_package_candidate(
             ));
             return Err(CandidateCompilationFailure::new(
                 diagnostic,
-                compile_duration,
+                compile_duration.saturating_add(export_started.elapsed()),
                 verify_duration,
             ));
         }
     }
-    let debug_started = Instant::now();
-    let tokens = nexa_compiler::lex(&candidate.entry_source).map_err(|error| {
-        CandidateCompilationFailure::new(
-            EngineDiagnostic::from_leaf(
-                Some(package_id.clone()),
-                Some(source_id.clone()),
-                EngineDiagnosticStage::Parse,
-                nexa::Diagnostic::new(&error, file),
-                Some(&candidate.source_files),
-            ),
-            compile_duration.saturating_add(debug_started.elapsed()),
-            verify_duration,
-        )
-    })?;
-    let ast = nexa_compiler::parse_with_file(&tokens, file).map_err(|error| {
-        CandidateCompilationFailure::new(
-            EngineDiagnostic::from_leaf(
-                Some(package_id.clone()),
-                Some(source_id.clone()),
-                EngineDiagnosticStage::Parse,
-                nexa::Diagnostic::new(&error, file),
-                Some(&candidate.source_files),
-            ),
-            compile_duration.saturating_add(debug_started.elapsed()),
-            verify_duration,
-        )
-    })?;
-    let functions = ast
-        .functions
-        .iter()
-        .enumerate()
-        .map(|(index, function)| FunctionDebugInfo {
-            function_index: u32::try_from(index).unwrap_or(u32::MAX),
-            name: function.name.clone(),
-            stable_id: nexa_core::StableId::from_name(&function.name),
-            definition_span: Some(function.span),
-        })
-        .collect();
+
     Ok(CandidateCompilation {
-        artifact: CompiledPackageArtifact {
-            verified,
-            source_files: candidate.source_files.clone(),
-            debug_info: ModuleDebugInfo {
-                module_name: candidate.manifest.id.to_string(),
-                functions,
-            },
-            source_hash: SourceHash(StableId::from_parts(&[
-                &candidate.manifest_source,
-                "\0",
-                &candidate.entry_source,
-            ])),
-            manifest_hash: ManifestHash(candidate.manifest_hash),
-        },
-        compile_duration: compile_duration.saturating_add(debug_started.elapsed()),
+        artifact,
+        compile_duration: compile_duration.saturating_add(export_started.elapsed()),
         verify_duration,
     })
 }
 
-fn diagnostic_stage(code: nexa::DiagnosticCode) -> EngineDiagnosticStage {
-    match code.as_str().as_bytes().get(2).copied() {
-        Some(b'1') => EngineDiagnosticStage::Parse,
-        Some(b'2') => EngineDiagnosticStage::TypeCheck,
-        Some(b'3') => EngineDiagnosticStage::Verify,
-        _ => EngineDiagnosticStage::Compile,
+fn package_build_diagnostics(
+    package_id: Option<nexa_analysis::PackageId>,
+    source_id: Option<SourceId>,
+    error: PackageBuildError,
+) -> Vec<EngineDiagnostic> {
+    match error {
+        PackageBuildError::AnalysisFailed(batch) => {
+            let diagnostics = EngineDiagnostic::from_diagnostic_batch(
+                package_id.clone(),
+                source_id.clone(),
+                EngineDiagnosticStage::TypeCheck,
+                &batch,
+            );
+            if diagnostics.is_empty() {
+                vec![EngineDiagnostic::without_source(
+                    package_id,
+                    source_id,
+                    EngineDiagnosticStage::TypeCheck,
+                    nexa::ErrorCode::NX7001,
+                    "package analysis failed without a diagnostic",
+                )]
+            } else {
+                diagnostics
+            }
+        }
+        PackageBuildError::Verify(error) => vec![EngineDiagnostic::without_source(
+            package_id,
+            source_id,
+            EngineDiagnosticStage::Verify,
+            error.metadata().code,
+            error.to_string(),
+        )],
+        PackageBuildError::MissingRequiredExport(name) => vec![EngineDiagnostic::without_source(
+            package_id,
+            source_id,
+            EngineDiagnosticStage::Export,
+            nexa::ErrorCode::NX7010,
+            format!("missing required export {name}"),
+        )],
+        PackageBuildError::ExportSignatureMismatch { name, .. } => {
+            vec![EngineDiagnostic::without_source(
+                package_id,
+                source_id,
+                EngineDiagnosticStage::Export,
+                nexa::ErrorCode::NX7011,
+                format!("export {name} has an incompatible signature"),
+            )]
+        }
+        error => vec![EngineDiagnostic::without_source(
+            package_id,
+            source_id,
+            EngineDiagnosticStage::Compile,
+            nexa::ErrorCode::NX7001,
+            error.to_string(),
+        )],
     }
 }
 
 #[allow(clippy::result_large_err)]
 pub fn compile_package(
-    idl: &nexa_idl::Idl,
+    idl: &nexa::Idl,
     required_exports: &[ExportRequirement],
     source_id: &SourceId,
-    candidate: &PackageCandidate,
+    identity: CandidateIdentity,
+    build_input: &ResolvedBuildInput,
 ) -> Result<CompiledPackageArtifact, EngineDiagnostic> {
-    compile_package_candidate(idl, required_exports, source_id, candidate)
-        .map(|compilation| compilation.artifact)
-        .map_err(|failure| failure.diagnostic)
+    let mut build_session = nexa::PackageBuildSession::new();
+    let host_contract = nexa::HostContractInput::canonical(idl);
+    compile_package_candidate(
+        &mut build_session,
+        &host_contract,
+        required_exports,
+        source_id,
+        identity,
+        build_input,
+    )
+    .map(|compilation| compilation.artifact)
+    .map_err(|failure| failure.diagnostic)
 }

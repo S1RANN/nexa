@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7011","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"export signature mismatch","notes":[]}}
+{"version":1,"code":"NX7011","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"export Run has an incompatible signature","notes":[]}}

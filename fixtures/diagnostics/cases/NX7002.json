@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7002","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"invalid package manifest","notes":[]}}
+{"version":1,"code":"NX7002","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"unsupported package manifest schema 9","notes":[]}}

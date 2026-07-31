@@ -1,0 +1,22 @@
+[package]
+name = "nexa-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nexa-core = { path = "../nexa-core" }
+nexa-diagnostics = { path = "../nexa-diagnostics" }
+nexa-stdlib = { path = "../nexa-stdlib" }
+nexa-syntax = { path = "../nexa-syntax" }
+semver = "1.0"
+serde = { version = "1", features = ["derive", "rc"] }
+toml = "0.8"
+
+[dev-dependencies]
+nexa-bytecode = { path = "../nexa-bytecode" }
+serde_json = "1"
+
+[lints]
+workspace = true

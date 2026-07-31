@@ -1,0 +1,721 @@
+[
+  {
+    "type": "nidl_member",
+    "named": true,
+    "subtypes": [
+      {
+        "type": "export_declaration",
+        "named": true
+      },
+      {
+        "type": "host_function_declaration",
+        "named": true
+      },
+      {
+        "type": "nidl_enum_declaration",
+        "named": true
+      },
+      {
+        "type": "nidl_struct_declaration",
+        "named": true
+      },
+      {
+        "type": "opaque_declaration",
+        "named": true
+      }
+    ]
+  },
+  {
+    "type": "nidl_type",
+    "named": true,
+    "subtypes": [
+      {
+        "type": "nidl_builtin_type",
+        "named": true
+      },
+      {
+        "type": "nidl_generic_type",
+        "named": true
+      },
+      {
+        "type": "nidl_type_identifier",
+        "named": true
+      }
+    ]
+  },
+  {
+    "type": "abandon_policy_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "cancel_policy_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "export_declaration",
+    "named": true,
+    "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "return_arrow_operator",
+            "named": true
+          }
+        ]
+      },
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "export_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_identifier",
+            "named": true
+          }
+        ]
+      },
+      "parameters": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_parameter_list",
+            "named": true
+          }
+        ]
+      },
+      "return_type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type",
+            "named": true
+          },
+          {
+            "type": "void_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "fuel_clause",
+    "named": true,
+    "fields": {
+      "amount": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "integer_literal",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "fuel_keyword",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "host_function_declaration",
+    "named": true,
+    "fields": {
+      "arrow": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "return_arrow_operator",
+            "named": true
+          }
+        ]
+      },
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_function_keyword",
+            "named": true
+          }
+        ]
+      },
+      "mode": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "host_mode_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_identifier",
+            "named": true
+          }
+        ]
+      },
+      "parameters": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_parameter_list",
+            "named": true
+          }
+        ]
+      },
+      "return_type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "fuel_clause",
+          "named": true
+        },
+        {
+          "type": "request_policy",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "host_mode_keyword",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "nidl_builtin_type",
+    "named": true,
+    "fields": {}
+  },
+  {
+    "type": "nidl_document",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "interface_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_member",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "nidl_enum_declaration",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_enum_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_enum_variant",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "nidl_enum_variant",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_identifier",
+            "named": true
+          }
+        ]
+      },
+      "payload": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "nidl_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "nidl_field_declaration",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "nidl_generic_type",
+    "named": true,
+    "fields": {
+      "arguments": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_argument_list",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_builtin_type",
+            "named": true
+          },
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "nidl_parameter",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "nidl_parameter_list",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_parameter",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "nidl_struct_declaration",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_struct_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "nidl_field_declaration",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "nidl_type_argument_list",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "nidl_type",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "nidl_type_identifier",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "nidl_identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "opaque_declaration",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "opaque_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "nidl_type_identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "request_policy",
+    "named": true,
+    "fields": {
+      "abandon": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "abandon_policy_keyword",
+            "named": true
+          }
+        ]
+      },
+      "cancel": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "cancel_policy_keyword",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "source_file",
+    "named": true,
+    "root": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "nidl_document",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "(",
+    "named": false
+  },
+  {
+    "type": ")",
+    "named": false
+  },
+  {
+    "type": ",",
+    "named": false
+  },
+  {
+    "type": ":",
+    "named": false
+  },
+  {
+    "type": ";",
+    "named": false
+  },
+  {
+    "type": "<",
+    "named": false
+  },
+  {
+    "type": ">",
+    "named": false
+  },
+  {
+    "type": "Option",
+    "named": false
+  },
+  {
+    "type": "Result",
+    "named": false
+  },
+  {
+    "type": "array",
+    "named": false
+  },
+  {
+    "type": "bool",
+    "named": false
+  },
+  {
+    "type": "buffer",
+    "named": false
+  },
+  {
+    "type": "cancel_task",
+    "named": false
+  },
+  {
+    "type": "export_keyword",
+    "named": true
+  },
+  {
+    "type": "f32",
+    "named": false
+  },
+  {
+    "type": "f64",
+    "named": false
+  },
+  {
+    "type": "fuel_keyword",
+    "named": true
+  },
+  {
+    "type": "host_request",
+    "named": false
+  },
+  {
+    "type": "i32",
+    "named": false
+  },
+  {
+    "type": "i64",
+    "named": false
+  },
+  {
+    "type": "integer_literal",
+    "named": true
+  },
+  {
+    "type": "interface_keyword",
+    "named": true
+  },
+  {
+    "type": "nidl_enum_keyword",
+    "named": true
+  },
+  {
+    "type": "nidl_function_keyword",
+    "named": true
+  },
+  {
+    "type": "nidl_identifier",
+    "named": true
+  },
+  {
+    "type": "nidl_struct_keyword",
+    "named": true
+  },
+  {
+    "type": "opaque_keyword",
+    "named": true
+  },
+  {
+    "type": "request",
+    "named": false
+  },
+  {
+    "type": "resource_token",
+    "named": false
+  },
+  {
+    "type": "return_arrow_operator",
+    "named": true
+  },
+  {
+    "type": "return_error",
+    "named": false
+  },
+  {
+    "type": "rune",
+    "named": false
+  },
+  {
+    "type": "snapshot",
+    "named": false
+  },
+  {
+    "type": "string",
+    "named": false
+  },
+  {
+    "type": "sync",
+    "named": false
+  },
+  {
+    "type": "token",
+    "named": false
+  },
+  {
+    "type": "trap",
+    "named": false
+  },
+  {
+    "type": "void_type",
+    "named": true
+  },
+  {
+    "type": "{",
+    "named": false
+  },
+  {
+    "type": "}",
+    "named": false
+  }
+]

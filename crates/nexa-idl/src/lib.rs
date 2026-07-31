@@ -1,11 +1,12 @@
 //! Exact-build IDL parsing, canonical hashing and Rust binding generation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fmt::Write;
 
 use nexa_bytecode::ValueType;
 use nexa_core::StableId;
+use nexa_syntax::{SyntaxErrorKind, lex_nidl};
 
 pub mod build;
 
@@ -17,6 +18,29 @@ pub struct Idl {
     pub enums: Vec<Enum>,
     pub functions: Vec<HostFunction>,
     pub exports: Vec<Export>,
+}
+
+/// Parser-owned byte ranges for every named declaration in an exact NIDL source snapshot.
+///
+/// Both ranges use UTF-8 byte offsets. `declaration_*` covers the complete declaration, including
+/// mode/policy/fuel prefixes and its closing delimiter; `name_*` covers exactly the declared name.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IdlDeclarationSource {
+    pub declaration_start: usize,
+    pub declaration_end: usize,
+    pub name_start: usize,
+    pub name_end: usize,
+}
+
+/// Exact parser source map keyed by canonical declaration coordinates.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct IdlSourceMap {
+    pub interface: IdlDeclarationSource,
+    pub types: BTreeMap<String, IdlDeclarationSource>,
+    pub fields: BTreeMap<(String, String), IdlDeclarationSource>,
+    pub variants: BTreeMap<(String, String), IdlDeclarationSource>,
+    pub functions: BTreeMap<String, IdlDeclarationSource>,
+    pub exports: BTreeMap<String, IdlDeclarationSource>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +193,12 @@ impl fmt::Display for IdlError {
 impl std::error::Error for IdlError {}
 
 pub fn parse(source: &str) -> Result<Idl, IdlError> {
+    parse_with_source_map(source).map(|(idl, _)| idl)
+}
+
+/// Parses one NIDL source and returns source ranges produced by that same parser pass.
+pub fn parse_with_source_map(source: &str) -> Result<(Idl, IdlSourceMap), IdlError> {
+    reject_comments(source)?;
     let tokens = tokenize(source);
     let mut parser = Parser {
         tokens,
@@ -180,9 +210,60 @@ pub fn parse(source: &str) -> Result<Idl, IdlError> {
     parser.parse()
 }
 
+fn reject_comments(source: &str) -> Result<(), IdlError> {
+    let lexed = lex_nidl(source).map_err(|error| {
+        IdlError::new(
+            IdlErrorKind::Syntax,
+            0,
+            0,
+            "source no larger than the 32-bit syntax range",
+            format!("{} bytes", error.bytes),
+            error.to_string(),
+        )
+    })?;
+    let Some(error) = lexed
+        .errors
+        .iter()
+        .find(|error| error.kind == SyntaxErrorKind::CommentsNotSupported)
+    else {
+        return Ok(());
+    };
+    Err(IdlError::new(
+        IdlErrorKind::Syntax,
+        error.range.start.to_usize(),
+        error.range.end.to_usize(),
+        "NIDL source without comments",
+        "comment",
+        error.message.clone(),
+    ))
+}
+
 #[must_use]
 pub fn exact_hash(idl: &Idl) -> StableId {
     StableId::from_name(&canonical(idl))
+}
+
+/// Canonical identity for the effective Host export requirements of one build.
+///
+/// `names` must be supplied in the declaration order of the complete [`Idl`]. This preserves one
+/// identity for equivalent user selections while keeping subset selection separate from the
+/// complete Host ABI encoded by [`canonical`].
+#[must_use]
+pub fn canonical_required_exports<'a>(names: impl ExactSizeIterator<Item = &'a str>) -> Vec<u8> {
+    let mut bytes = b"nexa.host-required-exports\0".to_vec();
+    bytes.extend_from_slice(&1_u32.to_le_bytes());
+    bytes.extend_from_slice(&u64::try_from(names.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for name in names {
+        bytes.extend_from_slice(&u64::try_from(name.len()).unwrap_or(u64::MAX).to_le_bytes());
+        bytes.extend_from_slice(name.as_bytes());
+    }
+    bytes
+}
+
+/// Canonical required-export identity for the default view in which every Host export is required.
+#[must_use]
+pub fn canonical_all_required_exports(idl: &Idl) -> Vec<u8> {
+    canonical_required_exports(idl.exports.iter().map(|export| export.name.as_str()))
 }
 
 #[must_use]
@@ -826,7 +907,7 @@ pub fn generate_rust(idl: &Idl) -> String {
             };
             let ticket = format!("{}CompletionTicket", pascal_case(&function.name));
             let success_payload = encode_completion_payload(idl, success, "value");
-            let error_code = encode_completion_error(idl, error, "error");
+            let error_payload = encode_completion_payload(idl, error, "error");
             writeln!(
                 output,
                 "pub struct {ticket}(pub nexa_runtime::HostCompletionTicket);\n\
@@ -834,7 +915,7 @@ pub fn generate_rust(idl: &Idl) -> String {
                  pub fn complete(&mut self, result: Result<{success}, {error}>) \
                  -> Result<(), nexa_runtime::HostRequestError> {{\n\
                  match result {{ Ok(value) => self.0.complete({success_payload}), \
-                 Err(error) => self.0.fail(nexa_runtime::HostErrorPayload {{ code: {error_code} }}) }}\
+                 Err(error) => self.0.fail(nexa_runtime::HostErrorPayload::Value({error_payload})) }}\
                  \n}}\n}}",
                 success = rust_type(success),
                 error = rust_type(error),
@@ -1791,19 +1872,6 @@ fn encode_enum_completion_payload(idl: &Idl, enumeration: &Enum, source: &str) -
     output
 }
 
-fn encode_completion_error(idl: &Idl, ty: &TypeRef, source: &str) -> String {
-    match ty {
-        TypeRef::I32 => format!("u32::from_ne_bytes({source}.to_ne_bytes())"),
-        TypeRef::Named(name) if idl.enums.iter().any(|item| item.name == *name) => {
-            format!("{source}.nexa_tag()")
-        }
-        TypeRef::Named(name) if idl.opaque_handles.contains(name) => {
-            format!("{source}.0 as u32")
-        }
-        _ => "u32::MAX".into(),
-    }
-}
-
 fn encode_option(
     idl: &Idl,
     inner: &TypeRef,
@@ -2292,12 +2360,6 @@ fn tokenize(source: &str) -> Vec<Token> {
             cursor += character.len_utf8();
             continue;
         }
-        if source[cursor..].starts_with("//") {
-            cursor = source[cursor..]
-                .find('\n')
-                .map_or(source.len(), |offset| cursor + offset + 1);
-            continue;
-        }
         let start = cursor;
         if source[cursor..].starts_with("->") {
             cursor += 2;
@@ -2312,7 +2374,6 @@ fn tokenize(source: &str) -> Vec<Token> {
                     .expect("cursor is on a character boundary");
                 if next.is_whitespace()
                     || "{}(),:;<>".contains(next)
-                    || source[cursor..].starts_with("//")
                     || source[cursor..].starts_with("->")
                 {
                     break;
@@ -2339,10 +2400,21 @@ struct Parser {
 
 impl Parser {
     #[allow(clippy::too_many_lines)]
-    fn parse(&mut self) -> Result<Idl, IdlError> {
+    fn parse(&mut self) -> Result<(Idl, IdlSourceMap), IdlError> {
+        let interface_start = self.current_span().0;
         self.expect("interface")?;
+        let interface_name = self.current_span();
         let interface = self.word()?;
         self.expect("{")?;
+        let mut source_map = IdlSourceMap {
+            interface: IdlDeclarationSource {
+                declaration_start: interface_start,
+                declaration_end: 0,
+                name_start: interface_name.0,
+                name_end: interface_name.1,
+            },
+            ..IdlSourceMap::default()
+        };
         let mut idl = Idl {
             interface,
             opaque_handles: Vec::new(),
@@ -2354,34 +2426,72 @@ impl Parser {
         while !self.take("}") {
             match self.peek() {
                 Some("opaque") => {
+                    let declaration_start = self.current_span().0;
                     self.cursor += 1;
+                    let name_span = self.current_span();
                     let name = self.word()?;
                     self.expect(";")?;
+                    let declaration_end = self.previous_span().1;
                     if idl.opaque_handles.contains(&name) {
                         return Err(self.duplicate(&name));
                     }
+                    source_map.types.insert(
+                        name.clone(),
+                        IdlDeclarationSource {
+                            declaration_start,
+                            declaration_end,
+                            name_start: name_span.0,
+                            name_end: name_span.1,
+                        },
+                    );
                     idl.opaque_handles.push(name);
                 }
                 Some("struct") => {
+                    let declaration_start = self.current_span().0;
                     self.cursor += 1;
+                    let name_span = self.current_span();
                     let name = self.word()?;
                     self.expect("{")?;
                     let mut fields = Vec::new();
+                    let mut field_sources = Vec::new();
                     while !self.take("}") {
-                        fields.push(self.field()?);
+                        let (field, mut field_source) = self.field_with_source()?;
                         self.expect(";")?;
+                        field_source.declaration_end = self.previous_span().1;
+                        fields.push(field);
+                        field_sources.push(field_source);
                     }
+                    let declaration_end = self.previous_span().1;
                     if idl.structs.iter().any(|item| item.name == name) {
                         return Err(self.duplicate(&name));
+                    }
+                    source_map.types.insert(
+                        name.clone(),
+                        IdlDeclarationSource {
+                            declaration_start,
+                            declaration_end,
+                            name_start: name_span.0,
+                            name_end: name_span.1,
+                        },
+                    );
+                    for (field, source) in fields.iter().zip(field_sources) {
+                        source_map
+                            .fields
+                            .insert((name.clone(), field.name.clone()), source);
                     }
                     idl.structs.push(Struct { name, fields });
                 }
                 Some("enum") => {
+                    let declaration_start = self.current_span().0;
                     self.cursor += 1;
+                    let name_span = self.current_span();
                     let name = self.word()?;
                     self.expect("{")?;
                     let mut variants = Vec::new();
+                    let mut variant_sources = Vec::new();
                     while !self.take("}") {
+                        let variant_start = self.current_span().0;
+                        let variant_name_span = self.current_span();
                         let variant_name = self.word()?;
                         if variants
                             .iter()
@@ -2396,14 +2506,40 @@ impl Parser {
                         } else {
                             None
                         };
+                        // A comma is the variant declaration delimiter when present, just as a
+                        // semicolon delimits fields/functions/exports. Retain it in the exact
+                        // declaration range produced by the parser.
+                        self.take(",");
+                        let variant_end = self.previous_span().1;
+                        variant_sources.push((
+                            variant_name.clone(),
+                            IdlDeclarationSource {
+                                declaration_start: variant_start,
+                                declaration_end: variant_end,
+                                name_start: variant_name_span.0,
+                                name_end: variant_name_span.1,
+                            },
+                        ));
                         variants.push(EnumVariant {
                             name: variant_name,
                             payload,
                         });
-                        self.take(",");
                     }
+                    let declaration_end = self.previous_span().1;
                     if idl.enums.iter().any(|item| item.name == name) {
                         return Err(self.duplicate(&name));
+                    }
+                    source_map.types.insert(
+                        name.clone(),
+                        IdlDeclarationSource {
+                            declaration_start,
+                            declaration_end,
+                            name_start: name_span.0,
+                            name_end: name_span.1,
+                        },
+                    );
+                    for (variant, source) in variant_sources {
+                        source_map.variants.insert((name.clone(), variant), source);
                     }
                     idl.enums.push(Enum { name, variants });
                 }
@@ -2464,6 +2600,7 @@ impl Parser {
                         1
                     };
                     self.expect("fn")?;
+                    let name_span = self.current_span();
                     let name = self.word()?;
                     self.expect("(")?;
                     let mut parameters = Vec::new();
@@ -2479,9 +2616,19 @@ impl Parser {
                     self.expect("->")?;
                     let result = self.ty()?;
                     self.expect(";")?;
+                    let declaration_end = self.previous_span().1;
                     if idl.functions.iter().any(|item| item.name == name) {
                         return Err(self.duplicate(&name));
                     }
+                    source_map.functions.insert(
+                        name.clone(),
+                        IdlDeclarationSource {
+                            declaration_start: mode_span.0,
+                            declaration_end,
+                            name_start: name_span.0,
+                            name_end: name_span.1,
+                        },
+                    );
                     idl.functions.push(HostFunction {
                         name,
                         parameters,
@@ -2494,7 +2641,9 @@ impl Parser {
                     self.function_mode_spans.push(mode_span);
                 }
                 Some("export") => {
+                    let declaration_start = self.current_span().0;
                     self.cursor += 1;
+                    let name_span = self.current_span();
                     let name = self.word()?;
                     self.expect("(")?;
                     let mut parameters = Vec::new();
@@ -2514,9 +2663,19 @@ impl Parser {
                         Some(self.ty()?)
                     };
                     self.expect(";")?;
+                    let declaration_end = self.previous_span().1;
                     if idl.exports.iter().any(|item| item.name == name) {
                         return Err(self.duplicate(&name));
                     }
+                    source_map.exports.insert(
+                        name.clone(),
+                        IdlDeclarationSource {
+                            declaration_start,
+                            declaration_end,
+                            name_start: name_span.0,
+                            name_end: name_span.1,
+                        },
+                    );
                     idl.exports.push(Export {
                         name,
                         parameters,
@@ -2533,17 +2692,31 @@ impl Parser {
                 }
             }
         }
+        source_map.interface.declaration_end = self.previous_span().1;
         validate_types(&idl, &self.type_spans, &self.function_mode_spans)?;
-        Ok(idl)
+        Ok((idl, source_map))
     }
 
     fn field(&mut self) -> Result<Field, IdlError> {
+        self.field_with_source().map(|(field, _)| field)
+    }
+
+    fn field_with_source(&mut self) -> Result<(Field, IdlDeclarationSource), IdlError> {
+        let declaration_start = self.current_span().0;
+        let name_span = self.current_span();
         let name = self.word()?;
         self.expect(":")?;
-        Ok(Field {
-            name,
-            ty: self.ty()?,
-        })
+        let ty = self.ty()?;
+        let declaration_end = self.previous_span().1;
+        Ok((
+            Field { name, ty },
+            IdlDeclarationSource {
+                declaration_start,
+                declaration_end,
+                name_start: name_span.0,
+                name_end: name_span.1,
+            },
+        ))
     }
 
     fn ty(&mut self) -> Result<TypeRef, IdlError> {
@@ -2816,7 +2989,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
-        AbandonPolicy, CancelPolicy, Export, Field, TypeRef, exact_hash, generate_rust, parse,
+        AbandonPolicy, CancelPolicy, Export, Field, IdlDeclarationSource, IdlErrorKind, TypeRef,
+        canonical_all_required_exports, canonical_required_exports, exact_hash, generate_rust,
+        parse, parse_with_source_map,
     };
 
     const IDL: &str = "
@@ -2827,6 +3002,29 @@ mod tests {
             export Update(entity: Entity, dt: f32) -> void;
         }
     ";
+
+    #[test]
+    fn required_export_identity_is_framed_and_preserves_declaration_order() {
+        let idl = parse(
+            "interface Host {
+                export Update(value: i32) -> i32;
+                export Reset() -> void;
+            }",
+        )
+        .unwrap();
+        let all = canonical_all_required_exports(&idl);
+        assert_eq!(
+            all,
+            canonical_required_exports(["Update", "Reset"].into_iter())
+        );
+        assert_ne!(
+            all,
+            canonical_required_exports(["Reset", "Update"].into_iter())
+        );
+        let empty = canonical_required_exports(std::iter::empty::<&str>());
+        assert!(empty.starts_with(b"nexa.host-required-exports\0"));
+        assert_ne!(empty, all);
+    }
 
     #[test]
     fn parse_errors_preserve_original_byte_span_and_token_expectation() {
@@ -2845,13 +3043,18 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_spans_remain_exact_after_unicode_and_comments() {
-        let source = "// 界面\ninterface Host {\n    sync fn broken(value: string) -> ;\n}";
-        let error = parse(source).expect_err("missing result type");
-        let start = source.find(";\n}").expect("actual semicolon");
-        assert_eq!((error.start, error.end), (start, start + 1));
-        assert_eq!(error.expected, "an identifier");
-        assert_eq!(error.actual, ";");
+    fn nidl_line_comments_are_rejected_with_exact_unicode_span() {
+        let source = "interface Host {\n    // 界面\n    sync fn log() -> i32;\n}";
+        let error = parse(source).expect_err("NIDL line comment");
+        let start = source.find("//").expect("comment start");
+        let end = source[start..]
+            .find('\n')
+            .map_or(source.len(), |offset| start + offset);
+        assert_eq!(error.kind, IdlErrorKind::Syntax);
+        assert_eq!((error.start, error.end), (start, end));
+        assert_eq!(error.expected, "NIDL source without comments");
+        assert_eq!(error.actual, "comment");
+        assert_eq!(error.message, "comments are not part of the NIDL language");
     }
 
     #[test]
@@ -2870,9 +3073,55 @@ mod tests {
     }
 
     #[test]
-    fn exact_hash_ignores_comments_and_whitespace_but_preserves_field_order() {
+    fn nidl_block_comments_are_rejected_with_exact_span() {
+        let source = "interface Host { /* forbidden */ sync fn log() -> i32; }";
+        let error = parse(source).expect_err("NIDL block comment");
+        let start = source.find("/*").expect("comment start");
+        let end = source.find("*/").expect("comment end") + 2;
+        assert_eq!(error.kind, IdlErrorKind::Syntax);
+        assert_eq!((error.start, error.end), (start, end));
+        assert_eq!(error.expected, "NIDL source without comments");
+        assert_eq!(error.actual, "comment");
+    }
+
+    #[test]
+    fn parser_source_map_preserves_exact_unicode_and_declaration_ranges() {
+        let source = " \r\ninterface Høst {\r\n\
+            opaque Second;\r\n\
+            struct Pair { first: Second; Second: i32; }\r\n\
+            enum Résult { Ok(Second), Second }\r\n\
+            request(return_error, trap) fuel 9 fn løad(value: Pair) -> request<Result<i32, Résult>>;\r\n\
+            export Rün(value: Pair) -> i32;\r\n\
+        }\r\n ";
+        let (idl, map) = parse_with_source_map(source).unwrap();
+        assert_eq!(idl.interface, "Høst");
+        let slice =
+            |range: IdlDeclarationSource| &source[range.declaration_start..range.declaration_end];
+        let name = |range: IdlDeclarationSource| &source[range.name_start..range.name_end];
+
+        assert!(slice(map.interface).starts_with("interface Høst"));
+        assert_eq!(name(map.interface), "Høst");
+        assert_eq!(
+            slice(map.fields[&("Pair".into(), "Second".into())]),
+            "Second: i32;"
+        );
+        assert_eq!(
+            name(map.variants[&("Résult".into(), "Second".into())]),
+            "Second"
+        );
+        assert_eq!(
+            slice(map.variants[&("Résult".into(), "Ok".into())]),
+            "Ok(Second),"
+        );
+        assert!(slice(map.functions["løad"]).starts_with("request(return_error, trap) fuel 9 fn"));
+        assert_eq!(name(map.functions["løad"]), "løad");
+        assert_eq!(slice(map.exports["Rün"]), "export Rün(value: Pair) -> i32;");
+    }
+
+    #[test]
+    fn exact_hash_ignores_whitespace_but_preserves_field_order() {
         let first = parse(IDL).unwrap();
-        let second = parse(&format!("// comment\n{IDL}")).unwrap();
+        let second = parse(&format!("\n\t{IDL}\n")).unwrap();
         assert_eq!(exact_hash(&first), exact_hash(&second));
         let reordered = parse(&IDL.replace("x: f32; y: f32", "y: f32; x: f32")).unwrap();
         assert_ne!(exact_hash(&first), exact_hash(&reordered));
@@ -3344,6 +3593,23 @@ mod tests {
         );
         assert!(struct_payload.contains("HostPayload::structure"));
         assert!(struct_payload.contains("HostPayload::String(value.label)"));
+
+        let typed_error_payload = generate_rust(
+            &parse(
+                "interface TypedErrors {
+                    opaque Trace;
+                    struct Failure { trace: Trace; message: string; }
+                    request(cancel_task, trap) fn load()
+                        -> request<Result<i32, Failure>>;
+                }",
+            )
+            .unwrap(),
+        );
+        assert!(typed_error_payload.contains("HostErrorPayload::Value"));
+        assert!(typed_error_payload.contains("HostPayload::structure"));
+        assert!(typed_error_payload.contains("HostPayload::Opaque(error.trace.0)"));
+        assert!(typed_error_payload.contains("HostPayload::String(error.message)"));
+        assert!(!typed_error_payload.contains("u32::MAX"));
     }
 
     #[test]

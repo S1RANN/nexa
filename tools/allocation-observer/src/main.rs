@@ -9,15 +9,15 @@ use nexa_bytecode::{
     FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap, Signature,
     StateField, StateSchema, StateType, ValueType,
 };
-use nexa_core::StableId;
+use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
     CancelReason, CopyBuffer, Heap, HeapError, HostCallOutcome, HostErrorPayload, HostPayload,
-    HostRegistry, HostReturnRequirements, HostTrap,
-    MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
-    RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RuntimeFailurePoint, TaskPoll,
-    RestartReloadOutcome, RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskRuntime, TaskState, TickBudget, YieldReason, set_migration_allocation_observer,
+    HostRegistry, HostReturnRequirements, HostTrap, MigrationAllocationPhase, ModuleHandle,
+    PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReleaseKind, ReleaseRecord,
+    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost,
+    RuntimeHostArgs, RuntimeHostDomain, RuntimeLimits, RuntimeResources, RuntimeValue, StateObject,
+    StateValue, StepConfig, TaskLimits, TaskPoll, TaskRuntime, TaskState, TickBudget, YieldReason,
+    set_migration_allocation_observer,
 };
 use nexa_verifier::{VerifierLimits, verify};
 
@@ -150,6 +150,7 @@ fn host_owned<T>(operation: impl FnOnce() -> T) -> T {
     dead_code,
     clippy::extra_unused_lifetimes,
     clippy::identity_op,
+    clippy::needless_borrow,
     clippy::needless_question_mark,
     clippy::too_many_arguments
 )]
@@ -257,7 +258,7 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
     let mut ticket = pending.lock().unwrap().take().unwrap().ticket;
     match completion {
         ObservedCompletion::Error(code) => {
-            ticket.fail(HostErrorPayload { code }).unwrap();
+            ticket.fail(HostErrorPayload::Code(code)).unwrap();
         }
         ObservedCompletion::Cancelled => {
             ticket.cancelled().unwrap();
@@ -300,7 +301,7 @@ fn observe_typed_writeback(spec: AsyncObserverSpec, completion: ObservedCompleti
 
 fn make_cleanup_realm(cleanup_traps: bool) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host = StableId::from_name("allocation-observer-cleanup-host");
-    let schema = StableId::from_name("allocation-observer-cleanup-schema");
+    let schema = StateSchema::default().fingerprint();
     let mut cleanup = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -660,9 +661,9 @@ fn validate_return(
             assert_eq!(
                 values,
                 [
-                RuntimeValue::I32(1),
-                RuntimeValue::I32(2),
-                RuntimeValue::I32(3)
+                    RuntimeValue::I32(1),
+                    RuntimeValue::I32(2),
+                    RuntimeValue::I32(3)
                 ]
             );
             Some(values.len())
@@ -672,9 +673,9 @@ fn validate_return(
             assert_eq!(
                 values,
                 [
-                RuntimeValue::I32(4),
-                RuntimeValue::I32(5),
-                RuntimeValue::I32(6)
+                    RuntimeValue::I32(4),
+                    RuntimeValue::I32(5),
+                    RuntimeValue::I32(6)
                 ]
             );
             Some(values.len())
@@ -1558,7 +1559,7 @@ fn main() {
             .take()
             .unwrap()
             .ticket
-            .fail(HostErrorPayload { code: 9 })
+            .fail(HostErrorPayload::Code(9))
             .unwrap();
         let error_result_writeback = observed(|| {
             realm
@@ -1839,7 +1840,7 @@ fn main() {
         host.try_finish_close().unwrap();
 
         let retired_host_hash = StableId::from_name("allocation-observer-retired-host");
-        let retired_schema = StableId::from_name("allocation-observer-retired-schema");
+        let retired_schema = StateSchema::default().fingerprint();
         let host = RuntimeHost::new(4);
         let mut realm = RealmRuntime::hosted(
             RealmConfig::default(),
@@ -2154,8 +2155,6 @@ fn main() {
 
 fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::VerifiedModule) {
     let host = StableId::from_name("allocation-observer-migration-host");
-    let old_schema_hash = StableId::from_name("allocation-observer-state-v1");
-    let new_schema_hash = StableId::from_name("allocation-observer-state-v2");
     let new_type = StableId::from_name("ObserverState");
     let new_field = StableId::from_name("ObserverState::value");
     let preserved_type = StableId::from_name("PreservedState");
@@ -2173,6 +2172,10 @@ fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::Verifie
             ty: ValueType::I32,
         }],
     };
+    let old_schema = StateSchema {
+        types: vec![preserved_schema.clone()],
+    };
+    let old_schema_fingerprint = old_schema.fingerprint();
     let mut old_entry = FunctionBuilder::new(
         Signature {
             parameters: Vec::new(),
@@ -2185,10 +2188,8 @@ fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::Verifie
         .emit(Instruction::ReturnVoid);
     let mut old_module = ModuleBuilder::new();
     old_module
-        .metadata(host, old_schema_hash)
-        .state_schema(StateSchema {
-            types: vec![preserved_schema.clone()],
-        })
+        .metadata(host, old_schema_fingerprint)
+        .state_schema(old_schema)
         .function(old_entry.finish().unwrap());
     let old_module = verify(old_module.finish(), VerifierLimits::default()).unwrap();
 
@@ -2240,28 +2241,30 @@ fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::Verifie
             bitmap: vec![false, true],
         },
     ];
+    let new_schema = StateSchema {
+        types: vec![
+            StateType {
+                stable_id: new_type,
+                version: 1,
+                fields: vec![StateField {
+                    stable_id: new_field,
+                    ty: ValueType::I32,
+                }],
+            },
+            preserved_schema,
+        ],
+    };
+    let new_schema_fingerprint = new_schema.fingerprint();
     let mut candidate = ModuleBuilder::new();
     candidate
-        .metadata(host, new_schema_hash)
-        .state_schema(StateSchema {
-            types: vec![
-                StateType {
-                    stable_id: new_type,
-                    version: 1,
-                    fields: vec![StateField {
-                        stable_id: new_field,
-                        ty: ValueType::I32,
-                    }],
-                },
-                preserved_schema,
-            ],
-        })
+        .metadata(host, new_schema_fingerprint)
+        .state_schema(new_schema)
         .function(migration);
     let candidate = verify(candidate.finish(), VerifierLimits::default()).unwrap();
 
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let old = realm
-        .load_module(old_module, host, old_schema_hash)
+        .load_module(old_module, host, old_schema_fingerprint)
         .unwrap();
     realm
         .insert_state(old, replaced_id, StateValue::I32(7))
@@ -2321,7 +2324,7 @@ fn make_async_host_realm_with_spec(
     spec: AsyncObserverSpec,
 ) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host_hash = StableId::from_name("allocation-observer-async-host");
-    let schema = StableId::from_name("allocation-observer-async-schema");
+    let schema = StateSchema::default().fingerprint();
     let result = nexa_bytecode::result_type(ValueType::I32, spec.error);
     let function = Function {
         signature: Signature {
@@ -2387,7 +2390,7 @@ fn make_async_host_realm_with_spec(
 
 fn make_immediate_host_realm(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host_hash = StableId::from_name("allocation-observer-immediate-host");
-    let schema = StableId::from_name("allocation-observer-immediate-schema");
+    let schema = StateSchema::default().fingerprint();
     let mut function = FunctionBuilder::new(
         Signature {
             parameters: vec![ValueType::I32; 8],
@@ -2428,7 +2431,7 @@ fn make_immediate_host_realm(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::
 
 fn make_realm_with_host(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host_hash = StableId::from_name("allocation-observer-host");
-    let schema = StableId::from_name("allocation-observer-schema");
+    let schema = StateSchema::default().fingerprint();
     let verified = build_module(host_hash, schema, vec![Instruction::Return { source: 0 }]);
     let mut realm =
         RealmRuntime::hosted(RealmConfig::default(), host, Box::new(NoHost(host_hash))).unwrap();
@@ -2438,7 +2441,7 @@ fn make_realm_with_host(host: RuntimeHost) -> (RealmRuntime, nexa_runtime::Modul
 
 fn make_realm(code: Vec<Instruction>) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
     let host = StableId::from_name("allocation-observer-host");
-    let schema = StableId::from_name("allocation-observer-schema");
+    let schema = StateSchema::default().fingerprint();
     let verified = build_module(host, schema, code);
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let module = realm.load_module(verified, host, schema).unwrap();
@@ -2447,7 +2450,7 @@ fn make_realm(code: Vec<Instruction>) -> (RealmRuntime, nexa_runtime::ModuleHand
 
 fn build_module(
     host: StableId,
-    schema: StableId,
+    schema: StateSchemaFingerprint,
     code: Vec<Instruction>,
 ) -> nexa_verifier::VerifiedModule {
     let mut function = FunctionBuilder::new(
@@ -2468,7 +2471,10 @@ fn build_module(
     verify(builder.finish(), VerifierLimits::default()).unwrap()
 }
 
-fn build_released_module_fixture(host: StableId, schema: StableId) -> nexa_verifier::VerifiedModule {
+fn build_released_module_fixture(
+    host: StableId,
+    schema: StateSchemaFingerprint,
+) -> nexa_verifier::VerifiedModule {
     let mut migration = FunctionBuilder::new(
         Signature {
             parameters: vec![ValueType::I32],

@@ -2,19 +2,31 @@
 
 This directory contains local language support for `.nexa` and `.nidl` files:
 
-- `tree-sitter-nexa/` is the shared Tree-sitter grammar.
+- `tree-sitter-nexa/` is the Nexa source Tree-sitter grammar.
+- `tree-sitter-nexa-idl/` is the intentionally separate NIDL Tree-sitter
+  grammar. Keeping it separate prevents Nexa comments and M4 module syntax
+  from being accepted in `.nidl` files.
 - `vscode/` is a code-free VS Code Language Basics extension.
 - `zed/` is a two-language Zed extension template.
 - `language-syntax.json` is the shared lexical vocabulary.
 - `scripts/` generates, validates, and packages the extensions.
 
+The Nexa grammar covers M4 modules and namespace imports, `pub` and
+`pub(package)`, typed constants, `@stable`, `@test`, loop control, comments,
+documentation comments, and string interpolation. NIDL remains on its
+pre-M4 syntax and does not recognize comments.
+
 Build everything from the repository root:
 
 ```sh
+rustup target add wasm32-wasip2
 pnpm --dir editors install --frozen-lockfile
 pnpm --dir editors package
 ```
 
-Artifacts are written below `target/nexa-editor-support/`. See
+The package command fails unless `vsce` produces a real VSIX and Cargo
+successfully builds the Zed extension for `wasm32-wasip2`. Artifacts and the
+typed package evidence report are written below `target/nexa-editor-support/`.
+See
 [`docs/EDITOR_SUPPORT.md`](../docs/EDITOR_SUPPORT.md) for installation,
 maintenance, supported syntax, and limitations.

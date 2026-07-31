@@ -1,10 +1,11 @@
-schema = 1
+schema = 2
+kind = "application"
 id = "community.corner-spawn"
 name = "Corner Spawn"
 version = "1.0.0"
-entry = "main.nexa"
+source_root = "src"
+entry = "snake.corner_spawn"
 priority = 130
 activation = "user-controlled"
-state_schema = "v1"
 handler_fuel = 30000
 capabilities = ["spawn.register", "spawn.propose"]

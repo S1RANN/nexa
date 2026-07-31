@@ -6,9 +6,12 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+nexa-analysis = { path = "../nexa-analysis" }
 nexa-bytecode = { path = "../nexa-bytecode" }
 nexa-core = { path = "../nexa-core" }
+nexa-diagnostics = { path = "../nexa-diagnostics" }
 nexa-idl = { path = "../nexa-idl" }
+nexa-stdlib = { path = "../nexa-stdlib" }
 nexa-verifier = { path = "../nexa-verifier" }
 
 [dev-dependencies]

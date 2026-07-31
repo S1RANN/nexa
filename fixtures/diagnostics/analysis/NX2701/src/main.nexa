@@ -1,0 +1,5 @@
+module wrong.name;
+
+pub fn entry() -> i32 {
+    return 1;
+}

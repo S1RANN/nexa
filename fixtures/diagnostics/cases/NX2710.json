@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2710","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2710","expected":{"primary_text":"bad stable id","secondary_count":0,"message_contains":"invalid @stable","notes":[]}}

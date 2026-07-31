@@ -1,0 +1,7 @@
+module main;
+
+import types;
+
+pub fn expose(value: types.Secret) -> i32 {
+    return 1;
+}

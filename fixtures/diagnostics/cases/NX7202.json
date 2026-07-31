@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7202","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"activation faulted after commit","notes":[]}}
+{"version":1,"code":"NX7202","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"integer division or remainder by zero","notes":[]}}

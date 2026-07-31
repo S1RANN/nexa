@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7102","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"handler waited under mustcomplete","notes":[]}}
+{"version":1,"code":"NX7102","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"HostWaitNotAllowed","notes":[]}}

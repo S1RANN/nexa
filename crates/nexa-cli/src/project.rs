@@ -1,12 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use nexa_embed::{
-    ActivationPolicy, ActivationSet, CapabilityId, CapabilitySet, EngineDiagnostic,
-    EngineDiagnosticStage, ExportRequirement, PackageCandidate, PackageId, PackageManifest,
-    PackagePolicy, PackageRuntimeLimits, SourceId, TrustLevel,
+use nexa_analysis::{
+    ActivationPolicy, BuildFingerprint, CandidateIdentity, CompilationLimits, CompilationOptions,
+    LoadedPackageDirectory, LockFile, NormalizedPackagePath, PackageCandidate, PackageCatalog,
+    PackageId, PackageLocation, PackageManifest, ResolvedBuildInput, ResolvedDependencyGraph,
+    ResolvedPackage, ResolvedTestInput, SourceId, SourceKey, SourceRole, SourceSetBuilder,
+    load_package_directory, load_package_directory_without_lock, validate_module_source_for_role,
 };
 use serde::Deserialize;
+
+use crate::{CliError, CliResult};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,7 +20,7 @@ pub struct ProjectConfig {
     pub schema: u32,
     pub contract: PathBuf,
     #[serde(default)]
-    pub required_exports: Vec<String>,
+    pub required_exports: Option<Vec<String>>,
     pub sources: Vec<SourceConfig>,
 }
 
@@ -33,20 +39,11 @@ pub struct SourceConfig {
     pub limits: RuntimeLimitsConfig,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ConfigTrustLevel {
     FirstParty,
     Trusted,
-}
-
-impl From<ConfigTrustLevel> for TrustLevel {
-    fn from(value: ConfigTrustLevel) -> Self {
-        match value {
-            ConfigTrustLevel::FirstParty => Self::FirstParty,
-            ConfigTrustLevel::Trusted => Self::Trusted,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize)]
@@ -60,48 +57,443 @@ pub struct RuntimeLimitsConfig {
     pub release_records: usize,
 }
 
-impl From<RuntimeLimitsConfig> for PackageRuntimeLimits {
-    fn from(value: RuntimeLimitsConfig) -> Self {
-        Self {
-            handler_fuel: value.handler_fuel,
-            cumulative_budget: value.cumulative_budget,
-            heap_objects: value.heap_objects,
-            host_resources: value.host_resources,
-            tasks: value.tasks,
-            release_records: value.release_records,
-        }
-    }
+#[derive(Clone, Debug)]
+pub struct SourcePolicy {
+    #[allow(dead_code)]
+    pub trust: ConfigTrustLevel,
+    pub activation: BTreeSet<ActivationPolicy>,
+    pub capabilities: BTreeSet<String>,
+    pub allow_entitlement: bool,
+    pub max_packages: usize,
+    pub limits: RuntimeLimitsConfig,
 }
 
 #[derive(Clone, Debug)]
 pub struct LoadedSource {
     pub id: SourceId,
     pub root: PathBuf,
-    pub policy: PackagePolicy,
+    pub policy: SourcePolicy,
 }
 
 #[derive(Clone, Debug)]
 pub struct DiscoveredPackage {
     pub directory: PathBuf,
     pub source_id: SourceId,
-    pub policy: PackagePolicy,
+    pub source_root: PathBuf,
+    pub policy: SourcePolicy,
 }
 
 #[derive(Clone, Debug)]
 pub struct LoadedProject {
     pub config_path: PathBuf,
     pub root: PathBuf,
-    pub config: ProjectConfig,
     pub sources: Vec<LoadedSource>,
+    pub contract_path: PathBuf,
     pub contract_source: String,
-    pub idl: nexa_idl::Idl,
-    pub required_exports: Vec<ExportRequirement>,
+    pub idl: nexa::Idl,
+    /// Effective required-export subset. An omitted setting means every NIDL export; an explicit
+    /// empty list means no Package export is required.
+    pub required_exports: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ProjectCheck {
-    pub checked_packages: usize,
-    pub diagnostics: Vec<EngineDiagnostic>,
+/// An owned Host contract snapshot which can borrow its parsed IDL only for the duration of one
+/// facade call while retaining the exact reader-facing source identity and bytes.
+#[derive(Clone, Debug)]
+pub struct HostContractSnapshot {
+    pub idl: Arc<nexa::Idl>,
+    pub identity: nexa::SourceIdentity,
+    pub source: Arc<str>,
+    pub required_exports: Arc<[String]>,
+}
+
+impl HostContractSnapshot {
+    pub fn with_source(
+        idl: &nexa::Idl,
+        identity: nexa::SourceIdentity,
+        source: impl Into<Arc<str>>,
+    ) -> CliResult<Self> {
+        let required_exports = idl
+            .exports
+            .iter()
+            .map(|export| export.name.clone())
+            .collect::<Vec<_>>();
+        Self::with_required_exports(idl, identity, source, &required_exports)
+    }
+
+    pub fn with_required_exports(
+        idl: &nexa::Idl,
+        identity: nexa::SourceIdentity,
+        source: impl Into<Arc<str>>,
+        required_exports: &[String],
+    ) -> CliResult<Self> {
+        let source = source.into();
+        nexa::HostContractInput::with_source(idl, identity.clone(), Arc::clone(&source))
+            .and_then(|contract| contract.requiring_exports(required_exports))
+            .map_err(|error| {
+                CliError::internal(format!("invalid owned Host contract snapshot: {error}"))
+            })?;
+        Ok(Self {
+            idl: Arc::new(idl.clone()),
+            identity,
+            source,
+            required_exports: Arc::from(required_exports),
+        })
+    }
+
+    #[must_use]
+    pub fn canonical(idl: &nexa::Idl) -> Self {
+        let input = nexa::HostContractInput::canonical(idl);
+        Self {
+            idl: Arc::new(idl.clone()),
+            identity: input.source().identity().clone(),
+            source: Arc::clone(input.source().text()),
+            required_exports: idl
+                .exports
+                .iter()
+                .map(|export| export.name.clone())
+                .collect::<Vec<_>>()
+                .into(),
+        }
+    }
+
+    fn input(&self) -> Result<nexa::HostContractInput<'_>, nexa::HostContractSourceError> {
+        nexa::HostContractInput::with_source(
+            &self.idl,
+            self.identity.clone(),
+            Arc::clone(&self.source),
+        )
+        .and_then(|contract| contract.requiring_exports(&self.required_exports))
+    }
+}
+
+/// One immutable, fully resolved build input shared by check, build, test, dev, and LSP.
+#[derive(Clone, Debug)]
+pub struct ResolvedBuild {
+    #[allow(dead_code)]
+    pub source_id: SourceId,
+    #[allow(dead_code)]
+    pub source_root: PathBuf,
+    #[allow(dead_code)]
+    pub root_directory: NormalizedPackagePath,
+    pub root: Arc<LoadedPackageDirectory>,
+    pub packages: BTreeMap<PackageId, Arc<LoadedPackageDirectory>>,
+    pub input: Arc<ResolvedBuildInput>,
+    pub host_contract: HostContractSnapshot,
+    pub dependency_graph: Arc<ResolvedDependencyGraph>,
+    pub canonical_lock: LockFile,
+    pub build_fingerprint: BuildFingerprint,
+    pub candidate: Arc<PackageCandidate>,
+    pub virtual_source_origin: Option<VirtualSourceOrigin>,
+}
+
+#[derive(Clone, Debug)]
+pub struct VirtualSourceOrigin {
+    pub source_key: SourceKey,
+    pub display_identity: nexa::SourceIdentity,
+    pub original_text: Arc<str>,
+    pub source_text_is_original: bool,
+}
+
+#[derive(Debug)]
+pub struct CompiledBuild {
+    pub identity: CandidateIdentity,
+    pub artifact: CompiledBuildArtifact,
+    pub module_count: usize,
+}
+
+#[derive(Debug)]
+pub enum CompiledBuildArtifact {
+    Checked,
+    Product(Box<nexa::CompiledPackageArtifact>),
+    Tests(Box<nexa::CompiledPackageTests>),
+}
+
+impl CompiledBuild {
+    #[must_use]
+    pub fn product(&self) -> Option<&nexa::CompiledPackageArtifact> {
+        match &self.artifact {
+            CompiledBuildArtifact::Product(artifact) => Some(artifact.as_ref()),
+            CompiledBuildArtifact::Checked | CompiledBuildArtifact::Tests(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn tests(&self) -> Option<&nexa::CompiledPackageTests> {
+        match &self.artifact {
+            CompiledBuildArtifact::Tests(artifact) => Some(artifact.as_ref()),
+            CompiledBuildArtifact::Checked | CompiledBuildArtifact::Product(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn function_count(&self) -> Option<usize> {
+        self.product()
+            .map(|artifact| artifact.module().functions.len())
+    }
+}
+
+#[derive(Debug)]
+pub enum BuildCompileError {
+    Cli(CliError),
+    Facade(nexa::PackageBuildError),
+}
+
+impl ResolvedBuild {
+    pub fn identity(&self, generation: u64) -> CliResult<CandidateIdentity> {
+        self.candidate
+            .identity(generation)
+            .map_err(|error| CliError::internal(format!("invalid Candidate identity: {error}")))
+    }
+
+    #[must_use]
+    pub fn package_id(&self) -> &PackageId {
+        &self.root.manifest.id
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn compile(
+        &self,
+        generation: u64,
+        host_idl: Option<&nexa::Idl>,
+        required_exports: &[String],
+        include_tests: bool,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        self.compile_with_limits(
+            generation,
+            host_idl,
+            required_exports,
+            include_tests,
+            nexa::VerifierLimits::default(),
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn compile_with_limits(
+        &self,
+        generation: u64,
+        host_idl: Option<&nexa::Idl>,
+        required_exports: &[String],
+        include_tests: bool,
+        verifier_limits: nexa::VerifierLimits,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        let mut session = nexa::PackageBuildSession::new();
+        self.compile_with_session_and_limits(
+            &mut session,
+            generation,
+            host_idl,
+            required_exports,
+            include_tests,
+            verifier_limits,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn compile_with_session(
+        &self,
+        session: &mut nexa::PackageBuildSession,
+        generation: u64,
+        host_idl: Option<&nexa::Idl>,
+        required_exports: &[String],
+        include_tests: bool,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        self.compile_with_session_and_limits(
+            session,
+            generation,
+            host_idl,
+            required_exports,
+            include_tests,
+            nexa::VerifierLimits::default(),
+        )
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn compile_with_session_and_limits(
+        &self,
+        session: &mut nexa::PackageBuildSession,
+        generation: u64,
+        host_idl: Option<&nexa::Idl>,
+        required_exports: &[String],
+        include_tests: bool,
+        verifier_limits: nexa::VerifierLimits,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        let canonical_contract;
+        let retained_contract;
+        let contract = if let Some(host_idl) = host_idl {
+            canonical_contract = nexa::HostContractInput::canonical(host_idl);
+            &canonical_contract
+        } else {
+            retained_contract = self.host_contract.input().map_err(|error| {
+                BuildCompileError::Cli(CliError::internal(format!(
+                    "retained Host contract is invalid: {error}"
+                )))
+            })?;
+            &retained_contract
+        };
+        self.compile_with_contract_session_and_limits(
+            session,
+            generation,
+            contract,
+            required_exports,
+            include_tests,
+            verifier_limits,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn compile_with_contract_session(
+        &self,
+        session: &mut nexa::PackageBuildSession,
+        generation: u64,
+        contract: &nexa::HostContractInput<'_>,
+        required_exports: &[String],
+        include_tests: bool,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        self.compile_with_contract_session_and_limits(
+            session,
+            generation,
+            contract,
+            required_exports,
+            include_tests,
+            nexa::VerifierLimits::default(),
+        )
+    }
+
+    #[allow(clippy::result_large_err, clippy::too_many_arguments)]
+    pub fn compile_with_contract_session_and_limits(
+        &self,
+        session: &mut nexa::PackageBuildSession,
+        generation: u64,
+        contract: &nexa::HostContractInput<'_>,
+        required_exports: &[String],
+        include_tests: bool,
+        verifier_limits: nexa::VerifierLimits,
+    ) -> Result<CompiledBuild, BuildCompileError> {
+        let contract = contract
+            .requiring_exports(required_exports)
+            .map_err(|error| {
+                BuildCompileError::Cli(CliError::diagnostic(format!(
+                    "invalid required-export view: {error}"
+                )))
+            })?;
+        let identity = self.identity(generation).map_err(BuildCompileError::Cli)?;
+        let (artifact, module_count) = if include_tests {
+            let input = self.input_with_tests().map_err(BuildCompileError::Cli)?;
+            let module_count = input.artifact_files.files().len();
+            let artifact = session
+                .compile_package_tests_with_contract_and_limits(
+                    &input,
+                    &contract,
+                    identity.clone(),
+                    verifier_limits,
+                )
+                .map(Box::new)
+                .map(CompiledBuildArtifact::Tests)
+                .map_err(BuildCompileError::Facade)?;
+            (artifact, module_count)
+        } else if self.root.manifest.is_application() {
+            let artifact = session
+                .compile_package_with_contract_and_limits(
+                    &self.input,
+                    &contract,
+                    identity.clone(),
+                    verifier_limits,
+                )
+                .map_err(BuildCompileError::Facade)?;
+            let module_count = artifact.debug_info.modules.len();
+            (
+                CompiledBuildArtifact::Product(Box::new(artifact)),
+                module_count,
+            )
+        } else {
+            let report = session
+                .check_package_with_contract(&self.input, &contract)
+                .map_err(BuildCompileError::Facade)?;
+            (CompiledBuildArtifact::Checked, report.modules)
+        };
+        Ok(CompiledBuild {
+            identity,
+            artifact,
+            module_count,
+        })
+    }
+
+    /// Atomically rebuilds every source-derived identity after an editor overlay changes one or
+    /// more package snapshots. Manifest/dependency topology remains fixed; all source tables,
+    /// fingerprints, and the candidate identity are reconstructed together.
+    pub fn rebuild_with_contract(
+        &self,
+        packages: BTreeMap<PackageId, Arc<LoadedPackageDirectory>>,
+        host_contract: &nexa::HostContractInput<'_>,
+    ) -> CliResult<Self> {
+        let expected = self
+            .dependency_graph
+            .packages
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let actual = packages.keys().cloned().collect::<BTreeSet<_>>();
+        if actual != expected {
+            return Err(CliError::internal(
+                "editor overlay changed the resolved Package dependency closure",
+            ));
+        }
+        let root = packages
+            .get(self.package_id())
+            .cloned()
+            .ok_or_else(|| CliError::internal("editor overlay omitted the root Package"))?;
+        nexa_analysis::PackageSourceSet::validate_dependency_closure(
+            packages
+                .values()
+                .map(|package| package.production_sources.as_ref()),
+            CompilationLimits::default(),
+        )
+        .map_err(|error| CliError::diagnostic(error.to_string()))?;
+        let selected_contract = host_contract
+            .requiring_exports(&self.host_contract.required_exports)
+            .map_err(|error| {
+                CliError::diagnostic(format!("invalid required-export view: {error}"))
+            })?;
+        let input = resolved_build_input(
+            &root,
+            Arc::clone(&root.production_sources),
+            &packages,
+            Arc::clone(&self.dependency_graph),
+            self.input.lock.clone(),
+            &selected_contract,
+        )?;
+        let build_fingerprint = input.build_fingerprint;
+        let candidate =
+            Arc::new(input.candidate().map_err(|error| {
+                CliError::internal(format!("invalid overlay Candidate: {error}"))
+            })?);
+        Ok(Self {
+            source_id: self.source_id.clone(),
+            source_root: self.source_root.clone(),
+            root_directory: self.root_directory.clone(),
+            root,
+            packages,
+            input,
+            host_contract: HostContractSnapshot::with_required_exports(
+                host_contract.idl(),
+                host_contract.source().identity().clone(),
+                Arc::clone(host_contract.source().text()),
+                &self.host_contract.required_exports,
+            )?,
+            dependency_graph: Arc::clone(&self.dependency_graph),
+            canonical_lock: self.canonical_lock.clone(),
+            build_fingerprint,
+            candidate,
+            virtual_source_origin: self.virtual_source_origin.clone(),
+        })
+    }
+
+    fn input_with_tests(&self) -> CliResult<Arc<ResolvedTestInput>> {
+        ResolvedTestInput::new(Arc::clone(&self.input), Arc::clone(&self.root.test_sources))
+            .map(Arc::new)
+            .map_err(|error| {
+                CliError::internal(format!("resolved Package test input is invalid: {error}"))
+            })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -120,42 +512,106 @@ struct PolicyFile {
 }
 
 impl LoadedProject {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let config_path = path
-            .canonicalize()
-            .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+    pub fn load(path: &Path) -> CliResult<Self> {
+        Self::load_with_overlays(path, |_| None)
+    }
+
+    /// Loads project metadata while allowing an editor snapshot to replace the exact text of
+    /// open build inputs. The callback is consulted for the project manifest and Host Contract;
+    /// every absent override is read from disk.
+    pub fn load_with_overlays(
+        path: &Path,
+        overlay_for_path: impl FnMut(&Path) -> Option<String>,
+    ) -> CliResult<Self> {
+        Self::load_snapshot(path, overlay_for_path, true)
+    }
+
+    /// Loads an editor snapshot without rejecting a syntactically valid NIDL that temporarily
+    /// omits a configured export. The LSP reports that semantic error against the NIDL URI after
+    /// project discovery, while normal CLI and development loads remain strict.
+    pub fn load_editor_snapshot(
+        path: &Path,
+        overlay_for_path: impl FnMut(&Path) -> Option<String>,
+    ) -> CliResult<Self> {
+        Self::load_snapshot(path, overlay_for_path, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn load_snapshot(
+        path: &Path,
+        mut overlay_for_path: impl FnMut(&Path) -> Option<String>,
+        validate_exports: bool,
+    ) -> CliResult<Self> {
+        let snapshot_config_path = snapshot_path(path);
+        let config_overlay = overlay_for_path(path).or_else(|| {
+            (snapshot_config_path != path)
+                .then(|| overlay_for_path(&snapshot_config_path))
+                .flatten()
+        });
+        let config_path = if config_overlay.is_some() {
+            if path.exists() {
+                reject_symlink_path(path)?;
+            }
+            snapshot_config_path
+        } else {
+            reject_symlink_path(path)?;
+            path.canonicalize().map_err(|error| {
+                CliError::environment(format!(
+                    "could not resolve project configuration {}: {error}",
+                    path.display()
+                ))
+            })?
+        };
         let root = config_path
             .parent()
-            .ok_or("project configuration has no parent directory")?
+            .ok_or_else(|| CliError::environment("project configuration has no parent directory"))?
             .to_path_buf();
-        let source = std::fs::read_to_string(&config_path)
-            .map_err(|error| format!("could not read {}: {error}", config_path.display()))?;
-        let config: ProjectConfig = toml::from_str(&source)
-            .map_err(|error| format!("invalid {}: {error}", config_path.display()))?;
+        let source = config_overlay
+            .or_else(|| overlay_for_path(&config_path))
+            .map_or_else(
+                || {
+                    fs::read_to_string(&config_path).map_err(|error| {
+                        CliError::internal(format!(
+                            "could not read {}: {error}",
+                            config_path.display()
+                        ))
+                    })
+                },
+                Ok,
+            )?;
+        let config: ProjectConfig = toml::from_str(&source).map_err(|error| {
+            CliError::environment(format!("invalid {}: {error}", config_path.display()))
+        })?;
         if config.schema != 2 {
-            return Err(format!(
+            return Err(CliError::environment(format!(
                 "unsupported nexa.dev.toml schema {}; expected schema 2",
                 config.schema
-            ));
+            )));
         }
         if config.sources.is_empty() {
-            return Err("nexa.dev.toml must declare at least one source".into());
+            return Err(CliError::environment(
+                "nexa.dev.toml must declare at least one [[sources]] entry",
+            ));
+        }
+        if let Some(required_exports) = &config.required_exports {
+            reject_duplicate_required_exports(required_exports)?;
         }
 
         let mut source_ids = BTreeSet::new();
         let mut sources = Vec::with_capacity(config.sources.len());
         for configured in &config.sources {
-            let id = SourceId::new(configured.id.clone())
-                .map_err(|error| format!("invalid source id `{}`: {error}", configured.id))?;
+            let id = SourceId::new(configured.id.clone()).map_err(|error| {
+                CliError::environment(format!("invalid source id `{}`: {error}", configured.id))
+            })?;
             if !source_ids.insert(id.clone()) {
-                return Err(format!("duplicate source id `{id}`"));
+                return Err(CliError::environment(format!("duplicate source id `{id}`")));
             }
             let source_root = resolve_within(&root, &configured.root)?;
             if !source_root.is_dir() {
-                return Err(format!(
+                return Err(CliError::environment(format!(
                     "source root is not a directory: {}",
                     source_root.display()
-                ));
+                )));
             }
             let policy = policy_from_parts(
                 configured.trust,
@@ -174,46 +630,72 @@ impl LoadedProject {
         reject_overlapping_roots(&sources)?;
 
         let contract_path = resolve_within(&root, &config.contract)?;
-        let contract_source = std::fs::read_to_string(&contract_path)
-            .map_err(|error| format!("could not read {}: {error}", contract_path.display()))?;
-        let idl = nexa_idl::parse(&contract_source)
-            .map_err(|error| format!("invalid {}: {error}", contract_path.display()))?;
-        let required_exports =
-            resolve_required_exports(&idl, &config.required_exports, &contract_path)?;
+        let contract_source = overlay_for_path(&contract_path).map_or_else(
+            || {
+                fs::read_to_string(&contract_path).map_err(|error| {
+                    CliError::internal(format!(
+                        "could not read {}: {error}",
+                        contract_path.display()
+                    ))
+                })
+            },
+            Ok,
+        )?;
+        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+            CliError::diagnostic(format!("invalid {}: {error}", contract_path.display()))
+        })?;
+        let required_exports = config.required_exports.clone().unwrap_or_else(|| {
+            idl.exports
+                .iter()
+                .map(|export| export.name.clone())
+                .collect()
+        });
+        if validate_exports {
+            validate_required_exports(&idl, &required_exports, &contract_path)?;
+        }
+
         Ok(Self {
             config_path,
             root,
-            config,
             sources,
+            contract_path,
             contract_source,
             idl,
             required_exports,
         })
     }
 
-    pub fn package_directories(&self) -> Result<Vec<DiscoveredPackage>, String> {
+    pub fn package_directories(&self) -> CliResult<Vec<DiscoveredPackage>> {
+        self.package_directories_snapshot(None)
+    }
+
+    /// Discovers packages from one editor snapshot. An open `package.toml` is authoritative even
+    /// before the file exists on disk, so adding or moving a package manifest immediately changes
+    /// the package scope and the resulting [`ResolvedBuildInput`].
+    pub fn package_directories_with_overlays(
+        &self,
+        overlays: &BTreeMap<PathBuf, String>,
+    ) -> CliResult<Vec<DiscoveredPackage>> {
+        self.package_directories_snapshot(Some(overlays))
+    }
+
+    fn package_directories_snapshot(
+        &self,
+        overlays: Option<&BTreeMap<PathBuf, String>>,
+    ) -> CliResult<Vec<DiscoveredPackage>> {
         let mut packages = Vec::new();
         for source in &self.sources {
-            let mut source_packages = if source.root.join("package.toml").is_file() {
-                vec![source.root.clone()]
-            } else {
-                let mut children = std::fs::read_dir(&source.root)
-                    .map_err(|error| format!("could not read {}: {error}", source.root.display()))?
-                    .filter_map(Result::ok)
-                    .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-                    .map(|entry| entry.path())
-                    .filter(|path| path.join("package.toml").is_file())
-                    .collect::<Vec<_>>();
-                children.sort();
-                children
-            };
+            let mut source_packages = overlays.map_or_else(
+                || discover_package_roots(&source.root),
+                |overlays| discover_package_roots_with_overlays(&source.root, overlays),
+            )?;
             if source_packages.len() > source.policy.max_packages {
-                return Err(format!(
+                return Err(CliError::environment(format!(
                     "source `{}` contains {} packages, exceeding max_packages {}",
                     source.id,
                     source_packages.len(),
                     source.policy.max_packages
-                ));
+                )));
             }
             packages.extend(
                 source_packages
@@ -221,6 +703,7 @@ impl LoadedProject {
                     .map(|directory| DiscoveredPackage {
                         directory,
                         source_id: source.id.clone(),
+                        source_root: source.root.clone(),
                         policy: source.policy.clone(),
                     }),
             );
@@ -233,186 +716,913 @@ impl LoadedProject {
         Ok(packages)
     }
 
-    pub fn source_for_directory(&self, directory: &Path) -> Result<&LoadedSource, String> {
-        let directory = directory
-            .canonicalize()
-            .map_err(|error| format!("could not resolve {}: {error}", directory.display()))?;
-        self.sources
-            .iter()
-            .find(|source| directory.starts_with(&source.root))
-            .ok_or_else(|| {
-                format!(
-                    "package {} is not inside any configured source root",
-                    directory.display()
-                )
-            })
+    pub fn host_contract_snapshot(&self) -> CliResult<HostContractSnapshot> {
+        HostContractSnapshot::with_required_exports(
+            &self.idl,
+            nexa::SourceIdentity::standalone(self.contract_path.to_string_lossy().into_owned()),
+            Arc::<str>::from(self.contract_source.as_str()),
+            &self.required_exports,
+        )
     }
 
-    #[allow(clippy::result_large_err)]
-    pub fn load_candidate(
+    pub fn resolve_package(
         &self,
-        directory: &Path,
-    ) -> Result<(SourceId, PackageCandidate), EngineDiagnostic> {
-        let source = self.source_for_directory(directory).map_err(|message| {
-            EngineDiagnostic::without_source(
-                None,
-                None,
-                EngineDiagnosticStage::Policy,
-                nexa::ErrorCode::NX7003,
-                message,
-            )
-        })?;
-        load_package_candidate(directory, &source.id, &source.policy)
+        package: &DiscoveredPackage,
+        require_current_lock: bool,
+    ) -> CliResult<ResolvedBuild> {
+        self.resolve_package_snapshot(package, require_current_lock, None)
     }
 
-    pub fn check(&self) -> Result<ProjectCheck, String> {
-        let mut check = ProjectCheck::default();
-        let mut package_ids = BTreeMap::<PackageId, (PathBuf, SourceId)>::new();
-        for package in self.package_directories()? {
-            check.checked_packages += 1;
-            match load_package_candidate(&package.directory, &package.source_id, &package.policy) {
-                Ok((source_id, candidate)) => {
-                    if let Some((first_path, first_source)) = package_ids.insert(
-                        candidate.manifest.id.clone(),
-                        (package.directory.clone(), source_id.clone()),
-                    ) {
-                        check.diagnostics.push(EngineDiagnostic::without_source(
-                            Some(candidate.manifest.id),
-                            Some(source_id),
-                            EngineDiagnosticStage::Policy,
-                            nexa::ErrorCode::NX7003,
-                            format!(
-                                "duplicate Package ID; first declared at {} in source `{first_source}`, repeated at {}",
-                                first_path.display(),
-                                package.directory.display()
-                            ),
-                        ));
-                        continue;
-                    }
-                    if let Err(diagnostic) = nexa_embed::compile_package(
-                        &self.idl,
-                        &self.required_exports,
-                        &source_id,
-                        &candidate,
-                    ) {
-                        check.diagnostics.push(diagnostic);
-                    }
-                }
-                Err(diagnostic) => check.diagnostics.push(diagnostic),
+    /// Resolves the complete package/dependency closure from one editor snapshot.
+    ///
+    /// Open `package.toml`, `nexa.lock`, production, and test documents are authoritative even
+    /// before they reach disk. Dependency retargeting therefore rebuilds the graph and every
+    /// source-derived identity atomically instead of patching a previously resolved graph.
+    pub fn resolve_package_with_overlays(
+        &self,
+        package: &DiscoveredPackage,
+        require_current_lock: bool,
+        overlays: &BTreeMap<PathBuf, String>,
+    ) -> CliResult<ResolvedBuild> {
+        self.resolve_package_snapshot(
+            package,
+            require_current_lock,
+            (!overlays.is_empty()).then_some(overlays),
+        )
+    }
+
+    fn resolve_package_snapshot(
+        &self,
+        package: &DiscoveredPackage,
+        require_current_lock: bool,
+        overlays: Option<&BTreeMap<PathBuf, String>>,
+    ) -> CliResult<ResolvedBuild> {
+        validate_package_belongs_to_source(package)?;
+        let (resolver_root, allowed_root) = if package.directory == package.source_root {
+            (
+                package.source_root.parent().ok_or_else(|| {
+                    CliError::environment("package source root has no parent directory")
+                })?,
+                package.source_root.as_path(),
+            )
+        } else {
+            (package.source_root.as_path(), package.source_root.as_path())
+        };
+        resolve_package_build(
+            &package.directory,
+            resolver_root,
+            allowed_root,
+            package.source_id.clone(),
+            Some(&package.policy),
+            &self.host_contract_snapshot()?,
+            require_current_lock,
+            false,
+            overlays,
+        )
+    }
+
+    pub fn resolve_package_for_lock(
+        &self,
+        package: &DiscoveredPackage,
+    ) -> CliResult<ResolvedBuild> {
+        validate_package_belongs_to_source(package)?;
+        let (resolver_root, allowed_root) = if package.directory == package.source_root {
+            (
+                package.source_root.parent().ok_or_else(|| {
+                    CliError::environment("package source root has no parent directory")
+                })?,
+                package.source_root.as_path(),
+            )
+        } else {
+            (package.source_root.as_path(), package.source_root.as_path())
+        };
+        resolve_package_build(
+            &package.directory,
+            resolver_root,
+            allowed_root,
+            package.source_id.clone(),
+            Some(&package.policy),
+            &self.host_contract_snapshot()?,
+            false,
+            true,
+            None,
+        )
+    }
+
+    pub fn resolved_builds(&self, require_current_lock: bool) -> CliResult<Vec<ResolvedBuild>> {
+        let packages = self.package_directories()?;
+        let mut builds = Vec::with_capacity(packages.len());
+        let mut package_ids = BTreeMap::<PackageId, PathBuf>::new();
+        for package in packages {
+            let build = self.resolve_package(&package, require_current_lock)?;
+            if let Some(first) = package_ids.get(build.package_id()) {
+                return Err(CliError::diagnostic(format!(
+                    "duplicate Package ID `{}` at {} and {}",
+                    build.package_id(),
+                    first.display(),
+                    package.directory.display()
+                )));
             }
+            package_ids.insert(build.package_id().clone(), package.directory.clone());
+            builds.push(build);
         }
-        Ok(check)
+        builds.sort_by(|left, right| left.package_id().cmp(right.package_id()));
+        Ok(builds)
     }
 }
 
-#[allow(clippy::result_large_err)]
-pub fn check_package(
+/// Resolves a direct package command in a controlled sibling-only source domain.
+pub fn resolve_direct_package(
     directory: &Path,
-    idl: &nexa_idl::Idl,
-    required_exports: &[ExportRequirement],
-    source_id: &SourceId,
-    policy: &PackagePolicy,
-) -> Result<nexa_embed::CompiledPackageArtifact, EngineDiagnostic> {
-    let (_, candidate) = load_package_candidate(directory, source_id, policy)?;
-    nexa_embed::compile_package(idl, required_exports, source_id, &candidate)
+    source_id: SourceId,
+    policy: Option<&SourcePolicy>,
+    host_contract: &HostContractSnapshot,
+    require_current_lock: bool,
+) -> CliResult<ResolvedBuild> {
+    reject_symlink_path(directory)?;
+    let directory = directory.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if !directory.is_dir() {
+        return Err(CliError::environment(format!(
+            "package path is not a directory: {}",
+            directory.display()
+        )));
+    }
+    let source_root = directory
+        .parent()
+        .ok_or_else(|| CliError::environment("package directory has no parent"))?
+        .to_path_buf();
+    resolve_package_build(
+        &directory,
+        &source_root,
+        &source_root,
+        source_id,
+        policy,
+        host_contract,
+        require_current_lock,
+        false,
+        None,
+    )
 }
 
-#[allow(clippy::result_large_err)]
-pub fn load_package_candidate(
+pub fn resolve_direct_package_for_lock(
     directory: &Path,
-    source_id: &SourceId,
-    policy: &PackagePolicy,
-) -> Result<(SourceId, PackageCandidate), EngineDiagnostic> {
-    let manifest_path = directory.join("package.toml");
-    let manifest_source = std::fs::read_to_string(&manifest_path).map_err(|error| {
-        EngineDiagnostic::without_source(
-            None,
-            Some(source_id.clone()),
-            EngineDiagnosticStage::SourceDiscovery,
-            nexa::ErrorCode::NX7001,
-            format!("could not read {}: {error}", manifest_path.display()),
-        )
+    source_id: SourceId,
+) -> CliResult<ResolvedBuild> {
+    reject_symlink_path(directory)?;
+    let directory = directory.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve {}: {error}",
+            directory.display()
+        ))
     })?;
-    let manifest = PackageManifest::parse(&manifest_source, policy).map_err(|error| {
-        let policy_error = matches!(
-            error,
-            nexa_embed::ManifestError::ActivationNotAllowed
-                | nexa_embed::ManifestError::CapabilityCeiling
-                | nexa_embed::ManifestError::RuntimeLimit
-                | nexa_embed::ManifestError::EntitlementNotAllowed
-        );
-        EngineDiagnostic::without_source(
-            None,
-            Some(source_id.clone()),
-            if policy_error {
-                EngineDiagnosticStage::Policy
-            } else {
-                EngineDiagnosticStage::Manifest
+    let source_root = directory
+        .parent()
+        .ok_or_else(|| CliError::environment("package directory has no parent"))?
+        .to_path_buf();
+    let host_idl = empty_host_idl()?;
+    let host_contract = HostContractSnapshot::canonical(&host_idl);
+    resolve_package_build(
+        &directory,
+        &source_root,
+        &source_root,
+        source_id,
+        None,
+        &host_contract,
+        false,
+        true,
+        None,
+    )
+}
+
+fn empty_host_idl() -> CliResult<nexa::Idl> {
+    nexa::parse_idl("interface NexaCliEmptyHost {}\n").map_err(|error| {
+        CliError::internal(format!("invalid built-in empty Host contract: {error}"))
+    })
+}
+
+/// Adapts the single-file CLI surface to the same package identity and fingerprint model.
+#[allow(clippy::too_many_lines)]
+pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedBuild> {
+    let host_idl = empty_host_idl()?;
+    let host_contract = HostContractSnapshot::canonical(&host_idl);
+    let package_id = PackageId::new("nexa.snippet")
+        .map_err(|error| CliError::internal(format!("invalid snippet Package ID: {error}")))?;
+    let manifest_source = "schema = 2\n\
+                           kind = \"application\"\n\
+                           id = \"nexa.snippet\"\n\
+                           name = \"Nexa Snippet\"\n\
+                           version = \"0.0.0\"\n\
+                           source_root = \"src\"\n\
+                           entry = \"main\"\n\
+                           activation = \"programmatic\"\n";
+    let manifest = Arc::new(
+        PackageManifest::parse(manifest_source)
+            .map_err(|error| CliError::internal(format!("invalid virtual manifest: {error}")))?,
+    );
+    let original_text = Arc::<str>::from(source);
+    let mut source_builder =
+        SourceSetBuilder::new(package_id.clone(), CompilationLimits::default());
+    source_builder
+        .add_virtual_snippet(
+            NormalizedPackagePath::new("src/main.nexa")
+                .map_err(|error| CliError::internal(error.to_string()))?,
+            Arc::clone(&original_text),
+            nexa_analysis::ModulePath::new("main")
+                .map_err(|error| CliError::internal(error.to_string()))?,
+        )
+        .map_err(|error| CliError::diagnostic(error.to_string()))?;
+    let production_sources = Arc::new(
+        source_builder
+            .build()
+            .map_err(|error| CliError::diagnostic(error.to_string()))?,
+    );
+    let source_key = production_sources
+        .production_units()
+        .next()
+        .expect("virtual snippet has exactly one source")
+        .key
+        .clone();
+    let test_sources = Arc::new(
+        SourceSetBuilder::new(package_id.clone(), CompilationLimits::default())
+            .build()
+            .map_err(|error| CliError::internal(error.to_string()))?,
+    );
+    let source_id = SourceId::new("cli")
+        .map_err(|error| CliError::internal(format!("invalid CLI Source ID: {error}")))?;
+    let root_directory = NormalizedPackagePath::new("snippet")
+        .map_err(|error| CliError::internal(error.to_string()))?;
+    let graph = Arc::new(ResolvedDependencyGraph {
+        root: package_id.clone(),
+        packages: BTreeMap::from([(
+            package_id.clone(),
+            ResolvedPackage {
+                id: package_id.clone(),
+                version: manifest.version.clone(),
+                source_id: source_id.clone(),
+                directory: root_directory.clone(),
+                kind: manifest.kind,
             },
-            if policy_error {
-                nexa::ErrorCode::NX7003
-            } else {
-                nexa::ErrorCode::NX7002
+        )]),
+        edges: BTreeSet::new(),
+    });
+    let root = Arc::new(LoadedPackageDirectory {
+        directory: PathBuf::from("nexa.snippet"),
+        manifest_source: Arc::from(manifest_source),
+        manifest: Arc::clone(&manifest),
+        production_sources: Arc::clone(&production_sources),
+        test_sources,
+        lock: None,
+    });
+    let packages = BTreeMap::from([(package_id, Arc::clone(&root))]);
+    let canonical_lock = LockFile::from_graph(&graph);
+    let contract = host_contract.input().map_err(|error| {
+        CliError::internal(format!("invalid virtual Host contract snapshot: {error}"))
+    })?;
+    let input = resolved_build_input(
+        &root,
+        Arc::clone(&root.production_sources),
+        &packages,
+        Arc::clone(&graph),
+        None,
+        &contract,
+    )?;
+    let build_fingerprint = input.build_fingerprint;
+    let candidate = Arc::new(
+        input
+            .candidate()
+            .map_err(|error| CliError::internal(format!("invalid snippet Candidate: {error}")))?,
+    );
+    Ok(ResolvedBuild {
+        source_id,
+        source_root: PathBuf::from("nexa.snippet"),
+        root_directory,
+        root,
+        packages,
+        input,
+        host_contract,
+        dependency_graph: graph,
+        canonical_lock,
+        build_fingerprint,
+        candidate,
+        virtual_source_origin: Some(VirtualSourceOrigin {
+            source_key,
+            display_identity: nexa::SourceIdentity::standalone(
+                display_path.to_string_lossy().into_owned(),
+            ),
+            original_text,
+            source_text_is_original: true,
+        }),
+    })
+}
+
+fn load_package_directory_with_overlays(
+    directory: &Path,
+    limits: CompilationLimits,
+    parse_lock: bool,
+    overlays: &BTreeMap<PathBuf, String>,
+) -> CliResult<LoadedPackageDirectory> {
+    reject_symlink_path(directory)?;
+    let canonical_directory = directory.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve package directory {}: {error}",
+            directory.display()
+        ))
+    })?;
+
+    let manifest_path = canonical_directory.join("package.toml");
+    if manifest_path.exists() {
+        reject_symlink_path(&manifest_path)?;
+    }
+    let manifest_source = snapshot_text(overlays, &manifest_path)
+        .map(str::to_owned)
+        .map_or_else(
+            || {
+                fs::read_to_string(&manifest_path).map_err(|error| {
+                    CliError::internal(format!(
+                        "could not read {}: {error}",
+                        manifest_path.display()
+                    ))
+                })
             },
-            error.to_string(),
-        )
-    })?;
-    let canonical_root = directory.canonicalize().map_err(|error| {
-        EngineDiagnostic::without_source(
-            Some(manifest.id.clone()),
-            Some(source_id.clone()),
-            EngineDiagnosticStage::SourceDiscovery,
-            nexa::ErrorCode::NX7001,
-            error.to_string(),
-        )
-    })?;
-    let entry_path = canonical_root
-        .join(manifest.entry.as_path())
-        .canonicalize()
+            Ok,
+        )?;
+    let manifest = Arc::new(PackageManifest::parse(&manifest_source).map_err(|error| {
+        CliError::diagnostic(format!("invalid {}: {error}", manifest_path.display()))
+    })?);
+
+    let production_sources = Arc::new(load_source_tree_with_overlays(
+        &canonical_directory,
+        &canonical_directory.join(manifest.source_root.as_path()),
+        manifest.id.clone(),
+        SourceRole::Production,
+        limits,
+        overlays,
+    )?);
+    if let Some(entry) = manifest.expected_entry_source()
+        && !production_sources
+            .units()
+            .keys()
+            .any(|key| key.path == entry)
+    {
+        return Err(CliError::diagnostic(format!(
+            "Package entry source is missing: {entry}"
+        )));
+    }
+
+    let test_sources = Arc::new(load_source_tree_with_overlays(
+        &canonical_directory,
+        &canonical_directory.join("tests"),
+        manifest.id.clone(),
+        SourceRole::Test,
+        limits,
+        overlays,
+    )?);
+
+    let lock_path = canonical_directory.join("nexa.lock");
+    let lock_source = snapshot_text(overlays, &lock_path).map(str::to_owned);
+    let lock = if parse_lock && (lock_source.is_some() || lock_path.exists()) {
+        if lock_path.exists() {
+            reject_symlink_path(&lock_path)?;
+        }
+        let source = lock_source.map_or_else(
+            || {
+                fs::read_to_string(&lock_path).map_err(|error| {
+                    CliError::internal(format!("could not read {}: {error}", lock_path.display()))
+                })
+            },
+            Ok,
+        )?;
+        Some(Arc::new(LockFile::parse(&source).map_err(|error| {
+            CliError::environment(format!("invalid {}: {error}", lock_path.display()))
+        })?))
+    } else {
+        None
+    };
+
+    Ok(LoadedPackageDirectory {
+        directory: canonical_directory,
+        manifest_source: manifest_source.into(),
+        manifest,
+        production_sources,
+        test_sources,
+        lock,
+    })
+}
+
+fn load_source_tree_with_overlays(
+    package_directory: &Path,
+    tree_root: &Path,
+    package_id: PackageId,
+    role: SourceRole,
+    limits: CompilationLimits,
+    overlays: &BTreeMap<PathBuf, String>,
+) -> CliResult<nexa_analysis::PackageSourceSet> {
+    let normalized_package = snapshot_path(package_directory);
+    let normalized_root = snapshot_path(tree_root);
+    if !normalized_root.starts_with(&normalized_package) {
+        return Err(CliError::environment(format!(
+            "package source root escapes {}: {}",
+            package_directory.display(),
+            tree_root.display()
+        )));
+    }
+
+    let mut paths = BTreeSet::new();
+    let has_overlay_source = overlays.keys().any(|path| {
+        let normalized = snapshot_path(path);
+        normalized.starts_with(&normalized_root)
+            && normalized.extension().and_then(|value| value.to_str()) == Some("nexa")
+    });
+    if role == SourceRole::Production && !tree_root.exists() && !has_overlay_source {
+        return Err(CliError::environment(format!(
+            "package source root does not exist: {}",
+            tree_root.display()
+        )));
+    }
+    if tree_root.exists() {
+        collect_nexa_source_paths(tree_root, &mut paths)?;
+    }
+    for path in overlays.keys() {
+        let normalized = snapshot_path(path);
+        if normalized.starts_with(&normalized_root)
+            && normalized.extension().and_then(|value| value.to_str()) == Some("nexa")
+        {
+            paths.insert(normalized);
+        }
+    }
+
+    let mut builder = SourceSetBuilder::new(package_id, limits);
+    for path in paths {
+        let normalized = snapshot_path(&path);
+        if !normalized.starts_with(&normalized_root) || !normalized.starts_with(&normalized_package)
+        {
+            return Err(CliError::environment(format!(
+                "package source path escapes {}: {}",
+                package_directory.display(),
+                path.display()
+            )));
+        }
+        let relative = normalized
+            .strip_prefix(&normalized_package)
+            .map_err(|_| {
+                CliError::environment(format!(
+                    "package source path escapes {}: {}",
+                    package_directory.display(),
+                    path.display()
+                ))
+            })?
+            .to_path_buf();
+        let normalized_relative = NormalizedPackagePath::from_path(&relative)
+            .map_err(|error| CliError::diagnostic(error.to_string()))?;
+        let source = snapshot_text(overlays, &normalized)
+            .map(str::to_owned)
+            .map_or_else(
+                || {
+                    fs::read_to_string(&normalized).map_err(|error| {
+                        CliError::internal(format!(
+                            "could not read {}: {error}",
+                            normalized.display()
+                        ))
+                    })
+                },
+                Ok,
+            )?;
+        if role == SourceRole::Production {
+            validate_module_source_for_role(&normalized_relative, &source, role)
+                .map_err(|error| package_load_error(package_directory, error))?;
+        }
+        builder
+            .add(normalized_relative, source, role)
+            .map_err(|error| CliError::diagnostic(error.to_string()))?;
+    }
+    builder
+        .build()
+        .map_err(|error| CliError::diagnostic(error.to_string()))
+}
+
+fn collect_nexa_source_paths(directory: &Path, output: &mut BTreeSet<PathBuf>) -> CliResult<()> {
+    reject_symlink_path(directory)?;
+    let mut entries = fs::read_dir(directory)
         .map_err(|error| {
-            EngineDiagnostic::without_source(
-                Some(manifest.id.clone()),
-                Some(source_id.clone()),
-                EngineDiagnosticStage::SourceDiscovery,
-                nexa::ErrorCode::NX7001,
-                error.to_string(),
-            )
+            CliError::internal(format!("could not read {}: {error}", directory.display()))
+        })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            CliError::internal(format!("could not read {}: {error}", directory.display()))
         })?;
-    if !entry_path.starts_with(&canonical_root) {
-        return Err(EngineDiagnostic::without_source(
-            Some(manifest.id.clone()),
-            Some(source_id.clone()),
-            EngineDiagnosticStage::Policy,
-            nexa::ErrorCode::NX7003,
-            "package entry escapes the package directory",
+    entries.sort_by_key(fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_type = entry.file_type().map_err(|error| {
+            CliError::internal(format!("could not inspect {}: {error}", path.display()))
+        })?;
+        if file_type.is_symlink() {
+            return Err(CliError::environment(format!(
+                "symlink package paths are not allowed: {}",
+                path.display()
+            )));
+        }
+        if file_type.is_dir() {
+            collect_nexa_source_paths(&path, output)?;
+        } else if file_type.is_file()
+            && path.extension().and_then(|value| value.to_str()) == Some("nexa")
+        {
+            output.insert(snapshot_path(&path));
+        }
+    }
+    Ok(())
+}
+
+fn snapshot_text<'a>(overlays: &'a BTreeMap<PathBuf, String>, path: &Path) -> Option<&'a str> {
+    let normalized = snapshot_path(path);
+    overlays
+        .iter()
+        .find(|(candidate, _)| snapshot_path(candidate) == normalized)
+        .map(|(_, text)| text.as_str())
+}
+
+fn snapshot_path(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while let Some(name) = cursor.file_name() {
+        missing.push(name.to_owned());
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+        if let Ok(mut canonical) = cursor.canonicalize() {
+            for component in missing.iter().rev() {
+                canonical.push(component);
+            }
+            return canonical;
+        }
+    }
+    path.to_path_buf()
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
+fn resolve_package_build(
+    root_directory: &Path,
+    resolver_root: &Path,
+    allowed_root: &Path,
+    source_id: SourceId,
+    policy: Option<&SourcePolicy>,
+    host_contract: &HostContractSnapshot,
+    require_current_lock: bool,
+    ignore_existing_lock: bool,
+    overlays: Option<&BTreeMap<PathBuf, String>>,
+) -> CliResult<ResolvedBuild> {
+    let limits = CompilationLimits::default();
+    let resolver_root = resolver_root.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve source root {}: {error}",
+            resolver_root.display()
+        ))
+    })?;
+    let allowed_root = allowed_root.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve allowed source root {}: {error}",
+            allowed_root.display()
+        ))
+    })?;
+    let root_directory = root_directory.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve package directory {}: {error}",
+            root_directory.display()
+        ))
+    })?;
+    if !root_directory.starts_with(&allowed_root) {
+        return Err(CliError::environment(format!(
+            "package {} escapes controlled source root {}",
+            root_directory.display(),
+            allowed_root.display()
+        )));
+    }
+    let root_relative = relative_package_path(&resolver_root, &root_directory)?;
+
+    let mut pending = vec![root_relative.clone()];
+    let mut by_path = BTreeMap::<NormalizedPackagePath, Arc<LoadedPackageDirectory>>::new();
+    while let Some(relative) = pending.pop() {
+        if by_path.contains_key(&relative) {
+            continue;
+        }
+        let requested = resolver_root.join(relative.as_path());
+        reject_symlink_path(&requested)?;
+        let canonical = requested.canonicalize().map_err(|error| {
+            CliError::environment(format!(
+                "could not resolve dependency package {}: {error}",
+                requested.display()
+            ))
+        })?;
+        if !canonical.starts_with(&allowed_root) {
+            return Err(CliError::environment(format!(
+                "dependency path escapes controlled source root: {}",
+                requested.display()
+            )));
+        }
+        let canonical_relative = relative_package_path(&resolver_root, &canonical)?;
+        if canonical_relative != relative {
+            return Err(CliError::environment(format!(
+                "dependency path is not canonical: requested `{relative}`, resolved `{canonical_relative}`"
+            )));
+        }
+        let loaded = Arc::new(if let Some(overlays) = overlays {
+            load_package_directory_with_overlays(
+                &canonical,
+                limits,
+                !ignore_existing_lock,
+                overlays,
+            )?
+        } else {
+            (if ignore_existing_lock {
+                load_package_directory_without_lock(&canonical, limits)
+            } else {
+                load_package_directory(&canonical, limits)
+            })
+            .map_err(|error| package_load_error(&canonical, error))?
+        });
+        if by_path.is_empty()
+            && let Some(policy) = policy
+        {
+            validate_manifest_policy(&loaded, policy)?;
+        }
+        for dependency in loaded.manifest.dependencies.values() {
+            pending.push(
+                dependency
+                    .path
+                    .resolve_from(&relative)
+                    .map_err(|error| CliError::diagnostic(error.to_string()))?,
+            );
+        }
+        by_path.insert(relative, loaded);
+    }
+
+    let mut catalog = PackageCatalog::new();
+    for (directory, package) in &by_path {
+        catalog
+            .insert(PackageLocation {
+                source_id: source_id.clone(),
+                directory: directory.clone(),
+                manifest: Arc::clone(&package.manifest),
+            })
+            .map_err(|error| CliError::diagnostic(error.to_string()))?;
+    }
+    let graph = Arc::new(
+        catalog
+            .resolve(&source_id, &root_relative, limits)
+            .map_err(|error| CliError::diagnostic(error.to_string()))?,
+    );
+
+    let packages = graph
+        .packages
+        .values()
+        .map(|resolved| {
+            let package = by_path.get(&resolved.directory).ok_or_else(|| {
+                CliError::internal(format!(
+                    "resolved package {} has no loaded source snapshot",
+                    resolved.id
+                ))
+            })?;
+            Ok((resolved.id.clone(), Arc::clone(package)))
+        })
+        .collect::<CliResult<BTreeMap<_, _>>>()?;
+    nexa_analysis::PackageSourceSet::validate_dependency_closure(
+        packages
+            .values()
+            .map(|package| package.production_sources.as_ref()),
+        limits,
+    )
+    .map_err(|error| CliError::diagnostic(error.to_string()))?;
+
+    let root = by_path
+        .get(&root_relative)
+        .cloned()
+        .ok_or_else(|| CliError::internal("root package disappeared during resolution"))?;
+    let canonical_lock = LockFile::from_graph(&graph);
+    verify_lock(&root, &graph, require_current_lock)?;
+    let resolved_lock = if ignore_existing_lock {
+        Some(Arc::new(canonical_lock.clone()))
+    } else {
+        root.lock.clone()
+    };
+    let contract = host_contract.input().map_err(|error| {
+        CliError::internal(format!("invalid resolved Host contract snapshot: {error}"))
+    })?;
+    let input = resolved_build_input(
+        &root,
+        Arc::clone(&root.production_sources),
+        &packages,
+        Arc::clone(&graph),
+        resolved_lock,
+        &contract,
+    )?;
+    let build_fingerprint = input.build_fingerprint;
+    let candidate = Arc::new(
+        input
+            .candidate()
+            .map_err(|error| CliError::internal(format!("invalid Package Candidate: {error}")))?,
+    );
+
+    Ok(ResolvedBuild {
+        source_id,
+        source_root: resolver_root,
+        root_directory: root_relative,
+        root,
+        packages,
+        input,
+        host_contract: host_contract.clone(),
+        dependency_graph: graph,
+        canonical_lock,
+        build_fingerprint,
+        candidate,
+        virtual_source_origin: None,
+    })
+}
+
+fn verify_lock(
+    root: &LoadedPackageDirectory,
+    graph: &ResolvedDependencyGraph,
+    require_current_lock: bool,
+) -> CliResult<()> {
+    let has_dependencies = !root.manifest.dependencies.is_empty();
+    match root.lock.as_deref() {
+        Some(lock) => lock
+            .verify(graph)
+            .map_err(|error| CliError::environment(error.to_string())),
+        None if require_current_lock && has_dependencies => Err(CliError::environment(
+            "nexa.lock is missing or stale; run `nexa lock`",
+        )),
+        None => Ok(()),
+    }
+}
+
+fn resolved_build_input(
+    root: &Arc<LoadedPackageDirectory>,
+    root_source_set: Arc<nexa_analysis::PackageSourceSet>,
+    packages: &BTreeMap<PackageId, Arc<LoadedPackageDirectory>>,
+    graph: Arc<ResolvedDependencyGraph>,
+    lock: Option<Arc<LockFile>>,
+    host_contract: &nexa::HostContractInput<'_>,
+) -> CliResult<Arc<ResolvedBuildInput>> {
+    let dependency_manifests = packages
+        .iter()
+        .filter(|(package, _)| *package != &root.manifest.id)
+        .map(|(package, loaded)| (package.clone(), Arc::clone(&loaded.manifest)))
+        .collect();
+    let dependency_source_sets = packages
+        .iter()
+        .filter(|(package, _)| *package != &root.manifest.id)
+        .map(|(package, loaded)| (package.clone(), Arc::clone(&loaded.production_sources)))
+        .collect::<BTreeMap<_, _>>();
+    let fingerprint_input = nexa::canonical_package_build_fingerprint_input_with_contract(
+        &root.manifest,
+        &root_source_set,
+        &dependency_manifests,
+        &dependency_source_sets,
+        host_contract,
+        lock.as_deref(),
+    );
+    let canonical_host_contract = fingerprint_input.host_contract.clone();
+    let host_contract_source_identity = fingerprint_input.host_contract_source.clone();
+    let host_required_exports_identity = fingerprint_input.host_required_exports.clone();
+    ResolvedBuildInput::new(
+        Arc::clone(&root.manifest),
+        root_source_set,
+        dependency_manifests,
+        dependency_source_sets,
+        graph,
+        lock,
+        Arc::<[u8]>::from(canonical_host_contract),
+        Arc::<[u8]>::from(host_contract_source_identity),
+        Arc::<[u8]>::from(host_required_exports_identity),
+        CompilationOptions::default(),
+        fingerprint_input,
+    )
+    .map(Arc::new)
+    .map_err(|error| {
+        CliError::internal(format!(
+            "resolved Package input failed canonical validation: {error}"
+        ))
+    })
+}
+
+fn validate_manifest_policy(
+    package: &LoadedPackageDirectory,
+    policy: &SourcePolicy,
+) -> CliResult<()> {
+    let Some(application) = &package.manifest.application else {
+        return Ok(());
+    };
+    if !policy.activation.contains(&application.activation) {
+        return Err(policy_error(
+            package,
+            format!(
+                "activation {:?} is outside the configured source policy",
+                application.activation
+            ),
         ));
     }
-    let entry_source = std::fs::read_to_string(&entry_path).map_err(|error| {
-        EngineDiagnostic::without_source(
-            Some(manifest.id.clone()),
-            Some(source_id.clone()),
-            EngineDiagnosticStage::SourceDiscovery,
-            nexa::ErrorCode::NX7001,
-            error.to_string(),
-        )
-    })?;
-    let candidate = PackageCandidate::new(manifest, manifest_source, entry_source);
-    Ok((source_id.clone(), candidate))
+    if !application
+        .capabilities
+        .iter()
+        .all(|capability| policy.capabilities.contains(capability))
+    {
+        return Err(policy_error(
+            package,
+            "Package capabilities exceed the configured source policy",
+        ));
+    }
+    if application.entitlement.is_some() && !policy.allow_entitlement {
+        return Err(policy_error(
+            package,
+            "Package entitlement is outside the configured source policy",
+        ));
+    }
+    check_optional_limit(
+        package,
+        "handler_fuel",
+        application.handler_fuel,
+        policy.limits.handler_fuel,
+    )?;
+    check_optional_limit(
+        package,
+        "cumulative_budget",
+        application.cumulative_budget,
+        policy.limits.cumulative_budget,
+    )?;
+    check_optional_limit(
+        package,
+        "heap_objects",
+        application.heap_objects,
+        policy.limits.heap_objects,
+    )?;
+    check_optional_limit(
+        package,
+        "host_resources",
+        application.host_resources,
+        policy.limits.host_resources,
+    )?;
+    check_optional_limit(package, "tasks", application.tasks, policy.limits.tasks)?;
+    check_optional_limit(
+        package,
+        "release_records",
+        application.release_records,
+        policy.limits.release_records,
+    )?;
+    Ok(())
 }
 
-pub fn load_policy(path: &Path) -> Result<(SourceId, PackagePolicy), String> {
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let config: PolicyFile =
-        toml::from_str(&source).map_err(|error| format!("invalid {}: {error}", path.display()))?;
+fn check_optional_limit<T>(
+    package: &LoadedPackageDirectory,
+    name: &str,
+    requested: Option<T>,
+    maximum: T,
+) -> CliResult<()>
+where
+    T: Copy + PartialOrd + std::fmt::Display,
+{
+    if requested.is_some_and(|requested| requested > maximum) {
+        Err(policy_error(
+            package,
+            format!("runtime limit `{name}` exceeds configured maximum {maximum}"),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn policy_error(package: &LoadedPackageDirectory, message: impl Into<String>) -> CliError {
+    CliError::diagnostic(format!(
+        "Package policy rejected `{}`: {}",
+        package.manifest.id,
+        message.into()
+    ))
+}
+
+pub fn load_policy(path: &Path) -> CliResult<(SourceId, SourcePolicy)> {
+    let source = fs::read_to_string(path).map_err(|error| {
+        CliError::internal(format!("could not read {}: {error}", path.display()))
+    })?;
+    let config: PolicyFile = toml::from_str(&source)
+        .map_err(|error| CliError::environment(format!("invalid {}: {error}", path.display())))?;
     if config.schema != 1 {
-        return Err(format!(
+        return Err(CliError::environment(format!(
             "unsupported package policy schema {}; expected schema 1",
             config.schema
-        ));
+        )));
     }
-    let id = SourceId::new(config.id)
-        .map_err(|error| format!("invalid package policy source id: {error}"))?;
+    let id = SourceId::new(config.id).map_err(|error| {
+        CliError::environment(format!("invalid package policy source id: {error}"))
+    })?;
     let policy = policy_from_parts(
         config.trust,
         &config.activation,
@@ -424,43 +1634,6 @@ pub fn load_policy(path: &Path) -> Result<(SourceId, PackagePolicy), String> {
     Ok((id, policy))
 }
 
-pub fn manifest_validation_policy(source: &str) -> Result<PackagePolicy, String> {
-    let value: toml::Value =
-        toml::from_str(source).map_err(|error| format!("invalid package manifest: {error}"))?;
-    let capabilities = value
-        .get("capabilities")
-        .and_then(toml::Value::as_array)
-        .into_iter()
-        .flatten()
-        .map(|value| {
-            value
-                .as_str()
-                .ok_or_else(|| "manifest capability must be a string".to_owned())
-                .and_then(|value| CapabilityId::new(value).map_err(|error| error.to_string()))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(PackagePolicy {
-        trust: TrustLevel::FirstParty,
-        capability_ceiling: CapabilitySet::new(capabilities),
-        allowed_activation: ActivationSet::new([
-            ActivationPolicy::Required,
-            ActivationPolicy::DefaultEnabled,
-            ActivationPolicy::UserControlled,
-            ActivationPolicy::Programmatic,
-        ]),
-        max_packages: usize::MAX,
-        runtime_limits: PackageRuntimeLimits {
-            handler_fuel: u64::MAX,
-            cumulative_budget: u64::MAX,
-            heap_objects: u32::MAX,
-            host_resources: u32::MAX,
-            tasks: u32::MAX,
-            release_records: usize::MAX,
-        },
-        allow_entitlement: true,
-    })
-}
-
 fn policy_from_parts(
     trust: ConfigTrustLevel,
     activation: &[ActivationPolicy],
@@ -468,403 +1641,544 @@ fn policy_from_parts(
     allow_entitlement: bool,
     max_packages: usize,
     limits: RuntimeLimitsConfig,
-) -> Result<PackagePolicy, String> {
+) -> CliResult<SourcePolicy> {
     if activation.is_empty() {
-        return Err("source policy activation set must not be empty".into());
+        return Err(CliError::environment(
+            "source policy activation set must not be empty",
+        ));
     }
     if max_packages == 0 {
-        return Err("source policy max_packages must be greater than zero".into());
+        return Err(CliError::environment(
+            "source policy max_packages must be greater than zero",
+        ));
     }
-    let unique_activation = activation.iter().copied().collect::<BTreeSet<_>>();
-    if unique_activation.len() != activation.len() {
-        return Err("duplicate activation mode in source policy".into());
+    let activation_set = activation.iter().copied().collect::<BTreeSet<_>>();
+    if activation_set.len() != activation.len() {
+        return Err(CliError::environment(
+            "duplicate activation mode in source policy",
+        ));
     }
-    let mut capability_ids = Vec::with_capacity(capabilities.len());
-    let mut seen = BTreeSet::new();
+    let mut capability_set = BTreeSet::new();
     for capability in capabilities {
-        let id = CapabilityId::new(capability.clone())
-            .map_err(|error| format!("invalid capability `{capability}`: {error}"))?;
-        if !seen.insert(id.clone()) {
-            return Err(format!(
-                "duplicate capability `{capability}` in source policy"
-            ));
+        if !valid_capability(capability) {
+            return Err(CliError::environment(format!(
+                "invalid capability `{capability}`"
+            )));
         }
-        capability_ids.push(id);
+        if !capability_set.insert(capability.clone()) {
+            return Err(CliError::environment(format!(
+                "duplicate capability `{capability}` in source policy"
+            )));
+        }
     }
-    let activation_set = ActivationSet::new(unique_activation);
-    Ok(PackagePolicy {
-        trust: trust.into(),
-        capability_ceiling: CapabilitySet::new(capability_ids),
-        allowed_activation: activation_set,
-        max_packages,
-        runtime_limits: limits.into(),
+    Ok(SourcePolicy {
+        trust,
+        activation: activation_set,
+        capabilities: capability_set,
         allow_entitlement,
+        max_packages,
+        limits,
     })
 }
 
-fn resolve_required_exports(
-    idl: &nexa_idl::Idl,
-    names: &[String],
-    contract_path: &Path,
-) -> Result<Vec<ExportRequirement>, String> {
-    let mut required_exports = Vec::new();
-    for name in names {
-        let export = idl
-            .exports
-            .iter()
-            .find(|export| export.name == *name)
-            .ok_or_else(|| {
-                format!(
-                    "required export `{name}` is not declared by {}",
-                    contract_path.display()
-                )
-            })?;
-        required_exports.push(ExportRequirement {
-            name: name.clone(),
-            stable_id: nexa_idl::export_stable_id(idl, export),
-            signature: nexa_idl::export_signature(idl, export),
-        });
-    }
-    Ok(required_exports)
+fn valid_capability(value: &str) -> bool {
+    !value.is_empty()
+        && !value.split('.').any(str::is_empty)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn reject_overlapping_roots(sources: &[LoadedSource]) -> Result<(), String> {
+fn validate_required_exports(
+    idl: &nexa::Idl,
+    names: &[String],
+    contract_path: &Path,
+) -> CliResult<()> {
+    for name in names {
+        if !idl.exports.iter().any(|export| export.name == *name) {
+            return Err(CliError::environment(format!(
+                "required export `{name}` is not declared by {}",
+                contract_path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_duplicate_required_exports(exports: &[String]) -> CliResult<()> {
+    let mut seen = BTreeSet::new();
+    for export in exports {
+        if !seen.insert(export) {
+            return Err(CliError::environment(format!(
+                "duplicate required export `{export}`"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn discover_package_roots(root: &Path) -> CliResult<Vec<PathBuf>> {
+    fn visit(directory: &Path, output: &mut Vec<PathBuf>) -> CliResult<()> {
+        reject_symlink_path(directory)?;
+        if directory.join("package.toml").is_file() {
+            output.push(directory.canonicalize().map_err(|error| {
+                CliError::environment(format!(
+                    "could not resolve package directory {}: {error}",
+                    directory.display()
+                ))
+            })?);
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| {
+                CliError::internal(format!("could not read {}: {error}", directory.display()))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CliError::internal(format!("could not read {}: {error}", directory.display()))
+            })?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type().map_err(|error| {
+                CliError::internal(format!(
+                    "could not inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_symlink() {
+                return Err(CliError::environment(format!(
+                    "symlink is not allowed in a package source root: {}",
+                    entry.path().display()
+                )));
+            }
+            if file_type.is_dir() {
+                visit(&entry.path(), output)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut packages = Vec::new();
+    visit(root, &mut packages)?;
+    packages.sort();
+    Ok(packages)
+}
+
+fn discover_package_roots_with_overlays(
+    root: &Path,
+    overlays: &BTreeMap<PathBuf, String>,
+) -> CliResult<Vec<PathBuf>> {
+    fn visit(
+        directory: &Path,
+        overlays: &BTreeMap<PathBuf, String>,
+        output: &mut Vec<PathBuf>,
+    ) -> CliResult<()> {
+        reject_symlink_path(directory)?;
+        let manifest = directory.join("package.toml");
+        if snapshot_text(overlays, &manifest).is_some() || manifest.is_file() {
+            output.push(snapshot_path(directory));
+            return Ok(());
+        }
+        let mut entries = fs::read_dir(directory)
+            .map_err(|error| {
+                CliError::internal(format!("could not read {}: {error}", directory.display()))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CliError::internal(format!("could not read {}: {error}", directory.display()))
+            })?;
+        entries.sort_by_key(fs::DirEntry::file_name);
+        for entry in entries {
+            let file_type = entry.file_type().map_err(|error| {
+                CliError::internal(format!(
+                    "could not inspect {}: {error}",
+                    entry.path().display()
+                ))
+            })?;
+            if file_type.is_symlink() {
+                return Err(CliError::environment(format!(
+                    "symlink is not allowed in a package source root: {}",
+                    entry.path().display()
+                )));
+            }
+            if file_type.is_dir() {
+                visit(&entry.path(), overlays, output)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut packages = Vec::new();
+    visit(root, overlays, &mut packages)?;
+    packages.sort();
+    packages.dedup();
+    Ok(packages)
+}
+
+fn validate_package_belongs_to_source(package: &DiscoveredPackage) -> CliResult<()> {
+    if package.directory.starts_with(&package.source_root) {
+        Ok(())
+    } else {
+        Err(CliError::internal(format!(
+            "discovered package {} escaped source root {}",
+            package.directory.display(),
+            package.source_root.display()
+        )))
+    }
+}
+
+fn relative_package_path(root: &Path, path: &Path) -> CliResult<NormalizedPackagePath> {
+    let relative = path.strip_prefix(root).map_err(|_| {
+        CliError::environment(format!(
+            "package {} escapes source root {}",
+            path.display(),
+            root.display()
+        ))
+    })?;
+    NormalizedPackagePath::from_path(relative)
+        .map_err(|error| CliError::environment(error.to_string()))
+}
+
+fn reject_symlink_path(path: &Path) -> CliResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        CliError::environment(format!("could not inspect {}: {error}", path.display()))
+    })?;
+    if metadata.file_type().is_symlink() {
+        Err(CliError::environment(format!(
+            "symlink package paths are not allowed: {}",
+            path.display()
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn reject_symlink_below(root: &Path, relative: &Path) -> CliResult<()> {
+    if relative.is_absolute() {
+        return Err(CliError::environment(format!(
+            "path must be relative to the project root: {}",
+            relative.display()
+        )));
+    }
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        match component {
+            std::path::Component::Normal(component) => current.push(component),
+            std::path::Component::CurDir => continue,
+            std::path::Component::ParentDir => {
+                return Err(CliError::environment(format!(
+                    "path must be canonical and cannot contain `..`: {}",
+                    relative.display()
+                )));
+            }
+            std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                return Err(CliError::environment(format!(
+                    "path must be relative to the project root: {}",
+                    relative.display()
+                )));
+            }
+        }
+        reject_symlink_path(&current)?;
+    }
+    Ok(())
+}
+
+fn package_load_error(path: &Path, error: nexa_analysis::PackageLoadError) -> CliError {
+    match error {
+        nexa_analysis::PackageLoadError::Io(error) => {
+            CliError::internal(format!("could not load {}: {error}", path.display()))
+        }
+        nexa_analysis::PackageLoadError::Lock(error) => {
+            CliError::environment(format!("invalid nexa.lock in {}: {error}", path.display()))
+        }
+        nexa_analysis::PackageLoadError::RootEscape(escaped) => CliError::environment(format!(
+            "package source path escapes {}: {}",
+            path.display(),
+            escaped.display()
+        )),
+        nexa_analysis::PackageLoadError::MissingEntry(entry) => {
+            CliError::diagnostic(format!("Package entry source is missing: {entry}"))
+        }
+        other => CliError::diagnostic(format!("invalid package {}: {other}", path.display())),
+    }
+}
+
+fn reject_overlapping_roots(sources: &[LoadedSource]) -> CliResult<()> {
     for (index, left) in sources.iter().enumerate() {
         for right in &sources[index + 1..] {
             if left.root.starts_with(&right.root) || right.root.starts_with(&left.root) {
-                return Err(format!(
+                return Err(CliError::environment(format!(
                     "source roots overlap: `{}` ({}) and `{}` ({})",
                     left.id,
                     left.root.display(),
                     right.id,
                     right.root.display()
-                ));
+                )));
             }
         }
     }
     Ok(())
 }
 
-fn resolve_within(root: &Path, path: &Path) -> Result<PathBuf, String> {
-    let resolved = root
-        .join(path)
-        .canonicalize()
-        .map_err(|error| format!("could not resolve {}: {error}", path.display()))?;
+fn resolve_within(root: &Path, path: &Path) -> CliResult<PathBuf> {
+    reject_symlink_below(root, path)?;
+    let resolved = root.join(path).canonicalize().map_err(|error| {
+        CliError::environment(format!("could not resolve {}: {error}", path.display()))
+    })?;
     if !resolved.starts_with(root) {
-        return Err(format!("path escapes project root: {}", path.display()));
+        return Err(CliError::environment(format!(
+            "path escapes project root: {}",
+            path.display()
+        )));
     }
     Ok(resolved)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use nexa_embed::{
-        ActivationPolicy, ActivationSet, CapabilityId, CapabilitySet, PackagePolicy,
-        PackageRuntimeLimits, SourceId, TrustLevel,
+        ActivationSet, CandidateBuildContext, CapabilitySet, MemoryPackage, MemorySource,
+        PackagePolicy, PackageRuntimeLimits, PackageSource, TrustLevel,
     };
 
-    static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
+    use super::*;
 
-    fn temporary_root(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "nexa-m3r1-cli-{label}-{}-{}",
-            std::process::id(),
-            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
+    static NEXT_TEMP_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
-    fn policy(
-        capabilities: &[&str],
-        activation: &[ActivationPolicy],
-        allow_entitlement: bool,
-    ) -> PackagePolicy {
-        PackagePolicy {
-            trust: TrustLevel::Trusted,
-            capability_ceiling: CapabilitySet::new(
-                capabilities
-                    .iter()
-                    .map(|value| CapabilityId::new(*value).expect("capability")),
-            ),
-            allowed_activation: ActivationSet::new(activation.iter().copied()),
-            max_packages: 4,
-            runtime_limits: PackageRuntimeLimits {
-                handler_fuel: 20_000,
-                cumulative_budget: 200_000,
-                heap_objects: 4_096,
-                host_resources: 256,
-                tasks: 8,
-                release_records: 512,
-            },
-            allow_entitlement,
+    struct TestDirectory(PathBuf);
+
+    impl TestDirectory {
+        fn new() -> Self {
+            let suffix = NEXT_TEMP_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "nexa-cli-lockless-fingerprint-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).expect("create test directory");
+            Self(path)
         }
     }
 
-    fn manifest(
-        id: &str,
-        activation: &str,
-        capabilities: &str,
-        entitlement: &str,
-        handler_fuel: u64,
-    ) -> String {
-        format!(
-            "schema = 1\n\
-             id = \"{id}\"\n\
-             name = \"Policy Test\"\n\
-             version = \"1.0.0\"\n\
-             entry = \"main.nexa\"\n\
-             activation = \"{activation}\"\n\
-             handler_fuel = {handler_fuel}\n\
-             capabilities = [{capabilities}]\n\
-             entitlement = \"{entitlement}\"\n"
-        )
-    }
-
-    fn write_package(root: &Path, name: &str, manifest: &str) -> PathBuf {
-        let package = root.join(name);
-        std::fs::create_dir_all(&package).expect("package directory");
-        std::fs::write(package.join("package.toml"), manifest).expect("manifest");
-        std::fs::write(
-            package.join("main.nexa"),
-            "module policy.fixture;\nfn Value() -> i32 { return 1; }",
-        )
-        .expect("entry source");
-        package
-    }
-
-    fn assert_policy_rejection(manifest: &str, policy: &PackagePolicy) {
-        let root = temporary_root("policy-rejection");
-        let package = write_package(&root, "package", manifest);
-        let diagnostic = super::load_package_candidate(
-            &package,
-            &SourceId::new("policy-test").expect("source ID"),
-            policy,
-        )
-        .expect_err("Package policy must reject the manifest");
-        assert_eq!(diagnostic.diagnostic.code, nexa::ErrorCode::NX7003);
-        std::fs::remove_dir_all(root).expect("cleanup");
+    impl Drop for TestDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
-    fn full_policy_rejects_capability_activation_entitlement_and_limits() {
-        let strict = policy(
-            &["allowed.read"],
-            &[ActivationPolicy::UserControlled],
-            false,
-        );
-        assert_policy_rejection(
-            &manifest(
-                "policy.capability",
-                "user-controlled",
-                "\"denied.write\"",
-                "",
-                20_000,
-            ),
-            &strict,
-        );
-        assert_policy_rejection(
-            &manifest("policy.activation", "required", "", "", 20_000),
-            &strict,
-        );
-        assert_policy_rejection(
-            &manifest(
-                "policy.entitlement",
-                "user-controlled",
-                "",
-                "paid.feature",
-                20_000,
-            ),
-            &strict,
-        );
-        assert_policy_rejection(
-            &manifest("policy.limit", "user-controlled", "", "", 20_001),
-            &strict,
-        );
-    }
+    fn lockless_package_has_identical_cli_and_memory_source_build_identity() {
+        const CONTRACT: &str = "interface LocklessHost {}\n";
+        const MANIFEST: &str = "schema = 2\n\
+kind = \"application\"\n\
+id = \"example.lockless\"\n\
+name = \"Lockless\"\n\
+version = \"1.0.0\"\n\
+source_root = \"src\"\n\
+entry = \"example.lockless\"\n\
+activation = \"default-enabled\"\n\
+handler_fuel = 20000\n\
+capabilities = []\n";
+        const SOURCE: &str = "module example.lockless;\n\
+pub fn value() -> i32 {\n\
+    return 1;\n\
+}\n";
 
-    #[test]
-    fn project_rejects_duplicate_source_ids_overlapping_roots_and_path_escape() {
-        let root = temporary_root("project-shape");
-        std::fs::create_dir_all(root.join("packages/nested")).expect("source roots");
-        std::fs::write(root.join("api.nidl"), "interface TestHost {}").expect("IDL");
-        let limits = "handler_fuel = 20000\n\
-                      cumulative_budget = 200000\n\
-                      heap_objects = 4096\n\
-                      host_resources = 256\n\
-                      tasks = 8\n\
-                      release_records = 512\n";
-        let source = |id: &str, source_root: &str| {
-            format!(
-                "[[sources]]\n\
-                 id = \"{id}\"\n\
-                 root = \"{source_root}\"\n\
-                 trust = \"trusted\"\n\
-                 activation = [\"user-controlled\"]\n\
-                 capabilities = []\n\
-                 allow_entitlement = false\n\
-                 max_packages = 4\n\
-                 [sources.limits]\n{limits}"
-            )
-        };
-        std::fs::write(
-            root.join("duplicate.toml"),
-            format!(
-                "schema = 2\ncontract = \"api.nidl\"\n{}{}",
-                source("same", "packages"),
-                source("same", "packages/nested")
-            ),
-        )
-        .expect("duplicate config");
-        assert!(
-            super::LoadedProject::load(&root.join("duplicate.toml"))
-                .expect_err("duplicate source ID")
-                .contains("duplicate source id")
-        );
-        std::fs::write(
-            root.join("overlap.toml"),
-            format!(
-                "schema = 2\ncontract = \"api.nidl\"\n{}{}",
-                source("outer", "packages"),
-                source("inner", "packages/nested")
-            ),
-        )
-        .expect("overlap config");
-        assert!(
-            super::LoadedProject::load(&root.join("overlap.toml"))
-                .expect_err("overlapping roots")
-                .contains("overlap")
-        );
-        std::fs::write(
-            root.join("escape.toml"),
-            format!(
-                "schema = 2\ncontract = \"../outside.nidl\"\n{}",
-                source("safe", "packages")
-            ),
-        )
-        .expect("escape config");
-        assert!(super::LoadedProject::load(&root.join("escape.toml")).is_err());
-        std::fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn project_selects_policy_by_source_and_rejects_wrong_source() {
-        let root = temporary_root("source-selection");
-        let allowed = root.join("allowed");
-        let denied = root.join("denied");
-        std::fs::create_dir_all(&allowed).expect("allowed root");
-        std::fs::create_dir_all(&denied).expect("denied root");
-        write_package(
-            &denied,
-            "package",
-            &manifest(
-                "policy.wrong-source",
-                "user-controlled",
-                "\"allowed.read\"",
-                "",
-                20_000,
-            ),
-        );
-        std::fs::write(root.join("api.nidl"), "interface TestHost {}").expect("IDL");
-        std::fs::write(
-            root.join("nexa.dev.toml"),
+        let directory = TestDirectory::new();
+        let package = directory.0.join("packages/app");
+        fs::create_dir_all(package.join("src/example")).expect("create package source directory");
+        fs::write(directory.0.join("lockless.nidl"), CONTRACT).expect("write Host contract");
+        fs::write(package.join("package.toml"), MANIFEST).expect("write Package Manifest");
+        fs::write(package.join("src/example/lockless.nexa"), SOURCE).expect("write Package source");
+        fs::write(
+            directory.0.join("nexa.dev.toml"),
             "schema = 2\n\
-             contract = \"api.nidl\"\n\
-             [[sources]]\n\
-             id = \"allowed\"\n\
-             root = \"allowed\"\n\
-             trust = \"trusted\"\n\
-             activation = [\"user-controlled\"]\n\
-             capabilities = [\"allowed.read\"]\n\
-             max_packages = 4\n\
-             [sources.limits]\n\
-             handler_fuel = 20000\n\
-             cumulative_budget = 200000\n\
-             heap_objects = 4096\n\
-             host_resources = 256\n\
-             tasks = 8\n\
-             release_records = 512\n\
-             [[sources]]\n\
-             id = \"denied\"\n\
-             root = \"denied\"\n\
-             trust = \"trusted\"\n\
-             activation = [\"user-controlled\"]\n\
-             capabilities = []\n\
-             max_packages = 4\n\
-             [sources.limits]\n\
-             handler_fuel = 20000\n\
-             cumulative_budget = 200000\n\
-             heap_objects = 4096\n\
-             host_resources = 256\n\
-             tasks = 8\n\
-             release_records = 512\n",
+contract = \"lockless.nidl\"\n\
+\n\
+[[sources]]\n\
+id = \"lockless\"\n\
+root = \"packages\"\n\
+trust = \"first-party\"\n\
+activation = [\"default-enabled\"]\n\
+capabilities = []\n\
+allow_entitlement = false\n\
+max_packages = 1\n\
+\n\
+[sources.limits]\n\
+handler_fuel = 20000\n\
+cumulative_budget = 20000\n\
+heap_objects = 4096\n\
+host_resources = 1024\n\
+tasks = 128\n\
+release_records = 2048\n",
         )
-        .expect("project config");
-        let project =
-            super::LoadedProject::load(&root.join("nexa.dev.toml")).expect("loaded project");
-        let report = project.check().expect("project check");
-        assert_eq!(report.checked_packages, 1);
-        assert_eq!(report.diagnostics.len(), 1);
-        assert_eq!(
-            report.diagnostics[0].diagnostic.code,
-            nexa::ErrorCode::NX7003
+        .expect("write Project Manifest");
+
+        assert!(
+            !package.join("nexa.lock").exists(),
+            "the regression must exercise an absent Lockfile"
         );
-        let outside = temporary_root("outside-source");
-        std::fs::create_dir_all(&outside).expect("outside package");
-        assert!(project.source_for_directory(&outside).is_err());
-        std::fs::remove_dir_all(outside).expect("outside cleanup");
-        std::fs::remove_dir_all(root).expect("cleanup");
+        let project =
+            LoadedProject::load(&directory.0.join("nexa.dev.toml")).expect("load CLI project");
+        let exact_host_source = project
+            .host_contract_snapshot()
+            .expect("retain exact CLI Host source");
+        let cli_build = project
+            .resolved_builds(true)
+            .expect("resolve CLI project")
+            .pop()
+            .expect("one CLI build");
+
+        let policy = PackagePolicy {
+            trust: TrustLevel::FirstParty,
+            capability_ceiling: CapabilitySet::default(),
+            allowed_activation: ActivationSet::new([ActivationPolicy::DefaultEnabled]),
+            max_packages: 1,
+            runtime_limits: PackageRuntimeLimits::default(),
+            allow_entitlement: false,
+        };
+        let memory_build = MemorySource::new(SourceId::new("lockless").expect("Source ID"), policy)
+            .package(
+                MemoryPackage::new("app", MANIFEST).source("src/example/lockless.nexa", SOURCE),
+            )
+            .discover(&CandidateBuildContext::with_source(
+                exact_host_source.identity,
+                exact_host_source.source.as_bytes().to_vec(),
+            ))
+            .expect("resolve MemorySource for Engine")
+            .pop()
+            .expect("one Engine candidate");
+
+        assert!(cli_build.input.lock.is_none());
+        assert!(memory_build.build_input.lock.is_none());
+        assert!(cli_build.input.canonical_lock_graph.is_empty());
+        assert!(memory_build.build_input.canonical_lock_graph.is_empty());
+        assert_eq!(
+            cli_build.input.fingerprint_input.as_ref(),
+            memory_build.build_input.fingerprint_input.as_ref()
+        );
+        assert_eq!(
+            cli_build.build_fingerprint,
+            memory_build.candidate.build_fingerprint
+        );
     }
 
     #[test]
-    fn project_reports_duplicate_package_ids_across_sources() {
-        let root = temporary_root("duplicate-package");
-        let left = root.join("left");
-        let right = root.join("right");
-        std::fs::create_dir_all(&left).expect("left root");
-        std::fs::create_dir_all(&right).expect("right root");
-        let duplicate = manifest("policy.duplicate", "user-controlled", "", "", 20_000);
-        write_package(&left, "first", &duplicate);
-        write_package(&right, "second", &duplicate);
-        std::fs::write(root.join("api.nidl"), "interface TestHost {}").expect("IDL");
-        let source = |id: &str, path: &str| {
-            format!(
-                "[[sources]]\n\
-                 id = \"{id}\"\n\
-                 root = \"{path}\"\n\
-                 trust = \"trusted\"\n\
-                 activation = [\"user-controlled\"]\n\
-                 capabilities = []\n\
-                 max_packages = 4\n\
-                 [sources.limits]\n\
-                 handler_fuel = 20000\n\
-                 cumulative_budget = 200000\n\
-                 heap_objects = 4096\n\
-                 host_resources = 256\n\
-                 tasks = 8\n\
-                 release_records = 512\n"
-            )
-        };
-        std::fs::write(
-            root.join("nexa.dev.toml"),
-            format!(
-                "schema = 2\ncontract = \"api.nidl\"\n{}{}",
-                source("left", "left"),
-                source("right", "right")
-            ),
+    #[allow(clippy::too_many_lines)]
+    fn host_contract_uri_changes_build_identity_and_artifact_source_registry() {
+        const CONTRACT: &str = "interface HostIdentity {}\n";
+        const MANIFEST: &str = "schema = 2\n\
+kind = \"application\"\n\
+id = \"example.hostidentity\"\n\
+name = \"Host Identity\"\n\
+version = \"1.0.0\"\n\
+source_root = \"src\"\n\
+entry = \"example.hostidentity\"\n\
+activation = \"default-enabled\"\n\
+handler_fuel = 20000\n\
+capabilities = []\n";
+        const SOURCE: &str = "module example.hostidentity;\n\
+pub fn value() -> i32 {\n\
+    return 1;\n\
+}\n";
+        const CONFIG: &str = "schema = 2\n\
+contract = \"contract-a.nidl\"\n\
+\n\
+[[sources]]\n\
+id = \"host-identity\"\n\
+root = \"packages\"\n\
+trust = \"first-party\"\n\
+activation = [\"default-enabled\"]\n\
+capabilities = []\n\
+allow_entitlement = false\n\
+max_packages = 1\n\
+\n\
+[sources.limits]\n\
+handler_fuel = 20000\n\
+cumulative_budget = 20000\n\
+heap_objects = 4096\n\
+host_resources = 1024\n\
+tasks = 128\n\
+release_records = 2048\n";
+
+        let directory = TestDirectory::new();
+        let package = directory.0.join("packages/app");
+        let config_path = directory.0.join("nexa.dev.toml");
+        let contract_a_path = directory.0.join("contract-a.nidl");
+        let contract_b_path = directory.0.join("contract-b.nidl");
+        fs::create_dir_all(package.join("src/example")).expect("create package source directory");
+        fs::write(&contract_a_path, CONTRACT).expect("write first Host contract");
+        fs::write(&contract_b_path, CONTRACT).expect("write moved Host contract");
+        fs::write(package.join("package.toml"), MANIFEST).expect("write Package Manifest");
+        fs::write(package.join("src/example/hostidentity.nexa"), SOURCE)
+            .expect("write Package source");
+        fs::write(&config_path, CONFIG).expect("write first Project Manifest");
+
+        let project_a = LoadedProject::load(&config_path).expect("load first CLI project");
+        let build_a = project_a
+            .resolved_builds(true)
+            .expect("resolve first CLI project")
+            .pop()
+            .expect("one first CLI build");
+        let compiled_a = build_a
+            .compile(1, None, &project_a.required_exports, false)
+            .expect("compile first exact Host source");
+        let artifact_a = compiled_a.product().expect("first product artifact");
+        let canonical_contract_a = contract_a_path
+            .canonicalize()
+            .expect("canonical first Host contract path");
+        let identity_a =
+            nexa::SourceIdentity::standalone(canonical_contract_a.to_string_lossy().into_owned());
+        let snapshot_a = artifact_a
+            .source_files
+            .diagnostic_sources()
+            .get(&identity_a)
+            .expect("first artifact retains the first Host URI");
+        assert_eq!(snapshot_a.text(), CONTRACT);
+
+        fs::write(
+            &config_path,
+            CONFIG.replace("contract-a.nidl", "contract-b.nidl"),
         )
-        .expect("project config");
-        let project =
-            super::LoadedProject::load(&root.join("nexa.dev.toml")).expect("loaded project");
-        let report = project.check().expect("project check");
-        assert_eq!(report.checked_packages, 2);
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|diagnostic| diagnostic.diagnostic.code == nexa::ErrorCode::NX7003)
+        .expect("retarget Project Manifest to the moved Host contract");
+        let project_b = LoadedProject::load(&config_path).expect("load retargeted CLI project");
+        let build_b = project_b
+            .resolved_builds(true)
+            .expect("resolve retargeted CLI project")
+            .pop()
+            .expect("one retargeted CLI build");
+        assert_ne!(
+            build_a.build_fingerprint, build_b.build_fingerprint,
+            "moving an exact external Host source must invalidate linked freshness"
         );
-        std::fs::remove_dir_all(root).expect("cleanup");
+
+        let compiled_b = build_b
+            .compile(1, None, &project_b.required_exports, false)
+            .expect("compile retargeted exact Host source");
+        let artifact_b = compiled_b.product().expect("retargeted product artifact");
+        assert_ne!(
+            artifact_a.linked_state_fingerprint, artifact_b.linked_state_fingerprint,
+            "the linked-state identity must include the exact Host source URI"
+        );
+        let canonical_contract_b = contract_b_path
+            .canonicalize()
+            .expect("canonical moved Host contract path");
+        let identity_b =
+            nexa::SourceIdentity::standalone(canonical_contract_b.to_string_lossy().into_owned());
+        let snapshot_b = artifact_b
+            .source_files
+            .diagnostic_sources()
+            .get(&identity_b)
+            .expect("retargeted artifact retains the active Host URI");
+        assert_eq!(snapshot_b.text(), CONTRACT);
+        assert!(
+            artifact_b
+                .source_files
+                .diagnostic_sources()
+                .get(&identity_a)
+                .is_none(),
+            "the active debug registry must not retain the stale Host URI"
+        );
     }
 }

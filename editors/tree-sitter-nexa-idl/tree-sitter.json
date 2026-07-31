@@ -1,0 +1,29 @@
+{
+  "grammars": [
+    {
+      "name": "nexa_idl",
+      "camelcase": "NexaIdl",
+      "scope": "source.nexa-idl",
+      "path": ".",
+      "file-types": [
+        "nidl"
+      ],
+      "highlights": [
+        "queries/highlights.scm"
+      ]
+    }
+  ],
+  "metadata": {
+    "version": "0.2.0",
+    "license": "MIT OR Apache-2.0",
+    "description": "Tree-sitter grammar for Nexa IDL.",
+    "authors": [
+      {
+        "name": "Nexa Contributors"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/S1RANN/nexa"
+    }
+  }
+}

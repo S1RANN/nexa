@@ -52,7 +52,8 @@ pub fn stress() -> Result<(), Box<dyn std::error::Error>> {
         || after_ticks.state_objects != baseline.state_objects
     {
         return Err(format!(
-            "runtime ownership grew: baseline={baseline:?}, after={after_ticks:?}"
+            "runtime ownership grew: baseline={baseline:?}, after={after_ticks:?}, packages={:?}",
+            extensions.packages()
         )
         .into());
     }

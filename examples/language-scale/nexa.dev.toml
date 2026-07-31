@@ -1,0 +1,20 @@
+schema = 2
+contract = "language_scale.nidl"
+required_exports = ["OnEvent"]
+
+[[sources]]
+id = "language-scale"
+root = "packages"
+trust = "first-party"
+activation = ["default-enabled"]
+capabilities = ["diagnostics.log"]
+allow_entitlement = false
+max_packages = 4
+
+[sources.limits]
+handler_fuel = 20000
+cumulative_budget = 100000
+heap_objects = 1024
+host_resources = 32
+tasks = 4
+release_records = 64

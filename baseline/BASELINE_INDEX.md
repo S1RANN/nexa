@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **3.0.3**
+Version: **4.0.0**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -26,6 +26,7 @@ Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
+Nexa M4 Language Scale Foundation = COMPLETE
 ```
 
 This is the only normative entry point for the active Internal Language Pivot.
@@ -52,7 +53,9 @@ M3R3 conformance requires a fail-closed desired source identity, a commit-time
 source refresh, and unified supersession of stale Candidate work before Worker
 admission, inside the Worker, in the Result queue, and after verification. The
 immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 has not
-started.
+changed those historical baselines. M4 is complete from the immutable M3R3
+completion commit and is marked by the annotated
+`language-scale-m4-complete` tag.
 
 ## Active specifications
 
@@ -71,6 +74,11 @@ started.
 - [`../docs/DIAGNOSTICS.md`](../docs/DIAGNOSTICS.md)
 - [`../docs/RELOAD_WORKFLOW.md`](../docs/RELOAD_WORKFLOW.md)
 - [`../docs/EDITOR_SUPPORT.md`](../docs/EDITOR_SUPPORT.md)
+- [`../docs/MODULES.md`](../docs/MODULES.md)
+- [`../docs/LOCAL_LIBRARIES.md`](../docs/LOCAL_LIBRARIES.md)
+- [`../docs/PACKAGE_TESTS.md`](../docs/PACKAGE_TESTS.md)
+- [`../docs/INCREMENTAL_ANALYSIS.md`](../docs/INCREMENTAL_ANALYSIS.md)
+- [`../docs/MIGRATING_TO_M4.md`](../docs/MIGRATING_TO_M4.md)
 - [`abi/IDL.md`](abi/IDL.md)
 - [`abi/BYTECODE.md`](abi/BYTECODE.md)
 - [`runtime/HANDLES.md`](runtime/HANDLES.md)

@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2201","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2201.nexa","expected":{"primary_text":"match value { A => 1 }","secondary_count":0,"message_contains":"non-exhaustive match","notes":["missing variant:"]}}
+{"version":1,"code":"NX2201","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2201.nexa","expected":{"primary_text":"match value { A => 1 }","secondary_count":0,"message_contains":"Non-exhaustive match","notes":["missing variant:"]}}

@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2302","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2302.nexa","expected":{"primary_text":"work()","primary_occurrence":2,"secondary_count":0,"message_contains":"missing await","notes":[]}}
+{"version":1,"code":"NX2302","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2302.nexa","expected":{"primary_text":"work()","primary_occurrence":2,"secondary_count":0,"message_contains":"Missing await","notes":[]}}

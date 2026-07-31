@@ -6,6 +6,7 @@ import {
   artifactDirectory,
   copyDirectory,
   grammarDirectory,
+  idlGrammarDirectory,
   renderZedManifest,
   zedDirectory,
 } from "./lib.mjs";
@@ -41,38 +42,6 @@ fs.copyFileSync(
 );
 copyDirectory(path.join(zedDirectory, "src"), path.join(output, "src"));
 
-const packagedGrammar = path.join(output, "tree-sitter-nexa");
-fs.mkdirSync(packagedGrammar, { recursive: true });
-for (const entry of [
-  "grammar.js",
-  "package.json",
-  "queries",
-  "src",
-  "tree-sitter.json",
-]) {
-  fs.cpSync(
-    path.join(grammarDirectory, entry),
-    path.join(packagedGrammar, entry),
-    { recursive: true },
-  );
-}
-fs.copyFileSync(
-  path.join(grammarDirectory, "..", "language-syntax.json"),
-  path.join(packagedGrammar, "language-syntax.json"),
-);
-const packagedGrammarSource = fs
-  .readFileSync(path.join(packagedGrammar, "grammar.js"), "utf8")
-  .replace(
-    'require("../language-syntax.json")',
-    'require("./language-syntax.json")',
-  );
-fs.writeFileSync(
-  path.join(packagedGrammar, "grammar.js"),
-  packagedGrammarSource,
-);
-
-runGit(["init", "--quiet", "--initial-branch=main"], packagedGrammar);
-runGit(["add", "--all"], packagedGrammar);
 const gitEnvironment = {
   ...process.env,
   GIT_AUTHOR_DATE: "2000-01-01T00:00:00Z",
@@ -82,48 +51,95 @@ const gitEnvironment = {
   GIT_COMMITTER_EMAIL: "nexa-editor-support@localhost",
   GIT_COMMITTER_NAME: "Nexa Editor Support",
 };
-runGit(
-  [
-    "-c",
-    "commit.gpgsign=false",
-    "commit",
-    "--quiet",
-    "--message",
-    "Package Nexa Tree-sitter grammar",
-  ],
-  packagedGrammar,
-  gitEnvironment,
-);
-const grammarRevision = runGit(["rev-parse", "HEAD"], packagedGrammar);
-const grammarCheck = spawnSync("tree-sitter", ["generate"], {
-  cwd: packagedGrammar,
-  encoding: "utf8",
-});
-if (grammarCheck.error) {
-  throw grammarCheck.error;
-}
-if (grammarCheck.status !== 0) {
-  throw new Error(
-    `packaged Zed grammar generation failed\n${grammarCheck.stdout}${grammarCheck.stderr}`,
+
+function packageGrammar(source, name, commitMessage) {
+  const destination = path.join(output, name);
+  fs.mkdirSync(destination, { recursive: true });
+  for (const entry of [
+    "grammar.js",
+    "package.json",
+    "queries",
+    "src",
+    "tree-sitter.json",
+  ]) {
+    fs.cpSync(path.join(source, entry), path.join(destination, entry), {
+      recursive: true,
+    });
+  }
+  fs.copyFileSync(
+    path.join(source, "..", "language-syntax.json"),
+    path.join(destination, "language-syntax.json"),
   );
+  const grammarSource = fs
+    .readFileSync(path.join(destination, "grammar.js"), "utf8")
+    .replace(
+      'require("../language-syntax.json")',
+      'require("./language-syntax.json")',
+    );
+  fs.writeFileSync(path.join(destination, "grammar.js"), grammarSource);
+
+  runGit(
+    ["init", "--quiet", "--initial-branch=main", "--object-format=sha1"],
+    destination,
+  );
+  runGit(["add", "--all"], destination);
+  runGit(
+    [
+      "-c",
+      "commit.gpgsign=false",
+      "commit",
+      "--quiet",
+      "--message",
+      commitMessage,
+    ],
+    destination,
+    gitEnvironment,
+  );
+  const revision = runGit(["rev-parse", "HEAD"], destination);
+  const grammarCheck = spawnSync("tree-sitter", ["generate"], {
+    cwd: destination,
+    encoding: "utf8",
+  });
+  if (grammarCheck.error) {
+    throw grammarCheck.error;
+  }
+  if (grammarCheck.status !== 0) {
+    throw new Error(
+      `packaged ${name} grammar generation failed\n${grammarCheck.stdout}${grammarCheck.stderr}`,
+    );
+  }
+  runGit(
+    [
+      "diff",
+      "--exit-code",
+      "--",
+      "src/parser.c",
+      "src/grammar.json",
+      "src/node-types.json",
+    ],
+    destination,
+  );
+  return { destination, revision };
 }
-runGit(
-  [
-    "diff",
-    "--exit-code",
-    "--",
-    "src/parser.c",
-    "src/grammar.json",
-    "src/node-types.json",
-  ],
-  packagedGrammar,
+
+const packagedGrammar = packageGrammar(
+  grammarDirectory,
+  "tree-sitter-nexa",
+  "Package Nexa Tree-sitter grammar",
+);
+const packagedIdlGrammar = packageGrammar(
+  idlGrammarDirectory,
+  "tree-sitter-nexa-idl",
+  "Package Nexa IDL Tree-sitter grammar",
 );
 
 fs.writeFileSync(
   path.join(output, "extension.toml"),
   renderZedManifest({
-    grammarRepository: packagedGrammar,
-    grammarRevision,
+    grammarRepository: packagedGrammar.destination,
+    grammarRevision: packagedGrammar.revision,
+    idlGrammarRepository: packagedIdlGrammar.destination,
+    idlGrammarRevision: packagedIdlGrammar.revision,
   }),
 );
 

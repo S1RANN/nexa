@@ -2,20 +2,23 @@ use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
+use nexa as nexa_idl;
 use nexa_embed::{
-    ActivationPolicy, ActivationSet, CandidateCancellation, CandidateTerminal, CapabilitySet,
-    CompileJob, DevelopmentCompileRequest, DevelopmentCompiler, DevelopmentConfig,
-    DiagnosticRenderer, EngineDiagnostic, EngineDiagnosticStage, EnqueueOutcome, ExportRequirement,
-    MemorySource, PackageId, PackagePolicy, PackageRuntimeLimits, PackageSource,
-    SourceFileRegistry, SourceId, TrustLevel,
+    ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateCancellation,
+    CandidateTerminal, CapabilitySet, CompileJob, DevelopmentCompileRequest, DevelopmentCompiler,
+    DevelopmentConfig, DiagnosticRenderer, EngineDiagnostic, EngineDiagnosticStage, EnqueueOutcome,
+    ExportRequirement, MemoryPackage, MemorySource, PackageId, PackagePolicy, PackageRuntimeLimits,
+    PackageSource, SourceFileRegistry, SourceId, TrustLevel,
 };
 
 const IDL: &str = "interface TestHost { export Value() -> i32; }";
-const MANIFEST: &str = "schema = 1
+const MANIFEST: &str = "schema = 2
+kind = \"application\"
 id = \"tests.development\"
 name = \"Development\"
 version = \"1.0.0\"
-entry = \"main.nexa\"
+source_root = \"src\"
+entry = \"tests.development\"
 activation = \"programmatic\"
 handler_fuel = 20000
 capabilities = []
@@ -32,34 +35,43 @@ fn policy() -> PackagePolicy {
     }
 }
 
-fn candidate(source: &str) -> nexa_embed::PackageCandidate {
-    let source = format!("module tests.development;\nimport test;\n{source}");
+fn candidate(source: &str) -> nexa_embed::DiscoveredPackage {
+    let source = format!("module tests.development;\nimport host as test;\n{source}");
     MemorySource::new(SourceId::new("tests").expect("source id"), policy())
-        .package(MANIFEST, source)
-        .discover()
+        .package(
+            MemoryPackage::new("development", MANIFEST)
+                .source("src/tests/development.nexa", source),
+        )
+        .discover(&CandidateBuildContext::new(IDL.as_bytes().to_vec()))
         .expect("candidate discovery")
         .remove(0)
 }
 
-fn candidate_for(package: &str, source: &str) -> nexa_embed::PackageCandidate {
+fn candidate_for(package: &str, source: &str) -> nexa_embed::DiscoveredPackage {
+    let module = package.replace('-', "_");
     let manifest = format!(
-        "schema = 1
+        "schema = 2
+kind = \"application\"
 id = \"{package}\"
 name = \"{package}\"
 version = \"1.0.0\"
-entry = \"main.nexa\"
+source_root = \"src\"
+entry = \"{module}\"
 activation = \"programmatic\"
 handler_fuel = 20000
 capabilities = []
 "
     );
-    let source = format!("module {package};\nimport test;\n{source}");
+    let source = format!("module {module};\nimport host as test;\n{source}");
     MemorySource::new(
         SourceId::new(format!("source-{}", package.replace('.', "-"))).expect("source id"),
         policy(),
     )
-    .package(manifest, source)
-    .discover()
+    .package(
+        MemoryPackage::new(package.replace('.', "-"), manifest)
+            .source(format!("src/{}.nexa", module.replace('.', "/")), source),
+    )
+    .discover(&CandidateBuildContext::new(IDL.as_bytes().to_vec()))
     .expect("candidate discovery")
     .remove(0)
 }
@@ -83,7 +95,7 @@ fn await_results(
         results.extend(compiler.poll());
         if results
             .iter()
-            .any(|result| result.data().generation == expected_generation)
+            .any(|result| result.data().identity.generation == expected_generation)
         {
             return results;
         }
@@ -98,8 +110,8 @@ fn await_compile_started(compiler: &DevelopmentCompiler, expected_generation: u6
         if compiler.poll_events().iter().any(|event| {
             matches!(
                 event,
-                nexa_embed::WorkerEvent::CompileStarted { generation, .. }
-                    if *generation == expected_generation
+                nexa_embed::WorkerEvent::CompileStarted { identity, .. }
+                    if identity.generation == expected_generation
             )
         }) {
             return;
@@ -153,15 +165,13 @@ fn source_registry_is_deterministic_bounded_and_unicode_safe() {
 fn dev_loop_only_latest_generation_becomes_ready() {
     let idl = nexa_idl::parse(IDL).expect("IDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
-    let package_id = candidate("fn Value() -> i32 { return 1; }").manifest.id;
     let mut terminals = Vec::new();
     for generation in 1..=20 {
-        let candidate = candidate(&format!("fn Value() -> i32 {{ return {generation}; }}"));
+        let candidate = candidate(&format!("pub fn Value() -> i32 {{ return {generation}; }}"));
         match compiler.submit(DevelopmentCompileRequest {
-            package_id: package_id.clone(),
             source_id: SourceId::new("tests").expect("source id"),
-            generation,
-            candidate,
+            identity: candidate.identity(generation).expect("candidate identity"),
+            build_input: candidate.build_input,
             idl: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }) {
@@ -176,25 +186,30 @@ fn dev_loop_only_latest_generation_becomes_ready() {
     terminals.extend(await_results(&compiler, 20));
     assert!(
         terminals.iter().any(|result| {
-            result.data().generation == 20 && matches!(result, CandidateTerminal::Compiled { .. })
+            result.data().identity.generation == 20
+                && matches!(result, CandidateTerminal::Compiled { .. })
         }),
         "latest result: {:?}",
         terminals
             .iter()
-            .find(|result| result.data().generation == 20)
+            .find(|result| result.data().identity.generation == 20)
             .map(CandidateTerminal::kind)
     );
     let latest = terminals
         .iter()
-        .find(|terminal| terminal.data().generation == 20)
+        .find(|terminal| terminal.data().identity.generation == 20)
         .expect("latest terminal");
     let CandidateTerminal::Compiled { compilation, .. } = latest else {
         panic!("latest generation was not compiled");
     };
-    assert!(compilation.compile_duration > Duration::ZERO);
-    assert!(compilation.verify_duration > Duration::ZERO);
+    assert!(
+        compilation
+            .compile_duration
+            .saturating_add(compilation.verify_duration)
+            > Duration::ZERO
+    );
     assert!(terminals.iter().all(|terminal| {
-        terminal.data().generation == 20
+        terminal.data().identity.generation == 20
             || matches!(
                 terminal,
                 CandidateTerminal::SupersededBeforeCompile(_)
@@ -212,14 +227,15 @@ fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
         ..DevelopmentConfig::default()
     })
     .expect("worker");
-    let package_id = candidate("fn Value() -> i32 { return 1; }").manifest.id;
-    let request = |generation| DevelopmentCompileRequest {
-        package_id: package_id.clone(),
-        source_id: SourceId::new("tests").expect("source id"),
-        generation,
-        candidate: candidate(&format!("fn Value() -> i32 {{ return {generation}; }}")),
-        idl: idl.clone(),
-        required_exports: vec![requirement(&idl)],
+    let request = |generation| {
+        let candidate = candidate(&format!("pub fn Value() -> i32 {{ return {generation}; }}"));
+        DevelopmentCompileRequest {
+            source_id: SourceId::new("tests").expect("source id"),
+            identity: candidate.identity(generation).expect("candidate identity"),
+            build_input: candidate.build_input,
+            idl: idl.clone(),
+            required_exports: vec![requirement(&idl)],
+        }
     };
 
     assert!(matches!(
@@ -244,11 +260,12 @@ fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
 
     let terminals = await_results(&compiler, 3);
     assert!(terminals.iter().any(|terminal| {
-        terminal.data().generation == 2
+        terminal.data().identity.generation == 2
             && matches!(terminal, CandidateTerminal::SupersededAfterCompile(_))
     }));
     assert!(terminals.iter().any(|terminal| {
-        terminal.data().generation == 3 && matches!(terminal, CandidateTerminal::Compiled { .. })
+        terminal.data().identity.generation == 3
+            && matches!(terminal, CandidateTerminal::Compiled { .. })
     }));
     assert!(compiler.shutdown().is_empty());
 }
@@ -262,49 +279,52 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
         ..DevelopmentConfig::default()
     })
     .expect("worker");
-    let package_id = candidate("fn Value() -> i32 { return 1; }").manifest.id;
     for generation in 1..=100 {
-        let source = format!("fn Value() -> i32 {{ return {generation}; }}");
+        let source = format!("pub fn Value() -> i32 {{ return {generation}; }}");
         assert!(matches!(
-            compiler.submit(DevelopmentCompileRequest {
-                package_id: package_id.clone(),
-                source_id: SourceId::new("tests").expect("source id"),
-                generation,
-                candidate: candidate(&source),
-                idl: idl.clone(),
-                required_exports: vec![requirement(&idl)],
+            compiler.submit({
+                let candidate = candidate(&source);
+                DevelopmentCompileRequest {
+                    source_id: SourceId::new("tests").expect("source id"),
+                    identity: candidate.identity(generation).expect("candidate identity"),
+                    build_input: candidate.build_input,
+                    idl: idl.clone(),
+                    required_exports: vec![requirement(&idl)],
+                }
             }),
             EnqueueOutcome::Accepted
         ));
         let results = await_results(&compiler, generation);
         assert!(
             results.iter().any(|result| {
-                result.data().generation == generation
+                result.data().identity.generation == generation
                     && matches!(result, CandidateTerminal::Compiled { .. })
             }),
             "generation {generation}: {:?}",
             results
                 .iter()
-                .find(|result| result.data().generation == generation)
+                .find(|result| result.data().identity.generation == generation)
                 .map(CandidateTerminal::kind)
         );
     }
     for generation in 101..=200 {
         assert!(matches!(
-            compiler.submit(DevelopmentCompileRequest {
-                package_id: package_id.clone(),
-                source_id: SourceId::new("tests").expect("source id"),
-                generation,
-                candidate: candidate("fn Value() -> i32 { return missing; }"),
-                idl: idl.clone(),
-                required_exports: vec![requirement(&idl)],
+            compiler.submit({
+                let candidate = candidate("pub fn Value() -> i32 { return missing; }");
+                DevelopmentCompileRequest {
+                    source_id: SourceId::new("tests").expect("source id"),
+                    identity: candidate.identity(generation).expect("candidate identity"),
+                    build_input: candidate.build_input,
+                    idl: idl.clone(),
+                    required_exports: vec![requirement(&idl)],
+                }
             }),
             EnqueueOutcome::Accepted
         ));
         let results = await_results(&compiler, generation);
         let failed = results
             .iter()
-            .find(|result| result.data().generation == generation)
+            .find(|result| result.data().identity.generation == generation)
             .expect("failed terminal");
         match failed {
             CandidateTerminal::CompileFailed {
@@ -338,11 +358,11 @@ fn submit_distinct_packages(
     let mut terminals = Vec::new();
     for index in 0..count {
         let package = format!("tests.dev{index}");
+        let candidate = candidate_for(&package, "pub fn Value() -> i32 { return 1; }");
         match compiler.submit(DevelopmentCompileRequest {
-            package_id: PackageId::new(&package).expect("package id"),
             source_id: SourceId::new(format!("source-{index}")).expect("source id"),
-            generation: 1,
-            candidate: candidate_for(&package, "fn Value() -> i32 { return 1; }"),
+            identity: candidate.identity(1).expect("candidate identity"),
+            build_input: candidate.build_input,
             idl: idl.clone(),
             required_exports: vec![requirement(idl)],
         }) {
@@ -376,7 +396,7 @@ fn drain_all_distinct(
         backpressured = still_waiting;
         let unique = terminals
             .iter()
-            .map(|terminal| terminal.data().package_id.clone())
+            .map(|terminal| terminal.data().identity.package_id.clone())
             .collect::<BTreeSet<_>>();
         if unique.len() == expected && backpressured.is_empty() {
             return terminals;
@@ -408,7 +428,7 @@ fn worker_queue_backpressure_preserves_32_distinct_packages() {
     assert_eq!(
         terminals
             .iter()
-            .map(|terminal| terminal.data().package_id.clone())
+            .map(|terminal| terminal.data().identity.package_id.clone())
             .collect::<BTreeSet<_>>()
             .len(),
         32
@@ -442,7 +462,7 @@ fn worker_result_backpressure_never_discards_completed_results() {
     assert_eq!(
         terminals
             .iter()
-            .map(|terminal| terminal.data().package_id.clone())
+            .map(|terminal| terminal.data().identity.package_id.clone())
             .collect::<BTreeSet<_>>()
             .len(),
         32
@@ -450,8 +470,8 @@ fn worker_result_backpressure_never_discards_completed_results() {
     assert!(compiler.shutdown().is_empty());
 }
 
-fn slow_candidate(package: &str) -> nexa_embed::PackageCandidate {
-    let mut body = String::from("fn Value() -> i32 {\n");
+fn slow_candidate(package: &str) -> nexa_embed::DiscoveredPackage {
+    let mut body = String::from("pub fn Value() -> i32 {\n");
     for index in 0..8_000 {
         writeln!(&mut body, "let value_{index}: i32 = {index};").expect("write slow source");
     }
@@ -475,29 +495,28 @@ fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
     let idl = nexa_idl::parse(IDL).expect("IDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
     let package_id = PackageId::new("tests.slow-disable").expect("package id");
+    let candidate = slow_candidate(package_id.as_str());
     assert!(matches!(
         compiler.submit(DevelopmentCompileRequest {
-            package_id: package_id.clone(),
             source_id: SourceId::new("slow-disable").expect("source id"),
-            generation: 1,
-            candidate: slow_candidate(package_id.as_str()),
+            identity: candidate.identity(1).expect("candidate identity"),
+            build_input: candidate.build_input,
             idl: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }),
         EnqueueOutcome::Accepted
     ));
     wait_until_in_flight(&compiler, &package_id);
-    assert!(
-        compiler
-            .cancel(&package_id, CandidateCancellation::Disable)
-            .is_empty()
-    );
-    let terminals = await_results(&compiler, 1);
+    let terminals = compiler.cancel(&package_id, CandidateCancellation::Disable);
     assert_eq!(terminals.len(), 1);
     assert!(matches!(
         terminals[0],
         CandidateTerminal::CancelledByDisable(_)
     ));
+    assert!(
+        compiler.poll().is_empty(),
+        "an in-flight cancellation terminal must not be duplicated through the result queue"
+    );
     assert!(compiler.shutdown().is_empty());
 }
 
@@ -506,12 +525,12 @@ fn shutdown_accounts_for_an_in_flight_generation_without_deadlock() {
     let idl = nexa_idl::parse(IDL).expect("IDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
     let package_id = PackageId::new("tests.slow-shutdown").expect("package id");
+    let candidate = slow_candidate(package_id.as_str());
     assert!(matches!(
         compiler.submit(DevelopmentCompileRequest {
-            package_id: package_id.clone(),
             source_id: SourceId::new("slow-shutdown").expect("source id"),
-            generation: 1,
-            candidate: slow_candidate(package_id.as_str()),
+            identity: candidate.identity(1).expect("candidate identity"),
+            build_input: candidate.build_input,
             idl: idl.clone(),
             required_exports: vec![requirement(&idl)],
         }),

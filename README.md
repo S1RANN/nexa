@@ -32,7 +32,11 @@ Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
-Current target = M3R3 complete; M4 not started
+Nexa M4 Language Scale Foundation = COMPLETE
+Multi-file Source Modules = COMPLETE
+Static Local Libraries = COMPLETE
+Incremental Analysis = COMPLETE
+Package Tests = COMPLETE
 Seamless advanced Reload = REMOVED
 ```
 
@@ -45,7 +49,9 @@ annotated tag `gate1-v2.9-stop`; the active branch keeps only the compact
 
 ```text
 Nexa source
-→ parser and type checker
+→ lossless syntax and shared package analysis
+→ Source Module and local Library graph
+→ deterministic Typed IR
 → bytecode compiler and verifier
 → RealmRuntime
 → spawn_task / poll_task
@@ -53,6 +59,25 @@ Nexa source
 → typed @state
 → Restart Reload
 ```
+
+M4 keeps Runtime isolation simple while scaling the language frontend. A
+schema 2 Application and its lockfile-pinned local Library closure compile to
+one deterministic Package Artifact, one Realm, and one Epoch. Imports always
+bind namespaces, Host access is explicit (`import host as app;`), and
+module-private, `pub(package)`, and `pub` visibility are distinct.
+
+M4 completion is enforced by the source, semantics, incremental, tooling, and
+scale-stress gates in `cargo xtask check`. Publication is finalized from the
+annotated `language-scale-m4-complete` tag, with the clean-HEAD report written
+to `target/nexa-artifacts/m4-finalize/final-report.json`.
+
+See [Source Modules](docs/MODULES.md),
+[Local Libraries](docs/LOCAL_LIBRARIES.md),
+[Incremental Analysis](docs/INCREMENTAL_ANALYSIS.md),
+[M4 Language Additions](docs/M4_LANGUAGE.md),
+[Standard Library](docs/STANDARD_LIBRARY.md),
+[Package Tests](docs/PACKAGE_TESTS.md), and the
+[schema 2 migration guide](docs/MIGRATING_TO_M4.md).
 
 `examples/hello-runtime` is the minimal high-level onboarding example. It uses
 `nexa-embed` to discover one in-memory package, enable it, call a generated

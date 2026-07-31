@@ -1,5 +1,5 @@
 module game.combat;
-import engine;
+import host as engine;
 
 @stateful(1) class EnemyBrain {
     phase: i32;
@@ -41,15 +41,15 @@ fn no_target() -> Option<i32> {
     return None;
 }
 
-task fn animation_checked(value: i32) -> Result<i32, AnimationError> {
+task fn animation_checked(value: i32) -> Result<i32, engine.AnimationError> {
     let completed: i32 = await engine.animation(value)?;
     return Ok(completed);
 }
 
-task fn update(value: i32) -> i32 {
+pub task fn Update(value: i32) -> i32 {
     let lock = engine.action_lock(value);
     let snapshot = engine.world_snapshot();
-    let animation: Result<i32, AnimationError> = await engine.animation(value);
+    let animation: Result<i32, engine.AnimationError> = await engine.animation(value);
     let completed: i32 = match animation {
         Ok(result) => result,
         Err(error) => 0,
@@ -89,9 +89,9 @@ fn feature_probe(input: Buffer<i32>) -> i32 {
     input.copy(copied, 0, 1, 1);
 
     let optional: Option<i32> = Some(input.get(1));
-    let result: Result<i32, AnimationError> = match optional {
+    let result: Result<i32, engine.AnimationError> = match optional {
         Some(value) => Ok(value),
-        None => Err(MissingClip),
+        None => Err(engine.MissingClip),
     };
     let amount: i32 = match result {
         Ok(value) => value,
@@ -103,7 +103,7 @@ fn feature_probe(input: Buffer<i32>) -> i32 {
 fn state_probe(handle: StateHandle<EnemyBrain>) -> i32 {
     let resolved: Result<EnemyBrain, StateHandleError> = handle.resolve();
     let alive: bool = handle.is_alive();
-    let stable: StableId = handle.stable_id();
+    let stable_value: StableId = handle.stable_id();
     let generation: i32 = handle.generation();
     return handle.hash();
 }

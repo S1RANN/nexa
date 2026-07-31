@@ -30,6 +30,9 @@ repository = "https://github.com/S1RANN/nexa"
 publish = false
 
 [workspace.dependencies]
+blake3 = "1.8"
+libm = "=0.2.16"
+semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

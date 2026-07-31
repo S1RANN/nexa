@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2706","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2706","expected":{"primary_text":"Secret","secondary_count":1,"related_messages":["type is declared here"],"related_texts":["Secret"],"message_contains":"API exposes inaccessible type","notes":[]}}

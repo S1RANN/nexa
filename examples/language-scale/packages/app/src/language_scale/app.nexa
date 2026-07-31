@@ -1,0 +1,13 @@
+module language_scale.app;
+
+import language_scale.flow as flow;
+import language_scale.rules as rules;
+import language_scale.text as text;
+import host as console;
+
+pub fn OnEvent(value: i32) -> string {
+    let score: i32 = flow.pass_through(rules.score(value));
+    let message: string = text.message(score);
+    console.log(message);
+    return message;
+}

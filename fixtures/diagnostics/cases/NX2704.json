@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2704","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2704","expected":{"primary_text":"shared","primary_occurrence":4,"secondary_count":0,"message_contains":"duplicate namespace","notes":[]}}

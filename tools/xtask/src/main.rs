@@ -7,6 +7,8 @@ use std::process::{Command, Stdio};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod m4;
+
 type DynError = Box<dyn std::error::Error>;
 
 #[derive(Debug, Serialize)]
@@ -171,7 +173,7 @@ struct CandidateFreshnessScenarioReport {
     stage: String,
     stale_candidates_observed: u64,
     stale_candidates_committed: u64,
-    desired_hash_mismatches_rejected: u64,
+    desired_build_fingerprint_mismatches_rejected: u64,
     superseded_before_compile: u64,
     superseded_after_compile: u64,
     created_generations: u64,
@@ -194,7 +196,7 @@ struct CandidateFreshnessReport {
     ready_candidate_scenario_count: u64,
     stale_candidates_observed: u64,
     stale_candidates_committed: u64,
-    desired_hash_mismatches_rejected: u64,
+    desired_build_fingerprint_mismatches_rejected: u64,
     superseded_before_compile: u64,
     superseded_after_compile: u64,
     created_generations: u64,
@@ -218,7 +220,7 @@ impl CandidateFreshnessReport {
             ready_candidate_scenario_count: 0,
             stale_candidates_observed: 0,
             stale_candidates_committed: u64::MAX,
-            desired_hash_mismatches_rejected: 0,
+            desired_build_fingerprint_mismatches_rejected: 0,
             superseded_before_compile: 0,
             superseded_after_compile: 0,
             created_generations: 0,
@@ -316,7 +318,7 @@ struct M3R3FinalReport {
     freshness_terminal_generations: u64,
     stale_candidates_observed: u64,
     stale_candidates_committed: u64,
-    desired_hash_mismatches_rejected: u64,
+    desired_build_fingerprint_mismatches_rejected: u64,
     superseded_before_compile: u64,
     superseded_after_compile: u64,
     duplicate_terminals: u64,
@@ -403,6 +405,12 @@ fn main() -> Result<(), DynError> {
         "finalize-m3-r1" => finalize_m3_r1(),
         "finalize-m3-r2" => finalize_m3_r2(),
         "finalize-m3-r3" => finalize_m3_r3(),
+        "test-m4-source" => m4::test_m4_source(),
+        "test-m4-semantics" => m4::test_m4_semantics(),
+        "test-m4-incremental" => m4::test_m4_incremental(),
+        "test-m4-tooling" => m4::test_m4_tooling(),
+        "m4-scale-stress" => m4::m4_scale_stress(),
+        "finalize-m4" => m4::finalize_m4(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -412,7 +420,8 @@ fn main() -> Result<(), DynError> {
                  test-engine-api|test-diagnostics|test-dev-loop|test-cli|test-lsp|\
                  editor-check|dev-loop-stress|test-generation-accounting|\
                  test-candidate-freshness|finalize-m3|finalize-m3-r1|finalize-m3-r2|\
-                 finalize-m3-r3"
+                 finalize-m3-r3|test-m4-source|test-m4-semantics|test-m4-incremental|\
+                 test-m4-tooling|m4-scale-stress|finalize-m4"
             );
             Err("unknown xtask command".into())
         }
@@ -478,6 +487,11 @@ fn finalize_m1() -> Result<(), DynError> {
 }
 
 fn check() -> Result<(), DynError> {
+    check_through_m3()?;
+    m4::run_m4_gates().ensure_passed()
+}
+
+fn check_through_m3() -> Result<(), DynError> {
     let summary = run_check_summary();
     println!("{summary:#?}");
     if !summary.passed() {
@@ -620,6 +634,7 @@ fn editor_check() -> Result<(), DynError> {
     let status = Command::new("pnpm")
         .args(["--dir", "editors", "check"])
         .env("CI", "true")
+        .env("PNPM_CONFIG_VERIFY_DEPS_BEFORE_RUN", "false")
         .current_dir(workspace_root())
         .status()?;
     if status.success() {
@@ -751,7 +766,7 @@ struct CandidateFreshnessTotals {
     ready_candidate_scenario_count: u64,
     stale_candidates_observed: u64,
     stale_candidates_committed: u64,
-    desired_hash_mismatches_rejected: u64,
+    desired_build_fingerprint_mismatches_rejected: u64,
     superseded_before_compile: u64,
     superseded_after_compile: u64,
     created_generations: u64,
@@ -787,9 +802,9 @@ impl CandidateFreshnessTotals {
         self.stale_candidates_committed = self
             .stale_candidates_committed
             .saturating_add(scenario.stale_candidates_committed);
-        self.desired_hash_mismatches_rejected = self
-            .desired_hash_mismatches_rejected
-            .saturating_add(scenario.desired_hash_mismatches_rejected);
+        self.desired_build_fingerprint_mismatches_rejected = self
+            .desired_build_fingerprint_mismatches_rejected
+            .saturating_add(scenario.desired_build_fingerprint_mismatches_rejected);
         self.superseded_before_compile = self
             .superseded_before_compile
             .saturating_add(scenario.superseded_before_compile);
@@ -879,7 +894,7 @@ fn candidate_freshness_gate() -> Result<CandidateFreshnessReport, DynError> {
             || scenario.stage != stage
             || scenario.stale_candidates_observed != 1
             || scenario.stale_candidates_committed != 0
-            || scenario.desired_hash_mismatches_rejected != mismatch
+            || scenario.desired_build_fingerprint_mismatches_rejected != mismatch
             || scenario.superseded_before_compile != before
             || scenario.superseded_after_compile != after
             || before.saturating_add(after) != 1
@@ -912,7 +927,8 @@ fn candidate_freshness_gate() -> Result<CandidateFreshnessReport, DynError> {
         && report.ready_candidate_scenario_count == totals.ready_candidate_scenario_count
         && report.stale_candidates_observed == totals.stale_candidates_observed
         && report.stale_candidates_committed == totals.stale_candidates_committed
-        && report.desired_hash_mismatches_rejected == totals.desired_hash_mismatches_rejected
+        && report.desired_build_fingerprint_mismatches_rejected
+            == totals.desired_build_fingerprint_mismatches_rejected
         && report.superseded_before_compile == totals.superseded_before_compile
         && report.superseded_after_compile == totals.superseded_after_compile
         && report.created_generations == totals.created_generations
@@ -929,7 +945,7 @@ fn candidate_freshness_gate() -> Result<CandidateFreshnessReport, DynError> {
         && report.ready_candidate_scenario_count == 1
         && report.stale_candidates_observed == 6
         && report.stale_candidates_committed == 0
-        && report.desired_hash_mismatches_rejected == 3
+        && report.desired_build_fingerprint_mismatches_rejected == 3
         && report.superseded_before_compile == 2
         && report.superseded_after_compile == 4
         && report.created_generations == 8
@@ -1447,7 +1463,8 @@ fn finalize_m3_r3() -> Result<(), DynError> {
         freshness_terminal_generations: freshness_report.terminal_generations,
         stale_candidates_observed: freshness_report.stale_candidates_observed,
         stale_candidates_committed: freshness_report.stale_candidates_committed,
-        desired_hash_mismatches_rejected: freshness_report.desired_hash_mismatches_rejected,
+        desired_build_fingerprint_mismatches_rejected: freshness_report
+            .desired_build_fingerprint_mismatches_rejected,
         superseded_before_compile: freshness_report.superseded_before_compile,
         superseded_after_compile: freshness_report.superseded_after_compile,
         duplicate_terminals: freshness_report.duplicate_terminals,
@@ -1698,16 +1715,19 @@ fn m3r1_audit() -> Result<(), DynError> {
         }
     }
     let engine = fs::read_to_string(root.join("crates/nexa-embed/src/lib.rs"))?;
-    for hash in [
-        "observed_hash",
-        "stable_hash",
-        "queued_hash",
-        "in_flight_hash",
-        "terminal_hash",
-        "active_hash",
+    for fingerprint in [
+        "observed_build_fingerprint",
+        "stable_build_fingerprint",
+        "queued_build_fingerprint",
+        "in_flight_build_fingerprint",
+        "terminal_build_fingerprint",
+        "active_build_fingerprint",
     ] {
-        if !engine.contains(hash) {
-            return Err(format!("M3R1 Engine hash lifecycle is missing `{hash}`").into());
+        if !engine.contains(fingerprint) {
+            return Err(format!(
+                "M3R1 Engine Build Fingerprint lifecycle is missing `{fingerprint}`"
+            )
+            .into());
         }
     }
     let evidence = fs::read_to_string(root.join("crates/nexa-embed/src/diagnostic_evidence.rs"))?;
@@ -2171,11 +2191,7 @@ fn m2_audit() -> Result<(), DynError> {
     if package_count != 9 {
         return Err(format!("expected 9 Snake packages, found {package_count}").into());
     }
-    let overlay =
-        fs::read_to_string(root.join("examples/snake-game/packages/mods/score-overlay/main.nexa"))?;
-    if !overlay.contains("@stateful(1) class OverlayState") {
-        return Err("Score Overlay does not declare typed state".into());
-    }
+    audit_snake_schema2_packages(&root)?;
     for required in [
         "docs/EMBEDDING.md",
         "docs/PACKAGE_SOURCES.md",
@@ -2186,6 +2202,82 @@ fn m2_audit() -> Result<(), DynError> {
         if !root.join(required).is_file() {
             return Err(format!("missing M2 documentation {required}").into());
         }
+    }
+    Ok(())
+}
+
+fn audit_snake_schema2_packages(root: &Path) -> Result<(), DynError> {
+    let packages = [
+        (
+            "builtin/classic-hud",
+            "snake.classic_hud",
+            "src/snake/classic_hud.nexa",
+        ),
+        (
+            "builtin/classic-rules",
+            "snake.classic_rules",
+            "src/snake/classic_rules.nexa",
+        ),
+        (
+            "builtin/classic-spawn",
+            "snake.classic_spawn",
+            "src/snake/classic_spawn.nexa",
+        ),
+        (
+            "builtin/default-skin",
+            "snake.default_skin",
+            "src/snake/default_skin.nexa",
+        ),
+        (
+            "dlc/food-chaos",
+            "snake.food_chaos",
+            "src/snake/food_chaos.nexa",
+        ),
+        (
+            "mods/corner-spawn",
+            "snake.corner_spawn",
+            "src/snake/corner_spawn.nexa",
+        ),
+        (
+            "mods/neon-skin",
+            "snake.neon_skin",
+            "src/snake/neon_skin.nexa",
+        ),
+        (
+            "mods/score-overlay",
+            "snake.score_overlay",
+            "src/snake/score_overlay.nexa",
+        ),
+        (
+            "mods/weird-foods",
+            "snake.weird_foods",
+            "src/snake/weird_foods.nexa",
+        ),
+    ];
+    for (package, module, source_path) in packages {
+        let package_root = root.join("examples/snake-game/packages").join(package);
+        let manifest = fs::read_to_string(package_root.join("package.toml"))?;
+        if !manifest.starts_with("schema = 2\n")
+            || !manifest.contains("source_root = \"src\"")
+            || !manifest.contains(&format!("entry = \"{module}\""))
+        {
+            return Err(
+                format!("Snake package {package} is not a schema 2 `{module}` package").into(),
+            );
+        }
+        let source = fs::read_to_string(package_root.join(source_path))?;
+        if !source.contains(&format!("module {module};")) {
+            return Err(format!(
+                "Snake package {package} source path `{source_path}` does not declare `{module}`"
+            )
+            .into());
+        }
+    }
+    let overlay = fs::read_to_string(
+        root.join("examples/snake-game/packages/mods/score-overlay/src/snake/score_overlay.nexa"),
+    )?;
+    if !overlay.contains("@stateful(1) class OverlayState") {
+        return Err("Score Overlay does not declare typed state".into());
     }
     Ok(())
 }
@@ -2248,7 +2340,11 @@ fn workspace_check() -> Result<(), DynError> {
         "warnings",
     ])?;
     cargo(&["test", "--workspace", "--all-targets"])?;
-    cargo(&["test", "--doc", "--workspace"])
+    cargo(&["test", "--doc", "--workspace"])?;
+    cargo_with_environment(
+        &["doc", "--workspace", "--no-deps"],
+        &[("RUSTDOCFLAGS", "-D warnings")],
+    )
 }
 
 fn test_task() -> Result<(), DynError> {
@@ -2748,14 +2844,33 @@ fn repo_audit() -> Result<(), DynError> {
 }
 
 fn cargo(arguments: &[&str]) -> Result<(), DynError> {
-    let status = Command::new("cargo")
-        .args(arguments)
-        .current_dir(workspace_root())
-        .status()?;
+    cargo_with_environment(arguments, &[])
+}
+
+fn cargo_with_environment(
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<(), DynError> {
+    let mut command = Command::new("cargo");
+    command.args(arguments).current_dir(workspace_root());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let status = command.status()?;
     if status.success() {
         Ok(())
     } else {
-        Err(format!("cargo {} failed with {status}", arguments.join(" ")).into())
+        let rendered_environment = environment
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let rendered = if rendered_environment.is_empty() {
+            format!("cargo {}", arguments.join(" "))
+        } else {
+            format!("{rendered_environment} cargo {}", arguments.join(" "))
+        };
+        Err(format!("{rendered} failed with {status}").into())
     }
 }
 
@@ -3050,4 +3165,12 @@ fn low_level_event_violations(root: &Path, tracked: &[String]) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod audit_tests {
+    #[test]
+    fn m3r1_audit_tracks_the_build_fingerprint_lifecycle_names() {
+        super::m3r1_audit().expect("the current Engine must satisfy the M3R1 lifecycle audit");
+    }
 }

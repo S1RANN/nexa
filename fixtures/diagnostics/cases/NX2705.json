@@ -1,0 +1,1 @@
+{"version":1,"code":"NX2705","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2705","expected":{"primary_text":"private_value","secondary_count":1,"related_messages":["declared with private visibility"],"related_texts":["private_value"],"message_contains":"not visible","notes":[]}}

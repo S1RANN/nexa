@@ -8,6 +8,10 @@
         "named": true
       },
       {
+        "type": "const_declaration",
+        "named": true
+      },
+      {
         "type": "enum_declaration",
         "named": true
       },
@@ -106,51 +110,11 @@
         "named": true
       },
       {
+        "type": "unary_expression",
+        "named": true
+      },
+      {
         "type": "with_expression",
-        "named": true
-      }
-    ]
-  },
-  {
-    "type": "nidl_member",
-    "named": true,
-    "subtypes": [
-      {
-        "type": "export_declaration",
-        "named": true
-      },
-      {
-        "type": "host_function_declaration",
-        "named": true
-      },
-      {
-        "type": "nidl_enum_declaration",
-        "named": true
-      },
-      {
-        "type": "nidl_struct_declaration",
-        "named": true
-      },
-      {
-        "type": "opaque_declaration",
-        "named": true
-      }
-    ]
-  },
-  {
-    "type": "nidl_type",
-    "named": true,
-    "subtypes": [
-      {
-        "type": "nidl_builtin_type",
-        "named": true
-      },
-      {
-        "type": "nidl_generic_type",
-        "named": true
-      },
-      {
-        "type": "nidl_type_identifier",
         "named": true
       }
     ]
@@ -165,6 +129,14 @@
       },
       {
         "type": "binding_statement",
+        "named": true
+      },
+      {
+        "type": "break_statement",
+        "named": true
+      },
+      {
+        "type": "continue_statement",
         "named": true
       },
       {
@@ -210,15 +182,14 @@
         "named": true
       },
       {
+        "type": "qualified_type_identifier",
+        "named": true
+      },
+      {
         "type": "type_identifier",
         "named": true
       }
     ]
-  },
-  {
-    "type": "abandon_policy_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "activation_attribute",
@@ -275,6 +246,33 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "attribute",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "activation_attribute",
+          "named": true
+        },
+        {
+          "type": "stable_attribute",
+          "named": true
+        },
+        {
+          "type": "stateful_attribute",
+          "named": true
+        },
+        {
+          "type": "test_attribute",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -410,6 +408,21 @@
     "fields": {}
   },
   {
+    "type": "break_statement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "break_keyword",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "builtin_type",
     "named": true,
     "fields": {}
@@ -453,11 +466,6 @@
     }
   },
   {
-    "type": "cancel_policy_keyword",
-    "named": true,
-    "fields": {}
-  },
-  {
     "type": "class_declaration",
     "named": true,
     "fields": {
@@ -490,14 +498,24 @@
             "named": true
           }
         ]
+      },
+      "visibility": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "visibility",
+            "named": true
+          }
+        ]
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "stateful_attribute",
+          "type": "attribute",
           "named": true
         }
       ]
@@ -555,6 +573,72 @@
     "fields": {}
   },
   {
+    "type": "const_declaration",
+    "named": true,
+    "fields": {
+      "keyword": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "const_keyword",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "identifier",
+            "named": true
+          }
+        ]
+      },
+      "type": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "type",
+            "named": true
+          }
+        ]
+      },
+      "value": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
+            "named": true
+          }
+        ]
+      },
+      "visibility": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "visibility",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "attribute",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "constructor_expression",
     "named": true,
     "fields": {
@@ -578,6 +662,21 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "continue_statement",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "continue_keyword",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -644,23 +743,28 @@
             "named": true
           }
         ]
+      },
+      "visibility": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "visibility",
+            "named": true
+          }
+        ]
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "stateful_attribute",
+          "type": "attribute",
           "named": true
         }
       ]
     }
-  },
-  {
-    "type": "enum_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "enum_variant",
@@ -704,66 +808,6 @@
     }
   },
   {
-    "type": "export_declaration",
-    "named": true,
-    "fields": {
-      "arrow": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "return_arrow_operator",
-            "named": true
-          }
-        ]
-      },
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "export_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_identifier",
-            "named": true
-          }
-        ]
-      },
-      "parameters": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_parameter_list",
-            "named": true
-          }
-        ]
-      },
-      "return_type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type",
-            "named": true
-          },
-          {
-            "type": "void_type",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
     "type": "expression_statement",
     "named": true,
     "fields": {},
@@ -802,6 +846,16 @@
           }
         ]
       }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "stable_attribute",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -879,7 +933,7 @@
         "required": true,
         "types": [
           {
-            "type": "integer_literal",
+            "type": "expression",
             "named": true
           }
         ]
@@ -889,7 +943,7 @@
         "required": true,
         "types": [
           {
-            "type": "integer_literal",
+            "type": "expression",
             "named": true
           }
         ]
@@ -915,32 +969,6 @@
         },
         {
           "type": "in_keyword",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "fuel_clause",
-    "named": true,
-    "fields": {
-      "amount": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "integer_literal",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": false,
-      "required": true,
-      "types": [
-        {
-          "type": "fuel_keyword",
           "named": true
         }
       ]
@@ -1019,23 +1047,28 @@
             "named": true
           }
         ]
+      },
+      "visibility": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "visibility",
+            "named": true
+          }
+        ]
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "activation_attribute",
+          "type": "attribute",
           "named": true
         }
       ]
     }
-  },
-  {
-    "type": "function_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "generic_name",
@@ -1094,97 +1127,16 @@
             "named": true
           },
           {
+            "type": "qualified_type_identifier",
+            "named": true
+          },
+          {
             "type": "type_identifier",
             "named": true
           }
         ]
       }
     }
-  },
-  {
-    "type": "host_function_declaration",
-    "named": true,
-    "fields": {
-      "arrow": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "return_arrow_operator",
-            "named": true
-          }
-        ]
-      },
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_function_keyword",
-            "named": true
-          }
-        ]
-      },
-      "mode": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "host_mode_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_identifier",
-            "named": true
-          }
-        ]
-      },
-      "parameters": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_parameter_list",
-            "named": true
-          }
-        ]
-      },
-      "return_type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "fuel_clause",
-          "named": true
-        },
-        {
-          "type": "request_policy",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "host_mode_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "identifier",
@@ -1215,6 +1167,10 @@
         "types": [
           {
             "type": "block",
+            "named": true
+          },
+          {
+            "type": "if_statement",
             "named": true
           }
         ]
@@ -1259,6 +1215,26 @@
     "type": "import_declaration",
     "named": true,
     "fields": {
+      "alias": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "lower_identifier",
+            "named": true
+          }
+        ]
+      },
+      "alias_keyword": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "as_keyword",
+            "named": true
+          }
+        ]
+      },
       "keyword": {
         "multiple": false,
         "required": true,
@@ -1274,11 +1250,27 @@
         "required": true,
         "types": [
           {
-            "type": "identifier",
+            "type": "host_module",
             "named": true
           },
           {
-            "type": "qualified_identifier",
+            "type": "module_path",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "interpolation",
+    "named": true,
+    "fields": {
+      "expression": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "expression",
             "named": true
           }
         ]
@@ -1501,15 +1493,26 @@
         "required": true,
         "types": [
           {
-            "type": "identifier",
-            "named": true
-          },
-          {
-            "type": "qualified_identifier",
+            "type": "module_path",
             "named": true
           }
         ]
       }
+    }
+  },
+  {
+    "type": "module_path",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "lower_identifier",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -1552,336 +1555,6 @@
     "type": "new_keyword",
     "named": true,
     "fields": {}
-  },
-  {
-    "type": "nexa_module",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "declaration",
-          "named": true
-        },
-        {
-          "type": "import_declaration",
-          "named": true
-        },
-        {
-          "type": "module_declaration",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_builtin_type",
-    "named": true,
-    "fields": {}
-  },
-  {
-    "type": "nidl_document",
-    "named": true,
-    "fields": {
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "interface_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_identifier",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "nidl_member",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_enum_declaration",
-    "named": true,
-    "fields": {
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_enum_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_identifier",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "nidl_enum_variant",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_enum_keyword",
-    "named": true,
-    "fields": {}
-  },
-  {
-    "type": "nidl_enum_variant",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_identifier",
-            "named": true
-          }
-        ]
-      },
-      "payload": {
-        "multiple": false,
-        "required": false,
-        "types": [
-          {
-            "type": "nidl_type",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "nidl_field_declaration",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_identifier",
-            "named": true
-          }
-        ]
-      },
-      "type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "nidl_function_keyword",
-    "named": true,
-    "fields": {}
-  },
-  {
-    "type": "nidl_generic_type",
-    "named": true,
-    "fields": {
-      "arguments": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_argument_list",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_builtin_type",
-            "named": true
-          },
-          {
-            "type": "nidl_type_identifier",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "nidl_parameter",
-    "named": true,
-    "fields": {
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_identifier",
-            "named": true
-          }
-        ]
-      },
-      "type": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type",
-            "named": true
-          }
-        ]
-      }
-    }
-  },
-  {
-    "type": "nidl_parameter_list",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "nidl_parameter",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_struct_declaration",
-    "named": true,
-    "fields": {
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_struct_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_identifier",
-            "named": true
-          }
-        ]
-      }
-    },
-    "children": {
-      "multiple": true,
-      "required": false,
-      "types": [
-        {
-          "type": "nidl_field_declaration",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_struct_keyword",
-    "named": true,
-    "fields": {}
-  },
-  {
-    "type": "nidl_type_argument_list",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": true,
-      "required": true,
-      "types": [
-        {
-          "type": "nidl_type",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "nidl_type_identifier",
-    "named": true,
-    "fields": {},
-    "children": {
-      "multiple": false,
-      "required": true,
-      "types": [
-        {
-          "type": "nidl_identifier",
-          "named": true
-        }
-      ]
-    }
-  },
-  {
-    "type": "opaque_declaration",
-    "named": true,
-    "fields": {
-      "keyword": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "opaque_keyword",
-            "named": true
-          }
-        ]
-      },
-      "name": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "nidl_type_identifier",
-            "named": true
-          }
-        ]
-      }
-    }
   },
   {
     "type": "parameter",
@@ -1955,29 +1628,22 @@
     }
   },
   {
-    "type": "request_policy",
+    "type": "qualified_type_identifier",
     "named": true,
-    "fields": {
-      "abandon": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "abandon_policy_keyword",
-            "named": true
-          }
-        ]
-      },
-      "cancel": {
-        "multiple": false,
-        "required": true,
-        "types": [
-          {
-            "type": "cancel_policy_keyword",
-            "named": true
-          }
-        ]
-      }
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "identifier",
+          "named": true
+        },
+        {
+          "type": "lower_identifier",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -2012,18 +1678,48 @@
     "root": true,
     "fields": {},
     "children": {
-      "multiple": false,
-      "required": true,
+      "multiple": true,
+      "required": false,
       "types": [
         {
-          "type": "nexa_module",
+          "type": "declaration",
           "named": true
         },
         {
-          "type": "nidl_document",
+          "type": "import_declaration",
+          "named": true
+        },
+        {
+          "type": "module_declaration",
           "named": true
         }
       ]
+    }
+  },
+  {
+    "type": "stable_attribute",
+    "named": true,
+    "fields": {
+      "identity": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "string_literal",
+            "named": true
+          }
+        ]
+      },
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "stable_keyword",
+            "named": true
+          }
+        ]
+      }
     }
   },
   {
@@ -2050,6 +1746,29 @@
           }
         ]
       }
+    }
+  },
+  {
+    "type": "string_literal",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "escape_sequence",
+          "named": true
+        },
+        {
+          "type": "interpolation",
+          "named": true
+        },
+        {
+          "type": "string_content",
+          "named": true
+        }
+      ]
     }
   },
   {
@@ -2085,23 +1804,28 @@
             "named": true
           }
         ]
+      },
+      "visibility": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "visibility",
+            "named": true
+          }
+        ]
       }
     },
     "children": {
-      "multiple": false,
+      "multiple": true,
       "required": false,
       "types": [
         {
-          "type": "stateful_attribute",
+          "type": "attribute",
           "named": true
         }
       ]
     }
-  },
-  {
-    "type": "struct_keyword",
-    "named": true,
-    "fields": {}
   },
   {
     "type": "struct_literal",
@@ -2123,6 +1847,22 @@
         "types": [
           {
             "type": "upper_identifier",
+            "named": true
+          }
+        ]
+      }
+    }
+  },
+  {
+    "type": "test_attribute",
+    "named": true,
+    "fields": {
+      "name": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "test_keyword",
             "named": true
           }
         ]
@@ -2170,6 +1910,51 @@
       "types": [
         {
           "type": "identifier",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "unary_expression",
+    "named": true,
+    "fields": {
+      "operator": {
+        "multiple": false,
+        "required": true,
+        "types": [
+          {
+            "type": "operator",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": false,
+      "required": true,
+      "types": [
+        {
+          "type": "expression",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
+    "type": "visibility",
+    "named": true,
+    "fields": {},
+    "children": {
+      "multiple": true,
+      "required": true,
+      "types": [
+        {
+          "type": "package_keyword",
+          "named": true
+        },
+        {
+          "type": "pub_keyword",
           "named": true
         }
       ]
@@ -2261,6 +2046,14 @@
         }
       ]
     }
+  },
+  {
+    "type": "\"",
+    "named": false
+  },
+  {
+    "type": "${",
+    "named": false
   },
   {
     "type": "(",
@@ -2363,24 +2156,25 @@
     "named": true
   },
   {
-    "type": "array",
-    "named": false
+    "type": "as_keyword",
+    "named": true
   },
   {
     "type": "await_keyword",
     "named": true
   },
   {
+    "type": "block_comment",
+    "named": true,
+    "extra": true
+  },
+  {
     "type": "bool",
     "named": false
   },
   {
-    "type": "buffer",
-    "named": false
-  },
-  {
-    "type": "cancel_task",
-    "named": false
+    "type": "break_keyword",
+    "named": true
   },
   {
     "type": "class_keyword",
@@ -2391,7 +2185,15 @@
     "named": false
   },
   {
+    "type": "const_keyword",
+    "named": true
+  },
+  {
     "type": "constructor_name",
+    "named": true
+  },
+  {
+    "type": "continue_keyword",
     "named": true
   },
   {
@@ -2403,15 +2205,20 @@
     "named": false
   },
   {
+    "type": "doc_comment",
+    "named": true,
+    "extra": true
+  },
+  {
     "type": "else_keyword",
     "named": true
   },
   {
-    "type": "enum",
-    "named": false
+    "type": "enum_keyword",
+    "named": true
   },
   {
-    "type": "export_keyword",
+    "type": "escape_sequence",
     "named": true
   },
   {
@@ -2435,20 +2242,16 @@
     "named": true
   },
   {
-    "type": "fn",
-    "named": false
-  },
-  {
     "type": "for_keyword",
     "named": true
   },
   {
-    "type": "fuel_keyword",
+    "type": "function_keyword",
     "named": true
   },
   {
-    "type": "host_request",
-    "named": false
+    "type": "host_module",
+    "named": true
   },
   {
     "type": "i32",
@@ -2479,12 +2282,13 @@
     "named": true
   },
   {
-    "type": "interface_keyword",
+    "type": "let_keyword",
     "named": true
   },
   {
-    "type": "let_keyword",
-    "named": true
+    "type": "line_comment",
+    "named": true,
+    "extra": true
   },
   {
     "type": "lower_identifier",
@@ -2519,15 +2323,11 @@
     "named": false
   },
   {
-    "type": "nidl_identifier",
-    "named": true
-  },
-  {
-    "type": "opaque_keyword",
-    "named": true
-  },
-  {
     "type": "operator",
+    "named": true
+  },
+  {
+    "type": "package_keyword",
     "named": true
   },
   {
@@ -2535,24 +2335,16 @@
     "named": false
   },
   {
+    "type": "pub_keyword",
+    "named": true
+  },
+  {
     "type": "replace",
-    "named": false
-  },
-  {
-    "type": "request",
-    "named": false
-  },
-  {
-    "type": "resource_token",
     "named": false
   },
   {
     "type": "return_arrow_operator",
     "named": true
-  },
-  {
-    "type": "return_error",
-    "named": false
   },
   {
     "type": "return_keyword",
@@ -2567,8 +2359,8 @@
     "named": true
   },
   {
-    "type": "snapshot",
-    "named": false
+    "type": "stable_keyword",
+    "named": true
   },
   {
     "type": "stateful_keyword",
@@ -2579,28 +2371,20 @@
     "named": false
   },
   {
-    "type": "string_literal",
+    "type": "string_content",
     "named": true
   },
   {
-    "type": "struct",
-    "named": false
-  },
-  {
-    "type": "sync",
-    "named": false
+    "type": "struct_keyword",
+    "named": true
   },
   {
     "type": "task",
     "named": false
   },
   {
-    "type": "token",
-    "named": false
-  },
-  {
-    "type": "trap",
-    "named": false
+    "type": "test_keyword",
+    "named": true
   },
   {
     "type": "true",
@@ -2612,10 +2396,6 @@
   },
   {
     "type": "var_keyword",
-    "named": true
-  },
-  {
-    "type": "void_type",
     "named": true
   },
   {

@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::{
-    CapabilitySet, EngineDiagnostic, EngineDiagnosticSummary, EngineHealth, PackageId,
-    PackageStatus, PackageVersion, SourceHash, SourceId,
+    BuildFingerprint, CandidateIdentity, CapabilitySet, EngineDiagnostic, EngineDiagnosticSummary,
+    EngineHealth, PackageId, PackageStatus, PackageVersion, SourceId,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -35,7 +35,7 @@ pub struct DevelopmentInspection {
     pub terminal_generations: u64,
     pub duplicate_terminals: u64,
     pub generations_without_terminal: u64,
-    pub desired_hash_mismatches_rejected: u64,
+    pub desired_build_fingerprint_mismatches_rejected: u64,
     pub worker: crate::WorkerInspection,
 }
 
@@ -47,13 +47,15 @@ pub struct PackageInspection {
     pub version: PackageVersion,
     pub effective_capabilities: CapabilitySet,
     pub active_epoch: Option<u64>,
-    pub source_hash: SourceHash,
-    pub desired_hash: Option<SourceHash>,
+    pub active_identity: Option<CandidateIdentity>,
+    pub active_linked_state_fingerprint: Option<nexa::LinkedStateFingerprint>,
+    pub build_fingerprint: BuildFingerprint,
+    pub desired_build_fingerprint: Option<BuildFingerprint>,
     pub candidate_generation: u64,
     pub terminal_generations: u64,
     pub duplicate_terminals: u64,
     pub generations_without_terminal: u64,
-    pub desired_hash_mismatches_rejected: u64,
+    pub desired_build_fingerprint_mismatches_rejected: u64,
     pub latest_terminal_generation: Option<u64>,
     pub latest_terminal_kind: Option<crate::CandidateTerminalKind>,
     pub tasks: u64,
@@ -72,7 +74,7 @@ pub struct PackageInspection {
 pub struct PackageMetric {
     pub tick: u64,
     pub discovery_duration: Duration,
-    pub source_hash_duration: Duration,
+    pub build_fingerprint_duration: Duration,
     pub change_to_stable_duration: Duration,
     pub candidate_queue_duration: Duration,
     pub compile_duration: Duration,
@@ -94,11 +96,9 @@ pub struct PackageMetric {
 
 #[derive(Clone, Debug)]
 pub struct ReloadReport {
-    pub package_id: PackageId,
-    pub candidate_generation: u64,
+    pub identity: CandidateIdentity,
     pub old_epoch: u64,
     pub new_epoch: Option<u64>,
-    pub source_hash: SourceHash,
     pub change_to_stable_duration: Duration,
     pub queue_duration: Duration,
     pub compile_duration: Duration,
@@ -128,8 +128,7 @@ pub enum ReloadReportOutcome {
 
 #[derive(Clone, Debug)]
 pub struct ReloadReportSummary {
-    pub package_id: PackageId,
-    pub candidate_generation: u64,
+    pub identity: CandidateIdentity,
     pub old_epoch: u64,
     pub new_epoch: Option<u64>,
     pub outcome: ReloadReportOutcome,
@@ -140,8 +139,7 @@ impl ReloadReport {
     #[must_use]
     pub fn summary(&self) -> ReloadReportSummary {
         ReloadReportSummary {
-            package_id: self.package_id.clone(),
-            candidate_generation: self.candidate_generation,
+            identity: self.identity.clone(),
             old_epoch: self.old_epoch,
             new_epoch: self.new_epoch,
             outcome: self.outcome,

@@ -1,0 +1,11 @@
+module main;
+
+@stable("same-id")
+pub fn first() -> i32 {
+    return 1;
+}
+
+@stable("same-id")
+pub fn second() -> i32 {
+    return 2;
+}

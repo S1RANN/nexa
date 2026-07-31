@@ -19,7 +19,9 @@ use crate::{
 };
 
 const MODEL_HOST: crate::StableId = crate::StableId(0x4d31_5245_414c_484f);
-const MODEL_SCHEMA: crate::StableId = crate::StableId(0x4d31_5245_414c_5354);
+fn model_schema() -> nexa_core::StateSchemaFingerprint {
+    nexa_bytecode::StateSchema::default().fingerprint()
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum RuntimeTaskLifecycle {
@@ -165,7 +167,7 @@ impl Default for RealmRuntimeModelAdapter {
         .expect("model adapter Realm");
         let replacement_module = async_module(false);
         let module = realm
-            .load_module(replacement_module.clone(), MODEL_HOST, MODEL_SCHEMA)
+            .load_module(replacement_module.clone(), MODEL_HOST, model_schema())
             .expect("model adapter module");
         let scope = realm.create_scope(None).expect("model adapter scope");
         Self {
@@ -662,7 +664,7 @@ impl ProbeFixture {
         )
         .expect("Probe Realm");
         let module = realm
-            .load_module(async_module(false), MODEL_HOST, MODEL_SCHEMA)
+            .load_module(async_module(false), MODEL_HOST, model_schema())
             .expect("Probe module");
         let scope = realm.create_scope(None).expect("Probe scope");
 
@@ -998,7 +1000,9 @@ fn async_module(failing_migration: bool) -> VerifiedModule {
         abandon_error: None,
     };
     let mut builder = ModuleBuilder::new();
-    builder.metadata(MODEL_HOST, MODEL_SCHEMA).enum_type(result);
+    builder
+        .metadata(MODEL_HOST, model_schema())
+        .enum_type(result);
     if failing_migration {
         let mut migration = FunctionBuilder::new(
             Signature {

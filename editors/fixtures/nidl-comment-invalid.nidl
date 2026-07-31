@@ -1,0 +1,4 @@
+// NIDL intentionally does not support comments.
+interface InvalidHost {
+    sync fn value() -> i32;
+}
