@@ -1151,7 +1151,7 @@ impl CheckedInterpreter {
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
-                    let reference = heap.allocate_string(value)?;
+                    let reference = heap.load_string_literal(value)?;
                     let hash = heap.string_hash(reference)?;
                     set_register(
                         &mut continuation.arena,

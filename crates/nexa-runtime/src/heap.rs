@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 
 use nexa_core::StableId;
@@ -588,6 +588,12 @@ pub struct Heap {
     host_transaction_active: bool,
     failure_injector: RuntimeFailureInjector,
     counters: VmAllocationCounters,
+    /// WP56 literal memoization: content-keyed cache of previously loaded
+    /// string constants. Entries are NOT roots; a hit revalidates the
+    /// generation-protected reference and its content, and a collected or
+    /// repurposed slot simply falls back to a fresh allocation. No root
+    /// management, no unload bookkeeping, no leak.
+    string_literal_cache: BTreeMap<String, GcRef>,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -686,6 +692,7 @@ impl Heap {
             host_transaction_active: false,
             failure_injector: RuntimeFailureInjector::default(),
             counters: VmAllocationCounters::default(),
+            string_literal_cache: BTreeMap::new(),
         }
     }
 
@@ -700,6 +707,27 @@ impl Heap {
         let mut reservation = self.preflight(1)?;
         let value = value.to_owned();
         Ok(self.commit(&mut reservation, Object::String(value)))
+    }
+
+    /// WP56 literal load: returns the cached live copy of a string constant
+    /// when its content still matches, otherwise allocates and re-caches.
+    /// Hot literal loads therefore create no new String objects.
+    pub fn load_string_literal(&mut self, value: &str) -> Result<GcRef, HeapError> {
+        if let Some(reference) = self.string_literal_cache.get(value).copied()
+            && matches!(
+                self.slots
+                    .get(reference.index as usize)
+                    .filter(|slot| slot.generation == reference.generation)
+                    .and_then(|slot| slot.object.as_ref()),
+                Some(Object::String(cached)) if cached == value
+            )
+        {
+            return Ok(reference);
+        }
+        let reference = self.allocate_string(value)?;
+        self.string_literal_cache
+            .insert(value.to_owned(), reference);
+        Ok(reference)
     }
 
     pub fn concat_strings(&mut self, lhs: GcRef, rhs: GcRef) -> Result<GcRef, HeapError> {
@@ -2847,6 +2875,23 @@ mod tests {
             heap.allocate_class(StableId::from_name("Empty"), &[])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn string_literal_cache_shares_live_copies_and_survives_collection() {
+        let mut heap = Heap::new(8);
+        let first = heap.load_string_literal("pooled").unwrap();
+        let second = heap.load_string_literal("pooled").unwrap();
+        assert_eq!(first, second, "hot literal loads share one object");
+        assert_eq!(heap.vm_allocation_counters().string_allocations, 1);
+
+        // Cache entries are not roots: an unrooted literal is collected,
+        // and the next load safely re-allocates instead of resurrecting.
+        let stats = heap.collect(&GcRoots::default()).unwrap();
+        assert_eq!(stats.reclaimed, 1);
+        let third = heap.load_string_literal("pooled").unwrap();
+        assert_ne!(first, third, "collected entries fall back to allocation");
+        assert_eq!(heap.string(third), Ok("pooled"));
     }
 
     #[test]
