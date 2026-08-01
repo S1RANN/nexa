@@ -941,8 +941,8 @@ impl CompiledStandaloneArtifact {
 /// Verified cumulative candidate for one transactional REPL cell.
 ///
 /// `cell` is the compiler-validated stable entrypoint marker for this exact candidate. The
-/// analysis session token is deliberately retained separately by [`ReplSession`], so compiling
-/// or inspecting this artifact cannot commit semantic state.
+/// analysis session token is deliberately retained separately by [`crate::ReplSession`], so
+/// compiling or inspecting this artifact cannot commit semantic state.
 #[derive(Clone, Debug)]
 pub struct CompiledReplCellArtifact {
     package: CompiledPackageArtifact,

@@ -3388,7 +3388,13 @@ impl RealmRuntime {
                 .map(|root| root.state.object_count())
                 .sum(),
         );
-        ledger.retired_modules = crate::ledger::count(self.retired_modules.entries.len());
+        ledger.retired_modules = crate::ledger::count(
+            self.retired_modules
+                .entries
+                .iter()
+                .filter(|record| !record.released)
+                .count(),
+        );
         ledger
     }
 

@@ -449,6 +449,7 @@ fn transient_resource_growth(before: EngineHealth, after: EngineHealth) -> bool 
 fn m4r1_nidl_reload_stress() {
     const ITERATIONS: u64 = 100;
     const REVISION: i32 = 50;
+    const NAME_ALPHABET: &[u8; 26] = b"abcdefghijklmnopqrstuvwxyz";
     const BASE_CONTRACT: &str = "contract TestHost {
         host {
             fn revision() -> i32;
@@ -506,6 +507,10 @@ fn m4r1_nidl_reload_stress() {
         script: Arc::clone(&script),
     };
     let mut engine = NexaEngine::builder(contract)
+        .host_contract_source(
+            nexa::SourceIdentity::standalone("contracts/m4r1-reload-stress.nidl"),
+            BASE_CONTRACT,
+        )
         .host_factory(move |_: &PackageContext| {
             Box::new(NidlReloadRegistry {
                 contract_runtime_id,
@@ -518,10 +523,10 @@ fn m4r1_nidl_reload_stress() {
         .build()
         .expect("build NIDL reload stress Engine");
     engine.discover().expect("discover NIDL stress Package");
-    engine
-        .enable_defaults()
-        .expect("enable NIDL stress Package");
     let package_id = PackageId::new("stress.nidl").expect("NIDL stress Package ID");
+    engine
+        .enable(&package_id)
+        .expect("enable NIDL stress Package");
     assert_eq!(
         engine
             .call::<Run>(&package_id, &7)
@@ -535,7 +540,13 @@ fn m4r1_nidl_reload_stress() {
     let mut active_delta = 1_i32;
 
     for iteration in 0..ITERATIONS {
-        let host_function = format!("revision_{iteration:03}");
+        let high = usize::try_from(iteration / 26).expect("stress iteration fits usize");
+        let low = usize::try_from(iteration % 26).expect("stress iteration fits usize");
+        let host_function = format!(
+            "revision_{}{}",
+            char::from(NAME_ALPHABET[high]),
+            char::from(NAME_ALPHABET[low])
+        );
         let changed_contract_source = format!(
             "contract TestHost {{\n\
                  host {{\n\
