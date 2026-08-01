@@ -528,6 +528,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "nexa-benchmark-v7"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "nexa-bytecode",
+ "nexa-compiler",
+ "nexa-core",
+ "nexa-migrate",
+ "nexa-runtime",
+ "nexa-verifier",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nexa-bytecode"
 version = "0.1.0"
 dependencies = [
