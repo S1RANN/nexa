@@ -25,7 +25,6 @@ pub enum ReloadLifecycle {
     Idle,
     Staging,
     Active,
-    ActivationFaulted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,10 +75,24 @@ pub enum RealmRejection {
     RealmDropped,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RealmModel {
     snapshot: RealmSnapshot,
+    next_epoch: u64,
     dropped: bool,
+}
+
+impl Default for RealmModel {
+    fn default() -> Self {
+        Self {
+            snapshot: RealmSnapshot {
+                epoch: 1,
+                ..RealmSnapshot::default()
+            },
+            next_epoch: 2,
+            dropped: false,
+        }
+    }
 }
 
 impl RealmModel {
@@ -98,7 +111,7 @@ impl RealmModel {
                 if matches!(
                     self.snapshot.task,
                     TaskLifecycle::Vacant | TaskLifecycle::Terminal
-                ) && self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
+                ) =>
             {
                 self.snapshot.task = TaskLifecycle::Ready;
                 self.snapshot.task_resources = 1;
@@ -148,28 +161,24 @@ impl RealmModel {
                 self.snapshot.task = TaskLifecycle::Terminal;
                 self.snapshot.task_resources = 0;
             }
-            RealmEvent::RestartReload
-                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
-            {
+            RealmEvent::RestartReload => {
+                let candidate_epoch = self.allocate_candidate_epoch();
                 self.restart_quiesce();
-                self.snapshot.epoch += 1;
+                self.snapshot.epoch = candidate_epoch;
                 self.snapshot.publications += 1;
                 self.snapshot.reload = ReloadLifecycle::Active;
             }
-            RealmEvent::MigrationFailure
-                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
-            {
+            RealmEvent::MigrationFailure => {
                 let prior_reload = self.snapshot.reload;
+                self.allocate_candidate_epoch();
                 self.restart_quiesce();
                 self.snapshot.reload = prior_reload;
             }
-            RealmEvent::ActivationFailure
-                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
-            {
+            RealmEvent::ActivationFailure => {
+                self.allocate_candidate_epoch();
                 self.restart_quiesce();
-                self.snapshot.epoch += 1;
                 self.snapshot.publications += 1;
-                self.snapshot.reload = ReloadLifecycle::ActivationFaulted;
+                self.snapshot.reload = ReloadLifecycle::Active;
             }
             RealmEvent::LateCompletion if self.snapshot.request == RequestLifecycle::Detached => {
                 self.snapshot.late_completions_discarded += 1;
@@ -183,20 +192,11 @@ impl RealmModel {
                 self.snapshot.request_resources = 0;
                 self.dropped = true;
             }
-            RealmEvent::Poll | RealmEvent::Cancel => {
+            RealmEvent::Poll | RealmEvent::Cancel | RealmEvent::Spawn => {
                 return Err(RealmRejection::InvalidTaskState);
             }
             RealmEvent::CompleteRequest | RealmEvent::LateCompletion => {
                 return Err(RealmRejection::InvalidRequestState);
-            }
-            RealmEvent::Spawn if self.snapshot.reload != ReloadLifecycle::ActivationFaulted => {
-                return Err(RealmRejection::InvalidTaskState);
-            }
-            RealmEvent::RestartReload
-            | RealmEvent::MigrationFailure
-            | RealmEvent::ActivationFailure
-            | RealmEvent::Spawn => {
-                return Err(RealmRejection::InvalidReloadState);
             }
         }
         debug_assert!(self.invariants_hold());
@@ -212,6 +212,15 @@ impl RealmModel {
         let request_balanced = (self.snapshot.request == RequestLifecycle::Pending)
             == (self.snapshot.request_resources == 1);
         task_balanced && request_balanced
+    }
+
+    fn allocate_candidate_epoch(&mut self) -> u64 {
+        let epoch = self.next_epoch;
+        self.next_epoch = self
+            .next_epoch
+            .checked_add(1)
+            .expect("bounded reference-model epoch overflow");
+        epoch
     }
 
     fn restart_quiesce(&mut self) {

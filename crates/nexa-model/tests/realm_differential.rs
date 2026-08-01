@@ -456,7 +456,6 @@ const fn runtime_snapshot(snapshot: RuntimeRealmSnapshot) -> RealmSnapshot {
             RuntimeReloadLifecycle::Idle => ReloadLifecycle::Idle,
             RuntimeReloadLifecycle::Staging => ReloadLifecycle::Staging,
             RuntimeReloadLifecycle::Active => ReloadLifecycle::Active,
-            RuntimeReloadLifecycle::ActivationFaulted => ReloadLifecycle::ActivationFaulted,
         },
         epoch: snapshot.epoch,
         task_resources: snapshot.task_resources,

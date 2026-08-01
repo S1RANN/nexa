@@ -19,6 +19,14 @@ comments, documentation comments, and string interpolation. NIDL v2 covers
 functions, policy attributes, PascalCase generic types, and all three comment
 forms including `///` documentation.
 
+`tree-sitter-nexa/src/parser.c` is a deterministic build artifact and is not
+versioned because the generated C parser exceeds the repository file-size
+budget. `pnpm generate` materializes it locally, `pnpm check` regenerates and
+validates it in an isolated directory, and the Zed packaging step commits it
+into the self-contained grammar repository shipped with the extension.
+`src/grammar.json` and `src/node-types.json` remain versioned and are checked
+byte-for-byte.
+
 Build everything from the repository root:
 
 ```sh

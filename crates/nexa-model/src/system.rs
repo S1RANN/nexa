@@ -453,7 +453,6 @@ pub enum RealmReloadState {
     PreCommit,
     Published,
     Activating,
-    ActivationFaulted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -461,7 +460,6 @@ pub enum RealmModuleLifecycle {
     Active,
     Staging,
     Activating,
-    ActivationFaulted,
     Retired,
 }
 
@@ -554,8 +552,10 @@ impl RealmSystemSnapshot {
                 self.candidate_lifecycle = Some(RealmModuleLifecycle::Active);
             }
             RealmSystemEvent::ActivationFailed if self.reload == RealmReloadState::Activating => {
-                self.reload = RealmReloadState::ActivationFaulted;
-                self.candidate_lifecycle = Some(RealmModuleLifecycle::ActivationFaulted);
+                self.reload = RealmReloadState::Idle;
+                self.active_epoch = 0;
+                self.old_lifecycle = RealmModuleLifecycle::Active;
+                self.candidate_lifecycle = None;
             }
             RealmSystemEvent::RollbackReload if self.reload == RealmReloadState::PreCommit => {
                 self.reload = RealmReloadState::Idle;
@@ -573,19 +573,12 @@ impl RealmSystemSnapshot {
         }
         if matches!(
             self.reload,
-            RealmReloadState::Published
-                | RealmReloadState::Activating
-                | RealmReloadState::ActivationFaulted
+            RealmReloadState::Published | RealmReloadState::Activating
         ) && (self.active_epoch != 1
             || self.old_lifecycle != RealmModuleLifecycle::Retired
             || self.old_task_live)
         {
             return Err("published root restored old execution");
-        }
-        if self.reload == RealmReloadState::ActivationFaulted
-            && self.candidate_lifecycle != Some(RealmModuleLifecycle::ActivationFaulted)
-        {
-            return Err("activation failure did not fault candidate");
         }
         if self.active_epoch == 0 && self.old_lifecycle != RealmModuleLifecycle::Active {
             return Err("pre-publication old root is not active");
@@ -688,7 +681,10 @@ pub fn all_events(config: SystemConfig) -> Vec<SystemEvent> {
 
 #[cfg(test)]
 mod tests {
-    use super::{RealmSystemConfig, SystemConfig, explore_realm_runtime, explore_task_scope};
+    use super::{
+        RealmModuleLifecycle, RealmReloadState, RealmSystemConfig, RealmSystemEvent, SystemConfig,
+        explore_realm_runtime, explore_task_scope, replay_realm_runtime,
+    };
 
     #[test]
     fn task_scope_system_explores_two_by_two_without_invariant_failure() {
@@ -711,5 +707,31 @@ mod tests {
         let report = explore_realm_runtime(config);
         assert!(report.failures.is_empty(), "{:?}", report.failures);
         assert!(report.visited_worlds >= 8);
+    }
+
+    #[test]
+    fn activation_failure_restores_a_runnable_last_known_good_root() {
+        let config = RealmSystemConfig::parse(include_str!(
+            "../../../specs/systems/realm_runtime.system.spec"
+        ))
+        .unwrap();
+        let mut snapshot = replay_realm_runtime(
+            config,
+            [
+                RealmSystemEvent::BeginReload,
+                RealmSystemEvent::PublishReload,
+                RealmSystemEvent::BeginActivation,
+                RealmSystemEvent::ActivationFailed,
+            ],
+        )
+        .expect("activation failure rolls back");
+
+        assert_eq!(snapshot.reload, RealmReloadState::Idle);
+        assert_eq!(snapshot.active_epoch, 0);
+        assert_eq!(snapshot.old_lifecycle, RealmModuleLifecycle::Active);
+        assert_eq!(snapshot.candidate_lifecycle, None);
+        snapshot
+            .apply(RealmSystemEvent::StartOldTask, config)
+            .expect("last-known-good root remains runnable");
     }
 }

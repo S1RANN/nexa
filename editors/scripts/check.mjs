@@ -22,11 +22,11 @@ import {
   zedDirectory,
 } from "./lib.mjs";
 
-const generatedGrammarFiles = [
-  "src/parser.c",
+const versionedGeneratedGrammarFiles = [
   "src/grammar.json",
   "src/node-types.json",
 ];
+const generatedParser = "src/parser.c";
 
 const require = createRequire(import.meta.url);
 const { OnigScanner, OnigString, loadWASM } = vscodeOniguruma;
@@ -585,7 +585,7 @@ async function validateTextMateTokenization() {
   }
 }
 
-function generateAndCompare(source, temporaryDirectory) {
+function generateAndCompare(source, temporaryDirectory, versionedParser) {
   const name = path.basename(source);
   const temporaryGrammar = path.join(temporaryDirectory, name);
   fs.mkdirSync(temporaryGrammar, { recursive: true });
@@ -602,13 +602,27 @@ function generateAndCompare(source, temporaryDirectory) {
       XDG_CACHE_HOME: path.join(temporaryDirectory, "cache"),
     },
   });
-  for (const file of generatedGrammarFiles) {
+  for (const file of versionedGeneratedGrammarFiles) {
     assertFileEquals(
       path.join(source, file),
       path.join(temporaryGrammar, file),
       `${name}/${file}`,
     );
   }
+  const generatedParserPath = path.join(temporaryGrammar, generatedParser);
+  assert(
+    fs.statSync(generatedParserPath).size > 0,
+    `${name}/${generatedParser} was not generated`,
+  );
+  const sourceParserPath = path.join(source, generatedParser);
+  if (versionedParser || fs.existsSync(sourceParserPath)) {
+    assertFileEquals(
+      sourceParserPath,
+      generatedParserPath,
+      `${name}/${generatedParser}`,
+    );
+  }
+  return temporaryGrammar;
 }
 
 function checkGeneratedFiles(temporaryDirectory) {
@@ -616,8 +630,10 @@ function checkGeneratedFiles(temporaryDirectory) {
     path.join(editorsDirectory, "language-syntax.json"),
     path.join(temporaryDirectory, "language-syntax.json"),
   );
-  generateAndCompare(grammarDirectory, temporaryDirectory);
-  generateAndCompare(idlGrammarDirectory, temporaryDirectory);
+  const generatedGrammars = {
+    nexa: generateAndCompare(grammarDirectory, temporaryDirectory, false),
+    nidl: generateAndCompare(idlGrammarDirectory, temporaryDirectory, true),
+  };
 
   for (const [file, grammar] of textMateGrammars()) {
     const actual = read(path.join(vscodeDirectory, "syntaxes", file));
@@ -626,6 +642,7 @@ function checkGeneratedFiles(temporaryDirectory) {
       `vscode/syntaxes/${file} is out of date`,
     );
   }
+  return generatedGrammars;
 }
 
 function parseExamples(grammar, files, environment) {
@@ -664,21 +681,25 @@ function parseExamples(grammar, files, environment) {
   );
 }
 
-function validateExamplesAndQueries(temporaryDirectory) {
+function validateExamplesAndQueries(temporaryDirectory, generatedGrammars) {
   const environment = {
     ...process.env,
     XDG_CACHE_HOME: path.join(temporaryDirectory, "cache"),
   };
-  parseExamples(grammarDirectory, nexaExamples, environment);
-  parseExamples(idlGrammarDirectory, nidlExamples, environment);
+  parseExamples(generatedGrammars.nexa, nexaExamples, environment);
+  parseExamples(generatedGrammars.nidl, nidlExamples, environment);
 
   for (const [grammar, query, example, expectedCaptures] of queryChecks) {
+    const generatedGrammar =
+      grammar === grammarDirectory
+        ? generatedGrammars.nexa
+        : generatedGrammars.nidl;
     const result = run(
       "tree-sitter",
       [
         "query",
         "--grammar-path",
-        grammar,
+        generatedGrammar,
         path.join(editorsDirectory, query),
         example,
       ],
@@ -708,8 +729,8 @@ try {
   validateZedFiles();
   validateSyntaxContract();
   await validateTextMateTokenization();
-  checkGeneratedFiles(temporaryDirectory);
-  validateExamplesAndQueries(temporaryDirectory);
+  const generatedGrammars = checkGeneratedFiles(temporaryDirectory);
+  validateExamplesAndQueries(temporaryDirectory, generatedGrammars);
   console.log(
     `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${nidlExamples.length} NIDL v2 examples including comments, ${queryChecks.length} queries).`,
   );

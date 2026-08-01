@@ -78,6 +78,19 @@ function packageGrammar(source, name, commitMessage) {
     );
   fs.writeFileSync(path.join(destination, "grammar.js"), grammarSource);
 
+  const generatedGrammar = spawnSync("tree-sitter", ["generate"], {
+    cwd: destination,
+    encoding: "utf8",
+  });
+  if (generatedGrammar.error) {
+    throw generatedGrammar.error;
+  }
+  if (generatedGrammar.status !== 0) {
+    throw new Error(
+      `packaged ${name} grammar generation failed\n${generatedGrammar.stdout}${generatedGrammar.stderr}`,
+    );
+  }
+
   runGit(
     ["init", "--quiet", "--initial-branch=main", "--object-format=sha1"],
     destination,

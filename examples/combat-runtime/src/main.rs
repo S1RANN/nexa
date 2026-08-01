@@ -719,26 +719,27 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )));
     };
     activation_probe.require_consumed().map_err(HostFailure)?;
-    assert_eq!(realm.active_root(), Some(fault));
-    assert_eq!(
-        realm.module_lifecycle(fault)?,
-        ModuleLifecycle::ActivationFaulted
-    );
+    assert_eq!(realm.active_root(), Some(v2));
+    assert_eq!(realm.module_lifecycle(v2)?, ModuleLifecycle::Active);
     assert!(
-        realm
-            .spawn_export::<generated::Update>(
-                fault,
-                &generated::UpdateArgs { entity: 1 },
-                StepConfig {
-                    owner: scope,
-                    priority: 1,
-                    fuel_slice: 32,
-                    cumulative_budget: 1_024,
-                    limits: TaskLimits::default(),
-                },
-            )
-            .is_err()
+        realm.module_lifecycle(fault).is_err(),
+        "the released activation-fault Candidate remained addressable"
     );
+    let recovered = realm.spawn_export::<generated::Update>(
+        v2,
+        &generated::UpdateArgs { entity: 1 },
+        StepConfig {
+            owner: scope,
+            priority: 1,
+            fuel_slice: 32,
+            cumulative_budget: 1_024,
+            limits: TaskLimits::default(),
+        },
+    )?;
+    assert!(matches!(
+        realm.cancel_task(recovered, nexa_runtime::CancelReason::HostCancelled)?,
+        TaskPoll::Cancelled(nexa_runtime::CancelReason::HostCancelled)
+    ));
     assert!(matches!(
         realm.terminal_record(live).map(|record| &record.reason),
         Some(nexa_runtime::TaskTerminalReason::Cancelled(

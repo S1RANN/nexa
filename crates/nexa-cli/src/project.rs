@@ -2284,10 +2284,11 @@ mod tests {
 
     #[test]
     fn project_config_rejects_the_removed_required_exports_key() {
-        let legacy = "schema = 2\n\
-                      contract = \"api.nidl\"\n\
-                      required_exports = []\n\
-                      sources = []\n";
+        let legacy = r#"schema = 2
+contract = "api.nidl"
+required_exports = []
+sources = []
+"#;
         assert!(toml::from_str::<ProjectConfig>(legacy).is_err());
     }
 

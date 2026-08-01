@@ -10,12 +10,11 @@ use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
     CancelReason, HostCallOutcome, HostCompletionResult, HostFunctionAuthority, HostPayload,
-    HostRegistry, HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, ModuleLifecycle,
-    PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState,
-    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeFailurePoint,
-    RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger, ScopeHandle,
-    SlotAllocError, StepConfig, TaskError, TaskHandle, TaskLimits, TaskPoll, TaskState, TickBudget,
-    ValueType,
+    HostRegistry, HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, PendingHostRequest,
+    RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState, ResourceContext,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeFailurePoint, RuntimeHost,
+    RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger, ScopeHandle, SlotAllocError, StepConfig,
+    TaskError, TaskHandle, TaskLimits, TaskPoll, TaskState, TickBudget, ValueType,
 };
 
 const MODEL_HOST: crate::StableId = crate::StableId(0x4d31_5245_414c_484f);
@@ -53,7 +52,6 @@ pub enum RuntimeReloadLifecycle {
     Idle,
     Staging,
     Active,
-    ActivationFaulted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -515,6 +513,7 @@ impl RealmRuntimeModelAdapter {
     fn activation_failure(&mut self) -> Result<(), RuntimeRealmRejection> {
         let request_was_pending = self.snapshot().request == RuntimeRequestLifecycle::Pending;
         self.counters.reload_attempts = self.counters.reload_attempts.saturating_add(1);
+        let old = self.module;
         let realm = self.realm.as_mut().expect("live adapter has a Realm");
         let probe = realm
             .failure_injector()
@@ -532,7 +531,15 @@ impl RealmRuntimeModelAdapter {
         probe
             .require_consumed()
             .unwrap_or_else(|error| panic!("ActivationTrap probe not consumed: {error:?}"));
-        self.module = candidate;
+        assert_eq!(
+            realm.active_root(),
+            Some(old),
+            "activation failure did not restore the last-known-good root"
+        );
+        assert!(
+            realm.module_lifecycle(candidate).is_err(),
+            "activation-fault candidate remained addressable after rollback"
+        );
         self.capture_detached_ticket(request_was_pending);
         Ok(())
     }
@@ -840,6 +847,10 @@ fn normalize_snapshot(
     let inspection = realm.inspection_snapshot();
     let ledger = realm.resource_ledger();
     let accounting = realm.completion_accounting();
+    let active_epoch = inspection
+        .active_root
+        .as_ref()
+        .map_or(0, |module| module.epoch);
     let task_lifecycle = task.map_or(RuntimeTaskLifecycle::Vacant, |handle| {
         inspection
             .tasks
@@ -880,29 +891,21 @@ fn normalize_snapshot(
             }
         }
     });
-    let activation_faulted = inspection
-        .active_root
-        .as_ref()
-        .is_some_and(|module| module.lifecycle == ModuleLifecycle::ActivationFaulted);
-    let reload = if activation_faulted {
-        RuntimeReloadLifecycle::ActivationFaulted
-    } else {
-        match inspection.reload.state {
-            ReloadInspectionState::ActivationFaulted => RuntimeReloadLifecycle::ActivationFaulted,
-            ReloadInspectionState::Preparing
-            | ReloadInspectionState::Quiescing
-            | ReloadInspectionState::Staging
-            | ReloadInspectionState::Committing
-            | ReloadInspectionState::Published
-            | ReloadInspectionState::Activating => RuntimeReloadLifecycle::Staging,
-            ReloadInspectionState::Idle
-            | ReloadInspectionState::Completed
-            | ReloadInspectionState::RolledBack => {
-                if publications == 0 {
-                    RuntimeReloadLifecycle::Idle
-                } else {
-                    RuntimeReloadLifecycle::Active
-                }
+    let reload = match inspection.reload.state {
+        ReloadInspectionState::Preparing
+        | ReloadInspectionState::Quiescing
+        | ReloadInspectionState::Staging
+        | ReloadInspectionState::Committing
+        | ReloadInspectionState::Published
+        | ReloadInspectionState::Activating
+        | ReloadInspectionState::ActivationFaulted => RuntimeReloadLifecycle::Staging,
+        ReloadInspectionState::Idle
+        | ReloadInspectionState::Completed
+        | ReloadInspectionState::RolledBack => {
+            if publications == 0 {
+                RuntimeReloadLifecycle::Idle
+            } else {
+                RuntimeReloadLifecycle::Active
             }
         }
     };
@@ -920,7 +923,7 @@ fn normalize_snapshot(
         task: task_lifecycle,
         request: request_lifecycle,
         reload,
-        epoch: publications,
+        epoch: active_epoch,
         task_resources: u8::from(ledger.tasks != 0),
         request_resources: u8::from(ledger.requests != 0),
         cancelled_tasks: u64::try_from(terminal_cancellations).unwrap_or(u64::MAX),
@@ -1148,5 +1151,30 @@ mod tests {
             1
         );
         assert_eq!(adapter.snapshot().request, RuntimeRequestLifecycle::Pending);
+    }
+
+    #[test]
+    fn activation_failure_keeps_the_last_known_good_module_callable() {
+        let mut adapter = RealmRuntimeModelAdapter::default();
+        let old = adapter.module;
+        let before = adapter.snapshot();
+
+        adapter
+            .apply(RuntimeRealmEvent::ActivationFailure)
+            .expect("activation failure outcome");
+
+        let after = adapter.snapshot();
+        assert_eq!(adapter.module, old);
+        assert_eq!(after.reload, RuntimeReloadLifecycle::Active);
+        assert_eq!(after.epoch, before.epoch);
+        assert_eq!(after.publications, before.publications + 1);
+        assert_eq!(
+            adapter.realm.as_ref().unwrap().active_root(),
+            Some(old),
+            "last-known-good root was not restored"
+        );
+        adapter
+            .apply(RuntimeRealmEvent::Spawn)
+            .expect("last-known-good module remains callable");
     }
 }

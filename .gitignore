@@ -14,3 +14,4 @@ editors/**/node_modules/
 .pnpm-store/
 editors/tree-sitter-nexa/.tree-sitter/
 editors/tree-sitter-nexa/build/
+/editors/tree-sitter-nexa/src/parser.c

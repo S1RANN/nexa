@@ -778,10 +778,14 @@ fn exercise_a_activation(artifact: &CompiledPackageArtifact, contract: &nexa::Va
     let RestartReloadOutcome::ActivationFaulted { candidate, .. } = faulted else {
         panic!("failing A activation must be observable, got {faulted:?}");
     };
-    assert_eq!(loaded.realm.active_root(), Some(candidate));
+    assert_eq!(loaded.realm.active_root(), Some(active));
     assert_eq!(
-        loaded.realm.module_lifecycle(candidate),
-        Ok(ModuleLifecycle::ActivationFaulted)
+        loaded.realm.module_lifecycle(active),
+        Ok(ModuleLifecycle::Active)
+    );
+    assert!(
+        loaded.realm.module_lifecycle(candidate).is_err(),
+        "activation-fault candidate remained addressable"
     );
     loaded.shutdown();
 }

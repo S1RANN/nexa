@@ -1539,19 +1539,35 @@ fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let RestartReloadOutcome::ActivationFaulted { candidate, error } = outcome else {
         return Err("activation trap did not produce ActivationFaulted".into());
     };
-    harness.modules.push(candidate);
     let after = harness.snapshot();
-    let lifecycle = format!(
+    let old_lifecycle = format!(
         "{:?}",
         harness
             .realm
-            .module_lifecycle(candidate)
+            .module_lifecycle(old)
             .map_err(|error| error.to_string())?
     );
+    let old_root_restored = harness.realm.active_root() == Some(old);
+    let candidate_released = harness.realm.module_lifecycle(candidate).is_err();
+    let candidate_root_cleared = after["candidate_root"].is_null();
+    let old_epoch_preserved =
+        before["active_root"]["epoch"].as_u64() == after["active_root"]["epoch"].as_u64();
     let publications = after["reload"]["root_publications"].as_u64().unwrap_or(0);
     let mut unexpected = Vec::new();
-    if lifecycle != "ActivationFaulted" {
-        unexpected.push("candidate did not become ActivationFaulted".into());
+    if old_lifecycle != "Active" {
+        unexpected.push("last-known-good module did not return to Active".into());
+    }
+    if !old_root_restored {
+        unexpected.push("last-known-good root was not restored".into());
+    }
+    if !candidate_released {
+        unexpected.push("activation-fault candidate remained addressable".into());
+    }
+    if !candidate_root_cleared {
+        unexpected.push("activation-fault transaction retained a candidate root".into());
+    }
+    if !old_epoch_preserved {
+        unexpected.push("last-known-good epoch changed during activation rollback".into());
     }
     if publications != 1 {
         unexpected.push("root publication count was not exactly one".into());
@@ -1562,18 +1578,26 @@ fn activation_failure_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         before,
         after,
         &[
-            "candidate publication",
-            "old epoch retirement",
-            "activation fault",
+            "candidate provisional publication",
+            "activation fault evidence",
+            "old root restoration",
+            "candidate release",
         ],
         unexpected,
         "",
-        &lifecycle,
+        &old_lifecycle,
         BTreeMap::from([
-            ("candidate_lifecycle".into(), json!(lifecycle)),
+            ("candidate_released".into(), json!(candidate_released)),
+            (
+                "candidate_root_cleared".into(),
+                json!(candidate_root_cleared),
+            ),
             ("root_publications".into(), json!(publications)),
-            ("old_epoch_retired".into(), json!(true)),
-            ("rollback_old_root".into(), json!(false)),
+            ("old_epoch_retired".into(), json!(false)),
+            ("old_epoch_preserved".into(), json!(old_epoch_preserved)),
+            ("old_lifecycle".into(), json!(old_lifecycle)),
+            ("outcome_activation_faulted".into(), json!(true)),
+            ("rollback_old_root".into(), json!(old_root_restored)),
         ]),
     ))
 }
@@ -2211,4 +2235,23 @@ fn migration_limit_config(kind: &str) -> (RealmConfig, MigrationLimitRequirement
         },
         required,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::execute_case;
+
+    #[test]
+    fn activation_failure_diagnostic_records_lkg_rollback() {
+        let evidence = execute_case("NX6003").expect("NX6003 evidence");
+
+        assert!(evidence.passed, "{:?}", evidence.unexpected_mutations);
+        assert_eq!(evidence.module_lifecycle, "Active");
+        assert_eq!(evidence.details["candidate_released"], true);
+        assert_eq!(evidence.details["candidate_root_cleared"], true);
+        assert_eq!(evidence.details["old_epoch_retired"], false);
+        assert_eq!(evidence.details["old_epoch_preserved"], true);
+        assert_eq!(evidence.details["outcome_activation_faulted"], true);
+        assert_eq!(evidence.details["rollback_old_root"], true);
+    }
 }

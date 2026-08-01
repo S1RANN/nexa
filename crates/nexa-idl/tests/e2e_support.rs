@@ -60,8 +60,10 @@ fn changed_binding_executes_through_generated_registry() {
         CONTRACT_RUNTIME_ID,
         old_state_schema_fingerprint,
     );
-    let old_bytecode_rejected =
-        matches!(old_load, Err(nexa_runtime::RealmError::HostHashMismatch));
+    let old_bytecode_rejected = matches!(
+        old_load,
+        Err(nexa_runtime::RealmError::HostContractIdMismatch)
+    );
     assert!(old_bytecode_rejected);
     let rejected = realm.inspection_snapshot();
     assert_eq!(rejected.active_root, before.active_root);
