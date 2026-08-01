@@ -470,6 +470,93 @@ pub struct CollectionStats {
     pub live: usize,
 }
 
+/// Cumulative VM allocation and copy counters (M5 WP13).
+///
+/// Counters are monotonic work totals, not live-state gauges: checkpoint
+/// restores (REPL transaction rollback) intentionally do not rewind them,
+/// because the allocation and copy work still happened. Host codec copy
+/// accounting lands with the stage-H boundary work and is reported as
+/// unavailable until then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct VmAllocationCounters {
+    pub object_allocations: u64,
+    pub string_allocations: u64,
+    pub class_allocations: u64,
+    pub collection_storage_allocations: u64,
+    pub map_slot_allocations: u64,
+    pub struct_materializations: u64,
+    pub enum_materializations: u64,
+    pub collection_relocation_bytes: u64,
+    pub string_copy_bytes: u64,
+}
+
+impl VmAllocationCounters {
+    /// Saturating element-wise accumulation for report aggregation.
+    pub fn accumulate(&mut self, other: Self) {
+        self.object_allocations = self
+            .object_allocations
+            .saturating_add(other.object_allocations);
+        self.string_allocations = self
+            .string_allocations
+            .saturating_add(other.string_allocations);
+        self.class_allocations = self
+            .class_allocations
+            .saturating_add(other.class_allocations);
+        self.collection_storage_allocations = self
+            .collection_storage_allocations
+            .saturating_add(other.collection_storage_allocations);
+        self.map_slot_allocations = self
+            .map_slot_allocations
+            .saturating_add(other.map_slot_allocations);
+        self.struct_materializations = self
+            .struct_materializations
+            .saturating_add(other.struct_materializations);
+        self.enum_materializations = self
+            .enum_materializations
+            .saturating_add(other.enum_materializations);
+        self.collection_relocation_bytes = self
+            .collection_relocation_bytes
+            .saturating_add(other.collection_relocation_bytes);
+        self.string_copy_bytes = self
+            .string_copy_bytes
+            .saturating_add(other.string_copy_bytes);
+    }
+
+    /// Work performed since an `earlier` snapshot of the same counters.
+    #[must_use]
+    pub const fn delta_since(self, earlier: Self) -> Self {
+        Self {
+            object_allocations: self
+                .object_allocations
+                .saturating_sub(earlier.object_allocations),
+            string_allocations: self
+                .string_allocations
+                .saturating_sub(earlier.string_allocations),
+            class_allocations: self
+                .class_allocations
+                .saturating_sub(earlier.class_allocations),
+            collection_storage_allocations: self
+                .collection_storage_allocations
+                .saturating_sub(earlier.collection_storage_allocations),
+            map_slot_allocations: self
+                .map_slot_allocations
+                .saturating_sub(earlier.map_slot_allocations),
+            struct_materializations: self
+                .struct_materializations
+                .saturating_sub(earlier.struct_materializations),
+            enum_materializations: self
+                .enum_materializations
+                .saturating_sub(earlier.enum_materializations),
+            collection_relocation_bytes: self
+                .collection_relocation_bytes
+                .saturating_sub(earlier.collection_relocation_bytes),
+            string_copy_bytes: self
+                .string_copy_bytes
+                .saturating_sub(earlier.string_copy_bytes),
+        }
+    }
+}
+
 /// Safe-Rust stop-the-world mark/sweep heap with generation-protected references.
 #[derive(Debug)]
 pub struct Heap {
@@ -482,6 +569,7 @@ pub struct Heap {
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
     failure_injector: RuntimeFailureInjector,
+    counters: VmAllocationCounters,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -579,7 +667,14 @@ impl Heap {
             host_staging: Vec::with_capacity(max_objects as usize),
             host_transaction_active: false,
             failure_injector: RuntimeFailureInjector::default(),
+            counters: VmAllocationCounters::default(),
         }
+    }
+
+    /// Cumulative allocation/copy work performed by this heap (WP13).
+    #[must_use]
+    pub const fn vm_allocation_counters(&self) -> VmAllocationCounters {
+        self.counters
     }
 
     pub fn allocate_string(&mut self, value: &str) -> Result<GcRef, HeapError> {
@@ -817,6 +912,42 @@ impl Heap {
             .remaining
             .checked_sub(1)
             .expect("heap allocation was preflighted");
+        self.counters.object_allocations = self.counters.object_allocations.saturating_add(1);
+        match &object {
+            Object::String(value) => {
+                self.counters.string_allocations =
+                    self.counters.string_allocations.saturating_add(1);
+                self.counters.string_copy_bytes = self
+                    .counters
+                    .string_copy_bytes
+                    .saturating_add(value.len() as u64);
+            }
+            Object::Class { .. } => {
+                self.counters.class_allocations = self.counters.class_allocations.saturating_add(1);
+            }
+            Object::Array { .. } | Object::Buffer { .. } | Object::I32Array(_) => {
+                self.counters.collection_storage_allocations = self
+                    .counters
+                    .collection_storage_allocations
+                    .saturating_add(1);
+            }
+            Object::Map(_) => {
+                self.counters.collection_storage_allocations = self
+                    .counters
+                    .collection_storage_allocations
+                    .saturating_add(1);
+                self.counters.map_slot_allocations =
+                    self.counters.map_slot_allocations.saturating_add(1);
+            }
+            Object::Struct { .. } => {
+                self.counters.struct_materializations =
+                    self.counters.struct_materializations.saturating_add(1);
+            }
+            Object::Enum { .. } => {
+                self.counters.enum_materializations =
+                    self.counters.enum_materializations.saturating_add(1);
+            }
+        }
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.object.is_none());
@@ -1591,6 +1722,12 @@ impl Heap {
         let (reference, old_range) = self.array_range(value)?;
         let mut reservation = self.preflight_collection(new_length)?;
         let new_range = reservation.range;
+        // Every surviving element is copied out of the old range exactly once
+        // per replacement; this is the WP49 relocation-copy accounting input.
+        self.counters.collection_relocation_bytes =
+            self.counters.collection_relocation_bytes.saturating_add(
+                (old_range.length.min(new_length) * std::mem::size_of::<RuntimeValue>()) as u64,
+            );
         let old_start = old_range.start;
         let old_end = old_range.end();
         let new_start = new_range.start;
@@ -1738,6 +1875,10 @@ impl Heap {
         let (_, destination_range) = self.buffer_range(destination)?;
         let source_absolute = source_range.start + source_start;
         let destination_absolute = destination_range.start + destination_start;
+        self.counters.collection_relocation_bytes =
+            self.counters.collection_relocation_bytes.saturating_add(
+                ((source_end - source_start) * std::mem::size_of::<RuntimeValue>()) as u64,
+            );
         self.collections.values.copy_within(
             source_absolute..source_absolute + (source_end - source_start),
             destination_absolute,
@@ -1963,6 +2104,10 @@ impl Heap {
                 .expect("map needs rehash");
             if new_capacity > old_capacity {
                 let new_slots = empty_map_slots(new_capacity)?;
+                self.counters.map_slot_allocations = self
+                    .counters
+                    .map_slot_allocations
+                    .saturating_add(new_capacity as u64);
                 let map = self.map_mut(value)?;
                 let old_slots = std::mem::take(&mut map.slots);
                 map.rehash = Some(MapRehash {
@@ -1979,6 +2124,7 @@ impl Heap {
             value: replacement,
             hash,
         };
+        self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
         let map = self.map_mut(value)?;
         insert_map_entry(&mut map.slots, entry)?;
         map.length += 1;
@@ -2615,6 +2761,34 @@ mod tests {
             heap.allocate_class(StableId::from_name("Empty"), &[])
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn vm_allocation_counters_track_kind_relocation_and_survive_restore() {
+        let mut heap = Heap::new_with_limits(16, usize::MAX, 8);
+        let checkpoint = heap.checkpoint();
+        heap.allocate_string("hello").unwrap();
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+        heap.array_push(array, RuntimeValue::I32(1)).unwrap();
+        heap.array_push(array, RuntimeValue::I32(2)).unwrap();
+
+        let counters = heap.vm_allocation_counters();
+        assert_eq!(counters.string_allocations, 1);
+        assert_eq!(counters.string_copy_bytes, 5);
+        assert_eq!(counters.collection_storage_allocations, 1);
+        assert_eq!(counters.object_allocations, 2);
+        // The first push copies zero surviving elements, the second copies one.
+        assert_eq!(
+            counters.collection_relocation_bytes,
+            std::mem::size_of::<RuntimeValue>() as u64
+        );
+
+        // Counters are monotonic work totals: rollback keeps them.
+        heap.restore_checkpoint(checkpoint);
+        assert_eq!(heap.vm_allocation_counters(), counters);
     }
 
     #[test]

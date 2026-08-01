@@ -3429,6 +3429,12 @@ impl RealmRuntime {
         self.resources.model_snapshot()
     }
 
+    /// Cumulative VM allocation/copy counters of this Realm's heap (WP13).
+    #[must_use]
+    pub const fn vm_allocation_counters(&self) -> crate::VmAllocationCounters {
+        self.heap.vm_allocation_counters()
+    }
+
     #[must_use]
     pub fn resource_ledger(&self) -> crate::RuntimeResourceLedger {
         let (tasks, scopes, continuations) = self.tasks.ledger_counts();

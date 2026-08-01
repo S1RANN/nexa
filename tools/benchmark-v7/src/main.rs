@@ -161,6 +161,7 @@ struct Observation {
     fuel: u64,
     instructions: u64,
     heap_slots: u64,
+    vm: Option<nexa_runtime::VmAllocationCounters>,
     resources: PeakResources,
 }
 
@@ -248,9 +249,47 @@ struct CaseStats {
 struct VmCounters {
     live_heap_slots_peak: u64,
     allocations: Option<u64>,
+    string_allocations: Option<u64>,
+    class_allocations: Option<u64>,
+    collection_storage_allocations: Option<u64>,
+    map_slot_allocations: Option<u64>,
+    struct_materializations: Option<u64>,
+    enum_materializations: Option<u64>,
     allocated_bytes: Option<u64>,
     live_bytes: Option<u64>,
     bytes_copied: Option<u64>,
+}
+
+impl VmCounters {
+    fn from_totals(
+        live_heap_slots_peak: u64,
+        totals: Option<nexa_runtime::VmAllocationCounters>,
+    ) -> Self {
+        let Some(totals) = totals else {
+            return Self {
+                live_heap_slots_peak,
+                ..Self::default()
+            };
+        };
+        Self {
+            live_heap_slots_peak,
+            allocations: Some(totals.object_allocations),
+            string_allocations: Some(totals.string_allocations),
+            class_allocations: Some(totals.class_allocations),
+            collection_storage_allocations: Some(totals.collection_storage_allocations),
+            map_slot_allocations: Some(totals.map_slot_allocations),
+            struct_materializations: Some(totals.struct_materializations),
+            enum_materializations: Some(totals.enum_materializations),
+            // Precise per-kind heap byte accounting is stage-G work (WP71).
+            allocated_bytes: None,
+            live_bytes: None,
+            bytes_copied: Some(
+                totals
+                    .collection_relocation_bytes
+                    .saturating_add(totals.string_copy_bytes),
+            ),
+        }
+    }
 }
 
 /// GC v1 telemetry lands with stage G; until then every field is `null`.
@@ -521,6 +560,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || (),
         |()| {
+            let vm_before = async_realm.vm_allocation_counters();
             let task =
                 call(&mut async_realm, async_module, async_scope, 7).expect("async task admission");
             assert!(matches!(
@@ -544,6 +584,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: async_instructions,
                 instructions: async_instructions,
                 heap_slots: async_realm.resource_ledger().heap_objects,
+                vm: Some(async_realm.vm_allocation_counters().delta_since(vm_before)),
                 resources: peak,
             }
         },
@@ -570,6 +611,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: result.usage.fuel_used,
                 instructions: result.usage.fuel_used,
                 heap_slots: result.usage.object_peak as u64,
+                vm: None,
                 resources: PeakResources {
                     state_objects: result.usage.object_peak as u64,
                     total: result.usage.object_peak as u64,
@@ -607,6 +649,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: 1,
                 instructions: 1,
                 heap_slots: after.heap_objects,
+                vm: Some(prepared.realm.vm_allocation_counters()),
                 resources,
             }
         },
@@ -867,7 +910,7 @@ fn run_returned(
         panic!("benchmark function did not return");
     };
     black_box(value);
-    observation(charge, heap.live_len())
+    observation(charge, heap)
 }
 
 fn run_two_slices(module: &VerifiedModule, function: u32, explicit: bool) -> Observation {
@@ -924,11 +967,12 @@ fn run_two_slices(module: &VerifiedModule, function: u32, explicit: bool) -> Obs
     }
 }
 
-fn observation(charge: ExecutionCharge, heap_slots: usize) -> Observation {
+fn observation(charge: ExecutionCharge, heap: &Heap) -> Observation {
     Observation {
         fuel: charge.fuel_used,
         instructions: charge.instructions,
-        heap_slots: u64::try_from(heap_slots).unwrap_or(u64::MAX),
+        heap_slots: u64::try_from(heap.live_len()).unwrap_or(u64::MAX),
+        vm: Some(heap.vm_allocation_counters()),
         ..Observation::default()
     }
 }
@@ -940,6 +984,9 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
         fuel: first.fuel.saturating_add(second.fuel),
         instructions: first.instructions.saturating_add(second.instructions),
         heap_slots: u64::try_from(heap_slots).unwrap_or(u64::MAX),
+        // Counters are cumulative per heap; the later observation subsumes
+        // the earlier one taken from the same heap.
+        vm: second.vm.or(first.vm),
         resources,
     }
 }
@@ -1319,6 +1366,7 @@ fn bench<T>(
     let mut fuel = 0_u64;
     let mut instructions = 0_u64;
     let mut heap_slots = 0_u64;
+    let mut vm_totals: Option<nexa_runtime::VmAllocationCounters> = None;
     let mut resources = PeakResources::default();
     for _ in 0..samples {
         let input = prepare();
@@ -1331,6 +1379,9 @@ fn bench<T>(
         fuel = fuel.saturating_add(observation.fuel);
         instructions = instructions.saturating_add(observation.instructions);
         heap_slots = heap_slots.max(observation.heap_slots);
+        if let Some(sample_vm) = observation.vm {
+            vm_totals.get_or_insert_default().accumulate(sample_vm);
+        }
         resources.merge(observation.resources);
     }
     durations.sort_unstable();
@@ -1369,10 +1420,7 @@ fn bench<T>(
         system_allocated_bytes: allocation_totals.allocated_bytes,
         system_reallocated_bytes: allocation_totals.reallocated_bytes,
         system_peak_outstanding_bytes: allocation_totals.peak_outstanding_bytes,
-        vm: VmCounters {
-            live_heap_slots_peak: heap_slots,
-            ..VmCounters::default()
-        },
+        vm: VmCounters::from_totals(heap_slots, vm_totals),
         gc: GcCounters::default(),
         fuel_total: fuel,
         fuel_per_operation: fuel / sample_count,
