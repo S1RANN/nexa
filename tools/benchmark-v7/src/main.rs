@@ -556,6 +556,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_returned(&language, 10, &[destination, source], &mut heap, 512)
         },
     ));
+    cases.push(bench(
+        "product_data_sweep",
+        "product",
+        samples,
+        || Heap::new_with_limits(1_024, 65_536, 512),
+        |mut heap| run_returned(&language, 11, &[], &mut heap, 2_000_000),
+    ));
+    cases.push(bench(
+        "product_standalone_pipeline",
+        "product",
+        samples,
+        || (),
+        |()| {
+            // Full frontend + verifier + execution per sample: the cost shape
+            // of a standalone script or REPL cell.
+            let verified =
+                nexa_compiler::compile(LANGUAGE_SOURCE).expect("benchmark language compiles");
+            let mut heap = Heap::new_with_limits(64, 4_096, 64);
+            run_returned(&verified, 0, &[RuntimeValue::I32(41)], &mut heap, 256)
+        },
+    ));
 
     let fast = fast_module();
     let snapshot_host = RuntimeHost::new(4_096);
@@ -962,6 +983,22 @@ fn map_operations() -> i32 {
 fn buffer_copy(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
     destination.copy(source, 0, 0, 3);
     return destination.get(2);
+}
+fn product_data_sweep() -> i32 {
+    let values: Array<i32> = Array::new();
+    let mut index: i32 = 0;
+    while index < 256 {
+        let cell: BenchStruct = BenchStruct { value: index, wide: 9, label: "sweep" };
+        values.push(cell.value);
+        index = index + 1;
+    }
+    let mut total: i32 = 0;
+    let mut cursor: i32 = 0;
+    while cursor < 256 {
+        total = total + values.get(cursor);
+        cursor = cursor + 1;
+    }
+    return total;
 }
 "#;
 
