@@ -713,7 +713,7 @@ fn async_module() -> VerifiedModule {
         },
         RootMap {
             pc: 2,
-            bitmap: vec![false, true, false],
+            bitmap: vec![false, false, false],
         },
     ];
     let function = module.function(function);
