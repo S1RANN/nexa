@@ -573,16 +573,7 @@ fn test_cli() -> Result<(), DynError> {
         "--diagnostic-format",
         "json",
     ])?;
-    cargo(&[
-        "run",
-        "-p",
-        "nexa-cli",
-        "--",
-        "check",
-        "examples/snake-game/packages/builtin/classic-rules",
-        "--contract",
-        "examples/snake-game/snake_api.nidl",
-    ])?;
+    test_cli_direct_contract_rejection()?;
     let policy = write_builtin_cli_policy()?;
     cargo(&[
         "run",
@@ -590,9 +581,9 @@ fn test_cli() -> Result<(), DynError> {
         "nexa-cli",
         "--",
         "check",
-        "examples/snake-game/packages/builtin/classic-rules",
+        "examples/language-scale/packages/app",
         "--contract",
-        "examples/snake-game/snake_api.nidl",
+        "examples/language-scale/language_scale.nidl",
         "--policy",
         policy
             .to_str()
@@ -612,6 +603,72 @@ fn test_cli() -> Result<(), DynError> {
         "--diagnostic-format",
         "ndjson",
     ])
+}
+
+fn test_cli_direct_contract_rejection() -> Result<(), DynError> {
+    let direct_contract = Command::new("cargo")
+        .args([
+            "run",
+            "--quiet",
+            "-p",
+            "nexa-cli",
+            "--",
+            "check",
+            "examples/snake-game/packages/builtin/classic-rules",
+            "--contract",
+            "examples/snake-game/snake_api.nidl",
+            "--diagnostic-format",
+            "json",
+        ])
+        .current_dir(workspace_root())
+        .output()?;
+    if direct_contract.status.success() {
+        return Err("classic-rules unexpectedly satisfied the unscoped Snake contract".into());
+    }
+    if !direct_contract.stdout.is_empty() {
+        return Err(format!(
+            "classic-rules direct-contract rejection unexpectedly wrote to stdout:\n{}",
+            String::from_utf8_lossy(&direct_contract.stdout)
+        )
+        .into());
+    }
+    let report: Value = serde_json::from_slice(&direct_contract.stderr).map_err(|error| {
+        format!(
+            "classic-rules direct-contract rejection was not JSON: {error}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&direct_contract.stdout),
+            String::from_utf8_lossy(&direct_contract.stderr)
+        )
+    })?;
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .ok_or("classic-rules direct-contract rejection omitted diagnostics")?;
+    let actual = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let code = diagnostic["code"]
+                .as_str()
+                .ok_or("classic-rules direct-contract diagnostic omitted its code")?;
+            let message = diagnostic["message"]
+                .as_str()
+                .ok_or("classic-rules direct-contract diagnostic omitted its message")?;
+            Ok((code, message))
+        })
+        .collect::<Result<BTreeSet<_>, DynError>>()?;
+    let expected = BTreeSet::from([
+        (
+            "NX7010",
+            "missing required entrypoint `calculate_food_effect`",
+        ),
+        ("NX7010", "missing required entrypoint `choose_food_spawn`"),
+    ]);
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "classic-rules direct-contract rejection changed: expected {expected:?}, got {actual:?}"
+        )
+        .into())
+    }
 }
 
 fn test_lsp() -> Result<(), DynError> {
