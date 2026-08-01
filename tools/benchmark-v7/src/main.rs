@@ -317,8 +317,67 @@ struct BenchmarkReport {
     warmup: usize,
     process_index: usize,
     started_at_unix_ms: u128,
+    profiler_enabled: bool,
+    profiler: Option<ProfilerSummary>,
     allocation_scope: &'static str,
     cases: Vec<CaseStats>,
+}
+
+/// WP15/WP16 profiler evidence attached to profiled runs.
+#[derive(Debug, Serialize)]
+struct ProfilerSummary {
+    host_calls: u64,
+    function_count: usize,
+    allocation_site_count: usize,
+    dropped_functions: u64,
+    dropped_sites: u64,
+    top_opcodes: Vec<(String, u64)>,
+    top_allocation_sites: Vec<AllocationSiteSummary>,
+}
+
+#[derive(Debug, Serialize)]
+struct AllocationSiteSummary {
+    function: u32,
+    pc: u32,
+    opcode: u16,
+    type_id: u64,
+    count: u64,
+}
+
+fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
+    if !enabled {
+        return None;
+    }
+    nexa_runtime::profiler::disable();
+    let report = nexa_runtime::profiler::take_thread_report()?;
+    let mut opcodes = report
+        .opcodes
+        .iter()
+        .map(|entry| (entry.opcode.to_owned(), entry.executions))
+        .collect::<Vec<_>>();
+    opcodes.sort_by_key(|(_, executions)| std::cmp::Reverse(*executions));
+    opcodes.truncate(5);
+    let mut sites = report.allocation_sites.clone();
+    sites.sort_by_key(|site| std::cmp::Reverse(site.count));
+    sites.truncate(5);
+    Some(ProfilerSummary {
+        host_calls: report.host_calls,
+        function_count: report.functions.len(),
+        allocation_site_count: report.allocation_sites.len(),
+        dropped_functions: report.dropped_functions,
+        dropped_sites: report.dropped_sites,
+        top_opcodes: opcodes,
+        top_allocation_sites: sites
+            .into_iter()
+            .map(|site| AllocationSiteSummary {
+                function: site.function,
+                pc: site.pc,
+                opcode: site.opcode,
+                type_id: site.type_id,
+                count: site.count,
+            })
+            .collect(),
+    })
 }
 
 /// Median-of-process-medians aggregate written by the multi-process driver.
@@ -369,8 +428,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(str::parse)
         .transpose()?
         .unwrap_or(1_usize);
+    let profiler_enabled = arguments.iter().any(|argument| argument == "--profile");
     if processes > 1 {
         return run_multi_process(&arguments, processes, samples);
+    }
+    if profiler_enabled {
+        nexa_runtime::profiler::enable();
     }
     let started_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -699,6 +762,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         warmup: WARMUP,
         process_index,
         started_at_unix_ms,
+        profiler_enabled,
+        profiler: profiler_summary(profiler_enabled),
         allocation_scope: "timed operation only; per-sample setup and result storage excluded",
         cases,
     };
@@ -728,6 +793,9 @@ fn run_multi_process(
         ];
         if arguments.iter().any(|argument| argument == "--smoke") {
             child_arguments.push("--smoke".to_owned());
+        }
+        if arguments.iter().any(|argument| argument == "--profile") {
+            child_arguments.push("--profile".to_owned());
         }
         let output = std::process::Command::new(&executable)
             .args(&child_arguments)

@@ -12,6 +12,7 @@ mod message;
 mod metrics;
 #[cfg(any(test, feature = "model-adapter"))]
 pub mod model_adapter;
+pub mod profiler;
 mod realm;
 mod reload;
 mod scheduler;
@@ -81,6 +82,10 @@ pub use interpreter::{
     SuspendReason, Trap, TrapKind,
 };
 pub use metrics::ExecutionMetrics;
+pub use profiler::{
+    AllocationSiteProfile, FunctionProfile, OpcodeProfile, PROFILER_FUNCTION_CAPACITY,
+    PROFILER_SITE_CAPACITY, ProfilerReport,
+};
 pub use realm::{
     CancelReason, CompletionDisposition, HostFunctionAuthorityField, HostResult, ModuleHandle,
     ModuleLifecycle, NexaValue, RealmConfig, RealmError, RealmRuntime, ReloadAccounting,

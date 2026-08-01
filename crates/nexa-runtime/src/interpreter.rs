@@ -491,6 +491,30 @@ impl OpcodeCostTable {
     }
 }
 
+/// Type identity for allocating instructions profiled as WP14 sites; `None`
+/// marks non-allocating instructions.
+const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
+    match instruction {
+        Instruction::StructNew { type_id, .. }
+        | Instruction::ClassNew { type_id, .. }
+        | Instruction::EnumNew { type_id, .. }
+        | Instruction::ArrayNew { type_id, .. }
+        | Instruction::MapNew { type_id, .. } => Some(type_id.0),
+        Instruction::StructWith { .. }
+        | Instruction::LoadString { .. }
+        | Instruction::StringConcat { .. }
+        | Instruction::StringToString { .. }
+        | Instruction::I32ToString { .. }
+        | Instruction::I64ToString { .. }
+        | Instruction::F32ToString { .. }
+        | Instruction::F64ToString { .. }
+        | Instruction::BoolToString { .. }
+        | Instruction::RuneToString { .. }
+        | Instruction::BufferSlice { .. } => Some(0),
+        _ => None,
+    }
+}
+
 pub struct CheckedInterpreter;
 
 pub trait InterpreterHost {
@@ -1011,6 +1035,9 @@ impl CheckedInterpreter {
         if let Some(migration) = migration.as_deref_mut() {
             migration.observe_call_depth(continuation.arena.depth());
         }
+        // WP15/WP16: the enabled flag is read once per poll; the disabled
+        // hot path costs one predictable branch per instruction.
+        let profiling = crate::profiler::enabled();
         loop {
             let frame = *continuation.arena.current()?;
             continuation.current_function = frame.function;
@@ -1082,6 +1109,14 @@ impl CheckedInterpreter {
                 pending_cost = settlement;
             }
             charge.instructions = charge.instructions.saturating_add(1);
+            if profiling {
+                crate::profiler::record_instruction(
+                    opcode_index(instruction),
+                    frame.function,
+                    allocation_type_identity(instruction).map(|type_id| (frame.pc, type_id)),
+                    matches!(instruction, Instruction::HostCall { .. }),
+                );
+            }
             match instruction {
                 Instruction::LoadI32 { dst, value } => {
                     set_register(&mut continuation.arena, dst, RuntimeValue::I32(value))?;
@@ -3850,6 +3885,9 @@ macro_rules! define_opcode_cost_schedule {
         ),+ $(,)?
     ) => {
         const DEFAULT_OPCODE_COSTS: [u16; 107] = [$($base_cost),+];
+
+        /// Stable opcode display names indexed by `opcode_index` (WP15).
+        pub(crate) const OPCODE_NAMES: [&str; 107] = [$($name),+];
 
         #[cfg(test)]
         const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 107] = [
