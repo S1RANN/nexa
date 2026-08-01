@@ -17,6 +17,8 @@ pub const MAGIC: [u8; 4] = *b"NXBC";
 /// bytecode is an internal package artifact and has no cross-version decoding
 /// compatibility promise.
 pub use nexa_core::BYTECODE_VERSION;
+
+pub mod layout;
 pub const MAX_STRUCT_FIELDS: usize = 16;
 pub const MAX_CLASS_FIELDS: usize = 16;
 pub const MAX_HOST_CAPABILITIES: usize = 64;

@@ -406,6 +406,8 @@ fn main() -> Result<(), DynError> {
         "finalize-m3-r1" => finalize_m3_r1(),
         "finalize-m3-r2" => finalize_m3_r2(),
         "finalize-m3-r3" => finalize_m3_r3(),
+        "test-performance-counters" => test_performance_counters(),
+        "test-value-layout" => test_value_layout(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -1389,6 +1391,23 @@ fn finalize_m3_r2() -> Result<(), DynError> {
     } else {
         Err("M3R2 finalization failed".into())
     }
+}
+
+/// M5 WP12/WP13/WP15 gate: allocator, VM counter, and profiler contracts.
+fn test_performance_counters() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--lib",
+        "vm_allocation_counters",
+    ])?;
+    cargo(&["test", "-p", "nexa-runtime", "--lib", "profiler"])
+}
+
+/// M5 WP19-WP22 gate: deterministic physical layout derivation.
+fn test_value_layout() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-bytecode", "--test", "layout"])
 }
 
 #[allow(clippy::too_many_lines)]
