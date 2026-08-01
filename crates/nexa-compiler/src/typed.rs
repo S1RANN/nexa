@@ -529,6 +529,11 @@ struct FunctionEmitter<'a> {
     files: &'a BTreeMap<SourceKey, FileId>,
     string_indices: &'a BTreeMap<String, u32>,
     locals: BTreeMap<DefinitionId, u16>,
+    /// M5 WP27/WP45 slice: immutable struct locals whose every use is a
+    /// direct field read live as per-field registers and never materialize
+    /// a heap object. Maps the binding to its owner struct and the base of
+    /// its contiguous field register range.
+    inline_structs: BTreeMap<DefinitionId, (DefinitionId, u16)>,
     register_types: Vec<Option<ValueType>>,
     parameter_count: usize,
     function_effect: IrEffect,
@@ -2199,6 +2204,248 @@ fn emit_standalone_main_export(
     }))
 }
 
+/// M5 WP45 minimal escape analysis: immutable locals initialized by a
+/// struct construction whose every later use is a direct field read.
+///
+/// Any bare reference (call argument, return value, container write, match
+/// scrutinee, struct-field value, place root, ...) disqualifies the binding,
+/// so the inlined form can never need re-materialization.
+fn inline_struct_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, DefinitionId> {
+    let mut candidates = BTreeMap::new();
+    collect_inline_candidates(&function.body, &mut candidates);
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut disqualified = BTreeSet::new();
+    scan_block_escapes(&function.body, &candidates, &mut disqualified);
+    candidates.retain(|definition, _| !disqualified.contains(definition));
+    candidates
+}
+
+fn collect_inline_candidates(
+    block: &TypedBlockIr,
+    candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
+) {
+    for statement in &block.statements {
+        match statement {
+            TypedStatementIr::Let {
+                definition,
+                mutable: false,
+                value: Some(value),
+            } => {
+                if let TypedExpressionKind::Construct {
+                    definition: owner, ..
+                } = &value.kind
+                {
+                    candidates.insert(*definition, *owner);
+                }
+            }
+            TypedStatementIr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_inline_candidates(then_block, candidates);
+                if let Some(else_block) = else_block {
+                    collect_inline_candidates(else_block, candidates);
+                }
+            }
+            TypedStatementIr::While { body, .. }
+            | TypedStatementIr::StaticRangeFor { body, .. } => {
+                collect_inline_candidates(body, candidates);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn scan_block_escapes(
+    block: &TypedBlockIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    for statement in &block.statements {
+        scan_statement_escapes(statement, candidates, disqualified);
+    }
+    if let Some(tail) = &block.tail {
+        scan_expression_escapes(tail, candidates, disqualified);
+    }
+}
+
+fn scan_statement_escapes(
+    statement: &TypedStatementIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match statement {
+        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
+            if let Some(value) = value {
+                scan_expression_escapes(value, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::Assign { target, value } => {
+            scan_place_escapes(target, candidates, disqualified);
+            scan_expression_escapes(value, candidates, disqualified);
+        }
+        TypedStatementIr::Expression(expression) => {
+            scan_expression_escapes(expression, candidates, disqualified);
+        }
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            scan_expression_escapes(condition, candidates, disqualified);
+            scan_block_escapes(then_block, candidates, disqualified);
+            if let Some(else_block) = else_block {
+                scan_block_escapes(else_block, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => {
+            scan_expression_escapes(condition, candidates, disqualified);
+            scan_block_escapes(body, candidates, disqualified);
+        }
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            scan_expression_escapes(start, candidates, disqualified);
+            scan_expression_escapes(end, candidates, disqualified);
+            scan_block_escapes(body, candidates, disqualified);
+        }
+        TypedStatementIr::Defer { captures, .. } => {
+            for capture in captures {
+                scan_expression_escapes(capture, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {}
+    }
+}
+
+fn scan_place_escapes(
+    place: &TypedPlaceIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match place {
+        // Whole-binding and field writes both disqualify: this slice only
+        // inlines read-only bindings.
+        TypedPlaceIr::Definition(definition) => {
+            if candidates.contains_key(definition) {
+                disqualified.insert(*definition);
+            }
+        }
+        TypedPlaceIr::Field { base, .. } => scan_place_escapes(base, candidates, disqualified),
+        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
+            scan_expression_escapes(object, candidates, disqualified);
+        }
+        TypedPlaceIr::Index { base, index } => {
+            scan_expression_escapes(base, candidates, disqualified);
+            scan_expression_escapes(index, candidates, disqualified);
+        }
+    }
+}
+
+fn scan_expression_escapes(
+    expression: &TypedExpressionIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match &expression.kind {
+        // A bare reference escapes the field-read-only discipline.
+        TypedExpressionKind::Reference(definition) => {
+            if candidates.contains_key(definition) {
+                disqualified.insert(*definition);
+            }
+        }
+        // A direct field read off the binding is the one sanctioned use.
+        TypedExpressionKind::Field { base, .. } => {
+            if !matches!(&base.kind, TypedExpressionKind::Reference(definition)
+                if candidates.contains_key(definition))
+            {
+                scan_expression_escapes(base, candidates, disqualified);
+            }
+        }
+        _ => {
+            let mut children = Vec::new();
+            collect_expression_children(expression, &mut children);
+            for child in children {
+                scan_expression_escapes(child, candidates, disqualified);
+            }
+        }
+    }
+}
+
+/// Read-only child enumeration for the escape scan.
+fn collect_expression_children<'expr>(
+    expression: &'expr TypedExpressionIr,
+    children: &mut Vec<&'expr TypedExpressionIr>,
+) {
+    match &expression.kind {
+        TypedExpressionKind::Literal(_)
+        | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
+        | TypedExpressionKind::Yield => {}
+        TypedExpressionKind::Unary { operand, .. } => children.push(operand),
+        TypedExpressionKind::Binary { left, right, .. } => {
+            children.push(left);
+            children.push(right);
+        }
+        TypedExpressionKind::Call { arguments, .. }
+        | TypedExpressionKind::StandardCall { arguments, .. }
+        | TypedExpressionKind::BuiltinCall { arguments, .. }
+        | TypedExpressionKind::HostCall { arguments, .. } => children.extend(arguments.iter()),
+        TypedExpressionKind::Construct { fields, .. } => {
+            children.extend(fields.iter().map(|(_, field)| field));
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            children.extend(fields.iter().map(|(_, field)| field));
+            if let Some(update) = update {
+                children.push(update);
+            }
+        }
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => {
+            if let Some(payload) = payload {
+                children.push(payload);
+            }
+        }
+        TypedExpressionKind::Field { base, .. } | TypedExpressionKind::StateField { base, .. } => {
+            children.push(base);
+        }
+        TypedExpressionKind::Index { base, index } => {
+            children.push(base);
+            children.push(index);
+        }
+        TypedExpressionKind::Array(items)
+        | TypedExpressionKind::Tuple(items)
+        | TypedExpressionKind::StringInterpolation(items) => children.extend(items.iter()),
+        TypedExpressionKind::Match { value, arms } => {
+            children.push(value);
+            children.extend(arms.iter().map(|arm| &arm.value));
+        }
+        TypedExpressionKind::Try(inner) | TypedExpressionKind::Await(inner) => children.push(inner),
+        TypedExpressionKind::Update { base, fields } => {
+            children.push(base);
+            children.extend(fields.iter().map(|(_, field)| field));
+        }
+        TypedExpressionKind::Migration(intrinsic) => match intrinsic {
+            MigrationIntrinsicIr::OldFieldGet { object, .. } => children.push(object),
+            MigrationIntrinsicIr::NewSet { object, value, .. } => {
+                children.push(object);
+                children.push(value);
+            }
+            MigrationIntrinsicIr::Replace { target, .. } => children.push(target),
+            MigrationIntrinsicIr::OldGet { .. }
+            | MigrationIntrinsicIr::NewCreate { .. }
+            | MigrationIntrinsicIr::Preserve { .. }
+            | MigrationIntrinsicIr::Delete { .. }
+            | MigrationIntrinsicIr::Finish => {}
+        },
+    }
+}
+
 impl<'a> FunctionEmitter<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -2225,6 +2472,25 @@ impl<'a> FunctionEmitter<'a> {
             locals.insert(*definition, register);
             register_types.push(Some(ty));
         }
+        // M5 WP27/WP45 slice: immutable struct locals used exclusively
+        // through direct field reads get one register per field and skip
+        // heap materialization entirely. Their primary register is never
+        // written, so the exact dataflow root maps ignore it.
+        let mut inline_structs = BTreeMap::new();
+        for (definition, owner) in inline_struct_candidates(function) {
+            let Some(layout) = layouts.aggregates.get(&owner) else {
+                continue;
+            };
+            if layout.kind != TypedAggregateKind::Struct {
+                continue;
+            }
+            let fields_base = u16::try_from(register_types.len())
+                .map_err(|_| CompileError::too_many_registers(function_span))?;
+            for field in &layout.fields {
+                register_types.push(Some(field.ty));
+            }
+            inline_structs.insert(definition, (owner, fields_base));
+        }
         Ok(Self {
             package,
             function_indices,
@@ -2235,6 +2501,7 @@ impl<'a> FunctionEmitter<'a> {
             files,
             string_indices,
             locals,
+            inline_structs,
             register_types,
             parameter_count: function.parameters.len(),
             function_effect: function.effect,
@@ -2296,6 +2563,21 @@ impl<'a> FunctionEmitter<'a> {
                 definition, value, ..
             } => {
                 if let Some(value) = value {
+                    if let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
+                    {
+                        // WP27 slice: evaluate initializers straight into the
+                        // per-field registers; no StructNew is emitted and no
+                        // heap object ever exists for this binding.
+                        let TypedExpressionKind::Construct { fields, .. } = &value.kind else {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        };
+                        self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
+                        return Ok(());
+                    }
                     let destination = self.local(*definition)?;
                     self.emit_expression(value, destination)?;
                 }
@@ -4135,6 +4417,21 @@ impl<'a> FunctionEmitter<'a> {
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
+        // WP27 slice: field reads off an inlined struct binding are plain
+        // register moves; the aggregate never existed on the heap.
+        if let TypedExpressionKind::Reference(definition) = &base.kind
+            && let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
+        {
+            let source = self.inline_field_register(owner, fields_base, field, span)?;
+            self.push(
+                Instruction::Move {
+                    dst: destination,
+                    source,
+                },
+                span,
+            );
+            return Ok(());
+        }
         let source = self.allocate_expression(base)?;
         self.emit_expression(base, source)?;
         let (owner, field) = self
@@ -4942,6 +5239,67 @@ impl<'a> FunctionEmitter<'a> {
             self.allocate(*ty)?;
         }
         Ok(base)
+    }
+
+    /// Evaluates construct initializers directly into the inline field
+    /// register range, in declared field order (WP27 slice).
+    fn emit_inline_struct_fields(
+        &mut self,
+        owner: DefinitionId,
+        fields_base: u16,
+        fields: &[(DefinitionId, TypedExpressionIr)],
+        value: &TypedExpressionIr,
+    ) -> Result<(), CompileError> {
+        let span = self.span(&value.span)?;
+        let layout = self
+            .layouts
+            .aggregates
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
+        let values = fields
+            .iter()
+            .map(|(field, value)| (*field, value))
+            .collect::<BTreeMap<_, _>>();
+        if values.len() != fields.len() || values.len() != layout.fields.len() {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        for (offset, field) in layout.fields.iter().enumerate() {
+            let value = values
+                .get(&field.definition)
+                .copied()
+                .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
+            let register = fields_base
+                .checked_add(
+                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
+                )
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            self.emit_expression(value, register)?;
+        }
+        Ok(())
+    }
+
+    /// Register carrying one field of an inlined struct binding.
+    fn inline_field_register(
+        &self,
+        owner: DefinitionId,
+        fields_base: u16,
+        field: DefinitionId,
+        span: SourceSpan,
+    ) -> Result<u16, CompileError> {
+        let layout = self
+            .layouts
+            .aggregates
+            .get(&owner)
+            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
+        let offset = layout
+            .fields
+            .iter()
+            .position(|candidate| candidate.definition == field)
+            .ok_or_else(|| CompileError::unknown_name(self.definition_name(field), span))?;
+        fields_base
+            .checked_add(u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?)
+            .ok_or_else(|| CompileError::too_many_registers(span))
     }
 
     fn allocate_expression(&mut self, expression: &TypedExpressionIr) -> Result<u16, CompileError> {
