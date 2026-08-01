@@ -2230,7 +2230,7 @@ fn collect_inline_candidates(
         match statement {
             TypedStatementIr::Let {
                 definition,
-                mutable: false,
+                mutable: _,
                 value: Some(value),
             } => {
                 if let TypedExpressionKind::Construct {
@@ -2284,7 +2284,21 @@ fn scan_statement_escapes(
             }
         }
         TypedStatementIr::Assign { target, value } => {
-            scan_place_escapes(target, candidates, disqualified);
+            // Inline-struct discipline (WP27 slice, mutable extension):
+            // a single-level field write and a whole-binding re-assignment
+            // from a fresh construction are the two sanctioned mutations;
+            // everything else disqualifies the binding.
+            match target {
+                TypedPlaceIr::Field { base, .. }
+                    if matches!(base.as_ref(), TypedPlaceIr::Definition(definition)
+                        if candidates.contains_key(definition)) => {}
+                TypedPlaceIr::Definition(definition) if candidates.contains_key(definition) => {
+                    if !matches!(&value.kind, TypedExpressionKind::Construct { .. }) {
+                        disqualified.insert(*definition);
+                    }
+                }
+                _ => scan_place_escapes(target, candidates, disqualified),
+            }
             scan_expression_escapes(value, candidates, disqualified);
         }
         TypedStatementIr::Expression(expression) => {
@@ -2583,6 +2597,37 @@ impl<'a> FunctionEmitter<'a> {
                 }
             }
             TypedStatementIr::Assign { target, value } => match target {
+                TypedPlaceIr::Definition(definition)
+                    if self.inline_structs.contains_key(definition) =>
+                {
+                    // WP27 slice: re-assignment from a fresh construction
+                    // stages every field first, then publishes with moves,
+                    // so initializers reading the old fields stay correct.
+                    let (owner, fields_base) = self.inline_structs[definition];
+                    let TypedExpressionKind::Construct { fields, .. } = &value.kind else {
+                        return Err(CompileError::type_mismatch(
+                            None,
+                            None,
+                            self.span(&value.span)?,
+                        ));
+                    };
+                    self.emit_inline_struct_reassign(owner, fields_base, fields, value)?;
+                }
+                TypedPlaceIr::Field { base, field }
+                    if matches!(base.as_ref(), TypedPlaceIr::Definition(definition)
+                        if self.inline_structs.contains_key(definition)) =>
+                {
+                    let TypedPlaceIr::Definition(definition) = base.as_ref() else {
+                        unreachable!("guard matched a definition base");
+                    };
+                    let (owner, fields_base) = self.inline_structs[definition];
+                    let span = self.span(&value.span)?;
+                    let register = self.inline_field_register(owner, fields_base, *field, span)?;
+                    // Right-hand sides evaluate through their own temporary
+                    // registers, so reads of the old field value complete
+                    // before this final write lands.
+                    self.emit_expression(value, register)?;
+                }
                 TypedPlaceIr::Definition(definition) => {
                     let destination = self.local(*definition)?;
                     let source = self.allocate_expression(value)?;
@@ -5275,6 +5320,62 @@ impl<'a> FunctionEmitter<'a> {
                 )
                 .ok_or_else(|| CompileError::too_many_registers(span))?;
             self.emit_expression(value, register)?;
+        }
+        Ok(())
+    }
+
+    /// Re-assigns an inlined struct binding: initializers evaluate into a
+    /// staging range first, then publish into the field registers, keeping
+    /// `s = S { x: s.y, y: s.x }` style self-references correct.
+    fn emit_inline_struct_reassign(
+        &mut self,
+        owner: DefinitionId,
+        fields_base: u16,
+        fields: &[(DefinitionId, TypedExpressionIr)],
+        value: &TypedExpressionIr,
+    ) -> Result<(), CompileError> {
+        let span = self.span(&value.span)?;
+        let layout = self
+            .layouts
+            .aggregates
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
+        let values = fields
+            .iter()
+            .map(|(field, value)| (*field, value))
+            .collect::<BTreeMap<_, _>>();
+        if values.len() != fields.len() || values.len() != layout.fields.len() {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        let field_types = layout
+            .fields
+            .iter()
+            .map(|field| field.ty)
+            .collect::<Vec<_>>();
+        let staging_base = self.reserve_types(&field_types)?;
+        for (offset, field) in layout.fields.iter().enumerate() {
+            let value = values
+                .get(&field.definition)
+                .copied()
+                .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
+            let register = staging_base
+                .checked_add(
+                    u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?,
+                )
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            self.emit_expression(value, register)?;
+        }
+        for offset in 0..layout.fields.len() {
+            let offset =
+                u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?;
+            let source = staging_base
+                .checked_add(offset)
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            let dst = fields_base
+                .checked_add(offset)
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            self.push(Instruction::Move { dst, source }, span);
         }
         Ok(())
     }
