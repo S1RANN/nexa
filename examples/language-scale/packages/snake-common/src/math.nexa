@@ -1,5 +1,3 @@
-module math;
-
 pub fn twice(value: i32) -> i32 {
     return value + value;
 }

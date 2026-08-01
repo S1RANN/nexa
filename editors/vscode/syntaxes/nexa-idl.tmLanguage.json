@@ -7,6 +7,15 @@
   ],
   "patterns": [
     {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#attributes"
+    },
+    {
       "include": "#declarations"
     },
     {
@@ -38,10 +47,49 @@
     }
   ],
   "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.documentation.nexa-idl",
+          "match": "///.*$"
+        },
+        {
+          "name": "comment.line.double-slash.nexa-idl",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.nexa-idl",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.nexa-idl",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "name": "constant.character.escape.nexa-idl",
+          "match": "\\\\[nrt\\\\\"]"
+        }
+      ]
+    },
+    "attributes": {
+      "match": "(@)(fuel|cancel|abandon|capability)\\b",
+      "captures": {
+        "1": {
+          "name": "punctuation.definition.annotation.nexa-idl"
+        },
+        "2": {
+          "name": "entity.name.tag.nexa-idl"
+        }
+      }
+    },
     "declarations": {
       "patterns": [
         {
-          "match": "\\b(interface|opaque|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(contract|handle|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
               "name": "storage.type.nexa-idl"
@@ -52,12 +100,15 @@
           }
         },
         {
-          "match": "\\b(fn|export)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
-              "name": "storage.type.function.nexa-idl"
+              "name": "storage.modifier.async.nexa-idl"
             },
             "2": {
+              "name": "storage.type.function.nexa-idl"
+            },
+            "3": {
               "name": "entity.name.function.nexa-idl"
             }
           }
@@ -70,11 +121,11 @@
     },
     "builtin-types": {
       "name": "support.type.builtin.nexa-idl",
-      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|host_request|request|resource_token|token|snapshot|array|buffer|Option|Result|void)\\b"
+      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Buffer|Option|Result|Token|Snapshot)\\b"
     },
     "keywords": {
       "name": "keyword.control.nexa-idl",
-      "match": "\\b(?:interface|opaque|struct|enum|fn|export|sync|request|fuel)\\b"
+      "match": "\\b(?:contract|struct|enum|handle|host|nexa|fn|async)\\b"
     },
     "function-names": {
       "name": "entity.name.function.call.nexa-idl",
@@ -100,13 +151,13 @@
         },
         {
           "name": "keyword.operator.nexa-idl",
-          "match": "[:<>]"
+          "match": "[=:<>]"
         }
       ]
     },
     "punctuation": {
       "name": "punctuation.separator.nexa-idl",
-      "match": "[{},();]"
+      "match": "[{},();@]"
     }
   }
 }

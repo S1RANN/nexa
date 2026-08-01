@@ -286,7 +286,7 @@ pub struct CompileJob {
     pub source_id: SourceId,
     pub identity: CandidateIdentity,
     pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
-    pub idl: nexa::Idl,
+    pub idl: nexa::ValidatedContract,
     pub required_exports: Vec<ExportRequirement>,
     host_contract_source_identity: nexa::SourceIdentity,
     host_contract_source: Arc<str>,
@@ -298,7 +298,7 @@ impl CompileJob {
         source_id: SourceId,
         identity: CandidateIdentity,
         build_input: Arc<nexa_analysis::ResolvedBuildInput>,
-        idl: nexa::Idl,
+        idl: nexa::ValidatedContract,
         required_exports: Vec<ExportRequirement>,
         host_contract_source_identity: nexa::SourceIdentity,
         host_contract_source: Arc<str>,
@@ -592,7 +592,7 @@ pub struct DevelopmentCompileRequest {
     pub source_id: SourceId,
     pub identity: CandidateIdentity,
     pub build_input: Arc<nexa_analysis::ResolvedBuildInput>,
-    pub idl: nexa::Idl,
+    pub idl: nexa::ValidatedContract,
     pub required_exports: Vec<ExportRequirement>,
 }
 
@@ -1021,7 +1021,14 @@ fn worker_loop(shared: &WorkerShared) {
             job.host_contract_source_identity.clone(),
             Arc::clone(&job.host_contract_source),
         )
-        .expect("compile jobs retain a validated immutable Host source");
+        .expect("compile jobs retain a validated immutable Host source")
+        .requiring_entrypoints(
+            &job.required_exports
+                .iter()
+                .map(|entrypoint| entrypoint.name.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("compile jobs retain validated required entrypoints");
         let result = {
             let mut build_session = shared
                 .build_session

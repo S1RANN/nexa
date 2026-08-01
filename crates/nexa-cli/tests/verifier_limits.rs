@@ -29,7 +29,7 @@ impl Fixture {
             .collect::<Vec<_>>()
             .join(", ");
         let oversized_frame = format!(
-            "fn main() -> i32 {{ return 7; }}\n\
+            "fn main(args: Array<string>) -> i32 {{ return 0; }}\n\
              fn oversized_frame({parameters}) -> i32 {{ return 7; }}\n"
         );
         fs::write(&source, &oversized_frame).expect("standalone source");
@@ -45,19 +45,15 @@ impl Fixture {
              activation = \"default-enabled\"\n",
         )
         .expect("Application Manifest");
-        fs::write(
-            app.join("src/example/main.nexa"),
-            format!("module example.main;\n{oversized_frame}"),
-        )
-        .expect("Application source");
-        fs::write(root.join("app_api.nidl"), "interface EmptyHost {}\n").expect("Host Contract");
+        fs::write(app.join("src/example/main.nexa"), &oversized_frame).expect("Application source");
+        fs::write(root.join("app_api.nidl"), "contract EmptyHost {}\n").expect("Host Contract");
 
         let project = root.join("nexa.dev.toml");
         fs::write(
             &project,
             "schema = 2\n\
              contract = \"app_api.nidl\"\n\
-             required_exports = []\n\
+             required_entrypoints = []\n\
              [[sources]]\n\
              id = \"fixture\"\n\
              root = \"packages\"\n\
@@ -189,12 +185,16 @@ fn relaxed_immediate_wcet_limits_handle_a_large_static_loop_without_aborting() {
     let limits = fixture.root.join("relaxed-immediate-limits.json");
     fs::write(
         &source,
-        "immediate fn main() -> i32 {\n\
-             for step in 0..1025 {\n\
-                 continue;\n\
-             }\n\
-             return 7;\n\
-         }\n",
+        concat!(
+            "fn main(args: Array<string>) -> i32 { return expensive(); }\n\
+             @immediate\n",
+            "fn expensive() -> i32 {\n\
+                 for step in 0..1025 {\n\
+                     continue;\n\
+                 }\n\
+                 return 7;\n\
+             }\n"
+        ),
     )
     .expect("immediate static-loop source");
     fs::write(

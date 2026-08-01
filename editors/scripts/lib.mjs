@@ -153,11 +153,11 @@ export function textMateGrammars(syntax = readSyntax()) {
         patterns: [
           {
             match:
-              "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+              "\\b(use)\\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
             captures: {
-              1: capture("keyword.control.module.nexa"),
+              1: capture("keyword.control.namespace.nexa"),
               2: capture("entity.name.namespace.nexa"),
-              3: capture("keyword.control.module.nexa"),
+              3: capture("keyword.control.namespace.nexa"),
               4: capture("entity.name.namespace.nexa"),
             },
           },
@@ -171,10 +171,11 @@ export function textMateGrammars(syntax = readSyntax()) {
           },
           {
             match:
-              "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+              "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
             captures: {
-              1: capture("storage.type.function.nexa"),
-              2: capture("entity.name.function.nexa"),
+              1: capture("storage.modifier.async.nexa"),
+              2: capture("storage.type.function.nexa"),
+              3: capture("entity.name.function.nexa"),
             },
           },
           {
@@ -216,7 +217,7 @@ export function textMateGrammars(syntax = readSyntax()) {
       "function-calls": {
         name: "entity.name.function.call.nexa",
         match:
-          "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:<[^;{}()]+>)?\\s*\\()",
+          "\\b[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\.)[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:<[^;{}()]+>)?\\s*\\()",
       },
       properties: {
         name: "variable.other.property.nexa",
@@ -234,7 +235,7 @@ export function textMateGrammars(syntax = readSyntax()) {
           },
           {
             name: "keyword.operator.nexa",
-            match: "&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]",
+            match: "::|&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]",
           },
         ],
       },
@@ -252,6 +253,9 @@ export function textMateGrammars(syntax = readSyntax()) {
     scopeName: "source.nexa-idl",
     fileTypes: ["nidl"],
     patterns: [
+      { include: "#comments" },
+      { include: "#strings" },
+      { include: "#attributes" },
       { include: "#declarations" },
       { include: "#policies" },
       { include: "#builtin-types" },
@@ -264,11 +268,48 @@ export function textMateGrammars(syntax = readSyntax()) {
       { include: "#punctuation" },
     ],
     repository: {
+      comments: {
+        patterns: [
+          {
+            name: "comment.line.documentation.nexa-idl",
+            match: "///.*$",
+          },
+          {
+            name: "comment.line.double-slash.nexa-idl",
+            match: "//.*$",
+          },
+          {
+            name: "comment.block.nexa-idl",
+            begin: "/\\*",
+            end: "\\*/",
+          },
+        ],
+      },
+      strings: {
+        name: "string.quoted.double.nexa-idl",
+        begin: "\"",
+        end: "\"",
+        patterns: [
+          {
+            name: "constant.character.escape.nexa-idl",
+            match: "\\\\[nrt\\\\\"]",
+          },
+        ],
+      },
+      attributes: {
+        match: `(@)(${nidl.attributeKeywords
+          .map(escapeRegex)
+          .join("|")})\\b`,
+        captures: {
+          1: capture("punctuation.definition.annotation.nexa-idl"),
+          2: capture("entity.name.tag.nexa-idl"),
+        },
+      },
       declarations: {
         patterns: [
           {
             match:
-              "\\b(interface|opaque|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+              "\\b(contract|handle|struct|enum)\\s+([A-Za-z_][A-Za-z0-9_]*)",
             captures: {
               1: capture("storage.type.nexa-idl"),
               2: capture("entity.name.type.nexa-idl"),
@@ -276,10 +317,11 @@ export function textMateGrammars(syntax = readSyntax()) {
           },
           {
             match:
-              "\\b(fn|export)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+              "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
             captures: {
-              1: capture("storage.type.function.nexa-idl"),
-              2: capture("entity.name.function.nexa-idl"),
+              1: capture("storage.modifier.async.nexa-idl"),
+              2: capture("storage.type.function.nexa-idl"),
+              3: capture("entity.name.function.nexa-idl"),
             },
           },
         ],
@@ -323,13 +365,13 @@ export function textMateGrammars(syntax = readSyntax()) {
           },
           {
             name: "keyword.operator.nexa-idl",
-            match: "[:<>]",
+            match: "[=:<>]",
           },
         ],
       },
       punctuation: {
         name: "punctuation.separator.nexa-idl",
-        match: "[{},();]",
+        match: "[{},();@]",
       },
     },
   };

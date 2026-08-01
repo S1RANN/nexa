@@ -1,10 +1,11 @@
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
-    AbandonPolicy, AsyncResultType, CancelPolicy, HostImport, MigrationLimitRequirements, ValueType,
+    AbandonPolicy, AsyncResultType, CancelPolicy, FunctionEffect, HostImport,
+    MigrationLimitRequirements, Signature, ValueType,
 };
 use nexa_core::{RawHandle, StableId, StateSchemaFingerprint};
 use nexa_verifier::VerifiedModule;
@@ -51,7 +52,7 @@ pub struct ModuleEpochRoot {
     pub stateful_domain: StatefulDomainId,
     pub epoch: u64,
     pub verified: Arc<VerifiedModule>,
-    pub host_hash: StableId,
+    pub host_contract_id: StableId,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
     state: Arc<StatefulRegistry>,
@@ -115,15 +116,16 @@ impl InterpreterHost for RealmHostBridge<'_> {
         arguments: &[RuntimeValue],
         heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
-        self.imports
-            .get(import as usize)
-            .ok_or(HostTrap::UnknownFunction(import))?;
+        let metadata = self.imports.get(import as usize).ok_or_else(|| {
+            HostTrap::Host("host import index is outside the verified module".into())
+        })?;
         let values = RuntimeHostArgs::new(arguments, heap)?;
         let mut context = self
             .resources
             .context(self.task, self.module_id, self.epoch);
         match crate::invoke_host_boundary(|| {
-            self.registry.call_runtime(import, &mut context, values)
+            self.registry
+                .call_runtime(metadata.stable_id, &mut context, values)
         })? {
             HostCallOutcome::RuntimeImmediate(value) => {
                 Ok(InterpreterHostOutcome::Immediate(value))
@@ -141,10 +143,41 @@ impl InterpreterHost for RealmHostBridge<'_> {
 }
 
 struct RealmStateBridge<'a> {
-    registry: &'a StatefulRegistry,
+    registry: &'a mut StatefulRegistry,
 }
 
 impl InterpreterState for RealmStateBridge<'_> {
+    fn current_object(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
+        self.registry.current_object_proxy(stable_id, type_id)
+    }
+
+    fn object_field(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
+        self.registry
+            .current_object_field(stable_id, type_id, field_id, expected)
+    }
+
+    fn set_object_field(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), RuntimeMessage> {
+        self.registry
+            .set_current_object_field(stable_id, type_id, field_id, expected, value)
+    }
+
     fn resolve(
         &mut self,
         handle: crate::StateHandle,
@@ -297,6 +330,139 @@ pub struct RestartReloadMetrics {
 pub struct RestartReloadResult {
     pub outcome: RestartReloadOutcome,
     pub metrics: RestartReloadMetrics,
+}
+
+/// Stable, typed identity of the one cell that a staged REPL candidate may run.
+///
+/// Transactional cells are always task-effect exports. Synchronous cells are
+/// lowered to task wrappers by the compiler, which keeps this runtime boundary
+/// independent of raw function indices and prevents callers from accidentally
+/// invoking migration, cleanup, or activation functions.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionalCellEntrypoint {
+    stable_id: StableId,
+    signature: Signature,
+    state_extension: Option<TransactionalStateExtension>,
+}
+
+impl TransactionalCellEntrypoint {
+    #[must_use]
+    pub const fn new(stable_id: StableId, signature: Signature) -> Self {
+        Self {
+            stable_id,
+            signature,
+            state_extension: None,
+        }
+    }
+
+    /// Marks this entrypoint as the sole writer for a staged REPL environment
+    /// schema extension. The runtime validates the exact old/candidate schema
+    /// delta; this value is authority to use the narrow transactional path,
+    /// not authority to change arbitrary state.
+    #[must_use]
+    pub const fn with_state_extension(mut self, environment: StableId) -> Self {
+        self.state_extension = Some(TransactionalStateExtension { environment });
+        self
+    }
+
+    #[must_use]
+    pub const fn stable_id(&self) -> StableId {
+        self.stable_id
+    }
+
+    #[must_use]
+    pub const fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    #[must_use]
+    pub const fn effect(&self) -> FunctionEffect {
+        FunctionEffect::Task
+    }
+
+    #[must_use]
+    pub const fn state_extension(&self) -> Option<TransactionalStateExtension> {
+        self.state_extension
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionalStateExtension {
+    environment: StableId,
+}
+
+impl TransactionalStateExtension {
+    #[must_use]
+    pub const fn environment(self) -> StableId {
+        self.environment
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransactionalCellPoll {
+    Yielded(YieldReason),
+    Waiting(HostRequestHandle),
+    ReadyToCommit {
+        value: RuntimeValue,
+        charge: ExecutionCharge,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionalCellCommit {
+    pub module: ModuleHandle,
+    pub value: RuntimeValue,
+    pub charge: ExecutionCharge,
+}
+
+#[derive(Debug)]
+pub enum TransactionalCellFailureCause {
+    Cancelled(CancelReason),
+    Trapped(Box<RuntimeError>),
+    Runtime(Box<RuntimeError>),
+    Activation(Box<RealmError>),
+    NotReady,
+    AlreadyFinished,
+}
+
+#[derive(Debug)]
+pub struct TransactionalCellFailure {
+    pub cause: TransactionalCellFailureCause,
+    /// Cleanup is best-effort but never short-circuited. This records the first
+    /// cleanup failure while preserving the primary cell failure above.
+    pub rollback_error: Option<Box<RealmError>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransactionalCellRollback {
+    pub candidate: ModuleHandle,
+    pub reason: CancelReason,
+}
+
+/// Exclusive guard for a prepared REPL cell candidate.
+///
+/// While this value exists the Realm cannot be used through another mutable
+/// reference. A successful cell still does not publish until [`Self::commit`];
+/// every other terminal path and `Drop` release the candidate.
+pub struct StagedCellTransaction<'a> {
+    realm: &'a mut RealmRuntime,
+    candidate: ModuleHandle,
+    task: TaskHandle,
+    fuel_slice: u64,
+    activation_arguments: Vec<RuntimeValue>,
+    activation_fuel: u64,
+    ready: Option<(RuntimeValue, ExecutionCharge)>,
+    heap_checkpoint: Option<crate::heap::HeapCheckpoint>,
+    session_checkpoint: Option<TransactionalSessionCheckpoint>,
+    finished: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TransactionalSessionCheckpoint {
+    next_epoch: u64,
+    next_stateful_domain: u64,
+    last_migration_usage_report: Option<crate::MigrationUsageReport>,
+    last_migration_hash: Option<StableId>,
 }
 
 struct CommitReloadMeasurement {
@@ -642,7 +808,7 @@ pub enum CancelReason {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PollResult<T> {
-    Completed(T),
+    Completed { value: T, charge: ExecutionCharge },
     Pending(PendingReason),
     Cancelled(CancelReason),
     Trapped(Trap),
@@ -850,10 +1016,15 @@ pub enum RealmError {
     ModuleHandle(crate::HandleError),
     MissingModule(u32),
     HostCapabilitiesUnavailable,
-    MissingHostInterfaceHash,
+    MissingHostContractRuntimeId,
     RuntimeHostClosing,
     RuntimeHostClosed,
-    HostHashMismatch,
+    HostContractIdMismatch,
+    MissingHostFunctionAuthority(StableId),
+    HostFunctionAuthorityMismatch {
+        stable_id: StableId,
+        field: HostFunctionAuthorityField,
+    },
     SchemaHashMismatch,
     EpochExhausted,
     ModuleNotCallable,
@@ -864,6 +1035,41 @@ pub enum RealmError {
     Reload(ReloadError),
     State(crate::StatefulError),
     InjectedFailure(crate::RuntimeFailurePoint),
+    MissingTransactionalCellExport(StableId),
+    MissingScriptExport(StableId),
+    ScriptExportMetadataMismatch(StableId),
+    ScriptExportNotCallable(StableId),
+    TransactionalCellSignatureMismatch(StableId),
+    TransactionalCellEffectMismatch {
+        stable_id: StableId,
+        actual: FunctionEffect,
+    },
+    InvalidTransactionalStateExtension,
+    InvalidTransactionalStateSeed,
+    TransactionalCellTerminalRecordMissing,
+    TransactionalCellSetupRollbackFailed {
+        setup: Box<RealmError>,
+        rollback: Box<RealmError>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostFunctionAuthorityField {
+    StableId,
+    DeclarationFingerprint,
+    Capabilities,
+    Parameters,
+    Result,
+    Mode,
+    FuelCost,
+    AsyncResultPresence,
+    AsyncResultType,
+    AsyncSuccessType,
+    AsyncErrorType,
+    CancelPolicy,
+    AbandonPolicy,
+    CancelErrorVariant,
+    AbandonErrorVariant,
 }
 
 impl fmt::Display for RealmError {
@@ -947,7 +1153,7 @@ pub struct RealmRuntime {
     total_reload_cancelled_tasks: u64,
     total_reload_detached_requests: u64,
     host_registry: Option<Box<dyn HostRegistry>>,
-    host_registry_hash: Option<StableId>,
+    host_registry_contract_id: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
     failure_injector: crate::RuntimeFailureInjector,
 }
@@ -998,7 +1204,7 @@ impl RealmRuntime {
             total_reload_cancelled_tasks: 0,
             total_reload_detached_requests: 0,
             host_registry: None,
-            host_registry_hash: None,
+            host_registry_contract_id: None,
             runtime_host: None,
             failure_injector,
         }
@@ -1014,9 +1220,9 @@ impl RealmRuntime {
         runtime_host: RuntimeHost,
         registry: Box<dyn HostRegistry>,
     ) -> Result<Self, RealmError> {
-        let host_registry_hash = registry
-            .interface_hash()
-            .ok_or(RealmError::MissingHostInterfaceHash)?;
+        let host_registry_contract_id = registry
+            .contract_runtime_id()
+            .ok_or(RealmError::MissingHostContractRuntimeId)?;
         runtime_host.register_realm().map_err(|state| match state {
             RuntimeHostState::Closing => RealmError::RuntimeHostClosing,
             RuntimeHostState::Closed => RealmError::RuntimeHostClosed,
@@ -1025,7 +1231,7 @@ impl RealmRuntime {
         let resource_config = config.clone();
         let mut realm = Self::base(config);
         realm.host_registry = Some(registry);
-        realm.host_registry_hash = Some(host_registry_hash);
+        realm.host_registry_contract_id = Some(host_registry_contract_id);
         realm.resources = RuntimeResources::with_runtime_host(
             resource_config.realm_id,
             resource_config.max_host_resources,
@@ -1146,6 +1352,49 @@ impl RealmRuntime {
         Ok(Arc::make_mut(&mut root.state).insert(stable_id, value)?)
     }
 
+    /// Creates revision zero's unique, empty transactional environment.
+    ///
+    /// The seed module must expose exactly one zero-field state Class and no
+    /// lifecycle entry. This operation is intentionally distinct from generic
+    /// `insert_state`, so REPL setup cannot silently seed an arbitrary schema.
+    pub fn initialize_transactional_state_seed(
+        &mut self,
+        module: ModuleHandle,
+        environment: StableId,
+    ) -> Result<crate::StateHandle, RealmError> {
+        let root = self
+            .modules
+            .resolve_mut(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let schema = &root.verified.module().state_schema;
+        let [state_type] = schema.types.as_slice() else {
+            return Err(RealmError::InvalidTransactionalStateSeed);
+        };
+        let reload = root.verified.module().reload_metadata;
+        if root.lifecycle != ModuleLifecycle::Active
+            || root.state.object_count() != 0
+            || state_type.stable_id != environment
+            || state_type.version == 0
+            || !state_type.fields.is_empty()
+            || reload.migration_entry.is_some()
+            || reload.activation_entry.is_some()
+        {
+            return Err(RealmError::InvalidTransactionalStateSeed);
+        }
+        let handle = Arc::make_mut(&mut root.state).insert(
+            environment,
+            crate::StateValue::Object(crate::StateObject {
+                type_id: environment,
+                version: state_type.version,
+                fields: BTreeMap::new(),
+            }),
+        )?;
+        root.state
+            .validate_transactional_state(schema)
+            .map_err(RealmError::State)?;
+        Ok(handle)
+    }
+
     pub fn state_handles(
         &self,
         module: ModuleHandle,
@@ -1212,34 +1461,111 @@ impl RealmRuntime {
         self.last_migration_hash
     }
 
+    fn validate_host_function_authorities(&self, imports: &[HostImport]) -> Result<(), RealmError> {
+        if imports.is_empty() {
+            return Ok(());
+        }
+        let registry = self
+            .host_registry
+            .as_deref()
+            .ok_or(RealmError::HostCapabilitiesUnavailable)?;
+        for import in imports {
+            let contract = registry
+                .function_authority(import.stable_id)
+                .ok_or(RealmError::MissingHostFunctionAuthority(import.stable_id))?;
+            let mismatch = |field| RealmError::HostFunctionAuthorityMismatch {
+                stable_id: import.stable_id,
+                field,
+            };
+            if contract.stable_id() != import.stable_id {
+                return Err(mismatch(HostFunctionAuthorityField::StableId));
+            }
+            if contract.declaration_fingerprint() != import.declaration_fingerprint {
+                return Err(mismatch(HostFunctionAuthorityField::DeclarationFingerprint));
+            }
+            let capabilities = contract.capabilities();
+            if capabilities.len() != import.capabilities.len()
+                || capabilities
+                    .iter()
+                    .zip(&import.capabilities)
+                    .any(|(expected, actual)| expected != actual)
+            {
+                return Err(mismatch(HostFunctionAuthorityField::Capabilities));
+            }
+            if contract.parameters() != import.parameters.as_slice() {
+                return Err(mismatch(HostFunctionAuthorityField::Parameters));
+            }
+            if contract.result() != import.result {
+                return Err(mismatch(HostFunctionAuthorityField::Result));
+            }
+            if contract.mode() != import.mode {
+                return Err(mismatch(HostFunctionAuthorityField::Mode));
+            }
+            if contract.fuel_cost() != import.fuel_cost {
+                return Err(mismatch(HostFunctionAuthorityField::FuelCost));
+            }
+            match (contract.async_result(), import.async_result) {
+                (None, None) => {}
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(mismatch(HostFunctionAuthorityField::AsyncResultPresence));
+                }
+                (Some(expected), Some(actual)) => {
+                    if expected.result_type != actual.result_type {
+                        return Err(mismatch(HostFunctionAuthorityField::AsyncResultType));
+                    }
+                    if expected.success != actual.success {
+                        return Err(mismatch(HostFunctionAuthorityField::AsyncSuccessType));
+                    }
+                    if expected.error != actual.error {
+                        return Err(mismatch(HostFunctionAuthorityField::AsyncErrorType));
+                    }
+                    if expected.cancel_policy != actual.cancel_policy {
+                        return Err(mismatch(HostFunctionAuthorityField::CancelPolicy));
+                    }
+                    if expected.abandon_policy != actual.abandon_policy {
+                        return Err(mismatch(HostFunctionAuthorityField::AbandonPolicy));
+                    }
+                    if expected.cancel_error != actual.cancel_error {
+                        return Err(mismatch(HostFunctionAuthorityField::CancelErrorVariant));
+                    }
+                    if expected.abandon_error != actual.abandon_error {
+                        return Err(mismatch(HostFunctionAuthorityField::AbandonErrorVariant));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn load_module(
         &mut self,
         verified: VerifiedModule,
-        host_hash: StableId,
+        host_contract_id: StableId,
         state_schema_fingerprint: StateSchemaFingerprint,
     ) -> Result<ModuleHandle, RealmError> {
         if self.runtime_host.is_none() && module_requires_host_capabilities(verified.module()) {
             return Err(RealmError::HostCapabilitiesUnavailable);
         }
         if self
-            .host_registry_hash
-            .is_some_and(|registry_hash| registry_hash != host_hash)
+            .host_registry_contract_id
+            .is_some_and(|registry_id| registry_id != host_contract_id)
         {
-            return Err(RealmError::HostHashMismatch);
+            return Err(RealmError::HostContractIdMismatch);
         }
-        if verified.module().host_interface_hash != Some(host_hash) {
-            return Err(RealmError::HostHashMismatch);
+        if verified.module().host_contract_id != Some(host_contract_id) {
+            return Err(RealmError::HostContractIdMismatch);
         }
+        self.validate_host_function_authorities(&verified.module().host_imports)?;
         if verified.module().state_schema_fingerprint != state_schema_fingerprint {
             return Err(RealmError::SchemaHashMismatch);
         }
         let epoch = self.next_epoch;
-        self.next_epoch = self
+        let next_epoch = self
             .next_epoch
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
         let stateful_domain = StatefulDomainId::new(self.next_stateful_domain);
-        self.next_stateful_domain = self
+        let next_stateful_domain = self
             .next_stateful_domain
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
@@ -1250,13 +1576,15 @@ impl RealmRuntime {
                 stateful_domain,
                 epoch,
                 verified: Arc::new(verified),
-                host_hash,
+                host_contract_id,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
                 state: Arc::new(StatefulRegistry::new(stateful_domain)),
                 staging_roots: Vec::new(),
             })
             .map_err(RealmError::ModuleAllocation)?;
+        self.next_epoch = next_epoch;
+        self.next_stateful_domain = next_stateful_domain;
         let loaded = self
             .modules
             .resolve_mut(raw)
@@ -1273,7 +1601,7 @@ impl RealmRuntime {
         &mut self,
         old_module: ModuleHandle,
         candidate: VerifiedModule,
-        host_hash: StableId,
+        host_contract_id: StableId,
     ) -> Result<ModuleHandle, RealmError> {
         if self.reload.active() {
             return Err(ReloadError::InvalidState.into());
@@ -1282,9 +1610,13 @@ impl RealmRuntime {
             .modules
             .resolve(old_module.raw())
             .map_err(RealmError::ModuleHandle)?;
-        if old.verified.module().host_interface_hash != Some(host_hash) {
-            return Err(RealmError::HostHashMismatch);
+        if self.active_root != Some(old_module) || old.lifecycle != ModuleLifecycle::Active {
+            return Err(ReloadError::InvalidState.into());
         }
+        if old.verified.module().host_contract_id != Some(host_contract_id) {
+            return Err(RealmError::HostContractIdMismatch);
+        }
+        self.validate_host_function_authorities(&candidate.module().host_imports)?;
         let old_module_id = old.module_id;
         let old_epoch = old.epoch;
         let stateful_domain = old.stateful_domain;
@@ -1300,7 +1632,7 @@ impl RealmRuntime {
         ) {
             return Err(ReloadError::MigrationLimit(error).into());
         }
-        let candidate = self.load_module(candidate, host_hash, candidate_schema)?;
+        let candidate = self.load_module(candidate, host_contract_id, candidate_schema)?;
         let candidate_root = self
             .modules
             .resolve_mut(candidate.raw())
@@ -1308,14 +1640,75 @@ impl RealmRuntime {
         candidate_root.lifecycle = ModuleLifecycle::Staging;
         candidate_root.stateful_domain = stateful_domain;
         candidate_root.state = Arc::new(StatefulRegistry::new(stateful_domain));
-        self.reload.begin(ReloadTransaction {
+        let transaction = ReloadTransaction {
             old_module,
             candidate,
             old_module_id,
             old_epoch,
             cancelled_task_count: 0,
             detached_request_count: 0,
-        })?;
+        };
+        if let Err(error) = self.reload.begin(transaction) {
+            self.modules
+                .release(candidate.raw())
+                .map_err(RealmError::ModuleHandle)?;
+            return Err(error.into());
+        }
+        Ok(candidate)
+    }
+
+    fn prepare_transactional_state_reload(
+        &mut self,
+        old_module: ModuleHandle,
+        candidate: VerifiedModule,
+        host_contract_id: StableId,
+        extension: TransactionalStateExtension,
+    ) -> Result<ModuleHandle, RealmError> {
+        if self.reload.active() {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let old = self
+            .modules
+            .resolve(old_module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        if self.active_root != Some(old_module) || old.lifecycle != ModuleLifecycle::Active {
+            return Err(ReloadError::InvalidState.into());
+        }
+        if old.verified.module().host_contract_id != Some(host_contract_id) {
+            return Err(RealmError::HostContractIdMismatch);
+        }
+        validate_transactional_state_transition(
+            old.verified.module(),
+            candidate.module(),
+            extension.environment(),
+        )?;
+        self.validate_host_function_authorities(&candidate.module().host_imports)?;
+        let old_module_id = old.module_id;
+        let old_epoch = old.epoch;
+        let stateful_domain = old.stateful_domain;
+        let candidate_schema = candidate.module().state_schema_fingerprint;
+        let candidate = self.load_module(candidate, host_contract_id, candidate_schema)?;
+        let candidate_root = self
+            .modules
+            .resolve_mut(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        candidate_root.lifecycle = ModuleLifecycle::Staging;
+        candidate_root.stateful_domain = stateful_domain;
+        candidate_root.state = Arc::new(StatefulRegistry::new(stateful_domain));
+        let transaction = ReloadTransaction {
+            old_module,
+            candidate,
+            old_module_id,
+            old_epoch,
+            cancelled_task_count: 0,
+            detached_request_count: 0,
+        };
+        if let Err(error) = self.reload.begin(transaction) {
+            self.modules
+                .release(candidate.raw())
+                .map_err(RealmError::ModuleHandle)?;
+            return Err(error.into());
+        }
         Ok(candidate)
     }
 
@@ -1341,13 +1734,13 @@ impl RealmRuntime {
             activation_fuel,
         } = policy;
         let mut metrics = RestartReloadMetrics::default();
-        let host_hash = self
+        let host_contract_id = self
             .modules
             .resolve(module.raw())
             .map_err(|error| ReloadError::Migration(RuntimeMessage::inline(&error.to_string())))?
-            .host_hash;
+            .host_contract_id;
         let candidate = self
-            .prepare_reload(module, candidate, host_hash)
+            .prepare_reload(module, candidate, host_contract_id)
             .map_err(restart_reload_error)?;
         let quiesce_started = Instant::now();
         self.quiesce_reload().map_err(restart_reload_error)?;
@@ -1387,6 +1780,135 @@ impl RealmRuntime {
             Err(error) => return Err(restart_reload_error(error)),
         };
         Ok(RestartReloadResult { outcome, metrics })
+    }
+
+    fn transactional_session_checkpoint(&self) -> TransactionalSessionCheckpoint {
+        TransactionalSessionCheckpoint {
+            next_epoch: self.next_epoch,
+            next_stateful_domain: self.next_stateful_domain,
+            last_migration_usage_report: self.last_migration_usage_report,
+            last_migration_hash: self.last_migration_hash,
+        }
+    }
+
+    fn restore_transactional_session_checkpoint(
+        &mut self,
+        checkpoint: TransactionalSessionCheckpoint,
+    ) {
+        self.next_epoch = checkpoint.next_epoch;
+        self.next_stateful_domain = checkpoint.next_stateful_domain;
+        self.last_migration_usage_report = checkpoint.last_migration_usage_report;
+        self.last_migration_hash = checkpoint.last_migration_hash;
+    }
+
+    fn rollback_failed_cell_setup(
+        &mut self,
+        setup: RealmError,
+        heap_checkpoint: crate::heap::HeapCheckpoint,
+        session_checkpoint: TransactionalSessionCheckpoint,
+    ) -> RealmError {
+        let cleanup = if self.reload.active() {
+            self.cleanup_staged_cell(None, CancelReason::HostCancelled)
+        } else {
+            Ok(())
+        };
+        self.heap.restore_checkpoint(heap_checkpoint);
+        let rollback = cleanup.err().or_else(|| {
+            self.reload
+                .active()
+                .then_some(RealmError::Reload(ReloadError::InvalidState))
+        });
+        if let Some(rollback) = rollback {
+            RealmError::TransactionalCellSetupRollbackFailed {
+                setup: Box::new(setup),
+                rollback: Box::new(rollback),
+            }
+        } else {
+            self.restore_transactional_session_checkpoint(session_checkpoint);
+            setup
+        }
+    }
+
+    /// Prepare and migrate a candidate module without publishing it, then
+    /// start exactly one stable, typed task export from that candidate.
+    ///
+    /// The returned guard owns the mutable Realm borrow. It must observe a
+    /// successful terminal value and explicitly commit before the candidate
+    /// can become active; dropping it rolls the candidate back.
+    pub fn stage_cell_transaction(
+        &mut self,
+        old_module: ModuleHandle,
+        candidate: VerifiedModule,
+        entrypoint: &TransactionalCellEntrypoint,
+        cell_arguments: &[RuntimeValue],
+        policy: RestartReloadPolicy,
+        step: StepConfig,
+    ) -> Result<StagedCellTransaction<'_>, RealmError> {
+        let host_contract_id = self
+            .modules
+            .resolve(old_module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .host_contract_id;
+        let session_checkpoint = self.transactional_session_checkpoint();
+        let heap_checkpoint = self.heap.checkpoint();
+        let state_extension = entrypoint.state_extension();
+        let prepared = match state_extension {
+            Some(extension) => self.prepare_transactional_state_reload(
+                old_module,
+                candidate,
+                host_contract_id,
+                extension,
+            ),
+            None => self.prepare_reload(old_module, candidate, host_contract_id),
+        };
+        if let Err(error) = prepared {
+            return Err(self.rollback_failed_cell_setup(
+                error,
+                heap_checkpoint,
+                session_checkpoint,
+            ));
+        }
+        let Ok(candidate) = prepared else {
+            unreachable!("the failed prepare branch returned above");
+        };
+        let setup = (|| {
+            self.quiesce_reload()?;
+            match state_extension {
+                Some(extension) => {
+                    if !policy.migration_arguments.is_empty() {
+                        return Err(RealmError::InvalidTransactionalStateExtension);
+                    }
+                    self.stage_transactional_state_reload(extension)?;
+                }
+                None => {
+                    self.stage_reload(&policy.migration_arguments)?;
+                }
+            }
+            let function = self.resolve_staged_cell_function(candidate, entrypoint)?;
+            self.spawn_staged_cell_task(candidate, function, cell_arguments, step)
+        })();
+        let task = match setup {
+            Ok(task) => task,
+            Err(error) => {
+                return Err(self.rollback_failed_cell_setup(
+                    error,
+                    heap_checkpoint,
+                    session_checkpoint,
+                ));
+            }
+        };
+        Ok(StagedCellTransaction {
+            realm: self,
+            candidate,
+            task,
+            fuel_slice: step.fuel_slice,
+            activation_arguments: policy.activation_arguments,
+            activation_fuel: policy.activation_fuel,
+            ready: None,
+            heap_checkpoint: Some(heap_checkpoint),
+            session_checkpoint: Some(session_checkpoint),
+            finished: false,
+        })
     }
 
     pub(crate) fn quiesce_reload(&mut self) -> Result<usize, RealmError> {
@@ -1533,6 +2055,43 @@ impl RealmRuntime {
         }
     }
 
+    fn stage_transactional_state_reload(
+        &mut self,
+        extension: TransactionalStateExtension,
+    ) -> Result<Option<RuntimeValue>, RealmError> {
+        self.last_migration_hash = None;
+        self.last_migration_usage_report = Some(crate::MigrationUsageReport::default());
+        let transaction = self.reload.transaction()?;
+        let old_root = self
+            .modules
+            .resolve(transaction.old_module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let old_schema = old_root.verified.module().state_schema.clone();
+        let mut staged_state = (*old_root.state).clone();
+        let candidate_schema = self
+            .modules
+            .resolve(transaction.candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .verified
+            .module()
+            .state_schema
+            .clone();
+        staged_state.stage_transactional_schema_extension(
+            extension.environment(),
+            &old_schema,
+            &candidate_schema,
+        )?;
+        if migrated_graph_has_invalid_gc_root(&self.heap, &staged_state) {
+            return Err(ReloadError::GraphCheck.into());
+        }
+        self.modules
+            .resolve_mut(transaction.candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .state = Arc::new(staged_state);
+        self.reload.staged()?;
+        Ok(None)
+    }
+
     fn stage_reload_without_entry(
         &mut self,
         candidate: ModuleHandle,
@@ -1550,6 +2109,99 @@ impl RealmRuntime {
             .state = migrated;
         self.reload.staged()?;
         Ok(None)
+    }
+
+    fn preflight_staged_activation(
+        &mut self,
+        activation_arguments: &[RuntimeValue],
+        activation_fuel: u64,
+    ) -> Result<(), RealmError> {
+        let candidate = self.reload.transaction()?.candidate;
+        let verified = self
+            .modules
+            .resolve(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .verified
+            .clone();
+        if self
+            .failure_injector
+            .trigger(crate::RuntimeFailurePoint::ActivationTrap)
+        {
+            return Err(RealmError::InjectedFailure(
+                crate::RuntimeFailurePoint::ActivationTrap,
+            ));
+        }
+        let Some(activation_entry) = verified.module().reload_metadata.activation_entry else {
+            return Ok(());
+        };
+        let function = verified
+            .module()
+            .functions
+            .get(activation_entry as usize)
+            .ok_or(ReloadError::Activation(RuntimeMessage::Static(
+                "activation function is missing",
+            )))?;
+        if function.effect != FunctionEffect::Immediate {
+            return Err(ReloadError::Activation(RuntimeMessage::Static(
+                "activation entry must have Immediate effect",
+            ))
+            .into());
+        }
+        let activation = CheckedInterpreter::run_with_heap(
+            &verified,
+            activation_entry,
+            activation_arguments,
+            activation_fuel,
+            &mut self.heap,
+        )
+        .map_err(|_| {
+            ReloadError::Activation(RuntimeMessage::Static("activation interpreter failed"))
+        })?;
+        match activation {
+            InterpreterOutcome::Returned { .. } => Ok(()),
+            InterpreterOutcome::Trapped { trap, .. } => {
+                Err(ReloadError::Activation(trap.message).into())
+            }
+            InterpreterOutcome::Suspended { .. } | InterpreterOutcome::HostPending { .. } => {
+                Err(ReloadError::Activation(RuntimeMessage::Static(
+                    "activation entry attempted to suspend",
+                ))
+                .into())
+            }
+        }
+    }
+
+    fn commit_staged_cell(
+        &mut self,
+        activation_arguments: &[RuntimeValue],
+        activation_fuel: u64,
+    ) -> Result<ModuleHandle, RealmError> {
+        self.validate_staged_cell_state()?;
+        self.preflight_staged_activation(activation_arguments, activation_fuel)?;
+        let candidate = self.reload.transaction()?.candidate;
+        self.publish_reload_root()?;
+        self.reload.activation_succeeded()?;
+        self.modules
+            .resolve_mut(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .lifecycle = ModuleLifecycle::Active;
+        let transaction = self.reload.finish()?;
+        debug_assert_eq!(transaction.candidate, candidate);
+        Ok(candidate)
+    }
+
+    fn validate_staged_cell_state(&self) -> Result<(), RealmError> {
+        let candidate = self.reload.transaction()?.candidate;
+        let root = self
+            .modules
+            .resolve(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        root.state
+            .validate_transactional_state(&root.verified.module().state_schema)?;
+        if migrated_graph_has_invalid_gc_root(&self.heap, &root.state) {
+            return Err(ReloadError::GraphCheck.into());
+        }
+        Ok(())
     }
 
     fn commit_reload_measured(
@@ -1666,6 +2318,47 @@ impl RealmRuntime {
         Ok(())
     }
 
+    fn cleanup_staged_cell(
+        &mut self,
+        task: Option<TaskHandle>,
+        cancel_reason: CancelReason,
+    ) -> Result<(), RealmError> {
+        let mut first_error = None;
+        if let Some(task) = task {
+            if self.terminal_record(task).is_none()
+                && self.tasks.task_snapshot(task).is_ok()
+                && let Err(error) = self.cancel_task(task, cancel_reason)
+            {
+                first_error = Some(RealmError::Runtime(error));
+            }
+            if let Err(error) = self.drain_host_completions()
+                && first_error.is_none()
+            {
+                first_error = Some(error);
+            }
+            let _ = self.take_terminal_record(task);
+        } else if let Err(error) = self.drain_host_completions() {
+            first_error = Some(error);
+        }
+        self.flush_releases();
+        if self.reload.active()
+            && let Err(error) = self.rollback_reload()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        self.flush_releases();
+        if let Err(error) = self.collect_garbage()
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+        if self.reload.active() && first_error.is_none() {
+            first_error = Some(RealmError::Reload(ReloadError::InvalidState));
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
     fn publish_reload_root(&mut self) -> Result<(), RealmError> {
         let transaction = self.reload.transaction()?;
         let old = transaction.old_module;
@@ -1737,15 +2430,110 @@ impl RealmRuntime {
         if loaded.lifecycle != ModuleLifecycle::Active {
             return Err(RealmError::ModuleNotCallable);
         }
-        let reservation = reservation_for_module(&loaded.verified, config.limits.frames);
+        self.admit_task(module, function, arguments, config)
+    }
+
+    fn spawn_staged_cell_task(
+        &mut self,
+        module: ModuleHandle,
+        function: u32,
+        arguments: &[RuntimeValue],
+        config: StepConfig,
+    ) -> Result<TaskHandle, RealmError> {
+        let transaction = self.reload.transaction()?;
+        if transaction.candidate != module || self.active_root != Some(transaction.old_module) {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        if loaded.lifecycle != ModuleLifecycle::Staging {
+            return Err(RealmError::ModuleNotCallable);
+        }
+        self.admit_task(module, function, arguments, config)
+    }
+
+    fn resolve_staged_cell_function(
+        &self,
+        module: ModuleHandle,
+        entrypoint: &TransactionalCellEntrypoint,
+    ) -> Result<u32, RealmError> {
+        let transaction = self.reload.transaction()?;
+        if transaction.candidate != module || self.active_root != Some(transaction.old_module) {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        if loaded.lifecycle != ModuleLifecycle::Staging {
+            return Err(RealmError::ModuleNotCallable);
+        }
+        let export = loaded
+            .verified
+            .module()
+            .exports
+            .iter()
+            .find(|export| export.stable_id == entrypoint.stable_id)
+            .ok_or(RealmError::MissingTransactionalCellExport(
+                entrypoint.stable_id,
+            ))?;
+        if export.signature != entrypoint.signature {
+            return Err(RealmError::TransactionalCellSignatureMismatch(
+                entrypoint.stable_id,
+            ));
+        }
+        if export.effect != entrypoint.effect() {
+            return Err(RealmError::TransactionalCellEffectMismatch {
+                stable_id: entrypoint.stable_id,
+                actual: export.effect,
+            });
+        }
+        let function = loaded
+            .verified
+            .module()
+            .functions
+            .get(export.function as usize)
+            .ok_or(RealmError::MissingTransactionalCellExport(
+                entrypoint.stable_id,
+            ))?;
+        if function.signature != entrypoint.signature {
+            return Err(RealmError::TransactionalCellSignatureMismatch(
+                entrypoint.stable_id,
+            ));
+        }
+        if function.effect != entrypoint.effect() {
+            return Err(RealmError::TransactionalCellEffectMismatch {
+                stable_id: entrypoint.stable_id,
+                actual: function.effect,
+            });
+        }
+        Ok(export.function)
+    }
+
+    fn admit_task(
+        &mut self,
+        module: ModuleHandle,
+        function: u32,
+        arguments: &[RuntimeValue],
+        config: StepConfig,
+    ) -> Result<TaskHandle, RealmError> {
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let verified = Arc::clone(&loaded.verified);
+        let epoch = loaded.epoch;
+        let reservation = reservation_for_module(&verified, config.limits.frames);
         let continuation = CheckedInterpreter::start(
-            &loaded.verified,
+            &verified,
             function,
             arguments,
             config.limits.frames,
             reservation,
         )?;
-        let task = self.tasks.admit_task(config.owner, loaded.epoch, true)?;
+        let task = self.tasks.admit_task(config.owner, epoch, true)?;
         if let Err(error) = self.tasks.attach_continuation(
             task,
             config.priority,
@@ -1764,15 +2552,52 @@ impl RealmRuntime {
     pub fn spawn_task(
         &mut self,
         module: ModuleHandle,
-        function: u32,
+        export: StableId,
         arguments: &[RuntimeValue],
         config: StepConfig,
     ) -> Result<TaskHandle, RuntimeError> {
+        let function = self
+            .resolve_dynamic_export_index(module, export)
+            .map_err(RuntimeError::from)?;
         self.spawn_task_inner(module, function, arguments, config)
             .map_err(RuntimeError::from)
     }
 
-    pub fn resolve_export<E: crate::ScriptExport>(
+    fn resolve_dynamic_export_index(
+        &self,
+        module: ModuleHandle,
+        stable_id: StableId,
+    ) -> Result<u32, RealmError> {
+        let loaded = self
+            .modules
+            .resolve(module.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        let export = loaded
+            .verified
+            .module()
+            .exports
+            .iter()
+            .find(|candidate| candidate.stable_id == stable_id)
+            .ok_or(RealmError::MissingScriptExport(stable_id))?;
+        let function = loaded
+            .verified
+            .module()
+            .functions
+            .get(export.function as usize)
+            .ok_or(RealmError::ScriptExportMetadataMismatch(stable_id))?;
+        if function.signature != export.signature || function.effect != export.effect {
+            return Err(RealmError::ScriptExportMetadataMismatch(stable_id));
+        }
+        if matches!(
+            function.effect,
+            FunctionEffect::Migration | FunctionEffect::Cleanup
+        ) {
+            return Err(RealmError::ScriptExportNotCallable(stable_id));
+        }
+        Ok(export.function)
+    }
+
+    fn resolve_export_index<E: crate::ScriptExport>(
         &self,
         module: ModuleHandle,
     ) -> Result<u32, crate::ScriptCallError> {
@@ -1793,6 +2618,9 @@ impl RealmRuntime {
         if export.signature != E::signature() {
             return Err(crate::ScriptCallError::SignatureMismatch { name: E::NAME });
         }
+        if export.effect != E::effect() {
+            return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
+        }
         let function = loaded
             .verified
             .module()
@@ -1802,6 +2630,9 @@ impl RealmRuntime {
                     .map_err(|_| crate::ScriptCallError::SignatureMismatch { name: E::NAME })?,
             )
             .ok_or(crate::ScriptCallError::SignatureMismatch { name: E::NAME })?;
+        if function.effect != E::effect() {
+            return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
+        }
         if matches!(
             function.effect,
             nexa_bytecode::FunctionEffect::Migration | nexa_bytecode::FunctionEffect::Cleanup
@@ -1817,7 +2648,7 @@ impl RealmRuntime {
         args: &E::Args,
         config: StepConfig,
     ) -> Result<TaskHandle, crate::ScriptCallError> {
-        let function = self.resolve_export::<E>(module)?;
+        let function = self.resolve_export_index::<E>(module)?;
         let requirements = E::argument_requirements(args)?;
         let values = {
             let mut writer = crate::ScriptCallWriter::new(&mut self.heap, requirements)
@@ -1827,7 +2658,7 @@ impl RealmRuntime {
                 .commit_arguments(values)
                 .map_err(|_| crate::ScriptCallError::ArgumentEncoding)?
         };
-        self.spawn_task(module, function, &values, config)
+        self.spawn_task_inner(module, function, &values, config)
             .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))
     }
 
@@ -1959,15 +2790,27 @@ impl RealmRuntime {
                 return Err(RealmError::TaskWaiting);
             }
         };
-        let module = resolve_task_module(&self.modules, self.realm_id, snapshot)?;
         let fuel = FuelState::new(
             fuel_slice,
             snapshot.fuel.cumulative_used,
             snapshot.fuel.cumulative_limit,
         );
         let trace_start = self.trace_cursor();
+        let module_raw = RawHandle::new(
+            self.realm_id,
+            snapshot.module_id,
+            snapshot.module_generation,
+        );
+        let module = self
+            .modules
+            .resolve_mut(module_raw)
+            .map_err(RealmError::ModuleHandle)?;
+        if module.module_id != snapshot.module_id || module.epoch != snapshot.module_epoch {
+            return Err(RealmError::MissingModule(snapshot.module_id));
+        }
+        let verified = Arc::clone(&module.verified);
         let mut state_bridge = RealmStateBridge {
-            registry: &module.state,
+            registry: Arc::make_mut(&mut module.state),
         };
         let outcome = if let Some(registry) = self.host_registry.as_deref_mut() {
             let mut bridge = RealmHostBridge {
@@ -1976,10 +2819,10 @@ impl RealmRuntime {
                 task,
                 module_id: snapshot.module_id,
                 epoch: snapshot.module_epoch,
-                imports: &module.verified.module().host_imports,
+                imports: &verified.module().host_imports,
             };
             CheckedInterpreter::poll_with_host_heap_and_state(
-                &module.verified,
+                &verified,
                 continuation,
                 fuel,
                 &self.cost_table,
@@ -1989,7 +2832,7 @@ impl RealmRuntime {
             )?
         } else {
             CheckedInterpreter::poll_with_heap_and_state(
-                &module.verified,
+                &verified,
                 continuation,
                 fuel,
                 &self.cost_table,
@@ -2012,7 +2855,10 @@ impl RealmRuntime {
                     value,
                 )?;
                 let _ = fuel;
-                Ok(PollResult::Completed(value))
+                Ok(PollResult::Completed {
+                    value,
+                    charge: final_charge,
+                })
             }
             InterpreterOutcome::Suspended {
                 continuation,
@@ -2024,7 +2870,7 @@ impl RealmRuntime {
                 crate::allocation::record(crate::allocation::AllocationPhase::Promotion, 0);
                 if continuation.cumulative_exhausted() {
                     let script_call_stack =
-                        crate::ScriptCallStack::from_continuation(&module.verified, &continuation);
+                        crate::ScriptCallStack::from_continuation(&verified, &continuation);
                     self.tasks
                         .put_execution(task, TaskExecution::Running(continuation), fuel)?;
                     if let Some(trap) = self.cancel_task_internal(
@@ -2121,7 +2967,7 @@ impl RealmRuntime {
             .map_err(classify_task_handle_error)
             .map_err(RuntimeError::from)?;
         Ok(match result {
-            PollResult::Completed(value) => {
+            PollResult::Completed { value, .. } => {
                 TaskPoll::Completed(value.unwrap_or(RuntimeValue::Unit))
             }
             PollResult::Pending(PendingReason::Fuel) => TaskPoll::Yielded(YieldReason::Fuel),
@@ -2226,7 +3072,7 @@ impl RealmRuntime {
                 break;
             };
             match self.poll_task_raw(task, budget.frame_fuel_budget) {
-                Ok(PollResult::Completed(_)) => report.completed += 1,
+                Ok(PollResult::Completed { .. }) => report.completed += 1,
                 Ok(PollResult::Cancelled(_)) => report.cancelled += 1,
                 Ok(PollResult::Trapped(_)) => report.trapped += 1,
                 Ok(PollResult::Pending(_))
@@ -2275,6 +3121,31 @@ impl RealmRuntime {
 
     pub fn allocate(&mut self, object: Object) -> Result<GcRef, RealmError> {
         Ok(self.heap.allocate(object)?)
+    }
+
+    pub fn allocate_array(
+        &mut self,
+        type_id: StableId,
+        element_type: ValueType,
+    ) -> Result<RuntimeValue, RealmError> {
+        Ok(self.heap.allocate_array(type_id, element_type)?)
+    }
+
+    pub fn allocate_map(
+        &mut self,
+        type_id: StableId,
+        key_type: ValueType,
+        value_type: ValueType,
+    ) -> Result<RuntimeValue, RealmError> {
+        Ok(self.heap.allocate_map(type_id, key_type, value_type)?)
+    }
+
+    pub fn array_length(&self, value: RuntimeValue) -> Result<usize, RealmError> {
+        Ok(self.heap.array_len(value)?)
+    }
+
+    pub fn map_length(&self, value: RuntimeValue) -> Result<usize, RealmError> {
+        Ok(self.heap.map_len(value)?)
     }
 
     pub fn allocate_buffer(
@@ -2366,6 +3237,7 @@ impl RealmRuntime {
     pub fn create_resource_token(
         &mut self,
         task: TaskHandle,
+        content_type: StableId,
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, RealmError> {
         self.require_host_capabilities()?;
@@ -2374,7 +3246,7 @@ impl RealmRuntime {
         Ok(self
             .resources
             .context(task, snapshot.module_id, snapshot.module_epoch)
-            .create_token(domain)?)
+            .create_token(content_type, domain)?)
     }
 
     pub fn release_resource_token(
@@ -3441,6 +4313,223 @@ impl RealmRuntime {
     }
 }
 
+impl StagedCellTransaction<'_> {
+    #[must_use]
+    pub const fn candidate(&self) -> ModuleHandle {
+        self.candidate
+    }
+
+    #[must_use]
+    pub const fn task(&self) -> TaskHandle {
+        self.task
+    }
+
+    #[must_use]
+    pub const fn active_root(&self) -> Option<ModuleHandle> {
+        self.realm.active_root()
+    }
+
+    pub fn candidate_lifecycle(&self) -> Result<ModuleLifecycle, RealmError> {
+        self.realm.module_lifecycle(self.candidate)
+    }
+
+    #[must_use]
+    pub fn output_reader(&self) -> crate::ScriptOutputReader<'_> {
+        crate::ScriptOutputReader::new(&self.realm.heap)
+    }
+
+    /// Deliver an explicitly completed Host request while the candidate is
+    /// staged. Completions submitted by an asynchronous `RuntimeHost` are also
+    /// drained automatically by [`Self::poll`].
+    pub fn complete_request(
+        &mut self,
+        request: HostRequestHandle,
+        result: HostResult,
+    ) -> Result<CompletionDisposition, RuntimeError> {
+        self.realm.complete_request(request, result)
+    }
+
+    pub fn abandon_request(&mut self, request: HostRequestHandle) -> Result<(), RuntimeError> {
+        self.realm.abandon_request(request)
+    }
+
+    pub fn poll(&mut self) -> Result<TransactionalCellPoll, TransactionalCellFailure> {
+        if self.finished {
+            return Err(TransactionalCellFailure {
+                cause: TransactionalCellFailureCause::AlreadyFinished,
+                rollback_error: None,
+            });
+        }
+        if let Some((value, charge)) = self.ready {
+            return Ok(TransactionalCellPoll::ReadyToCommit { value, charge });
+        }
+        if let Err(error) = self.realm.drain_host_completions() {
+            return Err(self.fail(TransactionalCellFailureCause::Runtime(Box::new(
+                RuntimeError::from(error),
+            ))));
+        }
+        if let Some(record) = self.realm.terminal_record(self.task).cloned() {
+            let cause = match record.reason {
+                TaskTerminalReason::Cancelled(reason) => {
+                    TransactionalCellFailureCause::Cancelled(reason)
+                }
+                TaskTerminalReason::Trapped(trap) => TransactionalCellFailureCause::Trapped(
+                    Box::new(RuntimeError::Trap(crate::RuntimeTrap::from(&trap))),
+                ),
+                TaskTerminalReason::Completed(value) => {
+                    let value = value.unwrap_or(RuntimeValue::Unit);
+                    return self.finish_poll(value, record.final_charge);
+                }
+            };
+            return Err(self.fail(cause));
+        }
+        match self.realm.poll_task_raw(self.task, self.fuel_slice) {
+            Ok(PollResult::Completed { value, charge }) => {
+                let value = value.unwrap_or(RuntimeValue::Unit);
+                self.finish_poll(value, charge)
+            }
+            Ok(PollResult::Pending(PendingReason::Fuel)) => {
+                Ok(TransactionalCellPoll::Yielded(YieldReason::Fuel))
+            }
+            Ok(PollResult::Pending(PendingReason::ExplicitYield)) => {
+                Ok(TransactionalCellPoll::Yielded(YieldReason::Explicit))
+            }
+            Ok(PollResult::Pending(PendingReason::HostRequest)) => {
+                let request = match self.realm.tasks.execution(self.task) {
+                    Ok(TaskExecution::Waiting { request, .. }) => *request,
+                    Ok(_) => {
+                        return Err(self.fail(TransactionalCellFailureCause::Runtime(Box::new(
+                            RuntimeError::from(RealmError::TaskWaiting),
+                        ))));
+                    }
+                    Err(error) => {
+                        return Err(self.fail(TransactionalCellFailureCause::Runtime(Box::new(
+                            RuntimeError::from(RealmError::Runtime(error)),
+                        ))));
+                    }
+                };
+                Ok(TransactionalCellPoll::Waiting(request))
+            }
+            Ok(PollResult::Cancelled(reason)) => {
+                Err(self.fail(TransactionalCellFailureCause::Cancelled(reason)))
+            }
+            Ok(PollResult::Trapped(trap)) => {
+                let error = RuntimeError::Trap(crate::RuntimeTrap::from(&trap));
+                Err(self.fail(TransactionalCellFailureCause::Trapped(Box::new(error))))
+            }
+            Err(error) => Err(self.fail(TransactionalCellFailureCause::Runtime(Box::new(
+                RuntimeError::from(error),
+            )))),
+        }
+    }
+
+    fn finish_poll(
+        &mut self,
+        value: RuntimeValue,
+        charge: ExecutionCharge,
+    ) -> Result<TransactionalCellPoll, TransactionalCellFailure> {
+        if let Err(error) = self.realm.validate_staged_cell_state() {
+            return Err(self.fail(TransactionalCellFailureCause::Runtime(Box::new(
+                RuntimeError::from(error),
+            ))));
+        }
+        self.ready = Some((value, charge));
+        Ok(TransactionalCellPoll::ReadyToCommit { value, charge })
+    }
+
+    pub fn commit(mut self) -> Result<TransactionalCellCommit, TransactionalCellFailure> {
+        if self.finished {
+            return Err(TransactionalCellFailure {
+                cause: TransactionalCellFailureCause::AlreadyFinished,
+                rollback_error: None,
+            });
+        }
+        let Some((value, charge)) = self.ready else {
+            return Err(self.fail(TransactionalCellFailureCause::NotReady));
+        };
+        let module = match self
+            .realm
+            .commit_staged_cell(&self.activation_arguments, self.activation_fuel)
+        {
+            Ok(module) => module,
+            Err(error) => {
+                return Err(self.fail(TransactionalCellFailureCause::Activation(Box::new(error))));
+            }
+        };
+        let _ = self.realm.take_terminal_record(self.task);
+        self.realm.flush_releases();
+        let _ = self.heap_checkpoint.take();
+        let _ = self.session_checkpoint.take();
+        self.finished = true;
+        Ok(TransactionalCellCommit {
+            module,
+            value,
+            charge,
+        })
+    }
+
+    pub fn cancel(
+        mut self,
+        reason: CancelReason,
+    ) -> Result<TransactionalCellRollback, TransactionalCellFailure> {
+        let cleanup = self.realm.cleanup_staged_cell(Some(self.task), reason);
+        let restore_session = cleanup.is_ok();
+        let rollback_error = cleanup.err().map(Box::new);
+        self.restore_after_rollback(restore_session);
+        self.finished = true;
+        if rollback_error.is_some() {
+            return Err(TransactionalCellFailure {
+                cause: TransactionalCellFailureCause::Cancelled(reason),
+                rollback_error,
+            });
+        }
+        Ok(TransactionalCellRollback {
+            candidate: self.candidate,
+            reason,
+        })
+    }
+
+    fn fail(&mut self, cause: TransactionalCellFailureCause) -> TransactionalCellFailure {
+        let cleanup = self
+            .realm
+            .cleanup_staged_cell(Some(self.task), CancelReason::HostCancelled);
+        let restore_session = cleanup.is_ok();
+        let rollback_error = cleanup.err().map(Box::new);
+        self.restore_after_rollback(restore_session);
+        self.finished = true;
+        TransactionalCellFailure {
+            cause,
+            rollback_error,
+        }
+    }
+
+    fn restore_after_rollback(&mut self, restore_session: bool) {
+        if let Some(checkpoint) = self.heap_checkpoint.take() {
+            self.realm.heap.restore_checkpoint(checkpoint);
+        }
+        if restore_session {
+            if let Some(checkpoint) = self.session_checkpoint.take() {
+                self.realm
+                    .restore_transactional_session_checkpoint(checkpoint);
+            }
+        } else {
+            let _ = self.session_checkpoint.take();
+        }
+    }
+}
+
+impl Drop for StagedCellTransaction<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let cleanup = self
+                .realm
+                .cleanup_staged_cell(Some(self.task), CancelReason::HostCancelled);
+            self.restore_after_rollback(cleanup.is_ok());
+            self.finished = true;
+        }
+    }
+}
+
 #[cfg(any(test, feature = "model-adapter"))]
 fn handle_identity(raw: RawHandle) -> u64 {
     u64::from(raw.realm_id).rotate_left(41)
@@ -3508,6 +4597,34 @@ fn module_requires_host_capabilities(module: &nexa_bytecode::Module) -> bool {
         .any(|state_type| state_type.fields.iter().any(|field| requires(field.ty)))
 }
 
+fn validate_transactional_state_transition(
+    old: &nexa_bytecode::Module,
+    candidate: &nexa_bytecode::Module,
+    environment: StableId,
+) -> Result<(), RealmError> {
+    let [old_type] = old.state_schema.types.as_slice() else {
+        return Err(RealmError::InvalidTransactionalStateExtension);
+    };
+    let [candidate_type] = candidate.state_schema.types.as_slice() else {
+        return Err(RealmError::InvalidTransactionalStateExtension);
+    };
+    if old_type.stable_id != environment
+        || candidate_type.stable_id != environment
+        || candidate_type.version != old_type.version
+        || candidate_type.fields.len() <= old_type.fields.len()
+        || candidate_type.fields[..old_type.fields.len()] != old_type.fields[..]
+        || candidate.reload_metadata.migration_entry.is_some()
+        || candidate.reload_metadata.activation_entry.is_some()
+        || candidate
+            .functions
+            .iter()
+            .any(|function| function.effect == FunctionEffect::Migration)
+    {
+        return Err(RealmError::InvalidTransactionalStateExtension);
+    }
+    Ok(())
+}
+
 fn migrated_graph_has_invalid_gc_root(heap: &Heap, state: &StatefulRegistry) -> bool {
     state
         .gc_roots()
@@ -3533,10 +4650,13 @@ fn requires_host_capabilities(
     if [
         StableId::from_name("HostRequest"),
         StableId::from_name("HostError"),
-        StableId::from_name("ResourceToken"),
         StableId::from_name("Buffer"),
     ]
     .contains(&type_id)
+        || module
+            .resource_token_types
+            .iter()
+            .any(|token| token.type_id == type_id)
         || module
             .snapshot_types
             .iter()
@@ -3665,7 +4785,9 @@ fn classify_task_handle_error(error: RealmError) -> RealmError {
 fn restart_reload_error(error: RealmError) -> ReloadError {
     match error {
         RealmError::Reload(error) => error,
-        RealmError::HostHashMismatch => ReloadError::HostHashMismatch,
+        RealmError::HostContractIdMismatch
+        | RealmError::MissingHostFunctionAuthority(_)
+        | RealmError::HostFunctionAuthorityMismatch { .. } => ReloadError::HostContractIdMismatch,
         error => ReloadError::Migration(RuntimeMessage::inline(&error.to_string())),
     }
 }

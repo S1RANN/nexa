@@ -1,4 +1,11 @@
 {
+  "comments": {
+    "lineComment": "//",
+    "blockComment": [
+      "/*",
+      "*/"
+    ]
+  },
   "brackets": [
     [
       "{",
@@ -17,6 +24,13 @@
     {
       "open": "(",
       "close": ")"
+    },
+    {
+      "open": "\"",
+      "close": "\"",
+      "notIn": [
+        "string"
+      ]
     }
   ],
   "surroundingPairs": [
@@ -27,6 +41,10 @@
     [
       "(",
       ")"
+    ],
+    [
+      "\"",
+      "\""
     ]
   ],
   "wordPattern": "[A-Za-z_][A-Za-z0-9_]*"

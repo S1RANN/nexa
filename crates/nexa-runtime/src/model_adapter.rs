@@ -1,16 +1,16 @@
 //! Real-runtime adapter for the current bounded Realm reference model.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nexa_bytecode::{
     AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-    ModuleBuilder, RootMap, Signature,
+    ModuleBuilder, RootMap, ScriptExport, Signature,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
-    CancelReason, HostCallOutcome, HostCompletionResult, HostPayload, HostRegistry,
-    HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, ModuleLifecycle,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostFunctionAuthority, HostPayload,
+    HostRegistry, HostRequestHandle, HostRequestState, HostTrap, ModuleHandle, ModuleLifecycle,
     PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ReloadError, ReloadInspectionState,
     ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeFailurePoint,
     RuntimeHost, RuntimeHostArgs, RuntimeLimits, RuntimeResourceLedger, ScopeHandle,
@@ -19,6 +19,11 @@ use crate::{
 };
 
 const MODEL_HOST: crate::StableId = crate::StableId(0x4d31_5245_414c_484f);
+
+fn model_task_export_id() -> crate::StableId {
+    crate::StableId::from_name("RealmRuntimeModel::run")
+}
+
 fn model_schema() -> nexa_core::StateSchemaFingerprint {
     nexa_bytecode::StateSchema::default().fingerprint()
 }
@@ -316,7 +321,12 @@ impl RealmRuntimeModelAdapter {
             .realm
             .as_mut()
             .expect("live adapter has a Realm")
-            .spawn_task(self.module, 0, &[], task_config(self.scope));
+            .spawn_task(
+                self.module,
+                model_task_export_id(),
+                &[],
+                task_config(self.scope),
+            );
         match result {
             Ok(task) => {
                 if self.request.is_some_and(|request| {
@@ -770,7 +780,7 @@ fn spawn_waiting_probe(
     scope: ScopeHandle,
 ) -> (TaskHandle, HostRequestHandle, PendingHostRequest) {
     let task = realm
-        .spawn_task(module, 0, &[], task_config(scope))
+        .spawn_task(module, model_task_export_id(), &[], task_config(scope))
         .expect("spawn Probe task");
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("poll Probe task") else {
         panic!("Probe task must wait on a Host request");
@@ -1018,19 +1028,19 @@ fn async_module(failing_migration: bool) -> VerifiedModule {
     }
     builder.host_import(HostImport {
         stable_id: crate::StableId::from_name("ModelHost::request"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: Vec::new(),
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
         fuel_cost: 1,
         async_result: Some(async_result),
     });
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: Some(ValueType::Named(async_result.result_type)),
-        },
-        1,
-    );
+    let task_signature = Signature {
+        parameters: Vec::new(),
+        result: Some(ValueType::Named(async_result.result_type)),
+    };
+    let mut function = FunctionBuilder::new(task_signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -1053,7 +1063,13 @@ fn async_module(failing_migration: bool) -> VerifiedModule {
             bitmap: vec![true],
         },
     ];
-    builder.function(function);
+    let function = builder.function(function);
+    builder.script_export(ScriptExport {
+        stable_id: model_task_export_id(),
+        function,
+        signature: task_signature,
+        effect: FunctionEffect::Task,
+    });
     verify(builder.finish(), VerifierLimits::default()).expect("verified model fixture")
 }
 
@@ -1062,17 +1078,47 @@ struct ModelHost {
 }
 
 impl HostRegistry for ModelHost {
-    fn interface_hash(&self) -> Option<crate::StableId> {
+    fn contract_runtime_id(&self) -> Option<crate::StableId> {
         Some(MODEL_HOST)
+    }
+
+    fn function_authority(&self, id: crate::StableId) -> Option<&HostFunctionAuthority> {
+        static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        let authority = AUTHORITY.get_or_init(|| {
+            let stable_id = crate::StableId::from_name("ModelHost::request");
+            let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+            HostFunctionAuthority::new(
+                stable_id,
+                [0; 32],
+                &[],
+                Some(ValueType::Named(result.type_id)),
+                HostCallMode::Async,
+                1,
+                Some(AsyncResultType {
+                    result_type: result.type_id,
+                    success: ValueType::I32,
+                    error: ValueType::I32,
+                    cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                    abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                    cancel_error: Some(1),
+                    abandon_error: None,
+                }),
+                &[],
+            )
+        });
+        (id == authority.stable_id()).then_some(authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: crate::StableId,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || !arguments.is_empty() {
+        if id != crate::StableId::from_name("ModelHost::request") {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if !arguments.is_empty() {
             return Err(HostTrap::Arity);
         }
         let pending = context

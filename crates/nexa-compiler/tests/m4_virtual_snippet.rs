@@ -2,10 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use nexa_analysis::{
-    AnalysisEnvironment, BuildFingerprintInput, CompilationOptions, HostContractSurface,
-    HostFunctionMode, HostFunctionSurface, NormalizedPackagePath, PackageId, PackageManifest,
-    QueryDatabase, ResolvedBuildInput, ResolvedDependencyGraph, ResolvedPackage, SourceId,
-    SourceRole, SourceSetBuilder, SurfaceType, analyze_package, source_set_fingerprint,
+    AnalysisEnvironment, BuildFingerprintInput, CompilationOptions, DependencyAlias,
+    DependencyEdge, HostContractSurface, HostFunctionMode, HostFunctionSurface, LockFile,
+    NormalizedPackagePath, PackageId, PackageManifest, QueryDatabase, ResolvedBuildInput,
+    ResolvedDependencyGraph, ResolvedPackage, SourceId, SourceRole, SourceSetBuilder, SurfaceType,
+    analyze_package, source_set_fingerprint,
 };
 use nexa_bytecode::{FunctionEffect, Instruction, StandardIntrinsic, ValueType};
 use nexa_compiler::PackageCompileOutput;
@@ -76,8 +77,11 @@ activation = "default-enabled"
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
         host_contract_source: Vec::new(),
-        host_required_exports: nexa_idl::canonical_required_exports(std::iter::empty::<&str>()),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: nexa_idl::required_entrypoints_descriptor(std::iter::empty::<
+            &str,
+        >()),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -97,7 +101,7 @@ activation = "default-enabled"
         None,
         Vec::<u8>::new(),
         Vec::<u8>::new(),
-        fingerprint.host_required_exports.clone(),
+        fingerprint.host_required_entrypoints.clone(),
         compilation_options,
         fingerprint,
     )
@@ -113,6 +117,181 @@ activation = "default-enabled"
         .ir
         .expect("successful evidence analysis emits typed IR");
     nexa_compiler::compile_typed_package(&ir).expect("evidence typed IR compiles")
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_dependency_host_evidence(environment: &AnalysisEnvironment) -> PackageCompileOutput {
+    const ROOT: &str = "nexa.compiler.host.root";
+    const DEPENDENCY: &str = "nexa.compiler.host.dependency";
+    let compilation_options = CompilationOptions::default();
+    let root = PackageId::new(ROOT).expect("valid root package ID");
+    let dependency = PackageId::new(DEPENDENCY).expect("valid dependency package ID");
+    let root_manifest = Arc::new(
+        PackageManifest::parse(
+            r#"
+schema = 2
+kind = "application"
+id = "nexa.compiler.host.root"
+name = "Compiler Host Root"
+version = "1.0.0"
+source_root = "src"
+entry = "app.main"
+activation = "default-enabled"
+
+[dependencies]
+host_dependency = { path = "../dependency" }
+"#,
+        )
+        .expect("valid root manifest"),
+    );
+    let dependency_manifest = Arc::new(
+        PackageManifest::parse(
+            r#"
+schema = 2
+kind = "library"
+id = "nexa.compiler.host.dependency"
+name = "Compiler Host Dependency"
+version = "1.0.0"
+source_root = "src"
+"#,
+        )
+        .expect("valid dependency manifest"),
+    );
+    let mut root_sources = SourceSetBuilder::new(root.clone(), compilation_options.limits);
+    root_sources
+        .add(
+            NormalizedPackagePath::new("src/app/main.nexa").expect("normalized root path"),
+            Arc::<str>::from(
+                r"
+use host_dependency::api as dependency;
+
+fn run() -> i32 {
+    return dependency::read();
+}
+",
+            ),
+            SourceRole::Production,
+        )
+        .expect("valid root source");
+    let root_sources = Arc::new(root_sources.build().expect("valid root source set"));
+    let mut dependency_sources =
+        SourceSetBuilder::new(dependency.clone(), compilation_options.limits);
+    dependency_sources
+        .add(
+            NormalizedPackagePath::new("src/api.nexa").expect("normalized dependency path"),
+            Arc::<str>::from(
+                r"
+use host::dispatch_host as host;
+
+pub fn read() -> i32 {
+    return host::third();
+}
+",
+            ),
+            SourceRole::Production,
+        )
+        .expect("valid dependency source");
+    let dependency_sources = Arc::new(
+        dependency_sources
+            .build()
+            .expect("valid dependency source set"),
+    );
+    let source_id = SourceId::new("compiler-host-evidence").expect("valid source ID");
+    let graph = Arc::new(ResolvedDependencyGraph {
+        root: root.clone(),
+        packages: BTreeMap::from([
+            (
+                root.clone(),
+                ResolvedPackage {
+                    id: root.clone(),
+                    version: root_manifest.version.clone(),
+                    source_id: source_id.clone(),
+                    directory: NormalizedPackagePath::new("virtual/root")
+                        .expect("normalized root directory"),
+                    kind: root_manifest.kind,
+                },
+            ),
+            (
+                dependency.clone(),
+                ResolvedPackage {
+                    id: dependency.clone(),
+                    version: dependency_manifest.version.clone(),
+                    source_id,
+                    directory: NormalizedPackagePath::new("virtual/dependency")
+                        .expect("normalized dependency directory"),
+                    kind: dependency_manifest.kind,
+                },
+            ),
+        ]),
+        edges: BTreeSet::from([DependencyEdge {
+            from: root.clone(),
+            alias: DependencyAlias::new("host_dependency").expect("valid dependency alias"),
+            to: dependency.clone(),
+        }]),
+    });
+    let lock = Arc::new(LockFile::from_graph(&graph));
+    let dependency_manifests =
+        BTreeMap::from([(dependency.clone(), Arc::clone(&dependency_manifest))]);
+    let dependency_source_sets =
+        BTreeMap::from([(dependency.clone(), Arc::clone(&dependency_sources))]);
+    let host_contract = b"compiler-host-subset-v2".to_vec();
+    let host_contract_source = b"virtual/dispatch-host.nidl\0compiler-host-subset-v2".to_vec();
+    let host_required_entrypoints =
+        nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
+    let fingerprint = BuildFingerprintInput {
+        root_package: root,
+        root_manifest: root_manifest.canonical_bytes(),
+        root_source_set: source_set_fingerprint(&root_sources),
+        dependency_manifests: BTreeMap::from([(
+            dependency.clone(),
+            dependency_manifest.canonical_bytes(),
+        )]),
+        dependency_source_sets: BTreeMap::from([(
+            dependency,
+            source_set_fingerprint(&dependency_sources),
+        )]),
+        host_contract: host_contract.clone(),
+        host_contract_source: host_contract_source.clone(),
+        host_required_entrypoints: host_required_entrypoints.clone(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
+        standard_library_version: nexa_stdlib::standard_library().version.to_string(),
+        standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
+        compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
+        bytecode_version: u32::from(nexa_core::BYTECODE_VERSION),
+        runtime_semantics_version: u32::from(nexa_core::RUNTIME_SEMANTICS_VERSION),
+        opcode_cost_table_version: nexa_core::OPCODE_COST_TABLE_VERSION,
+        deterministic_math_backend: nexa_core::RUNTIME_MATH_BACKEND_ID.into(),
+        compiler_options: nexa_analysis::canonical_compilation_options(&compilation_options),
+        canonical_lock_graph: lock.canonical_bytes(),
+    };
+    let input = ResolvedBuildInput::new(
+        root_manifest,
+        root_sources,
+        dependency_manifests,
+        dependency_source_sets,
+        graph,
+        Some(lock),
+        host_contract,
+        host_contract_source,
+        host_required_entrypoints,
+        compilation_options,
+        fingerprint,
+    )
+    .expect("valid dependency Host build input");
+    let mut queries = QueryDatabase::new();
+    let outcome = analyze_package(&input, environment, &mut queries);
+    assert!(
+        outcome.diagnostics.is_empty(),
+        "dependency Host source must analyze without diagnostics: {:?}",
+        outcome.diagnostics.diagnostics()
+    );
+    nexa_compiler::compile_typed_package(
+        &outcome
+            .ir
+            .expect("successful dependency analysis emits typed IR"),
+    )
+    .expect("dependency Host Typed IR compiles")
 }
 
 fn assert_defer_cleanup_evidence(compiled: &PackageCompileOutput) {
@@ -236,8 +415,6 @@ fn add(left: i32, right: i32) -> i32 {
 fn unit_runtime_values_are_materialized_after_effects_and_inside_containers() {
     let compiled = compile_typed_evidence_package(
         r"
-module compiler.evidence;
-
 fn noop() -> unit {}
 
 fn consume(value: unit) -> i32 {
@@ -253,20 +430,20 @@ fn via_parameter() -> i32 {
 }
 
 fn option_unit() -> Option<unit> {
-    return Some(noop());
+    return Option::Some(noop());
 }
 
 fn array_unit() -> Array<unit> {
     return [noop()];
 }
 
-task fn unit_task() -> unit {
+async fn unit_task() -> unit {
     yield;
     return noop();
 }
 
-task fn await_unit() -> i32 {
-    let value: unit = await unit_task();
+async fn await_unit() -> i32 {
+    let value: unit = unit_task().await;
     return consume(value);
 }
 ",
@@ -410,7 +587,9 @@ impl InterpreterHost for UnitHost {
         _heap: Option<&mut Heap>,
     ) -> Result<InterpreterHostOutcome, HostTrap> {
         if import != 0 {
-            return Err(HostTrap::UnknownFunction(import));
+            return Err(HostTrap::Host(nexa_runtime::RuntimeMessage::inline(
+                &format!("unexpected module-local Host import slot {import}"),
+            )));
         }
         if !arguments.is_empty() {
             return Err(HostTrap::Arity);
@@ -422,11 +601,11 @@ impl InterpreterHost for UnitHost {
 
 #[test]
 fn synchronous_unit_host_results_materialize_only_after_the_host_call() {
-    let host_interface = StableId::from_name("compiler-evidence-unit-host");
+    let host_contract = StableId::from_name("compiler-evidence-unit-host");
     let environment = AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "UnitHost".into(),
-            interface_stable_id: host_interface,
+            contract_name: "UnitHost".into(),
+            contract_stable_id: host_contract,
             types: Vec::new(),
             functions: vec![HostFunctionSurface {
                 name: "touch".into(),
@@ -434,28 +613,29 @@ fn synchronous_unit_host_results_materialize_only_after_the_host_call() {
                 result: SurfaceType::Unit,
                 mode: HostFunctionMode::Sync,
                 stable_id: StableId::from_name("compiler-evidence-unit-host.touch"),
+                declaration_fingerprint: [1; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result: None,
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: None,
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: None,
         }),
         static_modules: Vec::new(),
     };
     let compiled = compile_typed_evidence_package_with_environment(
         r"
-module compiler.evidence;
-import host as api;
+use host::unit_host as api;
 
 fn consume(value: unit) -> i32 {
     return 23;
 }
 
 fn host_unit() -> i32 {
-    return consume(api.touch());
+    return consume(api::touch());
 }
 ",
         &environment,
@@ -491,7 +671,7 @@ fn host_unit() -> i32 {
 
     let verified = nexa_verifier::verify(compiled.module, nexa_verifier::VerifierLimits::default())
         .expect("synchronous Unit Host-call bytecode verifies");
-    assert_eq!(verified.module().host_interface_hash, Some(host_interface));
+    assert_eq!(verified.module().host_contract_id, Some(host_contract));
     let limits = FrameLimits::default();
     let continuation = CheckedInterpreter::start(
         &verified,
@@ -524,8 +704,6 @@ fn host_unit() -> i32 {
 fn unused_generic_standard_templates_are_not_emitted_as_bytecode_functions() {
     let compiled = compile_typed_evidence_package(
         r"
-module compiler.evidence;
-
 pub fn value() -> i32 {
     return 7;
 }
@@ -671,32 +849,32 @@ fn typed_string_index_lowers_to_rune_at_and_executes_unicode_scalars() {
 fn generic_standard_calls_carry_concrete_call_site_types() {
     let verified = nexa_compiler::compile(
         r"
-import std.collections as collections;
-import std.core as core;
+use std::collections as collections;
+use std::core as core;
 
 fn inspect_i32(values: Array<i32>) -> bool {
-    let element: Option<i32> = collections.array_get<i32>(values, 0);
-    return core.is_some<i32>(element);
+    let element: Option<i32> = collections::array_get<i32>(values, 0);
+    return core::is_some<i32>(element);
 }
 
 fn inspect_nested(values: Array<i32>) -> bool {
-    return core.is_some(collections.array_get(values, 0));
+    return core::is_some(collections::array_get(values, 0));
 }
 
 fn append_i64(values: Array<i64>) -> bool {
-    return collections.array_push(values, 1);
+    return collections::array_push(values, 1);
 }
 
 fn empty_i32_len() -> i32 {
-    return collections.array_len<i32>([]);
+    return collections::array_len<i32>([]);
 }
 
 fn option_default() -> i32 {
-    return core.option_unwrap_or(None, 7);
+    return core::option_unwrap_or(Option::None, 7);
 }
 
 fn result_default() -> i32 {
-    return core.result_unwrap_or(Err(false), 7);
+    return core::result_unwrap_or(Result::Err(false), 7);
 }
 ",
     )
@@ -768,27 +946,27 @@ fn result_default() -> i32 {
 fn generic_standard_calls_reject_mismatched_or_unresolved_type_arguments() {
     for source in [
         r"
-import std.collections as collections;
+use std::collections as collections;
 fn invalid(values: Array<i32>) -> Option<bool> {
-    return collections.array_get<bool>(values, 0);
+    return collections::array_get<bool>(values, 0);
 }
 ",
         r"
-import std.core as core;
+use std::core as core;
 fn invalid() -> i32 {
-    return core.min_i32<bool>(1, 2);
+    return core::min_i32<bool>(1, 2);
 }
 ",
         r"
-import std.core as core;
+use std::core as core;
 fn invalid() -> bool {
-    return core.is_some<i32, bool>(None);
+    return core::is_some<i32, bool>(Option::None);
 }
 ",
         r"
-import std.collections as collections;
+use std::collections as collections;
 fn invalid() -> i32 {
-    return collections.array_len([]);
+    return collections::array_len([]);
 }
 ",
     ] {
@@ -803,13 +981,11 @@ fn invalid() -> i32 {
 fn analyzer_generated_defer_cleanup_reaches_typed_codegen_with_stable_debug_identity() {
     let compiled = compile_typed_evidence_package(
         r"
-module compiler.evidence;
-
 fn finalize(value: i32) -> i32 {
     return value;
 }
 
-task fn work(value: i32) -> i32 {
+async fn work(value: i32) -> i32 {
     defer finalize(value);
     yield;
     return value + 1;
@@ -823,32 +999,36 @@ task fn work(value: i32) -> i32 {
 fn qualified_host_snippet_uses_typed_analysis_and_preserves_file_id() {
     let idl = nexa_idl::parse(
         r"
-interface GameHost {
+contract GameHost {
     enum AnimationError { Missing, Cancelled }
-    request(return_error, trap) fn animation(entity: i32)
-        -> request<Result<i32, AnimationError>>;
-    export Update(entity: i32) -> i32;
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn animation(entity: i32) -> Result<i32, AnimationError>;
+    }
+    nexa {
+        fn update(entity: i32) -> i32;
+    }
 }
 ",
     )
     .unwrap();
     let source = r"
-module game.combat;
-import host as engine;
+use host::game_host as engine;
 
-pub task fn Update(entity: i32) -> i32 {
-    let result: Result<i32, engine.AnimationError> = await engine.animation(entity);
+pub async fn update(entity: i32) -> i32 {
+    let result: Result<i32, engine::AnimationError> = engine::animation(entity).await;
     return match result {
-        Ok(value) => value,
-        Err(error) => 0,
+        Result::Ok(value) => value,
+        Result::Err(error) => 0,
     };
 }
 ";
     let file = FileId(77);
-    let verified = nexa_compiler::compile_with_interface_file(source, file, &idl).unwrap();
+    let verified = nexa_compiler::compile_with_contract_file(source, file, &idl).unwrap();
     assert_eq!(
-        verified.module().host_interface_hash,
-        Some(nexa_idl::exact_hash(&idl))
+        verified.module().host_contract_id,
+        Some(nexa_idl::contract_runtime_id(&idl))
     );
     assert_eq!(verified.module().host_imports.len(), 1);
     let module = verified.module();
@@ -859,7 +1039,7 @@ pub task fn Update(entity: i32) -> i32 {
     let target_function = module
         .exports
         .first()
-        .expect("the required Update export is emitted")
+        .expect("the required update entrypoint is emitted")
         .function;
     let target_mappings = module
         .source_map
@@ -868,40 +1048,211 @@ pub task fn Update(entity: i32) -> i32 {
         .collect::<Vec<_>>();
     assert!(
         !target_mappings.is_empty(),
-        "the exported Update function must have source mappings"
+        "the exported update function must have source mappings"
     );
     assert!(
         target_mappings.iter().all(|entry| entry.span.file == file),
-        "every Update mapping must retain the caller's virtual FileId"
+        "every update mapping must retain the caller's virtual FileId"
     );
 }
 
 #[test]
-fn metadata_snippet_lowers_real_typed_migration_ir() {
-    let host_hash = StableId::from_name("m4-snippet-host");
-    let verified = nexa_compiler::compile_with_metadata(
+fn host_import_subset_keeps_the_referenced_contract_stable_identity() {
+    let contract = nexa_idl::parse(
         r"
-module reload;
+contract DispatchHost {
+    host {
+        fn first() -> i32;
+        fn second() -> i32;
+        fn third() -> i32;
+    }
+}
+",
+    )
+    .expect("valid three-function Host Contract");
+    let third = contract
+        .host_functions
+        .iter()
+        .find(|function| function.name == "third")
+        .expect("the third Host function is present");
+    let verified = nexa_compiler::compile_with_contract(
+        r"
+use host::dispatch_host as host;
 
-@stateful(1) class State {
-    value: i32;
+fn invoke_third() -> i32 {
+    return host::third();
+}
+",
+        &contract,
+    )
+    .expect("the referenced Host subset compiles");
+
+    assert_eq!(
+        verified.module().host_imports.len(),
+        1,
+        "unused Contract functions must not widen the effective import set"
+    );
+    assert_eq!(
+        verified.module().host_imports[0].stable_id,
+        third.stable_id,
+        "the module-local import slot dispatches by the referenced Contract stable identity"
+    );
+    assert_eq!(
+        verified.module().host_imports[0].declaration_fingerprint,
+        third.declaration_fingerprint.into_bytes(),
+        "Host declaration authority must be propagated verbatim"
+    );
 }
 
-pub migration fn migrate() -> bool {
-    let old_state: State = old.get<State>(root);
-    let value: i32 = old.field<i32>(old_state, State.value);
-    let new_state: State = new.create<State>(root);
-    new.set(new_state, State.value, value);
+#[test]
+fn virtual_contract_adapter_preserves_multiple_host_capabilities() {
+    let contract = nexa_idl::parse(
+        r#"
+contract CapabilityHost {
+    host {
+        @capability("world.read")
+        @capability("world.write")
+        fn privileged() -> i32;
+    }
+}
+"#,
+    )
+    .expect("multiple distinct capabilities are valid NIDL v2");
+    let verified =
+        nexa_compiler::compile_with_contract("fn local() -> i32 { return 7; }", &contract)
+            .expect("an unused multi-capability Host declaration remains a valid Contract surface");
+
+    assert!(
+        verified.module().host_imports.is_empty(),
+        "unused privileged functions must not widen the effective Host import set"
+    );
+}
+
+#[test]
+fn distinct_nidl_handles_emit_distinct_typed_resource_tokens() {
+    let contract = nexa_idl::parse(
+        r"
+contract TokenHost {
+    handle First;
+    handle Second;
+
+    host {
+        fn echo_first(value: Token<First>) -> Token<First>;
+        fn echo_second(value: Token<Second>) -> Token<Second>;
+    }
+}
+",
+    )
+    .expect("valid nominal Handle contract");
+    let verified = nexa_compiler::compile_with_contract(
+        r"
+use host::token_host as host;
+
+fn first(value: Token<host::First>) -> Token<host::First> {
+    return host::echo_first(value);
+}
+
+fn second(value: Token<host::Second>) -> Token<host::Second> {
+    return host::echo_second(value);
+}
+",
+        &contract,
+    )
+    .expect("nominal Handle tokens compile");
+    let mut expected = contract
+        .handles
+        .iter()
+        .map(|handle| nexa_bytecode::resource_token_type(handle.stable_id))
+        .collect::<Vec<_>>();
+    expected.sort();
+    let mut actual = verified
+        .module()
+        .resource_token_types
+        .iter()
+        .map(|token| token.type_id)
+        .collect::<Vec<_>>();
+    actual.sort();
+
+    assert_eq!(actual, expected);
+    assert_ne!(actual[0], actual[1]);
+}
+
+#[test]
+fn dependency_only_host_call_is_included_in_the_effective_import_subset() {
+    let contract_id = StableId::from_name("compiler-dispatch-host");
+    let functions = ["first", "second", "third"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| HostFunctionSurface {
+            name: name.into(),
+            parameters: Vec::new(),
+            result: SurfaceType::I32,
+            mode: HostFunctionMode::Sync,
+            stable_id: StableId::from_name(&format!("compiler-dispatch-host.{name}")),
+            declaration_fingerprint: [u8::try_from(index + 1).expect("small index"); 32],
+            import_index: u32::try_from(index).expect("three Host functions fit u32"),
+            fuel_cost: 1,
+            async_result: None,
+            required_capabilities: Vec::new(),
+            source: None,
+        })
+        .collect::<Vec<_>>();
+    let third = functions[2].stable_id;
+    let environment = AnalysisEnvironment {
+        host: Some(HostContractSurface {
+            contract_name: "DispatchHost".into(),
+            contract_stable_id: contract_id,
+            types: Vec::new(),
+            functions,
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
+            source: None,
+        }),
+        static_modules: Vec::new(),
+    };
+    let compiled = compile_dependency_host_evidence(&environment);
+
+    assert_eq!(compiled.module.host_contract_id, Some(contract_id));
+    assert_eq!(
+        compiled.module.host_imports.len(),
+        1,
+        "a Host call that exists only in dependency Typed IR must still be emitted"
+    );
+    assert_eq!(compiled.module.host_imports[0].stable_id, third);
+    assert!(
+        compiled.debug_info.functions.iter().any(|function| {
+            function.package_id == "nexa.compiler.host.dependency" && function.name == "read"
+        }),
+        "the dependency function containing the Host call is part of cumulative codegen"
+    );
+}
+
+#[test]
+fn contract_id_snippet_lowers_real_typed_migration_ir() {
+    let host_contract_id = StableId::from_name("m4-snippet-host");
+    let verified = nexa_compiler::compile_with_contract_id(
+        r"
+@state(version = 1)
+class State {
+    mut value: i32,
+}
+
+@migration
+pub fn migrate() -> bool {
+    let old_state: State = old.get(root);
+    let value: i32 = old.field(old_state, State::value);
+    let new_state: State = new.create(root);
+    new.set(new_state, State::value, value);
     replace(root, new_state);
     finish_migration();
     return true;
 }
 ",
-        host_hash,
+        host_contract_id,
     )
     .unwrap();
     let module = verified.module();
-    assert_eq!(module.host_interface_hash, Some(host_hash));
+    assert_eq!(module.host_contract_id, Some(host_contract_id));
     let migration_entry = module
         .reload_metadata
         .migration_entry
@@ -1046,25 +1397,28 @@ fn virtual_snippet_preserves_lexical_error_class_and_exact_byte_range() {
 }
 
 #[test]
-fn virtual_snippet_module_inference_preserves_invalid_path_origin() {
+fn virtual_snippet_rejects_removed_module_syntax_without_losing_origin() {
     let file = FileId(93);
     let error = nexa_compiler::compile_file("module Game.Combat;\n", file).unwrap_err();
     let nexa_compiler::CompileError::AnalysisDiagnostic(diagnostic) = error else {
-        panic!("invalid module paths must remain canonical analysis diagnostics");
+        panic!("removed module syntax must remain a canonical analysis diagnostic");
     };
-    assert_eq!(diagnostic.code.as_str(), "NX2701");
-    assert_eq!(diagnostic.message, "invalid module path `Game.Combat`");
+    assert!(
+        diagnostic.message.contains("module")
+            && (diagnostic.message.contains("legacy")
+                || diagnostic.message.contains("removed")
+                || diagnostic.message.contains("unexpected")),
+        "unexpected removed-module diagnostic: {}",
+        diagnostic.message
+    );
     assert_eq!(
         diagnostic.primary.source,
         nexa_compiler::AnalysisDiagnosticSource::Caller
     );
-    assert_eq!(
-        (
-            diagnostic.primary.span.file,
-            diagnostic.primary.span.start,
-            diagnostic.primary.span.end
-        ),
-        (file, 7, 18)
+    assert_eq!(diagnostic.primary.span.file, file);
+    assert!(
+        diagnostic.primary.span.start < diagnostic.primary.span.end,
+        "removed syntax must retain a nonempty caller span"
     );
 }
 
@@ -1082,4 +1436,203 @@ fn virtual_snippet_module_inference_preserves_source_limit_origin() {
         (span.file, span.start, span.end),
         (file, 0, u32::try_from(source.len()).unwrap())
     );
+}
+
+#[test]
+fn removed_nexa_v1_surface_forms_are_rejected() {
+    let removed = [
+        (
+            "var",
+            "fn old_var() -> i32 { var value: i32 = 1; return value; }",
+        ),
+        (
+            "module",
+            "module old.surface;\nfn value() -> i32 { return 1; }",
+        ),
+        (
+            "import",
+            "import std.core as core;\nfn value() -> i32 { return 1; }",
+        ),
+        ("task-function", "task fn old_task() -> i32 { return 1; }"),
+        (
+            "prefix await",
+            "async fn child() -> i32 { return 1; }\n\
+             async fn parent() -> i32 { return await child(); }",
+        ),
+        ("stateful", "stateful class OldState { value: i32; }"),
+        (
+            "migration-function",
+            "migration fn migrate() -> bool { finish_migration(); return true; }",
+        ),
+        (
+            "activation-function",
+            "activation fn activate() -> i32 { return 1; }",
+        ),
+        ("cleanup-function", "cleanup fn cleanup() -> unit {}"),
+        (
+            "immediate-function",
+            "immediate fn calculate() -> i32 { return 1; }",
+        ),
+        (
+            "with update",
+            "struct Cell { value: i32, }\n\
+             fn moved(cell: Cell) -> Cell { return cell with { value: 2 }; }",
+        ),
+    ];
+
+    for (name, source) in removed {
+        assert!(
+            nexa_compiler::compile(source).is_err(),
+            "removed Nexa v1 `{name}` form unexpectedly compiled:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn nidl_v2_accepts_contract_blocks_and_rejects_removed_surface_forms() {
+    let current = r#"
+contract SurfaceMatrix {
+    handle Ticket;
+
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+
+    enum LoadError {
+        Missing,
+        Failed(Point),
+        Cancelled,
+    }
+
+    host {
+        fn log(message: string);
+
+        @fuel(8)
+        @cancel(return_error)
+        @abandon(trap)
+        @capability("surface.read")
+        async fn load(ticket: Ticket) -> Result<Point, LoadError>;
+    }
+
+    nexa {
+        fn on_event(points: Array<Point>) -> Option<Point>;
+    }
+}
+"#;
+    nexa_idl::parse(current).expect("the frozen NIDL v2 surface parses");
+
+    let removed = [
+        ("interface", "interface Old {}"),
+        ("opaque", "contract Old { opaque Ticket; }"),
+        (
+            "sync-function",
+            "contract Old { host { sync fn ping() -> i32; } }",
+        ),
+        (
+            "request-function",
+            "contract Old { host { request(return_error, trap) fn load() -> request<i32>; } }",
+        ),
+        (
+            "export",
+            "contract Old { export OnEvent(value: i32) -> i32; }",
+        ),
+        (
+            "lowercase array",
+            "contract Old { struct Values { items: array<i32>, } }",
+        ),
+        ("void", "contract Old { host { fn ping() -> void; } }"),
+    ];
+    for (name, source) in removed {
+        assert!(
+            nexa_idl::parse(source).is_err(),
+            "removed NIDL v1 `{name}` form unexpectedly parsed:\n{source}"
+        );
+    }
+}
+
+#[test]
+fn async_postfix_await_preserves_task_lowering_and_execution() {
+    let verified = nexa_compiler::compile(
+        r"
+async fn child(value: i32) -> i32 {
+    yield;
+    return value + 1;
+}
+
+async fn parent(value: i32) -> i32 {
+    let completed: i32 = child(value).await;
+    return completed + 1;
+}
+",
+    )
+    .expect("postfix await compiles through typed codegen");
+    let parent = verified
+        .module()
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(index, function)| {
+            (function.effect == FunctionEffect::Task && index != 0)
+                .then_some(u32::try_from(index).expect("function index fits u32"))
+        })
+        .expect("parent task is emitted");
+    let suspended = CheckedInterpreter::run(&verified, parent, &[RuntimeValue::I32(40)], 1_000)
+        .expect("postfix-await task starts");
+    let (continuation, fuel) = match suspended {
+        InterpreterOutcome::Suspended {
+            continuation, fuel, ..
+        } => (continuation, fuel),
+        other => panic!("child yield must suspend the parent task, got {other:?}"),
+    };
+    let completed =
+        CheckedInterpreter::poll(&verified, continuation, fuel, &OpcodeCostTable::default())
+            .expect("postfix-await task resumes");
+    assert!(matches!(
+        completed,
+        InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::I32(42)),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn multi_payload_enum_patterns_unpack_the_analyzer_tuple_payload() {
+    let verified = nexa_compiler::compile(
+        r"
+enum Pair {
+    Empty,
+    Both(i32, i32),
+}
+
+fn sum() -> i32 {
+    let pair = Pair::Both(20, 22);
+    return match pair {
+        Pair::Empty => 0,
+        Pair::Both(left, right) => left + right,
+    };
+}
+",
+    )
+    .expect("multi-payload Enum construction and matching must reach typed codegen");
+    assert!(
+        verified.module().functions[0]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::StructGet { .. }))
+            .count()
+            >= 2,
+        "the tuple payload is unpacked through its two stable tuple fields"
+    );
+    let mut heap = Heap::new(16);
+    let result = CheckedInterpreter::run_with_heap(&verified, 0, &[], 1_000, &mut heap)
+        .expect("sum executes");
+    assert!(matches!(
+        result,
+        InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::I32(42)),
+            ..
+        }
+    ));
 }

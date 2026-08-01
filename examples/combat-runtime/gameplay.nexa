@@ -1,18 +1,19 @@
-module game.combat;
-import host as engine;
+use host::game as engine;
 
-@stateful(1) class EnemyBrain {
-    phase: i32;
-    legacy_target: i32;
+@state(version = 1)
+class EnemyBrain {
+    mut phase: i32,
+    mut legacy_target: i32,
 }
 
-@stateful(1) class StableBrain {
-    phase: i32;
+@state(version = 1)
+class StableBrain {
+    mut phase: i32,
 }
 
 struct CombatStats {
-    damage: i64;
-    label: string;
+    damage: i64,
+    label: string,
 }
 
 enum CombatEvent {
@@ -21,8 +22,8 @@ enum CombatEvent {
 }
 
 class CombatFrame {
-    hits: i32;
-    next: Option<CombatFrame>;
+    mut hits: i32,
+    next: Option<CombatFrame>,
 }
 
 fn identity(value: i32) -> i32 {
@@ -30,72 +31,72 @@ fn identity(value: i32) -> i32 {
 }
 
 fn option_value(value: i32) -> i32 {
-    let target: Option<i32> = Some(value);
+    let target: Option<i32> = Option::Some(value);
     return match target {
-        Some(found) => found,
-        None => 0,
+        Option::Some(found) => found,
+        Option::None => 0,
     };
 }
 
 fn no_target() -> Option<i32> {
-    return None;
+    return Option::None;
 }
 
-task fn animation_checked(value: i32) -> Result<i32, engine.AnimationError> {
-    let completed: i32 = await engine.animation(value)?;
-    return Ok(completed);
+pub async fn animation_checked(value: i32) -> Result<i32, engine::AnimationError> {
+    let completed: i32 = engine::animation(value).await?;
+    return Result::Ok(completed);
 }
 
-pub task fn Update(value: i32) -> i32 {
-    let lock = engine.action_lock(value);
-    let snapshot = engine.world_snapshot();
-    let animation: Result<i32, engine.AnimationError> = await engine.animation(value);
+pub async fn update(value: i32) -> i32 {
+    let lock = engine::action_lock(value);
+    let snapshot = engine::world_snapshot();
+    let animation: Result<i32, engine::AnimationError> = engine::animation(value).await;
     let completed: i32 = match animation {
-        Ok(result) => result,
-        Err(error) => 0,
+        Result::Ok(result) => result,
+        Result::Err(error) => 0,
     };
-    return engine.update(value, 1);
+    return engine::update(value, 1);
 }
 
-fn feature_probe(input: Buffer<i32>) -> i32 {
+pub fn feature_probe(input: Buffer<i32>) -> i32 {
     let wide: i64 = 9223372036854775806 + 1;
     let ratio: f32 = 7.5 / 2.5;
     let glyph: rune = '界';
     let label: string = "combat" + "-runtime";
     let stats: CombatStats = CombatStats { damage: wide, label: label };
-    let event: CombatEvent = Damage(stats);
+    let event: CombatEvent = CombatEvent::Damage(stats);
     let decoded: i64 = match event {
-        Idle => 0,
-        Damage(payload) => payload.damage,
+        CombatEvent::Idle => 0,
+        CombatEvent::Damage(payload) => payload.damage,
     };
 
-    let frame: CombatFrame = new CombatFrame { hits: 1, next: None };
+    let frame: CombatFrame = new CombatFrame { hits: 1, next: Option::None };
     frame.hits = frame.hits + 1;
 
-    let values: Array<i32> = Array.new<i32>();
+    let values: Array<i32> = Array::new();
     values.push(frame.hits);
     values.push(3);
 
-    let lookup: Map<i32, string> = Map.new<i32, string>();
+    let lookup: Map<i32, string> = Map::new();
     lookup.set(1, "ready");
     let mapped: Option<string> = lookup.get(1);
     let mapped_length: i32 = match mapped {
-        Some(value) => value.byte_len(),
-        None => 0,
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
     };
 
     input.set(0, values.get(0));
     let copied: Buffer<i32> = input.slice(0, 2);
     input.copy(copied, 0, 1, 1);
 
-    let optional: Option<i32> = Some(input.get(1));
-    let result: Result<i32, engine.AnimationError> = match optional {
-        Some(value) => Ok(value),
-        None => Err(engine.MissingClip),
+    let optional: Option<i32> = Option::Some(input.get(1));
+    let result: Result<i32, engine::AnimationError> = match optional {
+        Option::Some(value) => Result::Ok(value),
+        Option::None => Result::Err(engine::AnimationError::MissingClip),
     };
     let amount: i32 = match result {
-        Ok(value) => value,
-        Err(error) => 0,
+        Result::Ok(value) => value,
+        Result::Err(error) => 0,
     };
     return amount + mapped_length + values.len();
 }

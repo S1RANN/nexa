@@ -1,6 +1,6 @@
 schema = 2
 contract = "examples/snake-game/snake_api.nidl"
-required_exports = ["OnEvent"]
+required_entrypoints = ["on_event"]
 
 [[sources]]
 id = "snake-builtin"

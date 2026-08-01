@@ -11,13 +11,16 @@ use nexa_core::{
 pub const MAGIC: [u8; 4] = *b"NXBC";
 /// Current wire-format version.
 ///
-/// Version 5 adds deterministic scalar-to-string instructions for string
-/// interpolation. The decoder intentionally accepts only the current version:
+/// Version 6 adds typed resource-token identities, deterministic
+/// scalar-to-string instructions, and nominal enum equality. The decoder
+/// intentionally accepts only the current version:
 /// bytecode is an internal package artifact and has no cross-version decoding
 /// compatibility promise.
 pub use nexa_core::BYTECODE_VERSION;
 pub const MAX_STRUCT_FIELDS: usize = 16;
 pub const MAX_CLASS_FIELDS: usize = 16;
+pub const MAX_HOST_CAPABILITIES: usize = 64;
+pub const MAX_HOST_CAPABILITY_BYTES: usize = 128;
 /// Fixed stack buffer used by scalar-to-string lowering.
 ///
 /// Fuel charges the complete buffer bound before formatting starts, so
@@ -252,6 +255,9 @@ pub const STANDARD_STRING_FUEL_BLOCK_BYTES: u64 = 32;
 pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
 
 impl StandardIntrinsic {
+    /// Number of `StandardIntrinsic` tags reserved by the bytecode v6 wire codec.
+    pub const WIRE_VARIANT_COUNT: usize = 38;
+
     #[must_use]
     pub const fn canonical_name(self) -> &'static str {
         match self {
@@ -476,7 +482,7 @@ impl StandardIntrinsic {
         )
     }
 
-    /// Version-1 deterministic base fuel cost.
+    /// Bytecode v6 opcode-cost-table deterministic base fuel cost.
     ///
     /// Variable work declared by [`Self::fuel_model`] is charged separately
     /// from read-only register and heap metadata before any mutation.
@@ -610,6 +616,8 @@ pub struct AsyncResultType {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostImport {
     pub stable_id: StableId,
+    pub declaration_fingerprint: [u8; 32],
+    pub capabilities: Vec<String>,
     pub parameters: Vec<ValueType>,
     pub result: Option<ValueType>,
     pub mode: HostCallMode,
@@ -796,6 +804,27 @@ impl SnapshotType {
 }
 
 #[must_use]
+pub fn resource_token_type(content_type: StableId) -> StableId {
+    nexa_core::canonical_resource_token_type_id(content_type)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResourceTokenType {
+    pub type_id: StableId,
+    pub content_type: StableId,
+}
+
+impl ResourceTokenType {
+    #[must_use]
+    pub fn new(content_type: StableId) -> Self {
+        Self {
+            type_id: resource_token_type(content_type),
+            content_type,
+        }
+    }
+}
+
+#[must_use]
 pub fn stable_id_type() -> ValueType {
     ValueType::Named(StableId::from_name("StableId"))
 }
@@ -909,6 +938,7 @@ pub struct ScriptExport {
     pub stable_id: StableId,
     pub function: u32,
     pub signature: Signature,
+    pub effect: FunctionEffect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1155,6 +1185,11 @@ pub enum Instruction {
         ty: ValueType,
         dst: u16,
     },
+    StateCurrentGet {
+        stable_id: StableId,
+        type_id: StableId,
+        dst: u16,
+    },
     StateNewCreate {
         stable_id: StableId,
         type_id: StableId,
@@ -1188,6 +1223,11 @@ pub enum Instruction {
     EnumPayload {
         source: u16,
         variant: StableId,
+        dst: u16,
+    },
+    EnumEqual {
+        lhs: u16,
+        rhs: u16,
         dst: u16,
     },
     StructNew {
@@ -1410,13 +1450,14 @@ pub struct Module {
     pub map_types: Vec<MapType>,
     pub buffer_types: Vec<BufferType>,
     pub snapshot_types: Vec<SnapshotType>,
+    pub resource_token_types: Vec<ResourceTokenType>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
     pub host_imports: Vec<HostImport>,
     pub exports: Vec<ScriptExport>,
     pub state_schema: StateSchema,
-    pub host_interface_hash: Option<StableId>,
+    pub host_contract_id: Option<StableId>,
     pub state_schema_fingerprint: StateSchemaFingerprint,
     pub reload_metadata: ReloadMetadata,
     pub source_map: Vec<SourceMapEntry>,
@@ -1678,7 +1719,7 @@ impl Module {
     pub fn encode(&self) -> Vec<u8> {
         let mut output = Vec::new();
         put_u32(&mut output, 1);
-        put_optional_id(&mut output, self.host_interface_hash);
+        put_optional_id(&mut output, self.host_contract_id);
         output.extend_from_slice(self.state_schema_fingerprint.as_bytes());
         put_optional_u32(&mut output, self.reload_metadata.migration_entry);
         put_optional_u32(&mut output, self.reload_metadata.activation_entry);
@@ -1699,6 +1740,20 @@ impl Module {
         );
         for import in &self.host_imports {
             put_u64(&mut output, import.stable_id.0);
+            output.extend_from_slice(&import.declaration_fingerprint);
+            put_u16(
+                &mut output,
+                u16::try_from(import.capabilities.len())
+                    .expect("host capability count exceeds wire format"),
+            );
+            for capability in &import.capabilities {
+                put_u16(
+                    &mut output,
+                    u16::try_from(capability.len())
+                        .expect("host capability length exceeds wire format"),
+                );
+                output.extend_from_slice(capability.as_bytes());
+            }
             output.push(match import.mode {
                 HostCallMode::Immediate => 0,
                 HostCallMode::Async => 1,
@@ -1820,6 +1875,7 @@ impl Module {
         for export in &self.exports {
             put_u64(&mut output, export.stable_id.0);
             put_u32(&mut output, export.function);
+            output.push(encode_effect(export.effect));
             put_u16(
                 &mut output,
                 u16::try_from(export.signature.parameters.len())
@@ -1998,7 +2054,8 @@ impl Module {
                     .saturating_add(self.array_types.len())
                     .saturating_add(self.map_types.len())
                     .saturating_add(self.buffer_types.len())
-                    .saturating_add(self.snapshot_types.len()),
+                    .saturating_add(self.snapshot_types.len())
+                    .saturating_add(self.resource_token_types.len()),
             )
             .expect("parameterized type count exceeds wire format"),
         );
@@ -2027,6 +2084,11 @@ impl Module {
             types.push(5);
             put_u64(&mut types, snapshot.type_id.0);
             put_u64(&mut types, snapshot.content_type.0);
+        }
+        for token in &self.resource_token_types {
+            types.push(6);
+            put_u64(&mut types, token.type_id.0);
+            put_u64(&mut types, token.content_type.0);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -2135,6 +2197,7 @@ impl Module {
         let mut map_types = Vec::new();
         let mut buffer_types = Vec::new();
         let mut snapshot_types = Vec::new();
+        let mut resource_token_types = Vec::new();
         for _ in 0..state_handle_type_count {
             let kind = types_reader.u8()?;
             let type_id = StableId(types_reader.u64()?);
@@ -2157,6 +2220,10 @@ impl Module {
                     element: decode_type(&mut types_reader)?,
                 }),
                 5 => snapshot_types.push(SnapshotType {
+                    type_id,
+                    content_type: StableId(types_reader.u64()?),
+                }),
+                6 => resource_token_types.push(ResourceTokenType {
                     type_id,
                     content_type: StableId(types_reader.u64()?),
                 }),
@@ -2184,7 +2251,7 @@ impl Module {
             bytes: &metadata,
             cursor: 0,
         };
-        let host_interface_hash = read_optional_id(&mut reader)?;
+        let host_contract_id = read_optional_id(&mut reader)?;
         let state_schema_fingerprint = StateSchemaFingerprint::from_bytes(reader.array()?);
         let migration_entry = read_optional_u32(&mut reader)?;
         let activation_entry = read_optional_u32(&mut reader)?;
@@ -2215,6 +2282,17 @@ impl Module {
         let mut host_imports = Vec::with_capacity(host_import_count);
         for _ in 0..host_import_count {
             let stable_id = StableId(reader.u64()?);
+            let declaration_fingerprint = reader.array()?;
+            let capability_count = usize::from(reader.u16()?);
+            enforce_limit(capability_count, MAX_HOST_CAPABILITIES, "host capabilities")?;
+            let mut capabilities = Vec::with_capacity(capability_count);
+            for _ in 0..capability_count {
+                let length = usize::from(reader.u16()?);
+                enforce_limit(length, MAX_HOST_CAPABILITY_BYTES, "host capability bytes")?;
+                let capability = std::str::from_utf8(reader.take(length)?)
+                    .map_err(|_| DecodeError::InvalidUtf8)?;
+                capabilities.push(capability.to_owned());
+            }
             let mode = match reader.u8()? {
                 0 => HostCallMode::Immediate,
                 1 => HostCallMode::Async,
@@ -2266,6 +2344,8 @@ impl Module {
             };
             host_imports.push(HostImport {
                 stable_id,
+                declaration_fingerprint,
+                capabilities,
                 parameters,
                 result,
                 mode,
@@ -2390,6 +2470,7 @@ impl Module {
         for _ in 0..export_count {
             let stable_id = StableId(reader.u64()?);
             let function = reader.u32()?;
+            let effect = decode_effect(reader.u8()?)?;
             let parameter_count = usize::from(reader.u16()?);
             if parameter_count > reader.remaining() {
                 return Err(DecodeError::Truncated);
@@ -2407,6 +2488,7 @@ impl Module {
                 stable_id,
                 function,
                 signature: Signature { parameters, result },
+                effect,
             });
         }
         if reader.cursor != metadata.len() {
@@ -2591,13 +2673,14 @@ impl Module {
             map_types,
             buffer_types,
             snapshot_types,
+            resource_token_types,
             enum_types,
             struct_types,
             class_types,
             host_imports,
             exports,
             state_schema: StateSchema { types: state_types },
-            host_interface_hash,
+            host_contract_id,
             state_schema_fingerprint,
             reload_metadata,
             source_map,
@@ -2641,7 +2724,7 @@ fn encode_sections(sections: &[(SectionKind, Vec<u8>)]) -> Vec<u8> {
             u32::from_le_bytes(
                 bytes
                     .get(..4)
-                    .expect("every v5 section starts with a count")
+                    .expect("every v6 section starts with a count")
                     .try_into()
                     .expect("section count occupies four bytes"),
             ),
@@ -3551,6 +3634,16 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             encode_type(output, ty);
             put_u16(output, dst);
         }
+        Instruction::StateCurrentGet {
+            stable_id,
+            type_id,
+            dst,
+        } => {
+            output.push(105);
+            put_u64(output, stable_id.0);
+            put_u64(output, type_id.0);
+            put_u16(output, dst);
+        }
         Instruction::StateNewCreate {
             stable_id,
             type_id,
@@ -3608,6 +3701,12 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             output.push(26);
             put_u16(output, source);
             put_u64(output, variant.0);
+            put_u16(output, dst);
+        }
+        Instruction::EnumEqual { lhs, rhs, dst } => {
+            output.push(106);
+            put_u16(output, lhs);
+            put_u16(output, rhs);
             put_u16(output, dst);
         }
         Instruction::StatePreserve { stable_id } => {
@@ -3787,6 +3886,11 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             ty: decode_type(reader)?,
             dst: reader.u16()?,
         },
+        105 => Instruction::StateCurrentGet {
+            stable_id: StableId(reader.u64()?),
+            type_id: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
         20 => Instruction::StateNewCreate {
             stable_id: StableId(reader.u64()?),
             type_id: StableId(reader.u64()?),
@@ -3821,6 +3925,11 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         26 => Instruction::EnumPayload {
             source: reader.u16()?,
             variant: StableId(reader.u64()?),
+            dst: reader.u16()?,
+        },
+        106 => Instruction::EnumEqual {
+            lhs: reader.u16()?,
+            rhs: reader.u16()?,
             dst: reader.u16()?,
         },
         27 => Instruction::StatePreserve {
@@ -4211,13 +4320,14 @@ pub struct ModuleBuilder {
     map_types: Vec<MapType>,
     buffer_types: Vec<BufferType>,
     snapshot_types: Vec<SnapshotType>,
+    resource_token_types: Vec<ResourceTokenType>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
     host_imports: Vec<HostImport>,
     exports: Vec<ScriptExport>,
     state_schema: StateSchema,
-    host_interface_hash: Option<StableId>,
+    host_contract_id: Option<StableId>,
     state_schema_fingerprint: Option<StateSchemaFingerprint>,
     reload_metadata: ReloadMetadata,
     source_map: Vec<SourceMapEntry>,
@@ -4234,13 +4344,14 @@ impl ModuleBuilder {
             map_types: Vec::new(),
             buffer_types: Vec::new(),
             snapshot_types: Vec::new(),
+            resource_token_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
             host_imports: Vec::new(),
             exports: Vec::new(),
             state_schema: StateSchema { types: Vec::new() },
-            host_interface_hash: None,
+            host_contract_id: None,
             state_schema_fingerprint: None,
             reload_metadata: ReloadMetadata {
                 migration_entry: None,
@@ -4262,10 +4373,10 @@ impl ModuleBuilder {
 
     pub fn metadata(
         &mut self,
-        host_interface_hash: StableId,
+        host_contract_id: StableId,
         state_schema_fingerprint: StateSchemaFingerprint,
     ) -> &mut Self {
-        self.host_interface_hash = Some(host_interface_hash);
+        self.host_contract_id = Some(host_contract_id);
         self.state_schema_fingerprint = Some(state_schema_fingerprint);
         self
     }
@@ -4332,6 +4443,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn resource_token_type(&mut self, resource_token_type: ResourceTokenType) -> &mut Self {
+        self.resource_token_types.push(resource_token_type);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -4373,13 +4489,14 @@ impl ModuleBuilder {
             map_types: self.map_types,
             buffer_types: self.buffer_types,
             snapshot_types: self.snapshot_types,
+            resource_token_types: self.resource_token_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
             host_imports: self.host_imports,
             exports: self.exports,
             state_schema: self.state_schema,
-            host_interface_hash: self.host_interface_hash,
+            host_contract_id: self.host_contract_id,
             state_schema_fingerprint: self
                 .state_schema_fingerprint
                 .unwrap_or(computed_state_schema_fingerprint),
@@ -4507,12 +4624,14 @@ impl FunctionBuilder {
                         | Instruction::StringToString { .. }
                         | Instruction::StandardIntrinsic { .. }
                         | Instruction::EnumNew { .. }
+                        | Instruction::EnumEqual { .. }
                         | Instruction::StructNew { .. }
                         | Instruction::StructWith { .. }
                         | Instruction::StructEqual { .. }
                         | Instruction::ClassNew { .. }
                         | Instruction::Call { .. }
                         | Instruction::HostCall { .. }
+                        | Instruction::StateCurrentGet { .. }
                         | Instruction::StateHandleResolve { .. }
                         | Instruction::ArrayNew { .. }
                         | Instruction::ArrayLen { .. }
@@ -4591,10 +4710,11 @@ mod tests {
 
     use super::{
         ArrayType, BufferType, ClassType, DecodeError, DecodeLimits, EnumType, EnumVariant,
-        FunctionBuilder, FunctionEffect, Instruction, MapType, Module, ModuleBuilder, SectionKind,
-        Signature, SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType,
-        StateSchema, StateType, StructField, StructType, ValueType, minimum_migration_limits,
-        option_type, result_type, state_handle_error_type, state_handle_type,
+        FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, MapType, Module,
+        ModuleBuilder, ResourceTokenType, ScriptExport, SectionKind, Signature, SnapshotType,
+        SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
+        StructField, StructType, ValueType, minimum_migration_limits, option_type, result_type,
+        state_handle_error_type, state_handle_type,
     };
 
     #[test]
@@ -5128,7 +5248,45 @@ mod tests {
     }
 
     #[test]
-    fn state_handle_opcodes_round_trip_in_bytecode_v5() {
+    fn state_current_get_round_trips_in_bytecode_v6() {
+        let stable_id = StableId::from_name("repl::environment");
+        let type_id = StableId::from_name("repl::Environment");
+        let signature = Signature {
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(type_id)),
+        };
+        let mut function = FunctionBuilder::new(signature.clone(), 1);
+        function
+            .effect(FunctionEffect::Ordinary)
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::StateCurrentGet {
+                stable_id,
+                type_id,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut builder = ModuleBuilder::new();
+        builder.state_schema(StateSchema {
+            types: vec![StateType {
+                stable_id: type_id,
+                version: 1,
+                fields: Vec::new(),
+            }],
+        });
+        let function = builder.function(function.finish().unwrap());
+        builder.script_export(ScriptExport {
+            stable_id: StableId::from_name("repl::cell_0"),
+            function,
+            signature,
+            effect: FunctionEffect::Ordinary,
+        });
+        let module = builder.finish();
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn state_handle_opcodes_round_trip_in_bytecode_v6() {
         let target = ValueType::Named(nexa_core::StableId::from_name("EnemyBrain"));
         let result = result_type(target, ValueType::Named(state_handle_error_type().type_id));
         let mut function = FunctionBuilder::new(
@@ -5190,7 +5348,7 @@ mod tests {
     }
 
     #[test]
-    fn array_metadata_and_opcodes_round_trip_in_bytecode_v5() {
+    fn array_metadata_and_opcodes_round_trip_in_bytecode_v6() {
         let array = ArrayType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -5246,7 +5404,7 @@ mod tests {
     }
 
     #[test]
-    fn map_metadata_and_opcodes_round_trip_in_bytecode_v5() {
+    fn map_metadata_and_opcodes_round_trip_in_bytecode_v6() {
         let map = MapType::new(ValueType::I32, ValueType::String);
         let option = option_type(ValueType::String);
         let mut function = FunctionBuilder::new(
@@ -5301,7 +5459,7 @@ mod tests {
     }
 
     #[test]
-    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v5() {
+    fn buffer_metadata_and_copy_opcodes_round_trip_in_bytecode_v6() {
         let buffer = BufferType::new(ValueType::I32);
         let mut function = FunctionBuilder::new(
             Signature {
@@ -5350,7 +5508,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_snapshot_metadata_round_trips_in_bytecode_v5() {
+    fn typed_snapshot_metadata_round_trips_in_bytecode_v6() {
         let content_type = StableId::from_name("EnemyView");
         let snapshot = SnapshotType::new(content_type);
         let mut builder = ModuleBuilder::new();
@@ -5366,8 +5524,47 @@ mod tests {
     }
 
     #[test]
+    fn typed_resource_token_metadata_round_trips_in_bytecode_v6() {
+        let action_lock = StableId::from_name("ActionLock");
+        let motion_lock = StableId::from_name("MotionLock");
+        let action_token = ResourceTokenType::new(action_lock);
+        let motion_token = ResourceTokenType::new(motion_lock);
+        assert_ne!(action_token.type_id, motion_token.type_id);
+
+        let mut builder = ModuleBuilder::new();
+        builder
+            .resource_token_type(action_token)
+            .resource_token_type(motion_token);
+        let module = builder.finish();
+        assert_eq!(
+            module.resource_token_types,
+            vec![action_token, motion_token]
+        );
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
+    fn host_import_authority_metadata_round_trips_in_bytecode_v6() {
+        let import = HostImport {
+            stable_id: StableId::from_name("Host::read_profile"),
+            declaration_fingerprint: [0xa5; 32],
+            capabilities: vec!["profile.read".into(), "world-state_read".into()],
+            parameters: vec![ValueType::I32],
+            result: Some(ValueType::String),
+            mode: HostCallMode::Immediate,
+            fuel_cost: 7,
+            async_result: None,
+        };
+        let mut builder = ModuleBuilder::new();
+        builder.host_import(import.clone());
+        let module = builder.finish();
+        assert_eq!(module.host_imports, vec![import]);
+        assert_eq!(Module::decode(&module.encode()), Ok(module));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
-    fn scalar_types_and_opcodes_round_trip_in_bytecode_v5() {
+    fn scalar_types_and_opcodes_round_trip_in_bytecode_v6() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: vec![
@@ -5491,7 +5688,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_to_string_opcodes_round_trip_in_bytecode_v5() {
+    fn scalar_to_string_opcodes_round_trip_in_bytecode_v6() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: vec![
@@ -5543,18 +5740,18 @@ mod tests {
     }
 
     #[test]
-    fn bytecode_v5_rejects_a_v4_header() {
+    fn bytecode_v6_rejects_a_v5_header() {
         let module = ModuleBuilder::new().finish();
         let mut bytes = module.encode();
-        bytes[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&5_u16.to_le_bytes());
         assert_eq!(
             Module::decode(&bytes),
-            Err(DecodeError::UnsupportedVersion(4))
+            Err(DecodeError::UnsupportedVersion(5))
         );
     }
 
     #[test]
-    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v5() {
+    fn utf8_string_pool_and_operations_round_trip_in_bytecode_v6() {
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -5618,7 +5815,7 @@ mod tests {
     }
 
     #[test]
-    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v5() {
+    fn struct_metadata_and_opcodes_round_trip_in_bytecode_v6() {
         let type_id = nexa_core::StableId::from_name("Position");
         let x = nexa_core::StableId::from_parts(&["Position", "::x"]);
         let fields = vec![
@@ -5682,7 +5879,7 @@ mod tests {
     }
 
     #[test]
-    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v5() {
+    fn class_metadata_and_mutation_opcodes_round_trip_in_bytecode_v6() {
         let type_id = nexa_core::StableId::from_name("Node");
         let value = nexa_core::StableId::from_parts(&["Node", "::value"]);
         let mut function = FunctionBuilder::new(
@@ -5741,7 +5938,7 @@ mod tests {
     }
 
     #[test]
-    fn every_standard_intrinsic_round_trips_in_bytecode_v5() {
+    fn every_standard_intrinsic_round_trips_in_bytecode_v6() {
         let value = ValueType::I32;
         let key = ValueType::String;
         let intrinsics = vec![
@@ -5817,7 +6014,7 @@ mod tests {
     }
 
     #[test]
-    fn state_schema_fingerprint_is_256_bit_and_enumeration_order_independent() {
+    fn state_schema_fingerprint_is_256_bit_type_order_independent_and_field_order_sensitive() {
         let nested_core = nexa_core::canonical_array_type_id(nexa_core::CanonicalValueType::Named(
             nexa_core::canonical_option_type_id(nexa_core::CanonicalValueType::I32),
         ));
@@ -5851,21 +6048,29 @@ mod tests {
             types: vec![type_a.clone(), type_b.clone()],
         }
         .fingerprint();
-        let mut type_a_reordered = type_a.clone();
-        type_a_reordered.fields.reverse();
-        let reordered = StateSchema {
-            types: vec![type_b, type_a_reordered],
+        let type_reordered = StateSchema {
+            types: vec![type_b.clone(), type_a.clone()],
         }
         .fingerprint();
-        assert_eq!(first, reordered);
+        assert_eq!(first, type_reordered);
         assert_eq!(first.as_bytes().len(), 32);
 
-        let mut changed = type_a;
-        changed.version = 2;
+        let mut fields_reordered = type_a.clone();
+        fields_reordered.fields.reverse();
         assert_ne!(
             first,
             StateSchema {
-                types: vec![changed]
+                types: vec![fields_reordered, type_b.clone()]
+            }
+            .fingerprint()
+        );
+
+        let mut version_changed = type_a;
+        version_changed.version = 2;
+        assert_ne!(
+            first,
+            StateSchema {
+                types: vec![version_changed, type_b]
             }
             .fingerprint()
         );

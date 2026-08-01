@@ -60,7 +60,7 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<
     let mut successful = BTreeMap::<PackageId, CandidateIdentity>::new();
     let mut successful_inputs = BTreeMap::<PackageId, Arc<ResolvedBuildInput>>::new();
     let mut missing = BTreeSet::<PackageId>::new();
-    let mut contract_identity = nexa::canonical_idl(&initial_project.idl);
+    let mut contract_identity = nexa::contract_fingerprint(&initial_project.contract);
     let mut rendered_failure = false;
     let mut deferred_error = None;
 
@@ -85,7 +85,7 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<
                 continue;
             }
         };
-        let current_contract_identity = nexa::canonical_idl(&current_project.idl);
+        let current_contract_identity = nexa::contract_fingerprint(&current_project.contract);
         if current_contract_identity != contract_identity {
             contract_identity = current_contract_identity;
             emit_event(
@@ -207,7 +207,7 @@ pub fn dev_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<
                     &mut build_session,
                     identity.generation,
                     None,
-                    build.host_contract.required_exports.as_ref(),
+                    build.host_contract.required_entrypoints.as_ref(),
                     false,
                 );
 

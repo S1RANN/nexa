@@ -10,16 +10,17 @@ use std::sync::Arc;
 
 use nexa_core::{
     CanonicalSymbolIdentity, StableId, StableSymbolId, StableSymbolRegistry, SymbolKind,
+    deterministic_math::{rem_f32 as deterministic_rem_f32, rem_f64 as deterministic_rem_f64},
 };
 use nexa_diagnostics::{
     ByteRange, Diagnostic, DiagnosticBatch, DiagnosticBatchLimits, ErrorCode, Label,
     RelatedLocation, Severity, SourceIdentity, SourceSnapshotRegistry,
 };
 use nexa_syntax::ast::{
-    self, Attribute, AttributeArgumentKind, BinaryOperatorKind, DeclarationKind, ElseBranch,
-    Expression, ExpressionKind, FunctionEffect, InterpolationPart, LiteralKind, Pattern,
-    PatternKind, Statement, StatementKind, TypeDeclarationKind, TypeKind, TypeRef,
-    UnaryOperatorKind, Visibility, parse_nexa_ast,
+    self, AstErrorKind, Attribute, AttributeArgumentClassification, AttributeArgumentKind,
+    BinaryOperatorKind, DeclarationKind, ElseBranch, Expression, ExpressionKind, InterpolationPart,
+    LiteralKind, Pattern, PatternKind, Statement, StatementKind, TypeDeclarationKind, TypeKind,
+    TypeRef, UnaryOperatorKind, UsePathRootKind, Visibility, parse_nexa_ast,
 };
 use nexa_syntax::{TextRange, TextSize};
 
@@ -30,22 +31,22 @@ use crate::query::{
 };
 use crate::{
     ArtifactFileId, ArtifactFileTable, BinaryOperator, BuiltinOperationIr, BuiltinVariantIr,
-    CompilationLimits, DeclarationVisibility, Definition, DefinitionId, DefinitionKind,
-    ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr, FieldLayoutIr,
-    HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
+    CompilationLimits, CompilationProfile, DeclarationVisibility, Definition, DefinitionId,
+    DefinitionKind, ExportBindingIr, ExternalSourceRangeIr, ExternalSourceSnapshotIr,
+    FieldLayoutIr, HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
     HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr,
     IrAbandonPolicy, IrCancelPolicy, IrEffect, IrHostFunctionMode, IrLiteral, IrType,
     LifecycleBindingsIr, ModuleGraph, ModuleGraphError, ModuleKey, ModulePath,
     NormalizedPackagePath, PackageId, PackageKind, PackageSemanticMetadata, PackageSourceSet,
-    PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey, ResolvedBuildInput,
-    ResolvedReference, ResolvedTestInput, SemanticFingerprintRecord, SourceKey, SourceRange,
-    SourceRole, SourceSetFingerprint, StableSymbolIdentity, StandardFunctionBindingIr,
-    StateFieldIr, StateSchemaFingerprint, StateTypeIr, TestDefinitionIr, TypedBlockIr,
-    TypedDeclarationBody, TypedDeclarationIr, TypedExpressionIr, TypedExpressionKind,
-    TypedFunctionIr, TypedMatchArmIr, TypedModuleIr, TypedPackageIr, TypedPatternIr,
-    TypedPatternKind, TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr, UnaryOperator,
-    VariantLayoutIr, canonical_state_schema, external_source_key, public_api_fingerprint,
-    source_set_fingerprint,
+    PublicApiFingerprint, QueryDatabase, QueryExecutionReport, QueryKey, ReplCellInput,
+    ReplSessionSnapshot, ResolvedBuildInput, ResolvedReference, ResolvedTestInput,
+    SemanticFingerprintRecord, SourceKey, SourceRange, SourceRole, SourceSetFingerprint,
+    StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr, StateMetadataIr,
+    StateSchemaFingerprint, StateTypeIr, TestDefinitionIr, TypedBlockIr, TypedDeclarationBody,
+    TypedDeclarationIr, TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedMatchArmIr,
+    TypedModuleIr, TypedPackageIr, TypedPatternIr, TypedPatternKind, TypedPlaceIr,
+    TypedStatementIr, TypedTypeLayoutIr, UnaryOperator, VariantLayoutIr, canonical_state_schema,
+    external_source_key, public_api_fingerprint, source_set_fingerprint,
 };
 
 /// A type in a compiler-provided static module or Host contract.
@@ -69,8 +70,7 @@ pub enum SurfaceType {
     Array(Box<Self>),
     Map(Box<Self>, Box<Self>),
     Tuple(Vec<Self>),
-    HostRequest(Option<Box<Self>>),
-    ResourceToken(Option<Box<Self>>),
+    Token(Box<Self>),
     Snapshot(Box<Self>),
     Buffer(Box<Self>),
     StateHandle(Box<Self>),
@@ -159,10 +159,16 @@ pub struct HostFunctionSurface {
     pub result: SurfaceType,
     pub mode: HostFunctionMode,
     pub stable_id: nexa_core::StableId,
+    /// Canonical declaration fingerprint produced by the validated NIDL model.
+    ///
+    /// This is authoritative ABI metadata and must be propagated verbatim. Consumers must not
+    /// attempt to reconstruct it from this surface's individual fields.
+    pub declaration_fingerprint: [u8; 32],
     pub import_index: u32,
     pub fuel_cost: u32,
     pub async_result: Option<HostAsyncResultSurface>,
-    pub required_capability: Option<String>,
+    /// Canonical sorted, duplicate-free capabilities which must all be declared by the package.
+    pub required_capabilities: Vec<String>,
     pub source: Option<ExternalSourceOrigin>,
 }
 
@@ -183,16 +189,32 @@ pub struct HostAsyncResultSurface {
 /// codegen truth. The analyzer never guesses a Host signature from source spelling.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostContractSurface {
-    pub interface_name: String,
-    pub interface_stable_id: nexa_core::StableId,
+    pub contract_name: String,
+    pub contract_stable_id: nexa_core::StableId,
     pub types: Vec<ExternalTypeSurface>,
     pub functions: Vec<HostFunctionSurface>,
-    pub required_exports: Vec<RequiredExportSurface>,
+    /// Every legal `nexa {}` entrypoint declared by the contract.
+    ///
+    /// Presence in this list makes an implementation discoverable and signature-checked. It does
+    /// not make the entrypoint mandatory for every package.
+    pub nexa_entrypoints: Vec<NexaEntrypointSurface>,
+    /// Engine-selected subset which every enabled package must implement.
+    pub required_entrypoints: Vec<RequiredEntrypointSurface>,
     pub source: Option<ExternalSourceOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RequiredExportSurface {
+pub struct NexaEntrypointSurface {
+    pub name: String,
+    pub stable_id: nexa_core::StableId,
+    pub parameters: Vec<SurfaceType>,
+    pub result: SurfaceType,
+    pub effect: Option<IrEffect>,
+    pub source: Option<ExternalSourceOrigin>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequiredEntrypointSurface {
     pub name: String,
     pub stable_id: nexa_core::StableId,
     pub parameters: Vec<SurfaceType>,
@@ -238,8 +260,8 @@ pub struct AnalyzedHostFunction {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AnalyzedHostBinding {
-    pub interface: DefinitionId,
-    pub interface_stable_id: nexa_core::StableId,
+    pub contract: DefinitionId,
+    pub contract_stable_id: nexa_core::StableId,
     pub namespaces: Vec<(PackageId, ModulePath, String)>,
     pub functions: Vec<AnalyzedHostFunction>,
 }
@@ -315,6 +337,7 @@ struct SourceModuleKey {
 #[derive(Clone)]
 struct ParsedModule {
     key: SourceModuleKey,
+    virtual_module_path: Option<ModulePath>,
     source: SourceKey,
     role: SourceRole,
     syntax: Arc<nexa_syntax::SyntaxTree>,
@@ -364,9 +387,16 @@ struct ExternalFunctionMetadata {
 struct TypeMetadata {
     fields: BTreeMap<String, DefinitionId>,
     field_order: Vec<DefinitionId>,
+    field_mutability: BTreeMap<DefinitionId, bool>,
     variants: BTreeMap<String, DefinitionId>,
     variant_order: Vec<DefinitionId>,
-    stateful: bool,
+    variant_fields: BTreeMap<DefinitionId, BTreeMap<String, DefinitionId>>,
+    variant_field_order: BTreeMap<DefinitionId, Vec<DefinitionId>>,
+    state: Option<StateClassMetadata>,
+}
+
+#[derive(Clone)]
+struct StateClassMetadata {
     version: u32,
 }
 
@@ -382,7 +412,6 @@ enum ConstValue {
     String(String),
     Rune(char),
     Tuple(Vec<Self>),
-    Array(Vec<Self>),
     Construct {
         definition: DefinitionId,
         fields: Vec<(DefinitionId, Self)>,
@@ -390,6 +419,10 @@ enum ConstValue {
     Variant {
         definition: DefinitionId,
         values: Vec<Self>,
+    },
+    BuiltinVariant {
+        variant: BuiltinVariantIr,
+        value: Option<Box<Self>>,
     },
 }
 
@@ -413,6 +446,12 @@ struct Analyzer<'a> {
     db: &'a mut QueryDatabase,
     typed_module_semantic_context: [u8; 32],
     mode: AnalysisMode,
+    repl_snapshot: Option<&'a ReplSessionSnapshot>,
+    repl_cell: Option<&'a ReplCellInput>,
+    repl_prior_modules: Vec<TypedModuleIr>,
+    repl_prior_external_sources: Vec<ExternalSourceSnapshotIr>,
+    repl_environment_definition: Option<DefinitionId>,
+    repl_new_state_fields: Vec<DefinitionId>,
     diagnostics: DiagnosticBatch,
     modules: Vec<ParsedModule>,
     module_indices: BTreeMap<SourceModuleKey, usize>,
@@ -435,6 +474,8 @@ struct Analyzer<'a> {
     const_values: BTreeMap<DefinitionId, ConstValue>,
     call_edges: BTreeMap<DefinitionId, BTreeSet<DefinitionId>>,
     restricted: BTreeMap<DefinitionId, BTreeSet<RestrictedOperation>>,
+    repl_entry: Option<crate::ReplEntrypointIr>,
+    repl_entry_definition: Option<DefinitionId>,
     state_types: Vec<AnalyzedStateType>,
     host_binding: Option<AnalyzedHostBinding>,
     host_types: Vec<AnalyzedHostType>,
@@ -452,6 +493,8 @@ struct Analyzer<'a> {
 enum AnalysisMode {
     Product,
     Test,
+    Script,
+    ReplCell,
 }
 
 /// Analyze one immutable root package and its complete static dependency closure.
@@ -491,6 +534,67 @@ pub fn analyze_package_tests(
         db,
         AnalysisMode::Test,
     )
+    .run()
+}
+
+/// Analyze a single-file script and lower executable top-level statements to a synthetic `main`.
+///
+/// The input must carry [`CompilationProfile::Script`]; keeping the profile in the resolved build
+/// fingerprint prevents script and package semantics from sharing an artifact identity.
+#[must_use]
+pub fn analyze_script(
+    input: &ResolvedBuildInput,
+    environment: &AnalysisEnvironment,
+    db: &mut QueryDatabase,
+) -> AnalysisOutcome {
+    Analyzer::new(
+        input,
+        None,
+        &input.artifact_files,
+        environment,
+        db,
+        AnalysisMode::Script,
+    )
+    .run()
+}
+
+/// Analyze one structured REPL cell through the normal frontend and Typed IR.
+///
+/// Cross-cell staging is owned by the REPL session layer; this entrypoint guarantees that a cell
+/// itself uses the same syntax, name/type analysis, verifier-ready IR, and source spans as scripts.
+#[must_use]
+pub fn analyze_repl_cell(
+    input: &ResolvedBuildInput,
+    environment: &AnalysisEnvironment,
+    db: &mut QueryDatabase,
+) -> AnalysisOutcome {
+    Analyzer::new(
+        input,
+        None,
+        &input.artifact_files,
+        environment,
+        db,
+        AnalysisMode::ReplCell,
+    )
+    .run()
+}
+
+pub(crate) fn analyze_repl_cell_with_session<'a>(
+    input: &'a ResolvedBuildInput,
+    snapshot: &'a ReplSessionSnapshot,
+    cell: &'a ReplCellInput,
+    environment: &'a AnalysisEnvironment,
+    db: &'a mut QueryDatabase,
+) -> AnalysisOutcome {
+    Analyzer::new(
+        input,
+        None,
+        &input.artifact_files,
+        environment,
+        db,
+        AnalysisMode::ReplCell,
+    )
+    .with_repl_session(snapshot, cell)
     .run()
 }
 
@@ -548,6 +652,12 @@ impl<'a> Analyzer<'a> {
             db,
             typed_module_semantic_context: typed_module_semantic_context(input),
             mode,
+            repl_snapshot: None,
+            repl_cell: None,
+            repl_prior_modules: Vec::new(),
+            repl_prior_external_sources: Vec::new(),
+            repl_environment_definition: None,
+            repl_new_state_fields: Vec::new(),
             diagnostics,
             modules: Vec::new(),
             module_indices: BTreeMap::new(),
@@ -570,6 +680,8 @@ impl<'a> Analyzer<'a> {
             const_values: BTreeMap::new(),
             call_edges: BTreeMap::new(),
             restricted: BTreeMap::new(),
+            repl_entry: None,
+            repl_entry_definition: None,
             state_types: Vec::new(),
             host_binding: None,
             host_types: Vec::new(),
@@ -584,9 +696,534 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    fn with_repl_session(
+        mut self,
+        snapshot: &'a ReplSessionSnapshot,
+        cell: &'a ReplCellInput,
+    ) -> Self {
+        let mut sources = BTreeMap::<SourceIdentity, Arc<str>>::new();
+        for (identity, source) in self.diagnostics.sources().iter() {
+            sources.insert(identity.clone(), Arc::from(source.text()));
+        }
+        if let Some(candidate) = snapshot.candidate_ir() {
+            for module in candidate.modules() {
+                sources
+                    .entry(source_identity(&module.source))
+                    .or_insert_with(|| Arc::from(module.syntax.source.as_str()));
+            }
+            for source in candidate.metadata().external_sources.iter() {
+                sources
+                    .entry(source.identity.clone())
+                    .or_insert_with(|| Arc::clone(&source.text));
+            }
+        }
+        let mut builder = SourceSnapshotRegistry::builder();
+        for (identity, text) in sources {
+            builder
+                .insert(identity, text)
+                .expect("deduplicated REPL diagnostic source identity");
+        }
+        let limits = DiagnosticBatchLimits {
+            max_diagnostics: self
+                .input
+                .compilation_options
+                .limits
+                .diagnostics_per_revision,
+            ..DiagnosticBatchLimits::default()
+        };
+        let existing = self.diagnostics.diagnostics().to_vec();
+        self.diagnostics = DiagnosticBatch::new(builder.build(), limits);
+        self.diagnostics.extend(existing);
+        self.repl_snapshot = Some(snapshot);
+        self.repl_cell = Some(cell);
+        self
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn seed_repl_snapshot(&mut self) {
+        let Some(snapshot) = self.repl_snapshot else {
+            return;
+        };
+        let Some(candidate) = snapshot.candidate_ir() else {
+            return;
+        };
+
+        self.definitions = candidate.definitions().to_vec();
+        self.repl_prior_modules = candidate.modules().to_vec();
+        self.repl_prior_external_sources = candidate.metadata().external_sources.to_vec();
+        self.repl_environment_definition = candidate
+            .metadata()
+            .state_types
+            .iter()
+            .find(|state| state.stable_id == crate::repl_environment_symbol())
+            .map(|state| state.definition);
+
+        for definition in &self.definitions {
+            if let Some(stable) = &definition.stable_symbol {
+                let _ = self.stable_registry.insert(stable.canonical.clone());
+                self.stable_ids.insert(definition.id, stable.runtime_id);
+            }
+            if matches!(
+                definition.kind,
+                DefinitionKind::Function
+                    | DefinitionKind::Task
+                    | DefinitionKind::Struct
+                    | DefinitionKind::Enum
+                    | DefinitionKind::Class
+                    | DefinitionKind::Const
+                    | DefinitionKind::Variant
+                    | DefinitionKind::HostContract
+                    | DefinitionKind::HostFunction
+                    | DefinitionKind::StandardLibrary
+            ) {
+                self.symbols.insert(
+                    (
+                        definition.package_id.clone(),
+                        definition.module.clone(),
+                        definition.name.clone(),
+                    ),
+                    definition.id,
+                );
+            }
+        }
+
+        for module in &self.repl_prior_modules {
+            for declaration in module.declarations.iter() {
+                match &declaration.body {
+                    TypedDeclarationBody::Function(function) => {
+                        let parameter_types = function
+                            .parameters
+                            .iter()
+                            .map(|parameter| self.definitions[parameter.0 as usize].ty.clone())
+                            .collect();
+                        self.function_signatures.insert(
+                            declaration.definition,
+                            FunctionSignature {
+                                parameters: function.parameters.clone(),
+                                parameter_types,
+                                result: function.return_type.clone(),
+                                effect: function.effect,
+                            },
+                        );
+                    }
+                    TypedDeclarationBody::TypeLayout(layout) => {
+                        let mut metadata = TypeMetadata {
+                            fields: BTreeMap::new(),
+                            field_order: Vec::new(),
+                            field_mutability: BTreeMap::new(),
+                            variants: BTreeMap::new(),
+                            variant_order: Vec::new(),
+                            variant_fields: BTreeMap::new(),
+                            variant_field_order: BTreeMap::new(),
+                            state: None,
+                        };
+                        match layout {
+                            TypedTypeLayoutIr::Struct { fields }
+                            | TypedTypeLayoutIr::Class { fields, .. } => {
+                                for field in fields {
+                                    let definition = &self.definitions[field.definition.0 as usize];
+                                    metadata
+                                        .fields
+                                        .insert(definition.name.clone(), field.definition);
+                                    metadata.field_order.push(field.definition);
+                                    metadata
+                                        .field_mutability
+                                        .insert(field.definition, field.mutable);
+                                    self.members.insert(
+                                        (declaration.definition, definition.name.clone()),
+                                        field.definition,
+                                    );
+                                }
+                                if let TypedTypeLayoutIr::Class {
+                                    state: Some(state), ..
+                                } = layout
+                                {
+                                    metadata.state = Some(StateClassMetadata {
+                                        version: state.version,
+                                    });
+                                }
+                            }
+                            TypedTypeLayoutIr::Enum { variants } => {
+                                for variant in variants {
+                                    let definition =
+                                        &self.definitions[variant.definition.0 as usize];
+                                    metadata
+                                        .variants
+                                        .insert(definition.name.clone(), variant.definition);
+                                    metadata.variant_order.push(variant.definition);
+                                    self.members.insert(
+                                        (declaration.definition, definition.name.clone()),
+                                        variant.definition,
+                                    );
+                                    self.variant_payloads.insert(
+                                        variant.definition,
+                                        variant.payload.clone().into_iter().collect(),
+                                    );
+                                }
+                            }
+                        }
+                        self.type_metadata.insert(declaration.definition, metadata);
+                    }
+                    TypedDeclarationBody::Const(_) | TypedDeclarationBody::External => {}
+                }
+            }
+        }
+
+        for definition in &self.definitions {
+            if definition.kind == DefinitionKind::Field {
+                let Some((_, member)) = definition.canonical_identity.split_once("::Field::")
+                else {
+                    continue;
+                };
+                let Some((owner, _)) = member.rsplit_once('.') else {
+                    continue;
+                };
+                for metadata in self.type_metadata.values_mut() {
+                    let Some(variant) = metadata.variants.get(owner).copied() else {
+                        continue;
+                    };
+                    metadata
+                        .variant_fields
+                        .entry(variant)
+                        .or_default()
+                        .insert(definition.name.clone(), definition.id);
+                    metadata
+                        .variant_field_order
+                        .entry(variant)
+                        .or_default()
+                        .push(definition.id);
+                    self.members
+                        .insert((variant, definition.name.clone()), definition.id);
+                    break;
+                }
+            }
+        }
+
+        self.state_types = candidate
+            .metadata()
+            .state_types
+            .iter()
+            .map(|state| AnalyzedStateType {
+                definition: state.definition,
+                version: state.version,
+                stable_id: state.stable_id,
+                fields: state
+                    .fields
+                    .iter()
+                    .map(|field| AnalyzedStateField {
+                        definition: field.definition,
+                        ty: field.ty.clone(),
+                        stable_id: field.stable_id,
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        for binding in candidate.metadata().standard_functions.iter() {
+            let generic = (
+                binding
+                    .parameters
+                    .iter()
+                    .map(|ty| surface_type_from_ir(ty, &self.definitions, &binding.type_parameters))
+                    .collect::<Option<Vec<_>>>(),
+                surface_type_from_ir(&binding.result, &self.definitions, &binding.type_parameters),
+            );
+            self.external_functions.insert(
+                binding.definition,
+                ExternalFunctionMetadata {
+                    parameters: binding.parameters.clone(),
+                    result: binding.result.clone(),
+                    effect: self.definitions[binding.definition.0 as usize].effect,
+                    host: None,
+                    generic: match generic {
+                        (Some(parameters), Some(result)) if !binding.type_parameters.is_empty() => {
+                            Some((parameters, result))
+                        }
+                        _ => None,
+                    },
+                    type_parameters: binding.type_parameters.clone(),
+                    intrinsic: Some(binding.intrinsic),
+                },
+            );
+        }
+        for definition in &self.definitions {
+            if definition.kind == DefinitionKind::StandardLibrary
+                && matches!(definition.ty, IrType::Named(id) if id == definition.id)
+                && !self.external_functions.contains_key(&definition.id)
+            {
+                self.builtin_types
+                    .insert(definition.name.clone(), definition.id);
+            }
+        }
+
+        if let Some(host) = candidate.metadata().host_bindings.first() {
+            let external_origin = |range: Option<&ExternalSourceRangeIr>| {
+                let range = range?;
+                let snapshot = candidate
+                    .metadata()
+                    .external_sources
+                    .iter()
+                    .find(|snapshot| snapshot.file_id == range.file_id)?;
+                Some(ExternalSourceOrigin {
+                    identity: range.identity.clone(),
+                    text: Arc::clone(&snapshot.text),
+                    range: range.range,
+                })
+            };
+            let current_contract = self
+                .environment
+                .host
+                .as_ref()
+                .filter(|surface| surface.contract_stable_id == host.contract_stable_id);
+            for binding in &host.types {
+                let definition = self.definitions[binding.definition.0 as usize].clone();
+                let current = current_contract.and_then(|contract| {
+                    contract
+                        .types
+                        .iter()
+                        .find(|candidate| candidate.stable_id == Some(binding.stable_id))
+                        .cloned()
+                });
+                let mut metadata = TypeMetadata {
+                    fields: BTreeMap::new(),
+                    field_order: Vec::new(),
+                    field_mutability: BTreeMap::new(),
+                    variants: BTreeMap::new(),
+                    variant_order: Vec::new(),
+                    variant_fields: BTreeMap::new(),
+                    variant_field_order: BTreeMap::new(),
+                    state: None,
+                };
+                let (kind, fields, variants) = match &binding.layout {
+                    HostTypeLayoutIr::Opaque => (ExternalTypeKind::Opaque, Vec::new(), Vec::new()),
+                    HostTypeLayoutIr::Struct { fields } => {
+                        let analyzed = fields
+                            .iter()
+                            .map(|field| {
+                                let field_definition =
+                                    &self.definitions[field.definition.0 as usize];
+                                metadata
+                                    .fields
+                                    .insert(field_definition.name.clone(), field.definition);
+                                metadata.field_order.push(field.definition);
+                                metadata.field_mutability.insert(field.definition, false);
+                                self.members.insert(
+                                    (binding.definition, field_definition.name.clone()),
+                                    field.definition,
+                                );
+                                let surface = current
+                                    .as_ref()
+                                    .and_then(|ty| {
+                                        ty.fields.iter().find(|candidate| {
+                                            candidate.stable_id == Some(field.stable_id)
+                                        })
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| ExternalFieldSurface {
+                                        name: field_definition.name.clone(),
+                                        stable_id: Some(field.stable_id),
+                                        ty: surface_type_from_ir(
+                                            &field.ty,
+                                            &self.definitions,
+                                            &[],
+                                        )
+                                        .expect(
+                                            "validated Host field types have a concrete surface form",
+                                        ),
+                                        source: external_origin(field.source.as_ref()),
+                                    });
+                                (field.definition, surface)
+                            })
+                            .collect();
+                        (ExternalTypeKind::Struct, analyzed, Vec::new())
+                    }
+                    HostTypeLayoutIr::Enum { variants } => {
+                        let analyzed = variants
+                            .iter()
+                            .map(|variant| {
+                                let variant_definition =
+                                    &self.definitions[variant.definition.0 as usize];
+                                metadata.variants.insert(
+                                    variant_definition.name.clone(),
+                                    variant.definition,
+                                );
+                                metadata.variant_order.push(variant.definition);
+                                self.members.insert(
+                                    (binding.definition, variant_definition.name.clone()),
+                                    variant.definition,
+                                );
+                                let payload = match &variant.payload {
+                                    None => Vec::new(),
+                                    Some(IrType::Tuple(values)) => values.clone(),
+                                    Some(value) => vec![value.clone()],
+                                };
+                                self.variant_payloads
+                                    .insert(variant.definition, payload.clone());
+                                let surface = current
+                                    .as_ref()
+                                    .and_then(|ty| {
+                                        ty.variants.iter().find(|candidate| {
+                                            candidate.stable_id == Some(variant.stable_id)
+                                        })
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| ExternalVariantSurface {
+                                        name: variant_definition.name.clone(),
+                                        stable_id: Some(variant.stable_id),
+                                        payload: payload
+                                            .iter()
+                                            .map(|ty| {
+                                                surface_type_from_ir(ty, &self.definitions, &[])
+                                                    .expect(
+                                                        "validated Host variant payloads have a concrete surface form",
+                                                    )
+                                            })
+                                            .collect(),
+                                        source: external_origin(variant.source.as_ref()),
+                                    });
+                                (variant.definition, surface)
+                            })
+                            .collect();
+                        (ExternalTypeKind::Enum, Vec::new(), analyzed)
+                    }
+                };
+                self.type_metadata.insert(binding.definition, metadata);
+                self.host_types.push(AnalyzedHostType {
+                    definition: binding.definition,
+                    stable_id: binding.stable_id,
+                    kind,
+                    source: current
+                        .as_ref()
+                        .and_then(|surface| surface.source.clone())
+                        .or_else(|| external_origin(binding.source.as_ref())),
+                    fields,
+                    variants,
+                });
+                self.symbols.insert(
+                    (definition.package_id, definition.module, definition.name),
+                    binding.definition,
+                );
+            }
+            let functions = host
+                .functions
+                .iter()
+                .map(|function| {
+                    let mode = match function.mode {
+                        IrHostFunctionMode::Sync => HostFunctionMode::Sync,
+                        IrHostFunctionMode::Request => HostFunctionMode::Request,
+                    };
+                    let surface = current_contract
+                        .and_then(|surface| {
+                            surface
+                            .functions
+                            .iter()
+                            .find(|candidate| candidate.stable_id == function.stable_id)
+                            .cloned()
+                        })
+                        .unwrap_or_else(|| HostFunctionSurface {
+                            name: self.definitions[function.definition.0 as usize]
+                                .name
+                                .clone(),
+                            parameters: function
+                                .parameters
+                                .iter()
+                                .map(|ty| {
+                                    surface_type_from_ir(ty, &self.definitions, &[])
+                                        .expect(
+                                            "validated Host parameters have a concrete surface form",
+                                        )
+                                })
+                                .collect(),
+                            result: surface_type_from_ir(
+                                &function.result,
+                                &self.definitions,
+                                &[],
+                            )
+                            .expect("validated Host results have a concrete surface form"),
+                            mode,
+                            stable_id: function.stable_id,
+                            declaration_fingerprint: function.declaration_fingerprint,
+                            import_index: function.import_index,
+                            fuel_cost: function.fuel_cost,
+                            async_result: function.async_result.as_ref().map(|result| {
+                                HostAsyncResultSurface {
+                                    result_type: result.result_type,
+                                    success: surface_type_from_ir(
+                                        &result.success,
+                                        &self.definitions,
+                                        &[],
+                                    )
+                                    .expect(
+                                        "validated Host async success types have a concrete surface form",
+                                    ),
+                                    error: surface_type_from_ir(
+                                        &result.error,
+                                        &self.definitions,
+                                        &[],
+                                    )
+                                    .expect(
+                                        "validated Host async error types have a concrete surface form",
+                                    ),
+                                    cancel_policy: result.cancel_policy,
+                                    abandon_policy: result.abandon_policy,
+                                    cancel_error: result.cancel_error,
+                                    abandon_error: result.abandon_error,
+                                }
+                            }),
+                            required_capabilities: function.required_capabilities.clone(),
+                            source: external_origin(function.source.as_ref()),
+                        });
+                    self.external_functions.insert(
+                        function.definition,
+                        ExternalFunctionMetadata {
+                            parameters: function.parameters.clone(),
+                            result: function.result.clone(),
+                            effect: self.definitions[function.definition.0 as usize].effect,
+                            host: Some((host.contract, surface.clone())),
+                            generic: None,
+                            type_parameters: Vec::new(),
+                            intrinsic: None,
+                        },
+                    );
+                    AnalyzedHostFunction {
+                        definition: function.definition,
+                        stable_id: function.stable_id,
+                        import_index: function.import_index,
+                        mode,
+                        source: surface.source.as_ref().map(external_source_range),
+                    }
+                })
+                .collect();
+            self.host_binding = Some(AnalyzedHostBinding {
+                contract: host.contract,
+                contract_stable_id: host.contract_stable_id,
+                namespaces: host
+                    .namespaces
+                    .iter()
+                    .map(|namespace| {
+                        (
+                            namespace.package_id.clone(),
+                            namespace.module.clone(),
+                            namespace.namespace.clone(),
+                        )
+                    })
+                    .collect(),
+                functions,
+            });
+            self.host_namespaces
+                .extend(host.namespaces.iter().map(|namespace| {
+                    (
+                        namespace.package_id.clone(),
+                        namespace.module.clone(),
+                        namespace.namespace.clone(),
+                    )
+                }));
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn run(mut self) -> AnalysisOutcome {
-        if self.mode == AnalysisMode::Product {
+        if self.mode != AnalysisMode::Test {
             // A persistent session may previously have compiled this root's explicit test target.
             // Clear its transient modules and import edges outside the product execution report.
             self.db
@@ -598,11 +1235,27 @@ impl<'a> Analyzer<'a> {
             self.db.register_test_module_sources(test_sources);
         }
         self.parse_sources();
+        self.seed_repl_snapshot();
+        self.validate_compilation_profile();
+        self.lower_or_reject_top_level_statements();
         self.validate_dependency_graph();
         self.collect_source_declarations();
-        self.collect_external_declarations();
+        let prior_has_external_surface = self.definitions.iter().any(|definition| {
+            matches!(
+                definition.kind,
+                DefinitionKind::StandardLibrary
+                    | DefinitionKind::HostContract
+                    | DefinitionKind::HostFunction
+            )
+        });
+        if !prior_has_external_surface {
+            self.collect_external_declarations();
+        } else if self.mode == AnalysisMode::ReplCell {
+            self.collect_incremental_host_declarations();
+        }
         self.resolve_imports();
         self.resolve_declaration_signatures();
+        self.validate_recursive_value_layouts();
         self.validate_entry_and_exports();
         self.evaluate_constants();
         self.check_bodies();
@@ -652,10 +1305,10 @@ impl<'a> Analyzer<'a> {
             self.typed_modules()
         };
         let root_package = self.input.root_package().clone();
-        if has_errors && self.mode == AnalysisMode::Product {
+        if has_errors && self.mode != AnalysisMode::Test {
             self.db
                 .invalidate_keys([QueryKey::LinkedArtifact(root_package.clone())]);
-        } else if !has_errors && self.mode == AnalysisMode::Product {
+        } else if !has_errors && self.mode != AnalysisMode::Test {
             let typed_dependencies = typed_modules
                 .iter()
                 .map(|module| {
@@ -708,6 +1361,20 @@ impl<'a> Analyzer<'a> {
                     metadata,
                 ),
                 AnalysisMode::Test => TypedPackageIr::new_test(
+                    self.input.root_manifest.id.clone(),
+                    self.db.revision(),
+                    self.definitions,
+                    typed_modules,
+                    metadata,
+                ),
+                AnalysisMode::Script => TypedPackageIr::new_script(
+                    self.input.root_manifest.id.clone(),
+                    self.db.revision(),
+                    self.definitions,
+                    typed_modules,
+                    metadata,
+                ),
+                AnalysisMode::ReplCell => TypedPackageIr::new_repl_cell(
                     self.input.root_manifest.id.clone(),
                     self.db.revision(),
                     self.definitions,
@@ -856,8 +1523,8 @@ impl<'a> Analyzer<'a> {
                 })
                 .collect();
             vec![HostBindingIr {
-                interface: binding.interface,
-                interface_stable_id: binding.interface_stable_id,
+                contract: binding.contract,
+                contract_stable_id: binding.contract_stable_id,
                 namespaces: binding
                     .namespaces
                     .iter()
@@ -879,6 +1546,12 @@ impl<'a> Analyzer<'a> {
                         HostFunctionBindingIr {
                             definition: function.definition,
                             stable_id: function.stable_id,
+                            declaration_fingerprint: metadata
+                                .host
+                                .as_ref()
+                                .expect("Host function metadata retains its NIDL surface")
+                                .1
+                                .declaration_fingerprint,
                             import_index: function.import_index,
                             mode: match function.mode {
                                 HostFunctionMode::Sync => IrHostFunctionMode::Sync,
@@ -887,6 +1560,12 @@ impl<'a> Analyzer<'a> {
                             parameters: metadata.parameters.clone(),
                             result: metadata.result.clone(),
                             fuel_cost: metadata.host.as_ref().map_or(0, |(_, host)| host.fuel_cost),
+                            required_capabilities: metadata
+                                .host
+                                .as_ref()
+                                .map_or_else(Vec::new, |(_, host)| {
+                                    host.required_capabilities.clone()
+                                }),
                             async_result: metadata.host.as_ref().and_then(|(_, host)| {
                                 host.async_result.as_ref().and_then(|result| {
                                     let IrType::Result(success, error) = &metadata.result else {
@@ -971,12 +1650,14 @@ impl<'a> Analyzer<'a> {
             tests: tests.into(),
             external_sources: external_sources.into(),
             lifecycle: self.lifecycle_bindings(),
+            repl_entry: self.repl_entry.clone(),
             standard_functions: standard_functions.into(),
             public_api_fingerprint,
             state_schema_fingerprint,
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn external_source_catalog(
         &self,
     ) -> (
@@ -1032,34 +1713,273 @@ impl<'a> Analyzer<'a> {
                     .or_insert_with(|| Arc::clone(&origin.text));
             }
         }
-        let base = self
-            .artifact_files
-            .files()
-            .len()
-            .checked_add(self.compiler_file_ids.len())
-            .and_then(|value| value.checked_add(1))
-            .and_then(|value| u32::try_from(value).ok())
-            .expect("external source FileIds fit u32");
-        let mut file_ids = BTreeMap::new();
-        let mut snapshots = Vec::new();
-        for (offset, (identity, text)) in sources.into_iter().enumerate() {
-            let raw_offset = u32::try_from(offset).expect("external source count fits u32");
-            let file_id = ArtifactFileId(
-                base.checked_add(raw_offset)
-                    .expect("external FileId fits u32"),
-            );
-            file_ids.insert(identity.clone(), file_id);
-            snapshots.push(ExternalSourceSnapshotIr {
+        let base = if self.mode == AnalysisMode::ReplCell {
+            let prior_has_compiler_module = self
+                .repl_prior_modules
+                .iter()
+                .any(|module| module.package_id.as_str() == nexa_stdlib::PACKAGE_ID);
+            let current_modules = self
+                .modules
+                .iter()
+                .filter(|module| {
+                    module.role == SourceRole::Production
+                        && !(prior_has_compiler_module && module.compiler_provided)
+                })
+                .count();
+            self.repl_prior_modules
+                .len()
+                .checked_add(current_modules)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("external REPL source FileIds fit u32")
+        } else {
+            self.artifact_files
+                .files()
+                .len()
+                .checked_add(self.compiler_file_ids.len())
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| u32::try_from(value).ok())
+                .expect("external source FileIds fit u32")
+        };
+        let mut snapshots_by_identity = self
+            .repl_prior_external_sources
+            .iter()
+            .map(|snapshot| (snapshot.identity.clone(), Arc::clone(&snapshot.text)))
+            .collect::<BTreeMap<_, _>>();
+        for (identity, text) in sources {
+            snapshots_by_identity.insert(identity, text);
+        }
+        let snapshots_by_identity = snapshots_by_identity
+            .into_iter()
+            .enumerate()
+            .map(|(offset, (identity, text))| {
+                let file_id = base
+                    .checked_add(u32::try_from(offset).expect("external source count fits u32"))
+                    .map(ArtifactFileId)
+                    .expect("external FileId fits u32");
+                (identity, (file_id, text))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let file_ids = snapshots_by_identity
+            .iter()
+            .map(|(identity, (file_id, _))| (identity.clone(), *file_id))
+            .collect();
+        let mut snapshots = snapshots_by_identity
+            .into_iter()
+            .map(|(identity, (file_id, text))| ExternalSourceSnapshotIr {
                 file_id,
                 identity,
                 text,
-            });
-        }
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.file_id);
         (snapshots, file_ids)
     }
 
     fn lifecycle_bindings(&self) -> LifecycleBindingsIr {
         self.lifecycle
+    }
+
+    fn validate_compilation_profile(&mut self) {
+        let profile = self.input.compilation_options.profile;
+        let valid = match self.mode {
+            AnalysisMode::Product | AnalysisMode::Test => matches!(
+                profile,
+                CompilationProfile::Package | CompilationProfile::Standalone
+            ),
+            AnalysisMode::Script => profile == CompilationProfile::Script,
+            AnalysisMode::ReplCell => profile == CompilationProfile::ReplCell,
+        };
+        if !valid {
+            let fallback = self.fallback_source_range();
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &fallback.source,
+                ByteRange::default(),
+                format!(
+                    "analysis entrypoint/profile mismatch: mode {:?}, profile {profile:?}",
+                    self.mode
+                ),
+                "construct the resolved input with the matching CompilationProfile",
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn lower_or_reject_top_level_statements(&mut self) {
+        for index in 0..self.modules.len() {
+            let module = self.modules[index].clone();
+            let has_executable =
+                !module.ast.top_level_statements.is_empty() || module.ast.top_level_tail.is_some();
+            let is_executable_root =
+                matches!(self.mode, AnalysisMode::Script | AnalysisMode::ReplCell)
+                    && module.key.package == self.input.root_manifest.id
+                    && !module.compiler_provided;
+            let needs_empty_repl_entry = self.mode == AnalysisMode::ReplCell && is_executable_root;
+            if !has_executable && !needs_empty_repl_entry {
+                continue;
+            }
+            let eof = TextRange::at(module.syntax.source.len(), 0);
+            let mut range = TextRange::new(
+                module.ast.top_level_statements.first().map_or_else(
+                    || {
+                        module
+                            .ast
+                            .top_level_tail
+                            .as_ref()
+                            .map_or(eof.start, |tail| tail.range.start)
+                    },
+                    |statement| statement.range.start,
+                ),
+                module.ast.top_level_tail.as_ref().map_or_else(
+                    || {
+                        module
+                            .ast
+                            .top_level_statements
+                            .last()
+                            .map_or(eof.end, |statement| statement.range.end)
+                    },
+                    |tail| tail.range.end,
+                ),
+            );
+            if self.mode == AnalysisMode::ReplCell
+                && range.is_empty()
+                && !module.syntax.source.is_empty()
+            {
+                // A declaration-only Cell still gets a synthetic executable entry. Its bytecode
+                // and Task wrapper require real source provenance, so bind them to the exact Cell
+                // snapshot instead of the zero-width EOF marker used for synthetic identifiers.
+                range = TextRange::new(TextSize::ZERO, module.syntax.source.len());
+            }
+            if !is_executable_root {
+                self.push_source_error(
+                    ErrorCode::NX1002,
+                    &module.source,
+                    byte_range(range),
+                    "package modules cannot contain executable top-level statements",
+                    "move the statements into a function or compile this source as a Script",
+                );
+                continue;
+            }
+
+            let generated_name = self.repl_cell.map_or_else(
+                || "cell_1".to_owned(),
+                |cell| format!("cell_{}", cell.ordinal),
+            );
+            let conflicting_name = if self.mode == AnalysisMode::Script {
+                "main"
+            } else {
+                generated_name.as_str()
+            };
+            let explicit_conflict = module.ast.declarations.iter().find_map(|declaration| {
+                let DeclarationKind::Function(function) = &declaration.kind else {
+                    return None;
+                };
+                (function.name.text == conflicting_name).then_some(function.name.range)
+            });
+            if let Some(conflict_range) = explicit_conflict {
+                self.push_source_error(
+                    ErrorCode::NX2101,
+                    &module.source,
+                    byte_range(conflict_range),
+                    format!("top-level statements conflict with generated `{conflicting_name}`"),
+                    "rename the explicit function or remove the executable top-level statements",
+                );
+                continue;
+            }
+
+            let mut statements = std::mem::take(&mut self.modules[index].ast.top_level_statements);
+            let tail = self.modules[index].ast.top_level_tail.take();
+            let is_async = statements.iter().any(statement_contains_await)
+                || tail
+                    .as_ref()
+                    .is_some_and(|tail| expression_contains_await(tail));
+            let identifier = |text: &str| ast::Identifier {
+                text: text.to_owned(),
+                range: eof,
+            };
+            if self.mode == AnalysisMode::ReplCell {
+                self.modules[index].ast.declarations.push(ast::Declaration {
+                    docs: Vec::new(),
+                    attributes: Vec::new(),
+                    visibility: Visibility::Private,
+                    kind: DeclarationKind::Function(ast::FunctionDeclaration {
+                        is_async,
+                        name: identifier(&generated_name),
+                        parameters: Vec::new(),
+                        result: None,
+                        body: ast::Block {
+                            statements,
+                            tail,
+                            range,
+                        },
+                        range,
+                    }),
+                    range,
+                });
+                continue;
+            }
+
+            if let Some(tail) = tail {
+                let tail_range = tail.range;
+                statements.push(ast::Statement {
+                    kind: StatementKind::Expression(*tail),
+                    range: tail_range,
+                });
+            }
+            statements.push(ast::Statement {
+                kind: StatementKind::Return(Some(ast::Expression {
+                    kind: ExpressionKind::Literal(ast::Literal {
+                        kind: LiteralKind::Integer,
+                        raw: "0".into(),
+                        cooked: None,
+                        range: eof,
+                    }),
+                    range: eof,
+                })),
+                range: eof,
+            });
+            let string_type = TypeRef {
+                kind: TypeKind::Named(ast::QualifiedName {
+                    segments: vec![identifier("string")],
+                    range: eof,
+                }),
+                range: eof,
+            };
+            let arguments_type = TypeRef {
+                kind: TypeKind::Array(Box::new(string_type)),
+                range: eof,
+            };
+            let result_type = TypeRef {
+                kind: TypeKind::Named(ast::QualifiedName {
+                    segments: vec![identifier("i32")],
+                    range: eof,
+                }),
+                range: eof,
+            };
+            self.modules[index].ast.declarations.push(ast::Declaration {
+                docs: Vec::new(),
+                attributes: Vec::new(),
+                visibility: Visibility::Private,
+                kind: DeclarationKind::Function(ast::FunctionDeclaration {
+                    is_async,
+                    name: identifier("main"),
+                    parameters: vec![ast::Parameter {
+                        name: identifier("args"),
+                        ty: arguments_type,
+                        range: eof,
+                    }],
+                    result: Some(result_type),
+                    body: ast::Block {
+                        statements,
+                        tail: None,
+                        range,
+                    },
+                    range,
+                }),
+                range,
+            });
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1070,7 +1990,9 @@ impl<'a> Analyzer<'a> {
             .chain(self.test_source_set)
             .flat_map(|set| set.units().values())
             .filter(|unit| match self.mode {
-                AnalysisMode::Product => unit.role == SourceRole::Production,
+                AnalysisMode::Product | AnalysisMode::Script | AnalysisMode::ReplCell => {
+                    unit.role == SourceRole::Production
+                }
                 AnalysisMode::Test => {
                     unit.role == SourceRole::Production
                         || unit.key.package_id == self.input.root_manifest.id
@@ -1125,37 +2047,33 @@ impl<'a> Analyzer<'a> {
                 let _ = self.db.module_header(&unit.key);
             }
             for error in &ast.errors {
-                self.push_source_error(
-                    ErrorCode::NX1002,
-                    &unit.key,
-                    byte_range(error.range),
-                    error.message.clone(),
-                    "invalid Nexa syntax",
-                );
-            }
-            let declared = ast.module.as_ref().map(|module| module.path.text());
-            let declaration_matches = if unit.virtual_module_path().is_some() {
-                declared
-                    .as_deref()
-                    .is_none_or(|declared| declared == expected.as_str())
-            } else {
-                declared.as_deref() == Some(expected.as_str())
-            };
-            if !declaration_matches {
-                let range = ast
-                    .module
-                    .as_ref()
-                    .map_or(ByteRange::default(), |module| byte_range(module.path.range));
-                self.push_source_error(
-                    ErrorCode::NX2701,
-                    &unit.key,
-                    range,
-                    format!(
-                        "module declaration must be `{expected}`, found {}",
-                        declared.as_deref().unwrap_or("<missing>")
-                    ),
-                    "module declaration does not match the package-relative path",
-                );
+                match error.kind {
+                    AstErrorKind::LegacyModuleDeclaration { path }
+                        if self.input.compilation_options.profile
+                            == CompilationProfile::Package =>
+                    {
+                        let declared = syntax.source.slice(path).unwrap_or("<invalid>");
+                        self.push_source_error(
+                            ErrorCode::NX2701,
+                            &unit.key,
+                            byte_range(path),
+                            format!(
+                                "legacy module declaration `{declared}` is invalid; package source \
+                                 path selects module `{expected}`"
+                            ),
+                            "module declarations were removed; module identity comes from the package-relative source path",
+                        );
+                    }
+                    AstErrorKind::InvalidSyntax | AstErrorKind::LegacyModuleDeclaration { .. } => {
+                        self.push_source_error(
+                            ErrorCode::NX1002,
+                            &unit.key,
+                            byte_range(error.range),
+                            error.message.clone(),
+                            "invalid Nexa syntax",
+                        );
+                    }
+                }
             }
             let module = SourceModuleKey {
                 package: unit.key.package_id.clone(),
@@ -1170,10 +2088,8 @@ impl<'a> Analyzer<'a> {
                 )
                 .with_label(Label::primary(
                     source_identity(&unit.key),
-                    ast.module
-                        .as_ref()
-                        .map_or(ByteRange::default(), |value| byte_range(value.path.range)),
-                    "module is declared more than once",
+                    ByteRange::default(),
+                    "more than one source path maps to this module",
                 ))
                 .with_related(RelatedLocation::new(
                     source_identity(&prior_source),
@@ -1187,6 +2103,7 @@ impl<'a> Analyzer<'a> {
             self.module_indices.insert(module.clone(), index);
             self.modules.push(ParsedModule {
                 key: module,
+                virtual_module_path: unit.virtual_module_path().cloned(),
                 source: unit.key.clone(),
                 role: unit.role,
                 syntax,
@@ -1215,7 +2132,7 @@ impl<'a> Analyzer<'a> {
                         ErrorCode::NX2704,
                         Severity::Error,
                         format!(
-                            "compiler-provided module `{module}` collides with {}",
+                            "compiler-provided module `{module}` collides with package `{}`",
                             prior_source.package_id
                         ),
                     )
@@ -1260,24 +2177,11 @@ impl<'a> Analyzer<'a> {
                     "invalid embedded standard-library AST",
                 );
             }
-            if ast.module.as_ref().map(|declared| declared.path.text()) != Some(module.to_string())
-            {
-                self.push_source_error(
-                    ErrorCode::NX2701,
-                    &source,
-                    ast.module
-                        .as_ref()
-                        .map_or(ByteRange::default(), |declared| {
-                            byte_range(declared.path.range)
-                        }),
-                    format!("embedded standard-library source must declare `module {module};`"),
-                    "descriptor module path and source declaration differ",
-                );
-            }
             let index = self.modules.len();
             self.module_indices.insert(key.clone(), index);
             self.modules.push(ParsedModule {
                 key,
+                virtual_module_path: None,
                 source,
                 role: SourceRole::Production,
                 syntax,
@@ -1299,12 +2203,30 @@ impl<'a> Analyzer<'a> {
     fn collect_source_declarations(&mut self) {
         for module_index in 0..self.modules.len() {
             let module = self.modules[module_index].clone();
-            for declaration in module.ast.declarations.clone() {
+            let prior_has_compiler_module = self
+                .repl_prior_modules
+                .iter()
+                .any(|prior| prior.package_id.as_str() == nexa_stdlib::PACKAGE_ID);
+            if prior_has_compiler_module && module.compiler_provided {
+                continue;
+            }
+            for (declaration_index, declaration) in
+                module.ast.declarations.clone().into_iter().enumerate()
+            {
                 let Some((name, kind, mut symbol_kind, mut effect)) =
-                    declaration_surface(&declaration.kind)
+                    declaration_surface(&declaration)
                 else {
                     continue;
                 };
+                let is_repl_entry = self.mode == AnalysisMode::ReplCell
+                    && matches!(&declaration.kind, DeclarationKind::Function(_))
+                    && name == format!("cell_{}", self.repl_cell.map_or(1, |cell| cell.ordinal));
+                if is_repl_entry {
+                    // A Cell is always dispatched through the reserved Function StableId. Its
+                    // Task effect controls scheduling but must not change that public identity.
+                    symbol_kind = SymbolKind::Function;
+                }
+                self.validate_declaration_surface(&module, &declaration);
                 if has_attribute(&declaration.attributes, "test")
                     && matches!(declaration.kind, DeclarationKind::Function(_))
                 {
@@ -1322,6 +2244,7 @@ impl<'a> Analyzer<'a> {
                     &name,
                     declaration.range,
                     true,
+                    declaration_index,
                 );
                 let definition = self.allocate_definition(
                     module.key.package.clone(),
@@ -1334,6 +2257,9 @@ impl<'a> Analyzer<'a> {
                     source_range(&module.source, declaration.range),
                     canonical_identity,
                 );
+                if is_repl_entry {
+                    self.repl_entry_definition = Some(definition);
+                }
                 let key = (
                     module.key.package.clone(),
                     module.key.module.clone(),
@@ -1341,8 +2267,19 @@ impl<'a> Analyzer<'a> {
                 );
                 if let Some(prior) = self.symbols.insert(key, definition) {
                     let prior_definition = self.definitions[prior.0 as usize].clone();
-                    self.diagnostics.push(
-                        Diagnostic::new(
+                    let is_repl_shadow = self.mode == AnalysisMode::ReplCell
+                        && prior_definition.span.source != module.source
+                        && (matches!(kind, DefinitionKind::Function | DefinitionKind::Task)
+                            || (matches!(
+                                kind,
+                                DefinitionKind::Struct
+                                    | DefinitionKind::Enum
+                                    | DefinitionKind::Class
+                            ) && self
+                                .repl_snapshot
+                                .is_some_and(|snapshot| snapshot.resolve_type(&name).is_none())));
+                    if !is_repl_shadow {
+                        let mut diagnostic = Diagnostic::new(
                             ErrorCode::NX2704,
                             Severity::Error,
                             format!("duplicate declaration `{name}`"),
@@ -1356,8 +2293,20 @@ impl<'a> Analyzer<'a> {
                             source_identity(&prior_definition.span.source),
                             range_from_source(&prior_definition.span),
                             "first declaration",
-                        )),
-                    );
+                        ));
+                        if self.mode == AnalysisMode::ReplCell
+                            && matches!(
+                                kind,
+                                DefinitionKind::Struct
+                                    | DefinitionKind::Enum
+                                    | DefinitionKind::Class
+                            )
+                        {
+                            diagnostic =
+                                diagnostic.with_note("use `:reset` to begin a new type registry");
+                        }
+                        self.diagnostics.push(diagnostic);
+                    }
                 }
 
                 match &declaration.kind {
@@ -1394,19 +2343,19 @@ impl<'a> Analyzer<'a> {
                         );
                     }
                     DeclarationKind::Type(ty) => {
-                        let stateful = ty.kind == TypeDeclarationKind::Stateful;
-                        let version = if stateful {
-                            stateful_version(&declaration.attributes).unwrap_or(1)
-                        } else {
-                            0
-                        };
+                        let state = (ty.kind == TypeDeclarationKind::Class)
+                            .then(|| state_version(&declaration.attributes))
+                            .flatten()
+                            .map(|version| StateClassMetadata { version });
                         let mut metadata = TypeMetadata {
                             fields: BTreeMap::new(),
                             field_order: Vec::new(),
+                            field_mutability: BTreeMap::new(),
                             variants: BTreeMap::new(),
                             variant_order: Vec::new(),
-                            stateful,
-                            version,
+                            variant_fields: BTreeMap::new(),
+                            variant_field_order: BTreeMap::new(),
+                            state,
                         };
                         for field in &ty.fields {
                             let identity = self.member_canonical_identity(
@@ -1416,7 +2365,7 @@ impl<'a> Analyzer<'a> {
                                 &field.attributes,
                                 field.range,
                                 SymbolKind::Field,
-                                stateful,
+                                metadata.state.is_some(),
                             );
                             let id = self.allocate_definition(
                                 module.key.package.clone(),
@@ -1443,6 +2392,7 @@ impl<'a> Analyzer<'a> {
                                 );
                             }
                             metadata.field_order.push(id);
+                            metadata.field_mutability.insert(id, field.mutable);
                             self.members
                                 .insert((definition, field.name.text.clone()), id);
                         }
@@ -1483,6 +2433,48 @@ impl<'a> Analyzer<'a> {
                             metadata.variant_order.push(id);
                             self.members
                                 .insert((definition, variant.name.text.clone()), id);
+                            if let ast::VariantPayload::Struct(fields) = &variant.payload {
+                                let mut named = BTreeMap::new();
+                                let mut order = Vec::new();
+                                for field in fields {
+                                    let field_identity = self.member_canonical_identity(
+                                        &module,
+                                        id,
+                                        field.name.text.as_str(),
+                                        &field.attributes,
+                                        field.range,
+                                        SymbolKind::Field,
+                                        false,
+                                    );
+                                    let field_id = self.allocate_definition(
+                                        module.key.package.clone(),
+                                        module.key.module.clone(),
+                                        field.name.text.clone(),
+                                        DefinitionKind::Field,
+                                        visibility,
+                                        IrType::Unit,
+                                        IrEffect::Immediate,
+                                        source_range(&module.source, field.range),
+                                        field_identity,
+                                    );
+                                    if named.insert(field.name.text.clone(), field_id).is_some() {
+                                        self.push_source_error(
+                                            ErrorCode::NX2704,
+                                            &module.source,
+                                            byte_range(field.range),
+                                            format!(
+                                                "duplicate variant field `{}`",
+                                                field.name.text
+                                            ),
+                                            "variant field is declared more than once",
+                                        );
+                                    }
+                                    order.push(field_id);
+                                    self.members.insert((id, field.name.text.clone()), field_id);
+                                }
+                                metadata.variant_fields.insert(id, named);
+                                metadata.variant_field_order.insert(id, order);
+                            }
                             let variant_key = (
                                 module.key.package.clone(),
                                 module.key.module.clone(),
@@ -1527,6 +2519,270 @@ impl<'a> Analyzer<'a> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn validate_declaration_surface(
+        &mut self,
+        module: &ParsedModule,
+        declaration: &ast::Declaration,
+    ) {
+        let mut seen_attributes = BTreeSet::new();
+        for attribute in &declaration.attributes {
+            if !seen_attributes.insert(attribute.name.text.as_str()) {
+                self.push_source_error(
+                    ErrorCode::NX2740,
+                    &module.source,
+                    byte_range(attribute.range),
+                    format!("duplicate `@{}` attribute", attribute.name.text),
+                    "an attribute may be applied only once",
+                );
+            }
+            let legal = match &declaration.kind {
+                DeclarationKind::Function(_) => matches!(
+                    attribute.name.text.as_str(),
+                    "stable" | "migration" | "activation" | "cleanup" | "immediate" | "test"
+                ),
+                DeclarationKind::Type(_) => {
+                    matches!(attribute.name.text.as_str(), "stable" | "state")
+                }
+                DeclarationKind::Const(_) => attribute.name.text == "stable",
+                DeclarationKind::Error => true,
+            };
+            if !legal {
+                self.push_source_error(
+                    ErrorCode::NX2740,
+                    &module.source,
+                    byte_range(attribute.name.range),
+                    format!("unknown or misplaced `@{}` attribute", attribute.name.text),
+                    "the attribute is not valid on this declaration",
+                );
+            }
+            self.validate_attribute_arguments(module, attribute);
+        }
+
+        match &declaration.kind {
+            DeclarationKind::Function(function) => {
+                self.validate_snake_name(
+                    module,
+                    &function.name,
+                    "function names must use snake_case",
+                );
+                for parameter in &function.parameters {
+                    self.validate_snake_name(
+                        module,
+                        &parameter.name,
+                        "parameter names must use snake_case",
+                    );
+                }
+                let special = ["migration", "activation", "cleanup", "immediate"]
+                    .into_iter()
+                    .filter(|name| has_attribute(&declaration.attributes, name))
+                    .collect::<Vec<_>>();
+                if special.len() > 1 {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(declaration.range),
+                        format!("mutually exclusive attributes: {}", special.join(", ")),
+                        "a function may have at most one lifecycle/effect attribute",
+                    );
+                }
+                if has_attribute(&declaration.attributes, "test")
+                    && has_attribute(&declaration.attributes, "activation")
+                {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(declaration.range),
+                        "`@test` and `@activation` are mutually exclusive",
+                        "a package test cannot be an activation function",
+                    );
+                }
+                if function.is_async && !special.is_empty() {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(declaration.range),
+                        format!("`@{}` does not allow `async fn`", special[0]),
+                        "special lifecycle/effect functions must be synchronous",
+                    );
+                }
+            }
+            DeclarationKind::Type(ty) => {
+                self.validate_pascal_name(module, &ty.name, "type names must use PascalCase");
+                if self.mode == AnalysisMode::ReplCell
+                    && has_attribute(&declaration.attributes, "state")
+                {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(declaration.range),
+                        "REPL cells cannot declare additional persistent state classes",
+                        "top-level `let` and `let mut` are persisted by the reserved REPL environment",
+                    );
+                }
+                if has_attribute(&declaration.attributes, "state")
+                    && ty.kind != TypeDeclarationKind::Class
+                {
+                    self.push_source_error(
+                        ErrorCode::NX2740,
+                        &module.source,
+                        byte_range(declaration.range),
+                        "`@state` is only valid on a class",
+                        "persistent state is Class metadata",
+                    );
+                }
+                let state_class = ty.kind == TypeDeclarationKind::Class
+                    && has_attribute(&declaration.attributes, "state");
+                for field in &ty.fields {
+                    self.validate_snake_name(
+                        module,
+                        &field.name,
+                        "field names must use snake_case",
+                    );
+                    if field.mutable && ty.kind != TypeDeclarationKind::Class {
+                        self.push_source_error(
+                            ErrorCode::NX2501,
+                            &module.source,
+                            byte_range(field.range),
+                            "`mut` fields are only valid in a class",
+                            "Struct mutability is determined by its containing place",
+                        );
+                    }
+                    for attribute in &field.attributes {
+                        if attribute.name.text != "stable" || !state_class {
+                            self.push_source_error(
+                                ErrorCode::NX2740,
+                                &module.source,
+                                byte_range(attribute.range),
+                                format!("`@{}` is not valid on this field", attribute.name.text),
+                                "only fields of an `@state` class may use `@stable`",
+                            );
+                        }
+                        self.validate_attribute_arguments(module, attribute);
+                    }
+                }
+                for variant in &ty.variants {
+                    self.validate_pascal_name(
+                        module,
+                        &variant.name,
+                        "Enum variants must use PascalCase",
+                    );
+                    if let ast::VariantPayload::Struct(fields) = &variant.payload {
+                        for field in fields {
+                            self.validate_snake_name(
+                                module,
+                                &field.name,
+                                "Enum payload fields must use snake_case",
+                            );
+                            for attribute in &field.attributes {
+                                self.push_source_error(
+                                    ErrorCode::NX2740,
+                                    &module.source,
+                                    byte_range(attribute.range),
+                                    "Enum payload fields do not accept attributes",
+                                    "remove the field attribute",
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            DeclarationKind::Const(constant) => {
+                if !is_screaming_snake_case(&constant.name.text) {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(constant.name.range),
+                        format!(
+                            "const name `{}` must use SCREAMING_SNAKE_CASE",
+                            constant.name.text
+                        ),
+                        "invalid const name",
+                    );
+                }
+            }
+            DeclarationKind::Error => {}
+        }
+    }
+
+    fn validate_attribute_arguments(&mut self, module: &ParsedModule, attribute: &Attribute) {
+        // `@stable` owns the long-standing NX2710 diagnostic family and is validated while its
+        // canonical symbol identity is allocated.
+        if attribute.name.text == "stable" {
+            return;
+        }
+        let valid = match attribute.name.text.as_str() {
+            "state" => matches!(
+                attribute.arguments.as_slice(),
+                [argument]
+                    if argument.classification == AttributeArgumentClassification::Named
+                        && argument.name.as_ref().is_some_and(|name| name.text == "version")
+                        && argument.kind == AttributeArgumentKind::Integer
+                        && argument.text.replace('_', "").parse::<u32>().is_ok_and(|value| value > 0)
+            ),
+            "migration" | "activation" | "cleanup" | "immediate" | "test" => {
+                attribute.arguments.is_empty()
+            }
+            _ => true,
+        };
+        if !valid
+            || attribute.arguments.iter().any(|argument| {
+                matches!(
+                    argument.classification,
+                    AttributeArgumentClassification::Duplicate
+                        | AttributeArgumentClassification::Unknown
+                )
+            })
+        {
+            let expected = match attribute.name.text.as_str() {
+                "state" => "`@state(version = <positive integer>)`",
+                "stable" => "`@stable(\"name\")`",
+                _ => "an attribute without arguments",
+            };
+            self.push_source_error(
+                ErrorCode::NX2740,
+                &module.source,
+                byte_range(attribute.range),
+                format!("invalid arguments for `@{}`", attribute.name.text),
+                format!("expected {expected}"),
+            );
+        }
+    }
+
+    fn validate_snake_name(
+        &mut self,
+        module: &ParsedModule,
+        identifier: &ast::Identifier,
+        rule: &str,
+    ) {
+        if !is_snake_case(&identifier.text) {
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(identifier.range),
+                format!("invalid name `{}`", identifier.text),
+                rule,
+            );
+        }
+    }
+
+    fn validate_pascal_name(
+        &mut self,
+        module: &ParsedModule,
+        identifier: &ast::Identifier,
+        rule: &str,
+    ) {
+        if !is_pascal_case(&identifier.text) {
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &module.source,
+                byte_range(identifier.range),
+                format!("invalid name `{}`", identifier.text),
+                rule,
+            );
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn allocate_definition(
         &mut self,
@@ -1558,7 +2814,100 @@ impl<'a> Analyzer<'a> {
         id
     }
 
+    fn allocate_repl_state_field(
+        &mut self,
+        module: &ParsedModule,
+        name: &str,
+        mutable: bool,
+        ty: IrType,
+        range: TextRange,
+    ) -> Option<DefinitionId> {
+        let environment = self.repl_environment_definition?;
+        let ordinal = self.repl_cell.map_or(1, |cell| cell.ordinal);
+        let identity = crate::repl_binding_identity(
+            ordinal,
+            self.repl_new_state_fields.len(),
+            name,
+            &crate::ReplBindingKind::Value,
+        );
+        let canonical_identity = canonical_identity_text(&identity);
+        let next = DefinitionId(u32::try_from(self.definitions.len()).unwrap_or(u32::MAX));
+        match self.stable_registry.insert(identity) {
+            Ok(stable_id) => {
+                self.stable_ids.insert(next, stable_id);
+                self.pending_stable_symbols.insert(
+                    next,
+                    StableSymbolIdentity {
+                        canonical: self
+                            .stable_registry
+                            .identity(stable_id)
+                            .expect("inserted REPL binding identity exists")
+                            .clone(),
+                        runtime_id: stable_id,
+                    },
+                );
+            }
+            Err(collision) => {
+                self.push_source_error(
+                    ErrorCode::NX2711,
+                    &module.source,
+                    byte_range(range),
+                    collision.to_string(),
+                    "REPL state slot StableId collision",
+                );
+                return None;
+            }
+        }
+        let definition = self.allocate_definition(
+            module.key.package.clone(),
+            module.key.module.clone(),
+            name.to_owned(),
+            DefinitionKind::Field,
+            DeclarationVisibility::Private,
+            ty.clone(),
+            IrEffect::Immediate,
+            source_range(&module.source, range),
+            canonical_identity,
+        );
+        let metadata = self
+            .type_metadata
+            .get_mut(&environment)
+            .expect("the formal REPL seed provides environment type metadata");
+        metadata.fields.insert(name.to_owned(), definition);
+        metadata.field_order.push(definition);
+        metadata.field_mutability.insert(definition, mutable);
+        self.members
+            .insert((environment, name.to_owned()), definition);
+        let stable_id = self
+            .stable_ids
+            .get(&definition)
+            .copied()
+            .expect("the REPL field identity was registered");
+        let state = self
+            .state_types
+            .iter_mut()
+            .find(|state| state.definition == environment)
+            .expect("the formal REPL seed provides environment state metadata");
+        state.fields.push(AnalyzedStateField {
+            definition,
+            ty,
+            stable_id,
+        });
+        self.repl_new_state_fields.push(definition);
+        Some(definition)
+    }
+
+    fn is_repl_state_field(&self, definition: DefinitionId) -> bool {
+        let Some(environment) = self.repl_environment_definition else {
+            return false;
+        };
+        self.type_metadata
+            .get(&environment)
+            .is_some_and(|metadata| metadata.field_order.contains(&definition))
+    }
+
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn canonical_identity(
         &mut self,
         module: &ParsedModule,
@@ -1567,6 +2916,7 @@ impl<'a> Analyzer<'a> {
         name: &str,
         range: TextRange,
         allow_stable: bool,
+        declaration_index: usize,
     ) -> String {
         let canonical_package = if module.compiler_provided {
             nexa_stdlib::CANONICAL_PACKAGE_ID
@@ -1617,6 +2967,23 @@ impl<'a> Analyzer<'a> {
                     module.key.module.as_str(),
                     kind,
                     name,
+                )
+            }
+            Ok(None)
+                if self.mode == AnalysisMode::ReplCell
+                    && !module.compiler_provided
+                    && kind == SymbolKind::Function
+                    && name
+                        != format!("cell_{}", self.repl_cell.map_or(1, |cell| cell.ordinal)) =>
+            {
+                crate::repl_binding_identity(
+                    self.repl_cell.map_or(1, |cell| cell.ordinal),
+                    declaration_index,
+                    name,
+                    &crate::ReplBindingKind::Function {
+                        parameters: Arc::from([]),
+                        effect: IrEffect::Ordinary,
+                    },
                 )
             }
             Ok(None) => CanonicalSymbolIdentity::automatic(
@@ -1714,7 +3081,7 @@ impl<'a> Analyzer<'a> {
                     ErrorCode::NX2710,
                     &module.source,
                     byte_range(stable_range),
-                    "@stable is only valid on Stateful fields",
+                    "@stable is only valid on fields of an @state Class",
                     "remove the attribute",
                 );
                 let owner_name = &self.definitions[owner.0 as usize].name;
@@ -2048,10 +3415,12 @@ impl<'a> Analyzer<'a> {
                     TypeMetadata {
                         fields: BTreeMap::new(),
                         field_order: Vec::new(),
+                        field_mutability: BTreeMap::new(),
                         variants: BTreeMap::new(),
                         variant_order: Vec::new(),
-                        stateful: false,
-                        version: 0,
+                        variant_fields: BTreeMap::new(),
+                        variant_field_order: BTreeMap::new(),
+                        state: None,
                     },
                 );
             }
@@ -2103,18 +3472,18 @@ impl<'a> Analyzer<'a> {
                 .source
                 .as_ref()
                 .map_or_else(|| fallback.clone(), external_source_range);
-            let interface = self.allocate_definition(
+            let contract = self.allocate_definition(
                 root.clone(),
                 host_module.clone(),
-                host.interface_name.clone(),
-                DefinitionKind::HostInterface,
+                host.contract_name.clone(),
+                DefinitionKind::HostContract,
                 DeclarationVisibility::Public,
                 IrType::Unit,
                 IrEffect::Immediate,
                 source,
-                format!("host::interface::{}", host.interface_name),
+                format!("host::contract::{}", host.contract_name),
             );
-            self.definitions[interface.0 as usize].ty = IrType::Named(interface);
+            self.definitions[contract.0 as usize].ty = IrType::Named(contract);
             let mut host_types = host.types;
             host_types.sort();
             for host_type in host_types {
@@ -2166,7 +3535,7 @@ impl<'a> Analyzer<'a> {
                     root.clone(),
                     host_module.clone(),
                     host_type.name.clone(),
-                    DefinitionKind::HostInterface,
+                    DefinitionKind::HostContract,
                     DeclarationVisibility::Public,
                     IrType::Unit,
                     IrEffect::Immediate,
@@ -2191,10 +3560,12 @@ impl<'a> Analyzer<'a> {
                 let mut metadata = TypeMetadata {
                     fields: BTreeMap::new(),
                     field_order: Vec::new(),
+                    field_mutability: BTreeMap::new(),
                     variants: BTreeMap::new(),
                     variant_order: Vec::new(),
-                    stateful: false,
-                    version: 0,
+                    variant_fields: BTreeMap::new(),
+                    variant_field_order: BTreeMap::new(),
+                    state: None,
                 };
                 let mut analyzed_fields = Vec::new();
                 for field in host_type.fields {
@@ -2232,6 +3603,7 @@ impl<'a> Analyzer<'a> {
                     );
                     metadata.fields.insert(field.name.clone(), field_definition);
                     metadata.field_order.push(field_definition);
+                    metadata.field_mutability.insert(field_definition, false);
                     self.members
                         .insert((type_definition, field.name.clone()), field_definition);
                     analyzed_fields.push((field_definition, field));
@@ -2313,12 +3685,14 @@ impl<'a> Analyzer<'a> {
                 (left.import_index, &left.name).cmp(&(right.import_index, &right.name))
             });
             let mut binding = AnalyzedHostBinding {
-                interface,
-                interface_stable_id: host.interface_stable_id,
+                contract,
+                contract_stable_id: host.contract_stable_id,
                 namespaces: Vec::new(),
                 functions: Vec::new(),
             };
-            for function in functions {
+            for mut function in functions {
+                function.required_capabilities.sort();
+                function.required_capabilities.dedup();
                 let span = function
                     .source
                     .as_ref()
@@ -2358,7 +3732,7 @@ impl<'a> Analyzer<'a> {
                     mode: function.mode,
                     source: function.source.as_ref().map(external_source_range),
                 });
-                pending.push(Pending::HostFunction(id, interface, Box::new(function)));
+                pending.push(Pending::HostFunction(id, contract, Box::new(function)));
             }
             self.host_binding = Some(binding);
         }
@@ -2401,7 +3775,7 @@ impl<'a> Analyzer<'a> {
                 Pending::StaticConst(id, constant) => {
                     self.definitions[id.0 as usize].ty = self.resolve_surface_type(&constant.ty);
                 }
-                Pending::HostFunction(id, interface, function) => {
+                Pending::HostFunction(id, contract, function) => {
                     let parameters = function
                         .parameters
                         .iter()
@@ -2439,7 +3813,7 @@ impl<'a> Analyzer<'a> {
                             parameters,
                             result,
                             effect,
-                            host: Some((interface, *function)),
+                            host: Some((contract, *function)),
                             generic: None,
                             type_parameters: Vec::new(),
                             intrinsic: None,
@@ -2462,6 +3836,471 @@ impl<'a> Analyzer<'a> {
                     .collect();
                 self.variant_payloads.insert(definition, payload);
             }
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn collect_incremental_host_declarations(&mut self) {
+        let Some(mut host) = self.environment.host.clone() else {
+            return;
+        };
+        let root = self.input.root_manifest.id.clone();
+        let fallback = self.fallback_source_range();
+        let host_module = ModulePath::new("host").expect("host is a valid reserved module");
+
+        let contract = if let Some(binding) = self.host_binding.as_ref() {
+            if binding.contract_stable_id != host.contract_stable_id {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        "a cumulative REPL session cannot replace its Host contract",
+                    )
+                    .with_note(format!(
+                        "committed contract: {}, offered contract: {}",
+                        binding.contract_stable_id, host.contract_stable_id
+                    ))
+                    .with_note("use `:reset` before selecting a different Host contract"),
+                );
+                return;
+            }
+            binding.contract
+        } else {
+            let source = host
+                .source
+                .as_ref()
+                .map_or_else(|| fallback.clone(), external_source_range);
+            let definition = self.allocate_definition(
+                root.clone(),
+                host_module.clone(),
+                host.contract_name.clone(),
+                DefinitionKind::HostContract,
+                DeclarationVisibility::Public,
+                IrType::Unit,
+                IrEffect::Immediate,
+                source,
+                format!("host::contract::{}", host.contract_name),
+            );
+            self.definitions[definition.0 as usize].ty = IrType::Named(definition);
+            self.host_binding = Some(AnalyzedHostBinding {
+                contract: definition,
+                contract_stable_id: host.contract_stable_id,
+                namespaces: Vec::new(),
+                functions: Vec::new(),
+            });
+            definition
+        };
+
+        host.types.sort();
+        let mut new_type_definitions = Vec::new();
+        for host_type in host.types {
+            let Some(stable_id) = host_type.stable_id else {
+                self.diagnostics.push(Diagnostic::new(
+                    ErrorCode::NX2101,
+                    Severity::Error,
+                    format!("Host type `{}` is missing a stable ABI ID", host_type.name),
+                ));
+                continue;
+            };
+            if let Some(existing_index) = self
+                .host_types
+                .iter()
+                .position(|existing| existing.stable_id == stable_id)
+            {
+                let existing = &mut self.host_types[existing_index];
+                if existing.kind != host_type.kind
+                    || self.definitions[existing.definition.0 as usize].name != host_type.name
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        format!(
+                            "Host type StableId {stable_id} changed name or layout kind in a cumulative REPL session"
+                        ),
+                    ));
+                    continue;
+                }
+                let prior_fields = existing
+                    .fields
+                    .iter()
+                    .filter_map(|(_, field)| field.stable_id)
+                    .collect::<BTreeSet<_>>();
+                let current_fields = host_type
+                    .fields
+                    .iter()
+                    .filter_map(|field| field.stable_id)
+                    .collect::<BTreeSet<_>>();
+                let prior_variants = existing
+                    .variants
+                    .iter()
+                    .filter_map(|(_, variant)| variant.stable_id)
+                    .collect::<BTreeSet<_>>();
+                let current_variants = host_type
+                    .variants
+                    .iter()
+                    .filter_map(|variant| variant.stable_id)
+                    .collect::<BTreeSet<_>>();
+                if prior_fields != current_fields || prior_variants != current_variants {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        format!(
+                            "Host type StableId {stable_id} changed member ABI in a cumulative REPL session"
+                        ),
+                    ));
+                    continue;
+                }
+                existing.source = host_type.source.clone().or(existing.source.clone());
+                for (definition, prior) in &mut existing.fields {
+                    if let Some(current) = host_type
+                        .fields
+                        .iter()
+                        .find(|field| field.stable_id == prior.stable_id)
+                    {
+                        *prior = current.clone();
+                        self.definitions[definition.0 as usize].span = current
+                            .source
+                            .as_ref()
+                            .map_or_else(|| fallback.clone(), external_source_range);
+                    }
+                }
+                for (definition, prior) in &mut existing.variants {
+                    if let Some(current) = host_type
+                        .variants
+                        .iter()
+                        .find(|variant| variant.stable_id == prior.stable_id)
+                    {
+                        *prior = current.clone();
+                        self.definitions[definition.0 as usize].span = current
+                            .source
+                            .as_ref()
+                            .map_or_else(|| fallback.clone(), external_source_range);
+                    }
+                }
+                continue;
+            }
+            if !host_type.type_parameters.is_empty() {
+                self.diagnostics.push(Diagnostic::new(
+                    ErrorCode::NX2101,
+                    Severity::Error,
+                    format!(
+                        "Host type `{}` cannot declare Nexa type parameters",
+                        host_type.name
+                    ),
+                ));
+            }
+            let definition = self.allocate_definition(
+                root.clone(),
+                host_module.clone(),
+                host_type.name.clone(),
+                DefinitionKind::HostContract,
+                DeclarationVisibility::Public,
+                IrType::Unit,
+                IrEffect::Immediate,
+                host_type
+                    .source
+                    .as_ref()
+                    .map_or_else(|| fallback.clone(), external_source_range),
+                format!("host::type::{}", host_type.name),
+            );
+            self.definitions[definition.0 as usize].ty = IrType::Named(definition);
+            if self
+                .symbols
+                .insert(
+                    (root.clone(), host_module.clone(), host_type.name.clone()),
+                    definition,
+                )
+                .is_some()
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    ErrorCode::NX2704,
+                    Severity::Error,
+                    format!("duplicate Host type `{}`", host_type.name),
+                ));
+            }
+            let mut metadata = TypeMetadata {
+                fields: BTreeMap::new(),
+                field_order: Vec::new(),
+                field_mutability: BTreeMap::new(),
+                variants: BTreeMap::new(),
+                variant_order: Vec::new(),
+                variant_fields: BTreeMap::new(),
+                variant_field_order: BTreeMap::new(),
+                state: None,
+            };
+            let mut analyzed_fields = Vec::new();
+            for field in host_type.fields {
+                let Some(field_stable_id) = field.stable_id else {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        format!(
+                            "Host field `{}.{}` is missing a stable ABI ID",
+                            host_type.name, field.name
+                        ),
+                    ));
+                    continue;
+                };
+                let field_definition = self.allocate_definition(
+                    root.clone(),
+                    host_module.clone(),
+                    field.name.clone(),
+                    DefinitionKind::Field,
+                    DeclarationVisibility::Public,
+                    IrType::Unit,
+                    IrEffect::Immediate,
+                    field
+                        .source
+                        .as_ref()
+                        .map_or_else(|| fallback.clone(), external_source_range),
+                    format!(
+                        "host::type::{}::field::{}::{field_stable_id}",
+                        host_type.name, field.name
+                    ),
+                );
+                metadata.fields.insert(field.name.clone(), field_definition);
+                metadata.field_order.push(field_definition);
+                metadata.field_mutability.insert(field_definition, false);
+                self.members
+                    .insert((definition, field.name.clone()), field_definition);
+                analyzed_fields.push((field_definition, field));
+            }
+            let mut analyzed_variants = Vec::new();
+            for variant in host_type.variants {
+                let Some(variant_stable_id) = variant.stable_id else {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        format!(
+                            "Host variant `{}.{}` is missing a stable ABI ID",
+                            host_type.name, variant.name
+                        ),
+                    ));
+                    continue;
+                };
+                let variant_definition = self.allocate_definition(
+                    root.clone(),
+                    host_module.clone(),
+                    variant.name.clone(),
+                    DefinitionKind::Variant,
+                    DeclarationVisibility::Public,
+                    IrType::Named(definition),
+                    IrEffect::Immediate,
+                    variant
+                        .source
+                        .as_ref()
+                        .map_or_else(|| fallback.clone(), external_source_range),
+                    format!(
+                        "host::type::{}::variant::{}::{variant_stable_id}",
+                        host_type.name, variant.name
+                    ),
+                );
+                metadata
+                    .variants
+                    .insert(variant.name.clone(), variant_definition);
+                metadata.variant_order.push(variant_definition);
+                self.members
+                    .insert((definition, variant.name.clone()), variant_definition);
+                let key = (root.clone(), host_module.clone(), variant.name.clone());
+                if let std::collections::btree_map::Entry::Vacant(entry) = self.symbols.entry(key) {
+                    entry.insert(variant_definition);
+                } else {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2704,
+                        Severity::Error,
+                        format!("ambiguous Host variant `{}`", variant.name),
+                    ));
+                }
+                analyzed_variants.push((variant_definition, variant));
+            }
+            self.type_metadata.insert(definition, metadata);
+            self.host_types.push(AnalyzedHostType {
+                definition,
+                stable_id,
+                kind: host_type.kind,
+                source: host_type.source,
+                fields: analyzed_fields,
+                variants: analyzed_variants,
+            });
+            new_type_definitions.push(definition);
+        }
+
+        let new_type_set = new_type_definitions.into_iter().collect::<BTreeSet<_>>();
+        for host_type in self.host_types.clone() {
+            if !new_type_set.contains(&host_type.definition) {
+                continue;
+            }
+            for (definition, field) in host_type.fields {
+                self.definitions[definition.0 as usize].ty = self.resolve_surface_type(&field.ty);
+            }
+            for (definition, variant) in host_type.variants {
+                let payload = variant
+                    .payload
+                    .iter()
+                    .map(|ty| self.resolve_surface_type(ty))
+                    .collect();
+                self.variant_payloads.insert(definition, payload);
+            }
+        }
+
+        host.functions.sort_by(|left, right| {
+            (left.import_index, left.stable_id, &left.name).cmp(&(
+                right.import_index,
+                right.stable_id,
+                &right.name,
+            ))
+        });
+        for mut function in host.functions {
+            function.required_capabilities.sort();
+            function.required_capabilities.dedup();
+            if let Some(existing) = self
+                .host_binding
+                .as_ref()
+                .and_then(|binding| {
+                    binding
+                        .functions
+                        .iter()
+                        .find(|existing| existing.stable_id == function.stable_id)
+                })
+                .cloned()
+            {
+                let parameters = function
+                    .parameters
+                    .iter()
+                    .map(|ty| self.resolve_surface_type(ty))
+                    .collect::<Vec<_>>();
+                let result = match function.mode {
+                    HostFunctionMode::Sync => self.resolve_surface_type(&function.result),
+                    HostFunctionMode::Request => match function.async_result.as_ref() {
+                        None => {
+                            self.diagnostics.push(Diagnostic::new(
+                                ErrorCode::NX2101,
+                                Severity::Error,
+                                format!(
+                                    "Host Request `{}` has no concrete async Result metadata",
+                                    function.name
+                                ),
+                            ));
+                            IrType::Unit
+                        }
+                        Some(result) => IrType::Result(
+                            Box::new(self.resolve_surface_type(&result.success)),
+                            Box::new(self.resolve_surface_type(&result.error)),
+                        ),
+                    },
+                };
+                let Some(metadata) = self.external_functions.get_mut(&existing.definition) else {
+                    continue;
+                };
+                if metadata.parameters != parameters
+                    || metadata.result != result
+                    || existing.mode != function.mode
+                    || existing.import_index != function.import_index
+                    || metadata
+                        .host
+                        .as_ref()
+                        .map(|(_, previous)| previous.declaration_fingerprint)
+                        != Some(function.declaration_fingerprint)
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        ErrorCode::NX2101,
+                        Severity::Error,
+                        format!(
+                            "Host function StableId {} changed ABI in a cumulative REPL session",
+                            function.stable_id
+                        ),
+                    ));
+                    continue;
+                }
+                metadata.host = Some((contract, function));
+                continue;
+            }
+            let definition = self.allocate_definition(
+                root.clone(),
+                host_module.clone(),
+                function.name.clone(),
+                DefinitionKind::HostFunction,
+                DeclarationVisibility::Public,
+                IrType::Unit,
+                match function.mode {
+                    HostFunctionMode::Sync => IrEffect::Immediate,
+                    HostFunctionMode::Request => IrEffect::Task,
+                },
+                function
+                    .source
+                    .as_ref()
+                    .map_or_else(|| fallback.clone(), external_source_range),
+                format!("host::function::{}", function.name),
+            );
+            if self
+                .symbols
+                .insert(
+                    (root.clone(), host_module.clone(), function.name.clone()),
+                    definition,
+                )
+                .is_some()
+            {
+                self.diagnostics.push(Diagnostic::new(
+                    ErrorCode::NX2704,
+                    Severity::Error,
+                    format!("duplicate Host function `{}`", function.name),
+                ));
+            }
+            let parameters = function
+                .parameters
+                .iter()
+                .map(|ty| self.resolve_surface_type(ty))
+                .collect::<Vec<_>>();
+            let result = match function.mode {
+                HostFunctionMode::Sync => self.resolve_surface_type(&function.result),
+                HostFunctionMode::Request => match function.async_result.as_ref() {
+                    None => {
+                        self.diagnostics.push(Diagnostic::new(
+                            ErrorCode::NX2101,
+                            Severity::Error,
+                            format!(
+                                "Host Request `{}` has no concrete async Result metadata",
+                                function.name
+                            ),
+                        ));
+                        IrType::Unit
+                    }
+                    Some(result) => IrType::Result(
+                        Box::new(self.resolve_surface_type(&result.success)),
+                        Box::new(self.resolve_surface_type(&result.error)),
+                    ),
+                },
+            };
+            self.definitions[definition.0 as usize].ty = result.clone();
+            self.external_functions.insert(
+                definition,
+                ExternalFunctionMetadata {
+                    parameters,
+                    result,
+                    effect: self.definitions[definition.0 as usize].effect,
+                    host: Some((contract, function.clone())),
+                    generic: None,
+                    type_parameters: Vec::new(),
+                    intrinsic: None,
+                },
+            );
+            self.host_binding
+                .as_mut()
+                .expect("incremental Host contract binding exists")
+                .functions
+                .push(AnalyzedHostFunction {
+                    definition,
+                    stable_id: function.stable_id,
+                    import_index: function.import_index,
+                    mode: function.mode,
+                    source: function.source.as_ref().map(external_source_range),
+                });
+        }
+        self.host_types.sort_by_key(|host_type| host_type.stable_id);
+        if let Some(binding) = &mut self.host_binding {
+            binding
+                .functions
+                .sort_by_key(|function| (function.import_index, function.stable_id));
         }
     }
 
@@ -2505,16 +4344,9 @@ impl<'a> Analyzer<'a> {
                     .map(|value| self.resolve_standard_surface_type(value, type_parameters))
                     .collect(),
             ),
-            SurfaceType::HostRequest(inner) => {
-                IrType::HostRequest(inner.as_ref().map(|inner| {
-                    Box::new(self.resolve_standard_surface_type(inner, type_parameters))
-                }))
-            }
-            SurfaceType::ResourceToken(inner) => {
-                IrType::ResourceToken(inner.as_ref().map(|inner| {
-                    Box::new(self.resolve_standard_surface_type(inner, type_parameters))
-                }))
-            }
+            SurfaceType::Token(inner) => IrType::ResourceToken(Some(Box::new(
+                self.resolve_standard_surface_type(inner, type_parameters),
+            ))),
             SurfaceType::Snapshot(inner) => IrType::Snapshot(Box::new(
                 self.resolve_standard_surface_type(inner, type_parameters),
             )),
@@ -2569,10 +4401,10 @@ impl<'a> Analyzer<'a> {
                 match (first, candidates.next()) {
                     (Some(definition), None) => IrType::Named(definition),
                     (Some(_), Some(_)) => self.unresolved_surface_type(format!(
-                        "external nominal type `{module}.{name}` is ambiguous across packages"
+                        "external nominal type `{module}::{name}` is ambiguous across packages"
                     )),
                     (None, _) => self.unresolved_surface_type(format!(
-                        "unknown external nominal type `{module}.{name}`"
+                        "unknown external nominal type `{module}::{name}`"
                     )),
                 }
             }
@@ -2594,16 +4426,9 @@ impl<'a> Analyzer<'a> {
                     .map(|value| self.resolve_surface_type(value))
                     .collect(),
             ),
-            SurfaceType::HostRequest(inner) => IrType::HostRequest(
-                inner
-                    .as_ref()
-                    .map(|inner| Box::new(self.resolve_surface_type(inner))),
-            ),
-            SurfaceType::ResourceToken(inner) => IrType::ResourceToken(
-                inner
-                    .as_ref()
-                    .map(|inner| Box::new(self.resolve_surface_type(inner))),
-            ),
+            SurfaceType::Token(inner) => {
+                IrType::ResourceToken(Some(Box::new(self.resolve_surface_type(inner))))
+            }
             SurfaceType::Snapshot(inner) => {
                 IrType::Snapshot(Box::new(self.resolve_surface_type(inner)))
             }
@@ -2630,7 +4455,11 @@ impl<'a> Analyzer<'a> {
         bindings: &BTreeMap<String, IrType>,
     ) -> IrType {
         match ty {
-            SurfaceType::TypeParameter(name) => bindings.get(name).cloned().unwrap_or(IrType::Unit),
+            SurfaceType::TypeParameter(name) => bindings.get(name).cloned().unwrap_or_else(|| {
+                self.unresolved_surface_type(format!(
+                    "unbound external type parameter `{name}` during call-site instantiation"
+                ))
+            }),
             SurfaceType::Option(inner) => {
                 IrType::Option(Box::new(self.instantiate_surface_type(inner, bindings)))
             }
@@ -2651,16 +4480,9 @@ impl<'a> Analyzer<'a> {
                     .map(|value| self.instantiate_surface_type(value, bindings))
                     .collect(),
             ),
-            SurfaceType::HostRequest(inner) => IrType::HostRequest(
-                inner
-                    .as_ref()
-                    .map(|inner| Box::new(self.instantiate_surface_type(inner, bindings))),
-            ),
-            SurfaceType::ResourceToken(inner) => IrType::ResourceToken(
-                inner
-                    .as_ref()
-                    .map(|inner| Box::new(self.instantiate_surface_type(inner, bindings))),
-            ),
+            SurfaceType::Token(inner) => IrType::ResourceToken(Some(Box::new(
+                self.instantiate_surface_type(inner, bindings),
+            ))),
             SurfaceType::Snapshot(inner) => {
                 IrType::Snapshot(Box::new(self.instantiate_surface_type(inner, bindings)))
             }
@@ -2696,6 +4518,8 @@ impl<'a> Analyzer<'a> {
     #[allow(clippy::too_many_lines)]
     fn resolve_imports(&mut self) {
         let mut graphs = BTreeMap::<PackageId, ModuleGraph>::new();
+        let mut source_edge_ranges =
+            BTreeMap::<(SourceModuleKey, SourceModuleKey), (SourceKey, ByteRange)>::new();
         let graph_limits = CompilationLimits {
             imports_per_module: usize::MAX,
             module_edges: usize::MAX,
@@ -2716,46 +4540,25 @@ impl<'a> Analyzer<'a> {
                 module.key.package.clone(),
                 module.key.module.clone(),
             ));
-            for import in &module.ast.imports {
-                let text = import.path.text();
-                let local_alias = import
+            for usage in &module.ast.uses {
+                let text = use_path_text(usage);
+                let path_range = use_path_range(usage);
+                let local_alias = usage
                     .alias
                     .as_ref()
-                    .or_else(|| import.path.last())
+                    .or_else(|| usage.segments.last())
                     .map(|alias| (alias.text.clone(), alias.range));
                 let Some((local_alias, local_alias_range)) = local_alias else {
                     continue;
                 };
-                let target = if text == "host" {
-                    if import.alias.is_none() {
-                        self.push_source_error(
-                            ErrorCode::NX2703,
-                            &module.source,
-                            byte_range(import.path.range),
-                            "`import host` requires an explicit alias",
-                            "write `import host as <name>;`",
-                        );
-                    }
-                    if self.environment.host.is_none() {
-                        self.push_source_error(
-                            ErrorCode::NX2703,
-                            &module.source,
-                            byte_range(import.path.range),
-                            "Host contract is unavailable",
-                            "this build input has no structured Host surface",
-                        );
-                    }
-                    Some(ImportTarget::Host)
-                } else {
-                    self.resolve_import_target(&module, &import.path)
-                };
+                let target = self.resolve_use_target(&module, usage);
                 let Some(target) = target else {
                     self.push_source_error(
                         ErrorCode::NX2703,
                         &module.source,
-                        byte_range(import.path.range),
-                        format!("unknown module import `{text}`"),
-                        "the import must name a source module, dependency alias, or static module",
+                        byte_range(path_range),
+                        format!("unknown use path `{text}`"),
+                        "the use path must name a source module, dependency alias, Host contract, or standard module",
                     );
                     continue;
                 };
@@ -2778,10 +4581,10 @@ impl<'a> Analyzer<'a> {
                     self.push_source_error(
                         ErrorCode::NX2702,
                         &module.source,
-                        byte_range(import.range),
-                        format!("too many imports in {}", module.key.module),
+                        byte_range(usage.range),
+                        format!("too many use declarations in {}", module.key.module),
                         format!(
-                            "a module may resolve at most {} imports",
+                            "a module may resolve at most {} use declarations",
                             self.input.compilation_options.limits.imports_per_module
                         ),
                     );
@@ -2791,7 +4594,7 @@ impl<'a> Analyzer<'a> {
                     self.push_source_error(
                         ErrorCode::NX2702,
                         &module.source,
-                        byte_range(import.range),
+                        byte_range(usage.range),
                         "module graph edge limit exceeded",
                         format!(
                             "the resolved package closure may contain at most {} import edges",
@@ -2827,8 +4630,8 @@ impl<'a> Analyzer<'a> {
                             self.push_source_error(
                                 ErrorCode::NX2705,
                                 &module.source,
-                                byte_range(import.range),
-                                "production modules cannot import test modules",
+                                byte_range(usage.range),
+                                "production modules cannot use test modules",
                                 "move shared code under src/ with package visibility",
                             );
                         }
@@ -2845,7 +4648,7 @@ impl<'a> Analyzer<'a> {
                                 self.push_source_error(
                                     ErrorCode::NX2702,
                                     &module.source,
-                                    byte_range(import.range),
+                                    byte_range(usage.range),
                                     error.to_string(),
                                     "invalid module graph edge",
                                 );
@@ -2856,6 +4659,10 @@ impl<'a> Analyzer<'a> {
                             self.db
                                 .record_dependency_import(importer_module, resolved_source_target);
                         }
+                        source_edge_ranges.insert(
+                            (module.key.clone(), target.clone()),
+                            (module.source.clone(), byte_range(path_range)),
+                        );
                     }
                     ImportTarget::Host => {
                         self.host_namespaces.insert((
@@ -2903,21 +4710,20 @@ impl<'a> Analyzer<'a> {
                     .filter_map(|edge| {
                         let from = &edge[0];
                         let to = &edge[1];
-                        let index = *self.module_indices.get(&SourceModuleKey {
-                            package: package.clone(),
-                            module: from.clone(),
-                        })?;
-                        let module = &self.modules[index];
-                        let import = module
-                            .ast
-                            .imports
-                            .iter()
-                            .find(|import| import.path.text() == to.as_str())?;
-                        Some((
-                            module.source.clone(),
-                            byte_range(import.path.range),
-                            format!("`{from}` imports `{to}`"),
-                        ))
+                        source_edge_ranges
+                            .get(&(
+                                SourceModuleKey {
+                                    package: package.clone(),
+                                    module: from.clone(),
+                                },
+                                SourceModuleKey {
+                                    package: package.clone(),
+                                    module: to.clone(),
+                                },
+                            ))
+                            .map(|(source, range)| {
+                                (source.clone(), *range, format!("`{from}` uses `{to}`"))
+                            })
                     })
                     .collect::<Vec<_>>();
                 if let Some((source, range, edge)) = edges.first() {
@@ -2949,12 +4755,12 @@ impl<'a> Analyzer<'a> {
         self.resolved_import_edges.dedup();
     }
 
-    fn resolve_import_target(
+    fn resolve_use_target(
         &mut self,
         module: &ParsedModule,
-        path: &ast::QualifiedName,
+        usage: &ast::UseDeclaration,
     ) -> Option<ImportTarget> {
-        let segments = path
+        let segments = usage
             .segments
             .iter()
             .map(|segment| segment.text.as_str())
@@ -2963,71 +4769,67 @@ impl<'a> Analyzer<'a> {
             return None;
         }
 
-        let dependency = self
-            .input
-            .dependency_graph
-            .dependencies_of(&module.key.package)
-            .find(|edge| edge.alias.as_str() == segments[0]);
-        let dependency_target = dependency.and_then(|edge| {
-            (segments.len() > 1)
-                .then(|| ModulePath::new(segments[1..].join(".")).ok())
-                .flatten()
-                .map(|target_module| SourceModuleKey {
-                    package: edge.to.clone(),
-                    module: target_module,
-                })
-                .filter(|target| self.module_indices.contains_key(target))
-        });
-
-        let module_path = ModulePath::new(path.text()).ok();
-        let local_target = module_path.as_ref().and_then(|target_module| {
-            let target = SourceModuleKey {
-                package: module.key.package.clone(),
-                module: target_module.clone(),
-            };
-            self.module_indices.contains_key(&target).then_some(target)
-        });
-        let standard_library_target = module_path.as_ref().and_then(|target_module| {
-            let target = SourceModuleKey {
-                package: PackageId::new(nexa_stdlib::PACKAGE_ID)
-                    .expect("standard-library package ID is valid"),
-                module: target_module.clone(),
-            };
-            self.module_indices.contains_key(&target).then_some(target)
-        });
-        let static_target = module_path.as_ref().and_then(|target_module| {
-            // Compiler-provided standard-library source and its intrinsic surface are one
-            // namespace. A legacy/static surface with the same canonical module augments that
-            // namespace; it is not a second import candidate.
-            if standard_library_target.is_some() {
-                return None;
-            }
-            self.environment
-                .static_modules
-                .iter()
-                .any(|surface| &surface.module == target_module)
-                .then(|| target_module.clone())
-        });
-
-        let count = usize::from(dependency_target.is_some())
-            + usize::from(local_target.is_some())
-            + usize::from(standard_library_target.is_some())
-            + usize::from(static_target.is_some());
-        if count > 1 {
-            self.push_source_error(
-                ErrorCode::NX2704,
-                &module.source,
-                byte_range(path.range),
-                format!("ambiguous module import `{}`", path.text()),
-                "dependency aliases and source/static module paths must not overlap",
-            );
-            return None;
+        if usage.root.kind == UsePathRootKind::Host {
+            let host = self.environment.host.as_ref()?;
+            let expected = snake_case_name(&host.contract_name);
+            return (segments.as_slice() == [expected.as_str()]).then_some(ImportTarget::Host);
         }
-        dependency_target
-            .or(local_target)
-            .or(standard_library_target)
-            .map(ImportTarget::Source)
-            .or_else(|| static_target.map(ImportTarget::Static))
+
+        let source_target = |package: PackageId, path: String| {
+            let module = ModulePath::new(path).ok()?;
+            let target = SourceModuleKey { package, module };
+            self.module_indices.contains_key(&target).then_some(target)
+        };
+
+        let target = match usage.root.kind {
+            UsePathRootKind::Package => {
+                source_target(module.key.package.clone(), segments.join("."))
+            }
+            UsePathRootKind::Self_ => {
+                let suffix = segments.join(".");
+                source_target(
+                    module.key.package.clone(),
+                    format!("{}.{}", module.key.module, suffix),
+                )
+            }
+            UsePathRootKind::Super => {
+                let (parent, _) = module.key.module.as_str().rsplit_once('.')?;
+                source_target(
+                    module.key.package.clone(),
+                    format!("{parent}.{}", segments.join(".")),
+                )
+            }
+            UsePathRootKind::Std => source_target(
+                PackageId::new(nexa_stdlib::PACKAGE_ID)
+                    .expect("standard-library package ID is valid"),
+                format!("std.{}", segments.join(".")),
+            ),
+            UsePathRootKind::Dependency => {
+                let dependency = self
+                    .input
+                    .dependency_graph
+                    .dependencies_of(&module.key.package)
+                    .find(|edge| edge.alias.as_str() == usage.root.name.text);
+                dependency.and_then(|edge| source_target(edge.to.clone(), segments.join(".")))
+            }
+            UsePathRootKind::Host => unreachable!("Host use was resolved above"),
+        };
+        if let Some(target) = target {
+            return Some(ImportTarget::Source(target));
+        }
+
+        // Compiler-provided static modules use the same explicit root spelling as their canonical
+        // module path. They are considered only when no source/dependency module matched.
+        let static_path = std::iter::once(usage.root.name.text.as_str())
+            .chain(segments.iter().copied())
+            .collect::<Vec<_>>()
+            .join(".");
+        let static_module = ModulePath::new(static_path).ok()?;
+        self.environment
+            .static_modules
+            .iter()
+            .any(|surface| surface.module == static_module)
+            .then_some(ImportTarget::Static(static_module))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3068,13 +4870,7 @@ impl<'a> Analyzer<'a> {
                         resolved
                     });
                     self.definitions[record.definition.0 as usize].ty = result.clone();
-                    let effect = if has_attribute(&record.declaration.attributes, "test")
-                        && function.effect == FunctionEffect::Ordinary
-                    {
-                        IrEffect::Immediate
-                    } else {
-                        function_effect(function.effect)
-                    };
+                    let effect = function_semantic_effect(&record.declaration, function);
                     self.definitions[record.definition.0 as usize].effect = effect;
                     self.function_signatures.insert(
                         record.definition,
@@ -3115,9 +4911,15 @@ impl<'a> Analyzer<'a> {
                             .copied()
                             .map(|id| (variant, id))
                     }) {
-                        let payload = variant
-                            .payload
-                            .iter()
+                        let payload_syntax = match &variant.payload {
+                            ast::VariantPayload::Unit => Vec::new(),
+                            ast::VariantPayload::Tuple(values) => values.iter().collect::<Vec<_>>(),
+                            ast::VariantPayload::Struct(fields) => {
+                                fields.iter().map(|field| &field.ty).collect::<Vec<_>>()
+                            }
+                        };
+                        let payload = payload_syntax
+                            .into_iter()
                             .map(|syntax| {
                                 let resolved = self.resolve_type_ref(&module, syntax);
                                 self.validate_public_type_ref(
@@ -3130,14 +4932,24 @@ impl<'a> Analyzer<'a> {
                             })
                             .collect::<Vec<_>>();
                         self.variant_payloads.insert(definition, payload.clone());
+                        if let ast::VariantPayload::Struct(fields) = &variant.payload {
+                            for (field, resolved) in fields.iter().zip(payload) {
+                                if let Some(field_definition) = metadata
+                                    .variant_fields
+                                    .get(&definition)
+                                    .and_then(|named| named.get(&field.name.text))
+                                    .copied()
+                                {
+                                    self.definitions[field_definition.0 as usize].ty = resolved;
+                                }
+                            }
+                        }
                     }
-                    if metadata.stateful {
-                        self.definitions[record.definition.0 as usize].kind =
-                            DefinitionKind::Stateful;
+                    if let Some(state) = metadata.state {
                         let stable_id = self.stable_ids.get(&record.definition).copied();
                         let fields = metadata
-                            .fields
-                            .values()
+                            .field_order
+                            .iter()
                             .filter_map(|field| {
                                 let stable_id = self.stable_ids.get(field).copied()?;
                                 Some(AnalyzedStateField {
@@ -3150,7 +4962,7 @@ impl<'a> Analyzer<'a> {
                         if let Some(stable_id) = stable_id {
                             self.state_types.push(AnalyzedStateType {
                                 definition: record.definition,
-                                version: metadata.version,
+                                version: state.version,
                                 stable_id,
                                 fields,
                             });
@@ -3168,11 +4980,196 @@ impl<'a> Analyzer<'a> {
         self.state_types.sort_by_key(|state| state.definition);
     }
 
+    /// Reject nominal value layouts whose size would require implicit recursive boxing.
+    ///
+    /// `Struct` and `Enum` are inline values. `Option`, `Result`, and tuples preserve that inline
+    /// relationship, while `Class` and container/runtime handles terminate an inline-layout path.
+    fn validate_recursive_value_layouts(&mut self) {
+        let mut graph = BTreeMap::<DefinitionId, Vec<InlineLayoutEdge>>::new();
+
+        for (&owner, metadata) in &self.type_metadata {
+            let Some(definition) = self.definitions.get(owner.0 as usize) else {
+                continue;
+            };
+            if !matches!(
+                definition.kind,
+                DefinitionKind::Struct | DefinitionKind::Enum
+            ) {
+                continue;
+            }
+
+            let mut edges = Vec::new();
+            match definition.kind {
+                DefinitionKind::Struct => {
+                    for field in &metadata.field_order {
+                        let Some(field_definition) = self.definitions.get(field.0 as usize) else {
+                            continue;
+                        };
+                        collect_inline_value_targets(
+                            &field_definition.ty,
+                            &self.definitions,
+                            &mut |target| {
+                                edges.push(InlineLayoutEdge {
+                                    target,
+                                    span: field_definition.span.clone(),
+                                });
+                            },
+                        );
+                    }
+                }
+                DefinitionKind::Enum => {
+                    for variant in &metadata.variant_order {
+                        let Some(variant_definition) = self.definitions.get(variant.0 as usize)
+                        else {
+                            continue;
+                        };
+                        for payload in self.variant_payloads.get(variant).into_iter().flatten() {
+                            collect_inline_value_targets(
+                                payload,
+                                &self.definitions,
+                                &mut |target| {
+                                    edges.push(InlineLayoutEdge {
+                                        target,
+                                        span: variant_definition.span.clone(),
+                                    });
+                                },
+                            );
+                        }
+                    }
+                }
+                _ => unreachable!("only inline nominal values enter the layout graph"),
+            }
+
+            edges.sort_by(|left, right| {
+                (
+                    left.target,
+                    left.span.source.clone(),
+                    left.span.start,
+                    left.span.end,
+                )
+                    .cmp(&(
+                        right.target,
+                        right.span.source.clone(),
+                        right.span.start,
+                        right.span.end,
+                    ))
+            });
+            edges.dedup_by(|left, right| {
+                left.target == right.target
+                    && left.span.source == right.span.source
+                    && left.span.start == right.span.start
+                    && left.span.end == right.span.end
+            });
+            graph.insert(owner, edges);
+        }
+
+        let mut state = BTreeMap::<DefinitionId, InlineLayoutVisit>::new();
+        let mut stack = Vec::<DefinitionId>::new();
+        let mut reported = BTreeSet::<Vec<DefinitionId>>::new();
+        let nodes = graph.keys().copied().collect::<Vec<_>>();
+        for node in nodes {
+            self.visit_inline_layout(node, &graph, &mut state, &mut stack, &mut reported);
+        }
+    }
+
+    fn visit_inline_layout(
+        &mut self,
+        node: DefinitionId,
+        graph: &BTreeMap<DefinitionId, Vec<InlineLayoutEdge>>,
+        state: &mut BTreeMap<DefinitionId, InlineLayoutVisit>,
+        stack: &mut Vec<DefinitionId>,
+        reported: &mut BTreeSet<Vec<DefinitionId>>,
+    ) {
+        match state.get(&node) {
+            Some(InlineLayoutVisit::Complete | InlineLayoutVisit::Visiting) => return,
+            None => {}
+        }
+        state.insert(node, InlineLayoutVisit::Visiting);
+        stack.push(node);
+
+        for edge in graph.get(&node).into_iter().flatten() {
+            match state.get(&edge.target).copied() {
+                Some(InlineLayoutVisit::Visiting) => {
+                    let Some(cycle_start) =
+                        stack.iter().position(|candidate| *candidate == edge.target)
+                    else {
+                        continue;
+                    };
+                    let mut cycle = stack[cycle_start..].to_vec();
+                    cycle.push(edge.target);
+                    if reported.insert(canonical_inline_cycle(&cycle)) {
+                        let names = cycle
+                            .iter()
+                            .filter_map(|definition| {
+                                self.definitions
+                                    .get(definition.0 as usize)
+                                    .map(|definition| definition.name.as_str())
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" -> ");
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                ErrorCode::NX2101,
+                                Severity::Error,
+                                format!("recursive inline value layout: {names}"),
+                            )
+                            .with_label(Label::primary(
+                                source_identity(&edge.span.source),
+                                range_from_source(&edge.span),
+                                "this payload closes an inline value-layout cycle",
+                            ))
+                            .with_note(
+                                "use a Class node to break the recursive inline value layout",
+                            ),
+                        );
+                    }
+                }
+                Some(InlineLayoutVisit::Complete) => {}
+                None => {
+                    self.visit_inline_layout(edge.target, graph, state, stack, reported);
+                }
+            }
+        }
+
+        let popped = stack.pop();
+        debug_assert_eq!(popped, Some(node));
+        state.insert(node, InlineLayoutVisit::Complete);
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn resolve_type_ref(&mut self, module: &ParsedModule, ty: &TypeRef) -> IrType {
         match &ty.kind {
             TypeKind::Named(name) => match name.text().as_str() {
-                "HostRequest" => IrType::HostRequest(None),
-                "ResourceToken" => IrType::ResourceToken(None),
+                "HostRequest" => {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(ty.range),
+                        "`HostRequest` is runtime-only and cannot be named or stored in Nexa source",
+                        "call an async Host function and consume its result immediately with postfix `.await`",
+                    );
+                    IrType::Unit
+                }
+                "Token" => {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(ty.range),
+                        "`Token` requires exactly one content type",
+                        "write `Token<ContentType>`",
+                    );
+                    IrType::Unit
+                }
+                "ResourceToken" => {
+                    self.push_source_error(
+                        ErrorCode::NX2101,
+                        &module.source,
+                        byte_range(ty.range),
+                        "`ResourceToken` is not a Nexa v2 source type",
+                        "write `Token<ContentType>`",
+                    );
+                    IrType::Unit
+                }
                 name_text => match builtin_type(name_text) {
                     Some(ty) => ty,
                     None => {
@@ -3203,11 +5200,28 @@ impl<'a> Analyzer<'a> {
                         Box::new(self.resolve_type_ref(module, key)),
                         Box::new(self.resolve_type_ref(module, value)),
                     ),
-                    ("HostRequest", [inner]) => {
-                        IrType::HostRequest(Some(Box::new(self.resolve_type_ref(module, inner))))
+                    ("HostRequest", [_]) => {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(ty.range),
+                            "`HostRequest` is runtime-only and cannot be named or stored in Nexa source",
+                            "call an async Host function and consume its result immediately with postfix `.await`",
+                        );
+                        IrType::Unit
                     }
-                    ("ResourceToken", [inner]) => {
+                    ("Token", [inner]) => {
                         IrType::ResourceToken(Some(Box::new(self.resolve_type_ref(module, inner))))
+                    }
+                    ("ResourceToken", _) => {
+                        self.push_source_error(
+                            ErrorCode::NX2101,
+                            &module.source,
+                            byte_range(ty.range),
+                            "`ResourceToken` is not a Nexa v2 source type",
+                            "write `Token<ContentType>`",
+                        );
+                        IrType::Unit
                     }
                     ("Snapshot", [inner]) => {
                         IrType::Snapshot(Box::new(self.resolve_type_ref(module, inner)))
@@ -3219,7 +5233,7 @@ impl<'a> Analyzer<'a> {
                         IrType::StateHandle(Box::new(self.resolve_type_ref(module, inner)))
                     }
                     (
-                        "Option" | "Result" | "Array" | "Map" | "HostRequest" | "ResourceToken"
+                        "Option" | "Result" | "Array" | "Map" | "HostRequest" | "Token"
                         | "Snapshot" | "Buffer" | "StateHandle",
                         _,
                     ) => {
@@ -3385,7 +5399,16 @@ impl<'a> Analyzer<'a> {
         path: &ast::QualifiedName,
         usage: SymbolUse,
     ) -> Option<DefinitionId> {
-        let id = self.lookup_symbol_path(module, path);
+        let current = self.lookup_symbol_path(module, path);
+        let current_is_from_staged_cell = current.is_some_and(|definition| {
+            let definition = &self.definitions[definition.0 as usize];
+            definition.span.source == module.source && Self::symbol_matches_usage(definition, usage)
+        });
+        let id = if current_is_from_staged_cell {
+            current
+        } else {
+            self.repl_snapshot_symbol(module, path, usage).or(current)
+        };
         let Some(id) = id else {
             self.push_source_error(
                 match usage {
@@ -3400,34 +5423,7 @@ impl<'a> Analyzer<'a> {
             return None;
         };
         let definition = self.definitions[id.0 as usize].clone();
-        let kind_valid = match usage {
-            SymbolUse::Type => {
-                matches!(
-                    definition.kind,
-                    DefinitionKind::Struct
-                        | DefinitionKind::Enum
-                        | DefinitionKind::Class
-                        | DefinitionKind::Stateful
-                        | DefinitionKind::HostInterface
-                        | DefinitionKind::StandardLibrary
-                ) && matches!(definition.ty, IrType::Named(_))
-            }
-            SymbolUse::Value => !matches!(
-                definition.kind,
-                DefinitionKind::Struct
-                    | DefinitionKind::Enum
-                    | DefinitionKind::Class
-                    | DefinitionKind::Stateful
-                    | DefinitionKind::HostInterface
-            ),
-            SymbolUse::Callable => matches!(
-                definition.kind,
-                DefinitionKind::Function
-                    | DefinitionKind::Task
-                    | DefinitionKind::HostFunction
-                    | DefinitionKind::StandardLibrary
-            ),
-        };
+        let kind_valid = Self::symbol_matches_usage(&definition, usage);
         if !kind_valid {
             self.push_source_error(
                 if usage == SymbolUse::Type {
@@ -3462,7 +5458,7 @@ impl<'a> Analyzer<'a> {
                     source_identity(&declaration_span.source),
                     range_from_source(&declaration_span),
                     format!(
-                        "declared with {} visibility",
+                        "declared using {} visibility",
                         visibility_name(definition.visibility)
                     ),
                 )),
@@ -3470,6 +5466,66 @@ impl<'a> Analyzer<'a> {
         }
         self.record_reference(module, path.range, id);
         Some(id)
+    }
+
+    fn symbol_matches_usage(definition: &Definition, usage: SymbolUse) -> bool {
+        match usage {
+            SymbolUse::Type => {
+                matches!(
+                    definition.kind,
+                    DefinitionKind::Struct
+                        | DefinitionKind::Enum
+                        | DefinitionKind::Class
+                        | DefinitionKind::HostContract
+                        | DefinitionKind::StandardLibrary
+                ) && matches!(definition.ty, IrType::Named(_))
+            }
+            SymbolUse::Value => !matches!(
+                definition.kind,
+                DefinitionKind::Struct
+                    | DefinitionKind::Enum
+                    | DefinitionKind::Class
+                    | DefinitionKind::HostContract
+            ),
+            SymbolUse::Callable => matches!(
+                definition.kind,
+                DefinitionKind::Function
+                    | DefinitionKind::Task
+                    | DefinitionKind::HostFunction
+                    | DefinitionKind::StandardLibrary
+            ),
+        }
+    }
+
+    fn repl_snapshot_symbol(
+        &self,
+        module: &ParsedModule,
+        path: &ast::QualifiedName,
+        usage: SymbolUse,
+    ) -> Option<DefinitionId> {
+        if self.mode != AnalysisMode::ReplCell
+            || module.key.package != self.input.root_manifest.id
+            || module.key.module != crate::repl_module_path()
+        {
+            return None;
+        }
+        let [name] = path.segments.as_slice() else {
+            return None;
+        };
+        let snapshot = self.repl_snapshot?;
+        match usage {
+            SymbolUse::Type => snapshot
+                .resolve_type(&name.text)
+                .map(|slot| slot.definition),
+            SymbolUse::Value => snapshot
+                .visible_binding(&name.text)
+                .filter(|slot| matches!(&slot.kind, crate::ReplBindingKind::Value))
+                .map(|slot| slot.definition),
+            SymbolUse::Callable => snapshot
+                .visible_binding(&name.text)
+                .filter(|slot| matches!(&slot.kind, crate::ReplBindingKind::Function { .. }))
+                .map(|slot| slot.definition),
+        }
     }
 
     fn lookup_symbol_path(
@@ -3586,17 +5642,19 @@ impl<'a> Analyzer<'a> {
 
     #[allow(clippy::too_many_lines)]
     fn validate_entry_and_exports(&mut self) {
+        self.validate_standalone_main();
+
         let records = self.declaration_records.clone();
         for record in records {
             let DeclarationKind::Function(function) = &record.declaration.kind else {
                 continue;
             };
             let module = self.modules[record.module_index].clone();
+            let effect = self.definitions[record.definition.0 as usize].effect;
             let lifecycle = matches!(
-                function.effect,
-                FunctionEffect::Migration | FunctionEffect::Activation | FunctionEffect::Cleanup
-            ) || has_attribute(&record.declaration.attributes, "export")
-                || has_attribute(&record.declaration.attributes, "handler");
+                effect,
+                IrEffect::Migration | IrEffect::Activation | IrEffect::Cleanup
+            );
             if lifecycle {
                 let is_root_entry = self.input.root_manifest.kind == PackageKind::Application
                     && module.key.package == self.input.root_manifest.id
@@ -3607,19 +5665,17 @@ impl<'a> Analyzer<'a> {
                         &module.source,
                         byte_range(function.name.range),
                         format!(
-                            "lifecycle/export function `{}` must be `pub` in the root Application entry module",
-                            function.name.text
+                            "lifecycle attribute `@{}` on `{}` requires a `pub fn` in the root Application entry module",
+                            effect_name(effect), function.name.text
                         ),
-                        "libraries and non-entry modules cannot define lifecycle exports",
+                        "this lifecycle attribute is not legal at this location",
                     );
                 } else {
-                    let lifecycle_slot = match function.effect {
-                        FunctionEffect::Migration => Some(&mut self.lifecycle.migration),
-                        FunctionEffect::Activation => Some(&mut self.lifecycle.activation),
-                        FunctionEffect::Cleanup => Some(&mut self.lifecycle.cleanup),
-                        FunctionEffect::Ordinary
-                        | FunctionEffect::Immediate
-                        | FunctionEffect::Task => None,
+                    let lifecycle_slot = match effect {
+                        IrEffect::Migration => Some(&mut self.lifecycle.migration),
+                        IrEffect::Activation => Some(&mut self.lifecycle.activation),
+                        IrEffect::Cleanup => Some(&mut self.lifecycle.cleanup),
+                        IrEffect::Ordinary | IrEffect::Immediate | IrEffect::Task => None,
                     };
                     if let Some(slot) = lifecycle_slot {
                         if let Some(prior) = *slot {
@@ -3631,7 +5687,7 @@ impl<'a> Analyzer<'a> {
                                     Severity::Error,
                                     format!(
                                         "duplicate {} lifecycle function `{}`",
-                                        effect_name(function_effect(function.effect)),
+                                        effect_name(effect),
                                         function.name.text
                                     ),
                                 )
@@ -3652,20 +5708,6 @@ impl<'a> Analyzer<'a> {
                             *slot = Some(record.definition);
                         }
                     }
-                    if has_attribute(&record.declaration.attributes, "export")
-                        || has_attribute(&record.declaration.attributes, "handler")
-                    {
-                        self.exports.push(AnalyzedExport {
-                            name: function.name.text.clone(),
-                            function: record.definition,
-                            stable_id: self.definitions[record.definition.0 as usize]
-                                .stable_symbol
-                                .as_ref()
-                                .map_or(nexa_core::StableId::default(), |stable| {
-                                    stable.runtime_id.0
-                                }),
-                        });
-                    }
                 }
             }
         }
@@ -3674,41 +5716,68 @@ impl<'a> Analyzer<'a> {
             let Some(entry) = self.input.root_manifest.entry().cloned() else {
                 return;
             };
-            for required in &host.required_exports {
+            let required_names = host
+                .required_entrypoints
+                .iter()
+                .map(|entrypoint| entrypoint.name.clone())
+                .collect::<BTreeSet<_>>();
+            let mut entrypoints = host
+                .nexa_entrypoints
+                .iter()
+                .cloned()
+                .map(|entrypoint| (entrypoint.name.clone(), entrypoint))
+                .collect::<BTreeMap<_, _>>();
+            // A required surface is necessarily legal even while an older adapter is being
+            // migrated to populate `nexa_entrypoints`. Keep the semantic union deterministic.
+            for required in &host.required_entrypoints {
+                entrypoints
+                    .entry(required.name.clone())
+                    .or_insert_with(|| NexaEntrypointSurface {
+                        name: required.name.clone(),
+                        stable_id: required.stable_id,
+                        parameters: required.parameters.clone(),
+                        result: required.result.clone(),
+                        effect: required.effect,
+                        source: required.source.clone(),
+                    });
+            }
+            for (name, entrypoint) in entrypoints {
                 let key = (
                     self.input.root_manifest.id.clone(),
                     entry.clone(),
-                    required.name.clone(),
+                    name.clone(),
                 );
                 let Some(definition) = self.symbols.get(&key).copied() else {
-                    let mut diagnostic = Diagnostic::new(
-                        ErrorCode::NX7010,
-                        Severity::Error,
-                        format!("missing required export `{}`", required.name),
-                    );
-                    if let Some(source) = &required.source {
-                        diagnostic = diagnostic.with_label(Label::primary(
-                            source.identity.clone(),
-                            source.range,
-                            "Host contract requires this export",
-                        ));
+                    if required_names.contains(&name) {
+                        let mut diagnostic = Diagnostic::new(
+                            ErrorCode::NX7010,
+                            Severity::Error,
+                            format!("missing required entrypoint `{name}`"),
+                        );
+                        if let Some(source) = &entrypoint.source {
+                            diagnostic = diagnostic.with_label(Label::primary(
+                                source.identity.clone(),
+                                source.range,
+                                "Host configuration requires this Nexa entrypoint",
+                            ));
+                        }
+                        self.diagnostics.push(diagnostic);
                     }
-                    self.diagnostics.push(diagnostic);
                     continue;
                 };
                 let valid_visibility = self.definitions[definition.0 as usize].visibility
                     == DeclarationVisibility::Public;
-                let required_parameters = required
+                let required_parameters = entrypoint
                     .parameters
                     .iter()
                     .map(|ty| self.resolve_surface_type(ty))
                     .collect::<Vec<_>>();
-                let required_result = self.resolve_surface_type(&required.result);
+                let required_result = self.resolve_surface_type(&entrypoint.result);
                 let valid_signature =
                     self.function_signatures
                         .get(&definition)
                         .is_some_and(|signature| {
-                            required
+                            entrypoint
                                 .effect
                                 .is_none_or(|required| signature.effect == required)
                                 && signature.parameter_types == required_parameters
@@ -3719,21 +5788,18 @@ impl<'a> Analyzer<'a> {
                     let mut diagnostic = Diagnostic::new(
                         ErrorCode::NX7011,
                         Severity::Error,
-                        format!(
-                            "required export `{}` has the wrong signature",
-                            required.name
-                        ),
+                        format!("Nexa entrypoint `{name}` has the wrong signature"),
                     )
                     .with_label(Label::primary(
                         source_identity(&declared.span.source),
                         range_from_source(&declared.span),
-                        "export signature differs from the Host contract",
+                        "entrypoint signature differs from the Host contract",
                     ));
-                    if let Some(source) = &required.source {
+                    if let Some(source) = &entrypoint.source {
                         diagnostic = diagnostic.with_related(RelatedLocation::new(
                             source.identity.clone(),
                             source.range,
-                            "required Host export signature",
+                            "declared Nexa entrypoint signature",
                         ));
                     }
                     self.diagnostics.push(diagnostic);
@@ -3745,21 +5811,88 @@ impl<'a> Analyzer<'a> {
                     .any(|export| export.function == definition)
                 {
                     self.exports.push(AnalyzedExport {
-                        name: required.name.clone(),
+                        name,
                         function: definition,
-                        stable_id: required.stable_id,
+                        stable_id: entrypoint.stable_id,
                     });
                 } else if let Some(export) = self
                     .exports
                     .iter_mut()
                     .find(|export| export.function == definition)
                 {
-                    export.stable_id = required.stable_id;
+                    export.stable_id = entrypoint.stable_id;
                 }
             }
         }
         self.exports
             .sort_by(|left, right| (&left.name, left.function).cmp(&(&right.name, right.function)));
+    }
+
+    fn validate_standalone_main(&mut self) {
+        if matches!(
+            self.input.compilation_options.profile,
+            CompilationProfile::Package | CompilationProfile::ReplCell
+        ) {
+            return;
+        }
+        let Some(entry_module) = self.input.root_manifest.entry().cloned() else {
+            let fallback = self.fallback_source_range();
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &fallback.source,
+                ByteRange::default(),
+                "standalone compilation requires an entry module containing `main`",
+                "set the Application `entry` module and define `main(args: Array<string>) -> i32`",
+            );
+            return;
+        };
+        let key = (
+            self.input.root_manifest.id.clone(),
+            entry_module.clone(),
+            "main".to_owned(),
+        );
+        let Some(definition) = self.symbols.get(&key).copied() else {
+            let source = self
+                .modules
+                .iter()
+                .find(|module| {
+                    module.key.package == self.input.root_manifest.id
+                        && module.key.module == entry_module
+                })
+                .map_or_else(
+                    || self.fallback_source_range(),
+                    |module| source_range(&module.source, TextRange::at(TextSize::new(0), 0)),
+                );
+            self.push_source_error(
+                ErrorCode::NX2101,
+                &source.source,
+                range_from_source(&source),
+                format!(
+                    "standalone entry module `{entry_module}` is missing `main(args: Array<string>) -> i32`"
+                ),
+                "`main` may be `fn` or `async fn`, but no other signature is accepted",
+            );
+            return;
+        };
+        let valid = self
+            .function_signatures
+            .get(&definition)
+            .is_some_and(|signature| {
+                signature.parameter_types == [IrType::Array(Box::new(IrType::String))]
+                    && signature.result == IrType::I32
+                    && matches!(signature.effect, IrEffect::Ordinary | IrEffect::Task)
+            });
+        if valid {
+            return;
+        }
+        let span = self.definition_name_span(definition);
+        self.push_source_error(
+            ErrorCode::NX2101,
+            &span.source,
+            range_from_source(&span),
+            "standalone `main` has an invalid signature",
+            "only `fn main(args: Array<string>) -> i32` or `async fn main(args: Array<string>) -> i32` is accepted",
+        );
     }
 
     fn evaluate_constants(&mut self) {
@@ -3776,6 +5909,26 @@ impl<'a> Analyzer<'a> {
             .collect::<BTreeMap<_, _>>();
         let mut visiting = BTreeSet::new();
         for definition in constants.keys().copied().collect::<Vec<_>>() {
+            let declared = self.definitions[definition.0 as usize].clone();
+            if !const_safe_type(
+                &declared.ty,
+                &self.definitions,
+                &self.type_metadata,
+                &self.variant_payloads,
+                &mut BTreeSet::new(),
+            ) {
+                self.push_source_error(
+                    ErrorCode::NX2720,
+                    &declared.span.source,
+                    range_from_source(&declared.span),
+                    format!(
+                        "type `{}` is not const-safe",
+                        display_ir_type(&declared.ty, &self.definitions)
+                    ),
+                    "const values may contain primitives, string, rune, Struct, Enum, Tuple, Option, and Result values only",
+                );
+                continue;
+            }
             let _ = self.evaluate_const(definition, &constants, &mut visiting);
         }
     }
@@ -3835,12 +5988,55 @@ impl<'a> Analyzer<'a> {
                 }
             },
             ExpressionKind::Name(path) => {
-                let definition = self.resolve_symbol_path(module, path, SymbolUse::Value)?;
-                if self.definitions[definition.0 as usize].kind != DefinitionKind::Const {
-                    self.invalid_const(module, expression.range, "only another const may be read");
-                    return None;
+                if matches!(
+                    path.segments.as_slice(),
+                    [namespace, variant]
+                        if namespace.text == "Option" && variant.text == "None"
+                ) {
+                    if !matches!(expected, Some(IrType::Option(_))) {
+                        self.invalid_const(
+                            module,
+                            expression.range,
+                            "`Option::None` requires an `Option<T>` const type",
+                        );
+                        return None;
+                    }
+                    return Some(ConstValue::BuiltinVariant {
+                        variant: BuiltinVariantIr::OptionNone,
+                        value: None,
+                    });
                 }
-                self.evaluate_const(definition, constants, visiting)
+                let definition = self.resolve_symbol_path(module, path, SymbolUse::Value)?;
+                match self.definitions[definition.0 as usize].kind {
+                    DefinitionKind::Const => self.evaluate_const(definition, constants, visiting),
+                    DefinitionKind::Variant
+                        if self
+                            .variant_payloads
+                            .get(&definition)
+                            .is_none_or(Vec::is_empty) =>
+                    {
+                        Some(ConstValue::Variant {
+                            definition,
+                            values: Vec::new(),
+                        })
+                    }
+                    DefinitionKind::Variant => {
+                        self.invalid_const(
+                            module,
+                            expression.range,
+                            "Enum variant payload is required in this const expression",
+                        );
+                        None
+                    }
+                    _ => {
+                        self.invalid_const(
+                            module,
+                            expression.range,
+                            "only another const or a unit Enum variant may be read",
+                        );
+                        None
+                    }
+                }
             }
             ExpressionKind::Tuple(values) => values
                 .iter()
@@ -3854,17 +6050,6 @@ impl<'a> Analyzer<'a> {
                 })
                 .collect::<Option<Vec<_>>>()
                 .map(ConstValue::Tuple),
-            ExpressionKind::Array(values) => values
-                .iter()
-                .map(|value| {
-                    let expected = expected.and_then(|expected| match expected {
-                        IrType::Array(inner) => Some(inner.as_ref()),
-                        _ => None,
-                    });
-                    self.evaluate_const_expression(module, value, expected, constants, visiting)
-                })
-                .collect::<Option<Vec<_>>>()
-                .map(ConstValue::Array),
             ExpressionKind::Unary { operator, operand } => {
                 let value =
                     self.evaluate_const_expression(module, operand, expected, constants, visiting)?;
@@ -3918,8 +6103,36 @@ impl<'a> Analyzer<'a> {
                     None
                 })
             }
-            ExpressionKind::Construct { ty, fields } => {
-                let definition = self.resolve_symbol_path(module, ty, SymbolUse::Type)?;
+            ExpressionKind::Construct { ty, fields, update } => {
+                if update.is_some() {
+                    self.invalid_const(
+                        module,
+                        expression.range,
+                        "constant Struct values cannot use update syntax",
+                    );
+                    return None;
+                }
+                let definition = if self
+                    .lookup_symbol_path(module, ty)
+                    .is_some_and(|definition| {
+                        self.definitions[definition.0 as usize].kind == DefinitionKind::Variant
+                    }) {
+                    self.resolve_symbol_path(module, ty, SymbolUse::Value)?
+                } else {
+                    self.resolve_symbol_path(module, ty, SymbolUse::Type)?
+                };
+                let definition_kind = self.definitions[definition.0 as usize].kind;
+                if !matches!(
+                    definition_kind,
+                    DefinitionKind::Struct | DefinitionKind::Variant
+                ) {
+                    self.invalid_const(
+                        module,
+                        expression.range,
+                        "only Struct values and struct-style Enum variants may be constructed in a const",
+                    );
+                    return None;
+                }
                 let mut values = Vec::new();
                 for field in fields {
                     let Some(field_id) = self
@@ -3941,16 +6154,83 @@ impl<'a> Analyzer<'a> {
                     values.push((field_id, value));
                 }
                 values.sort_by_key(|(field, _)| *field);
-                Some(ConstValue::Construct {
-                    definition,
-                    fields: values,
-                })
+                if definition_kind == DefinitionKind::Struct {
+                    Some(ConstValue::Construct {
+                        definition,
+                        fields: values,
+                    })
+                } else {
+                    Some(ConstValue::Variant {
+                        definition,
+                        values: values.into_iter().map(|(_, value)| value).collect(),
+                    })
+                }
             }
             ExpressionKind::Call {
                 callee, arguments, ..
             } => {
-                if let ExpressionKind::Name(path) = &callee.kind
-                    && let Some(variant) = self.resolve_symbol_path(module, path, SymbolUse::Value)
+                let ExpressionKind::Name(path) = &callee.kind else {
+                    self.invalid_const(
+                        module,
+                        expression.range,
+                        "constant expressions cannot call computed values",
+                    );
+                    return None;
+                };
+                let builtin = match (path.segments.as_slice(), expected) {
+                    ([namespace, variant], Some(IrType::Option(inner)))
+                        if namespace.text == "Option" && variant.text == "Some" =>
+                    {
+                        Some((BuiltinVariantIr::OptionSome, inner.as_ref()))
+                    }
+                    ([namespace, variant], Some(IrType::Result(ok, _)))
+                        if namespace.text == "Result" && variant.text == "Ok" =>
+                    {
+                        Some((BuiltinVariantIr::ResultOk, ok.as_ref()))
+                    }
+                    ([namespace, variant], Some(IrType::Result(_, error)))
+                        if namespace.text == "Result" && variant.text == "Err" =>
+                    {
+                        Some((BuiltinVariantIr::ResultErr, error.as_ref()))
+                    }
+                    _ => None,
+                };
+                if let Some((variant, payload_type)) = builtin {
+                    let [argument] = arguments.as_slice() else {
+                        self.invalid_const(
+                            module,
+                            expression.range,
+                            "builtin const variant requires exactly one payload",
+                        );
+                        return None;
+                    };
+                    let value = self.evaluate_const_expression(
+                        module,
+                        argument,
+                        Some(payload_type),
+                        constants,
+                        visiting,
+                    )?;
+                    return Some(ConstValue::BuiltinVariant {
+                        variant,
+                        value: Some(Box::new(value)),
+                    });
+                }
+                if matches!(
+                    path.segments.as_slice(),
+                    [namespace, variant]
+                        if (namespace.text == "Option" && variant.text == "Some")
+                            || (namespace.text == "Result"
+                                && matches!(variant.text.as_str(), "Ok" | "Err"))
+                ) {
+                    self.invalid_const(
+                        module,
+                        expression.range,
+                        "builtin variant does not match the declared const type",
+                    );
+                    return None;
+                }
+                if let Some(variant) = self.resolve_symbol_path(module, path, SymbolUse::Value)
                     && self.definitions[variant.0 as usize].kind == DefinitionKind::Variant
                 {
                     let payload = self
@@ -4011,16 +6291,39 @@ impl<'a> Analyzer<'a> {
             let module = self.modules[record.module_index].clone();
             let typed = match &record.declaration.kind {
                 DeclarationKind::Function(function) => {
-                    let signature = self
+                    let mut signature = self
                         .function_signatures
                         .get(&record.definition)
                         .cloned()
                         .expect("function signature was resolved");
+                    let is_repl_entry = self.repl_entry_definition == Some(record.definition);
                     let mut checker =
                         BodyChecker::new(self, module.clone(), Some(record.definition), &signature);
-                    let body = checker.check_block(&function.body);
+                    let body = if is_repl_entry {
+                        checker.check_repl_entry_block(&function.body)
+                    } else {
+                        checker.check_block(&function.body)
+                    };
                     checker.validate_migration_body(&function.body, &body);
                     let locals = checker.locals;
+                    if is_repl_entry {
+                        signature.result = body
+                            .tail
+                            .as_ref()
+                            .map_or(IrType::Unit, |tail| tail.ty.clone());
+                        self.definitions[record.definition.0 as usize].ty =
+                            signature.result.clone();
+                        self.function_signatures
+                            .insert(record.definition, signature.clone());
+                        let ordinal = self.repl_cell.map_or(1, |cell| cell.ordinal);
+                        self.repl_entry = Some(crate::ReplEntrypointIr {
+                            cell_ordinal: ordinal,
+                            function: record.definition,
+                            stable_id: crate::repl_cell_entry_symbol(ordinal),
+                            result: signature.result.clone(),
+                            effect: signature.effect,
+                        });
+                    }
                     if signature.effect == IrEffect::Task {
                         self.restricted
                             .entry(record.definition)
@@ -4082,6 +6385,12 @@ impl<'a> Analyzer<'a> {
                             definition: *definition,
                             ty: self.definitions[definition.0 as usize].ty.clone(),
                             order: u32::try_from(order).unwrap_or(u32::MAX),
+                            mutable: ty.kind == TypeDeclarationKind::Class
+                                && metadata
+                                    .field_mutability
+                                    .get(definition)
+                                    .copied()
+                                    .unwrap_or(false),
                         })
                         .collect::<Vec<_>>();
                     let variants = metadata
@@ -4108,8 +6417,18 @@ impl<'a> Analyzer<'a> {
                         .collect::<Vec<_>>();
                     let layout = match ty.kind {
                         TypeDeclarationKind::Struct => TypedTypeLayoutIr::Struct { fields },
-                        TypeDeclarationKind::Class => TypedTypeLayoutIr::Class { fields },
-                        TypeDeclarationKind::Stateful => TypedTypeLayoutIr::Stateful { fields },
+                        TypeDeclarationKind::Class => TypedTypeLayoutIr::Class {
+                            fields,
+                            state: metadata.state.as_ref().and_then(|state| {
+                                self.stable_ids
+                                    .get(&record.definition)
+                                    .copied()
+                                    .map(|stable_id| StateMetadataIr {
+                                        version: state.version,
+                                        stable_id,
+                                    })
+                            }),
+                        },
                         TypeDeclarationKind::Enum => TypedTypeLayoutIr::Enum { variants },
                     };
                     TypedDeclarationIr {
@@ -4241,7 +6560,7 @@ impl<'a> Analyzer<'a> {
                         | DefinitionKind::Local
                         | DefinitionKind::Field
                         | DefinitionKind::Variant
-                        | DefinitionKind::HostInterface
+                        | DefinitionKind::HostContract
                         | DefinitionKind::HostFunction
                         | DefinitionKind::StandardLibrary
                 )
@@ -4289,7 +6608,7 @@ impl<'a> Analyzer<'a> {
             }
             self.state_records.push(SemanticFingerprintRecord {
                 canonical_identity: definition.canonical_identity.clone(),
-                kind: "stateful".into(),
+                kind: "state-class".into(),
                 payload,
             });
         }
@@ -4302,6 +6621,11 @@ impl<'a> Analyzer<'a> {
         self.modules
             .iter()
             .any(|module| module.source == *source && module.role == SourceRole::Production)
+            || (self.mode == AnalysisMode::ReplCell
+                && self
+                    .repl_prior_modules
+                    .iter()
+                    .any(|module| module.source == *source))
     }
 
     fn production_state_types(&self) -> Vec<AnalyzedStateType> {
@@ -4312,18 +6636,40 @@ impl<'a> Analyzer<'a> {
             .collect()
     }
 
+    #[allow(clippy::too_many_lines)]
     fn typed_modules(&mut self) -> Vec<TypedModuleIr> {
-        let mut typed_modules = Vec::new();
+        let mut typed_modules = self.repl_prior_modules.clone();
+        let next_repl_file_id = typed_modules
+            .iter()
+            .map(|module| module.file_id.0)
+            .chain(
+                self.repl_prior_external_sources
+                    .iter()
+                    .map(|source| source.file_id.0),
+            )
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .expect("REPL artifact FileId space is not exhausted");
         for (index, module) in self.modules.iter().enumerate() {
             if self.mode != AnalysisMode::Test && module.role != SourceRole::Production {
                 continue;
             }
+            let prior_has_compiler_module = self
+                .repl_prior_modules
+                .iter()
+                .any(|prior| prior.package_id.as_str() == nexa_stdlib::PACKAGE_ID);
+            if prior_has_compiler_module && module.compiler_provided {
+                continue;
+            }
             let module_key = ModuleKey::new(module.key.package.clone(), module.key.module.clone());
-            if let Some(cached) = self.db.typed_module(
-                &module_key,
-                &self.definitions,
-                &self.typed_module_semantic_context,
-            ) {
+            if self.mode != AnalysisMode::ReplCell
+                && let Some(cached) = self.db.typed_module(
+                    &module_key,
+                    &self.definitions,
+                    &self.typed_module_semantic_context,
+                )
+            {
                 typed_modules.push((*cached).clone());
                 continue;
             }
@@ -4343,8 +6689,22 @@ impl<'a> Analyzer<'a> {
             let typed = TypedModuleIr {
                 package_id: module.key.package.clone(),
                 module: module.key.module.clone(),
+                virtual_module_path: module.virtual_module_path.clone(),
                 source: module.source.clone(),
-                file_id: if module.compiler_provided {
+                file_id: if self.mode == AnalysisMode::ReplCell {
+                    ArtifactFileId(
+                        next_repl_file_id
+                            .checked_add(
+                                u32::try_from(
+                                    typed_modules
+                                        .len()
+                                        .saturating_sub(self.repl_prior_modules.len()),
+                                )
+                                .expect("REPL module count fits u32"),
+                            )
+                            .expect("REPL artifact FileId space is not exhausted"),
+                    )
+                } else if module.compiler_provided {
                     *self
                         .compiler_file_ids
                         .get(&module.source)
@@ -4363,23 +6723,95 @@ impl<'a> Analyzer<'a> {
                     .unwrap_or_default()
                     .into(),
             };
-            self.db.store_typed_module(
-                module_key.clone(),
-                Arc::new(typed.clone()),
-                &self.definitions,
-                self.typed_module_semantic_context,
-                {
-                    let mut dependencies = semantic_input_query_keys(self.input);
-                    dependencies.extend([
-                        QueryKey::Parse(module.source.clone()),
-                        QueryKey::ResolvedImports(module_key),
-                    ]);
-                    dependencies
-                },
-            );
+            if self.mode != AnalysisMode::ReplCell {
+                self.db.store_typed_module(
+                    module_key.clone(),
+                    Arc::new(typed.clone()),
+                    &self.definitions,
+                    self.typed_module_semantic_context,
+                    {
+                        let mut dependencies = semantic_input_query_keys(self.input);
+                        dependencies.extend([
+                            QueryKey::Parse(module.source.clone()),
+                            QueryKey::ResolvedImports(module_key),
+                        ]);
+                        dependencies
+                    },
+                );
+            }
             typed_modules.push(typed);
         }
+        self.refresh_repl_environment_layout(&mut typed_modules);
+        if self.mode == AnalysisMode::ReplCell {
+            // A cumulative Cell inserts a new package source before compiler-provided and external
+            // sources in the artifact authority. FileIds are artifact-local, so recanonicalize the
+            // complete module catalog on every candidate instead of preserving stale numeric IDs.
+            let mut canonical_order = (0..typed_modules.len()).collect::<Vec<_>>();
+            canonical_order.sort_by(|left, right| {
+                let left = &typed_modules[*left];
+                let right = &typed_modules[*right];
+                let left_tier = u8::from(left.package_id.as_str() == nexa_stdlib::PACKAGE_ID);
+                let right_tier = u8::from(right.package_id.as_str() == nexa_stdlib::PACKAGE_ID);
+                (left_tier, source_identity(&left.source).to_string())
+                    .cmp(&(right_tier, source_identity(&right.source).to_string()))
+            });
+            for (offset, module) in canonical_order.into_iter().enumerate() {
+                typed_modules[module].file_id = ArtifactFileId(
+                    u32::try_from(offset.saturating_add(1))
+                        .expect("REPL module count fits artifact FileId"),
+                );
+            }
+        }
         typed_modules
+    }
+
+    fn refresh_repl_environment_layout(&self, modules: &mut [TypedModuleIr]) {
+        let Some(environment) = self.repl_environment_definition else {
+            return;
+        };
+        let Some(metadata) = self.type_metadata.get(&environment) else {
+            return;
+        };
+        let Some(state) = self
+            .state_types
+            .iter()
+            .find(|state| state.definition == environment)
+        else {
+            return;
+        };
+        let fields = metadata
+            .field_order
+            .iter()
+            .enumerate()
+            .map(|(order, definition)| FieldLayoutIr {
+                definition: *definition,
+                ty: self.definitions[definition.0 as usize].ty.clone(),
+                order: u32::try_from(order).unwrap_or(u32::MAX),
+                mutable: metadata
+                    .field_mutability
+                    .get(definition)
+                    .copied()
+                    .unwrap_or(false),
+            })
+            .collect::<Vec<_>>();
+        for module in modules {
+            let mut declarations = module.declarations.to_vec();
+            let Some(declaration) = declarations
+                .iter_mut()
+                .find(|declaration| declaration.definition == environment)
+            else {
+                continue;
+            };
+            declaration.body = TypedDeclarationBody::TypeLayout(TypedTypeLayoutIr::Class {
+                fields: fields.clone(),
+                state: Some(StateMetadataIr {
+                    version: state.version,
+                    stable_id: state.stable_id,
+                }),
+            });
+            module.declarations = declarations.into();
+            break;
+        }
     }
 
     fn push_source_error(
@@ -4455,6 +6887,7 @@ struct BodyChecker<'analyzer, 'input> {
     effect: IrEffect,
     scopes: Vec<BTreeMap<String, DefinitionId>>,
     locals: Vec<DefinitionId>,
+    mutable_bindings: BTreeSet<DefinitionId>,
     readonly_loop_bindings: BTreeSet<DefinitionId>,
     loop_depth: usize,
     defer_count: usize,
@@ -4485,6 +6918,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             effect: signature.effect,
             scopes: vec![parameters],
             locals: Vec::new(),
+            mutable_bindings: BTreeSet::new(),
             readonly_loop_bindings: BTreeSet::new(),
             loop_depth: 0,
             defer_count: 0,
@@ -4510,12 +6944,120 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         TypedBlockIr { statements, tail }
     }
 
+    fn check_repl_entry_block(&mut self, block: &ast::Block) -> TypedBlockIr {
+        self.scopes.push(BTreeMap::new());
+        let statements = block
+            .statements
+            .iter()
+            .filter_map(|statement| self.check_repl_top_level_statement(statement))
+            .collect();
+        let tail = block
+            .tail
+            .as_ref()
+            .map(|expression| Box::new(self.check_expression(expression, None)));
+        self.scopes.pop();
+        TypedBlockIr { statements, tail }
+    }
+
+    fn check_repl_top_level_statement(
+        &mut self,
+        statement: &Statement,
+    ) -> Option<TypedStatementIr> {
+        if matches!(statement.kind, StatementKind::Return(_)) {
+            self.analyzer.push_source_error(
+                ErrorCode::NX2101,
+                &self.module.source,
+                byte_range(statement.range),
+                "REPL cells cannot use a top-level `return` statement",
+                "use the cell's tail expression as its result",
+            );
+            return None;
+        }
+        let StatementKind::Bind {
+            mutable,
+            name,
+            ty,
+            value,
+        } = &statement.kind
+        else {
+            return self.check_statement(statement);
+        };
+        self.analyzer.validate_snake_name(
+            &self.module.clone(),
+            name,
+            "local variable names must use snake_case",
+        );
+        let expected = ty
+            .as_ref()
+            .map(|ty| self.analyzer.resolve_type_ref(&self.module, ty));
+        let value = self.check_expression(value, expected.as_ref());
+        let resolved = expected.unwrap_or_else(|| value.ty.clone());
+        self.expect_type(&value.ty, &resolved, &value.span);
+        let Some(definition) = self.analyzer.allocate_repl_state_field(
+            &self.module.clone(),
+            &name.text,
+            *mutable,
+            resolved,
+            name.range,
+        ) else {
+            self.analyzer.push_source_error(
+                ErrorCode::NX2101,
+                &self.module.source,
+                byte_range(statement.range),
+                "REPL persistent environment is unavailable",
+                "analyze the cell from the formal revision-zero REPL seed",
+            );
+            return None;
+        };
+        self.scopes
+            .last_mut()
+            .expect("a lexical scope exists")
+            .insert(name.text.clone(), definition);
+        if *mutable {
+            self.mutable_bindings.insert(definition);
+        }
+        self.mark_restricted(RestrictedOperation::PersistentState);
+        Some(TypedStatementIr::Assign {
+            target: TypedPlaceIr::StateField {
+                base: Box::new(
+                    self.repl_environment_expression(source_range(&self.module.source, name.range)),
+                ),
+                field: definition,
+            },
+            value,
+        })
+    }
+
+    fn repl_environment_expression(&self, span: SourceRange) -> TypedExpressionIr {
+        let environment = self
+            .analyzer
+            .repl_environment_definition
+            .expect("formal cumulative REPL analysis has an environment definition");
+        TypedExpressionIr {
+            ty: IrType::Named(environment),
+            effect: IrEffect::Immediate,
+            span,
+            kind: TypedExpressionKind::PersistentStateGet {
+                identity: crate::repl_environment_symbol().0,
+                state_type: environment,
+            },
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     fn check_statement(&mut self, statement: &Statement) -> Option<TypedStatementIr> {
         match &statement.kind {
             StatementKind::Bind {
-                name, ty, value, ..
+                mutable,
+                name,
+                ty,
+                value,
             } => {
+                self.analyzer.validate_snake_name(
+                    &self.module.clone(),
+                    name,
+                    "local variable names must use snake_case",
+                );
                 let expected = ty
                     .as_ref()
                     .map(|ty| self.analyzer.resolve_type_ref(&self.module, ty));
@@ -4527,8 +7069,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     .last_mut()
                     .expect("a lexical scope exists")
                     .insert(name.text.clone(), definition);
+                if *mutable {
+                    self.mutable_bindings.insert(definition);
+                }
                 Some(TypedStatementIr::Let {
                     definition,
+                    mutable: *mutable,
                     value: Some(value),
                 })
             }
@@ -4675,15 +7221,28 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                         ErrorCode::NX2301,
                         &self.module.source,
                         byte_range(statement.range),
-                        "yield is only valid in a Task",
-                        "ordinary and Immediate functions cannot yield",
+                        "yield is only valid in an async function",
+                        "a synchronous function cannot yield",
                     );
                 }
                 self.mark_restricted(RestrictedOperation::Yield);
-                Some(TypedStatementIr::Yield)
+                Some(TypedStatementIr::Yield {
+                    span: source_range(&self.module.source, statement.range),
+                })
             }
             StatementKind::Defer(expression) => {
                 let mut expression = self.check_expression(expression, None);
+                if expression.effect == IrEffect::Task
+                    || typed_expression_contains_await(&expression)
+                {
+                    self.analyzer.push_source_error(
+                        ErrorCode::NX2301,
+                        &self.module.source,
+                        byte_range(statement.range),
+                        "defer cleanup cannot await or call asynchronous code",
+                        "defer always runs in a synchronous cleanup context",
+                    );
+                }
                 let visible = self
                     .scopes
                     .iter()
@@ -4830,8 +7389,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 if let Some(value) = self.check_receiver_name(path) {
                     return value;
                 }
-                if path.segments.len() == 1
-                    && path.segments[0].text == "None"
+                if path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.text.as_str())
+                    .eq(["Option", "None"])
                     && let Some(value) = self.check_empty_builtin_variant(
                         BuiltinVariantIr::OptionNone,
                         expected,
@@ -4880,7 +7442,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 let element = expected_element
                     .cloned()
                     .or_else(|| values.first().map(|value| value.ty.clone()))
-                    .unwrap_or(IrType::Unit);
+                    .unwrap_or_else(|| {
+                        self.type_error(
+                            span.clone(),
+                            "empty array literal requires an expected `Array<T>` type",
+                        );
+                        IrType::Unit
+                    });
                 for value in &values {
                     self.expect_type(&value.ty, &element, &value.span);
                 }
@@ -4924,11 +7492,18 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 let left = self.check_expression(left, expected);
                 let right = self.check_expression(right, Some(&left.ty));
                 self.expect_type(&right.ty, &left.ty, &right.span);
-                let result = binary_result(operator.kind, &left.ty, &self.analyzer.definitions)
-                    .unwrap_or_else(|| {
-                        self.type_error(span.clone(), "invalid binary operand type");
-                        self.recovery_unit_type(&span)
-                    });
+                let result = binary_result(
+                    operator.kind,
+                    &left.ty,
+                    &self.analyzer.definitions,
+                    &self.analyzer.type_metadata,
+                    &self.analyzer.variant_payloads,
+                    &self.analyzer.host_types,
+                )
+                .unwrap_or_else(|| {
+                    self.type_error(span.clone(), "invalid binary operand type");
+                    self.recovery_unit_type(&span)
+                });
                 TypedExpressionIr {
                     ty: result,
                     effect: max_effect(left.effect, right.effect),
@@ -4952,10 +7527,10 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 expected,
                 awaited,
             ),
-            ExpressionKind::Construct { ty, fields } => {
-                self.check_construct(expression, ty, fields)
+            ExpressionKind::Construct { ty, fields, update } => {
+                self.check_construct(expression, ty, fields, update.as_deref())
             }
-            ExpressionKind::New { ty, fields } => {
+            ExpressionKind::New { ty, fields, update } => {
                 let definition = match &ty.kind {
                     TypeKind::Named(path) | TypeKind::Generic { base: path, .. } => self
                         .analyzer
@@ -4963,30 +7538,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     _ => None,
                 };
                 if let Some(definition) = definition {
-                    self.check_construct_fields(expression, definition, fields)
+                    self.check_class_construct(expression, definition, fields, update.as_deref())
                 } else {
                     self.error_expression(span)
-                }
-            }
-            ExpressionKind::With { value, fields } => {
-                let value = self.check_expression(value, expected);
-                let IrType::Named(definition) = value.ty else {
-                    self.type_error(span.clone(), "`with` requires a struct value");
-                    return self.error_expression(span);
-                };
-                if self.analyzer.definitions[definition.0 as usize].kind != DefinitionKind::Struct {
-                    self.type_error(span.clone(), "`with` requires a struct value");
-                    return self.error_expression(span);
-                }
-                let fields = self.check_fields(definition, fields);
-                TypedExpressionIr {
-                    ty: IrType::Named(definition),
-                    effect: value.effect,
-                    span,
-                    kind: TypedExpressionKind::Update {
-                        base: Box::new(value),
-                        fields,
-                    },
                 }
             }
             ExpressionKind::Member { receiver, member } => {
@@ -5019,26 +7573,29 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     },
                 }
             }
-            ExpressionKind::Await(value) => {
+            ExpressionKind::Await { operand } => {
+                let await_range = TextRange::at(
+                    TextSize::new(expression.range.end.get().saturating_sub(6)),
+                    6,
+                );
                 if self.effect != IrEffect::Task {
                     self.analyzer.push_source_error(
                         ErrorCode::NX2301,
                         &self.module.source,
-                        byte_range(TextRange::at(expression.range.start, 5)),
-                        "await is only valid in a Task",
-                        "ordinary and Immediate functions cannot await",
+                        byte_range(await_range),
+                        "`.await` is only valid in an async function",
+                        "make the enclosing function `async fn` or remove `.await`",
                     );
                 }
                 self.mark_restricted(RestrictedOperation::Await);
-                let operand_range = byte_range(value.range);
-                let value = self.check_expression_inner(value, expected, true);
+                let value = self.check_expression_inner(operand, expected, true);
                 if self.effect == IrEffect::Task && value.effect != IrEffect::Task {
                     self.analyzer.push_source_error(
                         ErrorCode::NX2301,
                         &self.module.source,
-                        operand_range,
-                        "await requires a Task or Host Request operand",
-                        "remove `await` or call a Task/Request function",
+                        byte_range(await_range),
+                        "`.await` requires an asynchronous call result",
+                        "remove `.await` or call an `async fn`/asynchronous Host function",
                     );
                 }
                 if value.ty == IrType::Unit && self.is_recovery_unit(&value.span) {
@@ -5052,8 +7609,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             ExpressionKind::Try(value) => {
-                // `await request()?` is represented as Await(Try(Call)) by the lossless AST.
-                // Preserve the enclosing await context through `?` so the Request call itself is
+                // `request().await?` is represented as Try(Await(Call)) by the lossless AST.
+                // Preserve the enclosing await context through `?` so the async call itself is
                 // not incorrectly diagnosed as un-awaited.
                 let value = self.check_expression_inner(value, None, awaited);
                 let question_range = TextRange::at(
@@ -5152,7 +7709,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     ///
     /// The lossless parser intentionally keeps `value.field.more` as one qualified name. Semantic
     /// analysis gives a lexical value precedence over an imported namespace. An imported
-    /// namespace can also contribute the receiver (`import app.util as u; u.origin.x`): after the
+    /// namespace can also contribute the receiver (`use package::app::util as u; u::origin.x`):
+    /// after the
     /// namespace and value segments are consumed, every remaining segment is resolved from the
     /// receiver's nominal [`IrType::Named`] owner and lowered as a real field access.
     fn check_receiver_name(&mut self, path: &ast::QualifiedName) -> Option<TypedExpressionIr> {
@@ -5179,6 +7737,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     ) -> Option<(TypedExpressionIr, usize)> {
         let first = path.segments.first()?;
         if let Some(definition) = self.local(&first.text) {
+            self.analyzer
+                .record_reference(&self.module, first.range, definition);
+            return Some((self.receiver_reference(definition, first.range), 1));
+        }
+        if let Some(definition) =
+            self.analyzer
+                .repl_snapshot_symbol(&self.module, path, SymbolUse::Value)
+        {
             self.analyzer
                 .record_reference(&self.module, first.range, definition);
             return Some((self.receiver_reference(definition, first.range), 1));
@@ -5250,12 +7816,29 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         ))
     }
 
-    fn receiver_reference(&self, definition: DefinitionId, range: TextRange) -> TypedExpressionIr {
-        let declared = &self.analyzer.definitions[definition.0 as usize];
+    fn receiver_reference(
+        &mut self,
+        definition: DefinitionId,
+        range: TextRange,
+    ) -> TypedExpressionIr {
+        let declared = self.analyzer.definitions[definition.0 as usize].clone();
+        let span = source_range(&self.module.source, range);
+        if self.analyzer.is_repl_state_field(definition) {
+            self.mark_restricted(RestrictedOperation::PersistentState);
+            return TypedExpressionIr {
+                ty: declared.ty,
+                effect: IrEffect::Immediate,
+                span: span.clone(),
+                kind: TypedExpressionKind::StateField {
+                    base: Box::new(self.repl_environment_expression(span)),
+                    field: definition,
+                },
+            };
+        }
         TypedExpressionIr {
-            ty: declared.ty.clone(),
+            ty: declared.ty,
             effect: declared.effect,
-            span: source_range(&self.module.source, range),
+            span,
             kind: TypedExpressionKind::Reference(definition),
         }
     }
@@ -5263,6 +7846,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     fn is_receiver_value_definition(&self, definition: DefinitionId) -> bool {
         match self.analyzer.definitions[definition.0 as usize].kind {
             DefinitionKind::Const | DefinitionKind::Parameter | DefinitionKind::Local => true,
+            DefinitionKind::Field => self.analyzer.is_repl_state_field(definition),
             DefinitionKind::StandardLibrary => {
                 !self.analyzer.external_functions.contains_key(&definition)
                     && !self.analyzer.type_metadata.contains_key(&definition)
@@ -5272,10 +7856,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             | DefinitionKind::Struct
             | DefinitionKind::Enum
             | DefinitionKind::Class
-            | DefinitionKind::Stateful
-            | DefinitionKind::Field
             | DefinitionKind::Variant
-            | DefinitionKind::HostInterface
+            | DefinitionKind::HostContract
             | DefinitionKind::HostFunction => false,
         }
     }
@@ -5365,12 +7947,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             );
             return None;
         };
-        if self.is_stateful_definition(owner) {
+        if self.is_state_definition(owner) {
             self.analyzer.push_source_error(
                 ErrorCode::NX2101,
                 &self.module.source,
                 byte_range(whole_range),
-                "@stateful fields cannot be accessed directly",
+                "@state fields cannot be accessed directly",
                 "use old.field/new.set during migration and StateHandle APIs at runtime",
             );
             return None;
@@ -5410,11 +7992,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         })
     }
 
-    fn is_stateful_definition(&self, definition: DefinitionId) -> bool {
+    fn is_state_definition(&self, definition: DefinitionId) -> bool {
         self.analyzer
             .type_metadata
             .get(&definition)
-            .is_some_and(|metadata| metadata.stateful)
+            .is_some_and(|metadata| metadata.state.is_some())
     }
 
     fn check_receiver_method_path<'path>(
@@ -5443,6 +8025,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         path: &ast::QualifiedName,
         type_arguments: &[TypeRef],
         arguments: &[Expression],
+        expected: Option<&IrType>,
     ) -> Option<TypedExpressionIr> {
         let segments = path
             .segments
@@ -5455,11 +8038,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             _ => return None,
         };
         let span = source_range(&self.module.source, whole.range);
-        if type_arguments.len() != arity {
+        if !type_arguments.is_empty() && type_arguments.len() != arity {
             self.type_error(
                 span.clone(),
                 &format!(
-                    "`{}` expects {arity} type arguments, found {}",
+                    "`{}` expects either no explicit type arguments or exactly {arity}, found {}",
                     path.text(),
                     type_arguments.len()
                 ),
@@ -5475,12 +8058,33 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 ),
             );
         }
-        let mut resolved_type_arguments = type_arguments
-            .iter()
-            .take(arity)
-            .map(|argument| self.analyzer.resolve_type_ref(&self.module, argument))
-            .collect::<Vec<_>>();
-        resolved_type_arguments.resize(arity, IrType::Unit);
+        let resolved_type_arguments = if type_arguments.len() == arity {
+            type_arguments
+                .iter()
+                .map(|argument| self.analyzer.resolve_type_ref(&self.module, argument))
+                .collect::<Vec<_>>()
+        } else if type_arguments.is_empty() {
+            match (operation, expected) {
+                (BuiltinOperationIr::ArrayNew, Some(IrType::Array(element))) => {
+                    vec![element.as_ref().clone()]
+                }
+                (BuiltinOperationIr::MapNew, Some(IrType::Map(key, value))) => {
+                    vec![key.as_ref().clone(), value.as_ref().clone()]
+                }
+                _ => {
+                    self.type_error(
+                        span.clone(),
+                        &format!(
+                            "cannot infer `{}` element types without an expected type",
+                            path.text()
+                        ),
+                    );
+                    vec![IrType::Unit; arity]
+                }
+            }
+        } else {
+            vec![IrType::Unit; arity]
+        };
         let result = match operation {
             BuiltinOperationIr::ArrayNew => {
                 IrType::Array(Box::new(resolved_type_arguments[0].clone()))
@@ -5950,8 +8554,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             | SurfaceType::Rune
             | SurfaceType::Named { .. }
             | SurfaceType::Map(_, _)
-            | SurfaceType::HostRequest(_)
-            | SurfaceType::ResourceToken(_)
+            | SurfaceType::Token(_)
             | SurfaceType::Snapshot(_)
             | SurfaceType::Buffer(_)
             | SurfaceType::StateHandle(_) => {
@@ -5989,13 +8592,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     self.analyzer.lookup_symbol_path(&self.module, path)
                 }?;
                 let definition = &self.analyzer.definitions[definition.0 as usize];
-                matches!(
+                (matches!(
                     definition.kind,
                     DefinitionKind::Parameter
                         | DefinitionKind::Local
                         | DefinitionKind::Const
                         | DefinitionKind::Variant
-                )
+                ) || self.analyzer.is_repl_state_field(definition.id))
                 .then(|| definition.ty.clone())
             }
             ExpressionKind::Tuple(values) => values
@@ -6023,7 +8626,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             }
             ExpressionKind::Binary { left, operator, .. } => {
                 let left = self.infer_expression_type(left, allow_numeric_literals)?;
-                binary_result(operator.kind, &left, &self.analyzer.definitions)
+                binary_result(
+                    operator.kind,
+                    &left,
+                    &self.analyzer.definitions,
+                    &self.analyzer.type_metadata,
+                    &self.analyzer.variant_payloads,
+                    &self.analyzer.host_types,
+                )
             }
             ExpressionKind::Call {
                 callee,
@@ -6031,10 +8641,10 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 arguments,
             } => {
                 if let ExpressionKind::Name(path) = &callee.kind
-                    && let [name] = path.segments.as_slice()
+                    && let [namespace, name] = path.segments.as_slice()
                 {
-                    match name.text.as_str() {
-                        "Some" => {
+                    match (namespace.text.as_str(), name.text.as_str()) {
+                        ("Option", "Some") => {
                             let inner = type_arguments
                                 .first()
                                 .and_then(|ty| self.infer_type_ref(ty))
@@ -6045,13 +8655,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                                 })?;
                             return Some(IrType::Option(Box::new(inner)));
                         }
-                        "Ok" | "Err" if type_arguments.len() == 2 => {
+                        ("Result", "Ok" | "Err") if type_arguments.len() == 2 => {
                             return Some(IrType::Result(
                                 Box::new(self.infer_type_ref(&type_arguments[0])?),
                                 Box::new(self.infer_type_ref(&type_arguments[1])?),
                             ));
                         }
-                        "Ok" | "Err" => return None,
+                        ("Result", "Ok" | "Err") => return None,
                         _ => {}
                     }
                 }
@@ -6134,8 +8744,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 .lookup_symbol_path(&self.module, ty)
                 .map(IrType::Named),
             ExpressionKind::New { ty, .. } => self.infer_type_ref(ty),
-            ExpressionKind::With { value, .. } | ExpressionKind::Await(value) => {
-                self.infer_expression_type(value, allow_numeric_literals)
+            ExpressionKind::Await { operand } => {
+                self.infer_expression_type(operand, allow_numeric_literals)
             }
             ExpressionKind::Try(value) => {
                 match self.infer_expression_type(value, allow_numeric_literals)? {
@@ -6184,8 +8794,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             DefinitionKind::Struct
                                 | DefinitionKind::Enum
                                 | DefinitionKind::Class
-                                | DefinitionKind::Stateful
-                                | DefinitionKind::HostInterface
+                                | DefinitionKind::HostContract
                                 | DefinitionKind::StandardLibrary
                         )
                     })
@@ -6206,10 +8815,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ("Map", [key, value]) => {
                         Some(IrType::Map(Box::new(key.clone()), Box::new(value.clone())))
                     }
-                    ("HostRequest", [inner]) => {
-                        Some(IrType::HostRequest(Some(Box::new(inner.clone()))))
-                    }
-                    ("ResourceToken", [inner]) => {
+                    ("Token", [inner]) => {
                         Some(IrType::ResourceToken(Some(Box::new(inner.clone()))))
                     }
                     ("Snapshot", [inner]) => Some(IrType::Snapshot(Box::new(inner.clone()))),
@@ -6248,13 +8854,30 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         awaited: bool,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
-        if let ExpressionKind::Name(path) = &callee.kind
-            && let Some(intrinsic) =
-                self.check_migration_intrinsic(whole, path, type_arguments, arguments)
-        {
-            return intrinsic;
+        if let ExpressionKind::Name(path) = &callee.kind {
+            let name = path.text();
+            if let Some(intrinsic) =
+                self.check_migration_intrinsic(whole, &name, type_arguments, arguments, expected)
+            {
+                return intrinsic;
+            }
         }
         if let ExpressionKind::Member { receiver, member } = &callee.kind {
+            if let ExpressionKind::Name(path) = &receiver.kind
+                && let [root] = path.segments.as_slice()
+                && matches!(root.text.as_str(), "old" | "new")
+            {
+                let name = format!("{}.{}", root.text, member.text);
+                if let Some(intrinsic) = self.check_migration_intrinsic(
+                    whole,
+                    &name,
+                    type_arguments,
+                    arguments,
+                    expected,
+                ) {
+                    return intrinsic;
+                }
+            }
             let receiver = self.check_expression(receiver, None);
             return self
                 .check_builtin_method_call(whole, receiver, member, type_arguments, arguments)
@@ -6274,7 +8897,12 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             return self.error_expression(span);
         };
         if let Some(expression) =
-            self.check_builtin_constructor_call(whole, path, type_arguments, arguments)
+            self.check_builtin_constructor_call(whole, path, type_arguments, arguments, expected)
+        {
+            return expression;
+        }
+        if let Some(expression) =
+            self.check_builtin_variant_call(whole, path, type_arguments, arguments, expected)
         {
             return expression;
         }
@@ -6288,11 +8916,6 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     );
                     self.error_expression(span.clone())
                 });
-        }
-        if let Some(expression) =
-            self.check_builtin_variant_call(whole, path, type_arguments, arguments, expected)
-        {
-            return expression;
         }
         if let Some(definition) = self.analyzer.lookup_symbol_path(&self.module, path)
             && self.analyzer.definitions[definition.0 as usize].kind == DefinitionKind::Variant
@@ -6462,8 +9085,8 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 ErrorCode::NX2302,
                 &self.module.source,
                 byte_range(whole.range),
-                "Task/Request call must be awaited",
-                "prefix the call with `await` inside a Task",
+                "async call result must be consumed with postfix `.await`",
+                "append `.await` to the call inside an `async fn`, for example `call().await`",
             );
         }
         if let Some(caller) = self.current_function {
@@ -6473,9 +9096,9 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 .or_default()
                 .insert(definition);
         }
-        if let Some((interface, host_function)) = host {
+        if let Some((contract, host_function)) = host {
             self.mark_restricted(RestrictedOperation::Host);
-            if let Some(capability) = &host_function.required_capability {
+            for capability in &host_function.required_capabilities {
                 let available = self
                     .analyzer
                     .input
@@ -6498,7 +9121,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 effect,
                 span,
                 kind: TypedExpressionKind::HostCall {
-                    interface,
+                    contract,
                     function: definition,
                     arguments,
                 },
@@ -6532,13 +9155,13 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     fn check_migration_intrinsic(
         &mut self,
         whole: &Expression,
-        path: &ast::QualifiedName,
+        name: &str,
         type_arguments: &[TypeRef],
         arguments: &[Expression],
+        expected: Option<&IrType>,
     ) -> Option<TypedExpressionIr> {
-        let name = path.text();
         if !matches!(
-            name.as_str(),
+            name,
             "old.get"
                 | "old.field"
                 | "new.create"
@@ -6569,14 +9192,25 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
             this.type_error(span.clone(), &format!("`{name}` requires {expected}"));
             this.error_expression(span.clone())
         };
-        let expression = match name.as_str() {
+        let expression = match name {
             "old.get" => {
-                if !exact_counts(1, 1) {
-                    return Some(malformed(self, "one type argument and one state identity"));
+                if type_arguments.len() > 1 || arguments.len() != 1 {
+                    return Some(malformed(
+                        self,
+                        "one state identity and at most one explicit result type",
+                    ));
                 }
-                let value_type = self
-                    .analyzer
-                    .resolve_type_ref(&self.module, &type_arguments[0]);
+                let value_type = if let Some(ty) = type_arguments.first() {
+                    self.analyzer.resolve_type_ref(&self.module, ty)
+                } else if let Some(expected) = expected {
+                    expected.clone()
+                } else {
+                    self.type_error(
+                        span.clone(),
+                        "`old.get` result type must be explicit or inferred from context",
+                    );
+                    return Some(self.error_expression(span));
+                };
                 let Some(identity) = self.migration_identity(&arguments[0]) else {
                     return Some(self.error_expression(span));
                 };
@@ -6591,20 +9225,21 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             "old.field" => {
-                if !exact_counts(1, 2) {
+                if type_arguments.len() > 1 || arguments.len() != 2 {
                     return Some(malformed(
                         self,
-                        "one field-value type argument, an old object, and a Stateful field",
+                        "an old object, a @state Class field, and at most one explicit field type",
                     ));
                 }
-                let value_type = self
-                    .analyzer
-                    .resolve_type_ref(&self.module, &type_arguments[0]);
                 let object = self.check_expression(&arguments[0], None);
                 let Some(field) = self.migration_field(&arguments[1]) else {
                     return Some(self.error_expression(span));
                 };
                 let field_type = self.analyzer.definitions[field.0 as usize].ty.clone();
+                let value_type = type_arguments.first().map_or_else(
+                    || field_type.clone(),
+                    |ty| self.analyzer.resolve_type_ref(&self.module, ty),
+                );
                 self.expect_type(
                     &field_type,
                     &value_type,
@@ -6625,17 +9260,25 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 }
             }
             "new.create" => {
-                if !exact_counts(1, 1) {
+                if type_arguments.len() > 1 || arguments.len() != 1 {
                     return Some(malformed(
                         self,
-                        "one Stateful type argument and one state identity",
+                        "one state identity and at most one explicit @state Class type",
                     ));
                 }
-                let ty = self
-                    .analyzer
-                    .resolve_type_ref(&self.module, &type_arguments[0]);
+                let ty = if let Some(ty) = type_arguments.first() {
+                    self.analyzer.resolve_type_ref(&self.module, ty)
+                } else if let Some(expected) = expected {
+                    expected.clone()
+                } else {
+                    self.type_error(
+                        span.clone(),
+                        "`new.create` result type must be explicit or inferred from context",
+                    );
+                    return Some(self.error_expression(span));
+                };
                 let IrType::Named(state_type) = ty else {
-                    self.type_error(span.clone(), "`new.create` requires a Stateful type");
+                    self.type_error(span.clone(), "`new.create` requires a @state Class type");
                     return Some(self.error_expression(span));
                 };
                 if !self
@@ -6644,7 +9287,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     .iter()
                     .any(|state| state.definition == state_type)
                 {
-                    self.type_error(span.clone(), "`new.create` requires a Stateful type");
+                    self.type_error(span.clone(), "`new.create` requires a @state Class type");
                 }
                 let Some(identity) = self.migration_identity(&arguments[0]) else {
                     return Some(self.error_expression(span));
@@ -6663,7 +9306,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 if !exact_counts(0, 3) {
                     return Some(malformed(
                         self,
-                        "a new object, a Stateful field, and a field value",
+                        "a new object, a @state Class field, and a field value",
                     ));
                 }
                 let object = self.check_expression(&arguments[0], None);
@@ -6709,7 +9352,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 ) {
                     self.type_error(
                         target.span.clone(),
-                        "`replace` requires a newly created Stateful object",
+                        "`replace` requires a newly created @state Class object",
                     );
                 }
                 TypedExpressionIr {
@@ -6961,7 +9604,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     ..MigrationFlow::default()
                 }
             }
-            TypedStatementIr::Yield => MigrationFlow {
+            TypedStatementIr::Yield { .. } => MigrationFlow {
                 normal: paths,
                 ..MigrationFlow::default()
             },
@@ -7043,7 +9686,11 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
     fn apply_migration_place(&mut self, paths: &mut MigrationPaths, place: &TypedPlaceIr) {
         match place {
             TypedPlaceIr::Definition(_) => {}
-            TypedPlaceIr::Field { base, .. } | TypedPlaceIr::StateField { base, .. } => {
+            TypedPlaceIr::Field { base, .. } => {
+                self.apply_migration_place(paths, base);
+            }
+            TypedPlaceIr::ClassField { object: base, .. }
+            | TypedPlaceIr::StateField { base, .. } => {
                 self.apply_migration_expression(paths, base);
             }
             TypedPlaceIr::Index { base, index } => {
@@ -7075,6 +9722,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         match &expression.kind {
             TypedExpressionKind::Literal(_)
             | TypedExpressionKind::Reference(_)
+            | TypedExpressionKind::PersistentStateGet { .. }
             | TypedExpressionKind::Yield => {}
             TypedExpressionKind::Unary { operand, .. }
             | TypedExpressionKind::Await(operand)
@@ -7126,6 +9774,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 self.apply_migration_expressions(paths, arguments);
             }
             TypedExpressionKind::Construct { fields, .. } => {
+                for (_, value) in fields {
+                    self.apply_migration_expression(paths, value);
+                }
+            }
+            TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+                if let Some(base) = update {
+                    self.apply_migration_expression(paths, base);
+                }
                 for (_, value) in fields {
                     self.apply_migration_expression(paths, value);
                 }
@@ -7279,7 +9935,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         let ExpressionKind::Name(path) = &expression.kind else {
             self.type_error(
                 source_range(&self.module.source, expression.range),
-                "migration field must be a qualified Stateful field",
+                "migration field must be a qualified @state Class field",
             );
             return None;
         };
@@ -7296,7 +9952,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         {
             self.type_error(
                 source_range(&self.module.source, expression.range),
-                "migration field must belong to a Stateful type",
+                "migration field must belong to a @state Class type",
             );
             return None;
         }
@@ -7312,13 +9968,16 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         arguments: &[Expression],
         expected: Option<&IrType>,
     ) -> Option<TypedExpressionIr> {
-        let [name] = path.segments.as_slice() else {
-            return None;
-        };
-        let variant = match name.text.as_str() {
-            "Some" => BuiltinVariantIr::OptionSome,
-            "Ok" => BuiltinVariantIr::ResultOk,
-            "Err" => BuiltinVariantIr::ResultErr,
+        let (name, variant) = match path.segments.as_slice() {
+            [namespace, name] if namespace.text == "Option" && name.text == "Some" => {
+                (name, BuiltinVariantIr::OptionSome)
+            }
+            [namespace, name] if namespace.text == "Result" && name.text == "Ok" => {
+                (name, BuiltinVariantIr::ResultOk)
+            }
+            [namespace, name] if namespace.text == "Result" && name.text == "Err" => {
+                (name, BuiltinVariantIr::ResultErr)
+            }
             _ => return None,
         };
         let span = source_range(&self.module.source, whole.range);
@@ -7485,49 +10144,282 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn check_construct(
         &mut self,
         whole: &Expression,
         ty: &ast::QualifiedName,
         fields: &[ast::FieldInitializer],
+        update: Option<&Expression>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
+        if let Some(variant) = self.analyzer.lookup_symbol_path(&self.module, ty)
+            && self.analyzer.definitions[variant.0 as usize].kind == DefinitionKind::Variant
+        {
+            let Some(variant) =
+                self.analyzer
+                    .resolve_symbol_path(&self.module, ty, SymbolUse::Value)
+            else {
+                return self.error_expression(span);
+            };
+            if update.is_some() {
+                self.type_error(
+                    span.clone(),
+                    "Enum variant constructors do not support `..base`",
+                );
+            }
+            let Some(named) = self
+                .analyzer
+                .type_metadata
+                .values()
+                .find_map(|metadata| metadata.variant_fields.get(&variant).cloned())
+            else {
+                self.type_error(
+                    span.clone(),
+                    "brace construction requires an Enum variant with named payload fields",
+                );
+                return self.error_expression(span);
+            };
+            let values = self.check_named_variant_fields(variant, &named, fields);
+            let payload = match values.len() {
+                0 => None,
+                1 => values.into_iter().next().map(|(_, value)| Box::new(value)),
+                _ => {
+                    let values = values
+                        .into_iter()
+                        .map(|(_, value)| value)
+                        .collect::<Vec<_>>();
+                    Some(Box::new(TypedExpressionIr {
+                        ty: IrType::Tuple(values.iter().map(|value| value.ty.clone()).collect()),
+                        effect: expression_effect(&values),
+                        span: span.clone(),
+                        kind: TypedExpressionKind::Tuple(values),
+                    }))
+                }
+            };
+            let ty = self.analyzer.definitions[variant.0 as usize].ty.clone();
+            let IrType::Named(enum_definition) = ty.clone() else {
+                return self.error_expression(span);
+            };
+            return TypedExpressionIr {
+                ty,
+                effect: payload
+                    .as_ref()
+                    .map_or(IrEffect::Immediate, |payload| payload.effect),
+                span,
+                kind: TypedExpressionKind::EnumConstruct {
+                    enum_definition,
+                    variant_definition: variant,
+                    payload,
+                },
+            };
+        }
         let Some(definition) = self
             .analyzer
             .resolve_symbol_path(&self.module, ty, SymbolUse::Type)
         else {
             return self.error_expression(span);
         };
-        self.check_construct_fields(whole, definition, fields)
+        let definition_kind = self.analyzer.definitions[definition.0 as usize].kind;
+        let is_host_struct = definition_kind == DefinitionKind::HostContract
+            && self.analyzer.host_types.iter().any(|host_type| {
+                host_type.definition == definition && host_type.kind == ExternalTypeKind::Struct
+            });
+        if definition_kind != DefinitionKind::Struct && !is_host_struct {
+            self.type_error(
+                span.clone(),
+                "Class construction requires `new`; a Struct constructor cannot name this type",
+            );
+            return self.error_expression(span);
+        }
+        let checked_fields = self.check_fields(definition, fields);
+        self.check_missing_fields(whole, definition, &checked_fields, update.is_some());
+        if let Some(update) = update {
+            let base = self.check_expression(update, Some(&IrType::Named(definition)));
+            self.expect_type(&base.ty, &IrType::Named(definition), &base.span);
+            let effect = checked_fields
+                .iter()
+                .fold(base.effect, |effect, (_, value)| {
+                    max_effect(effect, value.effect)
+                });
+            TypedExpressionIr {
+                ty: IrType::Named(definition),
+                effect,
+                span,
+                kind: TypedExpressionKind::Update {
+                    base: Box::new(base),
+                    fields: checked_fields,
+                },
+            }
+        } else {
+            let effect = checked_fields
+                .iter()
+                .fold(IrEffect::Immediate, |effect, (_, value)| {
+                    max_effect(effect, value.effect)
+                });
+            TypedExpressionIr {
+                ty: IrType::Named(definition),
+                effect,
+                span,
+                kind: TypedExpressionKind::Construct {
+                    definition,
+                    fields: checked_fields,
+                },
+            }
+        }
     }
 
-    fn check_construct_fields(
+    fn check_named_variant_fields(
+        &mut self,
+        variant: DefinitionId,
+        named: &BTreeMap<String, DefinitionId>,
+        fields: &[ast::FieldInitializer],
+    ) -> Vec<(DefinitionId, TypedExpressionIr)> {
+        let mut values = Vec::new();
+        let mut seen = BTreeSet::new();
+        for field in fields {
+            let Some(definition) = named.get(&field.name.text).copied() else {
+                self.analyzer.push_source_error(
+                    ErrorCode::NX2501,
+                    &self.module.source,
+                    byte_range(field.range),
+                    format!("unknown variant field `{}`", field.name.text),
+                    "field is not present on this Enum variant",
+                );
+                continue;
+            };
+            if !seen.insert(definition) {
+                self.type_error(
+                    source_range(&self.module.source, field.range),
+                    "duplicate Enum variant field initializer",
+                );
+            }
+            let expected = self.analyzer.definitions[definition.0 as usize].ty.clone();
+            let value = self.check_expression(&field.value, Some(&expected));
+            self.expect_type(&value.ty, &expected, &value.span);
+            values.push((definition, value));
+        }
+        let order = self
+            .analyzer
+            .type_metadata
+            .values()
+            .find_map(|metadata| metadata.variant_field_order.get(&variant))
+            .cloned()
+            .unwrap_or_default();
+        let missing = order
+            .iter()
+            .filter(|definition| !seen.contains(definition))
+            .map(|definition| {
+                self.analyzer.definitions[definition.0 as usize]
+                    .name
+                    .clone()
+            })
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.type_error(
+                source_range(
+                    &self.module.source,
+                    fields
+                        .first()
+                        .map_or(TextRange::default(), |field| field.range),
+                ),
+                &format!("missing Enum variant fields: {}", missing.join(", ")),
+            );
+        }
+        values.sort_by_key(|(definition, _)| {
+            order
+                .iter()
+                .position(|candidate| candidate == definition)
+                .unwrap_or(usize::MAX)
+        });
+        values
+    }
+
+    fn check_class_construct(
         &mut self,
         whole: &Expression,
         definition: DefinitionId,
         fields: &[ast::FieldInitializer],
+        update: Option<&Expression>,
     ) -> TypedExpressionIr {
         let span = source_range(&self.module.source, whole.range);
-        if self.is_stateful_definition(definition) {
+        if self.analyzer.definitions[definition.0 as usize].kind != DefinitionKind::Class {
+            self.type_error(
+                span.clone(),
+                "`new` requires a Class type; Struct values omit `new`",
+            );
+            return self.error_expression(span);
+        }
+        if self.is_state_definition(definition) {
             self.analyzer.push_source_error(
                 ErrorCode::NX2101,
                 &self.module.source,
                 byte_range(whole.range),
-                "@stateful values cannot be constructed directly",
+                "@state Class values cannot be constructed directly",
                 "use new.create<T> inside a migration or obtain a value through StateHandle<T>",
             );
             return self.error_expression(span);
         }
         let fields = self.check_fields(definition, fields);
+        self.check_missing_fields(whole, definition, &fields, update.is_some());
+        let update = update.map(|update| {
+            let base = self.check_expression(update, Some(&IrType::Named(definition)));
+            self.expect_type(&base.ty, &IrType::Named(definition), &base.span);
+            Box::new(base)
+        });
+        let effect = fields.iter().fold(
+            update
+                .as_ref()
+                .map_or(IrEffect::Immediate, |base| base.effect),
+            |effect, (_, value)| max_effect(effect, value.effect),
+        );
         TypedExpressionIr {
             ty: IrType::Named(definition),
-            effect: fields
-                .iter()
-                .fold(IrEffect::Immediate, |effect, (_, value)| {
-                    max_effect(effect, value.effect)
-                }),
+            effect,
             span,
-            kind: TypedExpressionKind::Construct { definition, fields },
+            kind: TypedExpressionKind::ClassConstruct {
+                definition,
+                fields,
+                update,
+            },
+        }
+    }
+
+    fn check_missing_fields(
+        &mut self,
+        whole: &Expression,
+        definition: DefinitionId,
+        fields: &[(DefinitionId, TypedExpressionIr)],
+        has_update: bool,
+    ) {
+        if has_update {
+            return;
+        }
+        let present = fields
+            .iter()
+            .map(|(definition, _)| *definition)
+            .collect::<BTreeSet<_>>();
+        let missing = self
+            .analyzer
+            .type_metadata
+            .get(&definition)
+            .map(|metadata| {
+                metadata
+                    .field_order
+                    .iter()
+                    .filter(|field| !present.contains(field))
+                    .map(|field| self.analyzer.definitions[field.0 as usize].name.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !missing.is_empty() {
+            self.analyzer.push_source_error(
+                ErrorCode::NX2101,
+                &self.module.source,
+                byte_range(whole.range),
+                format!("missing constructor fields: {}", missing.join(", ")),
+                "initialize every field or provide a `..base` update",
+            );
         }
     }
 
@@ -7818,21 +10710,22 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         payload: &[Pattern],
         expected: &IrType,
     ) -> Option<TypedPatternKind> {
-        let [name] = path.segments.as_slice() else {
+        let [namespace, name] = path.segments.as_slice() else {
             return None;
         };
-        let (variant, payload_type) = match (name.text.as_str(), expected) {
-            ("Some", IrType::Option(inner)) => {
+        let family = namespace.text.as_str();
+        let (variant, payload_type) = match (family, name.text.as_str(), expected) {
+            ("Option", "Some", IrType::Option(inner)) => {
                 (BuiltinVariantIr::OptionSome, Some(inner.as_ref().clone()))
             }
-            ("None", IrType::Option(_)) => (BuiltinVariantIr::OptionNone, None),
-            ("Ok", IrType::Result(ok, _)) => {
+            ("Option", "None", IrType::Option(_)) => (BuiltinVariantIr::OptionNone, None),
+            ("Result", "Ok", IrType::Result(ok, _)) => {
                 (BuiltinVariantIr::ResultOk, Some(ok.as_ref().clone()))
             }
-            ("Err", IrType::Result(_, error)) => {
+            ("Result", "Err", IrType::Result(_, error)) => {
                 (BuiltinVariantIr::ResultErr, Some(error.as_ref().clone()))
             }
-            ("Some" | "None", _) => {
+            ("Option", "Some" | "None", _) => {
                 self.type_error(
                     source_range(&self.module.source, path.range),
                     "Option pattern requires an Option<T> scrutinee",
@@ -7846,7 +10739,7 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     None,
                 )
             }
-            ("Ok" | "Err", _) => {
+            ("Result", "Ok" | "Err", _) => {
                 self.type_error(
                     source_range(&self.module.source, path.range),
                     "Result pattern requires a Result<T, E> scrutinee",
@@ -7878,51 +10771,112 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
         Some(TypedPatternKind::BuiltinVariant { variant, payload })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn check_place(&mut self, expression: &Expression) -> Option<TypedPlaceIr> {
         match &expression.kind {
             ExpressionKind::Name(path) => {
-                if path.segments.len() == 1 {
-                    let definition = self.local(&path.segments[0].text).or_else(|| {
-                        self.analyzer
-                            .resolve_symbol_path(&self.module, path, SymbolUse::Value)
-                    })?;
-                    if self.readonly_loop_bindings.contains(&definition) {
-                        self.type_error(
-                            source_range(&self.module.source, expression.range),
-                            &format!(
-                                "static-range binding `{}` is read-only",
-                                path.segments[0].text
-                            ),
+                if path.segments.len() != 1 {
+                    self.type_error(
+                        source_range(&self.module.source, expression.range),
+                        "a namespace-qualified value is not an assignable binding",
+                    );
+                    return None;
+                }
+                let definition = self.local(&path.segments[0].text).or_else(|| {
+                    self.analyzer
+                        .resolve_symbol_path(&self.module, path, SymbolUse::Value)
+                })?;
+                if self.analyzer.is_repl_state_field(definition) {
+                    let mutable = self
+                        .analyzer
+                        .repl_environment_definition
+                        .and_then(|environment| self.analyzer.type_metadata.get(&environment))
+                        .and_then(|metadata| metadata.field_mutability.get(&definition))
+                        .copied()
+                        .unwrap_or(false);
+                    if !mutable {
+                        self.analyzer.push_source_error(
+                            ErrorCode::NX2501,
+                            &self.module.source,
+                            byte_range(expression.range),
+                            format!("binding `{}` is immutable", path.segments[0].text),
+                            "declare it with `let mut` to allow assignment",
                         );
                         return None;
                     }
-                    return Some(TypedPlaceIr::Definition(definition));
+                    self.mark_restricted(RestrictedOperation::PersistentState);
+                    return Some(TypedPlaceIr::StateField {
+                        base: Box::new(self.repl_environment_expression(source_range(
+                            &self.module.source,
+                            expression.range,
+                        ))),
+                        field: definition,
+                    });
                 }
-                let value = self.check_receiver_name(path)?;
-                match value.kind {
-                    TypedExpressionKind::Reference(definition) => {
-                        Some(TypedPlaceIr::Definition(definition))
-                    }
-                    TypedExpressionKind::Field { base, field } => {
-                        self.mutable_field_place(base, field, expression.range)
-                    }
-                    TypedExpressionKind::StateField { base, field } => {
-                        Some(TypedPlaceIr::StateField { base, field })
-                    }
-                    _ => None,
+                if self.readonly_loop_bindings.contains(&definition) {
+                    self.type_error(
+                        source_range(&self.module.source, expression.range),
+                        &format!(
+                            "static-range binding `{}` is read-only",
+                            path.segments[0].text
+                        ),
+                    );
+                    return None;
                 }
+                if !self.mutable_bindings.contains(&definition) {
+                    self.analyzer.push_source_error(
+                        ErrorCode::NX2501,
+                        &self.module.source,
+                        byte_range(expression.range),
+                        format!("binding `{}` is immutable", path.segments[0].text),
+                        "declare it with `let mut` to allow rebinding or Struct field updates",
+                    );
+                    return None;
+                }
+                Some(TypedPlaceIr::Definition(definition))
             }
             ExpressionKind::Member { receiver, member } => {
-                let base = self.check_expression(receiver, None);
-                let value = self.check_field_access(base, member, expression.range)?;
-                match value.kind {
-                    TypedExpressionKind::Field { base, field } => {
-                        self.mutable_field_place(base, field, expression.range)
+                let object = self.check_expression(receiver, None);
+                let IrType::Named(owner) = object.ty else {
+                    self.type_error(
+                        source_range(&self.module.source, expression.range),
+                        "field assignment requires a Struct or Class receiver",
+                    );
+                    return None;
+                };
+                let value = self.check_field_access(object, member, expression.range)?;
+                let TypedExpressionKind::Field {
+                    base: object,
+                    field,
+                } = value.kind
+                else {
+                    return None;
+                };
+                if self.analyzer.definitions[owner.0 as usize].kind == DefinitionKind::Class {
+                    let mutable = self
+                        .analyzer
+                        .type_metadata
+                        .get(&owner)
+                        .and_then(|metadata| metadata.field_mutability.get(&field))
+                        .copied()
+                        .unwrap_or(false);
+                    if !mutable {
+                        self.analyzer.push_source_error(
+                            ErrorCode::NX2501,
+                            &self.module.source,
+                            byte_range(member.range),
+                            format!("class field `{}` is immutable", member.text),
+                            "declare the Class field with `mut` to allow assignment",
+                        );
+                        return None;
                     }
-                    TypedExpressionKind::StateField { base, field } => {
-                        Some(TypedPlaceIr::StateField { base, field })
-                    }
-                    _ => None,
+                    Some(TypedPlaceIr::ClassField { object, field })
+                } else {
+                    let base = self.check_place(receiver)?;
+                    Some(TypedPlaceIr::Field {
+                        base: Box::new(base),
+                        field,
+                    })
                 }
             }
             ExpressionKind::Index { receiver, index } => {
@@ -7969,28 +10923,6 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                 None
             }
         }
-    }
-
-    fn mutable_field_place(
-        &mut self,
-        base: Box<TypedExpressionIr>,
-        field: DefinitionId,
-        range: TextRange,
-    ) -> Option<TypedPlaceIr> {
-        let mutable = match &base.ty {
-            IrType::Named(owner) => {
-                self.analyzer.definitions[owner.0 as usize].kind == DefinitionKind::Class
-            }
-            _ => false,
-        };
-        if !mutable {
-            self.type_error(
-                source_range(&self.module.source, range),
-                "only class fields are assignable",
-            );
-            return None;
-        }
-        Some(TypedPlaceIr::Field { base, field })
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -8044,14 +10976,14 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                     if numeric_conversion {
                         format!(
                             "cannot implicitly convert {} to {}",
-                            display_type(actual, &self.analyzer.definitions),
-                            display_type(expected, &self.analyzer.definitions)
+                            display_ir_type(actual, &self.analyzer.definitions),
+                            display_ir_type(expected, &self.analyzer.definitions)
                         )
                     } else {
                         format!(
                             "expected {}, found {}",
-                            display_type(expected, &self.analyzer.definitions),
-                            display_type(actual, &self.analyzer.definitions)
+                            display_ir_type(expected, &self.analyzer.definitions),
+                            display_ir_type(actual, &self.analyzer.definitions)
                         )
                     },
                 )
@@ -8175,7 +11107,7 @@ fn combined_source_snapshots(
                     .filter_map(|function| function.source.as_ref()),
             )
             .chain(
-                host.required_exports
+                host.required_entrypoints
                     .iter()
                     .filter_map(|export| export.source.as_ref()),
             )
@@ -8303,17 +11235,17 @@ fn syntax_error_code(kind: nexa_syntax::SyntaxErrorKind) -> ErrorCode {
 }
 
 fn declaration_surface(
-    declaration: &DeclarationKind,
+    declaration: &ast::Declaration,
 ) -> Option<(String, DefinitionKind, SymbolKind, IrEffect)> {
-    match declaration {
+    match &declaration.kind {
         DeclarationKind::Function(function) => {
-            let effect = function_effect(function.effect);
-            let kind = if function.effect == FunctionEffect::Task {
+            let effect = function_semantic_effect(declaration, function);
+            let kind = if function.is_async {
                 DefinitionKind::Task
             } else {
                 DefinitionKind::Function
             };
-            let symbol = if function.effect == FunctionEffect::Task {
+            let symbol = if function.is_async {
                 SymbolKind::Task
             } else {
                 SymbolKind::Function
@@ -8326,7 +11258,6 @@ fn declaration_surface(
                 TypeDeclarationKind::Struct => DefinitionKind::Struct,
                 TypeDeclarationKind::Enum => DefinitionKind::Enum,
                 TypeDeclarationKind::Class => DefinitionKind::Class,
-                TypeDeclarationKind::Stateful => DefinitionKind::Stateful,
             },
             SymbolKind::Type,
             IrEffect::Immediate,
@@ -8349,15 +11280,25 @@ const fn declaration_visibility(visibility: Visibility) -> DeclarationVisibility
     }
 }
 
-const fn function_effect(effect: FunctionEffect) -> IrEffect {
-    match effect {
-        FunctionEffect::Ordinary => IrEffect::Ordinary,
-        FunctionEffect::Immediate => IrEffect::Immediate,
-        FunctionEffect::Task => IrEffect::Task,
-        FunctionEffect::Migration => IrEffect::Migration,
-        FunctionEffect::Activation => IrEffect::Activation,
-        FunctionEffect::Cleanup => IrEffect::Cleanup,
+fn function_semantic_effect(
+    declaration: &ast::Declaration,
+    function: &ast::FunctionDeclaration,
+) -> IrEffect {
+    if function.is_async {
+        return IrEffect::Task;
     }
+    for (attribute, effect) in [
+        ("immediate", IrEffect::Immediate),
+        ("migration", IrEffect::Migration),
+        ("activation", IrEffect::Activation),
+        ("cleanup", IrEffect::Cleanup),
+        ("test", IrEffect::Immediate),
+    ] {
+        if has_attribute(&declaration.attributes, attribute) {
+            return effect;
+        }
+    }
+    IrEffect::Ordinary
 }
 
 fn has_attribute(attributes: &[Attribute], name: &str) -> bool {
@@ -8444,6 +11385,232 @@ fn valid_stable_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
+fn is_snake_case(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_lowercase)
+        && bytes.last().is_some_and(|byte| *byte != b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !bytes.windows(2).any(|pair| pair == b"__")
+}
+
+fn is_screaming_snake_case(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes.last().is_some_and(|byte| *byte != b'_')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+        && !bytes.windows(2).any(|pair| pair == b"__")
+}
+
+fn is_pascal_case(value: &str) -> bool {
+    value.as_bytes().first().is_some_and(u8::is_ascii_uppercase)
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
+fn snake_case_name(value: &str) -> String {
+    let characters = value.chars().collect::<Vec<_>>();
+    let mut output = String::new();
+    for (index, character) in characters.iter().copied().enumerate() {
+        if character.is_ascii_uppercase() {
+            let previous_is_lower_or_digit = index > 0
+                && (characters[index - 1].is_ascii_lowercase()
+                    || characters[index - 1].is_ascii_digit());
+            let acronym_boundary = index > 0
+                && characters[index - 1].is_ascii_uppercase()
+                && characters
+                    .get(index + 1)
+                    .is_some_and(char::is_ascii_lowercase);
+            if !output.is_empty() && (previous_is_lower_or_digit || acronym_boundary) {
+                output.push('_');
+            }
+            output.push(character.to_ascii_lowercase());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn use_path_text(usage: &ast::UseDeclaration) -> String {
+    std::iter::once(usage.root.name.text.as_str())
+        .chain(usage.segments.iter().map(|segment| segment.text.as_str()))
+        .collect::<Vec<_>>()
+        .join("::")
+}
+
+fn use_path_range(usage: &ast::UseDeclaration) -> TextRange {
+    TextRange::new(
+        usage.root.name.range.start,
+        usage
+            .segments
+            .last()
+            .map_or(usage.root.name.range.end, |segment| segment.range.end),
+    )
+}
+
+fn statement_contains_await(statement: &Statement) -> bool {
+    match &statement.kind {
+        StatementKind::Bind { value, .. }
+        | StatementKind::Defer(value)
+        | StatementKind::Expression(value) => expression_contains_await(value),
+        StatementKind::Assign { target, value } => {
+            expression_contains_await(target) || expression_contains_await(value)
+        }
+        StatementKind::Return(value) => value.as_ref().is_some_and(expression_contains_await),
+        StatementKind::If {
+            condition,
+            then_block,
+            else_branch,
+        } => {
+            expression_contains_await(condition)
+                || block_contains_await(then_block)
+                || else_branch.as_ref().is_some_and(|branch| match branch {
+                    ElseBranch::Block(block) => block_contains_await(block),
+                    ElseBranch::If(statement) => statement_contains_await(statement),
+                })
+        }
+        StatementKind::While { condition, body } => {
+            expression_contains_await(condition) || block_contains_await(body)
+        }
+        StatementKind::For {
+            start, end, body, ..
+        } => {
+            expression_contains_await(start)
+                || expression_contains_await(end)
+                || block_contains_await(body)
+        }
+        StatementKind::Break
+        | StatementKind::Continue
+        | StatementKind::Yield
+        | StatementKind::Error => false,
+    }
+}
+
+fn block_contains_await(block: &ast::Block) -> bool {
+    block.statements.iter().any(statement_contains_await)
+        || block
+            .tail
+            .as_ref()
+            .is_some_and(|expression| expression_contains_await(expression))
+}
+
+fn expression_contains_await(expression: &Expression) -> bool {
+    match &expression.kind {
+        ExpressionKind::Await { .. } => true,
+        ExpressionKind::Tuple(values) | ExpressionKind::Array(values) => {
+            values.iter().any(expression_contains_await)
+        }
+        ExpressionKind::Unary { operand, .. } | ExpressionKind::Try(operand) => {
+            expression_contains_await(operand)
+        }
+        ExpressionKind::Binary { left, right, .. } => {
+            expression_contains_await(left) || expression_contains_await(right)
+        }
+        ExpressionKind::Call {
+            callee, arguments, ..
+        } => expression_contains_await(callee) || arguments.iter().any(expression_contains_await),
+        ExpressionKind::Member { receiver, .. } => expression_contains_await(receiver),
+        ExpressionKind::Index { receiver, index } => {
+            expression_contains_await(receiver) || expression_contains_await(index)
+        }
+        ExpressionKind::Construct { fields, update, .. }
+        | ExpressionKind::New { fields, update, .. } => {
+            fields
+                .iter()
+                .any(|field| expression_contains_await(&field.value))
+                || update
+                    .as_ref()
+                    .is_some_and(|value| expression_contains_await(value))
+        }
+        ExpressionKind::Match { value, arms } => {
+            expression_contains_await(value)
+                || arms.iter().any(|arm| expression_contains_await(&arm.value))
+        }
+        ExpressionKind::Interpolation(parts) => parts.iter().any(|part| match part {
+            InterpolationPart::Text { .. } => false,
+            InterpolationPart::Expression(expression) => expression_contains_await(expression),
+        }),
+        ExpressionKind::Literal(_) | ExpressionKind::Name(_) | ExpressionKind::Error => false,
+    }
+}
+
+fn typed_expression_contains_await(expression: &TypedExpressionIr) -> bool {
+    match &expression.kind {
+        TypedExpressionKind::Await(_) => true,
+        TypedExpressionKind::Unary { operand, .. } | TypedExpressionKind::Try(operand) => {
+            typed_expression_contains_await(operand)
+        }
+        TypedExpressionKind::Binary { left, right, .. } => {
+            typed_expression_contains_await(left) || typed_expression_contains_await(right)
+        }
+        TypedExpressionKind::Call { arguments, .. }
+        | TypedExpressionKind::StandardCall { arguments, .. }
+        | TypedExpressionKind::BuiltinCall { arguments, .. }
+        | TypedExpressionKind::HostCall { arguments, .. } => {
+            arguments.iter().any(typed_expression_contains_await)
+        }
+        TypedExpressionKind::Construct { fields, .. } => fields
+            .iter()
+            .any(|(_, value)| typed_expression_contains_await(value)),
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            update
+                .as_ref()
+                .is_some_and(|value| typed_expression_contains_await(value))
+                || fields
+                    .iter()
+                    .any(|(_, value)| typed_expression_contains_await(value))
+        }
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => payload
+            .as_ref()
+            .is_some_and(|value| typed_expression_contains_await(value)),
+        TypedExpressionKind::Field { base, .. } | TypedExpressionKind::StateField { base, .. } => {
+            typed_expression_contains_await(base)
+        }
+        TypedExpressionKind::Index { base, index } => {
+            typed_expression_contains_await(base) || typed_expression_contains_await(index)
+        }
+        TypedExpressionKind::Array(values)
+        | TypedExpressionKind::Tuple(values)
+        | TypedExpressionKind::StringInterpolation(values) => {
+            values.iter().any(typed_expression_contains_await)
+        }
+        TypedExpressionKind::Match { value, arms } => {
+            typed_expression_contains_await(value)
+                || arms
+                    .iter()
+                    .any(|arm| typed_expression_contains_await(&arm.value))
+        }
+        TypedExpressionKind::Update { base, fields } => {
+            typed_expression_contains_await(base)
+                || fields
+                    .iter()
+                    .any(|(_, value)| typed_expression_contains_await(value))
+        }
+        TypedExpressionKind::Migration(intrinsic) => match intrinsic {
+            MigrationIntrinsicIr::OldFieldGet { object, .. }
+            | MigrationIntrinsicIr::Replace { target: object, .. } => {
+                typed_expression_contains_await(object)
+            }
+            MigrationIntrinsicIr::NewSet { object, value, .. } => {
+                typed_expression_contains_await(object) || typed_expression_contains_await(value)
+            }
+            MigrationIntrinsicIr::OldGet { .. }
+            | MigrationIntrinsicIr::NewCreate { .. }
+            | MigrationIntrinsicIr::Preserve { .. }
+            | MigrationIntrinsicIr::Delete { .. }
+            | MigrationIntrinsicIr::Finish => false,
+        },
+        TypedExpressionKind::Literal(_)
+        | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
+        | TypedExpressionKind::Yield => false,
+    }
+}
+
 fn canonical_identity_text(identity: &CanonicalSymbolIdentity) -> String {
     if let Some(stable) = identity.explicit_stable_name() {
         format!(
@@ -8462,11 +11629,16 @@ fn canonical_identity_text(identity: &CanonicalSymbolIdentity) -> String {
     }
 }
 
-fn stateful_version(attributes: &[Attribute]) -> Option<u32> {
+fn state_version(attributes: &[Attribute]) -> Option<u32> {
     let attribute = attributes
         .iter()
-        .find(|attribute| attribute.name.text == "stateful")?;
-    let argument = attribute.arguments.first()?;
+        .find(|attribute| attribute.name.text == "state")?;
+    let argument = attribute.arguments.iter().find(|argument| {
+        argument
+            .name
+            .as_ref()
+            .is_some_and(|name| name.text == "version")
+    })?;
     (argument.kind == AttributeArgumentKind::Integer)
         .then(|| argument.text.replace('_', "").parse().ok())
         .flatten()
@@ -8571,7 +11743,11 @@ fn is_none_expression(expression: &Expression) -> bool {
     matches!(
         &expression.kind,
         ExpressionKind::Name(path)
-            if path.segments.len() == 1 && path.segments[0].text == "None"
+            if matches!(
+                path.segments.as_slice(),
+                [namespace, variant]
+                    if namespace.text == "Option" && variant.text == "None"
+            )
     )
 }
 
@@ -8589,14 +11765,14 @@ fn builtin_variant_call(
     let ExpressionKind::Name(path) = &callee.kind else {
         return None;
     };
-    let [name] = path.segments.as_slice() else {
+    let [namespace, name] = path.segments.as_slice() else {
         return None;
     };
-    matches!(name.text.as_str(), "Some" | "Ok" | "Err").then_some((
-        name.text.as_str(),
-        type_arguments,
-        arguments,
-    ))
+    matches!(
+        (namespace.text.as_str(), name.text.as_str()),
+        ("Option", "Some") | ("Result", "Ok" | "Err")
+    )
+    .then_some((name.text.as_str(), type_arguments, arguments))
 }
 
 fn merge_surface_constraint(
@@ -8644,18 +11820,9 @@ fn instantiate_inferred_surface_type(
             .map(|value| instantiate_inferred_surface_type(value, bindings))
             .collect::<Option<Vec<_>>>()
             .map(IrType::Tuple),
-        SurfaceType::HostRequest(inner) => Some(IrType::HostRequest(match inner.as_deref() {
-            Some(inner) => Some(Box::new(instantiate_inferred_surface_type(
-                inner, bindings,
-            )?)),
-            None => None,
-        })),
-        SurfaceType::ResourceToken(inner) => Some(IrType::ResourceToken(match inner.as_deref() {
-            Some(inner) => Some(Box::new(instantiate_inferred_surface_type(
-                inner, bindings,
-            )?)),
-            None => None,
-        })),
+        SurfaceType::Token(inner) => Some(IrType::ResourceToken(Some(Box::new(
+            instantiate_inferred_surface_type(inner, bindings)?,
+        )))),
         SurfaceType::Snapshot(inner) => Some(IrType::Snapshot(Box::new(
             instantiate_inferred_surface_type(inner, bindings)?,
         ))),
@@ -8695,7 +11862,8 @@ fn unify_surface_type(
         | (SurfaceType::Array(left), IrType::Array(right))
         | (SurfaceType::Snapshot(left), IrType::Snapshot(right))
         | (SurfaceType::Buffer(left), IrType::Buffer(right))
-        | (SurfaceType::StateHandle(left), IrType::StateHandle(right)) => {
+        | (SurfaceType::StateHandle(left), IrType::StateHandle(right))
+        | (SurfaceType::Token(left), IrType::ResourceToken(Some(right))) => {
             unify_surface_type(left, right, bindings)
         }
         (SurfaceType::Result(left_ok, left_error), IrType::Result(right_ok, right_error))
@@ -8707,12 +11875,6 @@ fn unify_surface_type(
             .iter()
             .zip(right)
             .all(|(left, right)| unify_surface_type(left, right, bindings)),
-        (SurfaceType::HostRequest(left), IrType::HostRequest(right))
-        | (SurfaceType::ResourceToken(left), IrType::ResourceToken(right)) => match (left, right) {
-            (Some(left), Some(right)) => unify_surface_type(left, right, bindings),
-            (None, None) => true,
-            _ => false,
-        },
         _ => false,
     }
 }
@@ -8797,10 +11959,10 @@ fn eval_const_unary(operator: UnaryOperatorKind, value: ConstValue) -> Option<Co
             value.checked_neg().map(ConstValue::I64)
         }
         (UnaryOperatorKind::Negate, ConstValue::F32(bits)) => {
-            Some(ConstValue::F32((-f32::from_bits(bits)).to_bits()))
+            Some(ConstValue::F32(canonical_f32_bits(-f32::from_bits(bits))))
         }
         (UnaryOperatorKind::Negate, ConstValue::F64(bits)) => {
-            Some(ConstValue::F64((-f64::from_bits(bits)).to_bits()))
+            Some(ConstValue::F64(canonical_f64_bits(-f64::from_bits(bits))))
         }
         (UnaryOperatorKind::Not, ConstValue::Bool(value)) => Some(ConstValue::Bool(!value)),
         _ => None,
@@ -8851,7 +12013,9 @@ fn eval_const_binary(
                 Operator::Subtract => Some(ConstValue::F32(canonical_f32_bits(left - right))),
                 Operator::Multiply => Some(ConstValue::F32(canonical_f32_bits(left * right))),
                 Operator::Divide => Some(ConstValue::F32(canonical_f32_bits(left / right))),
-                Operator::Remainder => Some(ConstValue::F32(canonical_f32_bits(left % right))),
+                Operator::Remainder => Some(ConstValue::F32(canonical_f32_bits(
+                    deterministic_rem_f32(left, right),
+                ))),
                 Operator::Equal => Some(ConstValue::Bool(left == right)),
                 Operator::NotEqual => Some(ConstValue::Bool(left != right)),
                 Operator::Less => Some(ConstValue::Bool(left < right)),
@@ -8869,7 +12033,9 @@ fn eval_const_binary(
                 Operator::Subtract => Some(ConstValue::F64(canonical_f64_bits(left - right))),
                 Operator::Multiply => Some(ConstValue::F64(canonical_f64_bits(left * right))),
                 Operator::Divide => Some(ConstValue::F64(canonical_f64_bits(left / right))),
-                Operator::Remainder => Some(ConstValue::F64(canonical_f64_bits(left % right))),
+                Operator::Remainder => Some(ConstValue::F64(canonical_f64_bits(
+                    deterministic_rem_f64(left, right),
+                ))),
                 Operator::Equal => Some(ConstValue::Bool(left == right)),
                 Operator::NotEqual => Some(ConstValue::Bool(left != right)),
                 Operator::Less => Some(ConstValue::Bool(left < right)),
@@ -8893,10 +12059,88 @@ fn eval_const_binary(
             _ => None,
         },
         (left, right) => match operator {
-            Operator::Equal => Some(ConstValue::Bool(left == right)),
-            Operator::NotEqual => Some(ConstValue::Bool(left != right)),
+            Operator::Equal => Some(ConstValue::Bool(const_values_equal(&left, &right))),
+            Operator::NotEqual => Some(ConstValue::Bool(!const_values_equal(&left, &right))),
             _ => None,
         },
+    }
+}
+
+#[allow(clippy::float_cmp)]
+fn const_values_equal(left: &ConstValue, right: &ConstValue) -> bool {
+    match (left, right) {
+        (ConstValue::Unit, ConstValue::Unit) => true,
+        (ConstValue::Bool(left), ConstValue::Bool(right)) => left == right,
+        (ConstValue::I32(left), ConstValue::I32(right)) => left == right,
+        (ConstValue::I64(left), ConstValue::I64(right)) => left == right,
+        (ConstValue::F32(left), ConstValue::F32(right)) => {
+            f32::from_bits(*left) == f32::from_bits(*right)
+        }
+        (ConstValue::F64(left), ConstValue::F64(right)) => {
+            f64::from_bits(*left) == f64::from_bits(*right)
+        }
+        (ConstValue::String(left), ConstValue::String(right)) => left == right,
+        (ConstValue::Rune(left), ConstValue::Rune(right)) => left == right,
+        (ConstValue::Tuple(left), ConstValue::Tuple(right)) => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right)
+                    .all(|(left, right)| const_values_equal(left, right))
+        }
+        (
+            ConstValue::Construct {
+                definition: left_definition,
+                fields: left_fields,
+            },
+            ConstValue::Construct {
+                definition: right_definition,
+                fields: right_fields,
+            },
+        ) => {
+            left_definition == right_definition
+                && left_fields.len() == right_fields.len()
+                && left_fields.iter().zip(right_fields).all(
+                    |((left_field, left), (right_field, right))| {
+                        left_field == right_field && const_values_equal(left, right)
+                    },
+                )
+        }
+        (
+            ConstValue::Variant {
+                definition: left_definition,
+                values: left_values,
+            },
+            ConstValue::Variant {
+                definition: right_definition,
+                values: right_values,
+            },
+        ) => {
+            left_definition == right_definition
+                && left_values.len() == right_values.len()
+                && left_values
+                    .iter()
+                    .zip(right_values)
+                    .all(|(left, right)| const_values_equal(left, right))
+        }
+        (
+            ConstValue::BuiltinVariant {
+                variant: left_variant,
+                value: left_value,
+            },
+            ConstValue::BuiltinVariant {
+                variant: right_variant,
+                value: right_value,
+            },
+        ) => {
+            left_variant == right_variant
+                && match (left_value, right_value) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => const_values_equal(left, right),
+                    (None, Some(_)) | (Some(_), None) => false,
+                }
+        }
+        _ => false,
     }
 }
 
@@ -9007,14 +12251,103 @@ fn binary_operator(operator: BinaryOperatorKind) -> BinaryOperator {
     }
 }
 
+#[derive(Clone)]
+struct InlineLayoutEdge {
+    target: DefinitionId,
+    span: SourceRange,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum InlineLayoutVisit {
+    Visiting,
+    Complete,
+}
+
+fn collect_inline_value_targets(
+    ty: &IrType,
+    definitions: &[Definition],
+    push: &mut impl FnMut(DefinitionId),
+) {
+    match ty {
+        IrType::Named(definition)
+            if definitions
+                .get(definition.0 as usize)
+                .is_some_and(|definition| {
+                    matches!(
+                        definition.kind,
+                        DefinitionKind::Struct | DefinitionKind::Enum
+                    )
+                }) =>
+        {
+            push(*definition);
+        }
+        IrType::Option(inner) => collect_inline_value_targets(inner, definitions, push),
+        IrType::Result(ok, error) => {
+            collect_inline_value_targets(ok, definitions, push);
+            collect_inline_value_targets(error, definitions, push);
+        }
+        IrType::Tuple(values) => {
+            for value in values {
+                collect_inline_value_targets(value, definitions, push);
+            }
+        }
+        IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_)
+        | IrType::Array(_)
+        | IrType::Map(_, _)
+        | IrType::HostRequest(_)
+        | IrType::ResourceToken(_)
+        | IrType::Snapshot(_)
+        | IrType::Buffer(_)
+        | IrType::StateHandle(_)
+        | IrType::TypeParameter(_) => {}
+    }
+}
+
+fn canonical_inline_cycle(cycle: &[DefinitionId]) -> Vec<DefinitionId> {
+    let cycle = cycle
+        .first()
+        .filter(|first| cycle.last() == Some(first))
+        .map_or(cycle, |_| &cycle[..cycle.len().saturating_sub(1)]);
+    if cycle.is_empty() {
+        return Vec::new();
+    }
+    (0..cycle.len())
+        .map(|offset| {
+            cycle[offset..]
+                .iter()
+                .chain(&cycle[..offset])
+                .copied()
+                .collect::<Vec<_>>()
+        })
+        .min()
+        .unwrap_or_default()
+}
+
 fn binary_result(
     operator: BinaryOperatorKind,
     operand: &IrType,
     definitions: &[Definition],
+    type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+    variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+    host_types: &[AnalyzedHostType],
 ) -> Option<IrType> {
     match operator {
         BinaryOperatorKind::Equal | BinaryOperatorKind::NotEqual
-            if equality_supported(operand, definitions) =>
+            if equality_supported(
+                operand,
+                definitions,
+                type_metadata,
+                variant_payloads,
+                host_types,
+            ) =>
         {
             Some(IrType::Bool)
         }
@@ -9043,31 +12376,279 @@ fn binary_result(
     }
 }
 
-fn equality_supported(operand: &IrType, definitions: &[Definition]) -> bool {
-    match operand {
-        IrType::Bool
+#[allow(clippy::too_many_lines)]
+fn equality_supported(
+    operand: &IrType,
+    definitions: &[Definition],
+    type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+    variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+    host_types: &[AnalyzedHostType],
+) -> bool {
+    #[allow(clippy::too_many_lines)]
+    fn visit(
+        operand: &IrType,
+        definitions: &[Definition],
+        type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+        variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+        host_types: &[AnalyzedHostType],
+        visiting: &mut BTreeSet<DefinitionId>,
+    ) -> bool {
+        match operand {
+            IrType::Unit
+            | IrType::Bool
+            | IrType::I32
+            | IrType::I64
+            | IrType::F32
+            | IrType::F64
+            | IrType::String
+            | IrType::Rune => true,
+            IrType::Option(inner) => visit(
+                inner,
+                definitions,
+                type_metadata,
+                variant_payloads,
+                host_types,
+                visiting,
+            ),
+            IrType::Result(ok, error) => {
+                visit(
+                    ok,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    host_types,
+                    visiting,
+                ) && visit(
+                    error,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    host_types,
+                    visiting,
+                )
+            }
+            IrType::Tuple(values) => values.iter().all(|value| {
+                visit(
+                    value,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    host_types,
+                    visiting,
+                )
+            }),
+            IrType::Named(definition) => {
+                let Some(declaration) = definitions.get(definition.0 as usize) else {
+                    return false;
+                };
+                if declaration.kind == DefinitionKind::Class {
+                    // Class equality is object identity and never traverses fields.
+                    return true;
+                }
+                if !visiting.insert(*definition) {
+                    // Recursive inline layouts are diagnosed independently. This guard keeps type
+                    // recovery total without inventing resource equality.
+                    return true;
+                }
+                let supported = match declaration.kind {
+                    DefinitionKind::Struct => {
+                        type_metadata.get(definition).is_some_and(|metadata| {
+                            metadata.field_order.iter().all(|field| {
+                                definitions.get(field.0 as usize).is_some_and(|field| {
+                                    visit(
+                                        &field.ty,
+                                        definitions,
+                                        type_metadata,
+                                        variant_payloads,
+                                        host_types,
+                                        visiting,
+                                    )
+                                })
+                            })
+                        })
+                    }
+                    DefinitionKind::Enum => type_metadata.get(definition).is_some_and(|metadata| {
+                        metadata.variant_order.iter().all(|variant| {
+                            variant_payloads.get(variant).is_none_or(|payload| {
+                                payload.iter().all(|value| {
+                                    visit(
+                                        value,
+                                        definitions,
+                                        type_metadata,
+                                        variant_payloads,
+                                        host_types,
+                                        visiting,
+                                    )
+                                })
+                            })
+                        })
+                    }),
+                    DefinitionKind::HostContract => host_types
+                        .iter()
+                        .find(|host_type| host_type.definition == *definition)
+                        .is_some_and(|host_type| match host_type.kind {
+                            ExternalTypeKind::Opaque => false,
+                            ExternalTypeKind::Struct => {
+                                host_type.fields.iter().all(|(field, _)| {
+                                    definitions.get(field.0 as usize).is_some_and(|field| {
+                                        visit(
+                                            &field.ty,
+                                            definitions,
+                                            type_metadata,
+                                            variant_payloads,
+                                            host_types,
+                                            visiting,
+                                        )
+                                    })
+                                })
+                            }
+                            ExternalTypeKind::Enum => {
+                                host_type.variants.iter().all(|(variant, _)| {
+                                    variant_payloads.get(variant).is_none_or(|payload| {
+                                        payload.iter().all(|value| {
+                                            visit(
+                                                value,
+                                                definitions,
+                                                type_metadata,
+                                                variant_payloads,
+                                                host_types,
+                                                visiting,
+                                            )
+                                        })
+                                    })
+                                })
+                            }
+                        }),
+                    DefinitionKind::Function
+                    | DefinitionKind::Task
+                    | DefinitionKind::Class
+                    | DefinitionKind::Const
+                    | DefinitionKind::Field
+                    | DefinitionKind::Variant
+                    | DefinitionKind::Parameter
+                    | DefinitionKind::Local
+                    | DefinitionKind::HostFunction
+                    | DefinitionKind::StandardLibrary => false,
+                };
+                visiting.remove(definition);
+                supported
+            }
+            IrType::Array(_)
+            | IrType::Map(_, _)
+            | IrType::HostRequest(_)
+            | IrType::ResourceToken(_)
+            | IrType::Snapshot(_)
+            | IrType::Buffer(_)
+            | IrType::StateHandle(_)
+            | IrType::TypeParameter(_) => false,
+        }
+    }
+
+    visit(
+        operand,
+        definitions,
+        type_metadata,
+        variant_payloads,
+        host_types,
+        &mut BTreeSet::new(),
+    )
+}
+
+fn const_safe_type(
+    ty: &IrType,
+    definitions: &[Definition],
+    type_metadata: &BTreeMap<DefinitionId, TypeMetadata>,
+    variant_payloads: &BTreeMap<DefinitionId, Vec<IrType>>,
+    visiting: &mut BTreeSet<DefinitionId>,
+) -> bool {
+    match ty {
+        IrType::Unit
+        | IrType::Bool
         | IrType::I32
         | IrType::I64
         | IrType::F32
         | IrType::F64
         | IrType::String
         | IrType::Rune => true,
-        IrType::Named(definition) => {
-            definitions
-                .get(definition.0 as usize)
-                .is_some_and(|definition| {
-                    matches!(
-                        definition.kind,
-                        DefinitionKind::Struct | DefinitionKind::Class
-                    )
-                })
+        IrType::Option(inner) => const_safe_type(
+            inner,
+            definitions,
+            type_metadata,
+            variant_payloads,
+            visiting,
+        ),
+        IrType::Result(ok, error) => {
+            const_safe_type(ok, definitions, type_metadata, variant_payloads, visiting)
+                && const_safe_type(
+                    error,
+                    definitions,
+                    type_metadata,
+                    variant_payloads,
+                    visiting,
+                )
         }
-        IrType::Unit
-        | IrType::Option(_)
-        | IrType::Result(_, _)
-        | IrType::Array(_)
+        IrType::Tuple(values) => values.iter().all(|value| {
+            const_safe_type(
+                value,
+                definitions,
+                type_metadata,
+                variant_payloads,
+                visiting,
+            )
+        }),
+        IrType::Named(definition) => {
+            let Some(declaration) = definitions.get(definition.0 as usize) else {
+                return false;
+            };
+            if !visiting.insert(*definition) {
+                return false;
+            }
+            let safe = match declaration.kind {
+                DefinitionKind::Struct => type_metadata.get(definition).is_some_and(|metadata| {
+                    metadata.field_order.iter().all(|field| {
+                        definitions.get(field.0 as usize).is_some_and(|field| {
+                            const_safe_type(
+                                &field.ty,
+                                definitions,
+                                type_metadata,
+                                variant_payloads,
+                                visiting,
+                            )
+                        })
+                    })
+                }),
+                DefinitionKind::Enum => type_metadata.get(definition).is_some_and(|metadata| {
+                    metadata.variant_order.iter().all(|variant| {
+                        variant_payloads.get(variant).is_none_or(|payload| {
+                            payload.iter().all(|value| {
+                                const_safe_type(
+                                    value,
+                                    definitions,
+                                    type_metadata,
+                                    variant_payloads,
+                                    visiting,
+                                )
+                            })
+                        })
+                    })
+                }),
+                DefinitionKind::Function
+                | DefinitionKind::Task
+                | DefinitionKind::Class
+                | DefinitionKind::Const
+                | DefinitionKind::Field
+                | DefinitionKind::Variant
+                | DefinitionKind::Parameter
+                | DefinitionKind::Local
+                | DefinitionKind::HostContract
+                | DefinitionKind::HostFunction
+                | DefinitionKind::StandardLibrary => false,
+            };
+            visiting.remove(definition);
+            safe
+        }
+        IrType::Array(_)
         | IrType::Map(_, _)
-        | IrType::Tuple(_)
         | IrType::HostRequest(_)
         | IrType::ResourceToken(_)
         | IrType::Snapshot(_)
@@ -9289,6 +12870,9 @@ fn collect_expression_references(
         TypedExpressionKind::Reference(definition) => {
             output.insert(*definition);
         }
+        TypedExpressionKind::PersistentStateGet { state_type, .. } => {
+            output.insert(*state_type);
+        }
         TypedExpressionKind::Unary { operand, .. } => {
             collect_expression_references(operand, output);
         }
@@ -9305,6 +12889,14 @@ fn collect_expression_references(
             }
         }
         TypedExpressionKind::Construct { fields, .. } => {
+            for (_, value) in fields {
+                collect_expression_references(value, output);
+            }
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            if let Some(base) = update {
+                collect_expression_references(base, output);
+            }
             for (_, value) in fields {
                 collect_expression_references(value, output);
             }
@@ -9373,6 +12965,11 @@ fn rewrite_expression_references(
                 *definition = *replacement;
             }
         }
+        TypedExpressionKind::PersistentStateGet { state_type, .. } => {
+            if let Some(replacement) = replacements.get(state_type) {
+                *state_type = *replacement;
+            }
+        }
         TypedExpressionKind::Unary { operand, .. } => {
             rewrite_expression_references(operand, replacements);
         }
@@ -9389,6 +12986,14 @@ fn rewrite_expression_references(
             }
         }
         TypedExpressionKind::Construct { fields, .. } => {
+            for (_, value) in fields {
+                rewrite_expression_references(value, replacements);
+            }
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            if let Some(base) = update {
+                rewrite_expression_references(base, replacements);
+            }
             for (_, value) in fields {
                 rewrite_expression_references(value, replacements);
             }
@@ -9450,9 +13055,9 @@ fn rewrite_expression_references(
 fn place_type(place: &TypedPlaceIr, definitions: &[Definition]) -> IrType {
     match place {
         TypedPlaceIr::Definition(definition) => definitions[definition.0 as usize].ty.clone(),
-        TypedPlaceIr::Field { field, .. } | TypedPlaceIr::StateField { field, .. } => {
-            definitions[field.0 as usize].ty.clone()
-        }
+        TypedPlaceIr::Field { field, .. }
+        | TypedPlaceIr::ClassField { field, .. }
+        | TypedPlaceIr::StateField { field, .. } => definitions[field.0 as usize].ty.clone(),
         TypedPlaceIr::Index { base, .. } => match &base.ty {
             IrType::Array(inner) | IrType::Buffer(inner) => inner.as_ref().clone(),
             IrType::Map(_, value) => value.as_ref().clone(),
@@ -9647,12 +13252,8 @@ fn encode_const(value: &ConstValue, definitions: &[Definition], output: &mut Vec
             output.push(7);
             output.extend_from_slice(&u32::from(*value).to_le_bytes());
         }
-        ConstValue::Tuple(values) | ConstValue::Array(values) => {
-            output.push(if matches!(value, ConstValue::Tuple(_)) {
-                8
-            } else {
-                9
-            });
+        ConstValue::Tuple(values) => {
+            output.push(8);
             append_u32(output, u32::try_from(values.len()).unwrap_or(u32::MAX));
             for value in values {
                 encode_const(value, definitions, output);
@@ -9681,6 +13282,21 @@ fn encode_const(value: &ConstValue, definitions: &[Definition], output: &mut Vec
                 encode_const(value, definitions, output);
             }
         }
+        ConstValue::BuiltinVariant { variant, value } => {
+            output.push(12);
+            output.push(match variant {
+                BuiltinVariantIr::OptionSome => 0,
+                BuiltinVariantIr::OptionNone => 1,
+                BuiltinVariantIr::ResultOk => 2,
+                BuiltinVariantIr::ResultErr => 3,
+            });
+            if let Some(value) = value {
+                output.push(1);
+                encode_const(value, definitions, output);
+            } else {
+                output.push(0);
+            }
+        }
     }
 }
 
@@ -9700,13 +13316,12 @@ const fn definition_kind_name(kind: DefinitionKind) -> &'static str {
         DefinitionKind::Struct => "struct",
         DefinitionKind::Enum => "enum",
         DefinitionKind::Class => "class",
-        DefinitionKind::Stateful => "stateful",
         DefinitionKind::Const => "const",
         DefinitionKind::Field => "field",
         DefinitionKind::Variant => "variant",
         DefinitionKind::Parameter => "parameter",
         DefinitionKind::Local => "local",
-        DefinitionKind::HostInterface => "host-interface",
+        DefinitionKind::HostContract => "host-contract",
         DefinitionKind::HostFunction => "host-function",
         DefinitionKind::StandardLibrary => "standard-library",
     }
@@ -9718,8 +13333,7 @@ const fn is_nominal_type_kind(kind: DefinitionKind) -> bool {
         DefinitionKind::Struct
             | DefinitionKind::Enum
             | DefinitionKind::Class
-            | DefinitionKind::Stateful
-            | DefinitionKind::HostInterface
+            | DefinitionKind::HostContract
             | DefinitionKind::StandardLibrary
     )
 }
@@ -9735,7 +13349,9 @@ const fn effect_name(effect: IrEffect) -> &'static str {
     }
 }
 
-fn display_type(ty: &IrType, definitions: &[Definition]) -> String {
+/// Formats one fully resolved IR type using the canonical Nexa v2 source spelling.
+#[must_use]
+pub fn display_ir_type(ty: &IrType, definitions: &[Definition]) -> String {
     match ty {
         IrType::Unit => "unit".into(),
         IrType::Bool => "bool".into(),
@@ -9749,39 +13365,104 @@ fn display_type(ty: &IrType, definitions: &[Definition]) -> String {
             || format!("<definition {}>", definition.0),
             |value| value.name.clone(),
         ),
-        IrType::Option(inner) => format!("Option<{}>", display_type(inner, definitions)),
+        IrType::Option(inner) => format!("Option<{}>", display_ir_type(inner, definitions)),
         IrType::Result(ok, error) => format!(
             "Result<{}, {}>",
-            display_type(ok, definitions),
-            display_type(error, definitions)
+            display_ir_type(ok, definitions),
+            display_ir_type(error, definitions)
         ),
-        IrType::Array(inner) => format!("Array<{}>", display_type(inner, definitions)),
+        IrType::Array(inner) => format!("Array<{}>", display_ir_type(inner, definitions)),
         IrType::Map(key, value) => format!(
             "Map<{}, {}>",
-            display_type(key, definitions),
-            display_type(value, definitions)
+            display_ir_type(key, definitions),
+            display_ir_type(value, definitions)
         ),
         IrType::Tuple(values) => format!(
             "({})",
             values
                 .iter()
-                .map(|value| display_type(value, definitions))
+                .map(|value| display_ir_type(value, definitions))
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        IrType::HostRequest(inner) => inner.as_ref().map_or_else(
-            || "HostRequest".into(),
-            |inner| format!("HostRequest<{}>", display_type(inner, definitions)),
-        ),
+        IrType::HostRequest(_) => "<runtime-only async request>".into(),
         IrType::ResourceToken(inner) => inner.as_ref().map_or_else(
-            || "ResourceToken".into(),
-            |inner| format!("ResourceToken<{}>", display_type(inner, definitions)),
+            || "<invalid untyped Token>".into(),
+            |inner| format!("Token<{}>", display_ir_type(inner, definitions)),
         ),
-        IrType::Snapshot(inner) => format!("Snapshot<{}>", display_type(inner, definitions)),
-        IrType::Buffer(inner) => format!("Buffer<{}>", display_type(inner, definitions)),
+        IrType::Snapshot(inner) => format!("Snapshot<{}>", display_ir_type(inner, definitions)),
+        IrType::Buffer(inner) => format!("Buffer<{}>", display_ir_type(inner, definitions)),
         IrType::StateHandle(inner) => {
-            format!("StateHandle<{}>", display_type(inner, definitions))
+            format!("StateHandle<{}>", display_ir_type(inner, definitions))
         }
         IrType::TypeParameter(index) => format!("<type-parameter {index}>"),
+    }
+}
+
+fn surface_type_from_ir(
+    ty: &IrType,
+    definitions: &[Definition],
+    type_parameters: &[String],
+) -> Option<SurfaceType> {
+    match ty {
+        IrType::Unit => Some(SurfaceType::Unit),
+        IrType::Bool => Some(SurfaceType::Bool),
+        IrType::I32 => Some(SurfaceType::I32),
+        IrType::I64 => Some(SurfaceType::I64),
+        IrType::F32 => Some(SurfaceType::F32),
+        IrType::F64 => Some(SurfaceType::F64),
+        IrType::String => Some(SurfaceType::String),
+        IrType::Rune => Some(SurfaceType::Rune),
+        IrType::Named(definition) => {
+            let definition = definitions.get(definition.0 as usize)?;
+            Some(SurfaceType::Named {
+                module: definition.module.clone(),
+                name: definition.name.clone(),
+            })
+        }
+        IrType::Option(inner) => Some(SurfaceType::Option(Box::new(surface_type_from_ir(
+            inner,
+            definitions,
+            type_parameters,
+        )?))),
+        IrType::Result(ok, error) => Some(SurfaceType::Result(
+            Box::new(surface_type_from_ir(ok, definitions, type_parameters)?),
+            Box::new(surface_type_from_ir(error, definitions, type_parameters)?),
+        )),
+        IrType::Array(inner) => Some(SurfaceType::Array(Box::new(surface_type_from_ir(
+            inner,
+            definitions,
+            type_parameters,
+        )?))),
+        IrType::Map(key, value) => Some(SurfaceType::Map(
+            Box::new(surface_type_from_ir(key, definitions, type_parameters)?),
+            Box::new(surface_type_from_ir(value, definitions, type_parameters)?),
+        )),
+        IrType::Tuple(values) => values
+            .iter()
+            .map(|value| surface_type_from_ir(value, definitions, type_parameters))
+            .collect::<Option<Vec<_>>>()
+            .map(SurfaceType::Tuple),
+        IrType::HostRequest(_) | IrType::ResourceToken(None) => None,
+        IrType::ResourceToken(Some(inner)) => Some(SurfaceType::Token(Box::new(
+            surface_type_from_ir(inner, definitions, type_parameters)?,
+        ))),
+        IrType::Snapshot(inner) => Some(SurfaceType::Snapshot(Box::new(surface_type_from_ir(
+            inner,
+            definitions,
+            type_parameters,
+        )?))),
+        IrType::Buffer(inner) => Some(SurfaceType::Buffer(Box::new(surface_type_from_ir(
+            inner,
+            definitions,
+            type_parameters,
+        )?))),
+        IrType::StateHandle(inner) => Some(SurfaceType::StateHandle(Box::new(
+            surface_type_from_ir(inner, definitions, type_parameters)?,
+        ))),
+        IrType::TypeParameter(index) => type_parameters
+            .get(usize::from(*index))
+            .cloned()
+            .map(SurfaceType::TypeParameter),
     }
 }

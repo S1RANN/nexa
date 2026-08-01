@@ -85,7 +85,7 @@ fn shared_package_source_snapshot(files: &PackageSourceSnapshot) -> Arc<EngineSo
     let identities_by_file = files
         .files()
         .iter()
-        .map(|source| (source.file, source.identity.clone()))
+        .map(|source| (source.file(), source.identity().clone()))
         .collect::<BTreeMap<_, _>>();
     let cache = SOURCE_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(Vec::new()));
     let mut cache = cache
@@ -1109,15 +1109,15 @@ mod tests {
         let secondary = SourceIdentity::standalone("host://secondary.nidl");
         let mut sources = SourceSnapshotRegistry::builder();
         sources
-            .insert(primary.clone(), "interface Primary {}")
+            .insert(primary.clone(), "contract Primary {}")
             .unwrap();
         sources
-            .insert(secondary.clone(), "interface Secondary {}")
+            .insert(secondary.clone(), "contract Secondary {}")
             .unwrap();
         let sources = sources.build();
         let leaf =
             LeafDiagnostic::new(ErrorCode::NX2101, Severity::Error, "mixed identities").with_label(
-                LeafLabel::primary(primary.clone(), ByteRange::new(10, 17), "canonical primary"),
+                LeafLabel::primary(primary.clone(), ByteRange::new(9, 16), "canonical primary"),
             );
         let mut engine = EngineDiagnostic::from_leaf_diagnostic(
             None,
@@ -1131,7 +1131,7 @@ mod tests {
             .as_ref()
             .and_then(|snapshot| snapshot.file_id(&secondary))
             .unwrap();
-        let secondary_span = SourceSpan::new(secondary_file, 10, 19);
+        let secondary_span = SourceSpan::new(secondary_file, 9, 18);
         engine.diagnostic.secondary.push(nexa::Label {
             span: secondary_span,
             message: nexa::RuntimeMessage::Static("unresolved secondary"),
@@ -1162,30 +1162,20 @@ mod tests {
         let root = SourceIdentity::package("root.app", "src/main.nexa");
         let contract = SourceIdentity::standalone("host://contract.nidl");
         let sources = PackageSourceSnapshot::new([
-            CompiledSource {
-                file: FileId(1),
-                key: Some(dependency_key),
-                identity: dependency.clone(),
-                module_path: Some("value".into()),
-                text: Arc::from("pub fn value() -> i32 { 1 }"),
-                compiler_provided: false,
-            },
-            CompiledSource {
-                file: FileId(2),
-                key: Some(root_key),
-                identity: root.clone(),
-                module_path: Some("main".into()),
-                text: Arc::from("fn main() { value(); }"),
-                compiler_provided: false,
-            },
-            CompiledSource {
-                file: FileId(3),
-                key: None,
-                identity: contract.clone(),
-                module_path: None,
-                text: Arc::from("export fn value() -> i32;"),
-                compiler_provided: true,
-            },
+            CompiledSource::package(
+                FileId(1),
+                dependency_key,
+                "value",
+                "pub fn value() -> i32 { 1 }",
+                false,
+            ),
+            CompiledSource::package(FileId(2), root_key, "main", "fn main() { value(); }", false),
+            CompiledSource::external(
+                FileId(3),
+                contract.clone(),
+                "export fn value() -> i32;",
+                true,
+            ),
         ])
         .unwrap();
         let leaf = LeafDiagnostic::new(ErrorCode::NX2101, Severity::Error, "type mismatch")

@@ -1166,6 +1166,25 @@ impl<'a> HostValueRef<'a> {
         })
     }
 
+    pub fn class_ref(self, type_id: StableId) -> Result<HostClassRef<'a>, HostTrap> {
+        if !matches!(
+            self.value,
+            crate::RuntimeValue::NamedRef {
+                type_id: actual,
+                ..
+            } if actual == type_id
+        ) {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let fields = heap.class_fields(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostClassRef {
+            type_id,
+            fields,
+            heap,
+        })
+    }
+
     pub fn enum_ref(self, type_id: StableId) -> Result<HostEnumRef<'a>, HostTrap> {
         let heap = self.heap()?;
         let (actual, variant, tag, payload) =
@@ -1220,6 +1239,26 @@ impl<'a> HostValueRef<'a> {
         })
     }
 
+    pub fn map_ref(self, type_id: StableId) -> Result<HostMapRef<'a>, HostTrap> {
+        if !matches!(
+            self.value,
+            crate::RuntimeValue::NamedRef {
+                type_id: actual,
+                ..
+            } if actual == type_id
+        ) {
+            return Err(HostTrap::Type);
+        }
+        let heap = self.heap()?;
+        let len = heap.map_len(self.value).map_err(|_| HostTrap::Type)?;
+        Ok(HostMapRef {
+            type_id,
+            value: self.value,
+            len,
+            heap,
+        })
+    }
+
     fn heap(self) -> Result<&'a crate::Heap, HostTrap> {
         self.heap.ok_or(HostTrap::Type)
     }
@@ -1258,6 +1297,50 @@ impl<'a> HostStructRef<'a> {
                 heap: Some(self.heap),
             })
             .ok_or(HostTrap::Type)
+    }
+}
+
+/// A named class whose fields remain in the VM heap.
+#[derive(Clone, Copy, Debug)]
+pub struct HostClassRef<'a> {
+    type_id: StableId,
+    fields: &'a [crate::RuntimeValue],
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostClassRef<'a> {
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.fields.len()
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.fields.is_empty()
+    }
+
+    pub fn field(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+        self.fields
+            .get(index)
+            .copied()
+            .map(|value| HostValueRef {
+                value,
+                heap: Some(self.heap),
+            })
+            .ok_or(HostTrap::Type)
+    }
+
+    #[must_use]
+    pub fn iter(self) -> impl ExactSizeIterator<Item = HostValueRef<'a>> + 'a {
+        self.fields.iter().copied().map(|value| HostValueRef {
+            value,
+            heap: Some(self.heap),
+        })
     }
 }
 
@@ -1344,6 +1427,73 @@ macro_rules! host_collection_ref {
 
 host_collection_ref!(HostArrayRef);
 host_collection_ref!(HostBufferRef);
+
+/// One borrowed key/value pair from a VM map.
+#[derive(Clone, Copy, Debug)]
+pub struct HostMapEntryRef<'a> {
+    key: crate::RuntimeValue,
+    value: crate::RuntimeValue,
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostMapEntryRef<'a> {
+    #[must_use]
+    pub const fn key(self) -> HostValueRef<'a> {
+        HostValueRef {
+            value: self.key,
+            heap: Some(self.heap),
+        }
+    }
+
+    #[must_use]
+    pub const fn value(self) -> HostValueRef<'a> {
+        HostValueRef {
+            value: self.value,
+            heap: Some(self.heap),
+        }
+    }
+}
+
+/// A named map whose entries remain in the VM heap.
+///
+/// Iteration follows the heap's deterministic backing-slot order. It does not
+/// allocate, recompute hashes, or expose mutable map storage.
+#[derive(Clone, Copy, Debug)]
+pub struct HostMapRef<'a> {
+    type_id: StableId,
+    value: crate::RuntimeValue,
+    len: usize,
+    heap: &'a crate::Heap,
+}
+
+impl<'a> HostMapRef<'a> {
+    #[must_use]
+    pub const fn type_id(self) -> StableId {
+        self.type_id
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn entry(self, index: usize) -> Result<HostMapEntryRef<'a>, HostTrap> {
+        self.iter().nth(index).ok_or(HostTrap::Type)
+    }
+
+    #[must_use]
+    pub fn iter(self) -> impl ExactSizeIterator<Item = HostMapEntryRef<'a>> + 'a {
+        let heap = self.heap;
+        heap.map_entries(self.value)
+            .expect("validated immutable map reference remains valid")
+            .map(move |(key, value)| HostMapEntryRef { key, value, heap })
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostOptionRef<'a, T> {
@@ -1462,6 +1612,10 @@ impl<'a> RuntimeHostArgs<'a> {
         self.value_ref(index)?.struct_ref(type_id)
     }
 
+    pub fn class_ref(&self, index: usize, type_id: StableId) -> Result<HostClassRef<'_>, HostTrap> {
+        self.value_ref(index)?.class_ref(type_id)
+    }
+
     pub fn enum_ref(&self, index: usize, type_id: StableId) -> Result<HostEnumRef<'_>, HostTrap> {
         self.value_ref(index)?.enum_ref(type_id)
     }
@@ -1478,6 +1632,10 @@ impl<'a> RuntimeHostArgs<'a> {
         self.value_ref(index)?.buffer_ref(type_id)
     }
 
+    pub fn map_ref(&self, index: usize, type_id: StableId) -> Result<HostMapRef<'_>, HostTrap> {
+        self.value_ref(index)?.map_ref(type_id)
+    }
+
     pub fn request(&self, index: usize) -> Result<HostRequestHandle, HostTrap> {
         match self.value(index)? {
             crate::RuntimeValue::HostRequest(value) => Ok(value),
@@ -1490,6 +1648,18 @@ impl<'a> RuntimeHostArgs<'a> {
             crate::RuntimeValue::ResourceToken(value) => Ok(value),
             _ => Err(HostTrap::Type),
         }
+    }
+
+    pub fn typed_token(
+        &self,
+        index: usize,
+        content_type: StableId,
+    ) -> Result<ResourceTokenHandle, HostTrap> {
+        let token = self.token(index)?;
+        if token.content_type() != content_type {
+            return Err(HostTrap::Type);
+        }
+        Ok(token)
     }
 
     pub fn snapshot(&self, index: usize) -> Result<SnapshotHandle, HostTrap> {
@@ -1878,7 +2048,7 @@ pub enum HostCallOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostTrap {
-    UnknownFunction(u32),
+    UnknownFunction(StableId),
     Arity,
     Type,
     ResourceCapacity,
@@ -1886,33 +2056,232 @@ pub enum HostTrap {
     Host(crate::RuntimeMessage),
 }
 
+/// Immutable runtime authority for one Host function in a Contract.
+///
+/// Generated registries expose these records by [`StableId`]. A Realm accepts
+/// a module Host import only when every executable field is identical to this
+/// Contract metadata, preventing bytecode from weakening fuel or async
+/// completion policy.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostFunctionAuthority {
+    stable_id: StableId,
+    declaration_fingerprint: [u8; 32],
+    parameters: Vec<nexa_bytecode::ValueType>,
+    result: Option<nexa_bytecode::ValueType>,
+    mode: nexa_bytecode::HostCallMode,
+    fuel_cost: u32,
+    async_result: Option<nexa_bytecode::AsyncResultType>,
+    capabilities: Vec<String>,
+}
+
+impl HostFunctionAuthority {
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        stable_id: StableId,
+        declaration_fingerprint: [u8; 32],
+        parameters: &[nexa_bytecode::ValueType],
+        result: Option<nexa_bytecode::ValueType>,
+        mode: nexa_bytecode::HostCallMode,
+        fuel_cost: u32,
+        async_result: Option<nexa_bytecode::AsyncResultType>,
+        capabilities: &[&str],
+    ) -> Self {
+        Self::new_owned(
+            stable_id,
+            declaration_fingerprint,
+            parameters.to_vec(),
+            result,
+            mode,
+            fuel_cost,
+            async_result,
+            capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_owned(
+        stable_id: StableId,
+        declaration_fingerprint: [u8; 32],
+        parameters: Vec<nexa_bytecode::ValueType>,
+        result: Option<nexa_bytecode::ValueType>,
+        mode: nexa_bytecode::HostCallMode,
+        fuel_cost: u32,
+        async_result: Option<nexa_bytecode::AsyncResultType>,
+        capabilities: Vec<String>,
+    ) -> Self {
+        Self {
+            stable_id,
+            declaration_fingerprint,
+            parameters,
+            result,
+            mode,
+            fuel_cost,
+            async_result,
+            capabilities,
+        }
+    }
+
+    #[must_use]
+    pub fn from_import(import: &nexa_bytecode::HostImport) -> Self {
+        Self::new_owned(
+            import.stable_id,
+            import.declaration_fingerprint,
+            import.parameters.clone(),
+            import.result,
+            import.mode,
+            import.fuel_cost,
+            import.async_result,
+            import.capabilities.clone(),
+        )
+    }
+
+    #[must_use]
+    pub const fn stable_id(&self) -> StableId {
+        self.stable_id
+    }
+
+    #[must_use]
+    pub const fn declaration_fingerprint(&self) -> [u8; 32] {
+        self.declaration_fingerprint
+    }
+
+    #[must_use]
+    pub fn parameters(&self) -> &[nexa_bytecode::ValueType] {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub const fn result(&self) -> Option<nexa_bytecode::ValueType> {
+        self.result
+    }
+
+    #[must_use]
+    pub const fn mode(&self) -> nexa_bytecode::HostCallMode {
+        self.mode
+    }
+
+    #[must_use]
+    pub const fn fuel_cost(&self) -> u32 {
+        self.fuel_cost
+    }
+
+    #[must_use]
+    pub const fn async_result(&self) -> Option<nexa_bytecode::AsyncResultType> {
+        self.async_result
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &[String] {
+        &self.capabilities
+    }
+}
+
 pub trait HostRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        None
+    }
+
+    fn function_authority(&self, _id: StableId) -> Option<&HostFunctionAuthority> {
         None
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap>;
 }
 
-pub trait ScriptFunction {
-    type Args;
-    type Output;
-    const FUNCTION_ID: u32;
-}
-
-pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 1;
+pub const HOST_CONTRACT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HostContract {
-    pub interface_name: &'static str,
-    pub canonical_idl: &'static str,
-    pub interface_hash: StableId,
-    pub generator_schema_version: u32,
+    contract_name: &'static str,
+    source: &'static str,
+    canonical_descriptor: &'static [u8],
+    contract_fingerprint: [u8; 32],
+    contract_runtime_id: StableId,
+    generator_schema_version: u32,
+}
+
+impl HostContract {
+    #[must_use]
+    pub const fn new(
+        contract_name: &'static str,
+        source: &'static str,
+        canonical_descriptor: &'static [u8],
+        contract_fingerprint: [u8; 32],
+        contract_runtime_id: StableId,
+        generator_schema_version: u32,
+    ) -> Self {
+        let expected = contract_runtime_id_from_fingerprint(contract_fingerprint);
+        assert!(
+            contract_runtime_id.0 == expected.0,
+            "Contract runtime ID must be the fingerprint's first eight little-endian bytes"
+        );
+        assert!(
+            generator_schema_version == HOST_CONTRACT_SCHEMA_VERSION,
+            "Host Contract generator schema version must match this Runtime"
+        );
+        Self {
+            contract_name,
+            source,
+            canonical_descriptor,
+            contract_fingerprint,
+            contract_runtime_id,
+            generator_schema_version,
+        }
+    }
+
+    #[must_use]
+    pub const fn contract_name(self) -> &'static str {
+        self.contract_name
+    }
+
+    #[must_use]
+    pub const fn source(self) -> &'static str {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn canonical_descriptor(self) -> &'static [u8] {
+        self.canonical_descriptor
+    }
+
+    #[must_use]
+    pub const fn contract_fingerprint(self) -> [u8; 32] {
+        self.contract_fingerprint
+    }
+
+    #[must_use]
+    pub const fn contract_runtime_id(self) -> StableId {
+        self.contract_runtime_id
+    }
+
+    #[must_use]
+    pub const fn generator_schema_version(self) -> u32 {
+        self.generator_schema_version
+    }
+}
+
+#[must_use]
+pub const fn contract_runtime_id_from_fingerprint(fingerprint: [u8; 32]) -> StableId {
+    StableId(u64::from_le_bytes([
+        fingerprint[0],
+        fingerprint[1],
+        fingerprint[2],
+        fingerprint[3],
+        fingerprint[4],
+        fingerprint[5],
+        fingerprint[6],
+        fingerprint[7],
+    ]))
 }
 
 pub type ScriptArgumentRequirements = HostReturnRequirements;
@@ -1941,6 +2310,9 @@ pub enum ScriptCallError {
         stable_id: StableId,
     },
     SignatureMismatch {
+        name: &'static str,
+    },
+    EffectMismatch {
         name: &'static str,
     },
     EffectNotCallable {
@@ -1976,6 +2348,8 @@ pub trait ScriptExport {
     const NAME: &'static str;
 
     fn signature() -> nexa_bytecode::Signature;
+
+    fn effect() -> nexa_bytecode::FunctionEffect;
 
     fn argument_requirements(
         args: &Self::Args,
@@ -2899,12 +3273,25 @@ fn enqueue_request_release(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ResourceTokenHandle(RawHandle);
+pub struct ResourceTokenHandle {
+    raw: RawHandle,
+    content_type: StableId,
+}
 
 impl ResourceTokenHandle {
     #[must_use]
     pub const fn raw(self) -> RawHandle {
-        self.0
+        self.raw
+    }
+
+    #[must_use]
+    pub const fn content_type(self) -> StableId {
+        self.content_type
+    }
+
+    #[must_use]
+    pub fn token_type(self) -> StableId {
+        nexa_bytecode::resource_token_type(self.content_type)
     }
 }
 
@@ -2913,6 +3300,7 @@ struct ResourceToken {
     module_id: u32,
     epoch: u64,
     domain: RuntimeHostDomain,
+    content_type: StableId,
     state: resource_token::State,
     release: Option<ReleaseReservation>,
 }
@@ -2922,7 +3310,7 @@ pub(crate) struct ResourceTokenManager {
     realm_id: u32,
     tokens: SlotPool<ResourceToken>,
     epoch_counts: EpochCounts,
-    terminal: VecDeque<RawHandle>,
+    terminal: VecDeque<ResourceTokenHandle>,
     terminal_capacity: usize,
 }
 
@@ -2943,6 +3331,7 @@ impl ResourceTokenManager {
         _owner: TaskHandle,
         module_id: u32,
         epoch: u64,
+        content_type: StableId,
         domain: RuntimeHostDomain,
         releases: &mut ReleaseQueue,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
@@ -2960,12 +3349,16 @@ impl ResourceTokenManager {
             module_id,
             epoch,
             domain,
+            content_type,
             state: published.state,
             release: Some(release),
         }) {
             Ok(handle) => {
                 increment_epoch_count(&mut self.epoch_counts, module_id, epoch);
-                Ok(ResourceTokenHandle(handle))
+                Ok(ResourceTokenHandle {
+                    raw: handle,
+                    content_type,
+                })
             }
             Err(error) => {
                 releases.cancel_reservation(release);
@@ -2979,10 +3372,20 @@ impl ResourceTokenManager {
         handle: ResourceTokenHandle,
         releases: &mut ReleaseQueue,
     ) -> Result<bool, HostRequestError> {
-        if self.terminal.contains(&handle.0) {
+        if self.terminal.contains(&handle) {
             return Ok(false);
         }
-        let token = self.tokens.resolve_mut(handle.0)?;
+        if self
+            .terminal
+            .iter()
+            .any(|terminal| terminal.raw == handle.raw)
+        {
+            return Err(HostRequestError::InvalidState);
+        }
+        let token = self.tokens.resolve_mut(handle.raw)?;
+        if token.content_type != handle.content_type {
+            return Err(HostRequestError::InvalidState);
+        }
         token.state =
             resource_token::apply(token.state, resource_token::Event::EnqueueRelease, |_| true)
                 .expect("generated resource enqueue transition exists")
@@ -2999,7 +3402,7 @@ impl ResourceTokenManager {
                 module_id: token.module_id,
                 epoch: token.epoch,
                 kind: ReleaseKind::ResourceToken,
-                object_id: u64::from(handle.0.generation) << 32 | u64::from(handle.0.index),
+                object_id: u64::from(handle.raw.generation) << 32 | u64::from(handle.raw.index),
                 domain,
             },
         )?;
@@ -3009,11 +3412,11 @@ impl ResourceTokenManager {
                 .state;
         decrement_epoch_count(&mut self.epoch_counts, token.module_id, token.epoch);
         let _ = token;
-        self.tokens.release(handle.0)?;
+        self.tokens.release(handle.raw)?;
         if self.terminal.len() == self.terminal_capacity {
             self.terminal.pop_front();
         }
-        self.terminal.push_back(handle.0);
+        self.terminal.push_back(handle);
         Ok(true)
     }
 
@@ -3654,6 +4057,7 @@ impl ResourceContext<'_> {
 
     pub fn create_token(
         &mut self,
+        content_type: StableId,
         domain: RuntimeHostDomain,
     ) -> Result<ResourceTokenHandle, HostRequestError> {
         self.admit(HostAdmissionKind::ResourceToken)?;
@@ -3662,6 +4066,7 @@ impl ResourceContext<'_> {
             self.task,
             self.module_id,
             self.epoch,
+            content_type,
             domain,
             &mut self.resources.releases,
         )?;
@@ -3894,11 +4299,12 @@ mod tests {
     use nexa_core::RawHandle;
 
     use super::{
-        EncodedSnapshot, HostAdmissionError, HostAdmissionKind, HostErrorPayload, HostPayload,
-        HostRequestError, HostRequestHandle, HostRequestManager, HostReturnRequirements,
-        ReleaseKind, ReleaseQueue, ReleaseQueueError, ReleaseQueueState, ResourceTokenManager,
-        RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState,
-        SnapshotLayout, SnapshotManager,
+        EncodedSnapshot, HOST_CONTRACT_SCHEMA_VERSION, HostAdmissionError, HostAdmissionKind,
+        HostContract, HostErrorPayload, HostPayload, HostRequestError, HostRequestHandle,
+        HostRequestManager, HostReturnRequirements, ReleaseKind, ReleaseQueue, ReleaseQueueError,
+        ReleaseQueueState, ResourceTokenManager, RuntimeHost, RuntimeHostArgs,
+        RuntimeHostCloseError, RuntimeHostDomain, RuntimeHostState, ScriptOutputReader,
+        SnapshotLayout, SnapshotManager, contract_runtime_id_from_fingerprint,
     };
     use crate::{
         GcRoots, Heap, RuntimeFailurePoint, RuntimeLimits, RuntimeValue, StableId, TaskRuntime,
@@ -3920,6 +4326,47 @@ mod tests {
         }
         let value = transaction.finish_array(array)?;
         transaction.commit(value)
+    }
+
+    #[test]
+    fn host_contract_v2_preserves_source_descriptor_and_full_fingerprint() {
+        let fingerprint = [
+            0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+            18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+        ];
+        let runtime_id = contract_runtime_id_from_fingerprint(fingerprint);
+        let contract = HostContract::new(
+            "game.host",
+            "contract GameHost {}",
+            b"descriptor-v2",
+            fingerprint,
+            runtime_id,
+            HOST_CONTRACT_SCHEMA_VERSION,
+        );
+        assert_eq!(contract.contract_name(), "game.host");
+        assert_eq!(contract.source(), "contract GameHost {}");
+        assert_eq!(contract.canonical_descriptor(), b"descriptor-v2");
+        assert_eq!(contract.contract_fingerprint(), fingerprint);
+        assert_eq!(contract.contract_runtime_id(), runtime_id);
+        assert_eq!(
+            contract.generator_schema_version(),
+            HOST_CONTRACT_SCHEMA_VERSION
+        );
+        assert_eq!(runtime_id, StableId(0xfedc_ba98_7654_3210));
+    }
+
+    #[test]
+    #[should_panic(expected = "generator schema version")]
+    fn host_contract_rejects_non_v2_generator_schema() {
+        let fingerprint = [0_u8; 32];
+        let _ = HostContract::new(
+            "game.host",
+            "",
+            b"",
+            fingerprint,
+            contract_runtime_id_from_fingerprint(fingerprint),
+            HOST_CONTRACT_SCHEMA_VERSION - 1,
+        );
     }
 
     #[test]
@@ -3991,6 +4438,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn complex_host_views_borrow_runtime_storage() {
         let mut heap = Heap::new(16);
         let string_reference = heap.allocate_string("Nexa界").unwrap();
@@ -4021,43 +4469,90 @@ mod tests {
                 &[RuntimeValue::I32(11), RuntimeValue::I32(13)],
             )
             .unwrap();
-        let values = [string, structure, enumeration, array, buffer];
-        let args = RuntimeHostArgs::new(&values, Some(&mut heap)).unwrap();
-
-        assert_eq!(args.str_ref(0).unwrap().as_str(), "Nexa界");
-        let structure = args.struct_ref(1, struct_type).unwrap();
-        assert_eq!(structure.field(0).unwrap().i32().unwrap(), 7);
+        let class_type = StableId::from_name("HostViewClass");
+        let class = heap
+            .allocate_class(class_type, &[RuntimeValue::I32(17), string])
+            .unwrap();
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
         assert_eq!(
-            structure.field(1).unwrap().str_ref().unwrap().as_str(),
-            "Nexa界"
+            heap.map_set(map, RuntimeValue::I32(19), RuntimeValue::I32(23)),
+            Ok(crate::MapSetOutcome::Complete)
         );
-        let enumeration = args.enum_ref(2, enum_type).unwrap();
-        assert_eq!(enumeration.variant(), variant);
-        assert_eq!(enumeration.tag(), 1);
+        let values = [string, structure, enumeration, array, buffer, class, map];
+        {
+            let args = RuntimeHostArgs::new(&values, Some(&mut heap)).unwrap();
+
+            assert_eq!(args.str_ref(0).unwrap().as_str(), "Nexa界");
+            let structure = args.struct_ref(1, struct_type).unwrap();
+            assert_eq!(structure.field(0).unwrap().i32().unwrap(), 7);
+            assert_eq!(
+                structure.field(1).unwrap().str_ref().unwrap().as_str(),
+                "Nexa界"
+            );
+            let enumeration = args.enum_ref(2, enum_type).unwrap();
+            assert_eq!(enumeration.variant(), variant);
+            assert_eq!(enumeration.tag(), 1);
+            assert_eq!(
+                enumeration
+                    .payload()
+                    .unwrap()
+                    .struct_ref(struct_type)
+                    .unwrap()
+                    .field(0)
+                    .unwrap()
+                    .i32()
+                    .unwrap(),
+                7
+            );
+            assert_eq!(
+                args.array_ref(3, array_type).unwrap().get(1).unwrap().i32(),
+                Ok(5)
+            );
+            assert_eq!(
+                args.buffer_ref(4, buffer_type)
+                    .unwrap()
+                    .get(0)
+                    .unwrap()
+                    .i32(),
+                Ok(11)
+            );
+            assert_eq!(
+                args.class_ref(5, class_type)
+                    .unwrap()
+                    .field(1)
+                    .unwrap()
+                    .str_ref()
+                    .unwrap()
+                    .as_str(),
+                "Nexa界"
+            );
+            let entry = args.map_ref(6, map_type).unwrap().entry(0).unwrap();
+            assert_eq!(entry.key().i32(), Ok(19));
+            assert_eq!(entry.value().i32(), Ok(23));
+        }
+
+        let reader = ScriptOutputReader::new(&heap);
         assert_eq!(
-            enumeration
-                .payload()
-                .unwrap()
-                .struct_ref(struct_type)
+            reader
+                .value(class)
+                .class_ref(class_type)
                 .unwrap()
                 .field(0)
                 .unwrap()
-                .i32()
-                .unwrap(),
-            7
-        );
-        assert_eq!(
-            args.array_ref(3, array_type).unwrap().get(1).unwrap().i32(),
-            Ok(5)
-        );
-        assert_eq!(
-            args.buffer_ref(4, buffer_type)
-                .unwrap()
-                .get(0)
-                .unwrap()
                 .i32(),
-            Ok(11)
+            Ok(17)
         );
+        let map = reader.value(map).map_ref(map_type).unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.iter().len(), 1);
     }
 
     #[test]
@@ -4141,10 +4636,35 @@ mod tests {
         let task = runtime.admit_task(scope, 1, true).unwrap();
         let mut releases = ReleaseQueue::new(2);
         let mut resources = ResourceTokenManager::new(9, 2);
+        let content_type = StableId::from_name("RenderLease");
         let token = resources
-            .create(task, 0, 1, RuntimeHostDomain::Render, &mut releases)
+            .create(
+                task,
+                0,
+                1,
+                content_type,
+                RuntimeHostDomain::Render,
+                &mut releases,
+            )
             .unwrap();
+        assert_eq!(token.content_type(), content_type);
+        assert_eq!(
+            token.token_type(),
+            nexa_bytecode::resource_token_type(content_type)
+        );
+        let forged = super::ResourceTokenHandle {
+            raw: token.raw(),
+            content_type: StableId::from_name("DifferentLease"),
+        };
+        assert_eq!(
+            resources.release(forged, &mut releases),
+            Err(HostRequestError::InvalidState)
+        );
         assert_eq!(resources.release(token, &mut releases), Ok(true));
+        assert_eq!(
+            resources.release(forged, &mut releases),
+            Err(HostRequestError::InvalidState)
+        );
         assert_eq!(resources.release(token, &mut releases), Ok(false));
         releases.reparent_realm(9, 99);
         let record = releases.drain().next().unwrap();
@@ -4568,7 +5088,14 @@ mod tests {
         let mut token_releases = host.release_queue(1);
         let mut tokens = ResourceTokenManager::new(1, 1);
         assert_eq!(
-            tokens.create(task, 2, 3, RuntimeHostDomain::Render, &mut token_releases),
+            tokens.create(
+                task,
+                2,
+                3,
+                StableId::from_name("ClosingToken"),
+                RuntimeHostDomain::Render,
+                &mut token_releases,
+            ),
             Err(HostRequestError::HostClosing)
         );
         let mut snapshot_releases = host.release_queue(1);

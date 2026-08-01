@@ -747,9 +747,10 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
                     continue;
                 }
             };
-            if let Err(message) =
-                validate_required_exports_for_idl(&project.idl, &project.required_exports)
-            {
+            if let Err(message) = validate_required_entrypoints_for_contract(
+                &project.contract,
+                &project.required_entrypoints,
+            ) {
                 report.diagnostics.push(LocatedDiagnostic::new(
                     EngineDiagnostic::without_source(
                         None,
@@ -805,6 +806,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
         }
         for path in standalone_sources {
             let Some(source) = snapshot.text_for_path(&path)? else {
+                self.standalone_sessions.remove(&lexical_path(&path));
                 continue;
             };
             let session = self
@@ -838,7 +840,7 @@ impl WorkspaceAnalyzer for CurrentWorkspaceAnalyzer {
 fn valid_project_metadata_overlay(snapshot: &WorkspaceSnapshot<'_>, path: &Path) -> Option<String> {
     let source = snapshot.overlay_for_path(path)?;
     if path.extension().and_then(|extension| extension.to_str()) == Some("nidl")
-        && nexa::parse_idl(source).is_err()
+        && nexa::parse_nidl(source).is_err()
     {
         // The package analyzer turns this into one source-backed exact-span diagnostic below.
         // Feeding the same invalid text through project loading would add a generic duplicate and
@@ -902,46 +904,48 @@ fn analyze_package_snapshot(
     };
 
     let contract_path = project.contract_path.clone();
-    let (idl, contract_source) = if let Some(contract_overlay) =
-        snapshot.overlay_for_path(&contract_path)
-    {
-        let Ok(idl) = nexa::parse_idl(contract_overlay) else {
-            let root = contract_path
-                .parent()
-                .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
-            return Ok(
-                diagnostics_for_nidl_source(&contract_path, contract_overlay)?
-                    .into_iter()
-                    .map(|diagnostic| {
-                        LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
-                    })
-                    .collect(),
-            );
+    let (validated_contract, contract_source) =
+        if let Some(contract_overlay) = snapshot.overlay_for_path(&contract_path) {
+            let Ok(validated_contract) = nexa::parse_nidl(contract_overlay) else {
+                let root = contract_path
+                    .parent()
+                    .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
+                return Ok(
+                    diagnostics_for_nidl_source(&contract_path, contract_overlay)?
+                        .into_iter()
+                        .map(|diagnostic| {
+                            LocatedDiagnostic::new(diagnostic, root.clone(), contract_path.clone())
+                        })
+                        .collect(),
+                );
+            };
+            if let Err(message) = validate_required_entrypoints_for_contract(
+                &validated_contract,
+                &project.required_entrypoints,
+            ) {
+                return Ok(vec![LocatedDiagnostic::new(
+                    EngineDiagnostic::without_source(
+                        None,
+                        SourceId::new("editor").ok(),
+                        EngineDiagnosticStage::Export,
+                        nexa::ErrorCode::NX7010,
+                        message,
+                    ),
+                    project.root.clone(),
+                    contract_path,
+                )]);
+            }
+            (validated_contract, Arc::<str>::from(contract_overlay))
+        } else {
+            (
+                project.contract.clone(),
+                Arc::<str>::from(project.contract_source.as_str()),
+            )
         };
-        if let Err(message) = validate_required_exports_for_idl(&idl, &project.required_exports) {
-            return Ok(vec![LocatedDiagnostic::new(
-                EngineDiagnostic::without_source(
-                    None,
-                    SourceId::new("editor").ok(),
-                    EngineDiagnosticStage::Export,
-                    nexa::ErrorCode::NX7010,
-                    message,
-                ),
-                project.root.clone(),
-                contract_path,
-            )]);
-        }
-        (idl, Arc::<str>::from(contract_overlay))
-    } else {
-        (
-            project.idl.clone(),
-            Arc::<str>::from(project.contract_source.as_str()),
-        )
-    };
     let contract_identity =
         nexa::SourceIdentity::standalone(contract_path.to_string_lossy().into_owned());
     let contract = match nexa::HostContractInput::with_source(
-        &idl,
+        &validated_contract,
         contract_identity,
         Arc::clone(&contract_source),
     ) {
@@ -1040,7 +1044,7 @@ fn analyze_package_snapshot(
         &mut session.build,
         generation,
         &contract,
-        &project.required_exports,
+        &project.required_entrypoints,
         true,
     ) {
         Ok(_) => Ok(Vec::new()),
@@ -1246,10 +1250,12 @@ const fn package_build_error_stage(error: &nexa::PackageBuildError) -> EngineDia
         nexa::PackageBuildError::Verify(_)
         | nexa::PackageBuildError::InvalidTestArtifact(_)
         | nexa::PackageBuildError::Integrity(_) => EngineDiagnosticStage::Verify,
-        nexa::PackageBuildError::MissingRequiredExport(_)
-        | nexa::PackageBuildError::ExportSignatureMismatch { .. }
+        nexa::PackageBuildError::MissingRequiredEntrypoint(_)
+        | nexa::PackageBuildError::EntrypointSignatureMismatch { .. }
         | nexa::PackageBuildError::HostContractMismatch
-        | nexa::PackageBuildError::HostInterfaceHashMismatch => EngineDiagnosticStage::Export,
+        | nexa::PackageBuildError::HostContractSourceMismatch
+        | nexa::PackageBuildError::HostRequiredEntrypointsMismatch
+        | nexa::PackageBuildError::HostContractIdMismatch => EngineDiagnosticStage::Export,
         nexa::PackageBuildError::AnalysisFailed(_) => EngineDiagnosticStage::TypeCheck,
         _ => EngineDiagnosticStage::Compile,
     }
@@ -1261,19 +1267,28 @@ fn package_build_error_code(error: &nexa::PackageBuildError) -> nexa::ErrorCode 
             nexa::Diagnostic::new(error, nexa::FileId::default()).code
         }
         nexa::PackageBuildError::Verify(error) => nexa::ClassifiedError::metadata(error).code,
-        nexa::PackageBuildError::MissingRequiredExport(_) => nexa::ErrorCode::NX7010,
-        nexa::PackageBuildError::ExportSignatureMismatch { .. } => nexa::ErrorCode::NX7011,
+        nexa::PackageBuildError::MissingRequiredEntrypoint(_) => nexa::ErrorCode::NX7010,
+        nexa::PackageBuildError::EntrypointSignatureMismatch { .. } => nexa::ErrorCode::NX7011,
         nexa::PackageBuildError::HostContractMismatch
-        | nexa::PackageBuildError::HostInterfaceHashMismatch => nexa::ErrorCode::NX4001,
+        | nexa::PackageBuildError::HostContractSourceMismatch
+        | nexa::PackageBuildError::HostRequiredEntrypointsMismatch
+        | nexa::PackageBuildError::HostContractIdMismatch => nexa::ErrorCode::NX4001,
         _ => nexa::ErrorCode::NX7001,
     }
 }
 
-fn validate_required_exports_for_idl(idl: &nexa::Idl, names: &[String]) -> Result<(), String> {
+fn validate_required_entrypoints_for_contract(
+    contract: &nexa::ValidatedContract,
+    names: &[String],
+) -> Result<(), String> {
     for name in names {
-        if !idl.exports.iter().any(|export| export.name == *name) {
+        if !contract
+            .nexa_functions
+            .iter()
+            .any(|entrypoint| entrypoint.name == *name)
+        {
             return Err(format!(
-                "required export `{name}` is not declared by the current NIDL"
+                "required Nexa entrypoint `{name}` is not declared by the current NIDL"
             ));
         }
     }
@@ -1326,7 +1341,7 @@ fn diagnostics_for_path(
 }
 
 fn diagnostics_for_nidl_source(path: &Path, source: &str) -> Result<Vec<EngineDiagnostic>, String> {
-    let Err(error) = nexa::parse_idl(source) else {
+    let Err(error) = nexa::parse_nidl(source) else {
         return Ok(Vec::new());
     };
     let identity = nexa::SourceIdentity::standalone(path.to_string_lossy().into_owned());
@@ -1335,6 +1350,8 @@ fn diagnostics_for_nidl_source(path: &Path, source: &str) -> Result<Vec<EngineDi
         .insert(identity.clone(), source.to_owned())
         .map_err(|error| error.to_string())?;
     let sources = sources.build();
+    let span = error.span;
+    let kind = error.kind;
     let mut diagnostic = nexa::LeafDiagnostic::new(
         nexa::ErrorCode::NX1002,
         nexa::Severity::Error,
@@ -1342,15 +1359,12 @@ fn diagnostics_for_nidl_source(path: &Path, source: &str) -> Result<Vec<EngineDi
     )
     .with_label(nexa::LeafLabel::primary(
         identity,
-        nexa::ByteRange::new(
-            u32::try_from(error.start).unwrap_or(u32::MAX),
-            u32::try_from(error.end).unwrap_or(u32::MAX),
-        ),
-        format!("expected {}, found {}", error.expected, error.actual),
+        nexa::ByteRange::new(span.start, span.end),
+        "invalid NIDL v2 declaration",
     ));
     diagnostic
         .notes
-        .push(format!("expected: {}; actual: {}", error.expected, error.actual).into());
+        .push(format!("NIDL validation category: {kind:?}").into());
     Ok(vec![EngineDiagnostic::from_leaf_diagnostic(
         None,
         SourceId::new("editor").ok(),
@@ -1368,9 +1382,14 @@ fn diagnostics_for_nexa_source(
     let root = path
         .parent()
         .map_or_else(|| PathBuf::from("/"), Path::to_path_buf);
-    let build = project::virtual_snippet(source, path).map_err(|error| error.to_string())?;
+    let build =
+        project::virtual_standalone_script(source, path).map_err(|error| error.to_string())?;
     let generation = session.prepare(&build);
-    match build.compile_with_session(&mut session.build, generation, None, &[], false) {
+    match build.compile_standalone_with_session_and_limits(
+        &mut session.build,
+        generation,
+        nexa::VerifierLimits::default(),
+    ) {
         Ok(_) => Ok(Vec::new()),
         Err(project::BuildCompileError::Facade(nexa::PackageBuildError::AnalysisFailed(batch))) => {
             let origin = build
@@ -1909,6 +1928,86 @@ mod tests {
             .collect()
     }
 
+    fn lsp_range_contains_source_range(
+        rendered: &serde_json::Value,
+        source: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let diagnostic_start = (
+            rendered["range"]["start"]["line"]
+                .as_u64()
+                .expect("diagnostic start line"),
+            rendered["range"]["start"]["character"]
+                .as_u64()
+                .expect("diagnostic start character"),
+        );
+        let diagnostic_end = (
+            rendered["range"]["end"]["line"]
+                .as_u64()
+                .expect("diagnostic end line"),
+            rendered["range"]["end"]["character"]
+                .as_u64()
+                .expect("diagnostic end character"),
+        );
+        let expected_start = super::byte_offset_to_lsp_position(source, start);
+        let expected_end = super::byte_offset_to_lsp_position(source, end);
+        assert!(
+            diagnostic_start
+                <= (
+                    u64::from(expected_start.line),
+                    u64::from(expected_start.character)
+                ),
+            "diagnostic starts after the relevant source range: {rendered}"
+        );
+        assert!(
+            diagnostic_end
+                >= (
+                    u64::from(expected_end.line),
+                    u64::from(expected_end.character)
+                ),
+            "diagnostic ends before the relevant source range: {rendered}"
+        );
+    }
+
+    fn lsp_range_equals_source_range(
+        rendered: &serde_json::Value,
+        source: &str,
+        start: usize,
+        end: usize,
+    ) {
+        let expected_start = super::byte_offset_to_lsp_position(source, start);
+        let expected_end = super::byte_offset_to_lsp_position(source, end);
+        assert_eq!(
+            rendered["range"]["start"]["line"], expected_start.line,
+            "diagnostic start line differs from the exact source range: {rendered}"
+        );
+        assert_eq!(
+            rendered["range"]["start"]["character"], expected_start.character,
+            "diagnostic start character differs from the exact source range: {rendered}"
+        );
+        assert_eq!(
+            rendered["range"]["end"]["line"], expected_end.line,
+            "diagnostic end line differs from the exact source range: {rendered}"
+        );
+        assert_eq!(
+            rendered["range"]["end"]["character"], expected_end.character,
+            "diagnostic end character differs from the exact source range: {rendered}"
+        );
+    }
+
+    fn nexa_diagnostic_with_code(
+        path: &Path,
+        source: &str,
+        code: nexa::ErrorCode,
+    ) -> nexa_embed::EngineDiagnostic {
+        super::diagnostics_for_path(path, Some(source))
+            .expect("Nexa diagnostics")
+            .into_iter()
+            .find(|diagnostic| diagnostic.diagnostic.code == code)
+            .unwrap_or_else(|| panic!("missing diagnostic {code} for source:\n{source}"))
+    }
+
     #[derive(Clone, Debug)]
     struct RecordedCall {
         roots: Vec<PathBuf>,
@@ -1973,7 +2072,7 @@ mod tests {
     }
 
     fn located_type_error(path: &Path) -> super::LocatedDiagnostic {
-        let source = "fn Value() -> i32 { return \"error\"; }";
+        let source = "fn main(args: Array<string>) -> i32 { return \"error\"; }";
         let mut session = super::PackageAnalysisSession::default();
         super::diagnostics_for_nexa_source(path, source, &mut session)
             .expect("type diagnostics")
@@ -1982,11 +2081,11 @@ mod tests {
             .expect("type error")
     }
 
-    fn fixture_project_config(source_root: &str, required_exports: &str) -> String {
+    fn fixture_project_config(source_root: &str, required_entrypoints: &str) -> String {
         format!(
             "schema = 2\n\
              contract = \"api.nidl\"\n\
-             required_exports = [{required_exports}]\n\
+             required_entrypoints = [{required_entrypoints}]\n\
              [[sources]]\n\
              id = \"fixture\"\n\
              root = \"{source_root}\"\n\
@@ -2031,7 +2130,7 @@ mod tests {
         .expect("project configuration");
         fs::write(
             directory.path().join("api.nidl"),
-            "interface FixtureHost {}\n",
+            "contract FixtureHost {}\n",
         )
         .expect("Host contract");
         fs::write(
@@ -2050,11 +2149,7 @@ mod tests {
              path = \"app\"\n",
         )
         .expect("Package Lockfile");
-        fs::write(
-            &source,
-            "module app.main;\npub fn Run() -> i32 { return 1; }\n",
-        )
-        .expect("Package entry source");
+        fs::write(&source, "pub fn run() -> i32 { return 1; }\n").expect("Package entry source");
         (directory, source)
     }
 
@@ -2159,11 +2254,11 @@ mod tests {
     fn lsp_candidate_generation_tracks_fingerprint_changes_and_aba() {
         let path = Path::new("/tmp/nexa-lsp-generation.nexa");
         let first =
-            crate::project::virtual_snippet("fn Value() -> i32 { return 1; }", path).expect("A");
+            crate::project::virtual_snippet("fn value() -> i32 { return 1; }", path).expect("A");
         let second =
-            crate::project::virtual_snippet("fn Value() -> i32 { return 2; }", path).expect("B");
+            crate::project::virtual_snippet("fn value() -> i32 { return 2; }", path).expect("B");
         let restored =
-            crate::project::virtual_snippet("fn Value() -> i32 { return 1; }", path).expect("A2");
+            crate::project::virtual_snippet("fn value() -> i32 { return 1; }", path).expect("A2");
         assert_eq!(first.build_fingerprint, restored.build_fingerprint);
         assert_ne!(first.build_fingerprint, second.build_fingerprint);
 
@@ -2260,7 +2355,7 @@ mod tests {
         .expect("project configuration");
         fs::write(
             directory.path().join("api.nidl"),
-            "interface FixtureHost {}\n",
+            "contract FixtureHost {}\n",
         )
         .expect("Host contract");
         fs::write(
@@ -2268,11 +2363,8 @@ mod tests {
             fixture_application_manifest("fixture.workspace"),
         )
         .expect("Package Manifest");
-        fs::write(
-            &source,
-            "module app.main;\npub fn Run() -> i32 { return \"wrong\"; }\n",
-        )
-        .expect("invalid Package source");
+        fs::write(&source, "pub fn run() -> i32 { return \"wrong\"; }\n")
+            .expect("invalid Package source");
 
         #[cfg(unix)]
         let workspace_path = {
@@ -2375,12 +2467,12 @@ mod tests {
         let contract = directory.path().join("api.nidl");
         let config = directory.path().join("nexa.dev.toml");
         fs::create_dir_all(&packages).expect("package source root");
-        fs::write(&contract, "interface Broken {").expect("invalid disk NIDL");
+        fs::write(&contract, "contract Broken {").expect("invalid disk NIDL");
         fs::write(
             &config,
             "schema = 2\n\
              contract = \"api.nidl\"\n\
-             required_exports = [\"Run\"]\n\
+             required_entrypoints = [\"run\"]\n\
              [[sources]]\n\
              id = \"fixture\"\n\
              root = \"packages\"\n\
@@ -2405,24 +2497,27 @@ mod tests {
         );
         let project = crate::project::LoadedProject::load_with_overlays(&config, |requested| {
             super::same_file_path(requested, &contract)
-                .then(|| "interface OverlayHost { export Run() -> i32; }\n".to_owned())
+                .then(|| "contract OverlayHost { nexa { fn run() -> i32; } }\n".to_owned())
         })
         .expect("valid editor NIDL overlay");
-        assert_eq!(project.idl.interface, "OverlayHost");
+        assert_eq!(project.contract.name, "OverlayHost");
         assert_eq!(
             project.contract_source,
-            "interface OverlayHost { export Run() -> i32; }\n"
+            "contract OverlayHost { nexa { fn run() -> i32; } }\n"
         );
 
-        fs::write(&contract, "interface DiskHost { export Run() -> i32; }\n")
-            .expect("valid disk NIDL");
+        fs::write(
+            &contract,
+            "contract DiskHost { nexa { fn run() -> i32; } }\n",
+        )
+        .expect("valid disk NIDL");
         let uri = super::path_to_file_uri(&contract).expect("contract URI");
         let documents = BTreeMap::from([(
             uri.clone(),
             super::OpenDocument {
                 uri,
                 path: contract.clone(),
-                text: "interface Broken {".to_owned(),
+                text: "contract Broken {".to_owned(),
                 version: 2,
             },
         )]);
@@ -2454,43 +2549,43 @@ mod tests {
             nexa::ErrorCode::NX1002
         );
 
-        let missing_export_uri =
-            super::path_to_file_uri(&contract).expect("missing export contract URI");
-        let missing_export_documents = BTreeMap::from([(
-            missing_export_uri.clone(),
+        let missing_entrypoint_uri =
+            super::path_to_file_uri(&contract).expect("missing entrypoint contract URI");
+        let missing_entrypoint_documents = BTreeMap::from([(
+            missing_entrypoint_uri.clone(),
             super::OpenDocument {
-                uri: missing_export_uri,
+                uri: missing_entrypoint_uri,
                 path: contract.clone(),
-                text: "interface MissingExport {}\n".to_owned(),
+                text: "contract MissingExport {}\n".to_owned(),
                 version: 3,
             },
         )]);
-        let missing_export_snapshot = super::WorkspaceSnapshot {
+        let missing_entrypoint_snapshot = super::WorkspaceSnapshot {
             roots: &roots,
-            documents: &missing_export_documents,
+            documents: &missing_entrypoint_documents,
             known_inputs: &known_inputs,
         };
-        let missing_export = super::WorkspaceAnalyzer::analyze(
+        let missing_entrypoint = super::WorkspaceAnalyzer::analyze(
             &mut analyzer,
-            &missing_export_snapshot,
+            &missing_entrypoint_snapshot,
             &[super::BuildInputChange {
                 path: contract.clone(),
                 input: super::BuildInputKind::Nidl,
                 change: super::ChangeKind::Changed,
             }],
         )
-        .expect("missing required export analysis");
+        .expect("missing required entrypoint analysis");
         assert_eq!(
-            missing_export.diagnostics.len(),
+            missing_entrypoint.diagnostics.len(),
             1,
-            "a missing required export must be reported once"
+            "a missing required entrypoint must be reported once"
         );
         assert_eq!(
-            missing_export.diagnostics[0].diagnostic.diagnostic.code,
+            missing_entrypoint.diagnostics[0].diagnostic.diagnostic.code,
             nexa::ErrorCode::NX7010
         );
         assert!(super::same_file_path(
-            &missing_export.diagnostics[0].source_path(),
+            &missing_entrypoint.diagnostics[0].source_path(),
             &contract
         ));
     }
@@ -2507,14 +2602,10 @@ mod tests {
             .expect("renamed Package source directory");
         fs::write(
             workspace.join("api.nidl"),
-            "interface FixtureHost { export Run() -> i32; }\n",
+            "contract FixtureHost { nexa { fn run() -> i32; } }\n",
         )
         .expect("Host contract");
-        fs::write(
-            &source,
-            "module app.main;\npub fn Run() -> i32 { return 7; }\n",
-        )
-        .expect("Package source");
+        fs::write(&source, "pub fn run() -> i32 { return 7; }\n").expect("Package source");
         assert!(!config.exists(), "workspace Manifest must be overlay-only");
         assert!(!manifest.exists(), "Package Manifest must be overlay-only");
 
@@ -2526,7 +2617,7 @@ mod tests {
                 super::OpenDocument {
                     uri: config_uri,
                     path: config.clone(),
-                    text: fixture_project_config("packages", "\"Run\""),
+                    text: fixture_project_config("packages", "\"run\""),
                     version: 1,
                 },
             ),
@@ -2623,9 +2714,8 @@ mod tests {
              source_root = \"src\"\n",
         )
         .expect("dependency Manifest");
-        fs::write(application.join("src/main.nexa"), "module main;\n").expect("Application source");
-        fs::write(dependency.join("src/helper.nexa"), "module helper;\n")
-            .expect("dependency source");
+        fs::write(application.join("src/main.nexa"), "").expect("Application source");
+        fs::write(dependency.join("src/helper.nexa"), "").expect("dependency source");
 
         let build = crate::project::resolve_direct_package_for_lock(
             &application,
@@ -2634,7 +2724,7 @@ mod tests {
         .expect("resolved build");
         let old_fingerprint = build.build_fingerprint;
         let host_idl =
-            nexa::parse_idl("interface NexaCliEmptyHost {}\n").expect("built-in Host IDL");
+            nexa::parse_nidl("contract NexaCliEmptyHost {}\n").expect("built-in Host IDL");
         let host_contract = nexa::HostContractInput::canonical(&host_idl);
         let dependency = build
             .packages
@@ -2653,7 +2743,7 @@ mod tests {
                 super::OpenDocument {
                     uri: changed_uri,
                     path: changed_path.clone(),
-                    text: "module helper;\npub fn changed() -> i32 { return 2; }\n".to_owned(),
+                    text: "pub fn changed() -> i32 { return 2; }\n".to_owned(),
                     version: 2,
                 },
             ),
@@ -2662,7 +2752,7 @@ mod tests {
                 super::OpenDocument {
                     uri: added_uri,
                     path: added_path.clone(),
-                    text: "module extra;\npub fn added() -> i32 { return 3; }\n".to_owned(),
+                    text: "pub fn added() -> i32 { return 3; }\n".to_owned(),
                     version: 1,
                 },
             ),
@@ -2763,22 +2853,22 @@ mod tests {
         .expect("right Manifest");
         fs::write(
             application.join("src/main.nexa"),
-            "module main;\nfn Value() -> i32 { return 1; }\n",
+            "fn value() -> i32 { return 1; }\n",
         )
         .expect("Application source");
         fs::write(
             left.join("src/value.nexa"),
-            "module value;\npub fn value() -> i32 { return 1; }\n",
+            "pub fn value() -> i32 { return 1; }\n",
         )
         .expect("left source");
         fs::write(
             right.join("src/value.nexa"),
-            "module value;\npub fn value() -> i32 { return 2; }\n",
+            "pub fn value() -> i32 { return 2; }\n",
         )
         .expect("right source");
         fs::write(
             directory.path().join("api.nidl"),
-            "interface OverlayHost {}\n",
+            "contract OverlayHost {}\n",
         )
         .expect("Host Contract");
         let config = directory.path().join("nexa.dev.toml");
@@ -3147,7 +3237,11 @@ mod tests {
     fn lsp_did_close_reanalyzes_disk_without_an_overlay_version() {
         let directory = TestDirectory::new("close-disk");
         let path = directory.path().join("main.nexa");
-        fs::write(&path, "fn Value() -> i32 { return \"disk error\"; }").expect("disk source");
+        fs::write(
+            &path,
+            "fn main(args: Array<string>) -> i32 { return \"disk error\"; }",
+        )
+        .expect("disk source");
         let uri = super::path_to_file_uri(&path).expect("source URI");
         #[cfg(unix)]
         let close_uri = {
@@ -3164,7 +3258,7 @@ mod tests {
                     "uri":uri,
                     "languageId":"nexa",
                     "version":11,
-                    "text":"fn Value() -> i32 { return 1; }"
+                    "text":"fn main(args: Array<string>) -> i32 { return 1; }"
                 }
             }}),
             json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{
@@ -3208,16 +3302,16 @@ mod tests {
                     "uri":alias_uri,
                     "languageId":"nexa",
                     "version":1,
-                    "text":"fn Value() -> i32 { return \"alias error\"; }"
+                    "text":"fn main(args: Array<string>) -> i32 { return \"alias error\"; }"
                 }
             }}),
             json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
                 "textDocument":{"uri":real_uri,"version":2},
-                "contentChanges":[{"text":"fn Value() -> i32 { return 2; }"}]
+                "contentChanges":[{"text":"fn main(args: Array<string>) -> i32 { return 2; }"}]
             }}),
             json!({"jsonrpc":"2.0","method":"textDocument/didChange","params":{
                 "textDocument":{"uri":alias_uri,"version":1},
-                "contentChanges":[{"text":"fn Value() -> i32 { return \"stale\"; }"}]
+                "contentChanges":[{"text":"fn main(args: Array<string>) -> i32 { return \"stale\"; }"}]
             }}),
             json!({"jsonrpc":"2.0","method":"textDocument/didClose","params":{
                 "textDocument":{"uri":alias_uri}
@@ -3306,60 +3400,36 @@ mod tests {
     }
 
     #[test]
-    fn lsp_facade_errors_keep_stable_export_and_host_codes() {
+    fn lsp_facade_errors_keep_stable_entrypoint_and_host_codes() {
         assert_eq!(
-            super::package_build_error_code(&nexa::PackageBuildError::MissingRequiredExport(
-                "Run".to_owned()
+            super::package_build_error_code(&nexa::PackageBuildError::MissingRequiredEntrypoint(
+                "run".to_owned()
             )),
             nexa::ErrorCode::NX7010
         );
-        let expected_idl =
-            nexa::parse_idl("interface Expected { export Run() -> i32; }").expect("expected IDL");
+        let expected_idl = nexa::parse_nidl("contract Expected { nexa { fn run() -> i32; } }")
+            .expect("expected IDL");
         let actual_idl =
-            nexa::parse_idl("interface Actual { export Run() -> bool; }").expect("actual IDL");
-        let mismatch = nexa::PackageBuildError::ExportSignatureMismatch {
-            name: "Run".to_owned(),
-            expected: nexa::export_signature(&expected_idl, &expected_idl.exports[0]),
-            actual: nexa::export_signature(&actual_idl, &actual_idl.exports[0]),
+            nexa::parse_nidl("contract Actual { nexa { fn run() -> bool; } }").expect("actual IDL");
+        let mismatch = nexa::PackageBuildError::EntrypointSignatureMismatch {
+            name: "run".to_owned(),
+            expected: nexa::entrypoint_signature(&expected_idl.nexa_functions[0]),
+            actual: nexa::entrypoint_signature(&actual_idl.nexa_functions[0]),
         };
         assert_eq!(
             super::package_build_error_code(&mismatch),
             nexa::ErrorCode::NX7011
         );
         assert_eq!(
-            super::package_build_error_code(&nexa::PackageBuildError::HostInterfaceHashMismatch),
+            super::package_build_error_code(&nexa::PackageBuildError::HostContractIdMismatch),
             nexa::ErrorCode::NX4001
         );
     }
 
     #[test]
-    fn lsp_standalone_verifier_failure_keeps_verifier_metadata_code() {
-        let source = "pub immediate fn Run(value: i32) -> i32 {\n\
-                      for step in 0..1025 {\n\
-                          if step == 1024 { return value; }\n\
-                      }\n\
-                      return value;\n\
-                      }\n";
-        let diagnostics = super::diagnostics_for_path(
-            Path::new("/tmp/nexa-lsp-verifier-metadata.nexa"),
-            Some(source),
-        )
-        .expect("verifier diagnostic");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(
-            diagnostics[0].stage,
-            nexa_embed::EngineDiagnosticStage::Verify
-        );
-        assert_eq!(
-            diagnostics[0].diagnostic.code,
-            nexa::ErrorCode::NX3001,
-            "ImmediateCostLimit must retain VerifyError::metadata().code"
-        );
-    }
-
-    #[test]
     fn lsp_utf16_range_handles_unicode_before_error() {
-        let source = "fn Value() -> i32 {\n    let label = \"界\";\n    return label;\n}";
+        let source =
+            "fn main(args: Array<string>) -> i32 {\n    let label = \"界\";\n    return label;\n}";
         let diagnostics =
             super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-overlay.nexa"), Some(source))
                 .expect("diagnostics");
@@ -3370,16 +3440,103 @@ mod tests {
     }
 
     #[test]
+    fn lsp_v2_rejects_legacy_surface_at_the_legacy_token() {
+        let path = Path::new("/tmp/nexa-lsp-v2-legacy.nexa");
+        let source = "module legacy;\nfn main(args: Array<string>) -> i32 { return 1; }\n";
+        let diagnostic = nexa_diagnostic_with_code(path, source, nexa::ErrorCode::NX1002);
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.find("module").expect("legacy token");
+        lsp_range_contains_source_range(&rendered, source, start, start + "module".len());
+    }
+
+    #[test]
+    fn lsp_v2_locates_an_unresolved_use_path() {
+        let path = Path::new("/tmp/nexa-lsp-v2-use.nexa");
+        let source = "use package::missing;\nfn main(args: Array<string>) -> i32 { return 1; }\n";
+        let diagnostic = nexa_diagnostic_with_code(path, source, nexa::ErrorCode::NX2703);
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.find("missing").expect("missing path segment");
+        lsp_range_contains_source_range(&rendered, source, start, start + "missing".len());
+    }
+
+    #[test]
+    fn lsp_v2_locates_immutable_class_field_assignment() {
+        let path = Path::new("/tmp/nexa-lsp-v2-field-mutability.nexa");
+        let source = "class Counter {\n    locked: i32,\n}\n\
+                      fn change(counter: Counter) {\n\
+                          counter.locked = 2;\n\
+                      }\n\
+                      fn main(args: Array<string>) -> i32 { return 0; }\n";
+        let diagnostic = nexa_diagnostic_with_code(path, source, nexa::ErrorCode::NX2501);
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.rfind("locked").expect("assigned field");
+        lsp_range_contains_source_range(&rendered, source, start, start + "locked".len());
+    }
+
+    #[test]
+    fn lsp_v2_locates_postfix_await_in_a_synchronous_function() {
+        let path = Path::new("/tmp/nexa-lsp-v2-await.nexa");
+        let source = "async fn load() -> i32 { return 1; }\n\
+                      fn main(args: Array<string>) -> i32 { return load().await; }\n";
+        let diagnostic = nexa_diagnostic_with_code(path, source, nexa::ErrorCode::NX2301);
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.find(".await").expect("postfix await");
+        lsp_range_equals_source_range(&rendered, source, start, start + ".await".len());
+    }
+
+    #[test]
+    fn lsp_v2_locates_invalid_nidl_attribute_values_in_utf16() {
+        let path = Path::new("/tmp/Nexa LSP 属性.nidl");
+        let source = "contract Profile {\r\n\
+                          /// 🚀界\r\n\
+                          host {\r\n\
+                              @fuel(\"many\")\r\n\
+                              fn load() -> i32;\r\n\
+                          }\r\n\
+                      }\r\n";
+        let diagnostic = super::diagnostics_for_path(path, Some(source))
+            .expect("invalid NIDL diagnostics")
+            .into_iter()
+            .next()
+            .expect("invalid NIDL attribute diagnostic");
+        assert_eq!(diagnostic.diagnostic.code, nexa::ErrorCode::NX1002);
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.find("many").expect("invalid fuel value");
+        lsp_range_contains_source_range(&rendered, source, start, start + "many".len());
+    }
+
+    #[test]
+    fn lsp_v2_locates_invalid_standalone_main_signature() {
+        let path = Path::new("/tmp/nexa-lsp-v2-main.nexa");
+        let source = "fn main(args: i32) -> i32 { return 0; }\n";
+        let diagnostic = super::diagnostics_for_path(path, Some(source))
+            .expect("invalid standalone main diagnostics")
+            .into_iter()
+            .find(|diagnostic| {
+                diagnostic
+                    .diagnostic
+                    .message
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("main")
+            })
+            .unwrap_or_else(|| panic!("missing invalid main signature diagnostic:\n{source}"));
+        let rendered = super::lsp_diagnostic(&diagnostic, path.parent());
+        let start = source.find("main").expect("main name");
+        lsp_range_contains_source_range(&rendered, source, start, start + "main".len());
+    }
+
+    #[test]
     fn lsp_idl_diagnostics_clear_after_valid_overlay() {
         let path = Path::new("/tmp/nexa-lsp-overlay.nidl");
         assert_eq!(
-            super::diagnostics_for_path(path, Some("interface Broken {"))
+            super::diagnostics_for_path(path, Some("contract Broken {"))
                 .expect("invalid IDL")
                 .len(),
             1
         );
         assert!(
-            super::diagnostics_for_path(path, Some("interface Valid {}"))
+            super::diagnostics_for_path(path, Some("contract Valid {}"))
                 .expect("valid IDL")
                 .is_empty()
         );
@@ -3387,7 +3544,7 @@ mod tests {
 
     #[test]
     fn lsp_idl_diagnostic_uses_the_parser_token_span() {
-        let source = "interface Valid {\n    sync fn broken(value: i32) i32;\n}";
+        let source = "contract Valid {\n    host { fn broken(value: i32) i32; }\n}";
         let diagnostics =
             super::diagnostics_for_path(Path::new("/tmp/nexa-lsp-precise.nidl"), Some(source))
                 .expect("invalid IDL diagnostics");
@@ -3407,9 +3564,15 @@ mod tests {
     }
 
     #[test]
-    fn lsp_idl_comment_diagnostic_uses_the_exact_unicode_span() {
+    fn lsp_idl_attribute_diagnostic_keeps_the_exact_unicode_source_span() {
         let path = Path::new("/tmp/Nexa Host 合同.nidl");
-        let source = "interface Valid {\r\n    // 🚀界\r\n    sync fn value() -> i32;\r\n}\r\n";
+        let source = "contract Valid {\r\n\
+                          /// 🚀界\r\n\
+                          host {\r\n\
+                              @fuel(\"many\")\r\n\
+                              fn value() -> i32;\r\n\
+                          }\r\n\
+                      }\r\n";
         let diagnostics =
             super::diagnostics_for_path(path, Some(source)).expect("invalid IDL diagnostics");
         assert_eq!(diagnostics.len(), 1);
@@ -3419,10 +3582,8 @@ mod tests {
             .primary
             .as_ref()
             .expect("NIDL primary Span");
-        let start = source.find("//").expect("comment start");
-        let end = source[start..]
-            .find('\n')
-            .map_or(source.len(), |offset| start + offset);
+        let start = source.find("\"many\"").expect("invalid attribute value");
+        let end = start + "\"many\"".len();
         assert_eq!(primary.span.start as usize, start);
         assert_eq!(primary.span.end as usize, end);
         let identity = diagnostic.file.as_ref().expect("NIDL source identity");
@@ -3449,16 +3610,30 @@ mod tests {
             engine_json["sourceIdentity"],
             path.to_string_lossy().as_ref()
         );
-        assert_eq!(engine_json["range"]["start"]["line"], 1);
-        assert_eq!(engine_json["range"]["start"]["character"], 4);
-        assert_eq!(engine_json["range"]["end"]["line"], 1);
-        assert_eq!(engine_json["range"]["end"]["character"], 10);
+        let expected_start = super::byte_offset_to_lsp_position(source, start);
+        let expected_end = super::byte_offset_to_lsp_position(source, end);
+        assert_eq!(engine_json["range"]["start"]["line"], expected_start.line);
+        assert_eq!(
+            engine_json["range"]["start"]["character"],
+            expected_start.character
+        );
+        assert_eq!(engine_json["range"]["end"]["line"], expected_end.line);
+        assert_eq!(
+            engine_json["range"]["end"]["character"],
+            expected_end.character
+        );
         let rendered = super::lsp_diagnostic(diagnostic, Some(Path::new("/tmp")));
         assert_eq!(rendered["code"], "NX1002");
-        assert_eq!(rendered["range"]["start"]["line"], 1);
-        assert_eq!(rendered["range"]["start"]["character"], 4);
-        assert_eq!(rendered["range"]["end"]["line"], 1);
-        assert_eq!(rendered["range"]["end"]["character"], 10);
+        assert_eq!(rendered["range"]["start"]["line"], expected_start.line);
+        assert_eq!(
+            rendered["range"]["start"]["character"],
+            expected_start.character
+        );
+        assert_eq!(rendered["range"]["end"]["line"], expected_end.line);
+        assert_eq!(
+            rendered["range"]["end"]["character"],
+            expected_end.character
+        );
     }
 
     #[test]
@@ -3494,7 +3669,7 @@ mod tests {
                     "uri":uri,
                     "languageId":"nexa",
                     "version":1,
-                    "text":"fn Value() -> i32 { return \"界\"; }"
+                    "text":"fn main(args: Array<string>) -> i32 { return \"界\"; }"
                 }}
             }),
             json!({
@@ -3502,7 +3677,7 @@ mod tests {
                 "method":"textDocument/didChange",
                 "params":{
                     "textDocument":{"uri":uri,"version":2},
-                    "contentChanges":[{"text":"fn Value() -> i32 { return 1; }"}]
+                    "contentChanges":[{"text":"fn main(args: Array<string>) -> i32 { return 1; }"}]
                 }
             }),
             json!({"jsonrpc":"2.0","id":2,"method":"shutdown","params":null}),
@@ -3531,7 +3706,7 @@ mod tests {
                     "uri":uri,
                     "languageId":"nexa",
                     "version":1,
-                    "text":"fn Value() -> i32 { return \"界\"; }"
+                    "text":"fn main(args: Array<string>) -> i32 { return \"界\"; }"
                 }}
             }),
             json!({
@@ -3539,7 +3714,7 @@ mod tests {
                 "method":"textDocument/didChange",
                 "params":{
                     "textDocument":{"uri":uri,"version":2},
-                    "contentChanges":[{"text":"fn Value() -> i32 { return 1; }"}]
+                    "contentChanges":[{"text":"fn main(args: Array<string>) -> i32 { return 1; }"}]
                 }
             }),
             json!({
@@ -3547,13 +3722,13 @@ mod tests {
                 "method":"textDocument/didChange",
                 "params":{
                     "textDocument":{"uri":uri,"version":1},
-                    "contentChanges":[{"text":"fn Value() -> i32 { return \"stale\"; }"}]
+                    "contentChanges":[{"text":"fn main(args: Array<string>) -> i32 { return \"stale\"; }"}]
                 }
             }),
             json!({
                 "jsonrpc":"2.0",
                 "method":"textDocument/didSave",
-                "params":{"textDocument":{"uri":uri},"text":"fn Value() -> i32 { return 2; }"}
+                "params":{"textDocument":{"uri":uri},"text":"fn main(args: Array<string>) -> i32 { return 2; }"}
             }),
             json!({
                 "jsonrpc":"2.0",

@@ -12,8 +12,8 @@ use crate::diagnostic::{EngineDiagnostic, EngineDiagnosticStage};
 use crate::manifest::SourceId;
 
 pub use nexa::{
-    CompiledPackageArtifact, PackageDebugInfo as ModuleDebugInfo,
-    PackageFunctionDebugInfo as FunctionDebugInfo,
+    CompiledPackageArtifact, PackageDebugInspection, PackageFunctionInspection,
+    PackageHostImportInspection, PackageModuleInspection,
 };
 
 #[derive(Clone, Debug)]
@@ -26,7 +26,8 @@ pub struct LastKnownGood {
     pub state_schema_fingerprint: StateSchemaFingerprint,
     pub linked_state_fingerprint: nexa::LinkedStateFingerprint,
     pub dependency_closure: Arc<ResolvedDependencyGraph>,
-    pub host_interface_hash: nexa::StableId,
+    pub host_contract_fingerprint: [u8; 32],
+    pub host_contract_id: nexa::StableId,
 }
 
 #[derive(Clone, Debug)]
@@ -128,10 +129,10 @@ pub(crate) fn compile_package_candidate(
                 Some(source_id.clone()),
                 EngineDiagnosticStage::Export,
                 nexa::ErrorCode::NX7010,
-                format!("missing required export {}", requirement.name),
+                format!("missing required entrypoint {}", requirement.name),
             );
             diagnostic.fixes.push(format!(
-                "declare export {} with the required signature",
+                "declare entrypoint {} with the required signature",
                 requirement.name
             ));
             return Err(CandidateCompilationFailure::new(
@@ -140,16 +141,23 @@ pub(crate) fn compile_package_candidate(
                 verify_duration,
             ));
         };
-        if found.signature != requirement.signature {
+        let found_effect = usize::try_from(found.function)
+            .ok()
+            .and_then(|index| artifact.module().functions.get(index))
+            .map(|function| function.effect);
+        if found.signature != requirement.signature || found_effect != Some(requirement.effect) {
             let mut diagnostic = EngineDiagnostic::without_source(
                 Some(package_id.clone()),
                 Some(source_id.clone()),
                 EngineDiagnosticStage::Export,
                 nexa::ErrorCode::NX7011,
-                format!("export {} has an incompatible signature", requirement.name),
+                format!(
+                    "entrypoint {} has an incompatible signature or effect",
+                    requirement.name
+                ),
             );
             diagnostic.fixes.push(format!(
-                "change export {} to the Host contract signature",
+                "change entrypoint {} to the Host contract signature and effect",
                 requirement.name
             ));
             return Err(CandidateCompilationFailure::new(
@@ -199,20 +207,22 @@ fn package_build_diagnostics(
             error.metadata().code,
             error.to_string(),
         )],
-        PackageBuildError::MissingRequiredExport(name) => vec![EngineDiagnostic::without_source(
-            package_id,
-            source_id,
-            EngineDiagnosticStage::Export,
-            nexa::ErrorCode::NX7010,
-            format!("missing required export {name}"),
-        )],
-        PackageBuildError::ExportSignatureMismatch { name, .. } => {
+        PackageBuildError::MissingRequiredEntrypoint(name) => {
+            vec![EngineDiagnostic::without_source(
+                package_id,
+                source_id,
+                EngineDiagnosticStage::Export,
+                nexa::ErrorCode::NX7010,
+                format!("missing required entrypoint {name}"),
+            )]
+        }
+        PackageBuildError::EntrypointSignatureMismatch { name, .. } => {
             vec![EngineDiagnostic::without_source(
                 package_id,
                 source_id,
                 EngineDiagnosticStage::Export,
                 nexa::ErrorCode::NX7011,
-                format!("export {name} has an incompatible signature"),
+                format!("entrypoint {name} has an incompatible signature or effect"),
             )]
         }
         error => vec![EngineDiagnostic::without_source(
@@ -227,14 +237,28 @@ fn package_build_diagnostics(
 
 #[allow(clippy::result_large_err)]
 pub fn compile_package(
-    idl: &nexa::Idl,
+    idl: &nexa::ValidatedContract,
     required_exports: &[ExportRequirement],
     source_id: &SourceId,
     identity: CandidateIdentity,
     build_input: &ResolvedBuildInput,
 ) -> Result<CompiledPackageArtifact, EngineDiagnostic> {
     let mut build_session = nexa::PackageBuildSession::new();
-    let host_contract = nexa::HostContractInput::canonical(idl);
+    let required_entrypoints = required_exports
+        .iter()
+        .map(|entrypoint| entrypoint.name.clone())
+        .collect::<Vec<_>>();
+    let host_contract = nexa::HostContractInput::canonical(idl)
+        .requiring_entrypoints(&required_entrypoints)
+        .map_err(|error| {
+            EngineDiagnostic::without_source(
+                Some(identity.package_id.clone()),
+                Some(source_id.clone()),
+                EngineDiagnosticStage::Export,
+                nexa::ErrorCode::NX7011,
+                error.to_string(),
+            )
+        })?;
     compile_package_candidate(
         &mut build_session,
         &host_contract,

@@ -148,18 +148,24 @@ impl RealmModel {
                 self.snapshot.task = TaskLifecycle::Terminal;
                 self.snapshot.task_resources = 0;
             }
-            RealmEvent::RestartReload => {
+            RealmEvent::RestartReload
+                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
+            {
                 self.restart_quiesce();
                 self.snapshot.epoch += 1;
                 self.snapshot.publications += 1;
                 self.snapshot.reload = ReloadLifecycle::Active;
             }
-            RealmEvent::MigrationFailure => {
+            RealmEvent::MigrationFailure
+                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
+            {
                 let prior_reload = self.snapshot.reload;
                 self.restart_quiesce();
                 self.snapshot.reload = prior_reload;
             }
-            RealmEvent::ActivationFailure => {
+            RealmEvent::ActivationFailure
+                if self.snapshot.reload != ReloadLifecycle::ActivationFaulted =>
+            {
                 self.restart_quiesce();
                 self.snapshot.epoch += 1;
                 self.snapshot.publications += 1;
@@ -186,7 +192,10 @@ impl RealmModel {
             RealmEvent::Spawn if self.snapshot.reload != ReloadLifecycle::ActivationFaulted => {
                 return Err(RealmRejection::InvalidTaskState);
             }
-            RealmEvent::Spawn => {
+            RealmEvent::RestartReload
+            | RealmEvent::MigrationFailure
+            | RealmEvent::ActivationFailure
+            | RealmEvent::Spawn => {
                 return Err(RealmRejection::InvalidReloadState);
             }
         }

@@ -28,7 +28,7 @@ const ALLOWED_PIPELINES: &[&str] = &[
     "engine",
 ];
 
-use crate::{ErrorCategory, NexaError, compile_file};
+use crate::{Diagnostic, ErrorCategory, NexaError};
 
 #[derive(Clone, Debug, Deserialize)]
 struct DiagnosticCase {
@@ -1392,8 +1392,8 @@ fn load_analysis_fixture(directory: &Path) -> Result<AnalysisFixtureInput, Strin
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
         host_contract_source: Vec::new(),
-        host_required_exports: Vec::new(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.to_owned(),
+        host_required_entrypoints: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: standard_library.version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.to_owned(),
@@ -1403,6 +1403,7 @@ fn load_analysis_fixture(directory: &Path) -> Result<AnalysisFixtureInput, Strin
         deterministic_math_backend: nexa_core::RUNTIME_MATH_BACKEND_ID.to_owned(),
         compiler_options: nexa_analysis::canonical_compilation_options(&compilation_options),
         canonical_lock_graph: Vec::new(),
+        repl_session_context: Vec::new(),
     };
     let product = ResolvedBuildInput::new(
         manifest,
@@ -1413,7 +1414,7 @@ fn load_analysis_fixture(directory: &Path) -> Result<AnalysisFixtureInput, Strin
         None,
         Vec::<u8>::new(),
         Vec::<u8>::new(),
-        fingerprint_input.host_required_exports.clone(),
+        fingerprint_input.host_required_entrypoints.clone(),
         compilation_options,
         fingerprint_input,
     )
@@ -1490,7 +1491,8 @@ fn execute_compiler_case(
             input.display()
         ));
     }
-    let error = compile_file(&source, FileId(1))
+    let error = nexa_compiler::compile_file(&source, FileId(1))
+        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, FileId(1)))))
         .expect_err("a compiler diagnostic fixture must fail compilation");
     let NexaError::Diagnostic(diagnostic) = error else {
         return Err(format!("{} did not emit a diagnostic", input.display()));

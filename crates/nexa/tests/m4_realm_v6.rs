@@ -2,14 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use nexa::prelude::{
-    HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, RealmConfig,
-    RealmRuntime, ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeHost,
-    RuntimeHostArgs, RuntimeValue, ScopeHandle, StateObject, StateValue, StepConfig, TaskLimits,
-    TaskPoll, TaskTerminalReason, TickBudget, ValueType, YieldReason,
+    HostCallOutcome, HostFunctionAuthority, HostImport, HostPayload, HostRegistry, HostTrap,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RestartReloadOutcome,
+    RestartReloadPolicy, RuntimeHost, RuntimeHostArgs, RuntimeValue, ScopeHandle, StateObject,
+    StateValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget, ValueType,
+    YieldReason,
 };
 use nexa::{
-    CandidateIdentity, CompiledPackageArtifact, PackageBuildSession,
-    canonical_package_build_fingerprint_input,
+    CandidateIdentity, CompiledPackageArtifact, HostContractInput, PackageBuildSession,
+    SourceIdentity, canonical_host_contract_source_identity,
+    canonical_package_build_fingerprint_input_with_contract,
 };
 use nexa_analysis::{
     CompilationLimits, NormalizedPackagePath, PackageManifest, ResolvedBuildInput,
@@ -17,38 +19,37 @@ use nexa_analysis::{
 };
 use nexa_runtime::{ModuleLifecycle, Object};
 
-const PACKAGE_ID: &str = "realm.v5.fixture";
-const HOST_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v5/host.idl");
-const A_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v5/a.nexa");
-const B_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v5/b.nexa");
-const C_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v5/c.nexa");
-const D_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v5/d.nexa");
+const PACKAGE_ID: &str = "realm.v6.fixture";
+const HOST_URI: &str = "nidl://tests/m4-realm-v6/host.nidl";
+const HOST_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/host.nidl");
+const A_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/a.nexa");
+const B_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/b.nexa");
+const C_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/c.nexa");
+const D_SOURCE: &str = include_str!("../../nexa-runtime/fixtures/realm_v6/d.nexa");
+const WAIT_PARAMETERS: &[ValueType] = &[ValueType::I32];
 
 const B_BASELINE: &str = r"
-module realm.v5.b;
-
-@stateful(1) class ModelState {
-    value: i32;
-    legacy: i32;
+@state(version = 1)
+class ModelState {
+    mut value: i32,
+    mut legacy: i32,
 }
 ";
 
 const C_BASELINE: &str = r"
-module realm.v5.c;
-
-@stateful(2) class ModelState {
-    value: i32;
-    replacement: i32;
+@state(version = 2)
+class ModelState {
+    mut value: i32,
+    mut replacement: i32,
 }
 ";
 
 const D_BASELINE: &str = r"
-module realm.v5.d;
-
-@stateful(3) class ModelState {
-    value: i32;
-    replacement: i32;
-    generation: i32;
+@state(version = 3)
+class ModelState {
+    mut value: i32,
+    mut replacement: i32,
+    mut generation: i32,
 }
 ";
 
@@ -59,22 +60,49 @@ struct WaitObservation {
 }
 
 struct WaitRegistry {
-    host_hash: nexa::StableId,
+    contract_runtime_id: nexa::StableId,
+    authority: Option<HostFunctionAuthority>,
     observation: Arc<Mutex<WaitObservation>>,
 }
 
+fn wait_function_authority(import: &HostImport) -> HostFunctionAuthority {
+    assert_eq!(
+        import.parameters.as_slice(),
+        WAIT_PARAMETERS,
+        "Realm v6 wait fixture parameter surface changed"
+    );
+    assert!(
+        import.capabilities.is_empty(),
+        "Realm v6 wait fixture unexpectedly requires capabilities"
+    );
+    HostFunctionAuthority::from_import(import)
+}
+
 impl HostRegistry for WaitRegistry {
-    fn interface_hash(&self) -> Option<nexa::StableId> {
-        Some(self.host_hash)
+    fn contract_runtime_id(&self) -> Option<nexa::StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: nexa::StableId) -> Option<&HostFunctionAuthority> {
+        self.authority
+            .as_ref()
+            .filter(|authority| authority.stable_id() == id)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: nexa::StableId,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 1 {
+        if self
+            .authority
+            .as_ref()
+            .is_none_or(|authority| id != authority.stable_id())
+        {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if args.len() != 1 {
             return Err(HostTrap::Arity);
         }
         let argument = args.i32(0)?;
@@ -95,14 +123,14 @@ impl HostRegistry for WaitRegistry {
     }
 }
 
-fn build_input(module: &str, source: &str, contract: &nexa::Idl) -> ResolvedBuildInput {
+fn build_input(module: &str, source: &str, contract: &HostContractInput<'_>) -> ResolvedBuildInput {
     let manifest = Arc::new(
         PackageManifest::parse(&format!(
             r#"
 schema = 2
 kind = "application"
 id = "{PACKAGE_ID}"
-name = "Realm v5 canonical fixture"
+name = "Realm v6 canonical fixture"
 version = "1.0.0"
 source_root = "src"
 entry = "{module}"
@@ -129,15 +157,15 @@ activation = "programmatic"
             ResolvedPackage {
                 id: manifest.id.clone(),
                 version: manifest.version.clone(),
-                source_id: SourceId::new("realm-v5-canonical").expect("source ID"),
-                directory: NormalizedPackagePath::new("packages/realm-v5")
+                source_id: SourceId::new("realm-v6-canonical").expect("source ID"),
+                directory: NormalizedPackagePath::new("packages/realm-v6")
                     .expect("package directory"),
                 kind: manifest.kind,
             },
         )]),
         edges: BTreeSet::new(),
     });
-    let fingerprint_input = canonical_package_build_fingerprint_input(
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
         &manifest,
         &sources,
         &BTreeMap::new(),
@@ -145,8 +173,9 @@ activation = "programmatic"
         contract,
         None,
     );
-    let host_contract_source_identity = fingerprint_input.host_contract_source.clone();
-    let host_required_exports_identity = fingerprint_input.host_required_exports.clone();
+    let canonical_host_contract = fingerprint_input.host_contract.clone();
+    let host_contract_source_identity = canonical_host_contract_source_identity(contract);
+    let host_required_entrypoints = fingerprint_input.host_required_entrypoints.clone();
     ResolvedBuildInput::new(
         manifest,
         sources,
@@ -154,9 +183,9 @@ activation = "programmatic"
         BTreeMap::new(),
         graph,
         None,
-        Arc::<[u8]>::from(nexa::canonical_idl(contract).into_bytes()),
+        Arc::<[u8]>::from(canonical_host_contract),
         Arc::<[u8]>::from(host_contract_source_identity),
-        Arc::<[u8]>::from(host_required_exports_identity),
+        Arc::<[u8]>::from(host_required_entrypoints),
         nexa_analysis::CompilationOptions::default(),
         fingerprint_input,
     )
@@ -167,7 +196,7 @@ fn compile_fixture(
     session: &mut PackageBuildSession,
     module: &str,
     source: &str,
-    contract: &nexa::Idl,
+    contract: &HostContractInput<'_>,
     generation: u64,
 ) -> CompiledPackageArtifact {
     let input = build_input(module, source, contract);
@@ -178,14 +207,14 @@ fn compile_fixture(
     )
     .expect("candidate identity");
     let artifact = session
-        .compile_package(&input, contract, identity)
+        .compile_package_with_contract(&input, contract, identity)
         .unwrap_or_else(|error| panic!("canonical build of {module} failed: {error:#?}"));
     artifact
         .verify_integrity()
         .unwrap_or_else(|error| panic!("canonical artifact integrity for {module}: {error}"));
     assert!(
         artifact.source_files.files().iter().any(|compiled| {
-            compiled.module_path.as_deref() == Some(module) && compiled.text.as_ref() == source
+            compiled.module_path() == Some(module) && compiled.text().as_ref() == source
         }),
         "artifact must retain the exact {module} fixture source"
     );
@@ -206,18 +235,15 @@ fn task_config(owner: ScopeHandle) -> StepConfig {
     }
 }
 
-fn function_index(artifact: &CompiledPackageArtifact, module: &str, name: &str) -> u32 {
-    artifact
-        .debug_info
-        .functions
+fn entrypoint_stable_id(contract: &nexa::ValidatedContract, name: &str) -> nexa::StableId {
+    contract
+        .nexa_functions
         .iter()
-        .find(|function| {
-            function.package_id == PACKAGE_ID
-                && function.module_path == module
-                && function.name == name
-        })
-        .unwrap_or_else(|| panic!("missing function {module}::{name}"))
-        .function_index
+        .find(|entrypoint| entrypoint.name == name)
+        .map_or_else(
+            || panic!("missing NIDL Nexa entrypoint `{name}`"),
+            nexa::entrypoint_stable_id,
+        )
 }
 
 struct LoadedFixture {
@@ -251,16 +277,33 @@ impl LoadedFixture {
     }
 }
 
-fn load_fixture(artifact: &CompiledPackageArtifact, contract: &nexa::Idl) -> LoadedFixture {
-    let host_hash = nexa::exact_idl_hash(contract);
-    assert_eq!(artifact.module().host_interface_hash, Some(host_hash));
+fn load_fixture(
+    artifact: &CompiledPackageArtifact,
+    host_authority_artifact: &CompiledPackageArtifact,
+    contract: &nexa::ValidatedContract,
+) -> LoadedFixture {
+    let contract_runtime_id = nexa::contract_runtime_id(contract);
+    assert_eq!(
+        artifact.module().host_contract_id,
+        Some(contract_runtime_id)
+    );
     let observation = Arc::new(Mutex::new(WaitObservation::default()));
     let runtime_host = RuntimeHost::new(32);
+    assert!(
+        host_authority_artifact.module().host_imports.len() <= 1,
+        "Realm v6 fixture has at most one effective Host import"
+    );
+    let authority = host_authority_artifact
+        .module()
+        .host_imports
+        .first()
+        .map(wait_function_authority);
     let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
         runtime_host.clone(),
         Box::new(WaitRegistry {
-            host_hash,
+            contract_runtime_id,
+            authority,
             observation: Arc::clone(&observation),
         }),
     )
@@ -268,7 +311,7 @@ fn load_fixture(artifact: &CompiledPackageArtifact, contract: &nexa::Idl) -> Loa
     let module = realm
         .load_module(
             artifact.verified.clone(),
-            host_hash,
+            contract_runtime_id,
             artifact.state_schema_fingerprint,
         )
         .expect("load verified fixture");
@@ -296,25 +339,33 @@ fn assert_host_result_shape(artifact: &CompiledPackageArtifact, module: &str) {
         matches!(result.error, ValueType::Named(_)),
         "WaitError must remain a nominal error type"
     );
-    let request = &artifact.module().functions
-        [usize::try_from(function_index(artifact, module, "request")).expect("function index")];
+    let inspection = artifact.debug_inspection();
+    let request = inspection
+        .functions
+        .iter()
+        .find(|function| {
+            function.package_id == PACKAGE_ID
+                && function.module_path == module
+                && function.name == "request"
+        })
+        .expect("request inspection");
     assert_eq!(
-        request.signature.result,
+        request
+            .signature
+            .as_ref()
+            .expect("request signature")
+            .result,
         Some(ValueType::Named(result.result_type)),
         "await Host request must produce Result<i32, WaitError>, not Unit"
     );
 }
 
-fn exercise_normal(
-    loaded: &mut LoadedFixture,
-    artifact: &CompiledPackageArtifact,
-    module_name: &str,
-) {
+fn exercise_normal(loaded: &mut LoadedFixture, contract: &nexa::ValidatedContract) {
     let normal = loaded
         .realm
         .spawn_task(
             loaded.module,
-            function_index(artifact, module_name, "normal"),
+            entrypoint_stable_id(contract, "normal"),
             &[RuntimeValue::I32(17)],
             task_config(loaded.owner),
         )
@@ -325,16 +376,12 @@ fn exercise_normal(
     );
 }
 
-fn exercise_fuel(
-    loaded: &mut LoadedFixture,
-    artifact: &CompiledPackageArtifact,
-    module_name: &str,
-) {
+fn exercise_fuel(loaded: &mut LoadedFixture, contract: &nexa::ValidatedContract) {
     let fuel = loaded
         .realm
         .spawn_task(
             loaded.module,
-            function_index(artifact, module_name, "fuel"),
+            entrypoint_stable_id(contract, "fuel"),
             &[RuntimeValue::I32(23)],
             task_config(loaded.owner),
         )
@@ -350,16 +397,12 @@ fn exercise_fuel(
     );
 }
 
-fn exercise_explicit_yield(
-    loaded: &mut LoadedFixture,
-    artifact: &CompiledPackageArtifact,
-    module_name: &str,
-) {
+fn exercise_explicit_yield(loaded: &mut LoadedFixture, contract: &nexa::ValidatedContract) {
     let explicit = loaded
         .realm
         .spawn_task(
             loaded.module,
-            function_index(artifact, module_name, "explicit"),
+            entrypoint_stable_id(contract, "explicit"),
             &[RuntimeValue::I32(29)],
             task_config(loaded.owner),
         )
@@ -374,16 +417,12 @@ fn exercise_explicit_yield(
     );
 }
 
-fn exercise_host_await(
-    loaded: &mut LoadedFixture,
-    artifact: &CompiledPackageArtifact,
-    module_name: &str,
-) {
+fn exercise_host_await(loaded: &mut LoadedFixture, contract: &nexa::ValidatedContract) {
     let request = loaded
         .realm
         .spawn_task(
             loaded.module,
-            function_index(artifact, module_name, "request"),
+            entrypoint_stable_id(contract, "request"),
             &[RuntimeValue::I32(31)],
             task_config(loaded.owner),
         )
@@ -436,7 +475,7 @@ fn exercise_host_await(
         terminal.reason
     else {
         panic!(
-            "Host-await fixture must return Result::Ok, got {:?}",
+            "awaited Host fixture must return Result::Ok, got {:?}",
             terminal.reason
         );
     };
@@ -457,13 +496,17 @@ fn exercise_host_await(
     assert_eq!(*payload, Some(RuntimeValue::I32(32)));
 }
 
-fn exercise_tasks(artifact: &CompiledPackageArtifact, contract: &nexa::Idl, module_name: &str) {
+fn exercise_tasks(
+    artifact: &CompiledPackageArtifact,
+    contract: &nexa::ValidatedContract,
+    module_name: &str,
+) {
     assert_host_result_shape(artifact, module_name);
-    let mut loaded = load_fixture(artifact, contract);
-    exercise_normal(&mut loaded, artifact, module_name);
-    exercise_fuel(&mut loaded, artifact, module_name);
-    exercise_explicit_yield(&mut loaded, artifact, module_name);
-    exercise_host_await(&mut loaded, artifact, module_name);
+    let mut loaded = load_fixture(artifact, artifact, contract);
+    exercise_normal(&mut loaded, contract);
+    exercise_fuel(&mut loaded, contract);
+    exercise_explicit_yield(&mut loaded, contract);
+    exercise_host_await(&mut loaded, contract);
     assert!(loaded.realm.resource_invariants_hold());
     loaded.shutdown();
 }
@@ -563,12 +606,12 @@ fn reload_with_state(
     old_source_module: &str,
     candidate: &CompiledPackageArtifact,
     candidate_module: &str,
-    contract: &nexa::Idl,
+    contract: &nexa::ValidatedContract,
     old_fields: &[(&str, i32)],
     migration_arguments: Vec<RuntimeValue>,
 ) {
     assert_eq!(old_source_module, candidate_module);
-    let mut loaded = load_fixture(old, contract);
+    let mut loaded = load_fixture(old, candidate, contract);
     let seed = nexa::StableId::from_name("seed");
     insert_model_state(
         &mut loaded.realm,
@@ -607,8 +650,8 @@ fn reload_with_state(
     );
 
     let expected = match candidate_module {
-        "realm.v5.c" => &[("value", 8), ("replacement", 9), ("generation", 3)][..],
-        "realm.v5.d" => &[
+        "realm.v6.c" => &[("value", 8), ("replacement", 9), ("generation", 3)][..],
+        "realm.v6.d" => &[
             ("value", 8),
             ("replacement", 9),
             ("generation", 3),
@@ -631,9 +674,9 @@ fn reload_with_state(
 fn exercise_b_migration(
     old: &CompiledPackageArtifact,
     candidate: &CompiledPackageArtifact,
-    contract: &nexa::Idl,
+    contract: &nexa::ValidatedContract,
 ) {
-    let mut loaded = load_fixture(old, contract);
+    let mut loaded = load_fixture(old, candidate, contract);
     let boss = nexa::StableId::from_name("boss");
     let preserved = nexa::StableId::from_name("preserved");
     let deleted = nexa::StableId::from_name("deleted");
@@ -641,7 +684,7 @@ fn exercise_b_migration(
         &mut loaded.realm,
         loaded.module,
         old,
-        "realm.v5.b",
+        "realm.v6.b",
         boss,
         &[("value", 11), ("legacy", 99)],
     );
@@ -673,7 +716,7 @@ fn exercise_b_migration(
         &loaded.realm,
         candidate_handle,
         candidate,
-        "realm.v5.b",
+        "realm.v6.b",
         boss,
         &[("value", 11), ("replacement", 1)],
     );
@@ -681,7 +724,7 @@ fn exercise_b_migration(
         &loaded.realm,
         candidate_handle,
         candidate,
-        "realm.v5.b",
+        "realm.v6.b",
         nexa::StableId::from_name("seed"),
         &[("value", 1), ("replacement", 2)],
     );
@@ -698,8 +741,8 @@ fn exercise_b_migration(
     loaded.shutdown();
 }
 
-fn exercise_a_activation(artifact: &CompiledPackageArtifact, contract: &nexa::Idl) {
-    let mut loaded = load_fixture(artifact, contract);
+fn exercise_a_activation(artifact: &CompiledPackageArtifact, contract: &nexa::ValidatedContract) {
+    let mut loaded = load_fixture(artifact, artifact, contract);
     let committed = loaded
         .realm
         .restart_reload(
@@ -744,46 +787,52 @@ fn exercise_a_activation(artifact: &CompiledPackageArtifact, contract: &nexa::Id
 }
 
 #[test]
-fn realm_v5_fixtures_cross_the_canonical_pipeline_and_execute_in_realm() {
-    let contract = nexa::parse_idl(HOST_SOURCE).expect("realm v5 Host NIDL");
+fn realm_v6_fixtures_cross_the_canonical_pipeline_and_execute_in_realm() {
+    let parsed_contract = nexa::parse_nidl(HOST_SOURCE).expect("realm v6 Host NIDL");
+    let contract = HostContractInput::with_source(
+        &parsed_contract,
+        SourceIdentity::standalone(HOST_URI),
+        HOST_SOURCE,
+    )
+    .expect("exact realm v6 Host NIDL source");
     let mut session = PackageBuildSession::new();
-    let a = compile_fixture(&mut session, "realm.v5.a", A_SOURCE, &contract, 1);
-    let b = compile_fixture(&mut session, "realm.v5.b", B_SOURCE, &contract, 2);
-    let c = compile_fixture(&mut session, "realm.v5.c", C_SOURCE, &contract, 3);
-    let d = compile_fixture(&mut session, "realm.v5.d", D_SOURCE, &contract, 4);
+    let a = compile_fixture(&mut session, "realm.v6.a", A_SOURCE, &contract, 1);
+    let b = compile_fixture(&mut session, "realm.v6.b", B_SOURCE, &contract, 2);
+    let c = compile_fixture(&mut session, "realm.v6.c", C_SOURCE, &contract, 3);
+    let d = compile_fixture(&mut session, "realm.v6.d", D_SOURCE, &contract, 4);
 
     for (artifact, module) in [
-        (&a, "realm.v5.a"),
-        (&b, "realm.v5.b"),
-        (&c, "realm.v5.c"),
-        (&d, "realm.v5.d"),
+        (&a, "realm.v6.a"),
+        (&b, "realm.v6.b"),
+        (&c, "realm.v6.c"),
+        (&d, "realm.v6.d"),
     ] {
-        exercise_tasks(artifact, &contract, module);
+        exercise_tasks(artifact, &parsed_contract, module);
     }
 
-    exercise_a_activation(&a, &contract);
+    exercise_a_activation(&a, &parsed_contract);
 
-    let b_old = compile_fixture(&mut session, "realm.v5.b", B_BASELINE, &contract, 5);
-    exercise_b_migration(&b_old, &b, &contract);
+    let b_old = compile_fixture(&mut session, "realm.v6.b", B_BASELINE, &contract, 5);
+    exercise_b_migration(&b_old, &b, &parsed_contract);
 
-    let c_old = compile_fixture(&mut session, "realm.v5.c", C_BASELINE, &contract, 6);
+    let c_old = compile_fixture(&mut session, "realm.v6.c", C_BASELINE, &contract, 6);
     reload_with_state(
         &c_old,
-        "realm.v5.c",
+        "realm.v6.c",
         &c,
-        "realm.v5.c",
-        &contract,
+        "realm.v6.c",
+        &parsed_contract,
         &[("value", 8), ("replacement", 9)],
         Vec::new(),
     );
 
-    let d_old = compile_fixture(&mut session, "realm.v5.d", D_BASELINE, &contract, 7);
+    let d_old = compile_fixture(&mut session, "realm.v6.d", D_BASELINE, &contract, 7);
     reload_with_state(
         &d_old,
-        "realm.v5.d",
+        "realm.v6.d",
         &d,
-        "realm.v5.d",
-        &contract,
+        "realm.v6.d",
+        &parsed_contract,
         &[("value", 8), ("replacement", 9), ("generation", 3)],
         Vec::new(),
     );

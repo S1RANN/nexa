@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod m4;
+mod m4r1;
 
 type DynError = Box<dyn std::error::Error>;
 
@@ -411,6 +412,16 @@ fn main() -> Result<(), DynError> {
         "test-m4-tooling" => m4::test_m4_tooling(),
         "m4-scale-stress" => m4::m4_scale_stress(),
         "finalize-m4" => m4::finalize_m4(),
+        "test-language-v2" => m4r1::test_language_v2(),
+        "test-object-model-v2" => m4r1::test_object_model_v2(),
+        "test-async-v2" => m4r1::test_async_v2(),
+        "test-nidl-v2" => m4r1::test_nidl_v2(),
+        "test-structured-codegen" => m4r1::test_structured_codegen(),
+        "test-standalone" => m4r1::test_standalone(),
+        "test-repl" => m4r1::test_repl(),
+        "test-entrypoints" => m4r1::test_entrypoints(),
+        "m4r1-scale-stress" => m4r1::m4r1_scale_stress(),
+        "finalize-m4-r1" => m4r1::finalize_m4r1(),
         _ => {
             eprintln!(
                 "usage: cargo xtask \
@@ -421,7 +432,10 @@ fn main() -> Result<(), DynError> {
                  editor-check|dev-loop-stress|test-generation-accounting|\
                  test-candidate-freshness|finalize-m3|finalize-m3-r1|finalize-m3-r2|\
                  finalize-m3-r3|test-m4-source|test-m4-semantics|test-m4-incremental|\
-                 test-m4-tooling|m4-scale-stress|finalize-m4"
+                 test-m4-tooling|m4-scale-stress|finalize-m4|test-language-v2|\
+                 test-object-model-v2|test-async-v2|test-nidl-v2|\
+                 test-structured-codegen|test-standalone|test-repl|test-entrypoints|\
+                 m4r1-scale-stress|finalize-m4-r1"
             );
             Err("unknown xtask command".into())
         }
@@ -488,7 +502,8 @@ fn finalize_m1() -> Result<(), DynError> {
 
 fn check() -> Result<(), DynError> {
     check_through_m3()?;
-    m4::run_m4_gates().ensure_passed()
+    m4::run_m4_gates().ensure_passed()?;
+    m4r1::record_regression_pass()
 }
 
 fn check_through_m3() -> Result<(), DynError> {
@@ -2266,9 +2281,20 @@ fn audit_snake_schema2_packages(root: &Path) -> Result<(), DynError> {
             );
         }
         let source = fs::read_to_string(package_root.join(source_path))?;
-        if !source.contains(&format!("module {module};")) {
+        let expected_source_path = format!("src/{}.nexa", module.replace('.', "/"));
+        if source_path != expected_source_path {
             return Err(format!(
-                "Snake package {package} source path `{source_path}` does not declare `{module}`"
+                "Snake package {package} entry `{module}` must derive from path \
+                 `{expected_source_path}`, observed `{source_path}`"
+            )
+            .into());
+        }
+        if source.lines().any(|line| {
+            let line = line.trim_start();
+            line.starts_with("module ") || line.starts_with("import ")
+        }) {
+            return Err(format!(
+                "Snake package {package} still contains a removed module/import declaration"
             )
             .into());
         }
@@ -2276,7 +2302,7 @@ fn audit_snake_schema2_packages(root: &Path) -> Result<(), DynError> {
     let overlay = fs::read_to_string(
         root.join("examples/snake-game/packages/mods/score-overlay/src/snake/score_overlay.nexa"),
     )?;
-    if !overlay.contains("@stateful(1) class OverlayState") {
+    if !overlay.contains("@state(version = 1)\nclass OverlayState") {
         return Err("Score Overlay does not declare typed state".into());
     }
     Ok(())
@@ -3172,10 +3198,10 @@ fn historical_gate_tool_loc() -> Result<usize, DynError> {
 #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn low_level_event_violations(root: &Path, tracked: &[String]) -> Vec<String> {
     const FORBIDDEN: [&str; 4] = [
-        "RealmV5RuntimeEvent::TaskAdmission",
-        "RealmV5RuntimeEvent::FuelYield",
-        "RealmV5RuntimeEvent::HostWait",
-        "RealmV5RuntimeEvent::TaskComplete",
+        "RealmV6RuntimeEvent::TaskAdmission",
+        "RealmV6RuntimeEvent::FuelYield",
+        "RealmV6RuntimeEvent::HostWait",
+        "RealmV6RuntimeEvent::TaskComplete",
     ];
     tracked
         .iter()

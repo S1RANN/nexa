@@ -2,43 +2,99 @@ use super::*;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use nexa::prelude::{
-    HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue,
-    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, Signature, StableId, ValueType,
+    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
+    ResourceContext, RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements, ScriptCallError,
+    ScriptCallWriter, ScriptExport, ScriptOutputReader, Signature, StableId, ValueType,
 };
 use serde::Serialize;
 
-const IDL_SOURCE: &str = "interface TestHost {
-    enum WaitError { Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, WaitError>>;
-    export Run(value: i32) -> i32;
+const IDL_SOURCE: &str = "contract TestHost {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        fn run(value: i32) -> i32;
+    }
 }";
-const RUN_ID: StableId = StableId(0xf1c5_6273_0ddd_ab52);
+const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT: i32 = 10;
 const ACTIVE_A: i32 = 11;
 const STALE_B: i32 = 12;
 const ACTIVE_C: i32 = 13;
+static HOST_AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
 
-struct Registry(StableId);
+struct Registry {
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
+}
 
 impl HostRegistry for Registry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        _: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(0))
+        Err(HostTrap::UnknownFunction(id))
     }
+}
+
+fn host_function_authority() -> HostFunctionAuthority {
+    HOST_AUTHORITY
+        .get_or_init(|| {
+            let contract = nexa::parse_nidl(IDL_SOURCE).expect("freshness test NIDL");
+            let model = nexa::BindingModel::from_contract(&contract)
+                .expect("freshness Contract runtime binding model");
+            let function = model
+                .host_functions
+                .iter()
+                .find(|function| function.identity.source_name == "wait")
+                .expect("freshness Host wait function");
+            let runtime = function
+                .host_contract
+                .as_ref()
+                .expect("Host function has runtime metadata");
+            let parameters = Box::leak(runtime.parameters.clone().into_boxed_slice());
+            let capabilities: &'static [&'static str] = Box::leak(
+                function
+                    .capabilities
+                    .iter()
+                    .cloned()
+                    .map(|capability| {
+                        let capability: &'static str = Box::leak(capability.into_boxed_str());
+                        capability
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            HostFunctionAuthority::new(
+                function.identity.stable_id,
+                function.declaration_fingerprint,
+                parameters,
+                runtime.result,
+                runtime.mode,
+                function.fuel_cost,
+                runtime.async_result,
+                capabilities,
+            )
+        })
+        .clone()
 }
 
 struct Run;
@@ -48,13 +104,17 @@ impl ScriptExport for Run {
     type Output = i32;
 
     const STABLE_ID: StableId = RUN_ID;
-    const NAME: &'static str = "Run";
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
         Signature {
             parameters: vec![ValueType::I32],
             result: Some(ValueType::I32),
         }
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
     }
 
     fn argument_requirements(
@@ -97,7 +157,10 @@ impl SharedSource {
 
     fn current_build_fingerprint(&self) -> BuildFingerprint {
         let candidate = self
-            .discover(&CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec()))
+            .discover(
+                &CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec())
+                    .requiring_entrypoints([Run::NAME]),
+            )
             .expect("freshness source discovery")
             .remove(0);
         candidate.candidate.build_fingerprint
@@ -246,7 +309,7 @@ impl PackageSource for DynamicApplicationsSource {
                 )
                 .source(
                     format!("src/{}.nexa", package_id.as_str().replace('.', "/")),
-                    program(package_id.as_str(), delta),
+                    program(delta),
                 ),
             );
         }
@@ -267,7 +330,7 @@ struct Fixture {
 impl Fixture {
     fn new(label: &str, config: DevelopmentConfig, with_blocker: bool) -> Self {
         let target_id = PackageId::new(format!("tests.freshness{label}")).expect("target ID");
-        let initial_source = program(target_id.as_str(), 1);
+        let initial_source = program(1);
         let target = shared_source(
             &format!("freshness-{label}"),
             &target_id,
@@ -275,10 +338,14 @@ impl Fixture {
         );
         let initial_hash = target.current_build_fingerprint();
         let contract = contract();
-        let interface_hash = contract.interface_hash;
+        let contract_runtime_id = contract.contract_runtime_id();
+        let authority = host_function_authority();
         let mut builder = NexaEngine::builder(contract)
             .host_factory(move |_: &PackageContext| {
-                Box::new(Registry(interface_hash)) as Box<dyn HostRegistry>
+                Box::new(Registry {
+                    contract_runtime_id,
+                    authority: authority.clone(),
+                }) as Box<dyn HostRegistry>
             })
             .require_export::<Run>()
             .development(config);
@@ -289,7 +356,7 @@ impl Fixture {
             let blocker = shared_source(
                 &format!("freshness-{label}-blocker"),
                 &blocker_id,
-                program(blocker_id.as_str(), 1),
+                program(1),
             );
             builder = builder.package_source(blocker.clone());
             (Some(blocker), Some(blocker_id))
@@ -323,7 +390,7 @@ impl Fixture {
     }
 
     fn set_target_delta(&self, delta: i32) -> BuildFingerprint {
-        self.target.replace(program(self.target_id.as_str(), delta));
+        self.target.replace(program(delta));
         self.target.current_build_fingerprint()
     }
 
@@ -333,8 +400,7 @@ impl Fixture {
 
     fn change_blocker(&self) {
         let blocker = self.blocker.as_ref().expect("fixture has a blocker");
-        let blocker_id = self.blocker_id.as_ref().expect("fixture has a blocker ID");
-        blocker.replace(program(blocker_id.as_str(), 9));
+        blocker.replace(program(9));
     }
 }
 
@@ -430,13 +496,27 @@ struct FreshnessReport {
 }
 
 fn contract() -> HostContract {
-    let idl = nexa::parse(IDL_SOURCE).expect("freshness test IDL");
-    HostContract {
-        interface_name: "TestHost",
-        canonical_idl: IDL_SOURCE,
-        interface_hash: nexa::exact_hash(&idl),
-        generator_schema_version: nexa::HOST_CONTRACT_SCHEMA_VERSION,
-    }
+    static CONTRACT: OnceLock<HostContract> = OnceLock::new();
+    *CONTRACT.get_or_init(|| {
+        let contract = nexa::parse_nidl(IDL_SOURCE).expect("freshness test IDL");
+        let run = contract
+            .nexa_functions
+            .iter()
+            .find(|entrypoint| entrypoint.name == Run::NAME)
+            .expect("freshness required entrypoint is declared by the Contract");
+        assert_eq!(nexa::entrypoint_stable_id(run), Run::STABLE_ID);
+        let descriptor = nexa::abi_descriptor(&contract);
+        let fingerprint = descriptor.fingerprint.into_bytes();
+        let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+        HostContract::new(
+            "TestHost",
+            IDL_SOURCE,
+            descriptor,
+            fingerprint,
+            nexa::contract_runtime_id(&contract),
+            nexa::HOST_CONTRACT_SCHEMA_VERSION,
+        )
+    })
 }
 
 fn policy() -> PackagePolicy {
@@ -471,18 +551,12 @@ fn shared_source(id: &str, package_id: &PackageId, script: String) -> SharedSour
     }
 }
 
-fn program(module: &str, delta: i32) -> String {
-    format!(
-        "module {module};\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 {{ return value + {delta}; }}"
-    )
+fn program(delta: i32) -> String {
+    format!("pub fn run(value: i32) -> i32 {{ return value + {delta}; }}")
 }
 
-fn invalid_program(module: &str) -> String {
-    format!(
-        "module {module};\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 {{ return missing; }}"
-    )
+fn invalid_program() -> String {
+    "pub fn run(value: i32) -> i32 { return missing; }".into()
 }
 
 fn package_inspection(engine: &NexaEngine, package_id: &PackageId) -> PackageInspection {
@@ -526,17 +600,17 @@ fn exact_host_source_engine(
 ) -> (NexaEngine, PackageId, BuildFingerprint) {
     let package_id =
         PackageId::new("tests.exact_host_registry").expect("exact Host registry Package ID");
-    let target = shared_source(
-        "exact-host-registry",
-        &package_id,
-        program(package_id.as_str(), 1),
-    );
+    let target = shared_source("exact-host-registry", &package_id, program(1));
     let contract = contract();
-    let interface_hash = contract.interface_hash;
+    let contract_runtime_id = contract.contract_runtime_id();
+    let authority = host_function_authority();
     let mut engine = NexaEngine::builder(contract)
         .host_contract_source(identity, IDL_SOURCE)
         .host_factory(move |_: &PackageContext| {
-            Box::new(Registry(interface_hash)) as Box<dyn HostRegistry>
+            Box::new(Registry {
+                contract_runtime_id,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(target)
         .require_export::<Run>()
@@ -1039,7 +1113,7 @@ fn run_pending_revert_terminal_build_fingerprint() -> ScenarioEvidence {
         },
         true,
     );
-    let invalid = invalid_program(fixture.target_id.as_str());
+    let invalid = invalid_program();
     fixture.target.replace(invalid.clone());
     let failed_hash = fixture.target.current_build_fingerprint();
     let mut setup_trace = ScenarioTrace::default();
@@ -1382,20 +1456,20 @@ fn same_hash_aba_keeps_new_generation_worker_identity() {
 fn manual_reload_discards_diagnostics_from_a_superseded_failed_snapshot() {
     let package_id =
         PackageId::new("tests.manualstaleerror").expect("manual stale error Package ID");
-    let shared = shared_source(
-        "manual-stale-error",
-        &package_id,
-        program(package_id.as_str(), 1),
-    );
+    let shared = shared_source("manual-stale-error", &package_id, program(1));
     let source = SwitchAfterDiscoverySource {
         inner: shared.clone(),
         replacement: Arc::new(RwLock::new(None)),
     };
     let contract = contract();
-    let interface_hash = contract.interface_hash;
+    let contract_runtime_id = contract.contract_runtime_id();
+    let authority = host_function_authority();
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &PackageContext| {
-            Box::new(Registry(interface_hash)) as Box<dyn HostRegistry>
+            Box::new(Registry {
+                contract_runtime_id,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(source.clone())
         .require_export::<Run>()
@@ -1412,8 +1486,8 @@ fn manual_reload_discards_diagnostics_from_a_superseded_failed_snapshot() {
         .enable_defaults()
         .expect("enable manual stale-error Package");
 
-    shared.replace(invalid_program(package_id.as_str()));
-    source.arm(program(package_id.as_str(), 3));
+    shared.replace(invalid_program());
+    source.arm(program(3));
     assert!(matches!(
         engine.reload(&package_id),
         Err(EngineError::StaleCandidate(_))
@@ -1594,6 +1668,7 @@ fn reload_changed_reports_removal_and_same_input_restore_without_recompile() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn reload_changed_reconciles_application_add_delete_and_rename() {
     let app_a = PackageId::new("tests.dynamic.a").expect("dynamic A Package ID");
     let app_b = PackageId::new("tests.dynamic.b").expect("dynamic B Package ID");
@@ -1607,10 +1682,14 @@ fn reload_changed_reconciles_application_add_delete_and_rename() {
         applications: Arc::new(RwLock::new(BTreeMap::from([(app_a.clone(), 1)]))),
     };
     let contract = contract();
-    let interface_hash = contract.interface_hash;
+    let contract_runtime_id = contract.contract_runtime_id();
+    let authority = host_function_authority();
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &PackageContext| {
-            Box::new(Registry(interface_hash)) as Box<dyn HostRegistry>
+            Box::new(Registry {
+                contract_runtime_id,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(source.clone())
         .require_export::<Run>()

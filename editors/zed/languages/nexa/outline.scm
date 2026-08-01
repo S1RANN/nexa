@@ -1,7 +1,3 @@
-(module_declaration
-  keyword: (_) @context
-  name: (_) @name) @item
-
 (struct_declaration
   keyword: (_) @context
   name: (_) @name

@@ -1,45 +1,51 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use nexa::{CandidateIdentity, PackageBuildSession, canonical_package_build_fingerprint_input};
+use nexa::{
+    CandidateIdentity, HostContractInput, PackageBuildSession, SourceIdentity,
+    canonical_host_contract_source_identity,
+    canonical_package_build_fingerprint_input_with_contract,
+};
 use nexa_analysis::{
     CompilationLimits, NormalizedPackagePath, PackageManifest, ResolvedBuildInput,
     ResolvedDependencyGraph, ResolvedPackage, SourceId, SourceRole, SourceSetBuilder,
 };
 use nexa_bytecode::{HostCallMode, ValueType};
-use nexa_core::StableId;
 
 const PACKAGE_ID: &str = "host.nominal.fixture";
 const MODULE: &str = "host.nominal.fixture";
+const HOST_URI: &str = "nidl://tests/m4-host-nominal-async/nominal-host.nidl";
 const HOST: &str = r"
-interface NominalHost {
-    opaque Ticket;
-    struct Payload { ticket: Ticket; label: string; }
-    enum Failure { Cancelled, Abandoned, Missing(Ticket) }
-    sync fn issue() -> Ticket;
-    sync fn inspect(ticket: Ticket) -> Payload;
-    request(cancel_task, trap) fn fetch(ticket: Ticket)
-        -> request<Result<Payload, Failure>>;
+contract NominalHost {
+    handle Ticket;
+    struct Payload { ticket: Ticket, label: string, }
+    enum Failure { Cancelled, Abandoned, Missing(Ticket), }
+    host {
+        fn issue() -> Ticket;
+        fn inspect(ticket: Ticket) -> Payload;
+        @cancel(return_error)
+        @abandon(trap)
+        async fn fetch(ticket: Ticket) -> Result<Payload, Failure>;
+    }
 }
 ";
 const SOURCE: &str = r"
-module host.nominal.fixture;
-import host as api;
+use host::nominal_host as api;
 
-fn echo_ticket(value: api.Ticket) -> api.Ticket {
+fn echo_ticket(value: api::Ticket) -> api::Ticket {
     return value;
 }
 
-fn inspect_payload(value: api.Ticket) -> api.Payload {
-    return api.inspect(value);
+fn inspect_payload(value: api::Ticket) -> api::Payload {
+    return api::inspect(value);
 }
 
-task fn fetch_payload(value: api.Ticket) -> Result<api.Payload, api.Failure> {
-    return await api.fetch(value);
+async fn fetch_payload(value: api::Ticket) -> Result<api::Payload, api::Failure> {
+    return api::fetch(value).await;
 }
 ";
 
-fn resolved_input(contract: &nexa::Idl) -> ResolvedBuildInput {
+fn resolved_input(contract: &HostContractInput<'_>) -> ResolvedBuildInput {
     let manifest = Arc::new(
         PackageManifest::parse(&format!(
             r#"
@@ -80,7 +86,7 @@ activation = "programmatic"
         )]),
         edges: BTreeSet::new(),
     });
-    let fingerprint_input = canonical_package_build_fingerprint_input(
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
         &manifest,
         &sources,
         &BTreeMap::new(),
@@ -88,8 +94,9 @@ activation = "programmatic"
         contract,
         None,
     );
-    let host_contract_source = fingerprint_input.host_contract_source.clone();
-    let host_required_exports = fingerprint_input.host_required_exports.clone();
+    let canonical_host_contract = fingerprint_input.host_contract.clone();
+    let host_contract_source = canonical_host_contract_source_identity(contract);
+    let host_required_entrypoints = fingerprint_input.host_required_entrypoints.clone();
     ResolvedBuildInput::new(
         manifest,
         sources,
@@ -97,45 +104,83 @@ activation = "programmatic"
         BTreeMap::new(),
         graph,
         None,
-        Arc::<[u8]>::from(nexa::canonical_idl(contract).into_bytes()),
+        Arc::<[u8]>::from(canonical_host_contract),
         Arc::<[u8]>::from(host_contract_source),
-        Arc::<[u8]>::from(host_required_exports),
+        Arc::<[u8]>::from(host_required_entrypoints),
         nexa_analysis::CompilationOptions::default(),
         fingerprint_input,
     )
     .expect("resolved canonical fixture")
 }
 
-fn function_signature<'artifact>(
-    artifact: &'artifact nexa::CompiledPackageArtifact,
+fn function_signature(
+    artifact: &nexa::CompiledPackageArtifact,
     name: &str,
-) -> &'artifact nexa_bytecode::Signature {
-    let function = artifact
-        .debug_info
+) -> nexa_bytecode::Signature {
+    artifact
+        .debug_inspection()
         .functions
         .iter()
         .find(|function| function.module_path == MODULE && function.name == name)
-        .unwrap_or_else(|| panic!("missing function {name}"));
-    &artifact.module().functions
-        [usize::try_from(function.function_index).expect("function index fits usize")]
-    .signature
+        .and_then(|function| function.signature.clone())
+        .unwrap_or_else(|| panic!("missing function signature for {name}"))
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn canonical_build_preserves_host_nominals_and_async_result_arms() {
-    let contract = nexa::parse_idl(HOST).expect("fixture NIDL");
+    let parsed_contract = nexa::parse_nidl(HOST).expect("fixture NIDL");
+    let contract = HostContractInput::with_source(
+        &parsed_contract,
+        SourceIdentity::standalone(HOST_URI),
+        HOST,
+    )
+    .expect("exact fixture NIDL source");
     let input = resolved_input(&contract);
     let identity =
         CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
             .expect("candidate identity");
     let artifact = PackageBuildSession::new()
-        .compile_package(&input, &contract, identity)
+        .compile_package_with_contract(&input, &contract, identity)
         .expect("canonical typed build");
     artifact.verify_integrity().expect("artifact integrity");
 
-    let ticket = StableId::from_name("Ticket");
-    let payload = StableId::from_name("Payload");
-    let failure = StableId::from_name("Failure");
+    let ticket = parsed_contract
+        .handles
+        .iter()
+        .find(|declaration| declaration.name == "Ticket")
+        .expect("Ticket declaration")
+        .stable_id;
+    let payload = parsed_contract
+        .structs
+        .iter()
+        .find(|declaration| declaration.name == "Payload")
+        .expect("Payload declaration")
+        .stable_id;
+    let failure = parsed_contract
+        .enums
+        .iter()
+        .find(|declaration| declaration.name == "Failure")
+        .expect("Failure declaration")
+        .stable_id;
+    let issue = parsed_contract
+        .host_functions
+        .iter()
+        .find(|function| function.name == "issue")
+        .expect("issue declaration")
+        .stable_id;
+    let inspect = parsed_contract
+        .host_functions
+        .iter()
+        .find(|function| function.name == "inspect")
+        .expect("inspect declaration")
+        .stable_id;
+    let fetch = parsed_contract
+        .host_functions
+        .iter()
+        .find(|function| function.name == "fetch")
+        .expect("fetch declaration")
+        .stable_id;
     let payload_type = artifact
         .module()
         .struct_types
@@ -164,17 +209,32 @@ fn canonical_build_preserves_host_nominals_and_async_result_arms() {
     );
 
     let imports = &artifact.module().host_imports;
-    assert_eq!(imports.len(), 3);
-    assert_eq!(imports[0].result, Some(ValueType::Named(ticket)));
     assert_eq!(
-        (imports[1].parameters.as_slice(), imports[1].result),
+        imports.len(),
+        2,
+        "the effective Contract must emit only referenced Host functions"
+    );
+    assert!(
+        imports.iter().all(|import| import.stable_id != issue),
+        "the unreferenced issue function must not widen the bytecode import set"
+    );
+    let inspect_import = imports
+        .iter()
+        .find(|import| import.stable_id == inspect)
+        .expect("referenced inspect Host import");
+    assert_eq!(
+        (inspect_import.parameters.as_slice(), inspect_import.result),
         (
             [ValueType::Named(ticket)].as_slice(),
             Some(ValueType::Named(payload))
         )
     );
-    assert_eq!(imports[2].mode, HostCallMode::Async);
-    let async_result = imports[2]
+    let fetch_import = imports
+        .iter()
+        .find(|import| import.stable_id == fetch)
+        .expect("referenced fetch Host import");
+    assert_eq!(fetch_import.mode, HostCallMode::Async);
+    let async_result = fetch_import
         .async_result
         .expect("typed async Result metadata");
     assert_eq!(async_result.success, ValueType::Named(payload));
@@ -183,7 +243,7 @@ fn canonical_build_preserves_host_nominals_and_async_result_arms() {
         nexa_bytecode::result_type(ValueType::Named(payload), ValueType::Named(failure));
     assert_eq!(async_result.result_type, expected_result.type_id);
     assert_eq!(
-        imports[2].result,
+        fetch_import.result,
         Some(ValueType::Named(expected_result.type_id))
     );
     assert!(
@@ -197,21 +257,21 @@ fn canonical_build_preserves_host_nominals_and_async_result_arms() {
 
     assert_eq!(
         function_signature(&artifact, "echo_ticket"),
-        &nexa_bytecode::Signature {
+        nexa_bytecode::Signature {
             parameters: vec![ValueType::Named(ticket)],
             result: Some(ValueType::Named(ticket)),
         }
     );
     assert_eq!(
         function_signature(&artifact, "inspect_payload"),
-        &nexa_bytecode::Signature {
+        nexa_bytecode::Signature {
             parameters: vec![ValueType::Named(ticket)],
             result: Some(ValueType::Named(payload)),
         }
     );
     assert_eq!(
         function_signature(&artifact, "fetch_payload"),
-        &nexa_bytecode::Signature {
+        nexa_bytecode::Signature {
             parameters: vec![ValueType::Named(ticket)],
             result: Some(ValueType::Named(expected_result.type_id)),
         },

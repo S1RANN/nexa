@@ -1,4 +1,4 @@
-//! Nexa M4 typed-IR compiler and single-source virtual-package adapters.
+//! Nexa Language v2 typed-IR compiler and single-source virtual-package adapters.
 //!
 //! Parsing, name resolution, and type checking live in `nexa-syntax` and
 //! `nexa-analysis`. This crate only lowers typed package IR to verified bytecode.
@@ -12,17 +12,21 @@ use std::fmt;
 use nexa_bytecode::{Module, ValueType};
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_diagnostics::{ErrorCode, SourceIdentity};
-use nexa_idl::Idl;
+use nexa_idl::ValidatedContract;
 use nexa_verifier::VerifiedModule;
 
 pub use package::{
     PackageCompileOutput, PackageCompiledSource, PackageDebugInfo, PackageFunctionDebugInfo,
-    PackageHostImportDebugInfo, PackageModuleDebugInfo, PackagePublicSymbol,
-    PackageStandardLibraryInfo, PackageStateFieldInfo, PackageStateTypeInfo,
-    PackageTestCallGraphNode, PackageTestForbiddenEffect, PackageTestInfo, PackageTestRejection,
-    PackageVisibility,
+    PackageHostImportDebugInfo, PackageMainInfo, PackageModuleDebugInfo, PackagePublicSymbol,
+    PackageReplCellInfo, PackageReplStateFieldInfo, PackageStandardLibraryInfo,
+    PackageStateFieldInfo, PackageStateTypeInfo, PackageTestCallGraphNode,
+    PackageTestForbiddenEffect, PackageTestInfo, PackageTestRejection, PackageVisibility,
+    ReplCellCompileOutput, ReplSeedCompileOutput, StandaloneCompileOutput,
 };
-pub use typed::compile_typed_package;
+pub use typed::{
+    STANDALONE_MAIN_STABLE_ID, compile_typed_package, compile_typed_repl_cell,
+    compile_typed_repl_seed, compile_typed_standalone_package, standalone_main_stable_id,
+};
 
 /// Source ownership for one diagnostic label emitted by a virtual snippet.
 ///
@@ -85,6 +89,21 @@ pub enum CompileError {
     InvalidEffect {
         span: SourceSpan,
     },
+    MissingMain {
+        entry_module: String,
+        span: SourceSpan,
+    },
+    InvalidMainSignature {
+        message: &'static str,
+        span: SourceSpan,
+    },
+    MissingReplEntrypoint {
+        span: SourceSpan,
+    },
+    InvalidReplEntrypoint {
+        message: &'static str,
+        span: SourceSpan,
+    },
     InvalidReloadMetadata {
         message: &'static str,
         function_span: SourceSpan,
@@ -139,6 +158,22 @@ impl CompileError {
         Self::InvalidEffect { span }
     }
 
+    pub(crate) fn missing_main(entry_module: String, span: SourceSpan) -> Self {
+        Self::MissingMain { entry_module, span }
+    }
+
+    pub(crate) fn invalid_main_signature(message: &'static str, span: SourceSpan) -> Self {
+        Self::InvalidMainSignature { message, span }
+    }
+
+    pub(crate) fn missing_repl_entrypoint(span: SourceSpan) -> Self {
+        Self::MissingReplEntrypoint { span }
+    }
+
+    pub(crate) fn invalid_repl_entrypoint(message: &'static str, span: SourceSpan) -> Self {
+        Self::InvalidReplEntrypoint { message, span }
+    }
+
     pub(crate) fn invalid_reload_metadata(
         message: &'static str,
         function_span: SourceSpan,
@@ -168,7 +203,11 @@ impl CompileError {
             | Self::UnknownType { span, .. }
             | Self::TypeMismatch { span, .. }
             | Self::DeferCaptureLimit { span }
-            | Self::InvalidEffect { span } => Some(*span),
+            | Self::InvalidEffect { span }
+            | Self::MissingMain { span, .. }
+            | Self::InvalidMainSignature { span, .. }
+            | Self::MissingReplEntrypoint { span }
+            | Self::InvalidReplEntrypoint { span, .. } => Some(*span),
             Self::DuplicateName { duplicate, .. } => Some(*duplicate),
             Self::MissingReturn { function_span }
             | Self::InvalidReloadMetadata { function_span, .. }
@@ -201,36 +240,36 @@ pub fn compile_file(source: &str, file: FileId) -> Result<VerifiedModule, Compil
     snippet::compile_verified(source, file, None, None)
 }
 
-/// Compiles one source string and pins its expected host-interface fingerprint.
-pub fn compile_with_metadata(
+/// Compiles one source string and pins its compact Host Contract runtime identity.
+pub fn compile_with_contract_id(
     source: &str,
-    host_hash: StableId,
+    host_contract_id: StableId,
 ) -> Result<VerifiedModule, CompileError> {
-    snippet::compile_verified(source, FileId::default(), None, Some(host_hash))
+    snippet::compile_verified(source, FileId::default(), None, Some(host_contract_id))
 }
 
-/// Compiles one source string against a concrete host contract.
-pub fn compile_with_interface(
+/// Compiles one source string against a concrete NIDL v2 Contract.
+pub fn compile_with_contract(
     source: &str,
-    interface: &Idl,
+    contract: &ValidatedContract,
 ) -> Result<VerifiedModule, CompileError> {
-    compile_with_interface_file(source, FileId::default(), interface)
+    compile_with_contract_file(source, FileId::default(), contract)
 }
 
 /// Compiles one source string against a host contract and preserves its source identity.
-pub fn compile_with_interface_file(
+pub fn compile_with_contract_file(
     source: &str,
     file: FileId,
-    interface: &Idl,
+    contract: &ValidatedContract,
 ) -> Result<VerifiedModule, CompileError> {
-    snippet::compile_verified(source, file, Some(interface), None)
+    snippet::compile_verified(source, file, Some(contract), None)
 }
 
 /// Lowers one source string against a host contract without running the verifier.
-pub fn compile_module_with_interface_file(
+pub fn compile_module_with_contract_file(
     source: &str,
     file: FileId,
-    interface: &Idl,
+    contract: &ValidatedContract,
 ) -> Result<Module, CompileError> {
-    snippet::compile_module(source, file, Some(interface))
+    snippet::compile_module(source, file, Some(contract))
 }

@@ -1,5 +1,3 @@
-module language_scale.flow;
-
 // A small loop keeps both control-flow exits visible in the fixture.
 pub(package) fn pass_through(value: i32) -> i32 {
     for step in 0..3 {

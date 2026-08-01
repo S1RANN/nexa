@@ -4,9 +4,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use nexa_bytecode::{
-    Function, FunctionEffect, HostCallMode, Instruction, Module, SCALAR_TO_STRING_FUEL_PASSES,
-    SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES, StandardIntrinsic, ValueType,
-    minimum_migration_limits,
+    ArrayType, EnumVariant, Function, FunctionEffect, HostCallMode, Instruction, MapType, Module,
+    SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES,
+    StandardIntrinsic, StructField, ValueType, minimum_migration_limits,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +56,7 @@ pub enum VerifyErrorKind {
     InvalidRootMap(u32),
     InvalidLoopBound(u32),
     InvalidEffect,
+    InvalidHostImportMetadata,
     ImmediateRecursion,
     WcetComplexityLimit,
     InvalidEnumMetadata,
@@ -66,6 +67,7 @@ pub enum VerifyErrorKind {
     InvalidMapMetadata,
     InvalidBufferMetadata,
     InvalidSnapshotMetadata,
+    InvalidResourceTokenMetadata,
     InvalidSourceMap,
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
@@ -94,17 +96,211 @@ impl fmt::Display for VerifyError {
 impl std::error::Error for VerifyError {}
 
 #[derive(Clone, Debug)]
-pub struct VerifiedModule(Module);
+pub struct VerifiedModule {
+    module: Module,
+    nominal_indexes: NominalIndexes,
+}
+
+#[derive(Clone, Debug)]
+struct NominalIndexes {
+    enum_variants: Vec<((u64, u64), (usize, usize))>,
+    struct_fields: Vec<((u64, u64), (usize, usize))>,
+    class_fields: Vec<((u64, u64), (usize, usize))>,
+    array_types: Vec<(u64, usize)>,
+    map_types: Vec<(u64, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NominalIndexShape {
+    pub enum_variants: usize,
+    pub struct_fields: usize,
+    pub class_fields: usize,
+    pub array_types: usize,
+    pub map_types: usize,
+}
+
+impl NominalIndexes {
+    fn new(module: &Module) -> Self {
+        let mut enum_variants = module
+            .enum_types
+            .iter()
+            .enumerate()
+            .flat_map(|(type_index, enum_type)| {
+                enum_type
+                    .variants
+                    .iter()
+                    .enumerate()
+                    .map(move |(variant_index, variant)| {
+                        (
+                            (enum_type.type_id.0, variant.stable_id.0),
+                            (type_index, variant_index),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        enum_variants.sort_unstable_by_key(|(key, _)| *key);
+
+        let mut struct_fields = module
+            .struct_types
+            .iter()
+            .enumerate()
+            .flat_map(|(type_index, struct_type)| {
+                struct_type
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(move |(field_index, field)| {
+                        (
+                            (struct_type.type_id.0, field.stable_id.0),
+                            (type_index, field_index),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        struct_fields.sort_unstable_by_key(|(key, _)| *key);
+
+        let mut class_fields = module
+            .class_types
+            .iter()
+            .enumerate()
+            .flat_map(|(type_index, class_type)| {
+                class_type
+                    .fields
+                    .iter()
+                    .enumerate()
+                    .map(move |(field_index, field)| {
+                        (
+                            (class_type.type_id.0, field.stable_id.0),
+                            (type_index, field_index),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        class_fields.sort_unstable_by_key(|(key, _)| *key);
+
+        let mut array_types = module
+            .array_types
+            .iter()
+            .enumerate()
+            .map(|(index, array_type)| (array_type.type_id.0, index))
+            .collect::<Vec<_>>();
+        array_types.sort_unstable_by_key(|(type_id, _)| *type_id);
+
+        let mut map_types = module
+            .map_types
+            .iter()
+            .enumerate()
+            .map(|(index, map_type)| (map_type.type_id.0, index))
+            .collect::<Vec<_>>();
+        map_types.sort_unstable_by_key(|(type_id, _)| *type_id);
+
+        Self {
+            enum_variants,
+            struct_fields,
+            class_fields,
+            array_types,
+            map_types,
+        }
+    }
+}
 
 impl VerifiedModule {
+    fn new(module: Module) -> Self {
+        let nominal_indexes = NominalIndexes::new(&module);
+        Self {
+            module,
+            nominal_indexes,
+        }
+    }
+
     #[must_use]
     pub const fn module(&self) -> &Module {
-        &self.0
+        &self.module
     }
 
     #[must_use]
     pub fn into_module(self) -> Module {
-        self.0
+        self.module
+    }
+
+    #[must_use]
+    pub fn nominal_index_shape(&self) -> NominalIndexShape {
+        NominalIndexShape {
+            enum_variants: self.nominal_indexes.enum_variants.len(),
+            struct_fields: self.nominal_indexes.struct_fields.len(),
+            class_fields: self.nominal_indexes.class_fields.len(),
+            array_types: self.nominal_indexes.array_types.len(),
+            map_types: self.nominal_indexes.map_types.len(),
+        }
+    }
+
+    #[must_use]
+    pub fn enum_variant(&self, type_id: u64, variant: u64) -> Option<&EnumVariant> {
+        let (_, (type_index, variant_index)) = self
+            .nominal_indexes
+            .enum_variants
+            .binary_search_by_key(&(type_id, variant), |(key, _)| *key)
+            .ok()
+            .and_then(|index| self.nominal_indexes.enum_variants.get(index))?;
+        self.module
+            .enum_types
+            .get(*type_index)?
+            .variants
+            .get(*variant_index)
+    }
+
+    #[must_use]
+    pub fn struct_field(&self, type_id: u64, field: u64) -> Option<(usize, &StructField)> {
+        let (_, (type_index, field_index)) = self
+            .nominal_indexes
+            .struct_fields
+            .binary_search_by_key(&(type_id, field), |(key, _)| *key)
+            .ok()
+            .and_then(|index| self.nominal_indexes.struct_fields.get(index))?;
+        self.module
+            .struct_types
+            .get(*type_index)?
+            .fields
+            .get(*field_index)
+            .map(|field| (*field_index, field))
+    }
+
+    #[must_use]
+    pub fn class_field(&self, type_id: u64, field: u64) -> Option<(usize, &StructField)> {
+        let (_, (type_index, field_index)) = self
+            .nominal_indexes
+            .class_fields
+            .binary_search_by_key(&(type_id, field), |(key, _)| *key)
+            .ok()
+            .and_then(|index| self.nominal_indexes.class_fields.get(index))?;
+        self.module
+            .class_types
+            .get(*type_index)?
+            .fields
+            .get(*field_index)
+            .map(|field| (*field_index, field))
+    }
+
+    #[must_use]
+    pub fn array_type(&self, type_id: u64) -> Option<&ArrayType> {
+        let (_, type_index) = self
+            .nominal_indexes
+            .array_types
+            .binary_search_by_key(&type_id, |(candidate, _)| *candidate)
+            .ok()
+            .and_then(|index| self.nominal_indexes.array_types.get(index))?;
+        self.module.array_types.get(*type_index)
+    }
+
+    #[must_use]
+    pub fn map_type(&self, type_id: u64) -> Option<&MapType> {
+        let (_, type_index) = self
+            .nominal_indexes
+            .map_types
+            .binary_search_by_key(&type_id, |(candidate, _)| *candidate)
+            .ok()
+            .and_then(|index| self.nominal_indexes.map_types.get(index))?;
+        self.module.map_types.get(*type_index)
     }
 }
 
@@ -130,7 +326,7 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
                 instruction: None,
                 kind: VerifyErrorKind::ExportOutOfRange(export.function),
             })?;
-        if function.signature != export.signature {
+        if function.signature != export.signature || function.effect != export.effect {
             return Err(VerifyError {
                 function: export.function as usize,
                 instruction: None,
@@ -166,9 +362,10 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
             });
         }
     }
-    Ok(VerifiedModule(module))
+    Ok(VerifiedModule::new(module))
 }
 
+#[allow(clippy::too_many_lines)]
 fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
     let mut enum_ids = BTreeSet::new();
     for enum_type in &module.enum_types {
@@ -221,9 +418,25 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
             });
         }
     }
+    let mut state_ids = BTreeSet::new();
     for state_type in &module.state_schema.types {
         let mut field_ids = BTreeSet::new();
-        if !named_ids.insert(state_type.stable_id)
+        let matching_class = module
+            .class_types
+            .iter()
+            .find(|class_type| class_type.type_id == state_type.stable_id);
+        let class_layout_matches = matching_class.is_none_or(|class_type| {
+            class_type.fields.len() == state_type.fields.len()
+                && class_type.fields.iter().zip(&state_type.fields).all(
+                    |(class_field, state_field)| {
+                        class_field.stable_id == state_field.stable_id
+                            && class_field.ty == state_field.ty
+                    },
+                )
+        });
+        if !state_ids.insert(state_type.stable_id)
+            || (matching_class.is_none() && !named_ids.insert(state_type.stable_id))
+            || !class_layout_matches
             || state_type.version == 0
             || state_type
                 .fields
@@ -267,7 +480,60 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
     verify_map_metadata(module)?;
     verify_buffer_metadata(module)?;
     verify_snapshot_metadata(module)?;
+    verify_resource_token_metadata(module)?;
     verify_state_storage_metadata(module)?;
+    Ok(())
+}
+
+fn verify_resource_token_metadata(module: &Module) -> Result<(), VerifyError> {
+    let mut ids = BTreeSet::new();
+    if module.resource_token_types.iter().any(|token| {
+        !ids.insert(token.type_id)
+            || token.type_id != nexa_bytecode::resource_token_type(token.content_type)
+            || module
+                .enum_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .struct_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .class_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .state_schema
+                .types
+                .iter()
+                .any(|ty| ty.stable_id == token.type_id)
+            || module
+                .state_handle_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .array_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .map_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .buffer_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+            || module
+                .snapshot_types
+                .iter()
+                .any(|ty| ty.type_id == token.type_id)
+    }) {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidResourceTokenMetadata,
+        });
+    }
     Ok(())
 }
 
@@ -528,6 +794,23 @@ fn has_state_handle_type(module: &Module, target: ValueType) -> bool {
 
 fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
     for import in &module.host_imports {
+        let capabilities_are_canonical = import.capabilities.len()
+            <= nexa_bytecode::MAX_HOST_CAPABILITIES
+            && import
+                .capabilities
+                .iter()
+                .all(|capability| host_capability_is_valid(capability))
+            && import
+                .capabilities
+                .windows(2)
+                .all(|pair| pair[0].as_bytes() < pair[1].as_bytes());
+        if !capabilities_are_canonical {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidHostImportMetadata,
+            });
+        }
         let valid = match (import.mode, import.async_result) {
             (HostCallMode::Immediate, None) => true,
             (HostCallMode::Async, Some(async_result)) => {
@@ -563,6 +846,15 @@ fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {
         }
     }
     Ok(())
+}
+
+fn host_capability_is_valid(capability: &str) -> bool {
+    !capability.is_empty()
+        && capability.len() <= nexa_bytecode::MAX_HOST_CAPABILITY_BYTES
+        && !capability.split('.').any(str::is_empty)
+        && capability
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn host_policy_error_is_valid(
@@ -763,6 +1055,7 @@ const fn aggregate_instruction_requires_heap(instruction: Instruction) -> bool {
             | Instruction::EnumNew { .. }
             | Instruction::EnumTag { .. }
             | Instruction::EnumPayload { .. }
+            | Instruction::EnumEqual { .. }
             | Instruction::StructNew { .. }
             | Instruction::StructGet { .. }
             | Instruction::StructWith { .. }
@@ -944,6 +1237,7 @@ fn verify_function(
                 | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
                 | Instruction::StringRuneAt { .. }
+                | Instruction::EnumEqual { .. }
                 | Instruction::StructEqual { .. }
         ) && immediate_context
         {
@@ -1198,6 +1492,27 @@ fn verify_function(
                 }
                 state[register(dst)?] = Some(ty);
             }
+            Instruction::StateCurrentGet { type_id, dst, .. } => {
+                if !matches!(
+                    function.effect,
+                    FunctionEffect::Ordinary | FunctionEffect::Task
+                ) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidEffect));
+                }
+                if !module
+                    .state_schema
+                    .types
+                    .iter()
+                    .any(|state_type| state_type.stable_id == type_id)
+                    || !module
+                        .class_types
+                        .iter()
+                        .any(|class_type| class_type.type_id == type_id)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                }
+                state[register(dst)?] = Some(ValueType::Named(type_id));
+            }
             Instruction::StateOldFieldGet {
                 object,
                 field_id,
@@ -1448,6 +1763,24 @@ fn verify_function(
                         error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
                     })?;
                 state[register(dst)?] = Some(payload_type);
+            }
+            Instruction::EnumEqual { lhs, rhs, dst } => {
+                let lhs = register(lhs)?;
+                let Some(ValueType::Named(type_id)) = state[lhs] else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                if !module
+                    .enum_types
+                    .iter()
+                    .any(|enum_type| enum_type.type_id == type_id)
+                {
+                    return Err(error(
+                        Some(pc),
+                        VerifyErrorKind::EnumTypeOutOfRange(type_id.0),
+                    ));
+                }
+                require(&state, rhs, ValueType::Named(type_id))?;
+                state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::StructNew {
                 type_id,
@@ -1893,7 +2226,7 @@ fn verify_function(
             _ => {}
         }
     }
-    verify_safepoints(function_index, function, &states)?;
+    verify_safepoints(module, function_index, function, &states)?;
     Ok(())
 }
 
@@ -1929,10 +2262,12 @@ fn verify_loop_bounds(
 }
 
 fn verify_safepoints(
+    module: &Module,
     function_index: usize,
     function: &Function,
     states: &[Option<Vec<Option<ValueType>>>],
 ) -> Result<(), VerifyError> {
+    let live_before = exact_live_registers(module, function, states);
     let mut previous = None;
     for &safepoint in &function.safepoints {
         let pc = usize::try_from(safepoint).unwrap_or(usize::MAX);
@@ -1966,6 +2301,13 @@ fn verify_safepoints(
     }
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
+        if matches!(instruction, Instruction::Yield) && pc + 1 == function.code.len() {
+            return Err(VerifyError {
+                function: function_index,
+                instruction: Some(pc),
+                kind: VerifyErrorKind::MissingSafepoint(pc_u32.saturating_add(1)),
+            });
+        }
         let required = instruction_requires_safepoint(function, pc, instruction);
         if required && function.safepoints.binary_search(&pc_u32).is_err() {
             return Err(VerifyError {
@@ -1987,7 +2329,10 @@ fn verify_safepoints(
                 |state| {
                     state
                         .iter()
-                        .map(|ty| ty.is_some_and(ValueType::is_reference))
+                        .enumerate()
+                        .map(|(register, ty)| {
+                            ty.is_some_and(ValueType::is_reference) && live_before[pc][register]
+                        })
                         .collect()
                 },
             );
@@ -2009,6 +2354,356 @@ fn verify_safepoints(
     Ok(())
 }
 
+fn exact_live_registers(
+    module: &Module,
+    function: &Function,
+    states: &[Option<Vec<Option<ValueType>>>],
+) -> Vec<Vec<bool>> {
+    let register_count = usize::from(function.registers);
+    let mut live_before = vec![vec![false; register_count]; function.code.len()];
+    loop {
+        let mut changed = false;
+        for pc in (0..function.code.len()).rev() {
+            if states[pc].is_none() {
+                continue;
+            }
+            let instruction = function.code[pc];
+            let mut live = vec![false; register_count];
+            for successor in instruction_successors(function, pc, instruction) {
+                if states[successor].is_some() {
+                    for (current, incoming) in
+                        live.iter_mut().zip(live_before[successor].iter().copied())
+                    {
+                        *current |= incoming;
+                    }
+                }
+            }
+            if let Some(destination) = instruction_destination(module, instruction) {
+                live[usize::from(destination)] = false;
+            }
+            for source in instruction_sources(instruction) {
+                live[usize::from(source)] = true;
+            }
+            if live_before[pc] != live {
+                live_before[pc] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            return live_before;
+        }
+    }
+}
+
+fn instruction_successors(function: &Function, pc: usize, instruction: Instruction) -> Vec<usize> {
+    match instruction {
+        Instruction::Jump { target } => vec![
+            usize::try_from(target)
+                .expect("reachable jump targets were range-checked before root-map validation"),
+        ],
+        Instruction::JumpIfFalse { target, .. } => {
+            let mut successors =
+                vec![usize::try_from(target).expect(
+                    "reachable jump targets were range-checked before root-map validation",
+                )];
+            if pc + 1 < function.code.len() {
+                successors.push(pc + 1);
+            }
+            successors
+        }
+        Instruction::Return { .. }
+        | Instruction::ReturnVoid
+        | Instruction::CleanupReturn
+        | Instruction::Trap => Vec::new(),
+        _ if pc + 1 < function.code.len() => vec![pc + 1],
+        _ => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn instruction_sources(instruction: Instruction) -> Vec<u16> {
+    let range = |base: u16, count: u16| {
+        (0..count)
+            .map(|offset| base.saturating_add(offset))
+            .collect::<Vec<_>>()
+    };
+    match instruction {
+        Instruction::Move { source, .. }
+        | Instruction::StringLen { source, .. }
+        | Instruction::StringByteLen { source, .. }
+        | Instruction::StringHash { source, .. }
+        | Instruction::I32ToString { source, .. }
+        | Instruction::I64ToString { source, .. }
+        | Instruction::F32ToString { source, .. }
+        | Instruction::F64ToString { source, .. }
+        | Instruction::BoolToString { source, .. }
+        | Instruction::RuneToString { source, .. }
+        | Instruction::StringToString { source, .. }
+        | Instruction::EnumTag { source, .. }
+        | Instruction::EnumPayload { source, .. }
+        | Instruction::StructGet { source, .. }
+        | Instruction::ClassGet { source, .. }
+        | Instruction::ArrayLen { source, .. }
+        | Instruction::ArrayPop { source, .. }
+        | Instruction::ArrayClear { source }
+        | Instruction::MapLen { source, .. }
+        | Instruction::MapClear { source }
+        | Instruction::BufferLen { source, .. }
+        | Instruction::Return { source } => vec![source],
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::RemI32 { lhs, rhs, .. }
+        | Instruction::AddI64 { lhs, rhs, .. }
+        | Instruction::SubI64 { lhs, rhs, .. }
+        | Instruction::MulI64 { lhs, rhs, .. }
+        | Instruction::DivI64 { lhs, rhs, .. }
+        | Instruction::RemI64 { lhs, rhs, .. }
+        | Instruction::AddF32 { lhs, rhs, .. }
+        | Instruction::SubF32 { lhs, rhs, .. }
+        | Instruction::MulF32 { lhs, rhs, .. }
+        | Instruction::DivF32 { lhs, rhs, .. }
+        | Instruction::RemF32 { lhs, rhs, .. }
+        | Instruction::AddF64 { lhs, rhs, .. }
+        | Instruction::SubF64 { lhs, rhs, .. }
+        | Instruction::MulF64 { lhs, rhs, .. }
+        | Instruction::DivF64 { lhs, rhs, .. }
+        | Instruction::RemF64 { lhs, rhs, .. }
+        | Instruction::StringEqual { lhs, rhs, .. }
+        | Instruction::StringConcat { lhs, rhs, .. }
+        | Instruction::CompareEq { lhs, rhs, .. }
+        | Instruction::CompareLtI32 { lhs, rhs, .. }
+        | Instruction::CompareLtI64 { lhs, rhs, .. }
+        | Instruction::CompareLtF32 { lhs, rhs, .. }
+        | Instruction::CompareLtF64 { lhs, rhs, .. }
+        | Instruction::EnumEqual { lhs, rhs, .. }
+        | Instruction::StructEqual { lhs, rhs, .. }
+        | Instruction::ClassEqual { lhs, rhs, .. }
+        | Instruction::StateHandleEqual { lhs, rhs, .. } => vec![lhs, rhs],
+        Instruction::StringRuneAt { source, index, .. }
+        | Instruction::ArrayGet { source, index, .. }
+        | Instruction::ArrayRemove { source, index, .. }
+        | Instruction::BufferGet { source, index, .. } => vec![source, index],
+        Instruction::StandardIntrinsic {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::Call {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::HostCall {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::DeferPush {
+            args_base,
+            args_count,
+            ..
+        } => range(args_base, args_count),
+        Instruction::JumpIfFalse { condition, .. } => vec![condition],
+        Instruction::StateNewSet { object, source, .. } => vec![object, source],
+        Instruction::StateReplace { target, .. } => vec![target],
+        Instruction::EnumNew { payload, .. } => payload.into_iter().collect(),
+        Instruction::StructNew {
+            fields_base,
+            fields_count,
+            ..
+        }
+        | Instruction::ClassNew {
+            fields_base,
+            fields_count,
+            ..
+        } => range(fields_base, fields_count),
+        Instruction::StructWith { source, value, .. }
+        | Instruction::ClassSet { source, value, .. }
+        | Instruction::ArrayPush { source, value } => vec![source, value],
+        Instruction::ArraySet {
+            source,
+            index,
+            value,
+        }
+        | Instruction::ArrayInsert {
+            source,
+            index,
+            value,
+        }
+        | Instruction::BufferSet {
+            source,
+            index,
+            value,
+        } => vec![source, index, value],
+        Instruction::MapGet { source, key, .. }
+        | Instruction::MapRemove { source, key, .. }
+        | Instruction::MapContains { source, key, .. } => vec![source, key],
+        Instruction::MapSet { source, key, value } => vec![source, key, value],
+        Instruction::BufferSlice {
+            source,
+            start,
+            length,
+            ..
+        } => vec![source, start, length],
+        Instruction::BufferCopy {
+            destination,
+            source,
+            source_start,
+            destination_start,
+            length,
+        } => vec![destination, source, source_start, destination_start, length],
+        Instruction::StateOldFieldGet { object, .. } => vec![object],
+        Instruction::StateHandleResolve { handle, .. }
+        | Instruction::StateHandleIsAlive { handle, .. }
+        | Instruction::StateHandleStableId { handle, .. }
+        | Instruction::StateHandleGeneration { handle, .. }
+        | Instruction::StateHandleHash { handle, .. } => vec![handle],
+        Instruction::LoadI32 { .. }
+        | Instruction::LoadBool { .. }
+        | Instruction::LoadI64 { .. }
+        | Instruction::LoadF32 { .. }
+        | Instruction::LoadF64 { .. }
+        | Instruction::LoadRune { .. }
+        | Instruction::LoadString { .. }
+        | Instruction::Jump { .. }
+        | Instruction::StateOldGet { .. }
+        | Instruction::StateCurrentGet { .. }
+        | Instruction::StateNewCreate { .. }
+        | Instruction::StatePreserve { .. }
+        | Instruction::StateDelete { .. }
+        | Instruction::ArrayNew { .. }
+        | Instruction::MapNew { .. }
+        | Instruction::StateFinish
+        | Instruction::DeferPop
+        | Instruction::CleanupReturn
+        | Instruction::ReturnVoid
+        | Instruction::Safepoint
+        | Instruction::Yield
+        | Instruction::Trap => Vec::new(),
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn instruction_destination(module: &Module, instruction: Instruction) -> Option<u16> {
+    match instruction {
+        Instruction::Call { function, dst, .. } => module
+            .functions
+            .get(function as usize)
+            .and_then(|callee| callee.signature.result.map(|_| dst)),
+        Instruction::HostCall { import, dst, .. } => module
+            .host_imports
+            .get(import as usize)
+            .and_then(|host| host.result.map(|_| dst)),
+        Instruction::LoadI32 { dst, .. }
+        | Instruction::LoadBool { dst, .. }
+        | Instruction::LoadI64 { dst, .. }
+        | Instruction::LoadF32 { dst, .. }
+        | Instruction::LoadF64 { dst, .. }
+        | Instruction::LoadRune { dst, .. }
+        | Instruction::LoadString { dst, .. }
+        | Instruction::Move { dst, .. }
+        | Instruction::Add { dst, .. }
+        | Instruction::Sub { dst, .. }
+        | Instruction::Mul { dst, .. }
+        | Instruction::Div { dst, .. }
+        | Instruction::RemI32 { dst, .. }
+        | Instruction::AddI64 { dst, .. }
+        | Instruction::SubI64 { dst, .. }
+        | Instruction::MulI64 { dst, .. }
+        | Instruction::DivI64 { dst, .. }
+        | Instruction::RemI64 { dst, .. }
+        | Instruction::AddF32 { dst, .. }
+        | Instruction::SubF32 { dst, .. }
+        | Instruction::MulF32 { dst, .. }
+        | Instruction::DivF32 { dst, .. }
+        | Instruction::RemF32 { dst, .. }
+        | Instruction::AddF64 { dst, .. }
+        | Instruction::SubF64 { dst, .. }
+        | Instruction::MulF64 { dst, .. }
+        | Instruction::DivF64 { dst, .. }
+        | Instruction::RemF64 { dst, .. }
+        | Instruction::StringLen { dst, .. }
+        | Instruction::StringByteLen { dst, .. }
+        | Instruction::StringEqual { dst, .. }
+        | Instruction::StringConcat { dst, .. }
+        | Instruction::StringRuneAt { dst, .. }
+        | Instruction::StringHash { dst, .. }
+        | Instruction::I32ToString { dst, .. }
+        | Instruction::I64ToString { dst, .. }
+        | Instruction::F32ToString { dst, .. }
+        | Instruction::F64ToString { dst, .. }
+        | Instruction::BoolToString { dst, .. }
+        | Instruction::RuneToString { dst, .. }
+        | Instruction::StringToString { dst, .. }
+        | Instruction::StandardIntrinsic { dst, .. }
+        | Instruction::CompareEq { dst, .. }
+        | Instruction::CompareLtI32 { dst, .. }
+        | Instruction::CompareLtI64 { dst, .. }
+        | Instruction::CompareLtF32 { dst, .. }
+        | Instruction::CompareLtF64 { dst, .. }
+        | Instruction::StateOldGet { dst, .. }
+        | Instruction::StateCurrentGet { dst, .. }
+        | Instruction::StateNewCreate { dst, .. }
+        | Instruction::EnumNew { dst, .. }
+        | Instruction::EnumTag { dst, .. }
+        | Instruction::EnumPayload { dst, .. }
+        | Instruction::EnumEqual { dst, .. }
+        | Instruction::StructNew { dst, .. }
+        | Instruction::StructGet { dst, .. }
+        | Instruction::StructWith { dst, .. }
+        | Instruction::StructEqual { dst, .. }
+        | Instruction::ClassNew { dst, .. }
+        | Instruction::ClassGet { dst, .. }
+        | Instruction::ClassEqual { dst, .. }
+        | Instruction::ArrayNew { dst, .. }
+        | Instruction::ArrayLen { dst, .. }
+        | Instruction::ArrayGet { dst, .. }
+        | Instruction::ArrayPop { dst, .. }
+        | Instruction::ArrayRemove { dst, .. }
+        | Instruction::MapNew { dst, .. }
+        | Instruction::MapLen { dst, .. }
+        | Instruction::MapGet { dst, .. }
+        | Instruction::MapRemove { dst, .. }
+        | Instruction::MapContains { dst, .. }
+        | Instruction::BufferLen { dst, .. }
+        | Instruction::BufferGet { dst, .. }
+        | Instruction::BufferSlice { dst, .. }
+        | Instruction::StateOldFieldGet { dst, .. }
+        | Instruction::StateHandleResolve { dst, .. }
+        | Instruction::StateHandleIsAlive { dst, .. }
+        | Instruction::StateHandleStableId { dst, .. }
+        | Instruction::StateHandleGeneration { dst, .. }
+        | Instruction::StateHandleEqual { dst, .. }
+        | Instruction::StateHandleHash { dst, .. } => Some(dst),
+        Instruction::Jump { .. }
+        | Instruction::JumpIfFalse { .. }
+        | Instruction::StateNewSet { .. }
+        | Instruction::StateReplace { .. }
+        | Instruction::StatePreserve { .. }
+        | Instruction::StateDelete { .. }
+        | Instruction::ClassSet { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayInsert { .. }
+        | Instruction::ArrayClear { .. }
+        | Instruction::MapSet { .. }
+        | Instruction::MapClear { .. }
+        | Instruction::BufferSet { .. }
+        | Instruction::BufferCopy { .. }
+        | Instruction::StateFinish
+        | Instruction::DeferPush { .. }
+        | Instruction::DeferPop
+        | Instruction::CleanupReturn
+        | Instruction::Return { .. }
+        | Instruction::ReturnVoid
+        | Instruction::Safepoint
+        | Instruction::Yield
+        | Instruction::Trap => None,
+    }
+}
+
 fn instruction_requires_safepoint(
     function: &Function,
     pc: usize,
@@ -2016,7 +2711,11 @@ fn instruction_requires_safepoint(
 ) -> bool {
     let pc_u32 = u32::try_from(pc).expect("bytecode position fits u32");
     pc == 0
-        || (pc > 0 && matches!(function.code[pc - 1], Instruction::HostCall { .. }))
+        || (pc > 0
+            && matches!(
+                function.code[pc - 1],
+                Instruction::HostCall { .. } | Instruction::Yield
+            ))
         || matches!(
             instruction,
             Instruction::Safepoint
@@ -2036,6 +2735,7 @@ fn instruction_requires_safepoint(
                 | Instruction::StringToString { .. }
                 | Instruction::StandardIntrinsic { .. }
                 | Instruction::EnumNew { .. }
+                | Instruction::EnumEqual { .. }
                 | Instruction::StructNew { .. }
                 | Instruction::StructWith { .. }
                 | Instruction::StructEqual { .. }
@@ -2063,6 +2763,7 @@ fn instruction_requires_safepoint(
                 | Instruction::BufferCopy { .. }
                 | Instruction::Call { .. }
                 | Instruction::HostCall { .. }
+                | Instruction::StateCurrentGet { .. }
                 | Instruction::StateHandleResolve { .. }
                 | Instruction::Return { .. }
                 | Instruction::ReturnVoid
@@ -2661,13 +3362,57 @@ mod tests {
     use nexa_bytecode::{
         AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
         EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
-        Instruction, MapType, ModuleBuilder, RootMap, Signature, SnapshotType, SourceMapEntry,
-        StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType, StructField,
-        StructType, ValueType,
+        Instruction, MapType, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature,
+        SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema,
+        StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
     use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
+
+    #[test]
+    fn host_import_authority_metadata_is_canonical() {
+        let import = |capabilities: &[&str]| HostImport {
+            stable_id: StableId::from_name("Host::read_profile"),
+            declaration_fingerprint: [7; 32],
+            capabilities: capabilities
+                .iter()
+                .map(|capability| (*capability).to_owned())
+                .collect(),
+            parameters: Vec::new(),
+            result: Some(ValueType::I32),
+            mode: HostCallMode::Immediate,
+            fuel_cost: 3,
+            async_result: None,
+        };
+        let module = |capabilities: &[&str]| {
+            let mut module = ModuleBuilder::new();
+            module.host_import(import(capabilities));
+            module.finish()
+        };
+
+        assert!(
+            verify(
+                module(&["profile.read", "world-state_read"]),
+                VerifierLimits::default(),
+            )
+            .is_ok()
+        );
+        for invalid in [
+            Vec::from(["profile.read", "profile.read"]),
+            Vec::from(["world.write", "profile.read"]),
+            Vec::from([""]),
+            Vec::from(["scope..read"]),
+            Vec::from(["scope:read"]),
+        ] {
+            assert_eq!(
+                verify(module(&invalid), VerifierLimits::default())
+                    .unwrap_err()
+                    .kind,
+                VerifyErrorKind::InvalidHostImportMetadata
+            );
+        }
+    }
 
     #[test]
     fn unused_async_import_cannot_forge_its_result_type_identity() {
@@ -2677,6 +3422,8 @@ mod tests {
         module.enum_type(canonical);
         module.host_import(HostImport {
             stable_id: StableId::from_name("Host::unused"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: Vec::new(),
             result: Some(ValueType::Named(forged)),
             mode: HostCallMode::Async,
@@ -2706,6 +3453,8 @@ mod tests {
         scalar_module.enum_type(invalid_scalar.clone());
         scalar_module.host_import(HostImport {
             stable_id: StableId::from_name("Host::invalid_scalar"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: Vec::new(),
             result: Some(ValueType::Named(invalid_scalar.type_id)),
             mode: HostCallMode::Async,
@@ -2741,6 +3490,8 @@ mod tests {
         payload_module.enum_type(error).enum_type(result.clone());
         payload_module.host_import(HostImport {
             stable_id: StableId::from_name("Host::invalid_payload_variant"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: Vec::new(),
             result: Some(ValueType::Named(result.type_id)),
             mode: HostCallMode::Async,
@@ -3014,6 +3765,44 @@ mod tests {
     }
 
     #[test]
+    fn typed_resource_token_metadata_is_canonical_and_content_specific() {
+        let action_lock = StableId::from_name("ActionLock");
+        let motion_lock = StableId::from_name("MotionLock");
+        let action_token = ResourceTokenType::new(action_lock);
+        let motion_token = ResourceTokenType::new(motion_lock);
+        assert_ne!(action_token.type_id, motion_token.type_id);
+
+        let mut valid = ModuleBuilder::new();
+        valid
+            .resource_token_type(action_token)
+            .resource_token_type(motion_token);
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let mut forged = ModuleBuilder::new();
+        forged.resource_token_type(ResourceTokenType {
+            type_id: StableId::from_name("ResourceToken"),
+            content_type: action_lock,
+        });
+        assert_eq!(
+            verify(forged.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidResourceTokenMetadata
+        );
+
+        let mut duplicate = ModuleBuilder::new();
+        duplicate
+            .resource_token_type(action_token)
+            .resource_token_type(action_token);
+        assert_eq!(
+            verify(duplicate.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidResourceTokenMetadata
+        );
+    }
+
+    #[test]
     fn map_keys_metadata_and_option_results_are_verified_independently() {
         let map = MapType::new(ValueType::I32, ValueType::String);
         let option = nexa_bytecode::option_type(ValueType::String);
@@ -3043,7 +3832,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true, false, true],
+                bitmap: vec![false, false, true],
             },
         ];
         let mut valid = ModuleBuilder::new();
@@ -3057,6 +3846,8 @@ mod tests {
         let mut opaque_key = ModuleBuilder::new();
         opaque_key.host_import(HostImport {
             stable_id: StableId::from_name("host.entity"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: vec![opaque],
             result: Some(opaque),
             mode: HostCallMode::Immediate,
@@ -3701,8 +4492,19 @@ mod tests {
             .unwrap()
             .emit(Instruction::StringLen { dst: 1, source: 0 })
             .emit(Instruction::Return { source: 1 });
+        let mut immediate = immediate.finish().unwrap();
+        immediate.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![false, false],
+            },
+        ];
         let mut module = ModuleBuilder::new();
-        module.function(immediate.finish().unwrap());
+        module.function(immediate);
         module.function(runtime_sized_ordinary.finish().unwrap());
         let error = verify(module.finish(), VerifierLimits::default()).unwrap_err();
         assert_eq!(error.function, 1);
@@ -3759,6 +4561,8 @@ mod tests {
         );
         module.host_import(HostImport {
             stable_id: StableId::from_name("host.indirect"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: Vec::new(),
             result: None,
             mode: HostCallMode::Immediate,
@@ -3836,7 +4640,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true],
+                bitmap: vec![false],
             },
         ];
         helper
@@ -4061,7 +4865,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true, true],
+                bitmap: vec![false, true],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -4147,7 +4951,7 @@ mod tests {
                 },
                 RootMap {
                     pc: 1,
-                    bitmap: vec![source_is_root, true],
+                    bitmap: vec![false, true],
                 },
             ];
             function
@@ -4722,7 +5526,7 @@ mod tests {
             .map(|ty| ty.is_reference())
             .chain(std::iter::once(false))
             .collect::<Vec<_>>();
-        let mut roots_at_return = roots_at_entry.clone();
+        let mut roots_at_return = vec![false; usize::from(registers)];
         roots_at_return[usize::from(dst)] = result.is_reference();
         let root_bitmap = roots_at_entry
             .iter()
@@ -4889,6 +5693,122 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn state_current_get_is_typed_rooted_and_effect_scoped() {
+        let stable_id = StableId::from_name("repl::environment");
+        let type_id = StableId::from_name("repl::Environment");
+        let schema = StateSchema {
+            types: vec![StateType {
+                stable_id: type_id,
+                version: 1,
+                fields: Vec::new(),
+            }],
+        };
+        let module = |effect: FunctionEffect, requested_type: StableId, rooted: bool| {
+            let signature = Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::Named(requested_type)),
+            };
+            let mut function = FunctionBuilder::new(signature.clone(), 1);
+            function
+                .effect(effect)
+                .emit(Instruction::StateCurrentGet {
+                    stable_id,
+                    type_id: requested_type,
+                    dst: 0,
+                })
+                .emit(Instruction::Return { source: 0 });
+            if rooted {
+                function.set_root(0).unwrap();
+            }
+            let mut function = function.finish().unwrap();
+            if rooted {
+                function.root_maps[0].bitmap[0] = false;
+            }
+            let mut module = ModuleBuilder::new();
+            module.state_schema(schema.clone()).class_type(ClassType {
+                type_id,
+                fields: Vec::new(),
+            });
+            let function = module.function(function);
+            module.script_export(ScriptExport {
+                stable_id: StableId::from_name("repl::cell_0"),
+                function,
+                signature,
+                effect,
+            });
+            module.finish()
+        };
+
+        verify(
+            module(FunctionEffect::Ordinary, type_id, true),
+            VerifierLimits::default(),
+        )
+        .unwrap();
+        verify(
+            module(FunctionEffect::Task, type_id, true),
+            VerifierLimits::default(),
+        )
+        .unwrap();
+        for effect in [
+            FunctionEffect::Immediate,
+            FunctionEffect::Migration,
+            FunctionEffect::Cleanup,
+        ] {
+            assert_eq!(
+                verify(module(effect, type_id, true), VerifierLimits::default())
+                    .unwrap_err()
+                    .kind,
+                VerifyErrorKind::InvalidEffect
+            );
+        }
+        assert_eq!(
+            verify(
+                module(
+                    FunctionEffect::Ordinary,
+                    StableId::from_name("repl::UnknownEnvironment"),
+                    true,
+                ),
+                VerifierLimits::default(),
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+        assert_eq!(
+            verify(
+                module(FunctionEffect::Ordinary, type_id, false),
+                VerifierLimits::default(),
+            )
+            .unwrap_err()
+            .kind,
+            VerifyErrorKind::MissingRoot(0)
+        );
+        let mut forged_export = module(FunctionEffect::Ordinary, type_id, true);
+        forged_export.exports[0].effect = FunctionEffect::Task;
+        assert_eq!(
+            verify(forged_export, VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidExportSignature
+        );
+        let mut mismatched_state_class = module(FunctionEffect::Ordinary, type_id, true);
+        mismatched_state_class.class_types[0]
+            .fields
+            .push(StructField {
+                stable_id: StableId::from_name("repl::Environment::unexpected"),
+                ty: ValueType::Bool,
+            });
+        assert_eq!(
+            verify(mismatched_state_class, VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::InvalidStateMetadata
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn migration_fields_and_replace_targets_require_exact_state_schema_nominals() {
         let owner = StableId::from_name("Owner");
         let other_owner = StableId::from_name("OtherOwner");
@@ -4931,10 +5851,19 @@ mod tests {
                         dst: 1,
                     })
                     .emit(Instruction::ReturnVoid);
+                let mut function = function.finish().unwrap();
+                function.root_maps = vec![
+                    RootMap {
+                        pc: 0,
+                        bitmap: vec![true, false],
+                    },
+                    RootMap {
+                        pc: 1,
+                        bitmap: vec![false, false],
+                    },
+                ];
                 let mut module = ModuleBuilder::new();
-                module
-                    .state_schema(schema.clone())
-                    .function(function.finish().unwrap());
+                module.state_schema(schema.clone()).function(function);
                 module.reload_entries(Some(0), None);
                 module.finish()
             };
@@ -4971,10 +5900,19 @@ mod tests {
                     target: 0,
                 })
                 .emit(Instruction::ReturnVoid);
+            let mut function = function.finish().unwrap();
+            function.root_maps = vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: vec![true],
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: vec![false],
+                },
+            ];
             let mut module = ModuleBuilder::new();
-            module
-                .state_schema(schema.clone())
-                .function(function.finish().unwrap());
+            module.state_schema(schema.clone()).function(function);
             if declare_struct {
                 module.struct_type(StructType {
                     type_id: target_type,

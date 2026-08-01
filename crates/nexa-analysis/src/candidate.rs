@@ -63,7 +63,7 @@ pub struct ResolvedBuildInput {
     pub canonical_lock_graph: Arc<[u8]>,
     pub canonical_host_contract: Arc<[u8]>,
     pub host_contract_source_identity: Arc<[u8]>,
-    pub host_required_exports_identity: Arc<[u8]>,
+    pub host_required_entrypoints_identity: Arc<[u8]>,
     /// Exact analysis/codegen options bound into `build_fingerprint`.
     pub compilation_options: crate::CompilationOptions,
     pub fingerprint_input: Arc<BuildFingerprintInput>,
@@ -149,7 +149,7 @@ impl ResolvedBuildInput {
         lock: Option<Arc<LockFile>>,
         canonical_host_contract: impl Into<Arc<[u8]>>,
         host_contract_source_identity: impl Into<Arc<[u8]>>,
-        host_required_exports_identity: impl Into<Arc<[u8]>>,
+        host_required_entrypoints_identity: impl Into<Arc<[u8]>>,
         compilation_options: crate::CompilationOptions,
         mut fingerprint_input: BuildFingerprintInput,
     ) -> Result<Self, ResolvedBuildInputError> {
@@ -281,7 +281,7 @@ impl ResolvedBuildInput {
         .map_err(ResolvedBuildInputError::SourceSet)?;
         let canonical_host_contract = canonical_host_contract.into();
         let host_contract_source_identity = host_contract_source_identity.into();
-        let host_required_exports_identity = host_required_exports_identity.into();
+        let host_required_entrypoints_identity = host_required_entrypoints_identity.into();
         let expected_root_manifest = root_manifest.canonical_bytes();
         let expected_dependency_manifests = dependency_manifests
             .iter()
@@ -314,10 +314,10 @@ impl ResolvedBuildInput {
         {
             return Err(ResolvedBuildInputError::FingerprintHostContractSourceMismatch);
         }
-        if fingerprint_input.host_required_exports.as_slice()
-            != host_required_exports_identity.as_ref()
+        if fingerprint_input.host_required_entrypoints.as_slice()
+            != host_required_entrypoints_identity.as_ref()
         {
-            return Err(ResolvedBuildInputError::FingerprintHostRequiredExportsMismatch);
+            return Err(ResolvedBuildInputError::FingerprintHostRequiredEntrypointsMismatch);
         }
         if fingerprint_input.canonical_lock_graph.as_slice() != canonical_lock_graph.as_ref() {
             return Err(ResolvedBuildInputError::FingerprintLockMismatch);
@@ -363,7 +363,7 @@ impl ResolvedBuildInput {
         fingerprint_input.dependency_source_sets = expected_dependency_source_sets;
         fingerprint_input.host_contract = canonical_host_contract.to_vec();
         fingerprint_input.host_contract_source = host_contract_source_identity.to_vec();
-        fingerprint_input.host_required_exports = host_required_exports_identity.to_vec();
+        fingerprint_input.host_required_entrypoints = host_required_entrypoints_identity.to_vec();
         fingerprint_input.canonical_lock_graph = canonical_lock_graph.to_vec();
         let build_fingerprint = fingerprint_input.fingerprint();
         let fingerprint_input = Arc::new(fingerprint_input);
@@ -379,7 +379,7 @@ impl ResolvedBuildInput {
             canonical_lock_graph,
             canonical_host_contract,
             host_contract_source_identity,
-            host_required_exports_identity,
+            host_required_entrypoints_identity,
             compilation_options,
             fingerprint_input,
             build_fingerprint,
@@ -402,7 +402,7 @@ impl ResolvedBuildInput {
             self.lock.clone(),
             Arc::clone(&self.canonical_host_contract),
             Arc::clone(&self.host_contract_source_identity),
-            Arc::clone(&self.host_required_exports_identity),
+            Arc::clone(&self.host_required_entrypoints_identity),
             self.compilation_options,
             self.fingerprint_input.as_ref().clone(),
         )?;
@@ -536,10 +536,10 @@ fn differs_only_by_host_contract(
     let mut current_input = current.fingerprint_input.as_ref().clone();
     original_input.host_contract.clear();
     original_input.host_contract_source.clear();
-    original_input.host_required_exports.clear();
+    original_input.host_required_entrypoints.clear();
     current_input.host_contract.clear();
     current_input.host_contract_source.clear();
-    current_input.host_required_exports.clear();
+    current_input.host_required_entrypoints.clear();
     original_input == current_input
 }
 
@@ -812,7 +812,7 @@ pub enum ResolvedBuildInputError {
     FingerprintDependencySourceMismatch,
     FingerprintHostContractMismatch,
     FingerprintHostContractSourceMismatch,
-    FingerprintHostRequiredExportsMismatch,
+    FingerprintHostRequiredEntrypointsMismatch,
     FingerprintLockMismatch,
     FingerprintLanguageVersionMismatch,
     FingerprintStandardLibraryVersionMismatch,
@@ -911,8 +911,9 @@ activation = "programmatic"
             dependency_source_sets: BTreeMap::new(),
             host_contract: Vec::new(),
             host_contract_source: Vec::new(),
-            host_required_exports: Vec::new(),
-            language_version: crate::NEXA_LANGUAGE_VERSION.into(),
+            host_required_entrypoints: Vec::new(),
+            repl_session_context: Vec::new(),
+            language_version: crate::NEXA_LANGUAGE_VERSION,
             standard_library_version: nexa_stdlib::standard_library().version.to_string(),
             standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
             compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -932,7 +933,7 @@ activation = "programmatic"
             None,
             Vec::<u8>::new(),
             Vec::<u8>::new(),
-            fingerprint.host_required_exports.clone(),
+            fingerprint.host_required_entrypoints.clone(),
             options,
             fingerprint,
         )
@@ -941,17 +942,18 @@ activation = "programmatic"
     #[test]
     fn resolved_inputs_revalidate_source_sets_against_effective_options() {
         let package = PackageId::new("example.limits").unwrap();
+        let main_source = "fn main() -> i32 { return 0; }";
         let mut builder = SourceSetBuilder::new(package.clone(), CompilationLimits::default());
         builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                main_source,
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("src/extra.nexa").unwrap(),
-                "module extra;",
+                "fn value() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap();
@@ -973,7 +975,7 @@ activation = "programmatic"
 
         let file_limited = crate::CompilationOptions {
             limits: CompilationLimits {
-                source_file_bytes: "module main;".len() - 1,
+                source_file_bytes: main_source.len() - 1,
                 ..CompilationLimits::default()
             },
             ..crate::CompilationOptions::default()
@@ -1014,7 +1016,7 @@ activation = "programmatic"
         production
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1025,13 +1027,13 @@ activation = "programmatic"
         tests
             .add(
                 NormalizedPackagePath::new("tests/one.nexa").unwrap(),
-                "module test.one;",
+                "@test\nfn one() {}",
                 SourceRole::Test,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("tests/two.nexa").unwrap(),
-                "module test.two;",
+                "@test\nfn two() {}",
                 SourceRole::Test,
             )
             .unwrap();
@@ -1051,7 +1053,7 @@ activation = "programmatic"
         builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1081,7 +1083,7 @@ activation = "programmatic"
         changed_sources_builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\npub const changed: i32 = 1;",
+                "fn main() -> i32 { return 0; }\npub const CHANGED: i32 = 1;",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1096,13 +1098,13 @@ activation = "programmatic"
         extra_builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("src/extra.nexa").unwrap(),
-                "module extra;",
+                "fn value() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1315,7 +1317,7 @@ activation = "default-enabled"
         source
             .add(
                 NormalizedPackagePath::new("src/other.nexa").unwrap(),
-                "module other;",
+                "fn helper() {}",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1440,13 +1442,13 @@ activation = "programmatic"
         sources
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() -> i32 { return 0; }",
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("tests/main.nexa").unwrap(),
-                "module test.main;",
+                "@test\nfn main_test() {}",
                 SourceRole::Test,
             )
             .unwrap();
@@ -1474,8 +1476,9 @@ activation = "programmatic"
             dependency_source_sets: BTreeMap::new(),
             host_contract: Vec::new(),
             host_contract_source: Vec::new(),
-            host_required_exports: Vec::new(),
-            language_version: crate::NEXA_LANGUAGE_VERSION.into(),
+            host_required_entrypoints: Vec::new(),
+            repl_session_context: Vec::new(),
+            language_version: crate::NEXA_LANGUAGE_VERSION,
             standard_library_version: nexa_stdlib::standard_library().version.to_string(),
             standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
             compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -1496,7 +1499,7 @@ activation = "programmatic"
                 None,
                 Vec::<u8>::new(),
                 Vec::<u8>::new(),
-                fingerprint.host_required_exports.clone(),
+                fingerprint.host_required_entrypoints.clone(),
                 compilation_options,
                 fingerprint,
             ),
@@ -1526,7 +1529,7 @@ activation = "programmatic"
         source_builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\npub fn main() {}\n",
+                "pub fn main() {}\n",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1558,8 +1561,9 @@ activation = "programmatic"
             dependency_source_sets: BTreeMap::new(),
             host_contract: Vec::new(),
             host_contract_source: Vec::new(),
-            host_required_exports: Vec::new(),
-            language_version: crate::NEXA_LANGUAGE_VERSION.into(),
+            host_required_entrypoints: Vec::new(),
+            repl_session_context: Vec::new(),
+            language_version: crate::NEXA_LANGUAGE_VERSION,
             standard_library_version: nexa_stdlib::standard_library().version.to_string(),
             standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
             compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -1580,7 +1584,7 @@ activation = "programmatic"
                 None,
                 Vec::<u8>::new(),
                 Vec::<u8>::new(),
-                fingerprint.host_required_exports.clone(),
+                fingerprint.host_required_entrypoints.clone(),
                 options,
                 fingerprint,
             ),
@@ -1685,7 +1689,7 @@ activation = "programmatic"
         source_builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\npub fn main() {}\n",
+                "pub fn main() {}\n",
                 SourceRole::Production,
             )
             .unwrap();
@@ -1712,8 +1716,9 @@ activation = "programmatic"
             dependency_source_sets: BTreeMap::new(),
             host_contract: Vec::new(),
             host_contract_source: Vec::new(),
-            host_required_exports: Vec::new(),
-            language_version: crate::NEXA_LANGUAGE_VERSION.into(),
+            host_required_entrypoints: Vec::new(),
+            repl_session_context: Vec::new(),
+            language_version: crate::NEXA_LANGUAGE_VERSION,
             standard_library_version: nexa_stdlib::standard_library().version.to_string(),
             standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
             compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -1725,7 +1730,7 @@ activation = "programmatic"
             canonical_lock_graph: Vec::new(),
         };
         let mutations: [fn(&mut BuildFingerprintInput); 9] = [
-            |input| input.language_version.push_str("-forged"),
+            |input| input.language_version = input.language_version.saturating_add(1),
             |input| input.standard_library_version.push_str("-forged"),
             |input| input.standard_library_descriptor.push(0),
             |input| input.compiler_version.push_str("-forged"),

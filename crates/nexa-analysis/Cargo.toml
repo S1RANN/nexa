@@ -16,6 +16,7 @@ toml = "0.8"
 
 [dev-dependencies]
 nexa-bytecode = { path = "../nexa-bytecode" }
+nexa-idl = { path = "../nexa-idl" }
 serde_json = "1"
 
 [lints]

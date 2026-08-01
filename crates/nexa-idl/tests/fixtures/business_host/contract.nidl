@@ -1,0 +1,40 @@
+contract Game {
+    handle Entity;
+    handle ActionLock;
+    handle MotionLock;
+
+    struct EnemyView {
+        health: i32,
+    }
+
+    struct EnemyState {
+        health: i32,
+    }
+
+    enum AnimationError {
+        MissingClip,
+        Code(i32),
+        Cancelled,
+        Abandoned,
+    }
+
+    host {
+        @fuel(5)
+        fn update(entity: i32, delta: i32) -> i32;
+
+        @cancel(return_error)
+        @abandon(trap)
+        async fn animation(entity: i32) -> Result<i32, AnimationError>;
+
+        fn lock(entity: i32) -> Token<ActionLock>;
+        fn view() -> Snapshot<EnemyView>;
+        fn inspect(entity: Entity) -> i32;
+        fn score(view: EnemyView) -> i32;
+        fn classify(error: AnimationError) -> i32;
+        fn heartbeat(value: i32) -> i32;
+    }
+
+    nexa {
+        fn update(entity: i32) -> i32;
+    }
+}

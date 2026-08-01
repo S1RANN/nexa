@@ -4,25 +4,29 @@ use std::sync::Arc;
 use crate::CompileError;
 use crate::package::{
     PackageCompileOutput, PackageCompiledSource, PackageDebugInfo, PackageFunctionDebugInfo,
-    PackageHostImportDebugInfo, PackageModuleDebugInfo, PackagePublicSymbol, PackageStateFieldInfo,
-    PackageStateTypeInfo, PackageTestCallGraphNode, PackageTestForbiddenEffect, PackageTestInfo,
-    PackageTestRejection, PackageVisibility, standard_library_info,
+    PackageHostImportDebugInfo, PackageMainInfo, PackageModuleDebugInfo, PackagePublicSymbol,
+    PackageReplCellInfo, PackageReplStateFieldInfo, PackageStateFieldInfo, PackageStateTypeInfo,
+    PackageTestCallGraphNode, PackageTestForbiddenEffect, PackageTestInfo, PackageTestRejection,
+    PackageVisibility, ReplCellCompileOutput, ReplSeedCompileOutput, StandaloneCompileOutput,
+    standard_library_info,
 };
 use nexa_analysis::{
     BinaryOperator, BuiltinOperationIr, BuiltinVariantIr, DeclarationVisibility, Definition,
     DefinitionId, DefinitionKind, HostAsyncResultIr, HostTypeLayoutIr, IrAbandonPolicy,
     IrCancelPolicy, IrCompilationKind, IrEffect, IrHostFunctionMode, IrLiteral, IrType,
-    MigrationIntrinsicIr, SourceKey, SourceRange, StateTypeIr, TypedBlockIr, TypedDeclarationBody,
-    TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedPackageIr, TypedPatternIr,
-    TypedPatternKind, TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr, UnaryOperator,
+    MigrationIntrinsicIr, ModulePath, SourceKey, SourceRange, StateTypeIr, TypedBlockIr,
+    TypedDeclarationBody, TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedPackageIr,
+    TypedPatternIr, TypedPatternKind, TypedPlaceIr, TypedStatementIr, TypedTypeLayoutIr,
+    UnaryOperator,
 };
 use nexa_bytecode::{
     AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
     EnumVariant, Function, FunctionEffect, HostCallMode, HostImport, Instruction, LoopBound,
-    MapType, ModuleBuilder, RootMap, ScriptExport, Signature, SnapshotType, SourceMapEntry,
-    StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
+    MapType, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature, SnapshotType,
+    SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema, StateType,
     StructField as BytecodeStructField, StructType, ValueType, array_type, buffer_type, map_type,
-    option_type, parameterized_type_id, result_type, snapshot_type, state_handle_type,
+    option_type, parameterized_type_id, resource_token_type, result_type, snapshot_type,
+    state_handle_type,
 };
 use nexa_core::{CanonicalSymbolIdentity, FileId, SourceSpan, StableId, StableSymbolId};
 use nexa_diagnostics::SourceIdentity;
@@ -32,6 +36,34 @@ struct TypedFunctionPlan<'a> {
     definition: &'a Definition,
     function: &'a TypedFunctionIr,
     index: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StandaloneMainExport {
+    function_index: u32,
+    source_function_index: u32,
+    definition_span: SourceSpan,
+}
+
+#[derive(Default)]
+struct CodegenInputs {
+    strings: BTreeSet<String>,
+    host_functions: BTreeSet<DefinitionId>,
+}
+
+#[cfg(test)]
+const STANDALONE_MAIN_IDENTITY: &str = "nexa.standalone.main.v1";
+/// Fixed typed export identity for Standalone Profile v1.
+///
+/// This is `StableId::from_name("nexa.standalone.main.v1")`, materialized as a constant so
+/// runtime `ScriptExport` markers can reference one authority without copying the magic value.
+pub const STANDALONE_MAIN_STABLE_ID: StableId = StableId(0x6c54_4e77_81f7_db72);
+const STANDALONE_MAIN_WRAPPER_NAME: &str = "__nexa_standalone_main_task";
+
+/// Stable bytecode export identity for the standalone package `main` ABI.
+#[must_use]
+pub const fn standalone_main_stable_id() -> StableId {
+    STANDALONE_MAIN_STABLE_ID
 }
 
 #[derive(Clone, Debug)]
@@ -286,11 +318,69 @@ enum TypedAggregateKind {
     Class,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum TypedStructPlaceRoot {
+    Definition {
+        register: u16,
+        ty: ValueType,
+    },
+    ClassField {
+        object: u16,
+        field: StableId,
+        ty: ValueType,
+    },
+    ArrayIndex {
+        base: u16,
+        index: u16,
+        ty: ValueType,
+    },
+    BufferIndex {
+        base: u16,
+        index: u16,
+        ty: ValueType,
+    },
+    MapIndex {
+        base: u16,
+        index: u16,
+        ty: ValueType,
+    },
+}
+
+impl TypedStructPlaceRoot {
+    const fn ty(self) -> ValueType {
+        match self {
+            Self::Definition { ty, .. }
+            | Self::ClassField { ty, .. }
+            | Self::ArrayIndex { ty, .. }
+            | Self::BufferIndex { ty, .. }
+            | Self::MapIndex { ty, .. } => ty,
+        }
+    }
+}
+
+fn flatten_struct_place<'a>(
+    place: &'a TypedPlaceIr,
+    fields: &mut Vec<DefinitionId>,
+) -> &'a TypedPlaceIr {
+    match place {
+        TypedPlaceIr::Field { base, field } => {
+            let root = flatten_struct_place(base, fields);
+            fields.push(*field);
+            root
+        }
+        TypedPlaceIr::Definition(_)
+        | TypedPlaceIr::ClassField { .. }
+        | TypedPlaceIr::Index { .. }
+        | TypedPlaceIr::StateField { .. } => place,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TypedFieldLayout {
     definition: DefinitionId,
     stable_id: StableId,
     ty: ValueType,
+    mutable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -458,6 +548,14 @@ struct FunctionEmitter<'a> {
 pub fn compile_typed_package(
     package: &TypedPackageIr,
 ) -> Result<PackageCompileOutput, CompileError> {
+    compile_typed_package_with_profile(package, false)
+}
+
+#[allow(clippy::too_many_lines)]
+fn compile_typed_package_with_profile(
+    package: &TypedPackageIr,
+    emit_standalone_main: bool,
+) -> Result<PackageCompileOutput, CompileError> {
     let mut modules = package.modules().iter().collect::<Vec<_>>();
     modules.sort_by(|left, right| {
         (left.package_id.as_str(), left.module.as_str(), &left.source).cmp(&(
@@ -483,7 +581,7 @@ pub fn compile_typed_package(
                         module.module.as_str()
                     })
             },
-            |module| module.as_str(),
+            ModulePath::as_str,
         )
         .to_owned();
 
@@ -491,6 +589,23 @@ pub fn compile_typed_package(
     let mut sources = Vec::new();
     let mut used_files = BTreeMap::new();
     for module in &modules {
+        if module
+            .virtual_module_path
+            .as_ref()
+            .is_some_and(|virtual_module| virtual_module != &module.module)
+        {
+            return Err(CompileError::unknown_name(
+                format!(
+                    "typed virtual module `{}` disagrees with semantic module `{}`",
+                    module
+                        .virtual_module_path
+                        .as_ref()
+                        .expect("checked as present"),
+                    module.module
+                ),
+                fallback_span,
+            ));
+        }
         let file = FileId(module.file_id.0);
         if files.insert(module.source.clone(), file).is_some() {
             return Err(CompileError::duplicate_name(
@@ -516,6 +631,7 @@ pub fn compile_typed_package(
             identity: SourceIdentity::package(package_id.clone(), path.clone()),
             package_id: Some(package_id),
             module_path: Some(module.module.as_str().to_owned()),
+            virtual_module_path: module.virtual_module_path.as_ref().map(ToString::to_string),
             path,
             file,
             source: Arc::from(module.syntax.source.as_str()),
@@ -539,6 +655,7 @@ pub fn compile_typed_package(
             identity: external.identity.clone(),
             package_id: external.identity.package_id().map(str::to_owned),
             module_path: None,
+            virtual_module_path: None,
             path: external.identity.path().to_owned(),
             file,
             source: Arc::clone(&external.text),
@@ -644,16 +761,20 @@ pub fn compile_typed_package(
         .map(|plan| (plan.definition.id, plan.index))
         .collect::<BTreeMap<_, _>>();
 
-    let mut string_values = BTreeSet::from([String::new()]);
+    let mut codegen_inputs = CodegenInputs {
+        strings: BTreeSet::from([String::new()]),
+        host_functions: BTreeSet::new(),
+    };
     for plan in &function_plans {
-        collect_block_strings(&plan.function.body, &mut string_values);
-        collect_type_strings(package, plan.function, &mut string_values);
+        collect_block_codegen_inputs(&plan.function.body, &mut codegen_inputs);
+        collect_type_strings(package, plan.function, &mut codegen_inputs.strings);
     }
     for expression in constants.values() {
-        collect_expression_strings(expression, &mut string_values);
+        collect_expression_codegen_inputs(expression, &mut codegen_inputs);
     }
     let mut builder = ModuleBuilder::new();
-    let string_indices = string_values
+    let string_indices = codegen_inputs
+        .strings
         .into_iter()
         .map(|value| {
             let index = builder.string(value.clone());
@@ -664,7 +785,8 @@ pub fn compile_typed_package(
     let state_schema = typed_state_schema(package, &files)?;
     builder.state_schema(state_schema);
     let layouts = emit_typed_type_metadata(package, &modules, &files, &mut builder)?;
-    let (host_imports, host_interface_hash) = emit_typed_host_imports(package, &mut builder)?;
+    let (host_imports, host_contract_id) =
+        emit_typed_host_imports(package, &codegen_inputs.host_functions, &mut builder)?;
     let standard_functions = typed_standard_functions(package, &files)?;
 
     let mut source_map = Vec::new();
@@ -728,7 +850,28 @@ pub fn compile_typed_package(
             ));
         }
     }
+    let standalone_main_export = if emit_standalone_main {
+        emit_standalone_main_export(
+            package,
+            &function_indices,
+            &function_plans,
+            &files,
+            &entry_module,
+            &mut source_map,
+            &mut builder,
+        )?
+    } else {
+        None
+    };
     emit_typed_exports(
+        package,
+        &function_indices,
+        &function_plans,
+        &files,
+        standalone_main_export,
+        &mut builder,
+    )?;
+    emit_typed_test_exports(
         package,
         &function_indices,
         &function_plans,
@@ -739,10 +882,18 @@ pub fn compile_typed_package(
         .source_map(source_map)
         .reload_entries(migration_entry, activation_entry);
     let mut module = builder.finish();
-    module.host_interface_hash = host_interface_hash;
+    module.host_contract_id = host_contract_id;
     module.state_schema_fingerprint = package.metadata().state_schema_fingerprint;
     module.reload_metadata.state_schema_fingerprint = package.metadata().state_schema_fingerprint;
-    let debug_info = typed_debug_info(package, &modules, &function_plans, &files, &entry_module)?;
+    let debug_info = typed_debug_info(
+        package,
+        &modules,
+        &function_plans,
+        &files,
+        &entry_module,
+        standalone_main_export,
+        &host_imports,
+    )?;
     let public_symbols = typed_public_symbols(package, &files)?;
     let state_surface = typed_state_surface(package, &files)?;
     let tests = typed_test_info(package, &function_indices, &function_plans, &files)?;
@@ -777,6 +928,1262 @@ pub fn compile_typed_package(
         public_api_fingerprint: Some(package.metadata().public_api_fingerprint),
         state_schema_fingerprint: Some(package.metadata().state_schema_fingerprint),
     })
+}
+
+/// Compiles an analyzed package and enforces the standalone profile's only legal `main` ABI.
+///
+/// Embedded packages are still compiled with [`compile_typed_package`] and need no `main`.
+/// Standalone packages must define `main` in the manifest entry module with exactly one
+/// `Array<string>` parameter, an `i32` result, and either the ordinary or async Task effect.
+pub fn compile_typed_standalone_package(
+    package: &TypedPackageIr,
+) -> Result<StandaloneCompileOutput, CompileError> {
+    if package.compilation_kind() == IrCompilationKind::ReplCell {
+        return Err(CompileError::invalid_main_signature(
+            "REPL cells require compile_typed_repl_cell",
+            SourceSpan::default(),
+        ));
+    }
+    let mut compiled = compile_typed_package_with_profile(package, true)?;
+    let main = standalone_main_info(package, &compiled)?;
+    retain_standalone_generated_source_provenance(&mut compiled, main.definition_span)?;
+    Ok(StandaloneCompileOutput {
+        package: compiled,
+        main,
+    })
+}
+
+fn retain_standalone_generated_source_provenance(
+    compiled: &mut PackageCompileOutput,
+    main_span: SourceSpan,
+) -> Result<(), CompileError> {
+    if main_span.is_empty() {
+        return Err(CompileError::invalid_main_signature(
+            "standalone main must retain a non-empty source span",
+            main_span,
+        ));
+    }
+    let function_spans = compiled
+        .debug_info
+        .functions
+        .iter()
+        .map(|function| (function.function_index, function.definition_span))
+        .collect::<BTreeMap<_, _>>();
+    for entry in &mut compiled.module.source_map {
+        if entry.span.is_empty() {
+            entry.span = function_spans
+                .get(&entry.function)
+                .copied()
+                .filter(|span| !span.is_empty())
+                .unwrap_or(main_span);
+        }
+    }
+    Ok(())
+}
+
+/// Compiles the analyzer-owned revision-zero REPL seed.
+///
+/// The seed authority comes exclusively from [`nexa_analysis::repl_seed_typed_ir`]. This function
+/// does not reconstruct the reserved environment identity, schema, source, or fingerprint. The
+/// supplied Contract identity is the full compact runtime identity selected by the façade and is
+/// retained verbatim in the bytecode module.
+pub fn compile_typed_repl_seed(
+    host_contract_id: StableId,
+) -> Result<ReplSeedCompileOutput, CompileError> {
+    let seed = nexa_analysis::repl_seed_typed_ir();
+    let mut compiled = compile_typed_package(&seed)?;
+    let span = compiled
+        .state_surface
+        .first()
+        .map_or(SourceSpan::default(), |state| state.definition_span);
+    validate_repl_candidate_authority(&seed, &compiled, None, span)?;
+
+    let metadata = seed.metadata();
+    let [environment] = metadata.state_types.as_ref() else {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "revision-zero REPL seed must contain exactly the reserved environment",
+            span,
+        ));
+    };
+    if seed.package_id().as_str() != nexa_analysis::REPL_PACKAGE_ID
+        || metadata.entry_module.as_ref().map(ModulePath::as_str)
+            != Some(nexa_analysis::REPL_MODULE_PATH)
+        || metadata.repl_entry.is_some()
+        || metadata.lifecycle.migration.is_some()
+        || !metadata.exports.is_empty()
+        || !metadata.host_bindings.is_empty()
+        || environment.version != nexa_analysis::REPL_ENVIRONMENT_STATE_VERSION
+        || !environment.fields.is_empty()
+        || !compiled.module.functions.is_empty()
+        || !compiled.module.host_imports.is_empty()
+        || !compiled.module.exports.is_empty()
+        || compiled.module.reload_metadata.migration_entry.is_some()
+        || compiled.module.reload_metadata.activation_entry.is_some()
+        || compiled.state_surface.len() != 1
+        || !compiled.state_surface[0].fields.is_empty()
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "analyzer-owned revision-zero REPL seed violates its canonical ABI",
+            span,
+        ));
+    }
+
+    let state_schema_fingerprint = compiled.module.state_schema.fingerprint();
+    if metadata.state_schema_fingerprint != state_schema_fingerprint
+        || compiled.state_schema_fingerprint != Some(state_schema_fingerprint)
+        || compiled.module.state_schema_fingerprint != state_schema_fingerprint
+        || compiled.module.reload_metadata.state_schema_fingerprint != state_schema_fingerprint
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "revision-zero REPL seed schema fingerprint disagrees with Typed IR",
+            span,
+        ));
+    }
+
+    compiled.module.host_contract_id = Some(host_contract_id);
+    Ok(ReplSeedCompileOutput {
+        package: compiled,
+        state_schema_fingerprint,
+    })
+}
+
+/// Compiles one cumulative REPL candidate and emits exactly one typed cell marker.
+///
+/// The analyzer-owned [`nexa_analysis::ReplEntrypointIr`] identifies the function and its stable
+/// cell identity. Ordinary entries receive a hidden Task wrapper; async entries are exported
+/// directly. Neither path exposes a bytecode function index to callers.
+#[allow(clippy::too_many_lines)]
+pub fn compile_typed_repl_cell(
+    package: &TypedPackageIr,
+) -> Result<ReplCellCompileOutput, CompileError> {
+    if package.compilation_kind() != IrCompilationKind::ReplCell {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "compile_typed_repl_cell requires ReplCell Typed IR",
+            SourceSpan::default(),
+        ));
+    }
+    let entry = package
+        .metadata()
+        .repl_entry
+        .as_ref()
+        .ok_or_else(|| CompileError::missing_repl_entrypoint(SourceSpan::default()))?;
+    let definition = package
+        .definition(entry.function)
+        .ok_or_else(|| CompileError::missing_repl_entrypoint(SourceSpan::default()))?;
+    let expected_entry_name = format!("cell_{}", entry.cell_ordinal);
+    let expected_entry_symbol = nexa_analysis::repl_cell_entry_symbol(entry.cell_ordinal);
+    let expected_entry_identity = CanonicalSymbolIdentity::automatic(
+        nexa_analysis::REPL_PACKAGE_ID,
+        nexa_analysis::REPL_MODULE_PATH,
+        nexa_core::SymbolKind::Function,
+        &expected_entry_name,
+    );
+    let expected_definition_kind = match entry.effect {
+        IrEffect::Ordinary => DefinitionKind::Function,
+        IrEffect::Task => DefinitionKind::Task,
+        IrEffect::Immediate | IrEffect::Migration | IrEffect::Activation | IrEffect::Cleanup => {
+            DefinitionKind::Function
+        }
+    };
+    if entry.cell_ordinal < nexa_analysis::REPL_FIRST_CELL_ORDINAL
+        || package.package_id().as_str() != nexa_analysis::REPL_PACKAGE_ID
+        || package
+            .metadata()
+            .entry_module
+            .as_ref()
+            .is_none_or(|module| module.as_str() != nexa_analysis::REPL_MODULE_PATH)
+        || definition.package_id.as_str() != nexa_analysis::REPL_PACKAGE_ID
+        || definition.module.as_str() != nexa_analysis::REPL_MODULE_PATH
+        || definition.name != expected_entry_name
+        || definition.visibility != DeclarationVisibility::Private
+        || definition.kind != expected_definition_kind
+        || definition.effect != entry.effect
+        || definition.ty != entry.result
+        || definition.stable_symbol.as_ref().is_none_or(|symbol| {
+            symbol.canonical != expected_entry_identity
+                || symbol.runtime_id != expected_entry_identity.runtime_id()
+                || symbol.runtime_id != expected_entry_symbol
+        })
+        || entry.stable_id != expected_entry_symbol
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL cell package, module, entry name, ordinal, or stable identity violates the fixed synthetic ABI",
+            SourceSpan::default(),
+        ));
+    }
+    let function = package
+        .modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .find_map(|declaration| {
+            (declaration.definition == entry.function)
+                .then_some(&declaration.body)
+                .and_then(|body| match body {
+                    TypedDeclarationBody::Function(function) => Some(function),
+                    _ => None,
+                })
+        })
+        .ok_or_else(|| CompileError::missing_repl_entrypoint(SourceSpan::default()))?;
+    let mut compiled = compile_typed_package(package)?;
+    let debug = compiled
+        .debug_info
+        .functions
+        .iter()
+        .find(|debug| debug.stable_id == entry.stable_id)
+        .cloned()
+        .ok_or_else(|| CompileError::missing_repl_entrypoint(SourceSpan::default()))?;
+    if debug.package_id != definition.package_id.as_str()
+        || debug.module_path != definition.module.as_str()
+        || debug.name != definition.name
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL entry debug identity disagrees with Typed IR",
+            debug.definition_span,
+        ));
+    }
+    let (environment, new_state_fields) = validate_repl_candidate_authority(
+        package,
+        &compiled,
+        Some(function),
+        debug.definition_span,
+    )?;
+    if !function.parameters.is_empty()
+        || function.return_type != entry.result
+        || function.effect != entry.effect
+        || !matches!(entry.effect, IrEffect::Ordinary | IrEffect::Task)
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL entry must be a zero-argument ordinary or async function with the analyzed result",
+            debug.definition_span,
+        ));
+    }
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: (entry.result != IrType::Unit)
+            .then(|| lower_type(package, &entry.result, debug.definition_span))
+            .transpose()?,
+    };
+    let source_function = compiled
+        .module
+        .functions
+        .get(usize::try_from(debug.function_index).unwrap_or(usize::MAX))
+        .ok_or_else(|| {
+            CompileError::invalid_repl_entrypoint(
+                "REPL entry targets a missing bytecode function",
+                debug.definition_span,
+            )
+        })?;
+    if source_function.signature != signature
+        || source_function.effect != lower_effect(entry.effect)
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL entry bytecode signature disagrees with Typed IR",
+            debug.definition_span,
+        ));
+    }
+    let exported_function = if entry.effect == IrEffect::Task {
+        debug.function_index
+    } else {
+        append_repl_task_wrapper(
+            &mut compiled,
+            debug.function_index,
+            &signature,
+            &debug,
+            entry.cell_ordinal,
+        )?
+    };
+    let stable_id = entry.stable_id.0;
+    if compiled
+        .module
+        .exports
+        .iter()
+        .any(|export| export.stable_id == stable_id)
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL cell identity collides with another typed export",
+            debug.definition_span,
+        ));
+    }
+    compiled.module.exports.push(ScriptExport {
+        stable_id,
+        function: exported_function,
+        signature: signature.clone(),
+        effect: FunctionEffect::Task,
+    });
+    compiled
+        .module
+        .exports
+        .sort_by_key(|export| (export.stable_id.0, export.function));
+    Ok(ReplCellCompileOutput {
+        package: compiled,
+        cell: PackageReplCellInfo {
+            stable_id,
+            signature,
+            effect: FunctionEffect::Task,
+            definition_span: debug.definition_span,
+            cell_ordinal: entry.cell_ordinal,
+            environment,
+            new_state_fields,
+        },
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_repl_candidate_authority(
+    package: &TypedPackageIr,
+    compiled: &PackageCompileOutput,
+    entry_function: Option<&TypedFunctionIr>,
+    span: SourceSpan,
+) -> Result<(StableId, Vec<PackageReplStateFieldInfo>), CompileError> {
+    let metadata = package.metadata();
+    if metadata.lifecycle != nexa_analysis::LifecycleBindingsIr::default() {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL candidates cannot contain migration, activation, or cleanup lifecycle entries",
+            span,
+        ));
+    }
+
+    let environment_id = nexa_analysis::repl_environment_symbol();
+    let [environment] = metadata.state_types.as_ref() else {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL candidates must contain exactly the reserved environment state type",
+            span,
+        ));
+    };
+    if environment.stable_id != environment_id
+        || environment.version != nexa_analysis::REPL_ENVIRONMENT_STATE_VERSION
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL environment state identity or version is invalid",
+            span,
+        ));
+    }
+    let environment_definition = package.definition(environment.definition).ok_or_else(|| {
+        CompileError::invalid_repl_entrypoint("REPL environment state definition is missing", span)
+    })?;
+    let expected_environment_identity = CanonicalSymbolIdentity::automatic(
+        nexa_analysis::REPL_PACKAGE_ID,
+        nexa_analysis::REPL_MODULE_PATH,
+        nexa_core::SymbolKind::Type,
+        nexa_analysis::REPL_ENVIRONMENT_TYPE_NAME,
+    );
+    if environment_definition.kind != DefinitionKind::Class
+        || environment_definition.package_id.as_str() != nexa_analysis::REPL_PACKAGE_ID
+        || environment_definition.module.as_str() != nexa_analysis::REPL_MODULE_PATH
+        || environment_definition.name != nexa_analysis::REPL_ENVIRONMENT_TYPE_NAME
+        || environment_definition
+            .stable_symbol
+            .as_ref()
+            .is_none_or(|identity| {
+                identity.canonical != expected_environment_identity
+                    || identity.runtime_id != expected_environment_identity.runtime_id()
+                    || identity.runtime_id != environment_id
+            })
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL environment must be the analyzer-owned state Class",
+            span,
+        ));
+    }
+    let environment_layout = package
+        .modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .find_map(|declaration| {
+            (declaration.definition == environment.definition).then_some(&declaration.body)
+        })
+        .ok_or_else(|| {
+            CompileError::invalid_repl_entrypoint("REPL environment Class layout is missing", span)
+        })?;
+    let TypedDeclarationBody::TypeLayout(TypedTypeLayoutIr::Class {
+        fields,
+        state: Some(state),
+    }) = environment_layout
+    else {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL environment must have an authoritative state Class layout",
+            span,
+        ));
+    };
+    let mut ordered_layout_fields = fields.iter().collect::<Vec<_>>();
+    ordered_layout_fields.sort_by_key(|field| field.order);
+    if state.stable_id != environment_id
+        || state.version != environment.version
+        || ordered_layout_fields.len() != environment.fields.len()
+        || ordered_layout_fields
+            .iter()
+            .zip(&environment.fields)
+            .enumerate()
+            .any(|(index, (layout_field, state_field))| {
+                layout_field.order != u32::try_from(index).unwrap_or(u32::MAX)
+                    || layout_field.definition != state_field.definition
+                    || layout_field.ty != state_field.ty
+            })
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL environment state metadata disagrees with its Class layout",
+            span,
+        ));
+    }
+
+    let lifecycle_functions = package
+        .modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .filter_map(|declaration| {
+            let TypedDeclarationBody::Function(function) = &declaration.body else {
+                return None;
+            };
+            matches!(function.effect, IrEffect::Migration | IrEffect::Activation)
+                .then_some((declaration.definition, function.effect))
+        })
+        .collect::<Vec<_>>();
+    if !lifecycle_functions.is_empty() {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL candidates cannot contain migration or activation functions",
+            span,
+        ));
+    }
+    validate_repl_cleanup_helpers(package, span)?;
+
+    let expected_fingerprint = compiled.module.state_schema.fingerprint();
+    if compiled.module.state_schema.types.len() != 1
+        || compiled.module.state_schema.types[0].stable_id != environment_id.0
+        || compiled.module.state_schema.types[0].version != environment.version
+        || compiled.state_surface.len() != 1
+        || compiled.state_surface[0].stable_id != environment_id
+        || compiled.state_surface[0].version != environment.version
+        || compiled.state_surface[0].package_id != nexa_analysis::REPL_PACKAGE_ID
+        || compiled.state_surface[0].module_path != nexa_analysis::REPL_MODULE_PATH
+        || compiled.state_surface[0].name != nexa_analysis::REPL_ENVIRONMENT_TYPE_NAME
+        || compiled.state_surface[0].canonical_identity != expected_environment_identity
+        || compiled.module.state_schema_fingerprint != expected_fingerprint
+        || compiled.module.reload_metadata.state_schema_fingerprint != expected_fingerprint
+        || compiled.state_schema_fingerprint != Some(expected_fingerprint)
+        || compiled.module.reload_metadata.migration_entry.is_some()
+        || compiled.module.reload_metadata.activation_entry.is_some()
+    {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "compiled REPL state or lifecycle metadata disagrees with Typed IR",
+            span,
+        ));
+    }
+    if entry_function.is_some() {
+        let [host] = metadata.host_bindings.as_ref() else {
+            return Err(CompileError::invalid_repl_entrypoint(
+                "REPL cells require exactly one Hosted Console Contract authority",
+                span,
+            ));
+        };
+        if compiled.module.host_contract_id != Some(host.contract_stable_id) {
+            return Err(CompileError::invalid_repl_entrypoint(
+                "compiled REPL cell lost its Hosted Console Contract identity",
+                span,
+            ));
+        }
+    }
+    let new_state_fields =
+        repl_new_state_fields(package, environment, entry_function, environment_id.0, span)?;
+    Ok((environment_id.0, new_state_fields))
+}
+
+fn validate_repl_cleanup_helpers(
+    package: &TypedPackageIr,
+    span: SourceSpan,
+) -> Result<(), CompileError> {
+    let functions = package
+        .modules()
+        .iter()
+        .flat_map(|module| module.declarations.iter())
+        .filter_map(|declaration| {
+            let TypedDeclarationBody::Function(function) = &declaration.body else {
+                return None;
+            };
+            let definition = package.definition(declaration.definition)?;
+            Some((declaration.definition, (definition, function)))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let cleanup_functions = functions
+        .iter()
+        .filter_map(|(definition, (_, function))| {
+            (function.effect == IrEffect::Cleanup).then_some(*definition)
+        })
+        .collect::<BTreeSet<_>>();
+    let mut referenced_helpers = BTreeSet::new();
+    for (_, function) in functions.values() {
+        validate_repl_defer_block(
+            package,
+            &functions,
+            &function.body,
+            &mut referenced_helpers,
+            span,
+        )?;
+    }
+    if cleanup_functions != referenced_helpers {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL Cleanup functions must be private compiler-generated defer helpers referenced by a typed defer",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn validate_repl_defer_block<'a>(
+    package: &TypedPackageIr,
+    functions: &BTreeMap<DefinitionId, (&'a Definition, &'a TypedFunctionIr)>,
+    block: &TypedBlockIr,
+    referenced_helpers: &mut BTreeSet<DefinitionId>,
+    span: SourceSpan,
+) -> Result<(), CompileError> {
+    for statement in &block.statements {
+        match statement {
+            TypedStatementIr::Defer { cleanup, captures } => {
+                let Some((definition, function)) = functions.get(cleanup).copied() else {
+                    return Err(CompileError::invalid_repl_entrypoint(
+                        "REPL defer targets a missing Cleanup helper",
+                        span,
+                    ));
+                };
+                let canonical_package = if definition.package_id.as_str() == nexa_stdlib::PACKAGE_ID
+                {
+                    nexa_stdlib::CANONICAL_PACKAGE_ID
+                } else {
+                    definition.package_id.as_str()
+                };
+                let expected_identity = CanonicalSymbolIdentity::automatic(
+                    canonical_package,
+                    definition.module.as_str(),
+                    nexa_core::SymbolKind::Function,
+                    &definition.name,
+                );
+                let signature_matches = function.parameters.len() == captures.len()
+                    && function
+                        .parameters
+                        .iter()
+                        .zip(captures)
+                        .all(|(parameter, capture)| {
+                            package
+                                .definition(*parameter)
+                                .is_some_and(|parameter| parameter.ty == capture.ty)
+                        });
+                if definition.kind != DefinitionKind::Function
+                    || definition.visibility != DeclarationVisibility::Private
+                    || !definition.name.starts_with("__defer_")
+                    || definition.effect != IrEffect::Cleanup
+                    || function.effect != IrEffect::Cleanup
+                    || function.return_type != IrType::Unit
+                    || !signature_matches
+                    || definition.stable_symbol.as_ref().is_none_or(|symbol| {
+                        symbol.canonical != expected_identity
+                            || symbol.runtime_id != expected_identity.runtime_id()
+                    })
+                {
+                    return Err(CompileError::invalid_repl_entrypoint(
+                        "REPL defer helper identity, visibility, effect, or signature is invalid",
+                        span,
+                    ));
+                }
+                referenced_helpers.insert(*cleanup);
+            }
+            TypedStatementIr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                validate_repl_defer_block(
+                    package,
+                    functions,
+                    then_block,
+                    referenced_helpers,
+                    span,
+                )?;
+                if let Some(else_block) = else_block {
+                    validate_repl_defer_block(
+                        package,
+                        functions,
+                        else_block,
+                        referenced_helpers,
+                        span,
+                    )?;
+                }
+            }
+            TypedStatementIr::While { body, .. }
+            | TypedStatementIr::StaticRangeFor { body, .. } => {
+                validate_repl_defer_block(package, functions, body, referenced_helpers, span)?;
+            }
+            TypedStatementIr::Let { .. }
+            | TypedStatementIr::Assign { .. }
+            | TypedStatementIr::Expression(_)
+            | TypedStatementIr::Return(_)
+            | TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn repl_new_state_fields(
+    package: &TypedPackageIr,
+    environment: &StateTypeIr,
+    entry_function: Option<&TypedFunctionIr>,
+    environment_id: StableId,
+    span: SourceSpan,
+) -> Result<Vec<PackageReplStateFieldInfo>, CompileError> {
+    let entry = package.metadata().repl_entry.as_ref();
+    let (Some(entry), Some(entry_function)) = (entry, entry_function) else {
+        if entry.is_none() && entry_function.is_none() && environment.fields.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL entrypoint and state-extension authority are inconsistent",
+            span,
+        ));
+    };
+    let entry_definition = package.definition(entry.function).ok_or_else(|| {
+        CompileError::invalid_repl_entrypoint("REPL entrypoint definition is missing", span)
+    })?;
+    let mut field_definitions = Vec::new();
+    let mut fields = Vec::new();
+    let mut reached_current_suffix = false;
+    for field in &environment.fields {
+        let definition = package.definition(field.definition).ok_or_else(|| {
+            CompileError::invalid_repl_entrypoint(
+                "REPL environment field definition is missing",
+                span,
+            )
+        })?;
+        if definition.span.source != entry_definition.span.source {
+            if reached_current_suffix {
+                return Err(CompileError::invalid_repl_entrypoint(
+                    "new REPL environment fields must be one strict append-only suffix",
+                    span,
+                ));
+            }
+            continue;
+        }
+        reached_current_suffix = true;
+        field_definitions.push(field.definition);
+        fields.push(PackageReplStateFieldInfo {
+            stable_id: field.stable_id.0,
+            ty: lower_type(package, &field.ty, span)?,
+        });
+    }
+    validate_repl_new_field_writes(
+        entry_function,
+        environment.definition,
+        environment_id,
+        &field_definitions,
+        span,
+    )?;
+    Ok(fields)
+}
+
+fn validate_repl_new_field_writes(
+    entry: &TypedFunctionIr,
+    environment_definition: DefinitionId,
+    environment_id: StableId,
+    expected_fields: &[DefinitionId],
+    span: SourceSpan,
+) -> Result<(), CompileError> {
+    let expected = expected_fields.iter().copied().collect::<BTreeSet<_>>();
+    let mut initialized = BTreeSet::new();
+    let mut first_writes = Vec::new();
+    for statement in &entry.body.statements {
+        if repl_statement_reads_pending_field(statement, &expected, &initialized) {
+            return Err(CompileError::invalid_repl_entrypoint(
+                "REPL entrypoint reads a new environment field before its initializer write",
+                span,
+            ));
+        }
+        match statement {
+            TypedStatementIr::Assign { target, .. } => {
+                let Some(field) = repl_direct_environment_write(
+                    target,
+                    environment_definition,
+                    environment_id,
+                    &expected,
+                )?
+                else {
+                    continue;
+                };
+                if initialized.insert(field) {
+                    first_writes.push(field);
+                }
+            }
+            TypedStatementIr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                let pending = expected
+                    .difference(&initialized)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if repl_block_writes_any_field(then_block, &pending)
+                    || else_block
+                        .as_ref()
+                        .is_some_and(|block| repl_block_writes_any_field(block, &pending))
+                {
+                    return Err(CompileError::invalid_repl_entrypoint(
+                        "new REPL environment fields must be initialized by top-level writes",
+                        span,
+                    ));
+                }
+            }
+            TypedStatementIr::While { body, .. }
+            | TypedStatementIr::StaticRangeFor { body, .. } => {
+                let pending = expected
+                    .difference(&initialized)
+                    .copied()
+                    .collect::<BTreeSet<_>>();
+                if repl_block_writes_any_field(body, &pending) {
+                    return Err(CompileError::invalid_repl_entrypoint(
+                        "new REPL environment fields must be initialized by top-level writes",
+                        span,
+                    ));
+                }
+            }
+            TypedStatementIr::Let { .. }
+            | TypedStatementIr::Return(_)
+            | TypedStatementIr::Expression(_)
+            | TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Defer { .. }
+            | TypedStatementIr::Yield { .. } => {}
+        }
+    }
+    if first_writes != expected_fields {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "REPL entrypoint does not initialize every new environment field in source order",
+            span,
+        ));
+    }
+    Ok(())
+}
+
+fn repl_statement_reads_pending_field(
+    statement: &TypedStatementIr,
+    expected: &BTreeSet<DefinitionId>,
+    initialized: &BTreeSet<DefinitionId>,
+) -> bool {
+    let reads = |expression: &TypedExpressionIr| {
+        repl_expression_reads_pending_field(expression, expected, initialized)
+    };
+    match statement {
+        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
+            value.as_ref().is_some_and(reads)
+        }
+        TypedStatementIr::Assign { target, value } => {
+            repl_place_reads_pending_field(target, expected, initialized) || reads(value)
+        }
+        TypedStatementIr::Expression(value) => reads(value),
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            reads(condition)
+                || repl_block_reads_pending_field(then_block, expected, initialized)
+                || else_block.as_ref().is_some_and(|block| {
+                    repl_block_reads_pending_field(block, expected, initialized)
+                })
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => reads(condition) || repl_block_reads_pending_field(body, expected, initialized),
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            reads(start)
+                || reads(end)
+                || repl_block_reads_pending_field(body, expected, initialized)
+        }
+        TypedStatementIr::Defer { captures, .. } => captures.iter().any(reads),
+        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {
+            false
+        }
+    }
+}
+
+fn repl_block_reads_pending_field(
+    block: &TypedBlockIr,
+    expected: &BTreeSet<DefinitionId>,
+    initialized: &BTreeSet<DefinitionId>,
+) -> bool {
+    block
+        .statements
+        .iter()
+        .any(|statement| repl_statement_reads_pending_field(statement, expected, initialized))
+        || block
+            .tail
+            .as_deref()
+            .is_some_and(|tail| repl_expression_reads_pending_field(tail, expected, initialized))
+}
+
+fn repl_place_reads_pending_field(
+    place: &TypedPlaceIr,
+    expected: &BTreeSet<DefinitionId>,
+    initialized: &BTreeSet<DefinitionId>,
+) -> bool {
+    match place {
+        TypedPlaceIr::Definition(_) => false,
+        TypedPlaceIr::Field { base, .. } => {
+            repl_place_reads_pending_field(base, expected, initialized)
+        }
+        TypedPlaceIr::ClassField { object, .. } => {
+            repl_expression_reads_pending_field(object, expected, initialized)
+        }
+        TypedPlaceIr::StateField { base, .. } => {
+            repl_expression_reads_pending_field(base, expected, initialized)
+        }
+        TypedPlaceIr::Index { base, index } => {
+            repl_expression_reads_pending_field(base, expected, initialized)
+                || repl_expression_reads_pending_field(index, expected, initialized)
+        }
+    }
+}
+
+fn repl_expression_reads_pending_field(
+    expression: &TypedExpressionIr,
+    expected: &BTreeSet<DefinitionId>,
+    initialized: &BTreeSet<DefinitionId>,
+) -> bool {
+    let reads = |value: &TypedExpressionIr| {
+        repl_expression_reads_pending_field(value, expected, initialized)
+    };
+    match &expression.kind {
+        TypedExpressionKind::StateField { base, field } => {
+            (expected.contains(field) && !initialized.contains(field)) || reads(base)
+        }
+        TypedExpressionKind::Unary { operand, .. }
+        | TypedExpressionKind::Await(operand)
+        | TypedExpressionKind::Field { base: operand, .. }
+        | TypedExpressionKind::Try(operand) => reads(operand),
+        TypedExpressionKind::Binary { left, right, .. }
+        | TypedExpressionKind::Index {
+            base: left,
+            index: right,
+        } => reads(left) || reads(right),
+        TypedExpressionKind::Call { arguments, .. }
+        | TypedExpressionKind::StandardCall { arguments, .. }
+        | TypedExpressionKind::BuiltinCall { arguments, .. }
+        | TypedExpressionKind::HostCall { arguments, .. }
+        | TypedExpressionKind::Array(arguments)
+        | TypedExpressionKind::Tuple(arguments)
+        | TypedExpressionKind::StringInterpolation(arguments) => arguments.iter().any(reads),
+        TypedExpressionKind::Construct { fields, .. } => {
+            fields.iter().any(|(_, value)| reads(value))
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            update.as_deref().is_some_and(reads) || fields.iter().any(|(_, value)| reads(value))
+        }
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => {
+            payload.as_deref().is_some_and(reads)
+        }
+        TypedExpressionKind::Match { value, arms } => {
+            reads(value) || arms.iter().any(|arm| reads(&arm.value))
+        }
+        TypedExpressionKind::Update { base, fields } => {
+            reads(base) || fields.iter().any(|(_, value)| reads(value))
+        }
+        TypedExpressionKind::Migration(intrinsic) => match intrinsic {
+            MigrationIntrinsicIr::OldFieldGet { object, .. } => reads(object),
+            MigrationIntrinsicIr::NewSet { object, value, .. } => reads(object) || reads(value),
+            MigrationIntrinsicIr::Replace { target, .. } => reads(target),
+            MigrationIntrinsicIr::OldGet { .. }
+            | MigrationIntrinsicIr::NewCreate { .. }
+            | MigrationIntrinsicIr::Preserve { .. }
+            | MigrationIntrinsicIr::Delete { .. }
+            | MigrationIntrinsicIr::Finish => false,
+        },
+        TypedExpressionKind::Literal(_)
+        | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
+        | TypedExpressionKind::Yield => false,
+    }
+}
+
+fn repl_direct_environment_write(
+    target: &TypedPlaceIr,
+    environment_definition: DefinitionId,
+    environment_id: StableId,
+    expected: &BTreeSet<DefinitionId>,
+) -> Result<Option<DefinitionId>, CompileError> {
+    let TypedPlaceIr::StateField { base, field } = target else {
+        return Ok(None);
+    };
+    if !expected.contains(field) {
+        return Ok(None);
+    }
+    let valid_base = base.ty == IrType::Named(environment_definition)
+        && base.effect == IrEffect::Immediate
+        && matches!(
+            &base.kind,
+            TypedExpressionKind::PersistentStateGet {
+                identity,
+                state_type,
+            } if *identity == environment_id && *state_type == environment_definition
+        );
+    if !valid_base {
+        return Err(CompileError::invalid_repl_entrypoint(
+            "new REPL field write does not target the analyzer-owned environment",
+            SourceSpan::default(),
+        ));
+    }
+    Ok(Some(*field))
+}
+
+fn repl_block_writes_any_field(block: &TypedBlockIr, expected: &BTreeSet<DefinitionId>) -> bool {
+    block.statements.iter().any(|statement| match statement {
+        TypedStatementIr::Assign { target, .. } => {
+            matches!(target, TypedPlaceIr::StateField { field, .. } if expected.contains(field))
+        }
+        TypedStatementIr::If {
+            then_block,
+            else_block,
+            ..
+        } => {
+            repl_block_writes_any_field(then_block, expected)
+                || else_block
+                    .as_ref()
+                    .is_some_and(|block| repl_block_writes_any_field(block, expected))
+        }
+        TypedStatementIr::While { body, .. } | TypedStatementIr::StaticRangeFor { body, .. } => {
+            repl_block_writes_any_field(body, expected)
+        }
+        TypedStatementIr::Let { .. }
+        | TypedStatementIr::Return(_)
+        | TypedStatementIr::Expression(_)
+        | TypedStatementIr::Break
+        | TypedStatementIr::Continue
+        | TypedStatementIr::Defer { .. }
+        | TypedStatementIr::Yield { .. } => false,
+    })
+}
+
+fn append_repl_task_wrapper(
+    compiled: &mut PackageCompileOutput,
+    source_function: u32,
+    signature: &Signature,
+    source_debug: &PackageFunctionDebugInfo,
+    cell_ordinal: u64,
+) -> Result<u32, CompileError> {
+    let wrapper = u32::try_from(compiled.module.functions.len())
+        .map_err(|_| CompileError::too_many_registers(source_debug.definition_span))?;
+    let result_type = signature.result.unwrap_or(ValueType::I32);
+    let code = vec![
+        Instruction::Call {
+            function: source_function,
+            args_base: 0,
+            args_count: 0,
+            dst: 0,
+        },
+        signature
+            .result
+            .map_or(Instruction::ReturnVoid, |_| Instruction::Return {
+                source: 0,
+            }),
+    ];
+    let register_types = [Some(result_type)];
+    let safepoints = collect_safepoints(&code);
+    let (root_bitmap, root_maps) = typed_exact_root_maps(
+        &register_types,
+        0,
+        &code,
+        &safepoints,
+        source_debug.definition_span,
+    )?;
+    compiled.module.functions.push(Function {
+        signature: signature.clone(),
+        registers: 1,
+        frame_bytes: 8,
+        root_bitmap,
+        root_maps,
+        safepoints,
+        loop_bounds: Vec::new(),
+        effect: FunctionEffect::Task,
+        max_static_call_depth: 1,
+        code,
+    });
+    compiled
+        .module
+        .source_map
+        .extend([0_u32, 1].into_iter().map(|pc| SourceMapEntry {
+            function: wrapper,
+            pc_start: pc,
+            pc_end: pc + 1,
+            span: source_debug.definition_span,
+        }));
+    let wrapper_name = format!("__nexa_repl_cell_{cell_ordinal}_task");
+    let canonical_identity = CanonicalSymbolIdentity::explicit(
+        &source_debug.package_id,
+        nexa_core::SymbolKind::Task,
+        &wrapper_name,
+    );
+    compiled
+        .debug_info
+        .functions
+        .push(PackageFunctionDebugInfo {
+            function_index: wrapper,
+            package_id: source_debug.package_id.clone(),
+            module_path: source_debug.module_path.clone(),
+            name: wrapper_name,
+            stable_id: canonical_identity.runtime_id(),
+            canonical_identity,
+            definition_span: source_debug.definition_span,
+            effect: FunctionEffect::Task,
+            visibility: PackageVisibility::Private,
+        });
+    let module = compiled
+        .debug_info
+        .modules
+        .iter_mut()
+        .find(|module| {
+            module.package_id == source_debug.package_id
+                && module.module_path == source_debug.module_path
+                && module.file == source_debug.definition_span.file
+        })
+        .ok_or_else(|| {
+            CompileError::invalid_repl_entrypoint(
+                "REPL entry module has no debug owner",
+                source_debug.definition_span,
+            )
+        })?;
+    module.function_indices.push(wrapper);
+    Ok(wrapper)
+}
+
+fn standalone_main_info(
+    package: &TypedPackageIr,
+    compiled: &PackageCompileOutput,
+) -> Result<PackageMainInfo, CompileError> {
+    let entry_module = package.metadata().entry_module.as_ref().map_or(
+        compiled.debug_info.entry_module.as_str(),
+        ModulePath::as_str,
+    );
+    let entry_span = compiled
+        .debug_info
+        .modules
+        .iter()
+        .find(|module| {
+            module.package_id == package.package_id().as_str() && module.module_path == entry_module
+        })
+        .map_or_else(SourceSpan::default, |module| module.source_span);
+    let plan = package
+        .modules()
+        .iter()
+        .filter(|module| {
+            module.package_id == *package.package_id() && module.module.as_str() == entry_module
+        })
+        .flat_map(|module| module.declarations.iter())
+        .find_map(|declaration| {
+            let definition = package.definition(declaration.definition)?;
+            let TypedDeclarationBody::Function(function) = &declaration.body else {
+                return None;
+            };
+            (definition.name == "main").then_some((definition, function))
+        })
+        .ok_or_else(|| CompileError::missing_main(entry_module.to_owned(), entry_span))?;
+    let debug = compiled
+        .debug_info
+        .functions
+        .iter()
+        .find(|function| {
+            function.package_id == package.package_id().as_str()
+                && function.module_path == entry_module
+                && function.name == "main"
+        })
+        .ok_or_else(|| CompileError::missing_main(entry_module.to_owned(), entry_span))?;
+    if let Some(message) = invalid_standalone_main_signature(package, plan.1) {
+        return Err(CompileError::invalid_main_signature(
+            message,
+            debug.definition_span,
+        ));
+    }
+    let source_effect = lower_effect(plan.1.effect);
+    if debug.effect != source_effect {
+        return Err(CompileError::invalid_main_signature(
+            "standalone main debug effect disagrees with typed IR",
+            debug.definition_span,
+        ));
+    }
+    let expected_signature = standalone_main_signature();
+    let export = compiled
+        .module
+        .exports
+        .iter()
+        .find(|export| export.stable_id == standalone_main_stable_id())
+        .ok_or_else(|| {
+            CompileError::invalid_main_signature(
+                "standalone main export marker is missing",
+                debug.definition_span,
+            )
+        })?;
+    if export.signature != expected_signature
+        || export.effect != FunctionEffect::Task
+        || (source_effect == FunctionEffect::Task && export.function != debug.function_index)
+        || (source_effect == FunctionEffect::Ordinary
+            && !is_standalone_sync_wrapper(&compiled.module, export.function, debug.function_index))
+    {
+        return Err(CompileError::invalid_main_signature(
+            "standalone main export marker disagrees with the validated ABI",
+            debug.definition_span,
+        ));
+    }
+    let Some(exported_function) = compiled
+        .module
+        .functions
+        .get(usize::try_from(export.function).unwrap_or(usize::MAX))
+    else {
+        return Err(CompileError::invalid_main_signature(
+            "standalone main export targets a missing function",
+            debug.definition_span,
+        ));
+    };
+    if exported_function.effect != FunctionEffect::Task {
+        return Err(CompileError::invalid_main_signature(
+            "standalone main export must target a Task function",
+            debug.definition_span,
+        ));
+    }
+    Ok(PackageMainInfo {
+        stable_id: standalone_main_stable_id(),
+        effect: FunctionEffect::Task,
+        definition_span: debug.definition_span,
+    })
+}
+
+fn is_standalone_sync_wrapper(module: &nexa_bytecode::Module, wrapper: u32, main: u32) -> bool {
+    module
+        .functions
+        .get(usize::try_from(wrapper).unwrap_or(usize::MAX))
+        .is_some_and(|function| {
+            function.signature == standalone_main_signature()
+                && function.effect == FunctionEffect::Task
+                && function.code
+                    == [
+                        Instruction::Call {
+                            function: main,
+                            args_base: 0,
+                            args_count: 1,
+                            dst: 1,
+                        },
+                        Instruction::Return { source: 1 },
+                    ]
+        })
+}
+
+fn invalid_standalone_main_signature(
+    package: &TypedPackageIr,
+    function: &TypedFunctionIr,
+) -> Option<&'static str> {
+    if function.parameters.len() != 1 {
+        return Some("standalone main must accept exactly one Array<string> argument");
+    }
+    let Some(parameter) = package.definition(function.parameters[0]) else {
+        return Some("standalone main parameter is missing from typed IR");
+    };
+    if parameter.ty != IrType::Array(Box::new(IrType::String)) {
+        return Some("standalone main argument must have type Array<string>");
+    }
+    if function.return_type != IrType::I32 {
+        return Some("standalone main must return i32");
+    }
+    if !matches!(function.effect, IrEffect::Ordinary | IrEffect::Task) {
+        return Some("standalone main must be `fn` or `async fn` without lifecycle attributes");
+    }
+    None
+}
+
+fn standalone_main_signature() -> Signature {
+    Signature {
+        parameters: vec![ValueType::Named(array_type(ValueType::String))],
+        result: Some(ValueType::I32),
+    }
+}
+
+fn valid_standalone_main_plan<'a>(
+    package: &TypedPackageIr,
+    function_plans: &'a [TypedFunctionPlan<'a>],
+    entry_module: &str,
+) -> Option<&'a TypedFunctionPlan<'a>> {
+    function_plans.iter().find(|plan| {
+        plan.definition.package_id == *package.package_id()
+            && plan.definition.module.as_str() == entry_module
+            && plan.definition.name == "main"
+            && invalid_standalone_main_signature(package, plan.function).is_none()
+    })
+}
+
+fn emit_standalone_main_export(
+    package: &TypedPackageIr,
+    function_indices: &BTreeMap<DefinitionId, u32>,
+    function_plans: &[TypedFunctionPlan<'_>],
+    files: &BTreeMap<SourceKey, FileId>,
+    entry_module: &str,
+    source_map: &mut Vec<SourceMapEntry>,
+    builder: &mut ModuleBuilder,
+) -> Result<Option<StandaloneMainExport>, CompileError> {
+    let Some(main) = valid_standalone_main_plan(package, function_plans, entry_module) else {
+        return Ok(None);
+    };
+    let definition_span = source_span(&main.definition.span, files)?;
+    let source_function = function_indices[&main.definition.id];
+    let function_index = match main.function.effect {
+        IrEffect::Task => source_function,
+        IrEffect::Ordinary => {
+            let wrapper_index = u32::try_from(function_plans.len())
+                .map_err(|_| CompileError::too_many_registers(definition_span))?;
+            let code = vec![
+                Instruction::Call {
+                    function: source_function,
+                    args_base: 0,
+                    args_count: 1,
+                    dst: 1,
+                },
+                Instruction::Return { source: 1 },
+            ];
+            let register_types = vec![
+                Some(ValueType::Named(array_type(ValueType::String))),
+                Some(ValueType::I32),
+            ];
+            let safepoints = collect_safepoints(&code);
+            let (root_bitmap, root_maps) =
+                typed_exact_root_maps(&register_types, 1, &code, &safepoints, definition_span)?;
+            source_map.extend(code.iter().enumerate().map(|(pc, _)| SourceMapEntry {
+                function: wrapper_index,
+                pc_start: u32::try_from(pc).unwrap_or(u32::MAX),
+                pc_end: u32::try_from(pc.saturating_add(1)).unwrap_or(u32::MAX),
+                span: definition_span,
+            }));
+            builder.function(Function {
+                signature: standalone_main_signature(),
+                registers: 2,
+                frame_bytes: 16,
+                root_bitmap,
+                root_maps,
+                safepoints,
+                loop_bounds: Vec::new(),
+                effect: FunctionEffect::Task,
+                max_static_call_depth: 1,
+                code,
+            });
+            wrapper_index
+        }
+        IrEffect::Immediate | IrEffect::Activation | IrEffect::Migration | IrEffect::Cleanup => {
+            return Err(CompileError::invalid_main_signature(
+                "standalone main must lower from `fn` or `async fn`",
+                definition_span,
+            ));
+        }
+    };
+    Ok(Some(StandaloneMainExport {
+        function_index,
+        source_function_index: source_function,
+        definition_span,
+    }))
 }
 
 impl<'a> FunctionEmitter<'a> {
@@ -872,7 +2279,9 @@ impl<'a> FunctionEmitter<'a> {
     #[allow(clippy::too_many_lines)]
     fn emit_statement(&mut self, statement: &TypedStatementIr) -> Result<(), CompileError> {
         match statement {
-            TypedStatementIr::Let { definition, value } => {
+            TypedStatementIr::Let {
+                definition, value, ..
+            } => {
                 if let Some(value) = value {
                     let destination = self.local(*definition)?;
                     self.emit_expression(value, destination)?;
@@ -891,20 +2300,35 @@ impl<'a> FunctionEmitter<'a> {
                         self.span(&value.span)?,
                     );
                 }
-                TypedPlaceIr::Field { base, field } | TypedPlaceIr::StateField { base, field } => {
-                    let base_register = self.allocate_expression(base)?;
-                    self.emit_expression(base, base_register)?;
+                TypedPlaceIr::Field { .. } => {
+                    self.emit_assign_struct_place(target, value)?;
+                }
+                TypedPlaceIr::ClassField { object, field }
+                | TypedPlaceIr::StateField {
+                    base: object,
+                    field,
+                } => {
+                    let repl_state_initialization =
+                        matches!(target, TypedPlaceIr::StateField { .. });
+                    let base_register = self.allocate_expression(object)?;
+                    self.emit_expression(object, base_register)?;
                     let value_register = self.allocate_expression(value)?;
                     self.emit_expression(value, value_register)?;
                     let (owner, field) = self.layouts.fields.get(field).ok_or_else(|| {
                         CompileError::unknown_name(self.definition_name(*field), self.function_span)
                     })?;
                     let aggregate = &self.layouts.aggregates[owner];
-                    if aggregate.kind != TypedAggregateKind::Class {
+                    // An immutable REPL binding is initialized exactly once while its append-only
+                    // environment slot is staged. `validate_repl_new_field_writes` proves that
+                    // StateField authority before this output can be returned. Ordinary Class
+                    // assignments still require a mutable field.
+                    if aggregate.kind != TypedAggregateKind::Class
+                        || (!field.mutable && !repl_state_initialization)
+                    {
                         return Err(CompileError::type_mismatch(
                             None,
                             None,
-                            self.span(&base.span)?,
+                            self.span(&object.span)?,
                         ));
                     }
                     self.push(
@@ -1168,11 +2592,285 @@ impl<'a> FunctionEmitter<'a> {
                     self.function_span,
                 );
             }
-            TypedStatementIr::Yield => {
-                self.push(Instruction::Yield, self.function_span);
+            TypedStatementIr::Yield { span } => {
+                self.push(Instruction::Yield, self.span(span)?);
             }
         }
         Ok(())
+    }
+
+    fn emit_assign_struct_place(
+        &mut self,
+        place: &TypedPlaceIr,
+        value: &TypedExpressionIr,
+    ) -> Result<(), CompileError> {
+        let mut projection_ids = Vec::new();
+        let root_place = flatten_struct_place(place, &mut projection_ids);
+        if projection_ids.is_empty() {
+            return Err(CompileError::type_mismatch(None, None, self.function_span));
+        }
+
+        // Materialize the writable root before the RHS so class receivers and collection indices
+        // are evaluated exactly once and in source assignment order.
+        let (root, mut current) = self.prepare_struct_place_root(root_place)?;
+        let mut parents = Vec::with_capacity(projection_ids.len());
+        for (index, field_id) in projection_ids.iter().enumerate() {
+            let (owner, field) = self.layouts.fields.get(field_id).cloned().ok_or_else(|| {
+                CompileError::unknown_name(self.definition_name(*field_id), self.function_span)
+            })?;
+            let layout = self
+                .layouts
+                .aggregates
+                .get(&owner)
+                .cloned()
+                .ok_or_else(|| {
+                    CompileError::unknown_type(self.definition_name(owner), self.function_span)
+                })?;
+            if layout.kind != TypedAggregateKind::Struct
+                || self.register_types.get(usize::from(current))
+                    != Some(&Some(ValueType::Named(layout.type_id)))
+            {
+                return Err(CompileError::type_mismatch(None, None, self.function_span));
+            }
+            parents.push((current, layout.type_id, field.clone()));
+            if index.saturating_add(1) < projection_ids.len() {
+                let child = self.allocate(field.ty)?;
+                self.push(
+                    Instruction::StructGet {
+                        source: current,
+                        field: field.stable_id,
+                        dst: child,
+                    },
+                    self.function_span,
+                );
+                current = child;
+            }
+        }
+
+        let leaf = parents
+            .last()
+            .map(|(_, _, field)| field.ty)
+            .ok_or_else(|| CompileError::type_mismatch(None, None, self.function_span))?;
+        let value_register = self.allocate_expression(value)?;
+        if self.register_types.get(usize::from(value_register)) != Some(&Some(leaf)) {
+            return Err(CompileError::type_mismatch(
+                Some(leaf),
+                self.register_types
+                    .get(usize::from(value_register))
+                    .copied()
+                    .flatten(),
+                self.span(&value.span)?,
+            ));
+        }
+        self.emit_expression(value, value_register)?;
+
+        let mut updated = value_register;
+        for (parent, type_id, field) in parents.into_iter().rev() {
+            let rebuilt = self.allocate(ValueType::Named(type_id))?;
+            self.push(
+                Instruction::StructWith {
+                    source: parent,
+                    field: field.stable_id,
+                    value: updated,
+                    dst: rebuilt,
+                },
+                self.function_span,
+            );
+            updated = rebuilt;
+        }
+        if self.register_types.get(usize::from(updated)) != Some(&Some(root.ty())) {
+            return Err(CompileError::type_mismatch(None, None, self.function_span));
+        }
+        self.store_struct_place_root(root, updated);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn prepare_struct_place_root(
+        &mut self,
+        place: &TypedPlaceIr,
+    ) -> Result<(TypedStructPlaceRoot, u16), CompileError> {
+        match place {
+            TypedPlaceIr::Definition(definition) => {
+                let register = self.local(*definition)?;
+                let ty = self
+                    .register_types
+                    .get(usize::from(register))
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| CompileError::type_mismatch(None, None, self.function_span))?;
+                Ok((TypedStructPlaceRoot::Definition { register, ty }, register))
+            }
+            TypedPlaceIr::ClassField { object, field }
+            | TypedPlaceIr::StateField {
+                base: object,
+                field,
+            } => {
+                let object_register = self.allocate_expression(object)?;
+                self.emit_expression(object, object_register)?;
+                let (owner, field) = self.layouts.fields.get(field).cloned().ok_or_else(|| {
+                    CompileError::unknown_name(self.definition_name(*field), self.function_span)
+                })?;
+                let aggregate = self.layouts.aggregates.get(&owner).ok_or_else(|| {
+                    CompileError::unknown_type(self.definition_name(owner), self.function_span)
+                })?;
+                if aggregate.kind != TypedAggregateKind::Class
+                    || !field.mutable
+                    || self.register_types.get(usize::from(object_register))
+                        != Some(&Some(ValueType::Named(aggregate.type_id)))
+                {
+                    return Err(CompileError::type_mismatch(
+                        None,
+                        None,
+                        self.span(&object.span)?,
+                    ));
+                }
+                let value = self.allocate(field.ty)?;
+                self.push(
+                    Instruction::ClassGet {
+                        source: object_register,
+                        field: field.stable_id,
+                        dst: value,
+                    },
+                    self.span(&object.span)?,
+                );
+                Ok((
+                    TypedStructPlaceRoot::ClassField {
+                        object: object_register,
+                        field: field.stable_id,
+                        ty: field.ty,
+                    },
+                    value,
+                ))
+            }
+            TypedPlaceIr::Index { base, index } => {
+                let base_register = self.allocate_expression(base)?;
+                let index_register = self.allocate_expression(index)?;
+                self.emit_expression(base, base_register)?;
+                self.emit_expression(index, index_register)?;
+                let (root, value) = match &base.ty {
+                    IrType::Array(element) => {
+                        let ty = lower_type(self.package, element, self.span(&base.span)?)?;
+                        let value = self.allocate(ty)?;
+                        self.push(
+                            Instruction::ArrayGet {
+                                source: base_register,
+                                index: index_register,
+                                dst: value,
+                            },
+                            self.span(&base.span)?,
+                        );
+                        (
+                            TypedStructPlaceRoot::ArrayIndex {
+                                base: base_register,
+                                index: index_register,
+                                ty,
+                            },
+                            value,
+                        )
+                    }
+                    IrType::Buffer(element) => {
+                        let ty = lower_type(self.package, element, self.span(&base.span)?)?;
+                        let value = self.allocate(ty)?;
+                        self.push(
+                            Instruction::BufferGet {
+                                source: base_register,
+                                index: index_register,
+                                dst: value,
+                            },
+                            self.span(&base.span)?,
+                        );
+                        (
+                            TypedStructPlaceRoot::BufferIndex {
+                                base: base_register,
+                                index: index_register,
+                                ty,
+                            },
+                            value,
+                        )
+                    }
+                    IrType::Map(_, element) => {
+                        let ty = lower_type(self.package, element, self.span(&base.span)?)?;
+                        let option = option_type(ty);
+                        let option_register = self.allocate(ValueType::Named(option.type_id))?;
+                        self.push(
+                            Instruction::MapGet {
+                                source: base_register,
+                                key: index_register,
+                                result_type: option.type_id,
+                                dst: option_register,
+                            },
+                            self.span(&base.span)?,
+                        );
+                        let value = self.allocate(ty)?;
+                        let some = option
+                            .variants
+                            .get(1)
+                            .ok_or_else(|| {
+                                CompileError::type_mismatch(None, None, self.function_span)
+                            })?
+                            .stable_id;
+                        self.push(
+                            Instruction::EnumPayload {
+                                source: option_register,
+                                variant: some,
+                                dst: value,
+                            },
+                            self.span(&base.span)?,
+                        );
+                        (
+                            TypedStructPlaceRoot::MapIndex {
+                                base: base_register,
+                                index: index_register,
+                                ty,
+                            },
+                            value,
+                        )
+                    }
+                    _ => {
+                        return Err(CompileError::type_mismatch(
+                            None,
+                            None,
+                            self.span(&base.span)?,
+                        ));
+                    }
+                };
+                Ok((root, value))
+            }
+            TypedPlaceIr::Field { .. } => {
+                Err(CompileError::type_mismatch(None, None, self.function_span))
+            }
+        }
+    }
+
+    fn store_struct_place_root(&mut self, root: TypedStructPlaceRoot, source: u16) {
+        let instruction = match root {
+            TypedStructPlaceRoot::Definition { register, .. } => Instruction::Move {
+                dst: register,
+                source,
+            },
+            TypedStructPlaceRoot::ClassField { object, field, .. } => Instruction::ClassSet {
+                source: object,
+                field,
+                value: source,
+            },
+            TypedStructPlaceRoot::ArrayIndex { base, index, .. } => Instruction::ArraySet {
+                source: base,
+                index,
+                value: source,
+            },
+            TypedStructPlaceRoot::BufferIndex { base, index, .. } => Instruction::BufferSet {
+                source: base,
+                index,
+                value: source,
+            },
+            TypedStructPlaceRoot::MapIndex { base, index, .. } => Instruction::MapSet {
+                source: base,
+                key: index,
+                value: source,
+            },
+        };
+        self.push(instruction, self.function_span);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1209,22 +2907,80 @@ impl<'a> FunctionEmitter<'a> {
                     ));
                 }
             }
+            TypedExpressionKind::PersistentStateGet {
+                identity,
+                state_type,
+            } => {
+                if expression.ty != IrType::Named(*state_type)
+                    || !is_state_type(self.package, *state_type)
+                {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                }
+                self.push(
+                    Instruction::StateCurrentGet {
+                        stable_id: *identity,
+                        type_id: named_type_id(self.package, *state_type, span)?,
+                        dst: destination,
+                    },
+                    span,
+                );
+            }
             TypedExpressionKind::Unary { operator, operand } => match operator {
                 UnaryOperator::Negate => {
                     let operand_type = TypedNumericKind::from_ir_type(&operand.ty, span)?;
-                    let zero = self.allocate(operand_type.value_type())?;
-                    self.emit_numeric_zero(operand_type, zero, span);
                     let source = self.allocate_expression(operand)?;
                     self.emit_expression(operand, source)?;
-                    self.push(
-                        operand_type.binary(
-                            TypedNumericOperator::Subtract,
-                            destination,
-                            zero,
-                            source,
-                        ),
-                        span,
-                    );
+                    match operand_type {
+                        TypedNumericKind::I32 | TypedNumericKind::I64 => {
+                            let zero = self.allocate(operand_type.value_type())?;
+                            self.emit_numeric_zero(operand_type, zero, span);
+                            self.push(
+                                operand_type.binary(
+                                    TypedNumericOperator::Subtract,
+                                    destination,
+                                    zero,
+                                    source,
+                                ),
+                                span,
+                            );
+                        }
+                        TypedNumericKind::F32 => {
+                            let negative_one = self.allocate(ValueType::F32)?;
+                            self.push(
+                                Instruction::LoadF32 {
+                                    dst: negative_one,
+                                    bits: (-1.0_f32).to_bits(),
+                                },
+                                span,
+                            );
+                            self.push(
+                                Instruction::MulF32 {
+                                    dst: destination,
+                                    lhs: source,
+                                    rhs: negative_one,
+                                },
+                                span,
+                            );
+                        }
+                        TypedNumericKind::F64 => {
+                            let negative_one = self.allocate(ValueType::F64)?;
+                            self.push(
+                                Instruction::LoadF64 {
+                                    dst: negative_one,
+                                    bits: (-1.0_f64).to_bits(),
+                                },
+                                span,
+                            );
+                            self.push(
+                                Instruction::MulF64 {
+                                    dst: destination,
+                                    lhs: source,
+                                    rhs: negative_one,
+                                },
+                                span,
+                            );
+                        }
+                    }
                 }
                 UnaryOperator::Not => {
                     let source = self.allocate_expression(operand)?;
@@ -1338,7 +3094,7 @@ impl<'a> FunctionEmitter<'a> {
                 self.push(Instruction::Yield, span);
             }
             TypedExpressionKind::HostCall {
-                interface,
+                contract,
                 function,
                 arguments,
             } => {
@@ -1359,7 +3115,7 @@ impl<'a> FunctionEmitter<'a> {
                     .ok_or_else(|| {
                         CompileError::unknown_name(self.definition_name(*function), span)
                     })?;
-                if host.interface != *interface {
+                if host.contract != *contract {
                     return Err(CompileError::type_mismatch(None, None, span));
                 }
                 let destination_type = self.register_types[usize::from(destination)];
@@ -1405,7 +3161,33 @@ impl<'a> FunctionEmitter<'a> {
                 );
             }
             TypedExpressionKind::Construct { definition, fields } => {
-                self.emit_construct(*definition, fields, destination, span)?;
+                self.emit_construct(
+                    *definition,
+                    fields,
+                    TypedAggregateKind::Struct,
+                    destination,
+                    span,
+                )?;
+            }
+            TypedExpressionKind::ClassConstruct {
+                definition,
+                fields,
+                update,
+            } => {
+                if let Some(base) = update {
+                    if base.ty != IrType::Named(*definition) {
+                        return Err(CompileError::type_mismatch(None, None, span));
+                    }
+                    self.emit_update(base, fields, TypedAggregateKind::Class, destination, span)?;
+                } else {
+                    self.emit_construct(
+                        *definition,
+                        fields,
+                        TypedAggregateKind::Class,
+                        destination,
+                        span,
+                    )?;
+                }
             }
             TypedExpressionKind::EnumConstruct {
                 enum_definition,
@@ -1449,13 +3231,24 @@ impl<'a> FunctionEmitter<'a> {
                 self.emit_try(value, destination, span)?;
             }
             TypedExpressionKind::Update { base, fields } => {
-                self.emit_update(base, fields, destination, span)?;
+                self.emit_update(base, fields, TypedAggregateKind::Struct, destination, span)?;
             }
             TypedExpressionKind::Migration(intrinsic) => {
                 self.emit_migration(intrinsic, &expression.ty, destination, span)?;
             }
             TypedExpressionKind::Await(value) => {
+                let first_instruction = self.code.len();
                 self.emit_expression(value, destination)?;
+                let suspension = (first_instruction..self.code.len())
+                    .rev()
+                    .find(|index| {
+                        matches!(
+                            self.code[*index],
+                            Instruction::Call { .. } | Instruction::HostCall { .. }
+                        )
+                    })
+                    .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
+                self.spans[suspension] = span;
             }
         }
         if expression.ty == IrType::Unit {
@@ -1500,11 +3293,9 @@ impl<'a> FunctionEmitter<'a> {
             | TypedExpressionKind::BuiltinCall { .. }
             | TypedExpressionKind::Migration(_) => true,
             TypedExpressionKind::HostCall {
-                interface,
-                function,
-                ..
+                contract, function, ..
             } => self.package.metadata().host_bindings.iter().any(|host| {
-                host.interface == *interface
+                host.contract == *contract
                     && host.functions.iter().any(|binding| {
                         binding.definition == *function
                             && binding.mode == IrHostFunctionMode::Sync
@@ -1538,10 +3329,12 @@ impl<'a> FunctionEmitter<'a> {
             }
             TypedExpressionKind::Yield => expression.effect == IrEffect::Task,
             TypedExpressionKind::Literal(_)
+            | TypedExpressionKind::PersistentStateGet { .. }
             | TypedExpressionKind::Unary { .. }
             | TypedExpressionKind::Binary { .. }
             | TypedExpressionKind::StringInterpolation(_)
             | TypedExpressionKind::Construct { .. }
+            | TypedExpressionKind::ClassConstruct { .. }
             | TypedExpressionKind::EnumConstruct { .. }
             | TypedExpressionKind::BuiltinVariant { .. }
             | TypedExpressionKind::Array(_)
@@ -2198,6 +3991,7 @@ impl<'a> FunctionEmitter<'a> {
         &mut self,
         definition: DefinitionId,
         fields: &[(DefinitionId, TypedExpressionIr)],
+        expected_kind: TypedAggregateKind,
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
@@ -2205,6 +3999,9 @@ impl<'a> FunctionEmitter<'a> {
             self.layouts.aggregates.get(&definition).ok_or_else(|| {
                 CompileError::unknown_type(self.definition_name(definition), span)
             })?;
+        if layout.kind != expected_kind {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
         let values = fields
             .iter()
             .map(|(field, value)| (*field, value))
@@ -2364,35 +4161,54 @@ impl<'a> FunctionEmitter<'a> {
         self.emit_expression(base, source)?;
         self.emit_expression(index, index_register)?;
         let instruction = match &base.ty {
-            IrType::Array(_) => Instruction::ArrayGet {
+            IrType::Array(_) => Some(Instruction::ArrayGet {
                 source,
                 index: index_register,
                 dst: destination,
-            },
-            IrType::Buffer(_) => Instruction::BufferGet {
+            }),
+            IrType::Buffer(_) => Some(Instruction::BufferGet {
                 source,
                 index: index_register,
                 dst: destination,
-            },
-            IrType::String => Instruction::StringRuneAt {
+            }),
+            IrType::String => Some(Instruction::StringRuneAt {
                 source,
                 index: index_register,
                 dst: destination,
-            },
+            }),
             IrType::Map(_, _) => {
-                let ValueType::Named(result_type) = lower_type(self.package, result, span)? else {
-                    return Err(CompileError::type_mismatch(None, None, span));
-                };
-                Instruction::MapGet {
-                    source,
-                    key: index_register,
-                    result_type,
-                    dst: destination,
-                }
+                let value_type = lower_type(self.package, result, span)?;
+                let option = option_type(value_type);
+                let option_register = self.allocate(ValueType::Named(option.type_id))?;
+                self.push(
+                    Instruction::MapGet {
+                        source,
+                        key: index_register,
+                        result_type: option.type_id,
+                        dst: option_register,
+                    },
+                    span,
+                );
+                let some = option
+                    .variants
+                    .get(1)
+                    .ok_or_else(|| CompileError::type_mismatch(None, None, span))?
+                    .stable_id;
+                self.push(
+                    Instruction::EnumPayload {
+                        source: option_register,
+                        variant: some,
+                        dst: destination,
+                    },
+                    span,
+                );
+                None
             }
             _ => return Err(CompileError::type_mismatch(None, None, span)),
         };
-        self.push(instruction, span);
+        if let Some(instruction) = instruction {
+            self.push(instruction, span);
+        }
         Ok(())
     }
 
@@ -2463,28 +4279,105 @@ impl<'a> FunctionEmitter<'a> {
         &mut self,
         base: &TypedExpressionIr,
         fields: &[(DefinitionId, TypedExpressionIr)],
+        expected_kind: TypedAggregateKind,
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
-        self.emit_expression(base, destination)?;
-        for (field_definition, value) in fields {
-            let (owner, field) = self.layouts.fields.get(field_definition).ok_or_else(|| {
-                CompileError::unknown_name(self.definition_name(*field_definition), span)
-            })?;
-            if self.layouts.aggregates[owner].kind != TypedAggregateKind::Struct {
+        let IrType::Named(owner) = &base.ty else {
+            return Err(CompileError::type_mismatch(None, None, span));
+        };
+        let owner = *owner;
+        let layout = self
+            .layouts
+            .aggregates
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
+        if layout.kind != expected_kind {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        let mut overridden = BTreeSet::new();
+        for (field, _) in fields {
+            let Some((field_owner, _)) = self.layouts.fields.get(field) else {
+                return Err(CompileError::unknown_name(
+                    self.definition_name(*field),
+                    span,
+                ));
+            };
+            if *field_owner != owner || !overridden.insert(*field) {
                 return Err(CompileError::type_mismatch(None, None, span));
             }
-            let value_register = self.allocate_expression(value)?;
-            self.emit_expression(value, value_register)?;
-            self.push(
-                Instruction::StructWith {
-                    source: destination,
-                    field: field.stable_id,
-                    value: value_register,
-                    dst: destination,
-                },
-                self.span(&value.span)?,
-            );
+        }
+        match layout.kind {
+            TypedAggregateKind::Struct => {
+                self.emit_expression(base, destination)?;
+                for (field_definition, value) in fields {
+                    let (_, field) = &self.layouts.fields[field_definition];
+                    let value_register = self.allocate_expression(value)?;
+                    self.emit_expression(value, value_register)?;
+                    self.push(
+                        Instruction::StructWith {
+                            source: destination,
+                            field: field.stable_id,
+                            value: value_register,
+                            dst: destination,
+                        },
+                        self.span(&value.span)?,
+                    );
+                }
+            }
+            TypedAggregateKind::Class => {
+                // A class update is an explicit `new Class { ..base }`: it creates a fresh object
+                // rather than mutating or aliasing `base`.
+                let source = self.allocate_expression(base)?;
+                self.emit_expression(base, source)?;
+                let field_types = layout
+                    .fields
+                    .iter()
+                    .map(|field| field.ty)
+                    .collect::<Vec<_>>();
+                let fields_base = self.reserve_types(&field_types)?;
+                for (offset, field) in layout.fields.iter().enumerate() {
+                    let target = fields_base
+                        .checked_add(
+                            u16::try_from(offset)
+                                .map_err(|_| CompileError::too_many_registers(span))?,
+                        )
+                        .ok_or_else(|| CompileError::too_many_registers(span))?;
+                    self.push(
+                        Instruction::ClassGet {
+                            source,
+                            field: field.stable_id,
+                            dst: target,
+                        },
+                        span,
+                    );
+                }
+                for (field_definition, value) in fields {
+                    let offset = layout
+                        .fields
+                        .iter()
+                        .position(|field| field.definition == *field_definition)
+                        .ok_or_else(|| CompileError::type_mismatch(None, None, span))?;
+                    let target = fields_base
+                        .checked_add(
+                            u16::try_from(offset)
+                                .map_err(|_| CompileError::too_many_registers(span))?,
+                        )
+                        .ok_or_else(|| CompileError::too_many_registers(span))?;
+                    self.emit_expression(value, target)?;
+                }
+                self.push(
+                    Instruction::ClassNew {
+                        type_id: layout.type_id,
+                        fields_base,
+                        fields_count: u16::try_from(layout.fields.len())
+                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        dst: destination,
+                    },
+                    span,
+                );
+            }
         }
         Ok(())
     }
@@ -2547,6 +4440,7 @@ impl<'a> FunctionEmitter<'a> {
                 let condition = self.allocate(ValueType::Bool)?;
                 self.push(
                     equality_instruction(
+                        &pattern.ty,
                         lower_type(self.package, &pattern.ty, span)?,
                         condition,
                         source,
@@ -2630,7 +4524,7 @@ impl<'a> FunctionEmitter<'a> {
             },
             span,
         );
-        if payload_patterns.len() > 1 || payload_patterns.is_empty() != variant.payload.is_none() {
+        if payload_patterns.is_empty() != variant.payload.is_none() {
             return Err(CompileError::type_mismatch(None, None, span));
         }
         failures.push(self.push(
@@ -2640,21 +4534,42 @@ impl<'a> FunctionEmitter<'a> {
             },
             span,
         ));
-        if let Some(payload_pattern) = payload_patterns.first().copied() {
-            let payload = self.allocate(
-                variant
-                    .payload
-                    .ok_or_else(|| CompileError::type_mismatch(None, None, span))?,
-            )?;
-            self.push(
-                Instruction::EnumPayload {
-                    source,
-                    variant: variant.stable_id,
-                    dst: payload,
-                },
-                span,
-            );
+        let Some(payload_type) = variant.payload else {
+            return Ok(());
+        };
+        let payload = self.allocate(payload_type)?;
+        self.push(
+            Instruction::EnumPayload {
+                source,
+                variant: variant.stable_id,
+                dst: payload,
+            },
+            span,
+        );
+        if let [payload_pattern] = payload_patterns {
             self.emit_pattern_guard(payload, payload_pattern, failures, span)?;
+        } else if !payload_patterns.is_empty() {
+            let item_types = payload_patterns
+                .iter()
+                .map(|pattern| lower_type(self.package, &pattern.ty, span))
+                .collect::<Result<Vec<_>, _>>()?;
+            let expected_tuple = parameterized_type_id("Tuple", &item_types);
+            if payload_type != ValueType::Named(expected_tuple) {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+            for (index, (pattern, item_type)) in payload_patterns.iter().zip(item_types).enumerate()
+            {
+                let field_value = self.allocate(item_type)?;
+                self.push(
+                    Instruction::StructGet {
+                        source: payload,
+                        field: tuple_field_stable_id(expected_tuple, index),
+                        dst: field_value,
+                    },
+                    span,
+                );
+                self.emit_pattern_guard(field_value, pattern, failures, span)?;
+            }
         }
         Ok(())
     }
@@ -2821,11 +4736,11 @@ impl<'a> FunctionEmitter<'a> {
                 numeric.binary(operator, destination, lhs, rhs)
             }
             BinaryOperator::Equal => {
-                equality_instruction(ty, destination, lhs, rhs, self.layouts, span)?
+                equality_instruction(&left.ty, ty, destination, lhs, rhs, self.layouts, span)?
             }
             BinaryOperator::NotEqual => {
                 self.push(
-                    equality_instruction(ty, destination, lhs, rhs, self.layouts, span)?,
+                    equality_instruction(&left.ty, ty, destination, lhs, rhs, self.layouts, span)?,
                     span,
                 );
                 return self.invert_bool(destination, span);
@@ -2836,7 +4751,7 @@ impl<'a> FunctionEmitter<'a> {
             | BinaryOperator::GreaterEqual => {
                 let reverse = matches!(
                     operator,
-                    BinaryOperator::Greater | BinaryOperator::LessEqual
+                    BinaryOperator::Greater | BinaryOperator::GreaterEqual
                 );
                 let (comparison_lhs, comparison_rhs) =
                     if reverse { (rhs, lhs) } else { (lhs, rhs) };
@@ -2849,7 +4764,28 @@ impl<'a> FunctionEmitter<'a> {
                     operator,
                     BinaryOperator::LessEqual | BinaryOperator::GreaterEqual
                 ) {
-                    return self.invert_bool(destination, span);
+                    let compare_equal = self.push(
+                        Instruction::JumpIfFalse {
+                            condition: destination,
+                            target: 0,
+                        },
+                        span,
+                    );
+                    let finish = self.push(Instruction::Jump { target: 0 }, span);
+                    self.patch_target(compare_equal, self.position())?;
+                    self.push(
+                        equality_instruction(
+                            &left.ty,
+                            ty,
+                            destination,
+                            lhs,
+                            rhs,
+                            self.layouts,
+                            span,
+                        )?,
+                        span,
+                    );
+                    self.patch_target(finish, self.position())?;
                 }
                 return Ok(());
             }
@@ -3400,6 +5336,7 @@ fn validate_builtin_call_signature(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn typed_exact_root_maps(
     register_types: &[Option<ValueType>],
     parameter_count: usize,
@@ -3413,6 +5350,36 @@ fn typed_exact_root_maps(
     let mut entry = vec![false; register_count];
     for register in 0..parameter_count {
         entry[register] = register_types[register].is_some_and(ValueType::is_reference);
+    }
+
+    let mut successors = vec![Vec::new(); code.len()];
+    for (pc, instruction) in code.iter().copied().enumerate() {
+        match instruction {
+            Instruction::Jump { target } => {
+                successors[pc].push(usize::try_from(target).unwrap_or(usize::MAX));
+            }
+            Instruction::JumpIfFalse { target, .. } => {
+                successors[pc].push(usize::try_from(target).unwrap_or(usize::MAX));
+                if pc + 1 < code.len() {
+                    successors[pc].push(pc + 1);
+                }
+            }
+            Instruction::Return { .. }
+            | Instruction::ReturnVoid
+            | Instruction::CleanupReturn
+            | Instruction::Trap => {}
+            _ if pc + 1 < code.len() => successors[pc].push(pc + 1),
+            _ => {}
+        }
+        if successors[pc]
+            .iter()
+            .any(|successor| *successor >= code.len())
+        {
+            return Err(CompileError::verify(
+                "typed emitter produced an out-of-range control-flow target".into(),
+                span,
+            ));
+        }
     }
 
     let mut states = vec![None; code.len()];
@@ -3438,32 +5405,7 @@ fn typed_exact_root_maps(
             }
         }
 
-        let mut successors = Vec::with_capacity(2);
-        match code[pc] {
-            Instruction::Jump { target } => {
-                successors.push(usize::try_from(target).unwrap_or(usize::MAX));
-            }
-            Instruction::JumpIfFalse { target, .. } => {
-                successors.push(usize::try_from(target).unwrap_or(usize::MAX));
-                if pc + 1 < code.len() {
-                    successors.push(pc + 1);
-                }
-            }
-            Instruction::Return { .. }
-            | Instruction::ReturnVoid
-            | Instruction::CleanupReturn
-            | Instruction::Trap => {}
-            _ if pc + 1 < code.len() => successors.push(pc + 1),
-            _ => {}
-        }
-
-        for successor in successors {
-            if successor >= code.len() {
-                return Err(CompileError::verify(
-                    "typed emitter produced an out-of-range control-flow target".into(),
-                    span,
-                ));
-            }
+        for &successor in &successors[pc] {
             match &mut states[successor] {
                 None => {
                     states[successor] = Some(state.clone());
@@ -3485,6 +5427,58 @@ fn typed_exact_root_maps(
         }
     }
 
+    // Root maps describe values that are both definitely initialized on every
+    // path reaching the safepoint and actually live before its instruction.
+    // Definite initialization alone is intentionally insufficient: expression
+    // temporaries and locals after their final use must not retain heap objects
+    // across a suspension or allocation safepoint.
+    let mut live_before = vec![vec![false; register_count]; code.len()];
+    loop {
+        let mut changed = false;
+        for pc in (0..code.len()).rev() {
+            if states[pc].is_none() {
+                continue;
+            }
+            let mut live = vec![false; register_count];
+            for &successor in &successors[pc] {
+                if states[successor].is_some() {
+                    for (current, incoming) in
+                        live.iter_mut().zip(live_before[successor].iter().copied())
+                    {
+                        *current |= incoming;
+                    }
+                }
+            }
+            if let Some(destination) = typed_instruction_liveness_destination(code[pc]) {
+                let destination = usize::from(destination);
+                if destination >= register_count {
+                    return Err(CompileError::verify(
+                        "typed emitter produced an out-of-range destination register".into(),
+                        span,
+                    ));
+                }
+                live[destination] = false;
+            }
+            for source in typed_instruction_sources(code[pc]) {
+                let source = usize::from(source);
+                if source >= register_count {
+                    return Err(CompileError::verify(
+                        "typed emitter produced an out-of-range source register".into(),
+                        span,
+                    ));
+                }
+                live[source] = true;
+            }
+            if live_before[pc] != live {
+                live_before[pc] = live;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
     let root_bitmap = (0..register_count)
         .map(|register| {
             register_types[register].is_some_and(ValueType::is_reference)
@@ -3503,6 +5497,7 @@ fn typed_exact_root_maps(
                         .enumerate()
                         .map(|(register, initialized)| {
                             *initialized
+                                && live_before[pc_index][register]
                                 && register_types[register].is_some_and(ValueType::is_reference)
                         })
                         .collect()
@@ -3512,6 +5507,171 @@ fn typed_exact_root_maps(
         })
         .collect();
     Ok((root_bitmap, root_maps))
+}
+
+#[allow(clippy::too_many_lines)]
+fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
+    let range = |base: u16, count: u16| {
+        (0..count)
+            .map(|offset| base.saturating_add(offset))
+            .collect::<Vec<_>>()
+    };
+    match instruction {
+        Instruction::Move { source, .. }
+        | Instruction::StringLen { source, .. }
+        | Instruction::StringByteLen { source, .. }
+        | Instruction::StringHash { source, .. }
+        | Instruction::I32ToString { source, .. }
+        | Instruction::I64ToString { source, .. }
+        | Instruction::F32ToString { source, .. }
+        | Instruction::F64ToString { source, .. }
+        | Instruction::BoolToString { source, .. }
+        | Instruction::RuneToString { source, .. }
+        | Instruction::StringToString { source, .. }
+        | Instruction::EnumTag { source, .. }
+        | Instruction::EnumPayload { source, .. }
+        | Instruction::StructGet { source, .. }
+        | Instruction::ClassGet { source, .. }
+        | Instruction::ArrayLen { source, .. }
+        | Instruction::ArrayPop { source, .. }
+        | Instruction::ArrayClear { source }
+        | Instruction::MapLen { source, .. }
+        | Instruction::MapClear { source }
+        | Instruction::BufferLen { source, .. }
+        | Instruction::Return { source } => vec![source],
+        Instruction::Add { lhs, rhs, .. }
+        | Instruction::Sub { lhs, rhs, .. }
+        | Instruction::Mul { lhs, rhs, .. }
+        | Instruction::Div { lhs, rhs, .. }
+        | Instruction::RemI32 { lhs, rhs, .. }
+        | Instruction::AddI64 { lhs, rhs, .. }
+        | Instruction::SubI64 { lhs, rhs, .. }
+        | Instruction::MulI64 { lhs, rhs, .. }
+        | Instruction::DivI64 { lhs, rhs, .. }
+        | Instruction::RemI64 { lhs, rhs, .. }
+        | Instruction::AddF32 { lhs, rhs, .. }
+        | Instruction::SubF32 { lhs, rhs, .. }
+        | Instruction::MulF32 { lhs, rhs, .. }
+        | Instruction::DivF32 { lhs, rhs, .. }
+        | Instruction::RemF32 { lhs, rhs, .. }
+        | Instruction::AddF64 { lhs, rhs, .. }
+        | Instruction::SubF64 { lhs, rhs, .. }
+        | Instruction::MulF64 { lhs, rhs, .. }
+        | Instruction::DivF64 { lhs, rhs, .. }
+        | Instruction::RemF64 { lhs, rhs, .. }
+        | Instruction::StringEqual { lhs, rhs, .. }
+        | Instruction::StringConcat { lhs, rhs, .. }
+        | Instruction::CompareEq { lhs, rhs, .. }
+        | Instruction::CompareLtI32 { lhs, rhs, .. }
+        | Instruction::CompareLtI64 { lhs, rhs, .. }
+        | Instruction::CompareLtF32 { lhs, rhs, .. }
+        | Instruction::CompareLtF64 { lhs, rhs, .. }
+        | Instruction::EnumEqual { lhs, rhs, .. }
+        | Instruction::StructEqual { lhs, rhs, .. }
+        | Instruction::ClassEqual { lhs, rhs, .. }
+        | Instruction::StateHandleEqual { lhs, rhs, .. } => vec![lhs, rhs],
+        Instruction::StringRuneAt { source, index, .. }
+        | Instruction::ArrayGet { source, index, .. }
+        | Instruction::ArrayRemove { source, index, .. }
+        | Instruction::BufferGet { source, index, .. } => vec![source, index],
+        Instruction::StandardIntrinsic {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::Call {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::HostCall {
+            args_base,
+            args_count,
+            ..
+        }
+        | Instruction::DeferPush {
+            args_base,
+            args_count,
+            ..
+        } => range(args_base, args_count),
+        Instruction::JumpIfFalse { condition, .. } => vec![condition],
+        Instruction::StateNewSet { object, source, .. } => vec![object, source],
+        Instruction::StateReplace { target, .. } => vec![target],
+        Instruction::EnumNew { payload, .. } => payload.into_iter().collect(),
+        Instruction::StructNew {
+            fields_base,
+            fields_count,
+            ..
+        }
+        | Instruction::ClassNew {
+            fields_base,
+            fields_count,
+            ..
+        } => range(fields_base, fields_count),
+        Instruction::StructWith { source, value, .. }
+        | Instruction::ClassSet { source, value, .. }
+        | Instruction::ArrayPush { source, value } => vec![source, value],
+        Instruction::ArraySet {
+            source,
+            index,
+            value,
+        }
+        | Instruction::ArrayInsert {
+            source,
+            index,
+            value,
+        }
+        | Instruction::BufferSet {
+            source,
+            index,
+            value,
+        } => vec![source, index, value],
+        Instruction::MapGet { source, key, .. }
+        | Instruction::MapRemove { source, key, .. }
+        | Instruction::MapContains { source, key, .. } => vec![source, key],
+        Instruction::MapSet { source, key, value } => vec![source, key, value],
+        Instruction::BufferSlice {
+            source,
+            start,
+            length,
+            ..
+        } => vec![source, start, length],
+        Instruction::BufferCopy {
+            destination,
+            source,
+            source_start,
+            destination_start,
+            length,
+        } => vec![destination, source, source_start, destination_start, length],
+        Instruction::StateOldFieldGet { object, .. } => vec![object],
+        Instruction::StateHandleResolve { handle, .. }
+        | Instruction::StateHandleIsAlive { handle, .. }
+        | Instruction::StateHandleStableId { handle, .. }
+        | Instruction::StateHandleGeneration { handle, .. }
+        | Instruction::StateHandleHash { handle, .. } => vec![handle],
+        Instruction::LoadI32 { .. }
+        | Instruction::LoadBool { .. }
+        | Instruction::LoadI64 { .. }
+        | Instruction::LoadF32 { .. }
+        | Instruction::LoadF64 { .. }
+        | Instruction::LoadRune { .. }
+        | Instruction::LoadString { .. }
+        | Instruction::Jump { .. }
+        | Instruction::StateOldGet { .. }
+        | Instruction::StateCurrentGet { .. }
+        | Instruction::StateNewCreate { .. }
+        | Instruction::StatePreserve { .. }
+        | Instruction::StateDelete { .. }
+        | Instruction::ArrayNew { .. }
+        | Instruction::MapNew { .. }
+        | Instruction::StateFinish
+        | Instruction::DeferPop
+        | Instruction::CleanupReturn
+        | Instruction::ReturnVoid
+        | Instruction::Safepoint
+        | Instruction::Yield
+        | Instruction::Trap => Vec::new(),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -3571,6 +5731,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::EnumNew { dst, .. }
         | Instruction::EnumTag { dst, .. }
         | Instruction::EnumPayload { dst, .. }
+        | Instruction::EnumEqual { dst, .. }
         | Instruction::StructNew { dst, .. }
         | Instruction::StructGet { dst, .. }
         | Instruction::StructWith { dst, .. }
@@ -3592,6 +5753,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::BufferGet { dst, .. }
         | Instruction::BufferSlice { dst, .. }
         | Instruction::StateOldFieldGet { dst, .. }
+        | Instruction::StateCurrentGet { dst, .. }
         | Instruction::StateHandleResolve { dst, .. }
         | Instruction::StateHandleIsAlive { dst, .. }
         | Instruction::StateHandleStableId { dst, .. }
@@ -3622,6 +5784,17 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::Safepoint
         | Instruction::Yield
         | Instruction::Trap => None,
+    }
+}
+
+fn typed_instruction_liveness_destination(instruction: Instruction) -> Option<u16> {
+    // Typed emission allocates a fresh destination for every call expression.
+    // Keeping it live before the call is therefore filtered by definite
+    // initialization, while also matching void calls, whose encoded `dst` is
+    // not written at all.
+    match instruction {
+        Instruction::Call { .. } | Instruction::HostCall { .. } => None,
+        _ => typed_instruction_destination(instruction),
     }
 }
 
@@ -3710,9 +5883,7 @@ fn emit_typed_type_metadata(
             let span = source_span(&definition.span, files)?;
             let type_id = named_type_id(package, definition.id, span)?;
             match layout {
-                TypedTypeLayoutIr::Struct { fields }
-                | TypedTypeLayoutIr::Class { fields }
-                | TypedTypeLayoutIr::Stateful { fields } => {
+                TypedTypeLayoutIr::Struct { fields } | TypedTypeLayoutIr::Class { fields, .. } => {
                     let kind = if matches!(layout, TypedTypeLayoutIr::Struct { .. }) {
                         TypedAggregateKind::Struct
                     } else {
@@ -3734,6 +5905,12 @@ fn emit_typed_type_metadata(
                     let fields = fields
                         .into_iter()
                         .map(|field| {
+                            if kind == TypedAggregateKind::Struct && field.mutable {
+                                return Err(CompileError::unknown_type(
+                                    "Struct fields cannot carry Class field mutability".into(),
+                                    span,
+                                ));
+                            }
                             let definition = package
                                 .definition(field.definition)
                                 .expect("TypedPackageIr validates field layout IDs");
@@ -3743,6 +5920,7 @@ fn emit_typed_type_metadata(
                                 definition: field.definition,
                                 stable_id: stable_id.0,
                                 ty: lower_type(package, &field.ty, field_span)?,
+                                mutable: field.mutable,
                             })
                         })
                         .collect::<Result<Vec<_>, CompileError>>()?;
@@ -3897,6 +6075,7 @@ fn emit_typed_type_metadata(
                                 &field.ty,
                                 external_span(field.source.as_ref()),
                             )?,
+                            mutable: false,
                         };
                         bytecode_fields.push(BytecodeStructField {
                             stable_id: field_layout.stable_id,
@@ -4051,6 +6230,9 @@ fn emit_typed_type_metadata(
     for value in generics.state_handles.into_values() {
         builder.state_handle_type(value);
     }
+    for value in generics.resource_tokens.into_values() {
+        builder.resource_token_type(value);
+    }
     Ok(context)
 }
 
@@ -4094,6 +6276,7 @@ struct GenericTypeMetadata {
     buffers: BTreeMap<StableId, BufferType>,
     snapshots: BTreeMap<StableId, SnapshotType>,
     state_handles: BTreeMap<StableId, StateHandleType>,
+    resource_tokens: BTreeMap<StableId, ResourceTokenType>,
 }
 
 fn collect_ir_type_metadata(
@@ -4157,10 +6340,16 @@ fn collect_ir_type_metadata(
             let error = nexa_bytecode::state_handle_error_type();
             metadata.enums.insert(error.type_id, error);
         }
-        IrType::HostRequest(value) | IrType::ResourceToken(value) => {
-            if let Some(value) = value {
-                collect_ir_type_metadata(package, value, span, metadata)?;
-            }
+        IrType::HostRequest(_) => {
+            return Err(CompileError::unknown_type(
+                "HostRequest is an internal awaitable and cannot appear in Typed IR".into(),
+                span,
+            ));
+        }
+        IrType::ResourceToken(value) => {
+            let content_type = resource_token_content_id(package, value.as_deref(), span)?;
+            let token = ResourceTokenType::new(content_type);
+            metadata.resource_tokens.insert(token.type_id, token);
         }
         IrType::Named(definition)
             if compiler_builtin_type(package, *definition) == Some("StateHandleError") =>
@@ -4205,7 +6394,7 @@ fn collect_tuple_type_metadata(
         .into_iter()
         .enumerate()
         .map(|(index, ty)| BytecodeStructField {
-            stable_id: StableId::from_name(&format!("nexa.tuple.{:016x}.field.{index}", type_id.0)),
+            stable_id: tuple_field_stable_id(type_id, index),
             ty,
         })
         .collect();
@@ -4213,6 +6402,10 @@ fn collect_tuple_type_metadata(
         .structs
         .insert(type_id, StructType { type_id, fields });
     Ok(())
+}
+
+fn tuple_field_stable_id(type_id: StableId, index: usize) -> StableId {
+    StableId::from_name(&format!("nexa.tuple.{:016x}.field.{index}", type_id.0))
 }
 
 fn collect_block_type_metadata(
@@ -4264,7 +6457,9 @@ fn collect_block_type_metadata(
                     collect_expression_type_metadata(package, capture, span, metadata)?;
                 }
             }
-            TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield => {}
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
         }
     }
     if let Some(tail) = &block.tail {
@@ -4281,12 +6476,19 @@ fn collect_place_type_metadata(
 ) -> Result<(), CompileError> {
     match place {
         TypedPlaceIr::Definition(_) => Ok(()),
-        TypedPlaceIr::Field { base, .. } | TypedPlaceIr::StateField { base, .. } => {
+        TypedPlaceIr::Field { base, .. } => {
+            collect_place_type_metadata(package, base, span, metadata)
+        }
+        TypedPlaceIr::ClassField { object: base, .. } | TypedPlaceIr::StateField { base, .. } => {
             collect_expression_type_metadata(package, base, span, metadata)
         }
         TypedPlaceIr::Index { base, index } => {
             collect_expression_type_metadata(package, base, span, metadata)?;
-            collect_expression_type_metadata(package, index, span, metadata)
+            collect_expression_type_metadata(package, index, span, metadata)?;
+            if let IrType::Map(_, value) = &base.ty {
+                collect_ir_type_metadata(package, &IrType::Option(value.clone()), span, metadata)?;
+            }
+            Ok(())
         }
     }
 }
@@ -4301,6 +6503,7 @@ fn collect_expression_type_metadata(
     match &expression.kind {
         TypedExpressionKind::Literal(_)
         | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
         | TypedExpressionKind::Yield => {}
         TypedExpressionKind::Unary { operand, .. }
         | TypedExpressionKind::Await(operand)
@@ -4309,13 +6512,16 @@ fn collect_expression_type_metadata(
         | TypedExpressionKind::StateField { base: operand, .. } => {
             collect_expression_type_metadata(package, operand, span, metadata)?;
         }
-        TypedExpressionKind::Binary { left, right, .. }
-        | TypedExpressionKind::Index {
-            base: left,
-            index: right,
-        } => {
+        TypedExpressionKind::Binary { left, right, .. } => {
             collect_expression_type_metadata(package, left, span, metadata)?;
             collect_expression_type_metadata(package, right, span, metadata)?;
+        }
+        TypedExpressionKind::Index { base, index } => {
+            collect_expression_type_metadata(package, base, span, metadata)?;
+            collect_expression_type_metadata(package, index, span, metadata)?;
+            if let IrType::Map(_, value) = &base.ty {
+                collect_ir_type_metadata(package, &IrType::Option(value.clone()), span, metadata)?;
+            }
         }
         TypedExpressionKind::Call { arguments, .. }
         | TypedExpressionKind::HostCall { arguments, .. }
@@ -4347,6 +6553,14 @@ fn collect_expression_type_metadata(
         | TypedExpressionKind::Update { fields, .. } => {
             if let TypedExpressionKind::Update { base, .. } = &expression.kind {
                 collect_expression_type_metadata(package, base, span, metadata)?;
+            }
+            for (_, value) in fields {
+                collect_expression_type_metadata(package, value, span, metadata)?;
+            }
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            if let Some(update) = update {
+                collect_expression_type_metadata(package, update, span, metadata)?;
             }
             for (_, value) in fields {
                 collect_expression_type_metadata(package, value, span, metadata)?;
@@ -4447,7 +6661,7 @@ fn typed_state_schema(
                 .definition(state.definition)
                 .expect("TypedPackageIr validates state IDs");
             let span = source_span(&definition.span, files)?;
-            let mut fields = state
+            let fields = state
                 .fields
                 .iter()
                 .map(|field| {
@@ -4470,7 +6684,6 @@ fn typed_state_schema(
                     })
                 })
                 .collect::<Result<Vec<_>, CompileError>>()?;
-            fields.sort_by_key(|field| field.stable_id);
             if definition
                 .stable_symbol
                 .as_ref()
@@ -4546,7 +6759,13 @@ fn validate_standard_signature_type(
                 validate_standard_signature_type(value, type_parameter_count, span)?;
             }
         }
-        IrType::HostRequest(value) | IrType::ResourceToken(value) => {
+        IrType::HostRequest(_) => {
+            return Err(CompileError::unknown_type(
+                "HostRequest is not a standard-library signature type".into(),
+                span,
+            ));
+        }
+        IrType::ResourceToken(value) => {
             if let Some(value) = value {
                 validate_standard_signature_type(value, type_parameter_count, span)?;
             }
@@ -4613,8 +6832,11 @@ fn instantiate_standard_type(
         IrType::Tuple(values) => {
             IrType::Tuple(values.iter().map(instantiate).collect::<Result<_, _>>()?)
         }
-        IrType::HostRequest(value) => {
-            IrType::HostRequest(value.as_deref().map(instantiate).transpose()?.map(Box::new))
+        IrType::HostRequest(_) => {
+            return Err(CompileError::unknown_type(
+                "HostRequest cannot be instantiated as a source-visible type".into(),
+                span,
+            ));
         }
         IrType::ResourceToken(value) => {
             IrType::ResourceToken(value.as_deref().map(instantiate).transpose()?.map(Box::new))
@@ -4795,38 +7017,43 @@ fn validate_concrete_standard_lowering(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn emit_typed_host_imports(
     package: &TypedPackageIr,
+    referenced_functions: &BTreeSet<DefinitionId>,
     builder: &mut ModuleBuilder,
 ) -> Result<(BTreeMap<DefinitionId, u32>, Option<StableId>), CompileError> {
     let mut hosts = package.metadata().host_bindings.iter();
     let host = hosts.next();
     if hosts.next().is_some() {
         return Err(CompileError::unknown_name(
-            "one bytecode module cannot contain multiple host-interface identities".into(),
+            "one bytecode module cannot contain multiple Host Contract identities".into(),
             SourceSpan::default(),
         ));
     }
-    let interface_hash = host.map(|host| host.interface_stable_id);
+    let host_contract_id = host.map(|host| host.contract_stable_id);
     let mut bindings = host
         .into_iter()
         .flat_map(|host| host.functions.iter())
+        .filter(|binding| referenced_functions.contains(&binding.definition))
         .collect::<Vec<_>>();
-    bindings.sort_by_key(|function| function.import_index);
+    // NIDL declaration order is not ABI data. These are deterministic module-local slots only:
+    // Runtime resolves each slot through `HostImport::stable_id`, so a referenced subset must
+    // never be interpreted as dense ordinals into the complete generated Contract registry.
+    bindings.sort_by(|left, right| {
+        let left_name = package
+            .definition(left.definition)
+            .map_or("", |definition| definition.name.as_str());
+        let right_name = package
+            .definition(right.definition)
+            .map_or("", |definition| definition.name.as_str());
+        (left.stable_id.0, left_name).cmp(&(right.stable_id.0, right_name))
+    });
     let mut function_imports = BTreeMap::new();
     for (expected, binding) in bindings.into_iter().enumerate() {
         let expected = u32::try_from(expected)
             .map_err(|_| CompileError::too_many_registers(SourceSpan::default()))?;
         let span = external_span(binding.source.as_ref());
-        if binding.import_index != expected {
-            return Err(CompileError::unknown_name(
-                format!(
-                    "typed host imports must be dense: expected {expected}, found {}",
-                    binding.import_index
-                ),
-                span,
-            ));
-        }
         let parameters = binding
             .parameters
             .iter()
@@ -4868,6 +7095,8 @@ fn emit_typed_host_imports(
         };
         let actual = builder.host_import(HostImport {
             stable_id: binding.stable_id,
+            declaration_fingerprint: binding.declaration_fingerprint,
+            capabilities: binding.required_capabilities.clone(),
             parameters,
             result,
             mode,
@@ -4889,7 +7118,21 @@ fn emit_typed_host_imports(
             ));
         }
     }
-    Ok((function_imports, interface_hash))
+    if function_imports.len() != referenced_functions.len() {
+        let missing = referenced_functions
+            .iter()
+            .find(|definition| !function_imports.contains_key(definition))
+            .copied()
+            .expect("host import count mismatch guarantees a missing referenced function");
+        return Err(CompileError::unknown_name(
+            package.definition(missing).map_or_else(
+                || format!("host definition#{}", missing.0),
+                |definition| definition.name.clone(),
+            ),
+            SourceSpan::default(),
+        ));
+    }
+    Ok((function_imports, host_contract_id))
 }
 
 fn checked_async_result(
@@ -4924,6 +7167,7 @@ fn emit_typed_exports(
     function_indices: &BTreeMap<DefinitionId, u32>,
     function_plans: &[TypedFunctionPlan<'_>],
     files: &BTreeMap<SourceKey, FileId>,
+    standalone_main: Option<StandaloneMainExport>,
     builder: &mut ModuleBuilder,
 ) -> Result<(), CompileError> {
     let functions = function_plans
@@ -4931,7 +7175,9 @@ fn emit_typed_exports(
         .map(|plan| (plan.definition.id, plan))
         .collect::<BTreeMap<_, _>>();
     let mut exports = package.metadata().exports.iter().collect::<Vec<_>>();
-    exports.sort_by(|left, right| left.name.cmp(&right.name));
+    exports.sort_by(|left, right| {
+        (left.stable_id.0, left.name.as_str()).cmp(&(right.stable_id.0, right.name.as_str()))
+    });
     for export in exports {
         let plan = functions.get(&export.function).copied().ok_or_else(|| {
             CompileError::unknown_name(
@@ -4962,6 +7208,89 @@ fn emit_typed_exports(
             stable_id: export.stable_id,
             function: function_indices[&export.function],
             signature: analyzed_signature,
+            effect: lower_effect(export.effect),
+        });
+    }
+    if let Some(main) = standalone_main {
+        let stable_id = standalone_main_stable_id();
+        if package
+            .metadata()
+            .exports
+            .iter()
+            .any(|export| export.stable_id == stable_id)
+        {
+            return Err(CompileError::invalid_main_signature(
+                "standalone main export identity collides with a contract entrypoint",
+                main.definition_span,
+            ));
+        }
+        builder.script_export(ScriptExport {
+            stable_id,
+            function: main.function_index,
+            signature: standalone_main_signature(),
+            effect: FunctionEffect::Task,
+        });
+    }
+    Ok(())
+}
+
+fn emit_typed_test_exports(
+    package: &TypedPackageIr,
+    function_indices: &BTreeMap<DefinitionId, u32>,
+    function_plans: &[TypedFunctionPlan<'_>],
+    files: &BTreeMap<SourceKey, FileId>,
+    builder: &mut ModuleBuilder,
+) -> Result<(), CompileError> {
+    if package.compilation_kind() != IrCompilationKind::Test {
+        return Ok(());
+    }
+    let functions = function_plans
+        .iter()
+        .map(|plan| (plan.definition.id, plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut occupied = package
+        .metadata()
+        .exports
+        .iter()
+        .map(|export| export.stable_id)
+        .collect::<BTreeSet<_>>();
+    let mut tests = package.metadata().tests.iter().collect::<Vec<_>>();
+    tests.sort_by(|left, right| {
+        (left.module.as_str(), left.name.as_str(), left.function.0).cmp(&(
+            right.module.as_str(),
+            right.name.as_str(),
+            right.function.0,
+        ))
+    });
+    for test in tests {
+        let plan = functions.get(&test.function).copied().ok_or_else(|| {
+            CompileError::unknown_name(
+                format!("test `{}` does not target an emitted function", test.name),
+                source_span(&test.span, files).unwrap_or_default(),
+            )
+        })?;
+        if !plan.function.parameters.is_empty()
+            || plan.function.return_type != IrType::Bool
+            || plan.function.effect != IrEffect::Immediate
+        {
+            continue;
+        }
+        let span = source_span(&test.span, files)?;
+        let (identity, stable_id) = stable_symbol(plan.definition, span)?;
+        if identity.kind() != nexa_core::SymbolKind::Test {
+            return Err(CompileError::type_mismatch(None, None, span));
+        }
+        if !occupied.insert(stable_id.0) {
+            return Err(CompileError::duplicate_name(test.name.clone(), span, span));
+        }
+        builder.script_export(ScriptExport {
+            stable_id: stable_id.0,
+            function: function_indices[&test.function],
+            signature: Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::Bool),
+            },
+            effect: FunctionEffect::Immediate,
         });
     }
     Ok(())
@@ -5005,12 +7334,13 @@ fn lower_type(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(ValueType::Named(parameterized_type_id("Tuple", &items)))
         }
-        IrType::HostRequest(value) => {
-            lower_optional_named_type(package, "HostRequest", value.as_deref(), span)
-        }
-        // Resource domains are retained in typed IR for static checking, but the bytecode/IDL
-        // boundary uses one opaque ResourceToken runtime representation for every domain.
-        IrType::ResourceToken(_) => Ok(ValueType::Named(StableId::from_name("ResourceToken"))),
+        IrType::HostRequest(_) => Err(CompileError::unknown_type(
+            "HostRequest is an internal awaitable and has no bytecode value type".into(),
+            span,
+        )),
+        IrType::ResourceToken(content) => Ok(ValueType::Named(resource_token_type(
+            resource_token_content_id(package, content.as_deref(), span)?,
+        ))),
         IrType::Snapshot(content) => {
             let content = lower_type(package, content, span)?;
             let content_type = match content {
@@ -5030,6 +7360,20 @@ fn lower_type(
             span,
         )),
     }
+}
+
+fn resource_token_content_id(
+    package: &TypedPackageIr,
+    content: Option<&IrType>,
+    span: SourceSpan,
+) -> Result<StableId, CompileError> {
+    let Some(IrType::Named(definition)) = content else {
+        return Err(CompileError::unknown_type(
+            "ResourceToken requires one concrete nominal content type".into(),
+            span,
+        ));
+    };
+    named_type_id(package, *definition, span)
 }
 
 fn named_type_id(
@@ -5071,19 +7415,6 @@ fn compiler_builtin_type(package: &TypedPackageIr, definition: DefinitionId) -> 
         .then_some(definition.name.as_str())
 }
 
-fn lower_optional_named_type(
-    package: &TypedPackageIr,
-    name: &str,
-    value: Option<&IrType>,
-    span: SourceSpan,
-) -> Result<ValueType, CompileError> {
-    Ok(ValueType::Named(if let Some(value) = value {
-        parameterized_type_id(name, &[lower_type(package, value, span)?])
-    } else {
-        StableId::from_name(name)
-    }))
-}
-
 fn builtin_variant_layout(
     package: &TypedPackageIr,
     variant: BuiltinVariantIr,
@@ -5122,6 +7453,7 @@ fn builtin_variant_layout(
 }
 
 fn equality_instruction(
+    ir_ty: &IrType,
     ty: ValueType,
     dst: u16,
     lhs: u16,
@@ -5129,24 +7461,37 @@ fn equality_instruction(
     layouts: &TypedLayoutContext,
     span: SourceSpan,
 ) -> Result<Instruction, CompileError> {
-    match ty {
-        ValueType::I32
-        | ValueType::I64
-        | ValueType::F32
-        | ValueType::F64
-        | ValueType::Bool
-        | ValueType::Rune => Ok(Instruction::CompareEq { dst, lhs, rhs }),
-        ValueType::String => Ok(Instruction::StringEqual { dst, lhs, rhs }),
-        ValueType::Named(type_id) => layouts
-            .aggregates
-            .values()
-            .find(|layout| layout.type_id == type_id)
-            .map(|layout| match layout.kind {
-                TypedAggregateKind::Struct => Instruction::StructEqual { dst, lhs, rhs },
-                TypedAggregateKind::Class => Instruction::ClassEqual { dst, lhs, rhs },
-            })
-            .ok_or_else(|| CompileError::type_mismatch(None, Some(ty), span)),
-        ValueType::Ref => Err(CompileError::type_mismatch(None, Some(ty), span)),
+    match ir_ty {
+        IrType::Unit
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::Bool
+        | IrType::Rune => Ok(Instruction::CompareEq { dst, lhs, rhs }),
+        IrType::String => Ok(Instruction::StringEqual { dst, lhs, rhs }),
+        IrType::Tuple(_) => Ok(Instruction::StructEqual { dst, lhs, rhs }),
+        IrType::Option(_) | IrType::Result(_, _) => Ok(Instruction::EnumEqual { dst, lhs, rhs }),
+        IrType::Named(definition) => {
+            if let Some(layout) = layouts.aggregates.get(definition) {
+                return Ok(match layout.kind {
+                    TypedAggregateKind::Struct => Instruction::StructEqual { dst, lhs, rhs },
+                    TypedAggregateKind::Class => Instruction::ClassEqual { dst, lhs, rhs },
+                });
+            }
+            if layouts.enums.contains_key(definition) {
+                return Ok(Instruction::EnumEqual { dst, lhs, rhs });
+            }
+            Err(CompileError::type_mismatch(None, Some(ty), span))
+        }
+        IrType::Array(_)
+        | IrType::Map(_, _)
+        | IrType::HostRequest(_)
+        | IrType::ResourceToken(_)
+        | IrType::Snapshot(_)
+        | IrType::Buffer(_)
+        | IrType::StateHandle(_)
+        | IrType::TypeParameter(_) => Err(CompileError::type_mismatch(None, Some(ty), span)),
     }
 }
 
@@ -5188,148 +7533,171 @@ fn collect_type_strings(
     }
 }
 
-fn collect_block_strings(block: &TypedBlockIr, strings: &mut BTreeSet<String>) {
+fn collect_block_codegen_inputs(block: &TypedBlockIr, inputs: &mut CodegenInputs) {
     for statement in &block.statements {
         match statement {
             TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
                 if let Some(value) = value {
-                    collect_expression_strings(value, strings);
+                    collect_expression_codegen_inputs(value, inputs);
                 }
             }
             TypedStatementIr::Assign { target, value } => {
-                collect_place_strings(target, strings);
-                collect_expression_strings(value, strings);
+                collect_place_codegen_inputs(target, inputs);
+                collect_expression_codegen_inputs(value, inputs);
             }
-            TypedStatementIr::Expression(value) => collect_expression_strings(value, strings),
+            TypedStatementIr::Expression(value) => {
+                collect_expression_codegen_inputs(value, inputs);
+            }
             TypedStatementIr::If {
                 condition,
                 then_block,
                 else_block,
             } => {
-                collect_expression_strings(condition, strings);
-                collect_block_strings(then_block, strings);
+                collect_expression_codegen_inputs(condition, inputs);
+                collect_block_codegen_inputs(then_block, inputs);
                 if let Some(else_block) = else_block {
-                    collect_block_strings(else_block, strings);
+                    collect_block_codegen_inputs(else_block, inputs);
                 }
             }
             TypedStatementIr::While {
                 condition, body, ..
             } => {
-                collect_expression_strings(condition, strings);
-                collect_block_strings(body, strings);
+                collect_expression_codegen_inputs(condition, inputs);
+                collect_block_codegen_inputs(body, inputs);
             }
             TypedStatementIr::StaticRangeFor {
                 start, end, body, ..
             } => {
-                collect_expression_strings(start, strings);
-                collect_expression_strings(end, strings);
-                collect_block_strings(body, strings);
+                collect_expression_codegen_inputs(start, inputs);
+                collect_expression_codegen_inputs(end, inputs);
+                collect_block_codegen_inputs(body, inputs);
             }
             TypedStatementIr::Defer { captures, .. } => {
                 for capture in captures {
-                    collect_expression_strings(capture, strings);
+                    collect_expression_codegen_inputs(capture, inputs);
                 }
             }
-            TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield => {}
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
         }
     }
     if let Some(tail) = &block.tail {
-        collect_expression_strings(tail, strings);
+        collect_expression_codegen_inputs(tail, inputs);
     }
 }
 
-fn collect_place_strings(place: &TypedPlaceIr, strings: &mut BTreeSet<String>) {
+fn collect_place_codegen_inputs(place: &TypedPlaceIr, inputs: &mut CodegenInputs) {
     match place {
         TypedPlaceIr::Definition(_) => {}
-        TypedPlaceIr::Field { base, .. } | TypedPlaceIr::StateField { base, .. } => {
-            collect_expression_strings(base, strings);
+        TypedPlaceIr::Field { base, .. } => collect_place_codegen_inputs(base, inputs),
+        TypedPlaceIr::ClassField { object: base, .. } | TypedPlaceIr::StateField { base, .. } => {
+            collect_expression_codegen_inputs(base, inputs);
         }
         TypedPlaceIr::Index { base, index } => {
-            collect_expression_strings(base, strings);
-            collect_expression_strings(index, strings);
+            collect_expression_codegen_inputs(base, inputs);
+            collect_expression_codegen_inputs(index, inputs);
         }
     }
 }
 
-fn collect_expression_strings(expression: &TypedExpressionIr, strings: &mut BTreeSet<String>) {
+fn collect_expression_codegen_inputs(expression: &TypedExpressionIr, inputs: &mut CodegenInputs) {
     match &expression.kind {
         TypedExpressionKind::Literal(IrLiteral::String(value)) => {
-            strings.insert(value.clone());
+            inputs.strings.insert(value.clone());
         }
         TypedExpressionKind::Unary { operand, .. }
         | TypedExpressionKind::Await(operand)
         | TypedExpressionKind::Field { base: operand, .. }
         | TypedExpressionKind::StateField { base: operand, .. } => {
-            collect_expression_strings(operand, strings);
+            collect_expression_codegen_inputs(operand, inputs);
         }
         TypedExpressionKind::Binary { left, right, .. }
         | TypedExpressionKind::Index {
             base: left,
             index: right,
         } => {
-            collect_expression_strings(left, strings);
-            collect_expression_strings(right, strings);
+            collect_expression_codegen_inputs(left, inputs);
+            collect_expression_codegen_inputs(right, inputs);
         }
         TypedExpressionKind::Call { arguments, .. }
         | TypedExpressionKind::StandardCall { arguments, .. }
         | TypedExpressionKind::BuiltinCall { arguments, .. }
-        | TypedExpressionKind::HostCall { arguments, .. }
         | TypedExpressionKind::Array(arguments)
         | TypedExpressionKind::Tuple(arguments) => {
             for argument in arguments {
-                collect_expression_strings(argument, strings);
+                collect_expression_codegen_inputs(argument, inputs);
+            }
+        }
+        TypedExpressionKind::HostCall {
+            function,
+            arguments,
+            ..
+        } => {
+            inputs.host_functions.insert(*function);
+            for argument in arguments {
+                collect_expression_codegen_inputs(argument, inputs);
             }
         }
         TypedExpressionKind::Construct { fields, .. } => {
             for (_, value) in fields {
-                collect_expression_strings(value, strings);
+                collect_expression_codegen_inputs(value, inputs);
+            }
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            if let Some(update) = update {
+                collect_expression_codegen_inputs(update, inputs);
+            }
+            for (_, value) in fields {
+                collect_expression_codegen_inputs(value, inputs);
             }
         }
         TypedExpressionKind::EnumConstruct { payload, .. }
         | TypedExpressionKind::BuiltinVariant { payload, .. } => {
             if let Some(payload) = payload {
-                collect_expression_strings(payload, strings);
+                collect_expression_codegen_inputs(payload, inputs);
             }
         }
         TypedExpressionKind::StringInterpolation(parts) => {
-            strings.insert(String::new());
+            inputs.strings.insert(String::new());
             for part in parts {
-                collect_expression_strings(part, strings);
+                collect_expression_codegen_inputs(part, inputs);
             }
         }
         TypedExpressionKind::Match { value, arms } => {
-            collect_expression_strings(value, strings);
+            collect_expression_codegen_inputs(value, inputs);
             for arm in arms {
-                collect_expression_strings(&arm.value, strings);
+                collect_expression_codegen_inputs(&arm.value, inputs);
             }
         }
-        TypedExpressionKind::Try(value) => collect_expression_strings(value, strings),
+        TypedExpressionKind::Try(value) => collect_expression_codegen_inputs(value, inputs),
         TypedExpressionKind::Update { base, fields } => {
-            collect_expression_strings(base, strings);
+            collect_expression_codegen_inputs(base, inputs);
             for (_, value) in fields {
-                collect_expression_strings(value, strings);
+                collect_expression_codegen_inputs(value, inputs);
             }
         }
         TypedExpressionKind::Migration(intrinsic) => {
-            collect_migration_strings(intrinsic, strings);
+            collect_migration_codegen_inputs(intrinsic, inputs);
         }
         TypedExpressionKind::Literal(_)
         | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
         | TypedExpressionKind::Yield => {}
     }
 }
 
-fn collect_migration_strings(intrinsic: &MigrationIntrinsicIr, strings: &mut BTreeSet<String>) {
+fn collect_migration_codegen_inputs(intrinsic: &MigrationIntrinsicIr, inputs: &mut CodegenInputs) {
     match intrinsic {
         MigrationIntrinsicIr::OldFieldGet { object, .. } => {
-            collect_expression_strings(object, strings);
+            collect_expression_codegen_inputs(object, inputs);
         }
         MigrationIntrinsicIr::NewSet { object, value, .. } => {
-            collect_expression_strings(object, strings);
-            collect_expression_strings(value, strings);
+            collect_expression_codegen_inputs(object, inputs);
+            collect_expression_codegen_inputs(value, inputs);
         }
         MigrationIntrinsicIr::Replace { target, .. } => {
-            collect_expression_strings(target, strings);
+            collect_expression_codegen_inputs(target, inputs);
         }
         MigrationIntrinsicIr::OldGet { .. }
         | MigrationIntrinsicIr::NewCreate { .. }
@@ -5343,19 +7711,25 @@ fn stable_symbol(
     definition: &Definition,
     span: SourceSpan,
 ) -> Result<(&CanonicalSymbolIdentity, StableSymbolId), CompileError> {
-    definition
-        .stable_symbol
-        .as_ref()
-        .map(|symbol| (&symbol.canonical, symbol.runtime_id))
-        .ok_or_else(|| {
-            CompileError::unknown_name(
-                format!(
-                    "typed definition `{}` has no analysis-assigned stable identity",
-                    definition.name
-                ),
-                span,
-            )
-        })
+    let symbol = definition.stable_symbol.as_ref().ok_or_else(|| {
+        CompileError::unknown_name(
+            format!(
+                "typed definition `{}` has no analysis-assigned stable identity",
+                definition.name
+            ),
+            span,
+        )
+    })?;
+    if symbol.runtime_id != symbol.canonical.runtime_id() {
+        return Err(CompileError::unknown_name(
+            format!(
+                "typed definition `{}` has a forged stable runtime identity",
+                definition.name
+            ),
+            span,
+        ));
+    }
+    Ok((&symbol.canonical, symbol.runtime_id))
 }
 
 fn package_visibility(visibility: DeclarationVisibility) -> PackageVisibility {
@@ -5372,27 +7746,33 @@ fn typed_debug_info(
     functions: &[TypedFunctionPlan<'_>],
     files: &BTreeMap<SourceKey, FileId>,
     entry_module: &str,
+    standalone_main: Option<StandaloneMainExport>,
+    host_import_indices: &BTreeMap<DefinitionId, u32>,
 ) -> Result<PackageDebugInfo, CompileError> {
-    let function_by_module = functions.iter().fold(
-        BTreeMap::<(&str, &str), Vec<&TypedFunctionPlan<'_>>>::new(),
+    let function_by_source = functions.iter().fold(
+        BTreeMap::<SourceKey, Vec<&TypedFunctionPlan<'_>>>::new(),
         |mut map, plan| {
-            map.entry((
-                plan.definition.package_id.as_str(),
-                plan.definition.module.as_str(),
-            ))
-            .or_default()
-            .push(plan);
+            map.entry(plan.definition.span.source.clone())
+                .or_default()
+                .push(plan);
             map
         },
     );
     let mut module_debug = Vec::new();
     for module in modules {
         let source_span = full_source_span(module, files);
-        let function_indices = function_by_module
-            .get(&(module.package_id.as_str(), module.module.as_str()))
+        let mut function_indices = function_by_source
+            .get(&module.source)
             .map_or_else(Vec::new, |plans| {
                 plans.iter().map(|plan| plan.index).collect()
             });
+        if module.package_id == *package.package_id()
+            && module.module.as_str() == entry_module
+            && let Some(main) = standalone_main
+            && main.function_index != main.source_function_index
+        {
+            function_indices.push(main.function_index);
+        }
         module_debug.push(PackageModuleDebugInfo {
             package_id: module.package_id.as_str().to_owned(),
             module_path: module.module.as_str().to_owned(),
@@ -5402,7 +7782,7 @@ fn typed_debug_info(
             function_indices,
         });
     }
-    let functions = functions
+    let mut functions = functions
         .iter()
         .map(|plan| {
             let definition_span = source_span(&plan.definition.span, files)?;
@@ -5420,7 +7800,27 @@ fn typed_debug_info(
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    let host_imports = typed_host_import_debug_info(package, files)?;
+    if let Some(main) = standalone_main
+        && main.function_index != main.source_function_index
+    {
+        let canonical_identity = CanonicalSymbolIdentity::explicit(
+            package.package_id().as_str(),
+            nexa_core::SymbolKind::Task,
+            STANDALONE_MAIN_WRAPPER_NAME,
+        );
+        functions.push(PackageFunctionDebugInfo {
+            function_index: main.function_index,
+            package_id: package.package_id().as_str().to_owned(),
+            module_path: entry_module.to_owned(),
+            name: STANDALONE_MAIN_WRAPPER_NAME.into(),
+            stable_id: canonical_identity.runtime_id(),
+            canonical_identity,
+            definition_span: main.definition_span,
+            effect: FunctionEffect::Task,
+            visibility: PackageVisibility::Private,
+        });
+    }
+    let host_imports = typed_host_import_debug_info(package, files, host_import_indices)?;
     Ok(PackageDebugInfo {
         root_package_id: package.package_id().as_str().to_owned(),
         entry_module: entry_module.to_owned(),
@@ -5433,24 +7833,28 @@ fn typed_debug_info(
 fn typed_host_import_debug_info(
     package: &TypedPackageIr,
     files: &BTreeMap<SourceKey, FileId>,
+    host_import_indices: &BTreeMap<DefinitionId, u32>,
 ) -> Result<Vec<PackageHostImportDebugInfo>, CompileError> {
     let mut imports = Vec::new();
     for host in package.metadata().host_bindings.iter() {
-        let interface = package
-            .definition(host.interface)
-            .expect("TypedPackageIr validates host interface IDs");
-        let interface_span = catalog_source_span(package, &interface.span, files)?;
+        let contract = package
+            .definition(host.contract)
+            .expect("TypedPackageIr validates Host Contract IDs");
+        let contract_span = catalog_source_span(package, &contract.span, files)?;
         for function in &host.functions {
+            let Some(import_index) = host_import_indices.get(&function.definition).copied() else {
+                continue;
+            };
             let definition = package
                 .definition(function.definition)
                 .expect("TypedPackageIr validates host function IDs");
             imports.push(PackageHostImportDebugInfo {
-                import_index: function.import_index,
+                import_index,
                 stable_id: function.stable_id,
-                interface_id: host.interface_stable_id,
-                interface_name: interface.name.clone(),
+                contract_id: host.contract_stable_id,
+                contract_name: contract.name.clone(),
                 function_name: definition.name.clone(),
-                interface_span,
+                contract_span,
                 declaration_span: function.source.as_ref().map_or_else(
                     || catalog_source_span(package, &definition.span, files),
                     |source| Ok(external_span(Some(source))),
@@ -5549,10 +7953,12 @@ fn typed_state_surface(
                     })
                 })
                 .collect::<Result<Vec<_>, CompileError>>()?;
-            fields.sort_by(|left, right| {
-                (&left.canonical_identity, left.stable_id)
-                    .cmp(&(&right.canonical_identity, right.stable_id))
-            });
+            if package.compilation_kind() != IrCompilationKind::ReplCell {
+                fields.sort_by(|left, right| {
+                    (&left.canonical_identity, left.stable_id)
+                        .cmp(&(&right.canonical_identity, right.stable_id))
+                });
+            }
             Ok(PackageStateTypeInfo {
                 package_id: definition.package_id.as_str().to_owned(),
                 module_path: definition.module.as_str().to_owned(),
@@ -5679,6 +8085,14 @@ fn typed_test_call_graph(
         .collect::<Vec<_>>();
     nodes.sort_by_key(|node| node.function_index);
     nodes
+}
+
+fn is_state_type(package: &TypedPackageIr, definition: DefinitionId) -> bool {
+    package
+        .metadata()
+        .state_types
+        .iter()
+        .any(|state| state.definition == definition)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -5819,7 +8233,7 @@ fn collect_block_call_graph(
                     );
                 }
             }
-            TypedStatementIr::Yield => {
+            TypedStatementIr::Yield { .. } => {
                 effects.insert(PackageTestForbiddenEffect::Yield);
             }
             TypedStatementIr::Break | TypedStatementIr::Continue => {}
@@ -5847,7 +8261,24 @@ fn collect_place_call_graph(
 ) {
     match place {
         TypedPlaceIr::Definition(_) => {}
-        TypedPlaceIr::Field { base, field } | TypedPlaceIr::StateField { base, field } => {
+        TypedPlaceIr::Field { base, field } => {
+            if state_fields.contains(field) {
+                effects.insert(PackageTestForbiddenEffect::PersistentState);
+            }
+            collect_place_call_graph(
+                package,
+                base,
+                function_indices,
+                state_fields,
+                calls,
+                effects,
+            );
+        }
+        TypedPlaceIr::ClassField {
+            object: base,
+            field,
+        }
+        | TypedPlaceIr::StateField { base, field } => {
             if state_fields.contains(field) {
                 effects.insert(PackageTestForbiddenEffect::PersistentState);
             }
@@ -5887,12 +8318,12 @@ fn collect_expression_call_graph(
     match &expression.kind {
         TypedExpressionKind::Literal(_) => {}
         TypedExpressionKind::Reference(definition) => {
-            if package
-                .definition(*definition)
-                .is_some_and(|definition| definition.kind == DefinitionKind::Stateful)
-            {
+            if is_state_type(package, *definition) {
                 effects.insert(PackageTestForbiddenEffect::PersistentState);
             }
+        }
+        TypedExpressionKind::PersistentStateGet { .. } => {
+            effects.insert(PackageTestForbiddenEffect::PersistentState);
         }
         TypedExpressionKind::Unary { operand, .. }
         | TypedExpressionKind::Try(operand)
@@ -6026,11 +8457,40 @@ fn collect_expression_call_graph(
             }
         }
         TypedExpressionKind::Construct { definition, fields } => {
-            if package
-                .definition(*definition)
-                .is_some_and(|definition| definition.kind == DefinitionKind::Stateful)
-            {
+            if is_state_type(package, *definition) {
                 effects.insert(PackageTestForbiddenEffect::PersistentState);
+            }
+            for (field, value) in fields {
+                if state_fields.contains(field) {
+                    effects.insert(PackageTestForbiddenEffect::PersistentState);
+                }
+                collect_expression_call_graph(
+                    package,
+                    value,
+                    function_indices,
+                    state_fields,
+                    calls,
+                    effects,
+                );
+            }
+        }
+        TypedExpressionKind::ClassConstruct {
+            definition,
+            fields,
+            update,
+        } => {
+            if is_state_type(package, *definition) {
+                effects.insert(PackageTestForbiddenEffect::PersistentState);
+            }
+            if let Some(update) = update {
+                collect_expression_call_graph(
+                    package,
+                    update,
+                    function_indices,
+                    state_fields,
+                    calls,
+                    effects,
+                );
             }
             for (field, value) in fields {
                 if state_fields.contains(field) {
@@ -6185,6 +8645,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::StringToString { .. }
                     | Instruction::StandardIntrinsic { .. }
                     | Instruction::EnumNew { .. }
+                    | Instruction::EnumEqual { .. }
                     | Instruction::StructNew { .. }
                     | Instruction::StructWith { .. }
                     | Instruction::StructEqual { .. }
@@ -6213,6 +8674,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::Yield
                     | Instruction::Call { .. }
                     | Instruction::HostCall { .. }
+                    | Instruction::StateCurrentGet { .. }
                     | Instruction::StateHandleResolve { .. }
                     | Instruction::Return { .. }
                     | Instruction::ReturnVoid
@@ -6228,7 +8690,11 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
         })
         .collect::<Vec<_>>();
     for (pc, instruction) in code.iter().enumerate() {
-        if matches!(instruction, Instruction::HostCall { .. }) && pc + 1 < code.len() {
+        if matches!(
+            instruction,
+            Instruction::HostCall { .. } | Instruction::Yield
+        ) && pc + 1 < code.len()
+        {
             safepoints.push(u32::try_from(pc + 1).expect("instruction index is bounded"));
         }
     }
@@ -6250,8 +8716,9 @@ fn empty_debug_info(package: &TypedPackageIr, entry_module: &str) -> PackageDebu
 #[cfg(test)]
 mod tests {
     use super::{
-        checked_async_result, collect_safepoints, migration_field_owner,
-        migration_state_type_exists, typed_exact_root_maps, validate_static_range_bound,
+        STANDALONE_MAIN_IDENTITY, STANDALONE_MAIN_STABLE_ID, checked_async_result,
+        collect_safepoints, migration_field_owner, migration_state_type_exists,
+        typed_exact_root_maps, validate_static_range_bound,
     };
     use nexa_analysis::{
         DefinitionId, HostAsyncResultIr, IrAbandonPolicy, IrCancelPolicy, IrEffect, IrLiteral,
@@ -6288,6 +8755,14 @@ mod tests {
     }
     use nexa_verifier::{VerifierLimits, verify};
     use std::collections::BTreeMap;
+
+    #[test]
+    fn standalone_main_constant_matches_its_normative_identity() {
+        assert_eq!(
+            STANDALONE_MAIN_STABLE_ID,
+            StableId::from_name(STANDALONE_MAIN_IDENTITY)
+        );
+    }
 
     fn typed_i32(kind: TypedExpressionKind) -> TypedExpressionIr {
         TypedExpressionIr {
@@ -6465,7 +8940,7 @@ mod tests {
             ],
         );
         assert_eq!(function.root_maps[0].bitmap, vec![true, false]);
-        assert_eq!(function.root_maps[1].bitmap, vec![true, true]);
+        assert_eq!(function.root_maps[1].bitmap, vec![false, true]);
         let mut module = ModuleBuilder::new();
         module.function(function);
         verify(module.finish(), VerifierLimits::default()).unwrap();
@@ -6505,6 +8980,8 @@ mod tests {
             .enum_type(async_enum)
             .host_import(HostImport {
                 stable_id: StableId::from_name("test.host.request"),
+                declaration_fingerprint: [7; 32],
+                capabilities: Vec::new(),
                 parameters: Vec::new(),
                 result: Some(async_type),
                 mode: HostCallMode::Async,

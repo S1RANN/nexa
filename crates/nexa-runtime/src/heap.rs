@@ -48,6 +48,54 @@ impl VmMap {
     }
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct MapEntries<'a> {
+    current: &'a [Option<MapEntry>],
+    old: &'a [Option<MapEntry>],
+    new: &'a [Option<MapEntry>],
+    phase: u8,
+    index: usize,
+    remaining: usize,
+}
+
+impl Iterator for MapEntries<'_> {
+    type Item = (RuntimeValue, RuntimeValue);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let slots = match self.phase {
+                0 => self.current,
+                1 => self.old,
+                2 => self.new,
+                _ => return None,
+            };
+            let Some(slot) = slots.get(self.index) else {
+                self.phase += 1;
+                self.index = 0;
+                continue;
+            };
+            self.index += 1;
+            if let Some(entry) = slot {
+                self.remaining = self
+                    .remaining
+                    .checked_sub(1)
+                    .expect("map length matches occupied slots");
+                return Some((entry.key, entry.value));
+            }
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for MapEntries<'_> {
+    fn len(&self) -> usize {
+        self.remaining
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MapSetOutcome {
     Complete,
@@ -59,6 +107,13 @@ pub(crate) struct StringSplitFuelShape {
     pub source_bytes: usize,
     pub delimiter_bytes: usize,
     pub parts: usize,
+}
+
+/// O(1) collection-arena metadata used to settle deterministic fuel before an
+/// operation searches or mutates the free-range index.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CollectionArenaFuelShape {
+    pub free_ranges: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +287,18 @@ impl CollectionArena {
                 index: range.end(),
                 length: self.capacity,
             })
+    }
+
+    fn checkpoint_clone(&self) -> Self {
+        let mut values = Vec::with_capacity(self.values.capacity());
+        values.extend_from_slice(&self.values);
+        let mut free_ranges = Vec::with_capacity(self.free_ranges.capacity());
+        free_ranges.extend_from_slice(&self.free_ranges);
+        Self {
+            values,
+            free_ranges,
+            capacity: self.capacity,
+        }
     }
 }
 
@@ -417,6 +484,20 @@ pub struct Heap {
     failure_injector: RuntimeFailureInjector,
 }
 
+/// Exact heap state owned by one staged transactional Cell.
+///
+/// Runtime limits and the failure-control plane remain Realm authority and are
+/// intentionally not snapshotted. Every mutable VM storage surface is: object
+/// slots/generations, free lists, collection storage, and Host return staging.
+#[derive(Clone, Debug)]
+pub(crate) struct HeapCheckpoint {
+    slots: Vec<ObjectSlot>,
+    free: Vec<u32>,
+    collections: CollectionArena,
+    host_staging: Vec<GcRef>,
+    host_transaction_active: bool,
+}
+
 impl Heap {
     pub const DEFAULT_MAX_COLLECTION_LENGTH: usize = 1_024;
 
@@ -450,6 +531,31 @@ impl Heap {
             arena_elements,
             max_objects as usize + 1,
         )
+    }
+
+    #[must_use]
+    pub(crate) fn checkpoint(&self) -> HeapCheckpoint {
+        let mut slots = Vec::with_capacity(self.slots.capacity());
+        slots.extend_from_slice(&self.slots);
+        let mut free = Vec::with_capacity(self.free.capacity());
+        free.extend_from_slice(&self.free);
+        let mut host_staging = Vec::with_capacity(self.host_staging.capacity());
+        host_staging.extend_from_slice(&self.host_staging);
+        HeapCheckpoint {
+            slots,
+            free,
+            collections: self.collections.checkpoint_clone(),
+            host_staging,
+            host_transaction_active: self.host_transaction_active,
+        }
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, checkpoint: HeapCheckpoint) {
+        self.slots = checkpoint.slots;
+        self.free = checkpoint.free;
+        self.collections = checkpoint.collections;
+        self.host_staging = checkpoint.host_staging;
+        self.host_transaction_active = checkpoint.host_transaction_active;
     }
 
     #[must_use]
@@ -772,6 +878,13 @@ impl Heap {
         })
     }
 
+    #[must_use]
+    pub(crate) fn collection_arena_fuel_shape(&self) -> CollectionArenaFuelShape {
+        CollectionArenaFuelShape {
+            free_ranges: self.collections.free_ranges.len(),
+        }
+    }
+
     pub fn commit_collection_value(
         &mut self,
         reservation: &mut CollectionReservation,
@@ -1048,6 +1161,19 @@ impl Heap {
         }
     }
 
+    pub fn enum_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
+        let (lhs_type, lhs_variant, lhs_tag, lhs_payload) = self.enum_parts(lhs)?;
+        let (rhs_type, rhs_variant, rhs_tag, rhs_payload) = self.enum_parts(rhs)?;
+        if lhs_type != rhs_type || lhs_variant != rhs_variant || lhs_tag != rhs_tag {
+            return Ok(false);
+        }
+        match (lhs_payload, rhs_payload) {
+            (Some(lhs), Some(rhs)) => self.runtime_value_equal(lhs, rhs),
+            (None, None) => Ok(true),
+            _ => Ok(false),
+        }
+    }
+
     pub fn allocate_struct(
         &mut self,
         type_id: StableId,
@@ -1207,6 +1333,16 @@ impl Heap {
         value: RuntimeValue,
         index: usize,
     ) -> Result<RuntimeValue, HeapError> {
+        let RuntimeValue::NamedRef { reference, .. } = value else {
+            return Err(invalid_value_reference());
+        };
+        self.class_fields(value)?
+            .get(index)
+            .copied()
+            .ok_or(HeapError::InvalidReference(reference))
+    }
+
+    pub(crate) fn class_fields(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
@@ -1215,10 +1351,7 @@ impl Heap {
                 type_id: actual,
                 fields,
                 field_count,
-            } if *actual == type_id => fields[..usize::from(*field_count)]
-                .get(index)
-                .copied()
-                .ok_or(HeapError::InvalidReference(reference)),
+            } if *actual == type_id => Ok(&fields[..usize::from(*field_count)]),
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
@@ -1232,6 +1365,7 @@ impl Heap {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
+        self.write_barrier(reference, replacement)?;
         match self.resolve_mut(reference)? {
             Object::Class {
                 type_id: actual,
@@ -1243,6 +1377,21 @@ impl Heap {
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
+    }
+
+    /// Publishes a value into an already allocated GC object.
+    ///
+    /// Collection is currently stop-the-world, so the barrier does not need a
+    /// remembered set. It still validates both sides before mutation: a
+    /// forged or stale child reference must never become reachable through a
+    /// live object, and future collector strategies have one publication
+    /// point to extend.
+    fn write_barrier(&self, owner: GcRef, replacement: RuntimeValue) -> Result<(), HeapError> {
+        self.validate_reference(owner)?;
+        if let Some(child) = value_reference(replacement) {
+            self.validate_reference(child)?;
+        }
+        Ok(())
     }
 
     pub fn class_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
@@ -1670,6 +1819,26 @@ impl Heap {
         Ok(self.map(value)?.length)
     }
 
+    /// Iterates entries in deterministic backing-slot order without allocating
+    /// or recomputing hashes. A completed map visits its current table from
+    /// lowest to highest slot; an in-progress rehash then visits remaining old
+    /// slots followed by populated new slots in the same order.
+    pub(crate) fn map_entries(&self, value: RuntimeValue) -> Result<MapEntries<'_>, HeapError> {
+        let map = self.map(value)?;
+        let empty: &[Option<MapEntry>] = &[];
+        let (old, new) = map.rehash.as_ref().map_or((empty, empty), |rehash| {
+            (rehash.old_slots.as_slice(), rehash.new_slots.as_slice())
+        });
+        Ok(MapEntries {
+            current: &map.slots,
+            old,
+            new,
+            phase: 0,
+            index: 0,
+            remaining: map.length,
+        })
+    }
+
     pub(crate) fn map_fuel_shape(&self, value: RuntimeValue) -> Result<MapFuelShape, HeapError> {
         const REHASH_CHUNK: usize = 8;
         let map = self.map(value)?;
@@ -1917,6 +2086,7 @@ impl Heap {
         Ok(hash)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn runtime_value_hash(&self, value: RuntimeValue) -> Result<u64, HeapError> {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         match value {
@@ -1930,10 +2100,20 @@ impl Heap {
             }
             RuntimeValue::F32(value) => {
                 write_hash(&mut hash, &[3]);
+                let value = if value.trailing_zeros() >= 31 {
+                    0
+                } else {
+                    value
+                };
                 write_hash(&mut hash, &value.to_le_bytes());
             }
             RuntimeValue::F64(value) => {
                 write_hash(&mut hash, &[4]);
+                let value = if value.trailing_zeros() >= 63 {
+                    0
+                } else {
+                    value
+                };
                 write_hash(&mut hash, &value.to_le_bytes());
             }
             RuntimeValue::Bool(value) => write_hash(&mut hash, &[5, u8::from(value)]),
@@ -1985,6 +2165,7 @@ impl Heap {
                 write_hash(&mut hash, &[11]);
                 write_hash(&mut hash, &value.raw().index.to_le_bytes());
                 write_hash(&mut hash, &value.raw().generation.to_le_bytes());
+                write_hash(&mut hash, &value.content_type().0.to_le_bytes());
             }
             RuntimeValue::Snapshot(value) => {
                 write_hash(&mut hash, &[12]);
@@ -2057,17 +2238,7 @@ impl Heap {
                     unreachable!("matched named references")
                 };
                 match (self.resolve(lhs_reference)?, self.resolve(rhs_reference)?) {
-                    (Object::Enum { .. }, Object::Enum { .. }) => {
-                        let (_, lhs_variant, lhs_tag, lhs_payload) = self.enum_parts(lhs)?;
-                        let (_, rhs_variant, rhs_tag, rhs_payload) = self.enum_parts(rhs)?;
-                        lhs_variant == rhs_variant
-                            && lhs_tag == rhs_tag
-                            && match (lhs_payload, rhs_payload) {
-                                (Some(lhs), Some(rhs)) => self.runtime_value_equal(lhs, rhs)?,
-                                (None, None) => true,
-                                _ => false,
-                            }
-                    }
+                    (Object::Enum { .. }, Object::Enum { .. }) => self.enum_equal(lhs, rhs)?,
                     (Object::Class { .. }, Object::Class { .. })
                     | (Object::Array { .. }, Object::Array { .. })
                     | (Object::Buffer { .. }, Object::Buffer { .. }) => {
@@ -2364,7 +2535,7 @@ fn write_migration_object_hash(
 
 #[cfg(test)]
 mod tests {
-    use nexa_core::StableId;
+    use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, StableId};
 
     use super::{GcRoots, Heap, HeapError, MapSetOutcome, Object};
     use crate::{RuntimeFailurePoint, RuntimeValue};
@@ -2708,6 +2879,103 @@ mod tests {
         assert_eq!(heap.map_remove(map, RuntimeValue::I32(2)), Ok(None));
         heap.map_clear(map).unwrap();
         assert_eq!(heap.map_len(map), Ok(0));
+    }
+
+    #[test]
+    fn float_signed_zero_preserves_struct_and_map_hash_contracts() {
+        let mut heap = Heap::new_with_limits(4, usize::MAX, 4);
+        let struct_type = StableId::from_name("FloatPair");
+        let positive_zero = heap
+            .allocate_struct(
+                struct_type,
+                &[
+                    RuntimeValue::F32(0.0_f32.to_bits()),
+                    RuntimeValue::F64(0.0_f64.to_bits()),
+                ],
+            )
+            .unwrap();
+        let negative_zero = heap
+            .allocate_struct(
+                struct_type,
+                &[
+                    RuntimeValue::F32((-0.0_f32).to_bits()),
+                    RuntimeValue::F64((-0.0_f64).to_bits()),
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(heap.struct_equal(positive_zero, negative_zero), Ok(true));
+
+        let key_type = nexa_bytecode::ValueType::Named(struct_type);
+        let map_type = nexa_bytecode::map_type(key_type, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(map_type, key_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+        assert_eq!(
+            heap.map_set(map, positive_zero, RuntimeValue::I32(7)),
+            Ok(MapSetOutcome::Complete)
+        );
+        assert_eq!(
+            heap.map_get(map, negative_zero),
+            Ok(Some(RuntimeValue::I32(7)))
+        );
+
+        assert_eq!(
+            heap.runtime_value_equal(
+                RuntimeValue::F32(CANONICAL_NAN_F32_BITS),
+                RuntimeValue::F32(CANONICAL_NAN_F32_BITS),
+            ),
+            Ok(false)
+        );
+        assert_eq!(
+            heap.runtime_value_equal(
+                RuntimeValue::F64(CANONICAL_NAN_F64_BITS),
+                RuntimeValue::F64(CANONICAL_NAN_F64_BITS),
+            ),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn enum_equality_recurses_into_payloads() {
+        let mut heap = Heap::new(6);
+        let inner_type = nexa_bytecode::option_type(nexa_bytecode::ValueType::F32);
+        let some = StableId::from_parts(&["Option", "::Some"]);
+        let lhs_inner = heap
+            .allocate_enum(
+                inner_type.type_id,
+                some,
+                1,
+                Some(RuntimeValue::F32(0.0_f32.to_bits())),
+            )
+            .unwrap();
+        let rhs_inner = heap
+            .allocate_enum(
+                inner_type.type_id,
+                some,
+                1,
+                Some(RuntimeValue::F32((-0.0_f32).to_bits())),
+            )
+            .unwrap();
+        let outer_type =
+            nexa_bytecode::option_type(nexa_bytecode::ValueType::Named(inner_type.type_id));
+        let lhs = heap
+            .allocate_enum(outer_type.type_id, some, 1, Some(lhs_inner))
+            .unwrap();
+        let rhs = heap
+            .allocate_enum(outer_type.type_id, some, 1, Some(rhs_inner))
+            .unwrap();
+        assert_eq!(heap.enum_equal(lhs, rhs), Ok(true));
+
+        let nan = heap
+            .allocate_enum(
+                inner_type.type_id,
+                some,
+                1,
+                Some(RuntimeValue::F32(CANONICAL_NAN_F32_BITS)),
+            )
+            .unwrap();
+        assert_eq!(heap.enum_equal(nan, nan), Ok(false));
     }
 
     #[test]

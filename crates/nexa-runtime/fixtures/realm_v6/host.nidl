@@ -1,0 +1,32 @@
+contract RealmV6Host {
+    enum WaitError {
+        Cancelled,
+        Failed,
+    }
+
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(
+            value: i32,
+        ) -> Result<i32, WaitError>;
+    }
+
+    nexa {
+        async fn normal(
+            value: i32,
+        ) -> i32;
+
+        async fn fuel(
+            value: i32,
+        ) -> i32;
+
+        async fn explicit(
+            value: i32,
+        ) -> i32;
+
+        async fn request(
+            value: i32,
+        ) -> Result<i32, WaitError>;
+    }
+}

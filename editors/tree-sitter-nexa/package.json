@@ -2,7 +2,7 @@
   "name": "tree-sitter-nexa",
   "version": "0.2.0",
   "private": true,
-  "description": "Tree-sitter grammar for Nexa source.",
+  "description": "Tree-sitter grammar for Nexa v2 source.",
   "license": "MIT OR Apache-2.0",
   "keywords": [
     "tree-sitter",

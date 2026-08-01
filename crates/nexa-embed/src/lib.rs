@@ -36,8 +36,9 @@ use nexa::prelude as nexa_core;
 use nexa::prelude as nexa_runtime;
 
 pub use artifact::{
-    CandidateCompilation, CompiledPackageArtifact, FunctionDebugInfo, LastKnownGood,
-    ModuleDebugInfo, compile_package,
+    CandidateCompilation, CompiledPackageArtifact, LastKnownGood, PackageDebugInspection,
+    PackageFunctionInspection, PackageHostImportInspection, PackageModuleInspection,
+    compile_package,
 };
 pub use builder::NexaEngineBuilder;
 pub use capability::CapabilitySet;
@@ -59,8 +60,8 @@ pub use diagnostic_evidence::{
 pub use directory_source::DirectorySource;
 pub use entitlement::{EntitlementResolver, NoEntitlements, StaticEntitlements};
 pub use inspection::{
-    DevelopmentInspection, EngineInspection, EngineTickReport, PackageInspection, PackageMetric,
-    ReloadReport, ReloadReportOutcome, ReloadReportSummary,
+    DevelopmentInspection, EngineInspection, EngineTickReport, EntrypointSignature,
+    PackageInspection, PackageMetric, ReloadReport, ReloadReportOutcome, ReloadReportSummary,
 };
 pub use lifecycle::{LifecycleError, PackageLifecycle, PackageStatus};
 pub use manifest::{
@@ -115,7 +116,7 @@ where
 
 pub struct NexaEngine {
     contract: HostContract,
-    idl: nexa_idl::Idl,
+    idl: nexa_idl::ValidatedContract,
     host_contract_source_identity: nexa::SourceIdentity,
     host_contract_source: std::sync::Arc<str>,
     host_factory: Box<dyn HostRegistryFactory>,
@@ -126,6 +127,7 @@ pub struct NexaEngine {
     packages: Vec<PackageRecord>,
     diagnostics: BoundedDiagnosticLog,
     required_exports: Vec<ExportRequirement>,
+    declared_entrypoints: Vec<EntrypointSignature>,
     persisted: BTreeMap<PackageId, bool>,
     development: DevelopmentConfig,
     development_coordinator: nexa_analysis::DevelopmentCoordinator,
@@ -150,14 +152,66 @@ impl NexaEngine {
         NexaEngineBuilder::new(contract)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn from_builder(builder: NexaEngineBuilder) -> Result<Self, EngineError> {
-        let idl = nexa_idl::parse(builder.contract.canonical_idl)
+        let idl = nexa_idl::parse_nidl(builder.contract.source())
             .map_err(|error| EngineError::Contract(error.to_string()))?;
-        if nexa_idl::exact_hash(&idl) != builder.contract.interface_hash {
+        let descriptor = nexa_idl::abi_descriptor(&idl);
+        if idl.name != builder.contract.contract_name()
+            || descriptor.as_bytes() != builder.contract.canonical_descriptor()
+            || descriptor.fingerprint.into_bytes() != builder.contract.contract_fingerprint()
+            || nexa_idl::contract_runtime_id(&idl) != builder.contract.contract_runtime_id()
+            || builder.contract.generator_schema_version()
+                != nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION
+        {
             return Err(EngineError::Contract(
-                "generated interface hash mismatch".into(),
+                "generated Host Contract descriptor mismatch".into(),
             ));
         }
+        let declared_entrypoints = idl
+            .nexa_functions
+            .iter()
+            .map(|entrypoint| EntrypointSignature {
+                name: entrypoint.name.clone(),
+                stable_id: nexa_idl::entrypoint_stable_id(entrypoint),
+                signature: nexa_idl::entrypoint_signature(entrypoint),
+                effect: if entrypoint.is_async {
+                    nexa_runtime::FunctionEffect::Task
+                } else {
+                    nexa_runtime::FunctionEffect::Ordinary
+                },
+            })
+            .collect::<Vec<_>>();
+        for required in &builder.required_exports {
+            let Some(declared) = declared_entrypoints
+                .iter()
+                .find(|entrypoint| entrypoint.name == required.name)
+            else {
+                return Err(EngineError::Contract(format!(
+                    "required entrypoint `{}` is not declared by the Host contract",
+                    required.name
+                )));
+            };
+            if declared.stable_id != required.stable_id
+                || declared.signature != required.signature
+                || declared.effect != required.effect
+            {
+                return Err(EngineError::Contract(format!(
+                    "generated descriptor for required entrypoint `{}` does not match the Host contract",
+                    required.name
+                )));
+            }
+        }
+        let required_exports = declared_entrypoints
+            .iter()
+            .filter_map(|declared| {
+                builder
+                    .required_exports
+                    .iter()
+                    .find(|required| required.stable_id == declared.stable_id)
+                    .cloned()
+            })
+            .collect();
         let (host_contract_source_identity, host_contract_source) =
             if let Some((identity, text)) = builder.host_contract_source {
                 nexa::HostContractInput::with_source(&idl, identity.clone(), text.clone())
@@ -206,7 +260,8 @@ impl NexaEngine {
                 .unwrap_or_else(|| nexa_runtime::RuntimeHost::new(builder.runtime_host_capacity)),
             packages: Vec::new(),
             diagnostics: BoundedDiagnosticLog::default(),
-            required_exports: builder.required_exports,
+            required_exports,
+            declared_entrypoints,
             persisted,
             development: builder.development,
             development_coordinator,
@@ -432,7 +487,9 @@ impl NexaEngine {
                 self.packages[index].runtime = None;
                 let next = if matches!(
                     error,
-                    EngineError::MissingExport(_, _) | EngineError::ExportSignature(_, _)
+                    EngineError::MissingExport(_, _)
+                        | EngineError::ExportSignature(_, _)
+                        | EngineError::UndeclaredEntrypoint(_, _)
                 ) {
                     PackageStatus::Incompatible
                 } else {
@@ -477,6 +534,11 @@ impl NexaEngine {
             self.host_contract_source_identity.clone(),
             self.host_contract_source.as_bytes().to_vec(),
         )
+        .requiring_entrypoints(
+            self.required_exports
+                .iter()
+                .map(|entrypoint| entrypoint.name.clone()),
+        )
     }
 
     fn host_contract_input(&self) -> nexa::HostContractInput<'_> {
@@ -486,6 +548,14 @@ impl NexaEngine {
             std::sync::Arc::clone(&self.host_contract_source),
         )
         .expect("the Engine validates its immutable Host source while building")
+        .requiring_entrypoints(
+            &self
+                .required_exports
+                .iter()
+                .map(|entrypoint| entrypoint.name.clone())
+                .collect::<Vec<_>>(),
+        )
+        .expect("the Engine validates required entrypoints while building")
     }
 
     fn refresh_desired_build_fingerprint(&mut self, index: usize) -> Option<BuildFingerprint> {
@@ -578,7 +648,7 @@ impl NexaEngine {
         let module = realm
             .load_module(
                 artifact.verified.clone(),
-                self.contract.interface_hash,
+                self.contract.contract_runtime_id(),
                 artifact.state_schema_fingerprint,
             )
             .map_err(|error| EngineError::Load(manifest.id.clone(), error.to_string()))?;
@@ -632,6 +702,22 @@ impl NexaEngine {
         id: PackageId,
         verified: &nexa_verifier::VerifiedModule,
     ) -> Result<(), EngineError> {
+        for found in &verified.module().exports {
+            let Some(declared) = self
+                .declared_entrypoints
+                .iter()
+                .find(|entrypoint| entrypoint.stable_id == found.stable_id)
+            else {
+                return Err(EngineError::UndeclaredEntrypoint(id, found.stable_id));
+            };
+            let found_effect = usize::try_from(found.function)
+                .ok()
+                .and_then(|index| verified.module().functions.get(index))
+                .map(|function| function.effect);
+            if found.signature != declared.signature || found_effect != Some(declared.effect) {
+                return Err(EngineError::ExportSignature(id, declared.name.clone()));
+            }
+        }
         for requirement in &self.required_exports {
             let Some(found) = verified
                 .module()
@@ -641,7 +727,12 @@ impl NexaEngine {
             else {
                 return Err(EngineError::MissingExport(id, requirement.name.clone()));
             };
-            if found.signature != requirement.signature {
+            let found_effect = usize::try_from(found.function)
+                .ok()
+                .and_then(|index| verified.module().functions.get(index))
+                .map(|function| function.effect);
+            if found.signature != requirement.signature || found_effect != Some(requirement.effect)
+            {
                 return Err(EngineError::ExportSignature(id, requirement.name.clone()));
             }
         }
@@ -940,6 +1031,22 @@ impl NexaEngine {
             .as_ref()
             .and_then(|runtime| runtime.realm.active_module_epoch(runtime.module).ok())
             .unwrap_or_default();
+        if let Err(error) = self.validate_exports(id.clone(), &artifact.verified) {
+            return Err(ReloadFailure::new(
+                reload_report(
+                    identity.clone(),
+                    old_epoch,
+                    None,
+                    compile_duration,
+                    verify_duration,
+                    nexa_runtime::RestartReloadMetrics::default(),
+                    ReloadReportOutcome::RolledBackBeforeCommit,
+                    0,
+                    0,
+                ),
+                error,
+            ));
+        }
         let commit_identity_matches = artifact.identity.package_id.eq(&candidate.manifest.id)
             && artifact.identity.package_id.eq(build_input.root_package())
             && artifact.identity.build_fingerprint == artifact.build_fingerprint
@@ -1219,7 +1326,8 @@ impl NexaEngine {
             state_schema_fingerprint: artifact.state_schema_fingerprint,
             linked_state_fingerprint: artifact.linked_state_fingerprint,
             dependency_closure: std::sync::Arc::clone(&artifact.dependency_closure),
-            host_interface_hash: self.contract.interface_hash,
+            host_contract_fingerprint: self.contract.contract_fingerprint(),
+            host_contract_id: self.contract.contract_runtime_id(),
             artifact,
             epoch,
         });
@@ -2712,6 +2820,100 @@ impl NexaEngine {
         self.call_index::<E>(index, args)
     }
 
+    /// Reports whether a package's active or Last-Known-Good artifact implements `E`.
+    ///
+    /// This is deliberately typed: entrypoint names are never resolved from caller-provided
+    /// strings.
+    #[must_use]
+    pub fn has_export<E: nexa_runtime::ScriptExport>(&self, id: &PackageId) -> bool {
+        let Ok(index) = self.unique_index(id) else {
+            return false;
+        };
+        self.package_entrypoint(index, E::STABLE_ID)
+            .is_some_and(|(signature, effect)| signature == E::signature() && effect == E::effect())
+    }
+
+    /// Calls `E` when the selected package implements it.
+    ///
+    /// `None` means the entrypoint is absent. A present entrypoint preserves the ordinary call
+    /// result, including package state and runtime failures.
+    pub fn call_optional<E: nexa_runtime::ScriptExport>(
+        &mut self,
+        id: &PackageId,
+        args: &E::Args,
+    ) -> Option<Result<PackageOutput<E::Output>, EngineError>> {
+        let index = match self.unique_index(id) {
+            Ok(index) => index,
+            Err(error) => return Some(Err(error)),
+        };
+        let (signature, effect) = self.package_entrypoint(index, E::STABLE_ID)?;
+        if signature != E::signature() || effect != E::effect() {
+            return Some(Err(EngineError::ExportSignature(
+                id.clone(),
+                E::NAME.to_owned(),
+            )));
+        }
+        Some(self.call_index::<E>(index, args))
+    }
+
+    /// Deterministically broadcasts `E` to enabled packages which actually implement it.
+    pub fn dispatch_optional<E: nexa_runtime::ScriptExport>(
+        &mut self,
+        args: &E::Args,
+    ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
+        let mut indexes = self
+            .packages
+            .iter()
+            .enumerate()
+            .filter(|(index, record)| {
+                record.lifecycle.status() == PackageStatus::Enabled
+                    && self.package_entrypoint(*index, E::STABLE_ID).is_some_and(
+                        |(signature, effect)| signature == E::signature() && effect == E::effect(),
+                    )
+            })
+            .map(|(index, record)| {
+                (
+                    index,
+                    record.effective.priority,
+                    record.candidate.manifest.id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        indexes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
+        indexes
+            .into_iter()
+            .map(|(index, _, _)| self.call_index::<E>(index, args))
+            .collect()
+    }
+
+    fn package_entrypoint(
+        &self,
+        index: usize,
+        stable_id: nexa::StableId,
+    ) -> Option<(nexa_runtime::Signature, nexa_runtime::FunctionEffect)> {
+        let record = &self.packages[index];
+        let artifact = record
+            .runtime
+            .as_ref()
+            .map(|runtime| &runtime.artifact)
+            .or_else(|| {
+                record
+                    .last_known_good
+                    .as_ref()
+                    .map(|known_good| &known_good.artifact)
+            })?;
+        let entrypoint = artifact
+            .module()
+            .exports
+            .iter()
+            .find(|entrypoint| entrypoint.stable_id == stable_id)?;
+        let function = artifact
+            .module()
+            .functions
+            .get(usize::try_from(entrypoint.function).ok()?)?;
+        Some((entrypoint.signature.clone(), function.effect))
+    }
+
     fn call_index<E: nexa_runtime::ScriptExport>(
         &mut self,
         index: usize,
@@ -2841,7 +3043,7 @@ impl NexaEngine {
 
     /// Inserts or replaces one scalar field in a package's typed state domain.
     ///
-    /// The names use the same stable-ID derivation as `@stateful` classes.
+    /// The names use the same stable-ID derivation as `@state(version = N)` state classes.
     pub fn set_state_i32(
         &mut self,
         id: &PackageId,
@@ -3149,6 +3351,7 @@ impl NexaEngine {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn inspection(&self) -> EngineInspection {
         let packages = self
             .packages
@@ -3163,6 +3366,52 @@ impl NexaEngine {
                         )
                     },
                 );
+                let artifact = record
+                    .runtime
+                    .as_ref()
+                    .map(|runtime| &runtime.artifact)
+                    .or_else(|| {
+                        record
+                            .last_known_good
+                            .as_ref()
+                            .map(|known_good| &known_good.artifact)
+                    });
+                let implemented_entrypoints = self
+                    .declared_entrypoints
+                    .iter()
+                    .filter(|declared| {
+                        artifact.is_some_and(|artifact| {
+                            artifact.module().exports.iter().any(|implemented| {
+                                implemented.stable_id == declared.stable_id
+                                    && implemented.signature == declared.signature
+                                    && usize::try_from(implemented.function)
+                                        .ok()
+                                        .and_then(|index| artifact.module().functions.get(index))
+                                        .is_some_and(|function| function.effect == declared.effect)
+                            })
+                        })
+                    })
+                    .map(|entrypoint| entrypoint.name.clone())
+                    .collect::<Vec<_>>();
+                let required_entrypoints = self
+                    .required_exports
+                    .iter()
+                    .map(|entrypoint| entrypoint.name.clone())
+                    .collect::<Vec<_>>();
+                let missing_required_entrypoints = required_entrypoints
+                    .iter()
+                    .filter(|required| !implemented_entrypoints.contains(required))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let optional_entrypoint_signatures = self
+                    .declared_entrypoints
+                    .iter()
+                    .filter(|entrypoint| {
+                        implemented_entrypoints.contains(&entrypoint.name)
+                            && !required_entrypoints.contains(&entrypoint.name)
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
                 PackageInspection {
                     package_id: record.candidate.manifest.id.clone(),
                     source_id: record.source_id.clone(),
@@ -3210,6 +3459,10 @@ impl NexaEngine {
                     last_reload_duration: record.development.last_reload_duration,
                     recent_diagnostic: record.last_diagnostic.clone(),
                     recent_metrics: record.development.recent_metrics.iter().cloned().collect(),
+                    implemented_entrypoints,
+                    required_entrypoints,
+                    missing_required_entrypoints,
+                    optional_entrypoint_signatures,
                 }
             })
             .collect();
@@ -3368,7 +3621,7 @@ impl NexaEngine {
                 EngineError::MissingExport(_, _) => {
                     (EngineDiagnosticStage::Export, nexa::ErrorCode::NX7010)
                 }
-                EngineError::ExportSignature(_, _) => {
+                EngineError::ExportSignature(_, _) | EngineError::UndeclaredEntrypoint(_, _) => {
                     (EngineDiagnosticStage::Export, nexa::ErrorCode::NX7011)
                 }
                 EngineError::Handler(_, _) => {
@@ -3441,6 +3694,7 @@ pub enum EngineError {
     Load(PackageId, String),
     MissingExport(PackageId, String),
     ExportSignature(PackageId, String),
+    UndeclaredEntrypoint(PackageId, nexa::StableId),
     Handler(PackageId, String),
     State(PackageId, String),
     Reload(PackageId, String),
@@ -3534,7 +3788,7 @@ fn development_event_data(
 fn runtime_trap_diagnostic(
     record: &PackageRecord,
     contract: &HostContract,
-    idl: &nexa_idl::Idl,
+    idl: &nexa_idl::ValidatedContract,
     trap: &nexa_runtime::Trap,
     export: &str,
 ) -> EngineDiagnostic {
@@ -3587,12 +3841,9 @@ fn runtime_trap_diagnostic(
     for frame in trap.script_call_stack.as_slice() {
         let name = runtime
             .artifact
-            .debug_info
-            .functions
-            .iter()
-            .find(|function| function.function_index == frame.function)
+            .function_for_script_frame(frame)
             .map_or_else(
-                || format!("<function #{}>", frame.function),
+                || "<unknown-function>".to_owned(),
                 |function| function.name.clone(),
             );
         let source_identity = frame
@@ -3605,10 +3856,10 @@ fn runtime_trap_diagnostic(
         });
     }
     if let Some(boundary) = trap.host_call_boundary {
-        let function = idl.functions.get(boundary.import as usize);
+        let function = idl.host_functions.get(boundary.import as usize);
         let function_name = function.map_or_else(
             || format!("<host import #{}>", boundary.import),
-            |function| format!("{}::{}", contract.interface_name, function.name),
+            |function| format!("{}::{}", contract.contract_name(), function.name),
         );
         let source_identity = boundary
             .source_span
@@ -3620,21 +3871,18 @@ fn runtime_trap_diagnostic(
         });
         if let Some(function) = function
             && let Ok(registry) = SourceFileRegistry::from_files([(
-                format!("{}.nidl", contract.interface_name.to_ascii_lowercase()),
-                contract.canonical_idl.to_owned(),
+                format!("{}.nidl", contract.contract_name().to_ascii_lowercase()),
+                contract.source().to_owned(),
             )])
             && let Some(file) = registry.files().next().cloned()
         {
-            let start = contract
-                .canonical_idl
-                .find(&function.name)
-                .unwrap_or_default();
+            let start = contract.source().find(&function.name).unwrap_or_default();
             let end = start.saturating_add(function.name.len());
             let identity = diagnostic.attach_related_source(
                 nexa_diagnostics::SourceIdentity::standalone(std::sync::Arc::<str>::from(
                     file.path.as_str(),
                 )),
-                contract.canonical_idl,
+                contract.source(),
             );
             diagnostic.related.push(RelatedDiagnostic {
                 message: format!("Host function {function_name} is declared here"),

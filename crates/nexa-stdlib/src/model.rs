@@ -381,7 +381,8 @@ impl FunctionDescriptor {
 pub struct ModuleDescriptor {
     /// Short lookup name, such as `math`.
     pub name: &'static str,
-    /// Reserved source path, such as `std.math`.
+    /// Canonical internal module path, such as `std.math`. Source-level paths
+    /// render the same segments as `std::math`.
     pub path: &'static str,
     /// Whether names from this module are eligible for implicit prelude
     /// resolution.
@@ -491,43 +492,42 @@ impl StandardLibrary {
         self.modules
     }
 
-    /// Accepts either a short name (`string`) or reserved path (`std.string`).
+    /// Accepts either a short name (`string`) or a source-level reserved path
+    /// (`std::string`).
     #[must_use]
     pub fn module(&self, name_or_path: &str) -> Option<&'static ModuleDescriptor> {
-        self.modules
-            .iter()
-            .find(|module| module.name == name_or_path || module.path == name_or_path)
+        self.modules.iter().find(|module| {
+            module.name == name_or_path || module.path.split('.').eq(name_or_path.split("::"))
+        })
     }
 
-    /// Resolves `core.min_i32` or `std.core.min_i32`.
+    /// Resolves `core::min_i32` or `std::core::min_i32`.
     #[must_use]
     pub fn function(
         &self,
         qualified_name: &str,
     ) -> Option<(&'static ModuleDescriptor, &'static FunctionDescriptor)> {
+        let (qualifier, name) = qualified_name.rsplit_once("::")?;
         self.modules.iter().find_map(|module| {
-            let short_prefix = format!("{}.", module.name);
-            let path_prefix = format!("{}.", module.path);
-            let name = qualified_name
-                .strip_prefix(&path_prefix)
-                .or_else(|| qualified_name.strip_prefix(&short_prefix))?;
-            module.function(name).map(|function| (module, function))
+            (module.name == qualifier || module.path.split('.').eq(qualifier.split("::")))
+                .then(|| module.function(name))
+                .flatten()
+                .map(|function| (module, function))
         })
     }
 
-    /// Resolves `math.Vec2` or `std.math.Vec2`.
+    /// Resolves `math::Vec2` or `std::math::Vec2`.
     #[must_use]
     pub fn ty(
         &self,
         qualified_name: &str,
     ) -> Option<(&'static ModuleDescriptor, &'static TypeDescriptor)> {
+        let (qualifier, name) = qualified_name.rsplit_once("::")?;
         self.modules.iter().find_map(|module| {
-            let short_prefix = format!("{}.", module.name);
-            let path_prefix = format!("{}.", module.path);
-            let name = qualified_name
-                .strip_prefix(&path_prefix)
-                .or_else(|| qualified_name.strip_prefix(&short_prefix))?;
-            module.ty(name).map(|ty| (module, ty))
+            (module.name == qualifier || module.path.split('.').eq(qualifier.split("::")))
+                .then(|| module.ty(name))
+                .flatten()
+                .map(|ty| (module, ty))
         })
     }
 

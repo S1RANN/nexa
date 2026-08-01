@@ -40,15 +40,33 @@ const nexaExamples = [
   "examples/combat-runtime/reload/invalid.nexa",
   "examples/combat-runtime/reload/v1.nexa",
   "examples/combat-runtime/reload/v2.nexa",
+  "examples/hello-runtime/hello.nexa",
+  "examples/language-scale/packages/app/src/language_scale/app.nexa",
+  "examples/language-scale/packages/app/src/language_scale/flow.nexa",
+  "examples/language-scale/packages/app/src/language_scale/rules.nexa",
+  "examples/language-scale/packages/app/src/language_scale/text.nexa",
+  "examples/language-scale/packages/app/tests/basic/scoring.nexa",
+  "examples/language-scale/packages/snake-common/src/math.nexa",
+  "examples/snake-game/packages/builtin/classic-hud/src/snake/classic_hud.nexa",
+  "examples/snake-game/packages/builtin/classic-rules/src/snake/classic_rules.nexa",
+  "examples/snake-game/packages/builtin/classic-spawn/src/snake/classic_spawn.nexa",
+  "examples/snake-game/packages/builtin/default-skin/src/snake/default_skin.nexa",
+  "examples/snake-game/packages/dlc/food-chaos/src/snake/food_chaos.nexa",
+  "examples/snake-game/packages/mods/corner-spawn/src/snake/corner_spawn.nexa",
+  "examples/snake-game/packages/mods/neon-skin/src/snake/neon_skin.nexa",
+  "examples/snake-game/packages/mods/score-overlay/src/snake/score_overlay.nexa",
+  "examples/snake-game/packages/mods/weird-foods/src/snake/weird_foods.nexa",
 ];
 const nidlExamples = [
   "editors/fixtures/m4-language.nidl",
-  "examples/combat-runtime/combat_api.nidl",
-  "crates/nexa-idl/tests/fixtures/business_host/interface.nidl",
-];
-const invalidNidlExamples = [
   "editors/fixtures/nidl-comment-invalid.nidl",
   "editors/fixtures/nidl-enum-comment-invalid.nidl",
+  "examples/combat-runtime/combat_api.nidl",
+  "examples/game.nidl",
+  "examples/hello-runtime/hello_api.nidl",
+  "examples/language-scale/language_scale.nidl",
+  "examples/snake-game/snake_api.nidl",
+  "crates/nexa-idl/tests/fixtures/business_host/contract.nidl",
 ];
 
 const queryChecks = [
@@ -86,13 +104,13 @@ const queryChecks = [
     idlGrammarDirectory,
     "tree-sitter-nexa-idl/queries/highlights.scm",
     "editors/fixtures/m4-language.nidl",
-    ["keyword", "function", "type", "type.builtin"],
+    ["keyword", "function", "type", "type.builtin", "attribute"],
   ],
   [
     idlGrammarDirectory,
     "zed/languages/nexa-idl/highlights.scm",
     "editors/fixtures/m4-language.nidl",
-    ["keyword", "function", "type", "type.builtin"],
+    ["keyword", "function", "type", "type.builtin", "attribute"],
   ],
   [
     idlGrammarDirectory,
@@ -265,8 +283,10 @@ function validateContributions() {
     path.join(vscodeDirectory, "language-configuration", "nexa-idl.json"),
   );
   assert(
-    !Object.hasOwn(nidlConfig, "comments"),
-    "NIDL must not register comments",
+    nidlConfig.comments?.lineComment === "//" &&
+      nidlConfig.comments?.blockComment?.[0] === "/*" &&
+      nidlConfig.comments?.blockComment?.[1] === "*/",
+    "NIDL must register its v2 line, block, and documentation comments",
   );
 
   for (const [language, config] of [
@@ -307,9 +327,8 @@ function validateZedFiles() {
     "Nexa IDL must use grammar nexa_idl",
   );
   assert(
-    !Object.hasOwn(idlConfig, "line_comments") &&
-      !idlSource.includes("line_comments"),
-    "Nexa IDL must not register line comments",
+    idlConfig.line_comments?.includes("// "),
+    "Nexa IDL must register v2 line and documentation comments",
   );
 
   const manifest = TOML.parse(renderZedManifest());
@@ -352,14 +371,63 @@ function validateSyntaxContract() {
     nexaGrammar.rules.line_comment &&
       nexaGrammar.rules.block_comment &&
       nexaGrammar.rules.doc_comment,
-    "Nexa Tree-sitter grammar must define all M4 comments",
+    "Nexa Tree-sitter grammar must define all v2 comments",
   );
+  for (const rule of [
+    "use_declaration",
+    "namespace_path",
+    "field_declaration",
+    "postfix_expression",
+    "await_suffix",
+    "attribute",
+  ]) {
+    assert(
+      nexaGrammar.rules[rule],
+      `Nexa v2 Tree-sitter grammar is missing ${rule}`,
+    );
+  }
+  for (const rule of [
+    "module_declaration",
+    "import_declaration",
+    "await_expression",
+    "with_expression",
+  ]) {
+    assert(
+      !nexaGrammar.rules[rule],
+      `legacy Nexa Tree-sitter rule ${rule} remains active`,
+    );
+  }
   assert(
-    !idlGrammar.rules.line_comment &&
-      !idlGrammar.rules.block_comment &&
-      !idlGrammar.rules.doc_comment,
-    "NIDL Tree-sitter grammar must reject comments",
+    idlGrammar.rules.line_comment &&
+      idlGrammar.rules.block_comment &&
+      idlGrammar.rules.doc_comment,
+    "NIDL Tree-sitter grammar must define v2 comments",
   );
+  for (const rule of [
+    "nidl_document",
+    "handle_declaration",
+    "host_block",
+    "nexa_block",
+    "host_function_declaration",
+    "nexa_function_declaration",
+    "nidl_attribute",
+  ]) {
+    assert(
+      idlGrammar.rules[rule],
+      `NIDL v2 Tree-sitter grammar is missing ${rule}`,
+    );
+  }
+  for (const rule of [
+    "opaque_declaration",
+    "export_declaration",
+    "request_policy",
+    "void_type",
+  ]) {
+    assert(
+      !idlGrammar.rules[rule],
+      `legacy NIDL Tree-sitter rule ${rule} remains active`,
+    );
+  }
   assert(
     syntax.nexa.attributeKeywords.includes("stable") &&
       syntax.nexa.attributeKeywords.includes("test"),
@@ -371,8 +439,39 @@ function validateSyntaxContract() {
     "M4 loop control keywords are missing",
   );
   assert(
-    syntax.nidl.builtinTypes.includes("void"),
-    "NIDL builtin types must include void",
+    ["mut", "use", "async"].every((keyword) =>
+      [
+        ...syntax.nexa.declarationKeywords,
+        ...syntax.nexa.effectKeywords,
+        ...syntax.nexa.statementKeywords,
+      ].includes(keyword),
+    ),
+    "Nexa v2 surface keywords are missing",
+  );
+  assert(
+    ["var", "module", "import", "task", "immediate", "migration", "activation", "cleanup", "stateful", "with"]
+      .filter((keyword) => !syntax.nexa.attributeKeywords.includes(keyword))
+      .every(
+        (keyword) =>
+          ![
+            ...syntax.nexa.declarationKeywords,
+            ...syntax.nexa.effectKeywords,
+            ...syntax.nexa.statementKeywords,
+          ].includes(keyword),
+      ),
+    "legacy Nexa surface keywords remain active",
+  );
+  assert(
+    ["contract", "host", "nexa", "handle", "async", "fn"].every((keyword) =>
+      [
+        ...syntax.nidl.declarationKeywords,
+        ...syntax.nidl.modeKeywords,
+      ].includes(keyword),
+    ) &&
+      ["void", "request", "host_request", "array", "buffer"].every(
+        (type) => !syntax.nidl.builtinTypes.includes(type),
+      ),
+    "NIDL v2 keywords or generic type spelling are invalid",
   );
 
   const nexaTextMate = parseJson(
@@ -386,8 +485,22 @@ function validateSyntaxContract() {
     "Nexa TextMate grammar must define comments",
   );
   assert(
-    !Object.hasOwn(idlTextMate.repository, "comments"),
-    "NIDL TextMate grammar must reject comments",
+    Object.hasOwn(idlTextMate.repository, "comments"),
+    "NIDL TextMate grammar must define comments",
+  );
+  assert(
+    read(
+      path.join(idlGrammarDirectory, "queries", "highlights.scm"),
+    ).includes("(doc_comment) @comment.documentation") &&
+      read(
+        path.join(
+          zedDirectory,
+          "languages",
+          "nexa-idl",
+          "highlights.scm",
+        ),
+      ).includes("(doc_comment) @comment.documentation"),
+    "NIDL documentation comments must be highlighted in Tree-sitter and Zed",
   );
   const operatorPatterns = nexaTextMate.repository.operators.patterns.map(
     (pattern) => pattern.match,
@@ -444,7 +557,7 @@ async function validateTextMateTokenization() {
     },
     {
       scopeName: "source.nexa-idl",
-      line: "sync fn log(message: string) -> i32;",
+      line: "async fn load_profile(id: string) -> Result<Profile, LoadError>;",
       operators: [["->", "keyword.operator.arrow.nexa-idl"]],
     },
   ];
@@ -515,7 +628,7 @@ function checkGeneratedFiles(temporaryDirectory) {
   }
 }
 
-function parseExamples(grammar, files, environment, expectedSuccess) {
+function parseExamples(grammar, files, environment) {
   const result = spawnSync(
     "tree-sitter",
     [
@@ -542,14 +655,12 @@ function parseExamples(grammar, files, environment, expectedSuccess) {
     summary.source_count === files.length,
     "Tree-sitter did not parse every required example",
   );
-  const matchesExpectation = summary.parse_summaries.every(
-    (item) => item.successful === expectedSuccess,
+  const allSuccessful = summary.parse_summaries.every(
+    (item) => item.successful,
   );
   assert(
-    matchesExpectation,
-    expectedSuccess
-      ? "A required example contains ERROR or MISSING nodes"
-      : "NIDL unexpectedly accepted comment syntax in at least one invalid fixture",
+    allSuccessful,
+    "A required example contains ERROR or MISSING nodes",
   );
 }
 
@@ -558,14 +669,8 @@ function validateExamplesAndQueries(temporaryDirectory) {
     ...process.env,
     XDG_CACHE_HOME: path.join(temporaryDirectory, "cache"),
   };
-  parseExamples(grammarDirectory, nexaExamples, environment, true);
-  parseExamples(idlGrammarDirectory, nidlExamples, environment, true);
-  parseExamples(
-    idlGrammarDirectory,
-    invalidNidlExamples,
-    environment,
-    false,
-  );
+  parseExamples(grammarDirectory, nexaExamples, environment);
+  parseExamples(idlGrammarDirectory, nidlExamples, environment);
 
   for (const [grammar, query, example, expectedCaptures] of queryChecks) {
     const result = run(
@@ -606,7 +711,7 @@ try {
   checkGeneratedFiles(temporaryDirectory);
   validateExamplesAndQueries(temporaryDirectory);
   console.log(
-    `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${nidlExamples.length} NIDL examples, ${invalidNidlExamples.length} rejected NIDL comment fixtures, ${queryChecks.length} queries).`,
+    `Nexa editor support check passed (${nexaExamples.length} Nexa examples, ${nidlExamples.length} NIDL v2 examples including comments, ${queryChecks.length} queries).`,
   );
 } finally {
   fs.rmSync(temporaryDirectory, { recursive: true, force: true });

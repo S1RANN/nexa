@@ -1,23 +1,23 @@
 # Nexa diagnostics
 
-Status: M3R1 COMPLETE
+Status: M4 COMPLETE; M4R1 COMPLETE
 
 `nexa::Diagnostic` remains the leaf truth for parser, type checker, compiler,
 Verifier, Runtime, and Reload errors. `nexa-embed` adds package identity,
-source files, development generation, export/event context, sanitized task
+source files, development generation, entrypoint/event context, sanitized task
 identity, related locations, and textual fixes through `EngineDiagnostic`.
 It does not translate compiler codes into a generic package failure.
 
 ## Stable stages and codes
 
 Engine stages cover source discovery, manifest, policy, entitlement, parse,
-type check, compile, verify, load, export, handler, migration, activation,
+type check, compile, verify, load, entrypoint, handler, migration, activation,
 Reload, Runtime, resource, persistence, and shutdown.
 
 Engine-only codes occupy the stable `NX7xxx` range:
 
 - `NX7001`–`NX7004`: source, manifest, policy, and entitlement;
-- `NX7010`–`NX7011`: required export presence and signature;
+- `NX7010`–`NX7011`: required entrypoint presence and signature;
 - `NX7101`–`NX7103`: MustComplete yield, wait, and trap;
 - `NX7201`–`NX7202`: pre-commit rollback and activation fault;
 - `NX7302`–`NX7303`: persistence and shutdown. `NX7301` is intentionally unregistered until a
@@ -44,7 +44,7 @@ UTF-16 ranges.
 Runtime traps preserve module epoch, sanitized package-local task ID, source
 span, Nexa script frames, and an optional Host-call boundary. Function metadata
 uses stable IDs and definition spans; missing sidecar data falls back to
-`<function #N>`.
+`<unknown function>` and never exposes a Bytecode slot as source identity.
 
 ## Renderers
 

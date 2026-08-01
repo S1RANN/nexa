@@ -157,8 +157,11 @@ fn read_utf8(path: &Path) -> Result<String, PackageLoadError> {
     String::from_utf8(bytes).map_err(|_| PackageLoadError::NonUtf8File(path.to_path_buf()))
 }
 
-/// Validates one in-memory production source using the same complete syntax/module-path rules as
+/// Derives one in-memory production source's module identity using the same path rules as
 /// directory discovery.
+///
+/// Source syntax is deliberately left to package analysis so filesystem and in-memory sources
+/// receive the same structured diagnostics from the selected Product or Test target.
 pub fn validate_module_source(
     path: &NormalizedPackagePath,
     source: &str,
@@ -166,12 +169,16 @@ pub fn validate_module_source(
     validate_module_source_for_role(path, source, SourceRole::Production)
 }
 
+/// Derives a source's path-owned module identity without parsing its text.
+///
+/// In particular, an invalid Test source must remain loadable as an immutable snapshot so a later
+/// Test analysis can diagnose it. Product discovery likewise does not become a second parser.
 pub fn validate_module_source_for_role(
     path: &NormalizedPackagePath,
-    source: &str,
+    _source: &str,
     role: SourceRole,
 ) -> Result<ModulePath, PackageLoadError> {
-    let expected = match role {
+    match role {
         SourceRole::Production => ModulePath::from_source_path(path),
         SourceRole::Test => path
             .as_str()
@@ -183,85 +190,7 @@ pub fn validate_module_source_for_role(
             })
             .and_then(|relative| ModulePath::new(format!("test.{}", relative.replace('/', ".")))),
     }
-    .map_err(PackageLoadError::Identity)?;
-    let declared =
-        scan_module_header(source).map_err(|reason| PackageLoadError::InvalidModuleHeader {
-            path: path.clone(),
-            reason,
-        })?;
-    if declared != expected {
-        return Err(PackageLoadError::ModulePathMismatch {
-            path: path.clone(),
-            expected,
-            declared,
-        });
-    }
-    Ok(declared)
-}
-
-fn scan_module_header(source: &str) -> Result<ModulePath, String> {
-    use nexa_syntax::{Keyword, TokenKind};
-
-    let source = source.strip_prefix('\u{feff}').unwrap_or(source);
-    let lexed = nexa_syntax::lex_nexa(source).map_err(|error| error.to_string())?;
-    let mut tokens = lexed
-        .tokens
-        .iter()
-        .filter(|token| !token.kind.is_trivia())
-        .peekable();
-    let Some(module_keyword) = tokens.next() else {
-        return Err("source must begin with a module declaration".to_owned());
-    };
-    if module_keyword.kind != TokenKind::Keyword(Keyword::Module) {
-        return Err("source must begin with a module declaration".to_owned());
-    }
-
-    let mut path = String::new();
-    let mut expect_segment = true;
-    loop {
-        let Some(token) = tokens.next() else {
-            return Err("module declaration must end with `;`".to_owned());
-        };
-        match (expect_segment, token.kind) {
-            (true, TokenKind::Identifier) => {
-                path.push_str(
-                    lexed
-                        .source
-                        .slice(token.range)
-                        .expect("lexer token ranges are valid"),
-                );
-                expect_segment = false;
-            }
-            (false, TokenKind::Dot) => {
-                path.push('.');
-                expect_segment = true;
-            }
-            (false, TokenKind::Semicolon) => break,
-            _ => return Err("module declaration contains an invalid path".to_owned()),
-        }
-    }
-    let declared = ModulePath::new(path).map_err(|error| error.to_string())?;
-
-    // Only additional top-level declarations are header errors. Syntax errors inside function
-    // bodies are intentionally left for package analysis so they retain structured diagnostics.
-    let mut brace_depth = 0_u32;
-    let mut module_count = 1_usize;
-    for token in tokens {
-        match token.kind {
-            TokenKind::LBrace => brace_depth = brace_depth.saturating_add(1),
-            TokenKind::RBrace => brace_depth = brace_depth.saturating_sub(1),
-            TokenKind::Keyword(Keyword::Module) if brace_depth == 0 => {
-                module_count = module_count.saturating_add(1);
-            }
-            _ => {}
-        }
-    }
-    if module_count != 1 {
-        return Err(format!(
-            "expected exactly one module declaration, found {module_count}"
-        ));
-    }
-    Ok(declared)
+    .map_err(PackageLoadError::Identity)
 }
 
 #[derive(Debug)]
@@ -275,15 +204,6 @@ pub enum PackageLoadError {
     RootEscape(PathBuf),
     NonUtf8File(PathBuf),
     MissingEntry(NormalizedPackagePath),
-    InvalidModuleHeader {
-        path: NormalizedPackagePath,
-        reason: String,
-    },
-    ModulePathMismatch {
-        path: NormalizedPackagePath,
-        expected: ModulePath,
-        declared: ModulePath,
-    },
 }
 
 impl fmt::Display for PackageLoadError {
@@ -299,27 +219,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn module_header_scanner_skips_nexa_comments() {
+    fn module_identity_is_derived_only_from_the_source_path() {
+        let path = NormalizedPackagePath::new("src/food/effects.nexa").unwrap();
         assert_eq!(
-            scan_module_header(
-                "\u{feff}/// docs\n/* package docs */\nmodule food.effects;\npub fn x() {}"
-            )
-            .unwrap()
-            .as_str(),
-            "food.effects"
-        );
-    }
-
-    #[test]
-    fn module_header_scanner_rejects_path_invalid_names() {
-        assert!(scan_module_header("module Food.effects;").is_err());
-        assert!(scan_module_header("fn main() {}").is_err());
-    }
-
-    #[test]
-    fn module_header_scanner_leaves_body_errors_for_analysis() {
-        assert_eq!(
-            scan_module_header("module food.effects;\npub fn broken( { module nested;")
+            validate_module_source(&path, "pub fn score() -> i32 { return 1; }")
                 .unwrap()
                 .as_str(),
             "food.effects"
@@ -327,7 +230,13 @@ mod tests {
     }
 
     #[test]
-    fn module_header_scanner_rejects_duplicate_top_level_declarations() {
-        assert!(scan_module_header("module food.effects;\nmodule food.other;").is_err());
+    fn test_module_identity_is_derived_from_the_test_path() {
+        let path = NormalizedPackagePath::new("tests/food/effects.nexa").unwrap();
+        assert_eq!(
+            validate_module_source_for_role(&path, "", SourceRole::Test)
+                .unwrap()
+                .as_str(),
+            "test.food.effects"
+        );
     }
 }

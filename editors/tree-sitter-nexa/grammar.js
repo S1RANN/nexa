@@ -1,6 +1,6 @@
 const syntax = require("../language-syntax.json");
 
-const nexaKeywords = Object.fromEntries(
+const keywords = Object.fromEntries(
   [
     ...syntax.nexa.declarationKeywords,
     ...syntax.nexa.visibilityKeywords,
@@ -9,12 +9,6 @@ const nexaKeywords = Object.fromEntries(
     ...syntax.nexa.attributeKeywords,
     ...syntax.nexa.literalKeywords,
   ].map((keyword) => [keyword, keyword]),
-);
-const dottedMigrationIntrinsics = syntax.nexa.migrationIntrinsics.filter(
-  (intrinsic) => intrinsic.includes("."),
-);
-const bareMigrationIntrinsics = syntax.nexa.migrationIntrinsics.filter(
-  (intrinsic) => !intrinsic.includes("."),
 );
 
 const PREC = {
@@ -25,10 +19,7 @@ const PREC = {
   ADDITIVE: 5,
   MULTIPLICATIVE: 6,
   UNARY: 7,
-  AWAIT: 8,
-  WITH: 9,
-  TRY: 10,
-  CALL: 11,
+  POSTFIX: 8,
 };
 
 module.exports = grammar({
@@ -43,31 +34,30 @@ module.exports = grammar({
 
   word: ($) => $.lower_identifier,
 
-  supertypes: ($) => [$.declaration, $.statement, $.expression, $.type],
+  supertypes: ($) => [
+    $.declaration,
+    $.statement,
+    $.expression,
+    $.primary_expression,
+    $.type,
+  ],
+
+  conflicts: ($) => [
+    [$.expression_path_segment, $.type_path_segment],
+  ],
 
   rules: {
     source_file: ($) =>
-      seq(
-        optional($.module_declaration),
-        repeat($.import_declaration),
-        repeat($.declaration),
-      ),
+      repeat(choice($.use_declaration, $.declaration, $.statement)),
 
     doc_comment: (_) => token(prec(2, /\/\/\/[^\n\r]*/)),
     line_comment: (_) => token(prec(1, /\/\/[^\n\r]*/)),
     block_comment: (_) => token(seq("/*", /[^*]*\*+([^/*][^*]*\*+)*/, "/")),
 
-    module_declaration: ($) =>
+    use_declaration: ($) =>
       seq(
-        field("keyword", $.module_keyword),
-        field("name", $.module_path),
-        ";",
-      ),
-
-    import_declaration: ($) =>
-      seq(
-        field("keyword", $.import_keyword),
-        field("name", choice($.module_path, $.host_module)),
+        field("keyword", $.use_keyword),
+        field("path", $.namespace_path),
         optional(
           seq(
             field("alias_keyword", $.as_keyword),
@@ -77,10 +67,11 @@ module.exports = grammar({
         ";",
       ),
 
-    module_path: ($) =>
-      prec.left(seq($.lower_identifier, repeat(seq(".", $.lower_identifier)))),
-
-    host_module: (_) => "host",
+    namespace_path: ($) =>
+      seq(
+        field("root", $.identifier),
+        repeat1(seq("::", field("segment", $.identifier))),
+      ),
 
     declaration: ($) =>
       choice(
@@ -92,37 +83,41 @@ module.exports = grammar({
       ),
 
     attribute: ($) =>
+      seq(
+        "@",
+        field("name", $.attribute_name),
+        optional(
+          seq(
+            "(",
+            optional(commaSep1($.attribute_argument)),
+            optional(","),
+            ")",
+          ),
+        ),
+      ),
+
+    attribute_argument: ($) =>
       choice(
-        $.stateful_attribute,
-        $.activation_attribute,
-        $.stable_attribute,
-        $.test_attribute,
+        seq(
+          field("name", $.identifier),
+          "=",
+          field("value", $.attribute_value),
+        ),
+        field("value", $.attribute_value),
       ),
 
-    stateful_attribute: ($) =>
-      seq(
-        "@",
-        field("name", $.stateful_keyword),
-        optional(seq("(", field("version", $.integer_literal), ")")),
+    attribute_value: ($) =>
+      choice(
+        $.string_literal,
+        $.integer_literal,
+        $.boolean_literal,
+        $.identifier,
       ),
-
-    activation_attribute: ($) =>
-      seq("@", field("name", $.activation_keyword)),
-
-    stable_attribute: ($) =>
-      seq(
-        "@",
-        field("name", $.stable_keyword),
-        "(",
-        field("identity", $.string_literal),
-        ")",
-      ),
-
-    test_attribute: ($) => seq("@", field("name", $.test_keyword)),
 
     visibility: ($) =>
       choice(
         $.pub_keyword,
+        $.package_keyword,
         seq($.pub_keyword, "(", $.package_keyword, ")"),
       ),
 
@@ -167,40 +162,50 @@ module.exports = grammar({
       ),
 
     field_declaration_block: ($) =>
-      seq("{", repeat($.field_declaration), "}"),
+      seq("{", optional(commaSep1($.field_declaration)), optional(","), "}"),
 
     field_declaration: ($) =>
       seq(
-        repeat($.stable_attribute),
+        repeat($.attribute),
+        optional(field("mutable", $.mut_keyword)),
         field("name", $.identifier),
         ":",
         field("type", $.type),
-        ";",
       ),
 
     enum_variant_block: ($) =>
-      seq("{", repeat(seq($.enum_variant, optional(","))), "}"),
+      seq("{", optional(commaSep1($.enum_variant)), optional(","), "}"),
 
     enum_variant: ($) =>
       seq(
         field("name", $.type_identifier),
-        optional(seq("(", field("payload", $.type), ")")),
+        optional(
+          choice(
+            seq("(", optional(commaSep1($.type)), optional(","), ")"),
+            field("fields", $.field_declaration_block),
+          ),
+        ),
       ),
 
     function_declaration: ($) =>
       seq(
         repeat($.attribute),
         optional(field("visibility", $.visibility)),
-        optional(field("effect", $.effect_keyword)),
+        optional(field("effect", $.async_keyword)),
         field("keyword", $.function_keyword),
         field("name", $.identifier),
         field("parameters", $.parameter_list),
-        field("arrow", $.return_arrow_operator),
-        field("return_type", $.type),
+        optional(
+          seq(
+            field("arrow", $.return_arrow_operator),
+            field("return_type", $.type),
+          ),
+        ),
         field("body", $.block),
       ),
 
-    parameter_list: ($) => seq("(", optional(commaSep1($.parameter)), ")"),
+    parameter_list: ($) =>
+      seq("(", optional(commaSep1($.parameter)), optional(","), ")"),
 
     parameter: ($) =>
       seq(field("name", $.identifier), ":", field("type", $.type)),
@@ -223,11 +228,12 @@ module.exports = grammar({
       ),
 
     return_statement: ($) =>
-      seq($.return_keyword, field("value", $.expression), ";"),
+      seq($.return_keyword, optional(field("value", $.expression)), ";"),
 
     binding_statement: ($) =>
       seq(
-        field("keyword", choice($.let_keyword, $.var_keyword)),
+        field("keyword", $.let_keyword),
+        optional(field("mutable", $.mut_keyword)),
         field("name", $.identifier),
         optional(seq(":", field("type", $.type))),
         "=",
@@ -273,11 +279,11 @@ module.exports = grammar({
     yield_statement: ($) => seq($.yield_keyword, ";"),
 
     defer_statement: ($) =>
-      seq($.defer_keyword, field("value", $.expression), ";"),
+      seq($.defer_keyword, field("value", choice($.block, $.expression)), ";"),
 
     assignment_statement: ($) =>
       seq(
-        field("target", $.member_expression),
+        field("target", choice($.path_expression, $.postfix_expression)),
         "=",
         field("value", $.expression),
         ";",
@@ -287,32 +293,12 @@ module.exports = grammar({
 
     expression: ($) =>
       choice(
-        $.await_expression,
         $.match_expression,
-        $.collection_new_expression,
-        $.migration_member_call,
-        $.migration_intrinsic_call,
-        $.constructor_expression,
-        $.new_expression,
-        $.struct_literal,
-        $.with_expression,
-        $.try_expression,
         $.binary_expression,
         $.unary_expression,
-        $.call_expression,
-        $.generic_name,
-        $.member_expression,
-        $.parenthesized_expression,
-        $.boolean_literal,
-        $.float_literal,
-        $.integer_literal,
-        $.rune_literal,
-        $.string_literal,
-        $.identifier,
+        $.postfix_expression,
+        $.primary_expression,
       ),
-
-    await_expression: ($) =>
-      prec(PREC.AWAIT, seq($.await_keyword, field("value", $.expression))),
 
     match_expression: ($) =>
       prec.right(
@@ -320,150 +306,51 @@ module.exports = grammar({
           $.match_keyword,
           field("value", $.expression),
           "{",
-          repeat(seq($.match_arm, optional(","))),
+          optional(commaSep1($.match_arm)),
+          optional(","),
           "}",
         ),
       ),
 
     match_arm: ($) =>
       seq(
-        field("variant", $.type_identifier),
-        optional(seq("(", field("binding", $.identifier), ")")),
+        field("pattern", $.match_pattern),
         field("arrow", $.match_arrow_operator),
-        field("value", $.expression),
+        field("value", choice($.block, $.expression)),
       ),
 
-    new_expression: ($) =>
-      prec(
-        PREC.CALL,
-        seq(
-          $.new_keyword,
-          field("type", $.type_identifier),
-          field("fields", $.field_initializer_block),
-        ),
-      ),
-
-    collection_new_expression: ($) =>
-      prec(
-        PREC.CALL,
-        seq(
-          field("collection", $.collection_type),
-          ".",
-          field("constructor", $.new_keyword),
-          field("type_arguments", $.type_argument_list),
-          field("arguments", $.argument_list),
-        ),
-      ),
-
-    migration_member_call: ($) =>
-      prec(
-        PREC.CALL,
-        seq(
-          choice(
-            ...dottedMigrationIntrinsics.map((intrinsic) => {
-              const [namespace, functionName] = intrinsic.split(".");
-              return seq(
-                field("namespace", alias(namespace, $.migration_namespace)),
-                ".",
-                field("function", alias(functionName, $.migration_function)),
-              );
-            }),
-          ),
-          optional(field("type_arguments", $.type_argument_list)),
-          field("arguments", $.argument_list),
-        ),
-      ),
-
-    collection_type: (_) =>
-      choice(
-        ...syntax.nexa.builtinTypes.filter((type) =>
-          ["Array", "Map"].includes(type),
-        ),
-      ),
-
-    migration_namespace: (_) =>
-      choice(
-        ...new Set(
-          dottedMigrationIntrinsics.map((intrinsic) => intrinsic.split(".")[0]),
-        ),
-      ),
-
-    migration_function: (_) =>
-      choice(
-        ...new Set(
-          dottedMigrationIntrinsics.map((intrinsic) => intrinsic.split(".")[1]),
-        ),
-      ),
-
-    migration_intrinsic_call: ($) =>
-      prec(
-        PREC.CALL,
-        seq(
-          field("function", $.migration_intrinsic_name),
-          optional(field("type_arguments", $.type_argument_list)),
-          field("arguments", $.argument_list),
-        ),
-      ),
-
-    migration_intrinsic_name: (_) => choice(...bareMigrationIntrinsics),
-
-    constructor_expression: ($) =>
-      prec(
-        PREC.CALL,
-        choice(
-          field("constructor", alias("None", $.constructor_name)),
-          seq(
-            field(
-              "constructor",
-              alias(
-                choice(
-                  ...syntax.nexa.constructors.filter(
-                    (constructor) => constructor !== "None",
-                  ),
-                ),
-                $.constructor_name,
-              ),
-            ),
-            "(",
-            field("payload", $.expression),
-            ")",
-          ),
-        ),
-      ),
-
-    constructor_name: (_) => choice(...syntax.nexa.constructors),
-
-    struct_literal: ($) =>
-      prec(
-        PREC.CALL,
-        seq(
-          field("type", $.upper_identifier),
-          field("fields", $.field_initializer_block),
-        ),
-      ),
-
-    field_initializer_block: ($) =>
-      seq("{", optional(commaSep1($.field_initializer)), optional(","), "}"),
-
-    field_initializer: ($) =>
+    match_pattern: ($) =>
       seq(
-        field("name", $.identifier),
-        ":",
-        field("value", $.expression),
-      ),
-
-    with_expression: ($) =>
-      prec.left(
-        PREC.WITH,
-        seq(
-          field("value", $.expression),
-          $.with_keyword,
-          field("updates", $.field_initializer_block),
+        $.path_expression,
+        optional(
+          choice(
+            seq(
+              "(",
+              optional(commaSep1($.match_pattern_binding)),
+              optional(","),
+              ")",
+            ),
+            seq(
+              "{",
+              optional(commaSep1($.match_pattern_binding)),
+              optional(","),
+              "}",
+            ),
+          ),
         ),
       ),
 
-    try_expression: ($) =>
-      prec.left(PREC.TRY, seq(field("value", $.expression), "?")),
+    match_pattern_binding: ($) =>
+      choice(
+        $.identifier,
+        seq(field("field", $.identifier), ":", field("binding", $.identifier)),
+      ),
+
+    unary_expression: ($) =>
+      prec(
+        PREC.UNARY,
+        seq(field("operator", alias(choice("!", "-"), $.operator)), $.expression),
+      ),
 
     binary_expression: ($) =>
       choice(
@@ -475,90 +362,130 @@ module.exports = grammar({
         binary($, PREC.MULTIPLICATIVE, choice("*", "/")),
       ),
 
-    unary_expression: ($) =>
-      prec(
-        PREC.UNARY,
-        seq(field("operator", alias(choice("!", "-"), $.operator)), $.expression),
-      ),
-
-    call_expression: ($) =>
-      prec(
-        PREC.CALL,
+    postfix_expression: ($) =>
+      prec.left(
+        PREC.POSTFIX,
         seq(
+          field("operand", choice($.primary_expression, $.postfix_expression)),
           field(
-            "function",
+            "operation",
             choice(
-              $.identifier,
-              $.qualified_identifier,
-              $.member_expression,
-              $.generic_name,
+              $.call_suffix,
+              $.field_suffix,
+              $.await_suffix,
+              $.try_suffix,
+              $.index_suffix,
             ),
           ),
-          field("arguments", $.argument_list),
         ),
       ),
 
-    argument_list: ($) => seq("(", optional(commaSep1($.expression)), ")"),
+    call_suffix: ($) =>
+      seq(
+        optional(field("type_arguments", $.type_argument_list)),
+        field("arguments", $.argument_list),
+      ),
 
-    generic_name: ($) =>
+    field_suffix: ($) => seq(".", field("property", $.identifier)),
+    await_suffix: ($) => seq(".", field("keyword", $.await_keyword)),
+    try_suffix: (_) => "?",
+    index_suffix: ($) => seq("[", field("index", $.expression), "]"),
+
+    argument_list: ($) =>
+      seq("(", optional(commaSep1($.expression)), optional(","), ")"),
+
+    primary_expression: ($) =>
+      choice(
+        $.new_expression,
+        $.struct_literal,
+        $.tuple_expression,
+        $.parenthesized_expression,
+        $.path_expression,
+        $.boolean_literal,
+        $.float_literal,
+        $.integer_literal,
+        $.rune_literal,
+        $.string_literal,
+      ),
+
+    new_expression: ($) =>
       prec(
-        PREC.CALL,
+        PREC.POSTFIX,
         seq(
-          field(
-            "name",
-            choice($.identifier, $.qualified_identifier, $.member_expression),
-          ),
-          field("type_arguments", $.type_argument_list),
+          $.new_keyword,
+          field("type", $.type_path),
+          field("fields", $.field_initializer_block),
         ),
       ),
 
-    member_expression: ($) =>
-      prec.left(
-        PREC.CALL,
+    struct_literal: ($) =>
+      prec(
+        PREC.POSTFIX,
         seq(
-          field(
-            "object",
-            choice($.identifier, $.qualified_identifier, $.call_expression),
-          ),
-          ".",
-          field("property", $.identifier),
+          field("type", $.type_path),
+          field("fields", $.field_initializer_block),
         ),
+      ),
+
+    field_initializer_block: ($) =>
+      seq("{", optional(commaSep1($.field_initializer)), optional(","), "}"),
+
+    field_initializer: ($) =>
+      choice(
+        seq(
+          field("name", $.identifier),
+          ":",
+          field("value", $.expression),
+        ),
+        field("shorthand", $.identifier),
+        seq("..", field("base", $.expression)),
       ),
 
     parenthesized_expression: ($) => seq("(", $.expression, ")"),
 
-    type: ($) =>
-      choice(
-        $.builtin_type,
-        $.generic_type,
-        $.type_identifier,
-        $.qualified_type_identifier,
+    tuple_expression: ($) =>
+      seq(
+        "(",
+        field("element", $.expression),
+        ",",
+        optional(commaSep1(field("element", $.expression))),
+        ")",
+      ),
+
+    path_expression: ($) =>
+      seq(
+        $.expression_path_segment,
+        repeat(seq("::", $.expression_path_segment)),
+      ),
+
+    expression_path_segment: ($) =>
+      choice($.identifier, $.builtin_type, $.new_keyword),
+
+    type: ($) => choice($.generic_type, $.tuple_type, $.type_path),
+
+    tuple_type: ($) =>
+      seq(
+        "(",
+        field("element", $.type),
+        ",",
+        optional(commaSep1(field("element", $.type))),
+        ")",
       ),
 
     generic_type: ($) =>
       seq(
-        field(
-          "name",
-          choice(
-            $.builtin_type,
-            $.type_identifier,
-            $.qualified_type_identifier,
-          ),
-        ),
+        field("name", $.type_path),
         field("arguments", $.type_argument_list),
       ),
 
-    type_argument_list: ($) => seq("<", commaSep1($.type), ">"),
+    type_argument_list: ($) =>
+      seq("<", commaSep1($.type), optional(","), ">"),
 
-    qualified_type_identifier: ($) =>
-      prec.left(
-        seq($.lower_identifier, repeat1(seq(".", $.identifier))),
-      ),
+    type_path: ($) =>
+      seq($.type_path_segment, repeat(seq("::", $.type_path_segment))),
 
-    qualified_identifier: ($) =>
-      prec.left(seq($.identifier, repeat1(seq(".", $.identifier)))),
-
-    type_identifier: ($) => $.identifier,
+    type_path_segment: ($) => choice($.builtin_type, $.identifier),
+    type_identifier: ($) => $.upper_identifier,
     identifier: ($) => choice($.lower_identifier, $.upper_identifier),
     lower_identifier: (_) => /[a-z_][A-Za-z0-9_]*/,
     upper_identifier: (_) => /[A-Z][A-Za-z0-9_]*/,
@@ -582,49 +509,40 @@ module.exports = grammar({
       ),
 
     string_content: (_) => token.immediate(prec(1, /[^"\\$]+/)),
-    escape_sequence: (_) =>
-      token.immediate(/\\(?:[nrt\\"']|\$\{)/),
+    escape_sequence: (_) => token.immediate(/\\(?:[nrt\\"']|\$\{)/),
     interpolation: ($) =>
-      seq(
-        token.immediate("${"),
-        field("expression", $.expression),
-        "}",
-      ),
+      seq(token.immediate("${"), field("expression", $.expression), "}"),
 
     rune_literal: (_) =>
       token(seq("'", choice(/[^'\\]/, /\\[nrt\\']/), "'")),
 
-    module_keyword: (_) => nexaKeywords.module,
-    import_keyword: (_) => nexaKeywords.import,
-    as_keyword: (_) => nexaKeywords.as,
-    function_keyword: (_) => nexaKeywords.fn,
-    struct_keyword: (_) => nexaKeywords.struct,
-    enum_keyword: (_) => nexaKeywords.enum,
-    class_keyword: (_) => nexaKeywords.class,
-    const_keyword: (_) => nexaKeywords.const,
-    pub_keyword: (_) => nexaKeywords.pub,
-    package_keyword: (_) => nexaKeywords.package,
-    effect_keyword: (_) => choice(...syntax.nexa.effectKeywords),
-    stateful_keyword: (_) => nexaKeywords.stateful,
-    activation_keyword: (_) => nexaKeywords.activation,
-    stable_keyword: (_) => nexaKeywords.stable,
-    test_keyword: (_) => nexaKeywords.test,
-    return_keyword: (_) => nexaKeywords.return,
-    let_keyword: (_) => nexaKeywords.let,
-    var_keyword: (_) => nexaKeywords.var,
-    if_keyword: (_) => nexaKeywords.if,
-    else_keyword: (_) => nexaKeywords.else,
-    while_keyword: (_) => nexaKeywords.while,
-    match_keyword: (_) => nexaKeywords.match,
-    with_keyword: (_) => nexaKeywords.with,
-    new_keyword: (_) => nexaKeywords.new,
-    await_keyword: (_) => nexaKeywords.await,
-    yield_keyword: (_) => nexaKeywords.yield,
-    defer_keyword: (_) => nexaKeywords.defer,
-    for_keyword: (_) => nexaKeywords.for,
-    in_keyword: (_) => nexaKeywords.in,
-    break_keyword: (_) => nexaKeywords.break,
-    continue_keyword: (_) => nexaKeywords.continue,
+    attribute_name: ($) =>
+      choice(...syntax.nexa.attributeKeywords, $.identifier),
+    use_keyword: (_) => keywords.use,
+    as_keyword: (_) => keywords.as,
+    function_keyword: (_) => keywords.fn,
+    struct_keyword: (_) => keywords.struct,
+    enum_keyword: (_) => keywords.enum,
+    class_keyword: (_) => keywords.class,
+    const_keyword: (_) => keywords.const,
+    pub_keyword: (_) => keywords.pub,
+    package_keyword: (_) => keywords.package,
+    async_keyword: (_) => keywords.async,
+    return_keyword: (_) => keywords.return,
+    let_keyword: (_) => keywords.let,
+    mut_keyword: (_) => keywords.mut,
+    if_keyword: (_) => keywords.if,
+    else_keyword: (_) => keywords.else,
+    while_keyword: (_) => keywords.while,
+    match_keyword: (_) => keywords.match,
+    new_keyword: (_) => keywords.new,
+    await_keyword: (_) => keywords.await,
+    yield_keyword: (_) => keywords.yield,
+    defer_keyword: (_) => keywords.defer,
+    for_keyword: (_) => keywords.for,
+    in_keyword: (_) => keywords.in,
+    break_keyword: (_) => keywords.break,
+    continue_keyword: (_) => keywords.continue,
 
     return_arrow_operator: (_) => "->",
     match_arrow_operator: (_) => "=>",

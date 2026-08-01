@@ -1,18 +1,20 @@
 use std::collections::BTreeMap;
 
 use nexa_bytecode::{
-    FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, Signature, StateSchema,
-    ValueType,
+    FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap, ScriptExport, Signature,
+    StateSchema, ValueType,
 };
 use nexa_core::StableId;
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostRegistry, HostTrap, Object, RealmConfig, RealmRuntime,
-    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue, StateObject, StateValue,
-    StepConfig, TaskLimits, TaskPoll, YieldReason,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap, Object,
+    RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeValue,
+    StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const HOST: StableId = StableId(0x524f_4f54_4d41_5053);
+const NESTED_CALL_EXPORT: StableId = StableId(0x524f_4f54_4341_4c4c);
+const STATE_HANDLE_EXPORT: StableId = StableId(0x524f_4f54_5354_4154);
 
 fn task_config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
     StepConfig {
@@ -24,10 +26,61 @@ fn task_config(owner: nexa_runtime::ScopeHandle) -> StepConfig {
     }
 }
 
+fn compiler_task_export(
+    verified: &VerifiedModule,
+    function: usize,
+    expected_name: &str,
+) -> StableId {
+    let function_index = u32::try_from(function).expect("test function index fits u32");
+    let emitted_function = &verified.module().functions[function];
+    let mut matching = verified.module().exports.iter().filter(|export| {
+        export.function == function_index
+            && export.signature == emitted_function.signature
+            && export.effect == FunctionEffect::Task
+    });
+    let stable_id = matching
+        .next()
+        .unwrap_or_else(|| panic!("pub async `{expected_name}` has an exact bytecode export"))
+        .stable_id;
+    assert!(
+        matching.next().is_none(),
+        "pub async `{expected_name}` has exactly one bytecode export"
+    );
+    stable_id
+}
+
+fn export_compiled_task(
+    verified: VerifiedModule,
+    function: usize,
+    stable_id: StableId,
+) -> VerifiedModule {
+    let mut module = verified.into_module();
+    let function_index = u32::try_from(function).expect("test function index fits u32");
+    let emitted_function = &module.functions[function];
+    assert_eq!(emitted_function.effect, FunctionEffect::Task);
+    module.exports.push(ScriptExport {
+        stable_id,
+        function: function_index,
+        signature: emitted_function.signature.clone(),
+        effect: emitted_function.effect,
+    });
+    verify(module, VerifierLimits::default()).expect("verify explicit test ScriptExport")
+}
+
 #[test]
 fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
+    let contract = nexa_idl::parse(
+        r"
+            contract BranchRootMap {
+                nexa {
+                    async fn branch_then_yield(condition: bool) -> i32;
+                }
+            }
+        ",
+    )
+    .expect("parse branch root-map contract");
     let source = r#"
-        task fn branch_then_yield(condition: bool) -> i32 {
+        pub async fn branch_then_yield(condition: bool) -> i32 {
             if condition {
                 let branch_only: string = "dead after the join";
                 if branch_only.byte_len() == 0 {
@@ -38,8 +91,9 @@ fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
             return 7;
         }
     "#;
-    let verified =
-        nexa_compiler::compile_with_metadata(source, HOST).expect("compile branch-only root case");
+    let verified = nexa_compiler::compile_with_contract(source, &contract)
+        .expect("compile branch-only root case");
+    let task_export = compiler_task_export(&verified, 0, "branch_then_yield");
     let function = &verified.module().functions[0];
     assert!(
         function.root_bitmap.iter().any(|is_root| *is_root),
@@ -61,14 +115,20 @@ fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
         "a reference initialized on only one predecessor is dead after the join"
     );
 
+    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
     let schema = verified.module().state_schema_fingerprint;
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let module = realm
-        .load_module(verified, HOST, schema)
+        .load_module(verified, contract_runtime_id, schema)
         .expect("load compiler-produced module");
     let scope = realm.create_scope(None).expect("create scope");
     let task = realm
-        .spawn_task(module, 0, &[RuntimeValue::Bool(true)], task_config(scope))
+        .spawn_task(
+            module,
+            task_export,
+            &[RuntimeValue::Bool(true)],
+            task_config(scope),
+        )
         .expect("spawn branch-only task");
 
     assert_eq!(
@@ -91,23 +151,32 @@ fn compiler_branch_only_string_is_dead_at_joined_yield_during_realm_gc() {
     );
 }
 
-struct OpaqueHost {
-    hash: StableId,
+struct HandleHost {
+    contract_runtime_id: StableId,
     ticket_type: StableId,
+    function: nexa_bytecode::HostImport,
+    authority: HostFunctionAuthority,
 }
 
-impl HostRegistry for OpaqueHost {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.hash)
+impl HostRegistry for HandleHost {
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         _context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || !arguments.is_empty() {
+        if id != self.function.stable_id {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if !arguments.is_empty() {
             return Err(HostTrap::Arity);
         }
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::Opaque {
@@ -118,74 +187,90 @@ impl HostRegistry for OpaqueHost {
 }
 
 #[test]
-fn compiler_host_opaque_remains_live_across_yield_and_realm_gc() {
+fn compiler_host_handle_remains_live_across_yield_and_realm_gc() {
     let contract = nexa_idl::parse(
         r"
-            interface RootMapHost {
-                opaque Ticket;
-                sync fn issue() -> Ticket;
+            contract RootMapHost {
+                handle Ticket;
+                host {
+                    fn issue() -> Ticket;
+                }
+                nexa {
+                    async fn hold_ticket() -> Ticket;
+                }
             }
         ",
     )
-    .expect("parse Host opaque contract");
+    .expect("parse Host handle contract");
     let source = r"
-        module root.map.opaque;
-        import host as api;
+        use host::root_map_host as api;
 
-        task fn hold_ticket() -> api.Ticket {
-            let ticket: api.Ticket = api.issue();
+        pub async fn hold_ticket() -> api::Ticket {
+            let ticket: api::Ticket = api::issue();
             yield;
             return ticket;
         }
     ";
     let verified =
-        nexa_compiler::compile_with_interface(source, &contract).expect("compile Host opaque task");
+        nexa_compiler::compile_with_contract(source, &contract).expect("compile Host handle task");
+    let task_export = compiler_task_export(&verified, 0, "hold_ticket");
     let function = &verified.module().functions[0];
     let yield_pc = function
         .code
         .iter()
         .position(|instruction| matches!(instruction, Instruction::Yield))
-        .expect("opaque task has a yield");
+        .expect("handle task has a yield");
     let yield_pc = u32::try_from(yield_pc).expect("test bytecode position fits u32");
     assert!(
         function
             .root_maps
             .iter()
             .find(|root_map| root_map.pc == yield_pc)
-            .expect("opaque yield has a root map")
+            .expect("handle yield has a root map")
             .bitmap
             .iter()
             .any(|is_root| *is_root),
         "the verifier-visible Named Host value is live at the yield"
     );
 
-    let host_hash = nexa_idl::exact_hash(&contract);
+    let contract_fingerprint = nexa_idl::contract_fingerprint(&contract);
+    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
+    assert_eq!(
+        contract_runtime_id,
+        nexa_runtime::contract_runtime_id_from_fingerprint(contract_fingerprint.into_bytes())
+    );
     let schema = verified.module().state_schema_fingerprint;
-    let ticket_type = StableId::from_name("Ticket");
+    let ticket_type = contract.handles[0].stable_id;
+    let host_function = verified.module().host_imports[0].clone();
+    assert!(host_function.parameters.is_empty());
+    assert!(host_function.capabilities.is_empty());
+    let authority = HostFunctionAuthority::from_import(&host_function);
     let runtime_host = RuntimeHost::new(16);
     let mut realm = RealmRuntime::hosted(
         RealmConfig::default(),
         runtime_host.clone(),
-        Box::new(OpaqueHost {
-            hash: host_hash,
+        Box::new(HandleHost {
+            contract_runtime_id,
             ticket_type,
+            function: host_function,
+            authority,
         }),
     )
     .expect("create hosted realm");
     let module = realm
-        .load_module(verified, host_hash, schema)
-        .expect("load Host opaque module");
-    let scope = realm.create_scope(None).expect("create opaque scope");
+        .load_module(verified, contract_runtime_id, schema)
+        .expect("load Host handle module");
+    let scope = realm.create_scope(None).expect("create handle scope");
     let task = realm
-        .spawn_task(module, 0, &[], task_config(scope))
-        .expect("spawn Host opaque task");
+        .spawn_task(module, task_export, &[], task_config(scope))
+        .expect("spawn Host handle task");
 
     assert_eq!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Yielded(YieldReason::Explicit))
     );
     assert_eq!(
-        realm.collect_garbage().expect("collect opaque task"),
+        realm.collect_garbage().expect("collect handle task"),
         nexa_runtime::CollectionStats::default()
     );
     assert_eq!(
@@ -199,26 +284,33 @@ fn compiler_host_opaque_remains_live_across_yield_and_realm_gc() {
     let _ = runtime_host.begin_close();
     runtime_host
         .try_finish_close()
-        .expect("close Host opaque runtime");
+        .expect("close Host handle runtime");
 }
 
 #[test]
 fn compiler_state_handle_remains_live_across_yield_and_realm_gc() {
     let source = r"
-        module root.map.state_handle;
-
-        @stateful(1) class Model {
-            value: i32;
+        @state(version = 1)
+        pub class Model {
+            mut value: i32,
         }
 
-        task fn hold_handle(handle: StateHandle<Model>) -> StateHandle<Model> {
+        pub async fn hold_handle(handle: StateHandle<Model>) -> StateHandle<Model> {
             yield;
             return handle;
         }
     ";
     let verified =
-        nexa_compiler::compile_with_metadata(source, HOST).expect("compile StateHandle task");
-    let function = &verified.module().functions[0];
+        nexa_compiler::compile_with_contract_id(source, HOST).expect("compile StateHandle task");
+    let task_function = verified
+        .module()
+        .functions
+        .iter()
+        .position(|function| function.effect == FunctionEffect::Task)
+        .expect("compiled StateHandle task function");
+    let verified = export_compiled_task(verified, task_function, STATE_HANDLE_EXPORT);
+    let task_export = compiler_task_export(&verified, task_function, "hold_handle");
+    let function = &verified.module().functions[task_function];
     let handle_type = function.signature.parameters[0];
     let yield_pc = function
         .code
@@ -266,7 +358,7 @@ fn compiler_state_handle_remains_live_across_yield_and_realm_gc() {
 
     let scope = realm.create_scope(None).expect("create StateHandle scope");
     let task = realm
-        .spawn_task(module, 0, &[runtime_handle], task_config(scope))
+        .spawn_task(module, task_export, &[runtime_handle], task_config(scope))
         .expect("spawn StateHandle task");
     assert_eq!(
         realm.poll_task(task, 64),
@@ -285,14 +377,14 @@ fn compiler_state_handle_remains_live_across_yield_and_realm_gc() {
 fn exercise_defer_capture_cleanup(
     realm: &mut RealmRuntime,
     module: nexa_runtime::ModuleHandle,
-    function: u32,
+    export: StableId,
     cancel: bool,
 ) {
     let scope = realm.create_scope(None).expect("create defer scope");
     let task = realm
         .spawn_task(
             module,
-            function,
+            export,
             &[RuntimeValue::Bool(true)],
             task_config(scope),
         )
@@ -354,7 +446,7 @@ fn nested_call_transition_module(input: ValueType, result: ValueType) -> Verifie
     parent_function.root_maps = vec![
         RootMap {
             pc: 0,
-            bitmap: vec![input.is_reference()],
+            bitmap: vec![false],
         },
         RootMap {
             pc: 1,
@@ -397,7 +489,14 @@ fn nested_call_transition_module(input: ValueType, result: ValueType) -> Verifie
     if result == ValueType::String {
         module.string("callee result");
     }
-    module.function(parent_function);
+    let parent_signature = parent_function.signature.clone();
+    let parent = module.function(parent_function);
+    module.script_export(ScriptExport {
+        stable_id: NESTED_CALL_EXPORT,
+        function: parent,
+        signature: parent_signature,
+        effect: FunctionEffect::Task,
+    });
     module.function(child_function);
     verify(module.finish(), VerifierLimits::default()).expect("verify nested call transition")
 }
@@ -413,12 +512,22 @@ fn nested_call_realm(verified: VerifiedModule) -> (RealmRuntime, nexa_runtime::M
 
 #[test]
 fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
+    let contract = nexa_idl::parse(
+        r"
+            contract DeferRootMap {
+                nexa {
+                    async fn deferred(condition: bool) -> i32;
+                }
+            }
+        ",
+    )
+    .expect("parse defer root-map contract");
     let source = r#"
         fn retain(value: string) -> string {
             return value;
         }
 
-        task fn deferred(condition: bool) -> i32 {
+        pub async fn deferred(condition: bool) -> i32 {
             if condition {
                 let captured: string = "captured only by defer";
                 defer retain(captured);
@@ -428,13 +537,14 @@ fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
         }
     "#;
     let verified =
-        nexa_compiler::compile_with_metadata(source, HOST).expect("compile defer root task");
+        nexa_compiler::compile_with_contract(source, &contract).expect("compile defer root task");
     let task_function = verified
         .module()
         .functions
         .iter()
         .position(|function| function.effect == FunctionEffect::Task)
         .expect("compiled task function");
+    let task_export = compiler_task_export(&verified, task_function, "deferred");
     let function = &verified.module().functions[task_function];
     assert!(function.root_bitmap.iter().any(|is_root| *is_root));
     let yield_pc = function
@@ -454,19 +564,19 @@ fn compiler_defer_capture_is_a_gc_root_for_cancel_and_complete_cleanup() {
             .all(|is_root| !is_root),
         "the branch-only register is dead at the join; only the defer record owns the string"
     );
+    let contract_runtime_id = nexa_idl::contract_runtime_id(&contract);
     let schema = verified.module().state_schema_fingerprint;
 
     let mut realm = RealmRuntime::isolated(RealmConfig::default());
     let module = realm
-        .load_module(verified, HOST, schema)
+        .load_module(verified, contract_runtime_id, schema)
         .expect("load defer root module");
-    let task_function = u32::try_from(task_function).expect("test function index fits u32");
-    exercise_defer_capture_cleanup(&mut realm, module, task_function, true);
-    exercise_defer_capture_cleanup(&mut realm, module, task_function, false);
+    exercise_defer_capture_cleanup(&mut realm, module, task_export, true);
+    exercise_defer_capture_cleanup(&mut realm, module, task_export, false);
 }
 
 #[test]
-fn nested_call_fuel_suspend_keeps_pre_call_string_until_scalar_return() {
+fn nested_call_fuel_suspend_reclaims_dead_pre_call_string_before_scalar_return() {
     let (mut realm, module) = nested_call_realm(nested_call_transition_module(
         ValueType::String,
         ValueType::I32,
@@ -478,7 +588,7 @@ fn nested_call_fuel_suspend_keeps_pre_call_string_until_scalar_return() {
     let task = realm
         .spawn_task(
             module,
-            0,
+            NESTED_CALL_EXPORT,
             &[RuntimeValue::String { reference, hash: 0 }],
             task_config(scope),
         )
@@ -493,9 +603,9 @@ fn nested_call_fuel_suspend_keeps_pre_call_string_until_scalar_return() {
             .collect_garbage()
             .expect("collect suspended string-to-scalar call"),
         nexa_runtime::CollectionStats {
-            marked: 1,
-            reclaimed: 0,
-            live: 1,
+            marked: 0,
+            reclaimed: 1,
+            live: 0,
         }
     );
     assert_eq!(
@@ -504,11 +614,7 @@ fn nested_call_fuel_suspend_keeps_pre_call_string_until_scalar_return() {
     );
     assert_eq!(
         realm.collect_garbage().expect("reclaim old destination"),
-        nexa_runtime::CollectionStats {
-            marked: 0,
-            reclaimed: 1,
-            live: 0,
-        }
+        nexa_runtime::CollectionStats::default()
     );
 }
 
@@ -520,7 +626,12 @@ fn nested_call_fuel_suspend_uses_pre_call_scalar_map_until_string_return() {
     ));
     let scope = realm.create_scope(None).expect("create nested call scope");
     let task = realm
-        .spawn_task(module, 0, &[RuntimeValue::I32(11)], task_config(scope))
+        .spawn_task(
+            module,
+            NESTED_CALL_EXPORT,
+            &[RuntimeValue::I32(11)],
+            task_config(scope),
+        )
         .expect("spawn scalar-to-string call");
 
     assert_eq!(

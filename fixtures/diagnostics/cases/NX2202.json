@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2202","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2202.nexa","expected":{"primary_text":"A => 2","secondary_count":1,"secondary_texts":["A => 1"],"message_contains":"Duplicate match variant","notes":["duplicate variant:"]}}
+{"version":1,"code":"NX2202","category":"diagnostic","pipeline":"compiler","input":"../sources/NX2202.nexa","expected":{"primary_text":"Choice::A => 2","secondary_count":1,"secondary_texts":["Choice::A => 1"],"message_contains":"Duplicate match variant","notes":["duplicate variant:"]}}

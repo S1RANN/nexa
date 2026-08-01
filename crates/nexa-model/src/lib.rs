@@ -393,7 +393,7 @@ fn check_invariants(
             InvariantSpec::Nonnegative { resource } => {
                 (snapshot.resources[resource] < 0).then(|| {
                     format!(
-                        "invariant `{}` failed with {}",
+                        "invariant `{}` failed: {}",
                         invariant.name(),
                         snapshot.resources[resource]
                     )
@@ -414,7 +414,7 @@ fn check_invariants(
                 minimum,
             } => (snapshot.state == *state && snapshot.resources[resource] < *minimum).then(|| {
                 format!(
-                    "invariant `{}` failed with {}",
+                    "invariant `{}` failed: {}",
                     invariant.name(),
                     snapshot.resources[resource]
                 )

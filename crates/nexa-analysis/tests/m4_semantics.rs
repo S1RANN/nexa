@@ -164,8 +164,8 @@ source_root = "src"
             .unwrap();
         builder.build().unwrap()
     };
-    let root_sources = source_set(root_manifest.id.clone(), "module main;");
-    let library_sources = source_set(library_manifest.id.clone(), "module main;");
+    let root_sources = source_set(root_manifest.id.clone(), "const ROOT: i32 = 1;");
+    let library_sources = source_set(library_manifest.id.clone(), "const LIBRARY: i32 = 1;");
     let closure_bytes = root_sources.production_bytes() + library_sources.production_bytes();
     let closure = [&root_sources, &library_sources];
     assert_eq!(
@@ -197,7 +197,7 @@ fn manifest_and_standard_library_are_build_inputs() {
     sources
         .add(
             NormalizedPackagePath::new("src/main.nexa").unwrap(),
-            "module main;",
+            "const VALUE: i32 = 1;",
             SourceRole::Production,
         )
         .unwrap();
@@ -209,10 +209,11 @@ fn manifest_and_standard_library_are_build_inputs() {
         root_source_set: source_set,
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
-        host_contract: b"interface Host {}".to_vec(),
-        host_contract_source: b"host-contract.nidl\0interface Host {}".to_vec(),
-        host_required_exports: Vec::new(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_contract: b"contract Host {}".to_vec(),
+        host_contract_source: b"host-contract.nidl\0contract Host {}".to_vec(),
+        host_required_entrypoints: Vec::new(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: standard_library.version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -244,10 +245,10 @@ fn manifest_and_standard_library_are_build_inputs() {
 #[test]
 fn docs_change_source_and_build_but_not_analyzed_api_or_state_schema() {
     let (baseline, baseline_build) = analyze_documented_package(
-        "/// Persistent counter docs.\n@stateful(1) class Counter {\n    value: i32;\n}\n\n/// Returns the score.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
+        "/// Persistent counter docs.\n@state(version = 1) class Counter {\n    mut value: i32,\n}\n\n/// Returns the score.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
     );
     let (changed, changed_build) = analyze_documented_package(
-        "/// Reload-safe counter documentation.\n@stateful(1) class Counter {\n    value: i32;\n}\n\n/// Returns the unchanged score value.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
+        "/// Reload-safe counter documentation.\n@state(version = 1) class Counter {\n    mut value: i32,\n}\n\n/// Returns the unchanged score value.\npub fn score(value: i32) -> i32 {\n    return value;\n}\n",
     );
 
     assert!(
@@ -299,7 +300,7 @@ activation = "programmatic"
     sources
         .add(
             NormalizedPackagePath::new("src/main.nexa").unwrap(),
-            format!("module main;\n\n{declarations}"),
+            declarations,
             SourceRole::Production,
         )
         .unwrap();
@@ -327,8 +328,9 @@ activation = "programmatic"
         dependency_source_sets: BTreeMap::new(),
         host_contract: Vec::new(),
         host_contract_source: Vec::new(),
-        host_required_exports: Vec::new(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: Vec::new(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),

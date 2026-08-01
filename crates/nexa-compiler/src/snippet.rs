@@ -1,8 +1,8 @@
-//! Single-source adapters over the canonical M4 package pipeline.
+//! Single-source adapters over the canonical Language v2 package pipeline.
 //!
 //! These adapters deliberately do not rewrite source text. `SourceSetBuilder` supplies a virtual
-//! semantic module identity when a single-file source omits `module`, and every diagnostic
-//! and emitted source-map entry for that source is remapped to the caller's `FileId`.
+//! semantic module identity from the virtual source path, and every diagnostic and emitted
+//! source-map entry for that source is remapped to the caller's `FileId`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -11,18 +11,19 @@ use nexa_analysis::{
     AnalysisEnvironment, BuildFingerprintInput, CompilationOptions, ExternalFieldSurface,
     ExternalSourceOrigin, ExternalTypeKind, ExternalTypeSurface, ExternalVariantSurface,
     HostAsyncResultSurface, HostContractSurface, HostFunctionMode, HostFunctionSurface,
-    IrAbandonPolicy, IrCancelPolicy, ModulePath, NormalizedPackagePath, PackageId, PackageManifest,
-    PackageSourceSet, QueryDatabase, RequiredExportSurface, ResolvedBuildInput,
+    IrAbandonPolicy, IrCancelPolicy, ModulePath, NexaEntrypointSurface, NormalizedPackagePath,
+    PackageId, PackageManifest, PackageSourceSet, QueryDatabase, ResolvedBuildInput,
     ResolvedDependencyGraph, ResolvedPackage, SnippetModuleInferenceError,
     SnippetModuleInferenceErrorKind, SourceId, SourceSetBuilder, SurfaceType, analyze_package,
     external_source_key, infer_snippet_module, source_set_fingerprint,
 };
-use nexa_bytecode::{
-    Module, ValueType, array_type, buffer_type, option_type, result_type, snapshot_type,
-};
+use nexa_bytecode::{Module, result_type};
 use nexa_core::{FileId, SourceSpan, StableId};
-use nexa_diagnostics::{Diagnostic, ErrorCode, LabelStyle, SourceIdentity};
-use nexa_idl::{AbandonPolicy, CancelPolicy, Idl, TypeRef};
+use nexa_diagnostics::{ByteRange, Diagnostic, LabelStyle, SourceIdentity};
+use nexa_idl::{
+    AbandonPolicy, CancelPolicy, ResolvedTypeKind, ResolvedTypeRef, ValidatedContract,
+    ValidatedFunction,
+};
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 use crate::{
@@ -37,12 +38,12 @@ const INTERNAL_ROOT_FILE: FileId = FileId(1);
 pub(super) fn compile_verified(
     source: &str,
     file: FileId,
-    interface: Option<&Idl>,
-    host_hash_override: Option<StableId>,
+    contract: Option<&ValidatedContract>,
+    host_contract_id_override: Option<StableId>,
 ) -> Result<VerifiedModule, CompileError> {
-    let mut module = compile_module(source, file, interface)?;
-    if let Some(host_hash) = host_hash_override {
-        module.host_interface_hash = Some(host_hash);
+    let mut module = compile_module(source, file, contract)?;
+    if let Some(host_contract_id) = host_contract_id_override {
+        module.host_contract_id = Some(host_contract_id);
     }
     verify(module, VerifierLimits::default()).map_err(|error| {
         CompileError::verify(
@@ -55,17 +56,17 @@ pub(super) fn compile_verified(
 pub(super) fn compile_module(
     source: &str,
     file: FileId,
-    interface: Option<&Idl>,
+    contract: Option<&ValidatedContract>,
 ) -> Result<Module, CompileError> {
     let compilation_options = CompilationOptions::default();
     let module = infer_snippet_module(source, compilation_options.limits.source_file_bytes)
         .map_err(|error| snippet_module_error(error, file))?;
-    let input = resolved_snippet(source, file, &module, interface, compilation_options)?;
-    let environment = interface.map_or_else(
+    let input = resolved_snippet(source, file, &module, contract, compilation_options)?;
+    let environment = contract.map_or_else(
         || Ok(AnalysisEnvironment::default()),
-        |interface| {
+        |contract| {
             Ok(AnalysisEnvironment {
-                host: Some(host_surface(interface, source_span(file, source))?),
+                host: Some(host_surface(contract, source_span(file, source))?),
                 ..AnalysisEnvironment::default()
             })
         },
@@ -102,20 +103,6 @@ pub(super) fn compile_module(
 fn snippet_module_error(error: SnippetModuleInferenceError, file: FileId) -> CompileError {
     let span = SourceSpan::new(file, error.range.start, error.range.end);
     match error.kind {
-        SnippetModuleInferenceErrorKind::InvalidModulePath { .. } => {
-            CompileError::AnalysisDiagnostic(Box::new(CompilerAnalysisDiagnostic {
-                code: ErrorCode::NX2701,
-                message: error.message,
-                primary: AnalysisDiagnosticLabel {
-                    source: AnalysisDiagnosticSource::Caller,
-                    span,
-                    message: "module path is not canonical".into(),
-                },
-                secondary: Vec::new(),
-                related: Vec::new(),
-                notes: Vec::new(),
-            }))
-        }
         SnippetModuleInferenceErrorKind::SourceTooLarge { .. } => {
             CompileError::unknown_name(error.message, span)
         }
@@ -126,7 +113,7 @@ fn resolved_snippet(
     source: &str,
     file: FileId,
     module: &ModulePath,
-    interface: Option<&Idl>,
+    contract: Option<&ValidatedContract>,
     compilation_options: CompilationOptions,
 ) -> Result<ResolvedBuildInput, CompileError> {
     let package =
@@ -184,18 +171,23 @@ fn resolved_snippet(
         )]),
         edges: BTreeSet::new(),
     });
-    let canonical_host_contract =
-        interface.map_or_else(Vec::new, |idl| nexa_idl::canonical(idl).into_bytes());
-    let canonical_host_required_exports = interface.map_or_else(
-        || nexa_idl::canonical_required_exports(std::iter::empty::<&str>()),
-        nexa_idl::canonical_all_required_exports,
-    );
+    let canonical_host_contract = contract
+        .map(|contract| nexa_idl::abi_descriptor(contract).bytes)
+        .unwrap_or_default();
+    let canonical_host_contract_source = contract
+        .map(|contract| contract.source.as_bytes().to_vec())
+        .unwrap_or_default();
+    // A Contract declares the legal entrypoint universe. Requiredness is an Engine/profile
+    // decision and a plain snippet compile does not silently require every declared entrypoint.
+    let canonical_host_required_entrypoints =
+        nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
     let fingerprint = snippet_build_fingerprint(
         package,
         &manifest,
         &sources,
         &canonical_host_contract,
-        &canonical_host_required_exports,
+        &canonical_host_contract_source,
+        &canonical_host_required_entrypoints,
         &compilation_options,
     );
     ResolvedBuildInput::new(
@@ -206,8 +198,8 @@ fn resolved_snippet(
         graph,
         None,
         canonical_host_contract,
-        Vec::<u8>::new(),
-        canonical_host_required_exports,
+        canonical_host_contract_source,
+        canonical_host_required_entrypoints,
         compilation_options,
         fingerprint,
     )
@@ -224,7 +216,8 @@ fn snippet_build_fingerprint(
     manifest: &PackageManifest,
     sources: &PackageSourceSet,
     canonical_host_contract: &[u8],
-    canonical_host_required_exports: &[u8],
+    canonical_host_contract_source: &[u8],
+    canonical_host_required_entrypoints: &[u8],
     compilation_options: &CompilationOptions,
 ) -> BuildFingerprintInput {
     let standard_library = nexa_stdlib::standard_library();
@@ -235,9 +228,10 @@ fn snippet_build_fingerprint(
         dependency_manifests: BTreeMap::new(),
         dependency_source_sets: BTreeMap::new(),
         host_contract: canonical_host_contract.to_vec(),
-        host_contract_source: Vec::new(),
-        host_required_exports: canonical_host_required_exports.to_vec(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_contract_source: canonical_host_contract_source.to_vec(),
+        host_required_entrypoints: canonical_host_required_entrypoints.to_vec(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: standard_library.version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -251,55 +245,63 @@ fn snippet_build_fingerprint(
 }
 
 #[allow(clippy::too_many_lines)]
-fn host_surface(idl: &Idl, span: SourceSpan) -> Result<HostContractSurface, CompileError> {
+fn host_surface(
+    contract: &ValidatedContract,
+    span: SourceSpan,
+) -> Result<HostContractSurface, CompileError> {
     let host_module = ModulePath::new("host").expect("host is a valid reserved module");
+    let contract_text = Arc::<str>::from(contract.source.as_str());
+    let contract_identity = SourceIdentity::standalone("virtual/host-contract.nidl");
+    let origin = |declaration: SourceSpan| {
+        Some(ExternalSourceOrigin {
+            identity: contract_identity.clone(),
+            text: Arc::clone(&contract_text),
+            range: ByteRange::new(declaration.start, declaration.end),
+        })
+    };
     let mut types = Vec::new();
-    for name in &idl.opaque_handles {
+    for handle in &contract.handles {
         types.push(ExternalTypeSurface {
-            name: name.clone(),
+            name: handle.name.clone(),
             kind: ExternalTypeKind::Opaque,
-            stable_id: Some(StableId::from_name(name)),
+            stable_id: Some(handle.stable_id),
             type_parameters: Vec::new(),
             fields: Vec::new(),
             variants: Vec::new(),
-            source: None,
+            source: origin(handle.span),
         });
     }
-    for structure in &idl.structs {
+    for structure in &contract.structs {
         let fields = structure
             .fields
             .iter()
             .map(|field| {
                 Ok(ExternalFieldSurface {
                     name: field.name.clone(),
-                    stable_id: Some(StableId::from_parts(&[&structure.name, "::", &field.name])),
+                    stable_id: Some(field.stable_id),
                     ty: surface_type(&field.ty, &host_module)?,
-                    source: None,
+                    source: origin(field.span),
                 })
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
         types.push(ExternalTypeSurface {
             name: structure.name.clone(),
             kind: ExternalTypeKind::Struct,
-            stable_id: Some(StableId::from_name(&structure.name)),
+            stable_id: Some(structure.stable_id),
             type_parameters: Vec::new(),
             fields,
             variants: Vec::new(),
-            source: None,
+            source: origin(structure.span),
         });
     }
-    for enumeration in &idl.enums {
+    for enumeration in &contract.enums {
         let variants = enumeration
             .variants
             .iter()
             .map(|variant| {
                 Ok(ExternalVariantSurface {
                     name: variant.name.clone(),
-                    stable_id: Some(StableId::from_parts(&[
-                        &enumeration.name,
-                        "::",
-                        &variant.name,
-                    ])),
+                    stable_id: Some(variant.stable_id),
                     payload: variant
                         .payload
                         .as_ref()
@@ -307,24 +309,27 @@ fn host_surface(idl: &Idl, span: SourceSpan) -> Result<HostContractSurface, Comp
                         .transpose()?
                         .into_iter()
                         .collect(),
-                    source: None,
+                    source: origin(variant.span),
                 })
             })
             .collect::<Result<Vec<_>, CompileError>>()?;
         types.push(ExternalTypeSurface {
             name: enumeration.name.clone(),
             kind: ExternalTypeKind::Enum,
-            stable_id: Some(StableId::from_name(&enumeration.name)),
+            stable_id: Some(enumeration.stable_id),
             type_parameters: Vec::new(),
             fields: Vec::new(),
             variants,
-            source: None,
+            source: origin(enumeration.span),
         });
     }
 
-    let functions = idl
-        .functions
-        .iter()
+    let mut host_functions = contract.host_functions.iter().collect::<Vec<_>>();
+    host_functions.sort_by(|left, right| {
+        (left.stable_id.0, left.name.as_str()).cmp(&(right.stable_id.0, right.name.as_str()))
+    });
+    let functions = host_functions
+        .into_iter()
         .enumerate()
         .map(|(index, function)| {
             let import_index =
@@ -334,76 +339,88 @@ fn host_surface(idl: &Idl, span: SourceSpan) -> Result<HostContractSurface, Comp
                 .iter()
                 .map(|parameter| surface_type(&parameter.ty, &host_module))
                 .collect::<Result<Vec<_>, _>>()?;
-            let result = surface_type(&function.result, &host_module)?;
-            let (mode, async_result) = if function.synchronous {
-                (HostFunctionMode::Sync, None)
-            } else {
+            let result = function
+                .result
+                .as_ref()
+                .map(|result| surface_type(result, &host_module))
+                .transpose()?
+                .unwrap_or(SurfaceType::Unit);
+            let (mode, async_result) = if function.is_async {
                 (
                     HostFunctionMode::Request,
-                    Some(async_result_surface(idl, function, &host_module, span)?),
+                    Some(async_result_surface(
+                        contract,
+                        function,
+                        &host_module,
+                        span,
+                    )?),
                 )
+            } else {
+                (HostFunctionMode::Sync, None)
             };
             Ok(HostFunctionSurface {
                 name: function.name.clone(),
                 parameters,
                 result,
                 mode,
-                stable_id: StableId::from_parts(&[&idl.interface, "::", &function.name]),
+                stable_id: function.stable_id,
+                declaration_fingerprint: function.declaration_fingerprint.into_bytes(),
                 import_index,
                 fuel_cost: function.fuel_cost,
                 async_result,
-                required_capability: None,
-                source: None,
+                required_capabilities: function.capabilities.clone(),
+                source: origin(function.span),
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
-    let required_exports = idl
-        .exports
+    let nexa_entrypoints = contract
+        .nexa_functions
         .iter()
-        .map(|export| {
-            Ok(RequiredExportSurface {
-                name: export.name.clone(),
-                stable_id: nexa_idl::export_stable_id(idl, export),
-                parameters: export
+        .map(|entrypoint| {
+            Ok(NexaEntrypointSurface {
+                name: entrypoint.name.clone(),
+                stable_id: entrypoint.stable_id,
+                parameters: entrypoint
                     .parameters
                     .iter()
                     .map(|parameter| surface_type(&parameter.ty, &host_module))
                     .collect::<Result<Vec<_>, _>>()?,
-                result: export
+                result: entrypoint
                     .result
                     .as_ref()
                     .map(|result| surface_type(result, &host_module))
                     .transpose()?
                     .unwrap_or(SurfaceType::Unit),
                 effect: None,
-                source: None,
+                source: origin(entrypoint.span),
             })
         })
         .collect::<Result<Vec<_>, CompileError>>()?;
     Ok(HostContractSurface {
-        interface_name: idl.interface.clone(),
-        interface_stable_id: nexa_idl::exact_hash(idl),
+        contract_name: contract.name.clone(),
+        contract_stable_id: nexa_idl::contract_runtime_id(contract),
         types,
         functions,
-        required_exports,
-        source: None,
+        nexa_entrypoints,
+        required_entrypoints: Vec::new(),
+        source: origin(contract.span),
     })
 }
 
 fn async_result_surface(
-    idl: &Idl,
-    function: &nexa_idl::HostFunction,
+    contract: &ValidatedContract,
+    function: &ValidatedFunction,
     host_module: &ModulePath,
     span: SourceSpan,
 ) -> Result<HostAsyncResultSurface, CompileError> {
-    let TypeRef::HostRequest(Some(request)) = &function.result else {
+    let Some(result) = &function.result else {
         return Err(CompileError::type_mismatch(None, None, span));
     };
-    let TypeRef::Result(success, error) = request.as_ref() else {
+    let ResolvedTypeKind::Result(success, error) = &result.kind else {
         return Err(CompileError::type_mismatch(None, None, span));
     };
-    let success_value = idl_value_type(success, span)?;
-    let error_value = idl_value_type(error, span)?;
+    let success_value = nexa_idl::abi_value_type(success);
+    let error_value = nexa_idl::abi_value_type(error);
     Ok(HostAsyncResultSurface {
         result_type: result_type(success_value, error_value).type_id,
         success: surface_type(success, host_module)?,
@@ -418,7 +435,7 @@ fn async_result_surface(
         },
         cancel_error: match function.cancel_policy {
             CancelPolicy::ReturnError => Some(policy_error_tag(
-                idl,
+                contract,
                 error,
                 "Cancelled",
                 u32::MAX - 1,
@@ -427,111 +444,80 @@ fn async_result_surface(
             CancelPolicy::CancelTask => None,
         },
         abandon_error: match function.abandon_policy {
-            AbandonPolicy::ReturnError => {
-                Some(policy_error_tag(idl, error, "Abandoned", u32::MAX, span)?)
-            }
+            AbandonPolicy::ReturnError => Some(policy_error_tag(
+                contract,
+                error,
+                "Abandoned",
+                u32::MAX,
+                span,
+            )?),
             AbandonPolicy::Trap => None,
         },
     })
 }
 
 fn policy_error_tag(
-    idl: &Idl,
-    error: &TypeRef,
+    contract: &ValidatedContract,
+    error: &ResolvedTypeRef,
     variant: &str,
     integer_fallback: u32,
     span: SourceSpan,
 ) -> Result<u32, CompileError> {
-    match error {
-        TypeRef::I32 => Ok(integer_fallback),
-        TypeRef::Named(name) => {
-            idl.enums
-                .iter()
-                .find(|enumeration| enumeration.name == *name)
-                .and_then(|enumeration| {
-                    enumeration.variants.iter().position(|candidate| {
-                        candidate.name == variant && candidate.payload.is_none()
-                    })
-                })
-                .and_then(|index| u32::try_from(index).ok())
-                .ok_or_else(|| CompileError::type_mismatch(None, None, span))
-        }
+    match &error.kind {
+        ResolvedTypeKind::I32 => Ok(integer_fallback),
+        ResolvedTypeKind::Named(named) => contract
+            .enums
+            .iter()
+            .find(|enumeration| enumeration.stable_id == named.stable_id)
+            .and_then(|enumeration| {
+                enumeration
+                    .variants
+                    .iter()
+                    .position(|candidate| candidate.name == variant && candidate.payload.is_none())
+            })
+            .and_then(|index| u32::try_from(index).ok())
+            .ok_or_else(|| CompileError::type_mismatch(None, None, span)),
         _ => Err(CompileError::type_mismatch(None, None, span)),
     }
 }
 
-fn surface_type(ty: &TypeRef, named_module: &ModulePath) -> Result<SurfaceType, CompileError> {
-    Ok(match ty {
-        TypeRef::I32 => SurfaceType::I32,
-        TypeRef::I64 => SurfaceType::I64,
-        TypeRef::F32 => SurfaceType::F32,
-        TypeRef::F64 => SurfaceType::F64,
-        TypeRef::Bool => SurfaceType::Bool,
-        TypeRef::Rune => SurfaceType::Rune,
-        TypeRef::String => SurfaceType::String,
-        TypeRef::HostRequest(inner) => SurfaceType::HostRequest(
-            inner
-                .as_ref()
-                .map(|inner| surface_type(inner, named_module).map(Box::new))
-                .transpose()?,
-        ),
-        TypeRef::ResourceToken(inner) => SurfaceType::ResourceToken(
-            inner
-                .as_ref()
-                .map(|inner| surface_type(inner, named_module).map(Box::new))
-                .transpose()?,
-        ),
-        TypeRef::Snapshot(Some(inner)) => {
-            SurfaceType::Snapshot(Box::new(surface_type(inner, named_module)?))
+fn surface_type(
+    ty: &ResolvedTypeRef,
+    named_module: &ModulePath,
+) -> Result<SurfaceType, CompileError> {
+    Ok(match &ty.kind {
+        ResolvedTypeKind::I32 => SurfaceType::I32,
+        ResolvedTypeKind::I64 => SurfaceType::I64,
+        ResolvedTypeKind::F32 => SurfaceType::F32,
+        ResolvedTypeKind::F64 => SurfaceType::F64,
+        ResolvedTypeKind::Bool => SurfaceType::Bool,
+        ResolvedTypeKind::Rune => SurfaceType::Rune,
+        ResolvedTypeKind::String => SurfaceType::String,
+        ResolvedTypeKind::Token(named) => SurfaceType::Token(Box::new(SurfaceType::Named {
+            module: named_module.clone(),
+            name: named.source_name.clone(),
+        })),
+        ResolvedTypeKind::Snapshot(named) => SurfaceType::Snapshot(Box::new(SurfaceType::Named {
+            module: named_module.clone(),
+            name: named.source_name.clone(),
+        })),
+        ResolvedTypeKind::Array(inner) => {
+            SurfaceType::Array(Box::new(surface_type(inner, named_module)?))
         }
-        TypeRef::Snapshot(None) => {
-            return Err(CompileError::type_mismatch(
-                None,
-                None,
-                SourceSpan::default(),
-            ));
+        ResolvedTypeKind::Buffer(inner) => {
+            SurfaceType::Buffer(Box::new(surface_type(inner, named_module)?))
         }
-        TypeRef::Array(inner) => SurfaceType::Array(Box::new(surface_type(inner, named_module)?)),
-        TypeRef::Buffer(inner) => SurfaceType::Buffer(Box::new(surface_type(inner, named_module)?)),
-        TypeRef::Option(inner) => SurfaceType::Option(Box::new(surface_type(inner, named_module)?)),
-        TypeRef::Result(success, error) => SurfaceType::Result(
+        ResolvedTypeKind::Option(inner) => {
+            SurfaceType::Option(Box::new(surface_type(inner, named_module)?))
+        }
+        ResolvedTypeKind::Result(success, error) => SurfaceType::Result(
             Box::new(surface_type(success, named_module)?),
             Box::new(surface_type(error, named_module)?),
         ),
-        TypeRef::Named(name) => SurfaceType::Named {
+        ResolvedTypeKind::Named(named) => SurfaceType::Named {
             module: named_module.clone(),
-            name: name.clone(),
+            name: named.source_name.clone(),
         },
-    })
-}
-
-fn idl_value_type(ty: &TypeRef, span: SourceSpan) -> Result<ValueType, CompileError> {
-    Ok(match ty {
-        TypeRef::I32 => ValueType::I32,
-        TypeRef::I64 => ValueType::I64,
-        TypeRef::F32 => ValueType::F32,
-        TypeRef::F64 => ValueType::F64,
-        TypeRef::Bool => ValueType::Bool,
-        TypeRef::Rune => ValueType::Rune,
-        TypeRef::String => ValueType::String,
-        TypeRef::HostRequest(_) => ValueType::Named(StableId::from_name("HostRequest")),
-        TypeRef::ResourceToken(_) => ValueType::Named(StableId::from_name("ResourceToken")),
-        TypeRef::Snapshot(Some(inner)) => {
-            let ValueType::Named(content) = idl_value_type(inner, span)? else {
-                return Err(CompileError::type_mismatch(None, None, span));
-            };
-            ValueType::Named(snapshot_type(content))
-        }
-        TypeRef::Snapshot(None) => return Err(CompileError::type_mismatch(None, None, span)),
-        TypeRef::Array(inner) => ValueType::Named(array_type(idl_value_type(inner, span)?)),
-        TypeRef::Buffer(inner) => ValueType::Named(buffer_type(idl_value_type(inner, span)?)),
-        TypeRef::Option(inner) => {
-            ValueType::Named(option_type(idl_value_type(inner, span)?).type_id)
-        }
-        TypeRef::Result(success, error) => ValueType::Named(
-            result_type(idl_value_type(success, span)?, idl_value_type(error, span)?).type_id,
-        ),
-        TypeRef::Named(name) => ValueType::Named(StableId::from_name(name)),
     })
 }
 
@@ -785,6 +771,25 @@ fn remap_compile_error(error: CompileError, file: FileId) -> CompileError {
             CompileError::DeferCaptureLimit { span: remap(span) }
         }
         CompileError::InvalidEffect { span } => CompileError::InvalidEffect { span: remap(span) },
+        CompileError::MissingMain { entry_module, span } => CompileError::MissingMain {
+            entry_module,
+            span: remap(span),
+        },
+        CompileError::InvalidMainSignature { message, span } => {
+            CompileError::InvalidMainSignature {
+                message,
+                span: remap(span),
+            }
+        }
+        CompileError::MissingReplEntrypoint { span } => {
+            CompileError::MissingReplEntrypoint { span: remap(span) }
+        }
+        CompileError::InvalidReplEntrypoint { message, span } => {
+            CompileError::InvalidReplEntrypoint {
+                message,
+                span: remap(span),
+            }
+        }
         CompileError::InvalidReloadMetadata {
             message,
             function_span,
@@ -853,7 +858,7 @@ mod tests {
         let options = CompilationOptions::default();
         let module = ModulePath::new("main").unwrap();
         let input = resolved_snippet(
-            "module main;\nfn main() -> i32 { return 0; }\n",
+            "fn main() -> i32 { return 0; }\n",
             FileId(8),
             &module,
             None,
@@ -900,31 +905,43 @@ mod tests {
             nexa_stdlib::canonical_descriptor_identity()
         );
         assert!(fingerprint.host_contract.is_empty());
-        let empty_required_exports =
-            nexa_idl::canonical_required_exports(std::iter::empty::<&str>());
-        assert_eq!(fingerprint.host_required_exports, empty_required_exports);
+        let empty_required_entrypoints =
+            nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>());
         assert_eq!(
-            input.host_required_exports_identity.as_ref(),
-            empty_required_exports
+            fingerprint.host_required_entrypoints,
+            empty_required_entrypoints
+        );
+        assert_eq!(
+            input.host_required_entrypoints_identity.as_ref(),
+            empty_required_entrypoints
         );
         assert!(fingerprint.canonical_lock_graph.is_empty());
 
-        let idl = nexa_idl::parse("interface Host { export Update(value: i32) -> i32; }").unwrap();
+        let contract =
+            nexa_idl::parse("contract Host { nexa { fn update(value: i32) -> i32; } }").unwrap();
         let hosted = resolved_snippet(
-            "module main;\npub fn Update(value: i32) -> i32 { return value; }\n",
+            "pub fn update(value: i32) -> i32 { return value; }\n",
             FileId(9),
             &module,
-            Some(&idl),
+            Some(&contract),
             options,
         )
         .unwrap();
         assert_eq!(
-            hosted.fingerprint_input.host_required_exports,
-            nexa_idl::canonical_all_required_exports(&idl)
+            hosted.fingerprint_input.host_required_entrypoints,
+            empty_required_entrypoints
         );
         assert_eq!(
-            hosted.host_required_exports_identity.as_ref(),
-            nexa_idl::canonical_all_required_exports(&idl)
+            hosted.host_required_entrypoints_identity.as_ref(),
+            empty_required_entrypoints
+        );
+        assert_eq!(
+            hosted.fingerprint_input.host_contract,
+            nexa_idl::abi_descriptor(&contract).bytes
+        );
+        assert_eq!(
+            hosted.fingerprint_input.host_contract_source,
+            contract.source.as_bytes()
         );
     }
 

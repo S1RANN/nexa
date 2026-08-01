@@ -24,6 +24,14 @@ Rust Host Binding v1 = COMPLETE
 Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
+Nexa M4 Language Scale Foundation = COMPLETE
+Nexa M4R1 Language Surface Reset = COMPLETE
+Nexa Language v2 = COMPLETE
+NIDL v2 = COMPLETE
+Structured Codegen v2 = COMPLETE
+Standalone Profile v1 = COMPLETE
+REPL v1 = COMPLETE
+Multiple Entrypoint Model = COMPLETE
 ```
 
 ## Current position
@@ -43,7 +51,7 @@ Gate 1 v2.9 STOP (historical tag)
 ```
 
 Internal Pivot M1 and Nexa M2 are complete. M2 adds a generic
-package-oriented embedding layer, typed Rust-to-Nexa export calls, and a
+package-oriented embedding layer, typed Rust-to-Nexa entrypoint calls, and a
 playable Snake pilot using the same package contract for first-party content,
 licensed content, and reviewed local extensions. Its finalization gates cover
 the full workspace, package lifecycle stress, resource stability, and dispatch
@@ -94,7 +102,7 @@ the real Runtime, exact Host resource release, and local completion gates.
 This milestone does not add new syntax, user generics, `dynamic` or
 `interface`, C++ or C# bindings, JIT/AOT, LSP/DAP, UGC or untrusted bytecode,
 seamless old-Task migration, completion replay queues, multi-version business
-execution, cross-module stateful reload, or a new Gate/Contract/Receipt evidence
+execution, cross-Module state Reload, or a new Gate/Contract/Receipt evidence
 system.
 
 The final-closure batch also explicitly excludes JIT/AOT, new language syntax,
@@ -114,7 +122,7 @@ replay buffers, and any new Gate/Contract/Receipt system.
 ## M2 scope
 
 M2 standardizes `PackageSource`, source policy, capabilities, activation,
-entitlements, one-Realm-per-package lifecycle, typed export dispatch, and
+entitlements, one-Realm-per-package lifecycle, typed entrypoint dispatch, and
 automatic Runtime maintenance in `nexa-embed`. The Snake domain translates
 built-in, DLC, and local Mod directories into those generic concepts.
 
@@ -163,17 +171,50 @@ language, Runtime, Package, LSP, editor, or optimization capability.
 ## Current milestone
 
 M3R3 completes Candidate freshness and commit safety. M4 Language Scale
-Foundation is complete from the immutable M3R3 completion commit `9d310645`.
-It adds compile-time Source Modules, deterministic static local libraries,
-shared incremental analysis, cross-file diagnostics and debugging, language
-ergonomics, a minimal standard library, and pure Package Tests.
+Foundation is complete and remains marked by the immutable annotated
+`language-scale-m4-complete` tag. It adds compile-time Source Modules,
+deterministic static local libraries, shared incremental analysis, cross-file
+diagnostics and debugging, language ergonomics, a minimal standard library,
+and pure Package Tests.
 
 Source Modules are statically linked into one Package Artifact. Runtime
 isolation remains one Realm and one Epoch per Application Package, and Reload
 remains a Package-level Restart operation.
 
-The completion gates exercise a 129-Module, 1,379-symbol, 500-edge,
-20-Package closure, the nine canonical Snake Packages, and at least 100
-scenarios in each reload stress class. The completion marker is the annotated
-tag `language-scale-m4-complete`; the immutable M1 through M3R3 tags remain
-unchanged.
+M4R1 is a breaking language and toolchain reset built on that completed
+foundation. It replaces source declarations from M4 with path-derived modules,
+`use`, `let mut`, field-level `mut`, `async fn`, postfix `.await`,
+`@state(version = N) class`, and attribute-based lifecycle roles. It freezes
+Struct and Enum as value types, Class as a sealed GC reference type, and
+removes source-level compatibility aliases.
+
+NIDL v2 uses `contract`, `host`, `nexa`, `handle`, `fn`, and `async fn`.
+Validated contracts lower to a structured ABI Descriptor v2 and a semantic
+Binding Model before Rust is generated through token syntax trees. Generated
+bindings do not expose legacy export indexes or source-level Request types.
+
+The same release also finalizes two normal execution profiles. Standalone
+Packages expose a typed `main(args: Array<string>) -> i32`; single-file scripts
+lower ordered top-level statements to a synthetic main. REPL v1 sends every
+cell through the production syntax, analysis, Typed IR, Bytecode, verifier, and
+Runtime pipeline while preserving committed session state across cells.
+
+The M4R1 completion contract re-runs all M1–M4 behavior on the new syntax, the
+scale and reload stress suites, object-model and async matrices, structured
+codegen, Standalone, REPL, and multiple-entrypoint Snake tests on one clean
+tagged commit.
+
+## After M4R1
+
+```text
+M5 Deep Performance Optimization = NOT STARTED
+M6 LLVM JIT = NOT STARTED
+M7 Full Semantic LSP = NOT STARTED
+M8 DAP = NOT STARTED
+```
+
+M4R1 does not include user generics, traits or interfaces, closures,
+inheritance, dynamic dispatch, operator overloading, macros, reflection,
+`dynamic`/`any`, unwind exceptions, pointer syntax, a borrow checker, shared
+memory threads, remote registries, untrusted-code sandboxing, JIT/AOT, a full
+semantic LSP, or DAP.

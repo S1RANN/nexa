@@ -9,9 +9,9 @@ use nexa_analysis::{
 use nexa_bytecode::{
     AbandonPolicy, AsyncResultType, CancelPolicy, EnumType, EnumVariant, FunctionBuilder,
     FunctionEffect, HostCallMode, HostImport, Instruction, MigrationLimitRequirements, Module,
-    ModuleBuilder, ReloadMetadata, RootMap, Signature, SnapshotType, SourceMapEntry, StateField,
-    StateHandleType, StateSchema, StateType, StructField, StructType, ValueType, option_type,
-    result_type,
+    ModuleBuilder, ReloadMetadata, ResourceTokenType, RootMap, ScriptExport, Signature,
+    SnapshotType, SourceMapEntry, StateField, StateHandleType, StateSchema, StateType, StructField,
+    StructType, ValueType, option_type, result_type,
 };
 use nexa_core::{FileId, SourceSpan, StableId};
 use nexa_diagnostics::{
@@ -19,11 +19,11 @@ use nexa_diagnostics::{
     ErrorCode as LeafErrorCode, Label as LeafLabel, RelatedLocation, Severity as LeafSeverity,
 };
 use nexa_runtime::{
-    GcRef, HostCallOutcome, HostErrorPayload, HostRegistry, HostRequestHandle, HostTrap,
-    ModuleHandle, PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext,
-    RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeHost, RuntimeHostArgs,
-    RuntimeLimits, RuntimeValue, StatefulDomainId, StepConfig, TaskHandle, TaskLimits, TaskPoll,
-    TaskTerminalReason, TickBudget,
+    GcRef, HostCallOutcome, HostErrorPayload, HostFunctionAuthority, HostRegistry,
+    HostRequestHandle, HostTrap, ModuleHandle, PendingHostRequest, RealmConfig, RealmRuntime,
+    ResourceContext, RestartReloadOutcome, RestartReloadPolicy, RuntimeError, RuntimeHost,
+    RuntimeHostArgs, RuntimeLimits, RuntimeValue, StatefulDomainId, StepConfig, TaskHandle,
+    TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits};
 use serde::Serialize;
@@ -50,6 +50,7 @@ pub struct RuntimeDiagnosticHarness {
     realm: RealmRuntime,
     host: RuntimeHost,
     modules: Vec<ModuleHandle>,
+    module_exports: Vec<(ModuleHandle, Vec<(u32, StableId)>)>,
     observed_tasks: Vec<TaskHandle>,
     observed_requests: Vec<HostRequestHandle>,
 }
@@ -68,6 +69,7 @@ impl RuntimeDiagnosticHarness {
                 host,
                 realm,
                 modules: Vec::new(),
+                module_exports: Vec::new(),
                 observed_tasks: Vec::new(),
                 observed_requests: Vec::new(),
             },
@@ -81,6 +83,7 @@ impl RuntimeDiagnosticHarness {
             host,
             realm: RealmRuntime::isolated(config),
             modules: Vec::new(),
+            module_exports: Vec::new(),
             observed_tasks: Vec::new(),
             observed_requests: Vec::new(),
         }
@@ -92,14 +95,31 @@ impl RuntimeDiagnosticHarness {
         host_hash: StableId,
     ) -> Result<ModuleHandle, nexa_runtime::RealmError> {
         let state_schema_fingerprint = module.module().state_schema_fingerprint;
+        let exports = module
+            .module()
+            .exports
+            .iter()
+            .map(|export| (export.function, export.stable_id))
+            .collect();
         let module = self
             .realm
             .load_module(module, host_hash, state_schema_fingerprint)?;
         self.modules.push(module);
+        self.module_exports.push((module, exports));
         Ok(module)
     }
 
     fn call(&mut self, module: ModuleHandle, function: u32) -> Result<TaskHandle, String> {
+        let export = self
+            .module_exports
+            .iter()
+            .find(|(candidate, _)| *candidate == module)
+            .and_then(|(_, exports)| {
+                exports
+                    .iter()
+                    .find_map(|(index, stable_id)| (*index == function).then_some(*stable_id))
+            })
+            .ok_or_else(|| format!("module function {function} has no script export"))?;
         let scope = self
             .realm
             .create_scope(None)
@@ -108,7 +128,7 @@ impl RuntimeDiagnosticHarness {
             .realm
             .spawn_task(
                 module,
-                function,
+                export,
                 &[],
                 StepConfig {
                     owner: scope,
@@ -255,32 +275,65 @@ enum RegistryMode {
 
 struct DiagnosticRegistry {
     hash: StableId,
+    authority: Option<HostFunctionAuthority>,
     mode: RegistryMode,
     pending: Arc<Mutex<Option<PendingHostRequest>>>,
 }
 
 impl DiagnosticRegistry {
-    fn new(hash: StableId, mode: RegistryMode) -> Self {
+    fn for_import(hash: StableId, import: &HostImport, mode: RegistryMode) -> Self {
         Self {
             hash,
+            authority: Some(fixture_host_function_authority(import)),
+            mode,
+            pending: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn without_functions(hash: StableId, mode: RegistryMode) -> Self {
+        Self {
+            hash,
+            authority: None,
             mode,
             pending: Arc::new(Mutex::new(None)),
         }
     }
 }
 
+fn fixture_host_function_authority(import: &HostImport) -> HostFunctionAuthority {
+    assert!(
+        import.parameters.is_empty(),
+        "diagnostic Host fixture parameter surface changed"
+    );
+    assert!(
+        import.capabilities.is_empty(),
+        "diagnostic Host fixture unexpectedly requires capabilities"
+    );
+    HostFunctionAuthority::from_import(import)
+}
+
 impl HostRegistry for DiagnosticRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(self.hash)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        self.authority
+            .as_ref()
+            .filter(|authority| authority.stable_id() == id)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 {
+        if self
+            .authority
+            .as_ref()
+            .is_none_or(|authority| authority.stable_id() != id)
+        {
             return Err(HostTrap::UnknownFunction(id));
         }
         match self.mode {
@@ -343,7 +396,7 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
     let missing_codes = expected.difference(&observed).cloned().collect::<Vec<_>>();
     let mut failures = cases
         .iter()
-        .filter(|(_, case)| !case.passed || !case.unexpected_mutations.is_empty())
+        .filter(|(_, case)| !(case.passed && case.unexpected_mutations.is_empty()))
         .map(|(code, case)| {
             format!(
                 "{code} failed: observed={} unexpected={:?}",
@@ -374,23 +427,19 @@ pub fn run_runtime_diagnostic_end_to_end() -> Result<RuntimeDiagnosticEndToEndRe
 
 #[allow(clippy::too_many_lines)]
 fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticEvidence, String> {
-    const IDL_SOURCE: &str =
-        "interface DiagnosticStackHost {\r\n    sync fn fail() -> i32;\r\n}\r\n";
+    const IDL_SOURCE: &str = "contract DiagnosticStackHost {\r\n    host {\r\n        fn fail() -> i32;\r\n    }\r\n    nexa {\r\n        fn entry() -> i32;\r\n    }\r\n}\r\n";
     const IDL_PATH: &str = "diagnostic_stack_api.nidl";
     const ENTRY_SOURCE: &str = concat!(
-        "module diagnostic_stack.entry;\r\n",
-        "import diagnostic_stack.middle as middle;\r\n",
-        "pub fn entry() -> i32 { let marker: string = \"🚀\"; return middle.forward(); }\r\n",
+        "use package::diagnostic_stack::middle as middle;\r\n",
+        "pub fn entry() -> i32 { let marker: string = \"🚀\"; return middle::forward(); }\r\n",
     );
     const MIDDLE_SOURCE: &str = concat!(
-        "module diagnostic_stack.middle;\n",
-        "import diagnostic_stack.leaf as leaf;\n",
-        "pub(package) fn forward() -> i32 { return leaf.crash(); }\n",
+        "use package::diagnostic_stack::leaf as leaf;\n",
+        "pub(package) fn forward() -> i32 { return leaf::crash(); }\n",
     );
     const LEAF_SOURCE: &str = concat!(
-        "module diagnostic_stack.leaf;\n",
-        "import host as test_host;\n",
-        "pub(package) fn crash() -> i32 { return test_host.fail(); }\n",
+        "use host::diagnostic_stack_host as test_host;\n",
+        "pub(package) fn crash() -> i32 { return test_host::fail(); }\n",
     );
 
     let idl = nexa_idl::parse(IDL_SOURCE).map_err(|error| error.to_string())?;
@@ -434,8 +483,13 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         .map(|function| function.function_index)
         .ok_or("compiled artifact has no entry debug function")?;
 
-    let host_hash = nexa_idl::exact_hash(&idl);
-    let registry = DiagnosticRegistry::new(host_hash, RegistryMode::StrictArity);
+    let host_hash = nexa_idl::contract_runtime_id(&idl);
+    let host_import = bytecode
+        .host_imports
+        .first()
+        .ok_or("compiled artifact has no Host import")?;
+    let registry =
+        DiagnosticRegistry::for_import(host_hash, host_import, RegistryMode::StrictArity);
     let (mut harness, _) = RuntimeDiagnosticHarness::hosted(RealmConfig::default(), registry)?;
     let module = harness
         .load(verified, host_hash)
@@ -558,20 +612,20 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         .to_owned();
     let interface_source = artifact
         .source_files
-        .source(host_import_debug.interface_span.file)
-        .ok_or("Host interface debug span refers to an unknown source")?;
+        .source(host_import_debug.contract_span.file)
+        .ok_or("Host contract debug span refers to an unknown source")?;
     let interface_text = interface_source
         .text
         .get(
-            host_import_debug.interface_span.start as usize
-                ..host_import_debug.interface_span.end as usize,
+            host_import_debug.contract_span.start as usize
+                ..host_import_debug.contract_span.end as usize,
         )
-        .ok_or("Host interface debug span is out of bounds")?;
+        .ok_or("Host contract debug span is out of bounds")?;
     let nidl_binding_verified = host_import_debug.stable_id == host_import.stable_id
-        && host_import_debug.interface_id == host_hash
-        && host_import_debug.interface_name == "DiagnosticStackHost"
+        && host_import_debug.contract_id == host_hash
+        && host_import_debug.contract_name == "DiagnosticStackHost"
         && host_import_debug.function_name == "fail"
-        && bytecode.host_interface_hash == Some(host_import_debug.interface_id)
+        && bytecode.host_contract_id == Some(host_import_debug.contract_id)
         && nidl_source.key.is_none()
         && nidl_source.identity == expected_nidl_identity
         && nidl_source.text.as_ref() == IDL_SOURCE
@@ -676,7 +730,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
     let stack_source_set = stack_sources.iter().collect::<BTreeSet<_>>();
     let file_id_set = file_ids.iter().collect::<BTreeSet<_>>();
     let expected_stack = ["crash", "forward", "entry"];
-    let expected_text = ["test_host.fail()", "leaf.crash()", "middle.forward()"];
+    let expected_text = ["test_host::fail()", "leaf::crash()", "middle::forward()"];
     let nidl_identity = nidl_source.identity.to_string();
     let human_has_all_sources = stack_sources
         .iter()
@@ -707,7 +761,7 @@ fn execute_multi_file_runtime_diagnostic() -> Result<MultiFileRuntimeDiagnosticE
         && true_call_site_pcs
         && true_host_call_boundary
         && boundary_source.identity.to_string() == stack_sources[0]
-        && host_boundary_text.contains("test_host.fail()")
+        && host_boundary_text.contains("test_host::fail()")
         && nidl_range.start < nidl_range.end
         && nidl_binding_verified
         && nidl_exact_source_preserved
@@ -808,7 +862,7 @@ activation = "programmatic"
         None,
         fingerprint.host_contract.clone(),
         fingerprint.host_contract_source.clone(),
-        fingerprint.host_required_exports.clone(),
+        fingerprint.host_required_entrypoints.clone(),
         nexa_analysis::CompilationOptions::default(),
         fingerprint,
     )
@@ -885,7 +939,8 @@ fn ledger_delta(before: &Value, after: &Value, field: &str) -> String {
 fn host_hash_mismatch_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
     let registry_hash = StableId::from_name("r3-host-a");
     let module_hash = StableId::from_name("r3-host-b");
-    let registry = DiagnosticRegistry::new(registry_hash, RegistryMode::ResultMismatch);
+    let registry =
+        DiagnosticRegistry::without_functions(registry_hash, RegistryMode::ResultMismatch);
     let (mut harness, _) = RuntimeDiagnosticHarness::hosted(RealmConfig::default(), registry)?;
     let before = harness.snapshot();
     let module = simple_module(module_hash);
@@ -1206,7 +1261,7 @@ fn resource_capacity_case() -> Result<RuntimeDiagnosticCaseEvidence, String> {
         .realm
         .spawn_task(
             module,
-            0,
+            StableId::from_name("runtime-diagnostics::simple"),
             &[],
             StepConfig {
                 owner: scope,
@@ -1585,13 +1640,18 @@ fn hosted_host_call_with_config(
     config: RealmConfig,
 ) -> Result<HostedHarness, String> {
     let host = StableId::from_name("r3-diagnostic-host");
-    let registry = DiagnosticRegistry::new(host, mode);
-    let (mut harness, pending) = RuntimeDiagnosticHarness::hosted(config, registry)?;
     let module = if asynchronous {
         async_module(host, typed_error)
     } else {
         host_call_module(host)
     };
+    let import = module
+        .module()
+        .host_imports
+        .first()
+        .expect("diagnostic Host-call module has one import");
+    let registry = DiagnosticRegistry::for_import(host, import, mode);
+    let (mut harness, pending) = RuntimeDiagnosticHarness::hosted(config, registry)?;
     let module = harness
         .load(module, host)
         .map_err(|error| error.to_string())?;
@@ -1609,10 +1669,17 @@ fn simple_module(host: StableId) -> VerifiedModule {
     function
         .effect(FunctionEffect::Immediate)
         .emit(Instruction::ReturnVoid);
+    let function = function.finish().expect("simple diagnostic function");
     let mut module = ModuleBuilder::new();
     module
         .metadata(host, StateSchema::default().fingerprint())
-        .function(function.finish().expect("simple diagnostic function"));
+        .script_export(ScriptExport {
+            stable_id: StableId::from_name("runtime-diagnostics::simple"),
+            function: 0,
+            signature: function.signature.clone(),
+            effect: function.effect,
+        })
+        .function(function);
     verify_round_trip(module.finish())
 }
 
@@ -1649,11 +1716,19 @@ fn host_call_module(host: StableId) -> VerifiedModule {
     module.metadata(host, StateSchema::default().fingerprint());
     module.host_import(HostImport {
         stable_id: StableId::from_name("R3::immediate"),
+        declaration_fingerprint: [0x31; 32],
+        capabilities: Vec::new(),
         parameters: Vec::new(),
         result: Some(ValueType::I32),
         mode: HostCallMode::Immediate,
         fuel_cost: 1,
         async_result: None,
+    });
+    module.script_export(ScriptExport {
+        stable_id: StableId::from_name("runtime-diagnostics::host-call"),
+        function: 0,
+        signature: function.signature.clone(),
+        effect: function.effect,
     });
     module.function(function);
     module.source_map([
@@ -1738,11 +1813,19 @@ fn async_module(host: StableId, typed_error: bool) -> VerifiedModule {
     module.enum_type(result);
     module.host_import(HostImport {
         stable_id: StableId::from_name("R3::async"),
+        declaration_fingerprint: [0x32; 32],
+        capabilities: Vec::new(),
         parameters: Vec::new(),
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
         fuel_cost: 1,
         async_result: Some(async_result),
+    });
+    module.script_export(ScriptExport {
+        stable_id: StableId::from_name("runtime-diagnostics::async"),
+        function: 0,
+        signature: function.signature.clone(),
+        effect: function.effect,
     });
     module.function(function);
     module.source_map([
@@ -1903,7 +1986,7 @@ fn migration_graph_module(host: StableId, fault: GraphFault) -> VerifiedModule {
         },
         RootMap {
             pc: 3,
-            bitmap: vec![true, true],
+            bitmap: vec![false, false],
         },
     ];
     let state_schema = StateSchema {
@@ -1967,6 +2050,8 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     direct.metadata(host, StateSchema::default().fingerprint());
     direct.host_import(HostImport {
         stable_id: StableId::from_name("R3::capability"),
+        declaration_fingerprint: [0x33; 32],
+        capabilities: vec!["diagnostic.invoke".into()],
         parameters: Vec::new(),
         result: None,
         mode: HostCallMode::Immediate,
@@ -2019,7 +2104,9 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     );
     modules.push(verify_round_trip(struct_module.finish()));
 
-    let resource = ValueType::Named(StableId::from_name("ResourceToken"));
+    let resource_content = StableId::from_name("R3DiagnosticResource");
+    let resource_token = ResourceTokenType::new(resource_content);
+    let resource = ValueType::Named(resource_token.type_id);
     let enumeration = EnumType {
         type_id: StableId::from_name("ResourceEnvelope"),
         variants: vec![EnumVariant {
@@ -2031,6 +2118,7 @@ fn host_capability_modules(host: StableId) -> Result<Vec<VerifiedModule>, String
     let mut enum_module = ModuleBuilder::new();
     enum_module
         .metadata(host, StateSchema::default().fingerprint())
+        .resource_token_type(resource_token)
         .enum_type(enumeration.clone());
     add_void_function(
         &mut enum_module,
@@ -2066,7 +2154,16 @@ fn add_void_function(module: &mut ModuleBuilder, parameters: Vec<ValueType>) {
     function
         .effect(FunctionEffect::Immediate)
         .emit(Instruction::ReturnVoid);
-    module.function(function.finish().expect("capability function"));
+    let mut function = function.finish().expect("capability function");
+    function.safepoints = vec![0];
+    function.root_maps = vec![RootMap {
+        pc: 0,
+        // The parameters establish which registers may contain references, but
+        // this fixture returns without reading them. Exact root maps therefore
+        // contain no live roots at the entry/return safepoint.
+        bitmap: vec![false; usize::from(registers)],
+    }];
+    module.function(function);
 }
 
 #[allow(clippy::needless_pass_by_value)]

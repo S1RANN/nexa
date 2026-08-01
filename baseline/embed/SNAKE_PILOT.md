@@ -27,8 +27,9 @@ Safe Mode is implemented entirely in Rust and remains playable with no package,
 with failed classic rule/HUD content, without a valid skin, or without a spawn
 proposal.
 
-M2 non-goals are JIT/AOT, new syntax, user generics, dynamic/interface types,
-LSP/DAP, C++/C# binding, remote packages, a public Mod market, network or
-arbitrary filesystem capabilities, hostile bytecode sandboxing, cross-module
-state references, old-Task migration, completion replay, parallel business
-versions, and cross-process script-state persistence.
+The M2 baseline did not cover JIT/AOT, the later Language v2 surface, user
+generics, dynamic types, traits, LSP/DAP, C++/C# binding, remote packages, a
+public Mod market, network or arbitrary filesystem capabilities, hostile
+bytecode sandboxing, cross-module state references, old-Task migration,
+completion replay, parallel business versions, or cross-process script-state
+persistence.

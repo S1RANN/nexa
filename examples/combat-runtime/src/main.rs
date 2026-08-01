@@ -119,13 +119,17 @@ impl generated::GameHost for EngineHost {
         _: i32,
     ) -> Result<generated::ActionLockToken, generated::HostError> {
         let token = context
-            .create_token(RuntimeHostDomain::Render)
+            .create_token(
+                generated::ActionLockToken::CONTENT_TYPE_ID,
+                RuntimeHostDomain::Render,
+            )
             .map_err(|error| generated::HostError(error.to_string()))?;
         *self
             .last_token
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(token);
-        Ok(generated::ActionLockToken::from_raw(token))
+        generated::ActionLockToken::try_from_raw(token)
+            .map_err(|error| generated::HostError(format!("{error:?}")))
     }
 
     fn world_snapshot(
@@ -242,14 +246,20 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let declared_idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
     assert_eq!(
         include_str!(concat!(env!("OUT_DIR"), "/combat_api.rs")),
-        nexa_idl::generate_rust(&declared_idl),
+        nexa_idl::generate_rust(&declared_idl)?,
         "Combat bindings must be generated without manual edits"
     );
-    assert_eq!(generated::Update::EXPORT_NAME, "Update");
-    let _typed_export_id = generated::Update::EXPORT_ID;
+    assert_eq!(
+        <generated::Update as nexa_runtime::ScriptExport>::NAME,
+        "update"
+    );
+    let _typed_export_id = <generated::Update as nexa_runtime::ScriptExport>::STABLE_ID;
     let idl = nexa_idl::parse(include_str!("../combat_api.nidl"))?;
-    let host_hash = generated::INTERFACE_HASH;
-    assert_eq!(host_hash, nexa_idl::exact_hash(&idl));
+    assert_eq!(
+        generated::CONTRACT_FINGERPRINT,
+        nexa_idl::contract_fingerprint(&idl).into_bytes()
+    );
+    let host_contract_id = generated::CONTRACT_RUNTIME_ID;
     let host_source = Arc::<str>::from(include_str!("../combat_api.nidl"));
     let host_contract = nexa::HostContractInput::with_source(
         &idl,
@@ -271,30 +281,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .find(|buffer| buffer.element == nexa_bytecode::ValueType::I32)
         .copied()
         .ok_or(HostFailure("combat buffer metadata was not emitted"))?;
-    let function_index = |name: &str| {
-        initial
-            .debug_info
-            .functions
-            .iter()
-            .find(|function| {
-                function.package_id == COMBAT_PACKAGE_ID
-                    && function.module_path == "game.combat"
-                    && function.name == name
-            })
-            .map(|function| function.function_index)
-    };
-    let animation_checked = function_index("animation_checked").ok_or(HostFailure(
-        "animation_checked debug metadata was not emitted",
-    ))?;
-    let update = function_index("Update").ok_or(HostFailure("Update metadata was not emitted"))?;
-    let feature_probe = function_index("feature_probe")
-        .ok_or(HostFailure("feature_probe debug metadata was not emitted"))?;
-    let state_probe = function_index("state_probe")
-        .ok_or(HostFailure("state_probe debug metadata was not emitted"))?;
+    let animation_checked = <generated::AnimationChecked as nexa_runtime::ScriptExport>::STABLE_ID;
+    let feature_probe = <generated::FeatureProbe as nexa_runtime::ScriptExport>::STABLE_ID;
     let verified = initial.verified;
-    let state_handle_type = nexa_bytecode::state_handle_type(nexa_bytecode::ValueType::Named(
-        combat_symbol(SymbolKind::Type, "EnemyBrain"),
-    ));
     let last_request = Arc::new(Mutex::new(None));
     let last_token = Arc::new(Mutex::new(None));
     let last_snapshot = Arc::new(Mutex::new(None));
@@ -309,7 +298,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         runtime_host.clone(),
         Box::new(registry),
     )?;
-    let module = realm.load_module(verified, host_hash, state_schema_fingerprint)?;
+    let module = realm.load_module(verified, host_contract_id, state_schema_fingerprint)?;
     let enemy_brain = StableId::from_name("boss");
     let replaced_handle = realm.insert_state(
         module,
@@ -387,27 +376,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         realm.poll_task(feature_task, 1_024)?,
         TaskPoll::Completed(RuntimeValue::I32(9))
     ));
-    let state_task = realm.spawn_task(
-        module,
-        state_probe,
-        &[RuntimeValue::StateHandle {
-            handle_type: state_handle_type,
-            domain: replaced_handle.domain.get(),
-            stable_id: replaced_handle.stable_id,
-            generation: replaced_handle.generation,
-        }],
-        StepConfig {
-            owner: scope,
-            priority: 10,
-            fuel_slice: 256,
-            cumulative_budget: 1_024,
-            limits: TaskLimits::default(),
-        },
-    )?;
-    assert!(matches!(
-        realm.poll_task(state_task, 256)?,
-        TaskPoll::Completed(RuntimeValue::I32(_))
-    ));
     let checked = realm.spawn_task(
         module,
         animation_checked,
@@ -478,10 +446,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         )))
     ));
 
-    let task = realm.spawn_task(
+    let task = realm.spawn_export::<generated::Update>(
         module,
-        update,
-        &[RuntimeValue::I32(41)],
+        &generated::UpdateArgs { entity: 41 },
         StepConfig {
             owner: scope,
             priority: 10,
@@ -522,10 +489,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let cancelled = realm.spawn_task(
+    let cancelled = realm.spawn_export::<generated::Update>(
         module,
-        update,
-        &[RuntimeValue::I32(12)],
+        &generated::UpdateArgs { entity: 12 },
         StepConfig {
             owner: scope,
             priority: 1,
@@ -560,10 +526,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
-    let live = realm.spawn_task(
+    let live = realm.spawn_export::<generated::Update>(
         module,
-        update,
-        &[RuntimeValue::I32(10)],
+        &generated::UpdateArgs { entity: 10 },
         StepConfig {
             owner: scope,
             priority: 1,
@@ -585,17 +550,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         2,
         include_str!("../reload/v2.nexa"),
     )?;
-    let v2_update = v2_artifact
-        .debug_info
-        .functions
-        .iter()
-        .find(|function| {
-            function.package_id == COMBAT_PACKAGE_ID
-                && function.module_path == "game.combat"
-                && function.name == "Update"
-        })
-        .map(|function| function.function_index)
-        .ok_or(HostFailure("reloaded Update metadata was not emitted"))?;
     let v2 = v2_artifact.verified;
     let RestartReloadOutcome::Committed(v2) = realm.restart_reload(
         module,
@@ -662,10 +616,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .is_err()
     );
 
-    let rollback_task = realm.spawn_task(
+    let rollback_task = realm.spawn_export::<generated::Update>(
         v2,
-        v2_update,
-        &[RuntimeValue::I32(4)],
+        &generated::UpdateArgs { entity: 4 },
         StepConfig {
             owner: scope,
             priority: 1,
@@ -703,10 +656,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     ));
 
     let cancelled_scope = realm.create_scope(None)?;
-    let cancelled_task = realm.spawn_task(
+    let cancelled_task = realm.spawn_export::<generated::Update>(
         v2,
-        v2_update,
-        &[RuntimeValue::I32(5)],
+        &generated::UpdateArgs { entity: 5 },
         StepConfig {
             owner: cancelled_scope,
             priority: 2,
@@ -729,10 +681,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         ))
     ));
 
-    let live = realm.spawn_task(
+    let live = realm.spawn_export::<generated::Update>(
         v2,
-        v2_update,
-        &[RuntimeValue::I32(1)],
+        &generated::UpdateArgs { entity: 1 },
         StepConfig {
             owner: scope,
             priority: 1,
@@ -775,10 +726,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(
         realm
-            .spawn_task(
+            .spawn_export::<generated::Update>(
                 fault,
-                0,
-                &[RuntimeValue::I32(1)],
+                &generated::UpdateArgs { entity: 1 },
                 StepConfig {
                     owner: scope,
                     priority: 1,

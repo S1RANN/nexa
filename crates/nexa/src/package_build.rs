@@ -13,13 +13,14 @@ use nexa_analysis::{
     AnalysisOutcome, BuildFingerprint, BuildFingerprintInput, CandidateIdentity,
     FingerprintBuilder, LinkedStateFingerprint, LockFile, ModulePath, NormalizedPackagePath,
     PackageId, PackageKind, PackageManifest, PackageSourceSet, PublicApiFingerprint, QueryDatabase,
-    QueryExecutionReport, QueryStats, ResolvedBuildInput, ResolvedDependencyGraph,
+    QueryExecutionReport, QueryStats, ReplCellInput, ReplSessionAnalysisOutcome, ReplSessionInput,
+    ReplSessionSnapshot, ReplStagedCell, ResolvedBuildInput, ResolvedDependencyGraph,
     ResolvedTestInput, SourceKey, SourceSetFingerprint, StateSchemaFingerprint, analyze_package,
-    analyze_package_tests, source_set_fingerprint,
+    analyze_package_tests, analyze_repl_session_cell, source_set_fingerprint,
 };
 use nexa_compiler::{
-    PackageDebugInfo, PackageStateTypeInfo, PackageTestCallGraphNode, PackageTestInfo,
-    PackageVisibility,
+    PackageDebugInfo, PackageMainInfo, PackageReplCellInfo, PackageStateTypeInfo,
+    PackageTestCallGraphNode, PackageTestInfo, PackageVisibility,
 };
 use nexa_core::{CanonicalSymbolIdentity, FileId, SourceSpan, StableSymbolId, SymbolKind};
 use nexa_diagnostics::{
@@ -28,7 +29,7 @@ use nexa_diagnostics::{
 };
 use nexa_verifier::VerifiedModule;
 
-pub const NEXA_LANGUAGE_VERSION: &str = nexa_analysis::NEXA_LANGUAGE_VERSION;
+pub const NEXA_LANGUAGE_VERSION: u16 = nexa_analysis::NEXA_LANGUAGE_VERSION;
 pub const NEXA_COMPILER_VERSION: &str = nexa_core::NEXA_COMPILER_VERSION;
 pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 =
     nexa_analysis::COMPILATION_OPTIONS_SCHEMA_VERSION;
@@ -61,28 +62,33 @@ impl HostContractSource {
 /// do not retain an original `.nidl` file can use [`HostContractInput::canonical`].
 #[derive(Clone, Debug)]
 pub struct HostContractInput<'a> {
-    idl: &'a nexa_idl::Idl,
+    contract: &'a nexa_idl::ValidatedContract,
     source: HostContractSource,
-    required_export_indices: Arc<[usize]>,
+    required_entrypoint_indices: Arc<[usize]>,
+    effective_selection: Arc<nexa_idl::EffectiveContractSelection>,
+    effective_descriptor: Arc<nexa_idl::EffectiveContractDescriptor>,
 }
 
 impl<'a> HostContractInput<'a> {
     #[must_use]
-    pub fn canonical(idl: &'a nexa_idl::Idl) -> Self {
+    pub fn canonical(contract: &'a nexa_idl::ValidatedContract) -> Self {
+        let selection = default_effective_selection(contract, &[]);
+        let descriptor = nexa_idl::effective_contract_descriptor(contract, &selection)
+            .expect("the validated Contract's own declarations form a valid selection");
         Self {
-            idl,
+            contract,
             source: HostContractSource {
-                identity: SourceIdentity::standalone(
-                    crate::package_environment::CANONICAL_HOST_SOURCE_PATH,
-                ),
-                text: Arc::from(nexa_idl::canonical_source(idl)),
+                identity: SourceIdentity::standalone(format!("nidl://generated/{}", contract.name)),
+                text: Arc::from(contract.source.as_str()),
             },
-            required_export_indices: (0..idl.exports.len()).collect::<Vec<_>>().into(),
+            required_entrypoint_indices: Arc::from([]),
+            effective_selection: Arc::new(selection),
+            effective_descriptor: Arc::new(descriptor),
         }
     }
 
     pub fn with_source(
-        idl: &'a nexa_idl::Idl,
+        contract: &'a nexa_idl::ValidatedContract,
         identity: SourceIdentity,
         text: impl Into<Arc<str>>,
     ) -> Result<Self, HostContractSourceError> {
@@ -91,22 +97,28 @@ impl<'a> HostContractInput<'a> {
         }
         let text = text.into();
         let parsed = nexa_idl::parse(&text).map_err(HostContractSourceError::Parse)?;
-        if parsed != *idl {
+        if nexa_idl::abi_descriptor(&parsed).bytes != nexa_idl::abi_descriptor(contract).bytes {
             return Err(HostContractSourceError::ParsedContractMismatch);
         }
+        let selection = default_effective_selection(contract, &[]);
+        let descriptor = nexa_idl::effective_contract_descriptor(contract, &selection)
+            .expect("the validated Contract's own declarations form a valid selection");
         Ok(Self {
-            idl,
+            contract,
             source: HostContractSource { identity, text },
-            required_export_indices: (0..idl.exports.len()).collect::<Vec<_>>().into(),
+            required_entrypoint_indices: Arc::from([]),
+            effective_selection: Arc::new(selection),
+            effective_descriptor: Arc::new(descriptor),
         })
     }
 
-    /// Selects the exact subset of Host-declared exports which this build must implement.
+    /// Selects the exact subset of contract-declared Nexa entrypoints which this build must
+    /// implement.
     ///
     /// The complete IDL, Host hash, functions, types, source identity, and source bytes remain
     /// unchanged. Names are canonicalized into declaration order so equivalent configuration
     /// lists produce one build identity.
-    pub fn requiring_exports(&self, names: &[String]) -> Result<Self, HostContractSourceError> {
+    pub fn requiring_entrypoints(&self, names: &[String]) -> Result<Self, HostContractSourceError> {
         let requested = names.iter().map(String::as_str).collect::<BTreeSet<_>>();
         if requested.len() != names.len() {
             let mut seen = BTreeSet::new();
@@ -115,31 +127,64 @@ impl<'a> HostContractInput<'a> {
                 .find(|name| !seen.insert(name.as_str()))
                 .expect("a duplicate exists")
                 .clone();
-            return Err(HostContractSourceError::DuplicateRequiredExport(duplicate));
+            return Err(HostContractSourceError::DuplicateRequiredEntrypoint(
+                duplicate,
+            ));
         }
         for name in names {
-            if !self.idl.exports.iter().any(|export| export.name == *name) {
-                return Err(HostContractSourceError::UnknownRequiredExport(name.clone()));
+            if !self
+                .contract
+                .nexa_functions
+                .iter()
+                .any(|entrypoint| entrypoint.name == *name)
+            {
+                return Err(HostContractSourceError::UnknownRequiredEntrypoint(
+                    name.clone(),
+                ));
             }
         }
-        let required_export_indices = self
-            .idl
-            .exports
+        let mut required_entrypoint_indices = self
+            .contract
+            .nexa_functions
             .iter()
             .enumerate()
-            .filter_map(|(index, export)| requested.contains(export.name.as_str()).then_some(index))
-            .collect::<Vec<_>>()
-            .into();
+            .filter_map(|(index, entrypoint)| {
+                requested
+                    .contains(entrypoint.name.as_str())
+                    .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        required_entrypoint_indices.sort_by(|left, right| {
+            let left = &self.contract.nexa_functions[*left];
+            let right = &self.contract.nexa_functions[*right];
+            left.stable_id
+                .cmp(&right.stable_id)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        let required_entrypoint_indices: Arc<[usize]> = required_entrypoint_indices.into();
+        let required_names = required_entrypoint_indices
+            .iter()
+            .map(|index| self.contract.nexa_functions[*index].name.clone())
+            .collect::<BTreeSet<_>>();
+        let mut selection = self.effective_selection.as_ref().clone();
+        selection.required_nexa_entrypoints = required_names;
+        selection
+            .present_optional_nexa_entrypoints
+            .retain(|name| !selection.required_nexa_entrypoints.contains(name));
+        let descriptor = nexa_idl::effective_contract_descriptor(self.contract, &selection)
+            .map_err(HostContractSourceError::InvalidEffectiveSelection)?;
         Ok(Self {
-            idl: self.idl,
+            contract: self.contract,
             source: self.source.clone(),
-            required_export_indices,
+            required_entrypoint_indices,
+            effective_selection: Arc::new(selection),
+            effective_descriptor: Arc::new(descriptor),
         })
     }
 
     #[must_use]
-    pub fn idl(&self) -> &nexa_idl::Idl {
-        self.idl
+    pub const fn contract(&self) -> &nexa_idl::ValidatedContract {
+        self.contract
     }
 
     #[must_use]
@@ -147,28 +192,215 @@ impl<'a> HostContractInput<'a> {
         &self.source
     }
 
-    pub(crate) fn required_exports(&self) -> impl ExactSizeIterator<Item = &nexa_idl::Export> + '_ {
-        self.required_export_indices
-            .iter()
-            .map(|index| &self.idl.exports[*index])
+    /// Package-specific Contract selection bound into the build fingerprint.
+    #[must_use]
+    pub fn effective_selection(&self) -> &nexa_idl::EffectiveContractSelection {
+        &self.effective_selection
     }
 
-    /// Canonical identity of the effective required-export view.
+    /// Canonical ABI Descriptor v2 bytes for this Package's effective Contract.
     #[must_use]
-    pub fn canonical_required_exports(&self) -> Vec<u8> {
-        nexa_idl::canonical_required_exports(
-            self.required_exports().map(|export| export.name.as_str()),
+    pub fn effective_descriptor(&self) -> &nexa_idl::EffectiveContractDescriptor {
+        &self.effective_descriptor
+    }
+
+    /// Full 32-byte Package-specific Contract fingerprint used by build/freshness identity.
+    #[must_use]
+    pub fn effective_contract_fingerprint(&self) -> nexa_idl::AbiFingerprint {
+        self.effective_descriptor.fingerprint
+    }
+
+    /// Applies the Package's actually referenced Host/type surface and present optional
+    /// entrypoints. The Host-selected required subset remains authoritative.
+    pub fn selecting_effective_contract(
+        &self,
+        mut selection: nexa_idl::EffectiveContractSelection,
+    ) -> Result<Self, HostContractSourceError> {
+        selection.required_nexa_entrypoints = self
+            .required_entrypoints()
+            .map(|entrypoint| entrypoint.name.clone())
+            .collect();
+        selection
+            .present_optional_nexa_entrypoints
+            .retain(|name| !selection.required_nexa_entrypoints.contains(name));
+        let descriptor = nexa_idl::effective_contract_descriptor(self.contract, &selection)
+            .map_err(HostContractSourceError::InvalidEffectiveSelection)?;
+        Ok(Self {
+            contract: self.contract,
+            source: self.source.clone(),
+            required_entrypoint_indices: Arc::clone(&self.required_entrypoint_indices),
+            effective_selection: Arc::new(selection),
+            effective_descriptor: Arc::new(descriptor),
+        })
+    }
+
+    /// Derives the package-specific Host/type/entrypoint subset before fingerprinting or analysis.
+    pub fn selecting_effective_package_contract(
+        &self,
+        root_manifest: &PackageManifest,
+        root_sources: &PackageSourceSet,
+        dependency_sources: &BTreeMap<PackageId, Arc<PackageSourceSet>>,
+    ) -> Result<Self, HostContractSourceError> {
+        let required = self
+            .required_entrypoints()
+            .map(|entrypoint| entrypoint.name.clone())
+            .collect::<Vec<_>>();
+        let environment = crate::package_environment::canonical_analysis_environment(self)
+            .map_err(HostContractSourceError::Environment)?;
+        let host = environment
+            .host
+            .as_ref()
+            .expect("the canonical Contract environment always contains a Host surface");
+        let references = nexa_analysis::effective_contract_references(
+            root_sources,
+            dependency_sources,
+            &contract_scan_entry_module(root_manifest, root_sources),
+            host,
+            &required,
+        )
+        .map_err(HostContractSourceError::EffectiveContractScan)?;
+        let type_names = self
+            .contract
+            .handles
+            .iter()
+            .map(|declaration| (declaration.stable_id, declaration.name.clone()))
+            .chain(
+                self.contract
+                    .structs
+                    .iter()
+                    .map(|declaration| (declaration.stable_id, declaration.name.clone())),
+            )
+            .chain(
+                self.contract
+                    .enums
+                    .iter()
+                    .map(|declaration| (declaration.stable_id, declaration.name.clone())),
+            )
+            .collect::<BTreeMap<_, _>>();
+        let host_function_names = self
+            .contract
+            .host_functions
+            .iter()
+            .map(|function| (function.stable_id, function.name.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let selection = nexa_idl::EffectiveContractSelection {
+            referenced_types: references
+                .referenced_types
+                .iter()
+                .filter_map(|stable_id| type_names.get(stable_id).cloned())
+                .collect(),
+            host_functions: references
+                .host_functions
+                .iter()
+                .filter_map(|stable_id| host_function_names.get(stable_id).cloned())
+                .collect(),
+            required_nexa_entrypoints: references.entrypoints.required.into_iter().collect(),
+            present_optional_nexa_entrypoints: if root_manifest.application.is_some() {
+                references
+                    .entrypoints
+                    .implemented_optional
+                    .into_iter()
+                    .collect()
+            } else {
+                BTreeSet::new()
+            },
+        };
+        self.selecting_effective_contract(selection)
+    }
+
+    /// Compact runtime compatibility identity for the complete validated Contract.
+    #[must_use]
+    pub fn runtime_id(&self) -> nexa_core::StableId {
+        nexa_idl::contract_runtime_id(self.contract)
+    }
+
+    /// All legal Nexa entrypoints declared by this contract.
+    #[must_use]
+    pub fn entrypoints(&self) -> impl ExactSizeIterator<Item = &nexa_idl::ValidatedFunction> + '_ {
+        self.contract.nexa_functions.iter()
+    }
+
+    /// Entrypoints selected as required by the Host use case.
+    #[must_use]
+    pub fn required_entrypoints(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &nexa_idl::ValidatedFunction> + '_ {
+        self.required_entrypoint_indices
+            .iter()
+            .map(|index| &self.contract.nexa_functions[*index])
+    }
+
+    /// Canonical identity of the effective required-entrypoint view.
+    #[must_use]
+    pub fn canonical_required_entrypoints(&self) -> Vec<u8> {
+        nexa_idl::required_entrypoints_descriptor(
+            self.required_entrypoints()
+                .map(|entrypoint| entrypoint.name.as_str()),
         )
     }
+}
+
+fn default_effective_selection(
+    contract: &nexa_idl::ValidatedContract,
+    required_entrypoints: &[String],
+) -> nexa_idl::EffectiveContractSelection {
+    nexa_idl::EffectiveContractSelection {
+        referenced_types: contract
+            .handles
+            .iter()
+            .map(|declaration| declaration.name.clone())
+            .chain(
+                contract
+                    .structs
+                    .iter()
+                    .map(|declaration| declaration.name.clone()),
+            )
+            .chain(
+                contract
+                    .enums
+                    .iter()
+                    .map(|declaration| declaration.name.clone()),
+            )
+            .collect(),
+        host_functions: contract
+            .host_functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect(),
+        required_nexa_entrypoints: required_entrypoints.iter().cloned().collect(),
+        present_optional_nexa_entrypoints: BTreeSet::new(),
+    }
+}
+
+fn contract_scan_entry_module(
+    manifest: &PackageManifest,
+    sources: &PackageSourceSet,
+) -> ModulePath {
+    manifest.application.as_ref().map_or_else(
+        || contract_scan_fallback_module(sources),
+        |application| application.entry.clone(),
+    )
+}
+
+fn contract_scan_fallback_module(sources: &PackageSourceSet) -> ModulePath {
+    sources
+        .units()
+        .values()
+        .find(|unit| unit.role == nexa_analysis::SourceRole::Production)
+        .and_then(|unit| unit.expected_module_path().ok())
+        .unwrap_or_else(|| ModulePath::new("lib").expect("the fallback library module is valid"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HostContractSourceError {
     InvalidIdentity(SourceIdentity),
-    Parse(nexa_idl::IdlError),
+    Parse(nexa_idl::NidlError),
     ParsedContractMismatch,
-    UnknownRequiredExport(String),
-    DuplicateRequiredExport(String),
+    UnknownRequiredEntrypoint(String),
+    DuplicateRequiredEntrypoint(String),
+    InvalidEffectiveSelection(nexa_idl::EffectiveDescriptorError),
+    EffectiveContractScan(nexa_analysis::EffectiveContractScanError),
+    Environment(crate::package_environment::PackageEnvironmentError),
 }
 
 impl fmt::Display for HostContractSourceError {
@@ -179,17 +411,21 @@ impl fmt::Display for HostContractSourceError {
                 "Host contract source identity must be a non-empty standalone path, found {identity}"
             ),
             Self::Parse(error) => write!(formatter, "invalid Host contract source: {error}"),
-            Self::ParsedContractMismatch => formatter
-                .write_str("Host contract source does not parse to the supplied canonical IDL"),
-            Self::UnknownRequiredExport(name) => {
+            Self::ParsedContractMismatch => formatter.write_str(
+                "Host contract source does not parse to the supplied validated contract",
+            ),
+            Self::UnknownRequiredEntrypoint(name) => {
                 write!(
                     formatter,
-                    "required export `{name}` is not declared by the Host contract"
+                    "required entrypoint `{name}` is not declared by the Host contract"
                 )
             }
-            Self::DuplicateRequiredExport(name) => {
-                write!(formatter, "duplicate required export `{name}`")
+            Self::DuplicateRequiredEntrypoint(name) => {
+                write!(formatter, "duplicate required entrypoint `{name}`")
             }
+            Self::InvalidEffectiveSelection(error) => error.fmt(formatter),
+            Self::EffectiveContractScan(error) => error.fmt(formatter),
+            Self::Environment(error) => error.fmt(formatter),
         }
     }
 }
@@ -198,22 +434,31 @@ impl std::error::Error for HostContractSourceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Parse(error) => Some(error),
+            Self::InvalidEffectiveSelection(error) => Some(error),
+            Self::EffectiveContractScan(error) => Some(error),
+            Self::Environment(error) => Some(error),
             Self::InvalidIdentity(_)
             | Self::ParsedContractMismatch
-            | Self::UnknownRequiredExport(_)
-            | Self::DuplicateRequiredExport(_) => None,
+            | Self::UnknownRequiredEntrypoint(_)
+            | Self::DuplicateRequiredEntrypoint(_) => None,
         }
     }
 }
 
-/// Canonical bytes for the one M4 compiler configuration that the façade actually applies.
+/// Canonical bytes for the default manifest-backed package profile.
 ///
-/// M4 does not expose per-caller optimization or language-feature flags. Making this byte
-/// sequence internal to the façade prevents CLI and Engine from assigning different build
-/// identities to the same artifact.
+/// Callers compiling standalone packages, scripts, or REPL cells must use
+/// [`canonical_compilation_options_for_profile`]. Keeping this construction in the façade
+/// prevents CLI and Engine from assigning different build identities to the same artifact.
 #[must_use]
 pub fn canonical_compilation_options() -> Vec<u8> {
-    nexa_analysis::canonical_compilation_options(&nexa_analysis::CompilationOptions::default())
+    canonical_compilation_options_for_profile(crate::BuildProfile::Package)
+}
+
+/// Canonical compiler-option identity for one explicit source profile.
+#[must_use]
+pub fn canonical_compilation_options_for_profile(profile: crate::BuildProfile) -> Vec<u8> {
+    nexa_analysis::canonical_compilation_options(&profile.compilation_options())
 }
 
 /// Canonical, lossless identity of the Host source snapshot that is emitted into debug metadata.
@@ -241,14 +486,14 @@ pub fn canonical_host_contract_source_identity(contract: &HostContractInput<'_>)
 ///
 /// [`BuildFingerprint`] binds the complete validated input closure, including the lock graph,
 /// Host ABI/source/required exports, compiler and runtime versions, standard-library descriptor,
-/// and effective compiler options. The encoded v5 module independently binds the actual
+/// and effective compiler options. The encoded v6 module independently binds the actual
 /// code-generation/link result. Exact source and debug registries prevent an internally tampered
 /// artifact from retaining a valid linked identity. The exact canonical Stateful surface binds
 /// the host lookup registry as well as the runtime schema. The remaining fields bind the artifact
 /// summaries and resolved dependency closure exposed to Runtime and Last-Known-Good inspection.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
-pub fn linked_state_fingerprint(
+pub(crate) fn linked_state_fingerprint(
     build_fingerprint: BuildFingerprint,
     module: &nexa_bytecode::Module,
     source_files: &PackageSourceSnapshot,
@@ -261,10 +506,10 @@ pub fn linked_state_fingerprint(
     dependency_closure: &ResolvedDependencyGraph,
     dependency_source_fingerprints: &BTreeMap<PackageId, SourceSetFingerprint>,
 ) -> LinkedStateFingerprint {
-    const LINKED_STATE_SCHEMA: u16 = 4;
+    const LINKED_STATE_SCHEMA: u16 = 5;
     let mut builder = FingerprintBuilder::new(LinkedStateFingerprint::DOMAIN, LINKED_STATE_SCHEMA);
     builder.field_bytes("build", build_fingerprint.as_bytes());
-    builder.field_bytes("module-v5", &module.encode());
+    builder.field_bytes("module-v6", &module.encode());
     fingerprint_source_snapshot(&mut builder, source_files);
     fingerprint_debug_info(&mut builder, debug_info);
     fingerprint_state_surface(&mut builder, state_surface);
@@ -350,6 +595,14 @@ fn fingerprint_source_snapshot(
             source.module_path.as_deref().unwrap_or_default(),
         );
         builder.field_u8(
+            "source-virtual-module-present",
+            u8::from(source.virtual_module_path.is_some()),
+        );
+        builder.field_str(
+            "source-virtual-module",
+            source.virtual_module_path.as_deref().unwrap_or_default(),
+        );
+        builder.field_u8(
             "source-compiler-provided",
             u8::from(source.compiler_provided),
         );
@@ -424,10 +677,10 @@ fn fingerprint_debug_info(builder: &mut FingerprintBuilder, debug_info: &Package
     for host in &debug_info.host_imports {
         builder.field_u32("debug-host-import-index", host.import_index);
         builder.field_u64("debug-host-stable-id", host.stable_id.0);
-        builder.field_u64("debug-host-interface-id", host.interface_id.0);
-        builder.field_str("debug-host-interface-name", &host.interface_name);
+        builder.field_u64("debug-host-contract-id", host.contract_id.0);
+        builder.field_str("debug-host-contract-name", &host.contract_name);
         builder.field_str("debug-host-function-name", &host.function_name);
-        fingerprint_source_span(builder, "debug-host-interface", host.interface_span);
+        fingerprint_source_span(builder, "debug-host-contract", host.contract_span);
         fingerprint_source_span(builder, "debug-host-declaration", host.declaration_span);
     }
 }
@@ -643,6 +896,91 @@ pub struct PackageBuildObservation {
     pub pipeline: PackagePipelineStats,
 }
 
+/// Verified output of the manifest-backed standalone profile.
+///
+/// The package artifact retains the same freshness, source, debug, state, and dependency
+/// authorities as an embedded application. `main` is the compiler-validated entrypoint
+/// descriptor; callers never need to infer it from a debug name or a user-supplied function
+/// index.
+#[derive(Clone, Debug)]
+pub struct CompiledStandaloneArtifact {
+    package: CompiledPackageArtifact,
+    main: PackageMainInfo,
+}
+
+impl CompiledStandaloneArtifact {
+    fn new(package: CompiledPackageArtifact, main: PackageMainInfo) -> Self {
+        Self { package, main }
+    }
+
+    /// Complete verified package artifact used for runtime loading.
+    #[must_use]
+    pub const fn package(&self) -> &CompiledPackageArtifact {
+        &self.package
+    }
+
+    /// Compiler-validated `main(Array<string>) -> i32` descriptor.
+    #[must_use]
+    pub const fn main(&self) -> &PackageMainInfo {
+        &self.main
+    }
+
+    /// Transfers the verified package artifact into an owning runtime.
+    #[must_use]
+    pub fn into_package(self) -> CompiledPackageArtifact {
+        self.package
+    }
+
+    /// Stable bytecode identity of the standalone entrypoint marker.
+    #[must_use]
+    pub const fn main_stable_id(&self) -> nexa_core::StableId {
+        self.main.stable_id
+    }
+}
+
+/// Verified cumulative candidate for one transactional REPL cell.
+///
+/// `cell` is the compiler-validated stable entrypoint marker for this exact candidate. The
+/// analysis session token is deliberately retained separately by [`ReplSession`], so compiling
+/// or inspecting this artifact cannot commit semantic state.
+#[derive(Clone, Debug)]
+pub struct CompiledReplCellArtifact {
+    package: CompiledPackageArtifact,
+    cell: PackageReplCellInfo,
+}
+
+impl CompiledReplCellArtifact {
+    fn new(package: CompiledPackageArtifact, cell: PackageReplCellInfo) -> Self {
+        Self { package, cell }
+    }
+
+    /// Complete verified candidate used by the Realm transaction.
+    #[must_use]
+    pub const fn package(&self) -> &CompiledPackageArtifact {
+        &self.package
+    }
+
+    /// Stable typed task entrypoint for this cell.
+    #[must_use]
+    pub const fn cell(&self) -> &PackageReplCellInfo {
+        &self.cell
+    }
+
+    /// Transfers the verified package artifact into an owning runtime transaction.
+    #[must_use]
+    pub fn into_package(self) -> CompiledPackageArtifact {
+        self.package
+    }
+}
+
+/// Verified revision-zero module which owns the unique empty REPL environment.
+#[derive(Clone, Debug)]
+pub(crate) struct CompiledReplSeedArtifact {
+    pub(crate) verified: VerifiedModule,
+    pub(crate) state_schema_fingerprint: StateSchemaFingerprint,
+    pub(crate) environment: nexa_core::StableId,
+}
+
 /// Persistent canonical package-build session.
 ///
 /// Reusing this object is the only supported way to retain incremental query state. Free
@@ -674,12 +1012,44 @@ impl PackageBuildSession {
         self.pipeline
     }
 
-    pub fn check_package(
+    pub(crate) fn compile_repl_seed_with_contract(
         &mut self,
-        input: &ResolvedBuildInput,
-        interface: &nexa_idl::Idl,
-    ) -> Result<PackageCheckReport, PackageBuildError> {
-        self.check_package_with_contract(input, &HostContractInput::canonical(interface))
+        contract: &HostContractInput<'_>,
+        verifier_limits: nexa_verifier::VerifierLimits,
+    ) -> Result<CompiledReplSeedArtifact, PackageBuildError> {
+        self.pipeline.start_typed_compiler();
+        let seed = nexa_compiler::compile_typed_repl_seed(contract.runtime_id())?;
+        let compiled = seed.package;
+        if compiled.module.host_contract_id != Some(contract.runtime_id())
+            || compiled.module.state_schema_fingerprint != seed.state_schema_fingerprint
+            || compiled.module.reload_metadata.state_schema_fingerprint
+                != seed.state_schema_fingerprint
+            || !compiled.module.host_imports.is_empty()
+            || !compiled.module.exports.is_empty()
+            || !compiled.module.functions.is_empty()
+            || compiled.module.reload_metadata.migration_entry.is_some()
+            || compiled.module.reload_metadata.activation_entry.is_some()
+        {
+            return Err(PackageBuildError::InvalidReplStateSurface);
+        }
+        let [environment] = compiled.state_surface.as_slice() else {
+            return Err(PackageBuildError::InvalidReplStateSurface);
+        };
+        if environment.name != nexa_analysis::REPL_ENVIRONMENT_TYPE_NAME
+            || environment.version != nexa_analysis::REPL_ENVIRONMENT_STATE_VERSION
+            || !environment.fields.is_empty()
+            || environment.stable_id != nexa_analysis::repl_environment_symbol()
+        {
+            return Err(PackageBuildError::InvalidReplStateSurface);
+        }
+        self.pipeline.start_verifier();
+        let verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
+        validate_host_entrypoints(verified.module(), contract)?;
+        Ok(CompiledReplSeedArtifact {
+            verified,
+            state_schema_fingerprint: seed.state_schema_fingerprint,
+            environment: environment.stable_id.0,
+        })
     }
 
     pub fn check_package_with_contract(
@@ -690,6 +1060,12 @@ impl PackageBuildSession {
         input
             .validate_integrity()
             .map_err(PackageBuildError::InvalidResolvedInput)?;
+        let effective_contract = contract.selecting_effective_package_contract(
+            &input.root_manifest,
+            &input.root_source_set,
+            &input.dependency_source_sets,
+        )?;
+        let contract = &effective_contract;
         validate_host_contract(input, contract)?;
         let environment = crate::package_environment::canonical_analysis_environment(contract)?;
         self.pipeline.start_check_analysis();
@@ -744,50 +1120,6 @@ impl PackageBuildSession {
             resolved_dependency_imports,
             compilation_evidence,
         })
-    }
-
-    pub fn compile_package(
-        &mut self,
-        input: &ResolvedBuildInput,
-        interface: &nexa_idl::Idl,
-        identity: CandidateIdentity,
-    ) -> Result<CompiledPackageArtifact, PackageBuildError> {
-        self.compile_package_with_limits(
-            input,
-            interface,
-            identity,
-            nexa_verifier::VerifierLimits::default(),
-        )
-    }
-
-    pub fn compile_package_with_limits(
-        &mut self,
-        input: &ResolvedBuildInput,
-        interface: &nexa_idl::Idl,
-        identity: CandidateIdentity,
-        verifier_limits: nexa_verifier::VerifierLimits,
-    ) -> Result<CompiledPackageArtifact, PackageBuildError> {
-        self.compile_package_with_contract_and_limits(
-            input,
-            &HostContractInput::canonical(interface),
-            identity,
-            verifier_limits,
-        )
-    }
-
-    /// Builds one Application and reports the real compile/verifier phase split.
-    pub fn compile_package_observed(
-        &mut self,
-        input: &ResolvedBuildInput,
-        interface: &nexa_idl::Idl,
-        identity: CandidateIdentity,
-    ) -> PackageBuildObservation {
-        self.compile_package_with_contract_and_limits_observed(
-            input,
-            &HostContractInput::canonical(interface),
-            identity,
-            nexa_verifier::VerifierLimits::default(),
-        )
     }
 
     pub fn compile_package_with_contract(
@@ -850,7 +1182,14 @@ impl PackageBuildSession {
                 .validate_integrity()
                 .map_err(PackageBuildError::InvalidResolvedInput)?;
             validate_candidate(input, &identity)?;
+            let effective_contract = contract.selecting_effective_package_contract(
+                &input.root_manifest,
+                &input.root_source_set,
+                &input.dependency_source_sets,
+            )?;
+            let contract = &effective_contract;
             validate_host_contract(input, contract)?;
+            validate_compilation_profile(input, nexa_analysis::CompilationProfile::Package)?;
             if input.root_manifest.kind != PackageKind::Application {
                 return Err(PackageBuildError::ApplicationArtifactRequired(
                     input.root_manifest.id.clone(),
@@ -873,8 +1212,10 @@ impl PackageBuildSession {
             let verification = nexa_verifier::verify(compiled.module, verifier_limits);
             verify_duration = verify_started.elapsed();
             let verified = verification?;
-            validate_host_exports(verified.module(), contract)?;
+            validate_host_entrypoints(verified.module(), contract)?;
             let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
+            validate_compiled_host_source(&source_files, contract)?;
+            validate_compiler_standard_library_sources(&source_files)?;
             validate_compiled_closure(
                 input,
                 &source_files,
@@ -933,33 +1274,304 @@ impl PackageBuildSession {
         }
     }
 
-    pub fn compile_package_tests(
+    /// Compiles a manifest-backed executable through analysis, typed standalone lowering, and
+    /// bytecode verification.
+    pub fn compile_standalone_package_with_contract(
         &mut self,
-        input: &ResolvedTestInput,
-        interface: &nexa_idl::Idl,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
         identity: CandidateIdentity,
-    ) -> Result<CompiledPackageTests, PackageBuildError> {
-        self.compile_package_tests_with_limits(
+    ) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+        self.compile_standalone_package_with_contract_and_limits(
             input,
-            interface,
+            contract,
             identity,
             nexa_verifier::VerifierLimits::default(),
         )
     }
 
-    pub fn compile_package_tests_with_limits(
+    /// Standalone build with an explicit verifier budget.
+    pub fn compile_standalone_package_with_contract_and_limits(
         &mut self,
-        input: &ResolvedTestInput,
-        interface: &nexa_idl::Idl,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
         identity: CandidateIdentity,
         verifier_limits: nexa_verifier::VerifierLimits,
-    ) -> Result<CompiledPackageTests, PackageBuildError> {
-        self.compile_package_tests_with_contract_and_limits(
+    ) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+        validate_compilation_profile(input, nexa_analysis::CompilationProfile::Standalone)?;
+        self.compile_standalone_with_contract_and_limits(input, contract, identity, verifier_limits)
+    }
+
+    /// Exact-source variant for standalone packages and single-file scripts.
+    pub fn compile_standalone_with_contract(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+        identity: CandidateIdentity,
+    ) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+        self.compile_standalone_with_contract_and_limits(
             input,
-            &HostContractInput::canonical(interface),
+            contract,
             identity,
-            verifier_limits,
+            nexa_verifier::VerifierLimits::default(),
         )
+    }
+
+    pub fn compile_standalone_with_contract_and_limits(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+        identity: CandidateIdentity,
+        verifier_limits: nexa_verifier::VerifierLimits,
+    ) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+        input
+            .validate_integrity()
+            .map_err(PackageBuildError::InvalidResolvedInput)?;
+        validate_candidate(input, &identity)?;
+        let effective_contract = contract.selecting_effective_package_contract(
+            &input.root_manifest,
+            &input.root_source_set,
+            &input.dependency_source_sets,
+        )?;
+        let contract = &effective_contract;
+        validate_host_contract(input, contract)?;
+        if input.root_manifest.kind != PackageKind::Application {
+            return Err(PackageBuildError::ApplicationArtifactRequired(
+                input.root_manifest.id.clone(),
+            ));
+        }
+        let environment = crate::package_environment::canonical_analysis_environment(contract)?;
+        self.pipeline.start_compile_analysis();
+        let mut outcome = match input.compilation_options.profile {
+            nexa_analysis::CompilationProfile::Standalone => {
+                analyze_package(input, &environment, &mut self.queries)
+            }
+            nexa_analysis::CompilationProfile::Script => {
+                nexa_analysis::analyze_script(input, &environment, &mut self.queries)
+            }
+            nexa_analysis::CompilationProfile::Package
+            | nexa_analysis::CompilationProfile::ReplCell => {
+                return Err(PackageBuildError::ExecutableProfileRequired);
+            }
+        };
+        let ir = outcome
+            .ir
+            .take()
+            .ok_or_else(|| PackageBuildError::AnalysisFailed(outcome.diagnostics.clone()))?;
+        let compilation_evidence =
+            package_compilation_evidence(&ir, &outcome.resolved_import_edges);
+        self.pipeline.start_typed_compiler();
+        let standalone = nexa_compiler::compile_typed_standalone_package(&ir)?;
+        let compiled = standalone.package;
+        validate_product_compiler_output(&compiled, &outcome)?;
+        self.pipeline.start_verifier();
+        let verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
+        validate_host_entrypoints(verified.module(), contract)?;
+        let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
+        validate_compiled_host_source(&source_files, contract)?;
+        validate_compiler_standard_library_sources(&source_files)?;
+        validate_compiled_closure(
+            input,
+            &source_files,
+            &compiled.debug_info,
+            compilation_evidence,
+        )?;
+        let state_surface = Arc::from(compiled.state_surface);
+        let dependency_source_fingerprints = input
+            .dependency_source_sets
+            .iter()
+            .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
+            .collect::<BTreeMap<_, _>>();
+        let linked_state_fingerprint = linked_state_fingerprint(
+            input.build_fingerprint,
+            verified.module(),
+            &source_files,
+            &compiled.debug_info,
+            &state_surface,
+            compilation_evidence,
+            outcome.source_set_fingerprint,
+            outcome.public_api_fingerprint,
+            outcome.state_schema_fingerprint,
+            &input.dependency_graph,
+            &dependency_source_fingerprints,
+        );
+        let artifact = CompiledPackageArtifact {
+            identity,
+            verified,
+            source_files,
+            debug_info: compiled.debug_info,
+            state_surface,
+            compilation_evidence,
+            source_set_fingerprint: outcome.source_set_fingerprint,
+            public_api_fingerprint: outcome.public_api_fingerprint,
+            state_schema_fingerprint: outcome.state_schema_fingerprint,
+            build_fingerprint: input.build_fingerprint,
+            linked_state_fingerprint,
+            dependency_closure: Arc::clone(&input.dependency_graph),
+            dependency_source_fingerprints: Arc::new(dependency_source_fingerprints),
+            analysis_revision: outcome.analyzed_revision,
+        };
+        artifact.verify_integrity()?;
+        Ok(CompiledStandaloneArtifact::new(artifact, standalone.main))
+    }
+
+    /// Compiles and verifies one cumulative REPL candidate without committing analysis state.
+    pub(crate) fn compile_repl_cell_with_contract(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+        identity: CandidateIdentity,
+        snapshot: &ReplSessionSnapshot,
+        cell: ReplCellInput,
+    ) -> Result<(CompiledReplCellArtifact, ReplStagedCell), PackageBuildError> {
+        self.compile_repl_cell_with_contract_and_limits(
+            input,
+            contract,
+            identity,
+            snapshot,
+            cell,
+            nexa_verifier::VerifierLimits::default(),
+        )
+    }
+
+    /// REPL candidate build with an explicit verifier budget.
+    ///
+    /// The returned stage token remains uncommitted. [`crate::ReplSession`] commits it only after
+    /// the matching Realm transaction has completed and published successfully.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn compile_repl_cell_with_contract_and_limits(
+        &mut self,
+        input: &ResolvedBuildInput,
+        contract: &HostContractInput<'_>,
+        identity: CandidateIdentity,
+        snapshot: &ReplSessionSnapshot,
+        cell: ReplCellInput,
+        verifier_limits: nexa_verifier::VerifierLimits,
+    ) -> Result<(CompiledReplCellArtifact, ReplStagedCell), PackageBuildError> {
+        input
+            .validate_integrity()
+            .map_err(PackageBuildError::InvalidResolvedInput)?;
+        validate_candidate(input, &identity)?;
+        validate_compilation_profile(input, nexa_analysis::CompilationProfile::ReplCell)?;
+        let current_source = validate_repl_cell_source(input, &cell)?;
+        if input.root_manifest.kind != PackageKind::Application {
+            return Err(PackageBuildError::ApplicationArtifactRequired(
+                input.root_manifest.id.clone(),
+            ));
+        }
+        let current_contract = contract.selecting_effective_package_contract(
+            &input.root_manifest,
+            &input.root_source_set,
+            &input.dependency_source_sets,
+        )?;
+        validate_host_contract(input, &current_contract)?;
+        if !effective_selection_is_superset(
+            contract.effective_selection(),
+            current_contract.effective_selection(),
+        ) {
+            return Err(PackageBuildError::ReplEffectiveContractNotMonotonic);
+        }
+        let input = retarget_host_contract(input, contract, snapshot)?;
+        let identity = CandidateIdentity {
+            package_id: identity.package_id,
+            generation: identity.generation,
+            build_fingerprint: input.build_fingerprint,
+        };
+        let environment = crate::package_environment::canonical_analysis_environment(contract)?;
+
+        self.pipeline.start_compile_analysis();
+        let repl_input = ReplSessionInput::new(snapshot, cell, current_source, &input);
+        let outcome = analyze_repl_session_cell(&repl_input, &environment, &mut self.queries);
+        let (analysis, staged) = match outcome {
+            ReplSessionAnalysisOutcome::Accepted {
+                analysis, staged, ..
+            } => (analysis, staged),
+            ReplSessionAnalysisOutcome::Rejected { analysis } => {
+                return Err(PackageBuildError::AnalysisFailed(analysis.diagnostics));
+            }
+        };
+        let ir = staged
+            .candidate_ir()
+            .ok_or(PackageBuildError::MissingTypedPackageIr)?;
+        let compilation_evidence =
+            package_compilation_evidence(ir, &analysis.resolved_import_edges);
+
+        self.pipeline.start_typed_compiler();
+        let repl = nexa_compiler::compile_typed_repl_cell(ir)?;
+        if repl.cell.stable_id != staged.entry_symbol().0
+            || repl.cell.cell_ordinal != staged.input().ordinal
+            || repl.cell.effect != nexa_bytecode::FunctionEffect::Task
+        {
+            return Err(PackageBuildError::InvalidProductCompilerOutput(
+                "compiled REPL entrypoint disagrees with its analyzer-owned stage",
+            ));
+        }
+        let compiled = repl.package;
+        validate_product_compiler_output(&compiled, &analysis)?;
+
+        self.pipeline.start_verifier();
+        let verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
+        validate_host_entrypoints(verified.module(), contract)?;
+        let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
+        validate_compiled_host_source(&source_files, contract)?;
+        validate_compiler_standard_library_sources(&source_files)?;
+        validate_repl_compiled_closure(
+            &input,
+            snapshot,
+            &source_files,
+            &compiled.debug_info,
+            compilation_evidence,
+        )?;
+        let state_surface = Arc::from(compiled.state_surface);
+        validate_repl_state_surface(
+            verified.module(),
+            &state_surface,
+            snapshot,
+            &staged,
+            &repl.cell,
+        )?;
+        let dependency_source_fingerprints = input
+            .dependency_source_sets
+            .iter()
+            .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
+            .collect::<BTreeMap<_, _>>();
+        let linked_state_fingerprint = linked_state_fingerprint(
+            input.build_fingerprint,
+            verified.module(),
+            &source_files,
+            &compiled.debug_info,
+            &state_surface,
+            compilation_evidence,
+            analysis.source_set_fingerprint,
+            analysis.public_api_fingerprint,
+            analysis.state_schema_fingerprint,
+            &input.dependency_graph,
+            &dependency_source_fingerprints,
+        );
+        let artifact = CompiledPackageArtifact {
+            identity,
+            verified,
+            source_files,
+            debug_info: compiled.debug_info,
+            state_surface,
+            compilation_evidence,
+            source_set_fingerprint: analysis.source_set_fingerprint,
+            public_api_fingerprint: analysis.public_api_fingerprint,
+            state_schema_fingerprint: analysis.state_schema_fingerprint,
+            build_fingerprint: input.build_fingerprint,
+            linked_state_fingerprint,
+            dependency_closure: Arc::clone(&input.dependency_graph),
+            dependency_source_fingerprints: Arc::new(dependency_source_fingerprints),
+            analysis_revision: analysis.analyzed_revision,
+        };
+        validate_repl_state_identities(
+            ir,
+            &artifact.state_surface,
+            &artifact.source_files,
+            &artifact.debug_info,
+        )?;
+        artifact.verify_integrity()?;
+        Ok((CompiledReplCellArtifact::new(artifact, repl.cell), staged))
     }
 
     pub fn compile_package_tests_with_contract(
@@ -987,7 +1599,14 @@ impl PackageBuildSession {
             .validate_integrity()
             .map_err(PackageBuildError::InvalidResolvedInput)?;
         validate_candidate(&input.product, &identity)?;
+        let effective_contract = contract.selecting_effective_package_contract(
+            &input.product.root_manifest,
+            &input.product.root_source_set,
+            &input.product.dependency_source_sets,
+        )?;
+        let contract = &effective_contract;
         validate_host_contract(&input.product, contract)?;
+        validate_compilation_profile(&input.product, nexa_analysis::CompilationProfile::Package)?;
         let environment = crate::package_environment::canonical_analysis_environment(contract)?;
         self.pipeline.start_compile_analysis();
         let mut outcome = analyze_package_tests(input, &environment, &mut self.queries);
@@ -1006,10 +1625,20 @@ impl PackageBuildSession {
             .ok_or(PackageBuildError::MissingTestDebugInfo)?;
         self.pipeline.start_verifier();
         let verified = nexa_verifier::verify(module, verifier_limits)?;
-        if verified.module().host_interface_hash != Some(nexa_idl::exact_hash(contract.idl())) {
-            return Err(PackageBuildError::HostInterfaceHashMismatch);
+        if verified.module().host_contract_id != Some(contract.runtime_id()) {
+            return Err(PackageBuildError::HostContractIdMismatch);
         }
         let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.test_sources)?;
+        validate_compiled_host_source(&source_files, contract)?;
+        validate_compiler_standard_library_sources(&source_files)?;
+        validate_compiled_source_authority(
+            input
+                .product
+                .all_source_sets()
+                .flat_map(PackageSourceSet::production_units)
+                .chain(input.test_source_set.test_units()),
+            &source_files,
+        )?;
         CompiledPackageTests::new(
             identity.package_id,
             verified,
@@ -1021,29 +1650,12 @@ impl PackageBuildSession {
     }
 }
 
-/// One-shot cold semantic check for an application or library package.
-pub fn check_package(
-    input: &ResolvedBuildInput,
-    interface: &nexa_idl::Idl,
-) -> Result<PackageCheckReport, PackageBuildError> {
-    PackageBuildSession::new().check_package(input, interface)
-}
-
 /// One-shot cold semantic check which retains the caller's exact `.nidl` source snapshot.
 pub fn check_package_with_contract(
     input: &ResolvedBuildInput,
     contract: &HostContractInput<'_>,
 ) -> Result<PackageCheckReport, PackageBuildError> {
     PackageBuildSession::new().check_package_with_contract(input, contract)
-}
-
-/// One-shot canonical Application build.
-pub fn compile_package(
-    input: &ResolvedBuildInput,
-    interface: &nexa_idl::Idl,
-    identity: CandidateIdentity,
-) -> Result<CompiledPackageArtifact, PackageBuildError> {
-    PackageBuildSession::new().compile_package(input, interface, identity)
 }
 
 /// One-shot canonical Application build with exact Host source/debug identity.
@@ -1055,13 +1667,22 @@ pub fn compile_package_with_contract(
     PackageBuildSession::new().compile_package_with_contract(input, contract, identity)
 }
 
-/// One-shot canonical pure package-test build for an Application or Library root.
-pub fn compile_package_tests(
-    input: &ResolvedTestInput,
-    interface: &nexa_idl::Idl,
+/// One-shot standalone build retaining the exact Host contract source.
+pub fn compile_standalone_package_with_contract(
+    input: &ResolvedBuildInput,
+    contract: &HostContractInput<'_>,
     identity: CandidateIdentity,
-) -> Result<CompiledPackageTests, PackageBuildError> {
-    PackageBuildSession::new().compile_package_tests(input, interface, identity)
+) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+    PackageBuildSession::new().compile_standalone_package_with_contract(input, contract, identity)
+}
+
+/// Exact-source one-shot executable build.
+pub fn compile_standalone_with_contract(
+    input: &ResolvedBuildInput,
+    contract: &HostContractInput<'_>,
+    identity: CandidateIdentity,
+) -> Result<CompiledStandaloneArtifact, PackageBuildError> {
+    PackageBuildSession::new().compile_standalone_with_contract(input, contract, identity)
 }
 
 /// One-shot pure Package Test build with exact Host source/debug identity.
@@ -1074,32 +1695,7 @@ pub fn compile_package_tests_with_contract(
 }
 
 /// Constructs the complete versioned identity input used by
-/// [`nexa_analysis::ResolvedBuildInput`].
-///
-/// The standard-library descriptor carries both its canonical bytes and independently computed
-/// descriptor hash. Human version strings are never treated as sufficient content identity.
-#[must_use]
-#[allow(clippy::too_many_arguments)]
-pub fn canonical_package_build_fingerprint_input(
-    root_manifest: &PackageManifest,
-    root_source_set: &PackageSourceSet,
-    dependency_manifests: &BTreeMap<PackageId, Arc<PackageManifest>>,
-    dependency_source_sets: &BTreeMap<PackageId, Arc<PackageSourceSet>>,
-    host_contract: &nexa_idl::Idl,
-    lock: Option<&LockFile>,
-) -> BuildFingerprintInput {
-    let contract = HostContractInput::canonical(host_contract);
-    canonical_package_build_fingerprint_input_with_contract(
-        root_manifest,
-        root_source_set,
-        dependency_manifests,
-        dependency_source_sets,
-        &contract,
-        lock,
-    )
-}
-
-/// Exact-source variant used by CLI, LSP, and any caller retaining a real `.nidl` snapshot.
+/// [`nexa_analysis::ResolvedBuildInput`] while retaining the exact `.nidl` snapshot.
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub fn canonical_package_build_fingerprint_input_with_contract(
@@ -1110,7 +1706,38 @@ pub fn canonical_package_build_fingerprint_input_with_contract(
     host_contract: &HostContractInput<'_>,
     lock: Option<&LockFile>,
 ) -> BuildFingerprintInput {
+    canonical_package_build_fingerprint_input_with_contract_for_profile(
+        root_manifest,
+        root_source_set,
+        dependency_manifests,
+        dependency_source_sets,
+        host_contract,
+        lock,
+        crate::BuildProfile::Package,
+    )
+}
+
+/// Exact-source, profile-aware build identity used by package, standalone, script, and REPL
+/// orchestration.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_package_build_fingerprint_input_with_contract_for_profile(
+    root_manifest: &PackageManifest,
+    root_source_set: &PackageSourceSet,
+    dependency_manifests: &BTreeMap<PackageId, Arc<PackageManifest>>,
+    dependency_source_sets: &BTreeMap<PackageId, Arc<PackageSourceSet>>,
+    host_contract: &HostContractInput<'_>,
+    lock: Option<&LockFile>,
+    profile: crate::BuildProfile,
+) -> BuildFingerprintInput {
     let standard_library = nexa_stdlib::standard_library();
+    let effective_contract = host_contract
+        .selecting_effective_package_contract(
+            root_manifest,
+            root_source_set,
+            dependency_source_sets,
+        )
+        .expect("validated package sources have a derivable effective entrypoint set");
 
     BuildFingerprintInput {
         root_package: root_manifest.id.clone(),
@@ -1124,10 +1751,10 @@ pub fn canonical_package_build_fingerprint_input_with_contract(
             .iter()
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
-        host_contract: nexa_idl::canonical(host_contract.idl()).into_bytes(),
-        host_contract_source: canonical_host_contract_source_identity(host_contract),
-        host_required_exports: host_contract.canonical_required_exports(),
-        language_version: NEXA_LANGUAGE_VERSION.into(),
+        host_contract: effective_contract.effective_descriptor().bytes.clone(),
+        host_contract_source: canonical_host_contract_source_identity(&effective_contract),
+        host_required_entrypoints: effective_contract.canonical_required_entrypoints(),
+        language_version: NEXA_LANGUAGE_VERSION,
         standard_library_version: standard_library.version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: NEXA_COMPILER_VERSION.into(),
@@ -1135,8 +1762,9 @@ pub fn canonical_package_build_fingerprint_input_with_contract(
         runtime_semantics_version: u32::from(nexa_core::RUNTIME_SEMANTICS_VERSION),
         opcode_cost_table_version: nexa_core::OPCODE_COST_TABLE_VERSION,
         deterministic_math_backend: nexa_core::RUNTIME_MATH_BACKEND_ID.into(),
-        compiler_options: canonical_compilation_options(),
+        compiler_options: canonical_compilation_options_for_profile(profile),
         canonical_lock_graph: lock.map_or_else(Vec::new, LockFile::canonical_bytes),
+        repl_session_context: Vec::new(),
     }
 }
 
@@ -1147,14 +1775,98 @@ pub fn canonical_package_build_fingerprint_input_with_contract(
 /// precisely addressable as ordinary package sources.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompiledSource {
-    pub file: FileId,
+    pub(crate) file: FileId,
     /// Present for package, dependency, and compiler-provided static-module sources.
     /// Standalone external sources such as the exact NIDL snapshot have no package `SourceKey`.
-    pub key: Option<SourceKey>,
-    pub identity: SourceIdentity,
-    pub module_path: Option<String>,
-    pub text: Arc<str>,
-    pub compiler_provided: bool,
+    pub(crate) key: Option<SourceKey>,
+    pub(crate) identity: SourceIdentity,
+    pub(crate) module_path: Option<String>,
+    /// Analyzer-owned virtual module identity for snippets whose physical key is diagnostic-only.
+    ///
+    /// This is explicit provenance, not an inference from a path/module mismatch.
+    pub(crate) virtual_module_path: Option<String>,
+    pub(crate) text: Arc<str>,
+    pub(crate) compiler_provided: bool,
+}
+
+impl CompiledSource {
+    /// Constructs an ordinary path-derived package source.
+    ///
+    /// Virtual-module provenance is intentionally unavailable through this public constructor;
+    /// only the canonical analyzer/compiler pipeline may create it.
+    #[must_use]
+    pub fn package(
+        file: FileId,
+        key: SourceKey,
+        module_path: impl Into<String>,
+        text: impl Into<Arc<str>>,
+        compiler_provided: bool,
+    ) -> Self {
+        let identity = SourceIdentity::package(key.package_id.as_str(), key.path.as_str());
+        Self {
+            file,
+            key: Some(key),
+            identity,
+            module_path: Some(module_path.into()),
+            virtual_module_path: None,
+            text: text.into(),
+            compiler_provided,
+        }
+    }
+
+    /// Constructs a standalone external source with no package/module semantic identity.
+    #[must_use]
+    pub fn external(
+        file: FileId,
+        identity: SourceIdentity,
+        text: impl Into<Arc<str>>,
+        compiler_provided: bool,
+    ) -> Self {
+        Self {
+            file,
+            key: None,
+            identity,
+            module_path: None,
+            virtual_module_path: None,
+            text: text.into(),
+            compiler_provided,
+        }
+    }
+
+    #[must_use]
+    pub const fn file(&self) -> FileId {
+        self.file
+    }
+
+    #[must_use]
+    pub const fn key(&self) -> Option<&SourceKey> {
+        self.key.as_ref()
+    }
+
+    #[must_use]
+    pub const fn identity(&self) -> &SourceIdentity {
+        &self.identity
+    }
+
+    #[must_use]
+    pub fn module_path(&self) -> Option<&str> {
+        self.module_path.as_deref()
+    }
+
+    #[must_use]
+    pub fn virtual_module_path(&self) -> Option<&str> {
+        self.virtual_module_path.as_deref()
+    }
+
+    #[must_use]
+    pub const fn text(&self) -> &Arc<str> {
+        &self.text
+    }
+
+    #[must_use]
+    pub const fn compiler_provided(&self) -> bool {
+        self.compiler_provided
+    }
 }
 
 /// Complete immutable source snapshot for one package artifact.
@@ -1169,7 +1881,7 @@ pub struct PackageSourceSnapshot {
 }
 
 impl PackageSourceSnapshot {
-    pub fn from_compiler_sources(
+    pub(crate) fn from_compiler_sources(
         sources: impl IntoIterator<Item = nexa_compiler::PackageCompiledSource>,
     ) -> Result<Self, PackageArtifactIntegrityError> {
         let sources = sources
@@ -1204,6 +1916,7 @@ impl PackageSourceSnapshot {
                     key: source.source_key,
                     identity: source.identity,
                     module_path: source.module_path,
+                    virtual_module_path: source.virtual_module_path,
                     text: source.source,
                     compiler_provided: source.compiler_provided,
                 })
@@ -1233,6 +1946,27 @@ impl PackageSourceSnapshot {
             if source.file == FileId::default() {
                 return Err(PackageArtifactIntegrityError::ReservedFileId);
             }
+            if let Some(key) = &source.key {
+                if source.identity
+                    != SourceIdentity::package(key.package_id.as_str(), key.path.as_str())
+                {
+                    return Err(
+                        PackageArtifactIntegrityError::CompilerSourceIdentityMismatch {
+                            key: key.clone(),
+                            package: source.identity.package_id().map(str::to_owned),
+                            path: source.identity.path().to_owned(),
+                        },
+                    );
+                }
+            } else if source.identity.package_id().is_some() {
+                return Err(
+                    PackageArtifactIntegrityError::InvalidExternalSourceIdentity {
+                        identity: source.identity.clone(),
+                        package: source.identity.package_id().map(str::to_owned),
+                        module: source.module_path.clone(),
+                    },
+                );
+            }
             let module = source
                 .module_path
                 .as_ref()
@@ -1242,26 +1976,53 @@ impl PackageSourceSnapshot {
                     })
                 })
                 .transpose()?;
-            if let (Some(key), Some(module)) = (&source.key, &module)
-                && !source.compiler_provided
-            {
-                let expected = if let Some(test_module) = module.as_str().strip_prefix("test.") {
-                    NormalizedPackagePath::new(format!(
-                        "tests/{}.nexa",
-                        test_module.replace('.', "/")
-                    ))
-                    .expect("a validated test module maps to a normalized path")
+            let virtual_module = source
+                .virtual_module_path
+                .as_ref()
+                .map(|module| {
+                    ModulePath::new(module.clone()).map_err(|_| {
+                        PackageArtifactIntegrityError::InvalidModulePath(module.clone())
+                    })
+                })
+                .transpose()?;
+            if let (Some(key), Some(module)) = (&source.key, &module) {
+                if let Some(virtual_module) = virtual_module {
+                    if virtual_module != *module {
+                        return Err(PackageArtifactIntegrityError::VirtualModulePathMismatch {
+                            key: key.clone(),
+                            module: module.clone(),
+                            virtual_module,
+                        });
+                    }
                 } else {
-                    module.source_path()
-                };
-                if key.path != expected {
-                    return Err(PackageArtifactIntegrityError::ModulePathMismatch {
-                        module: module.clone(),
-                        expected,
-                        actual: key.path.clone(),
-                    });
+                    let expected = if source.compiler_provided
+                        && key.package_id.as_str() == nexa_stdlib::PACKAGE_ID
+                    {
+                        NormalizedPackagePath::new(format!(
+                            "stdlib/{}.nexa",
+                            module.as_str().replace('.', "/")
+                        ))
+                        .expect("a validated standard-library module maps to a normalized path")
+                    } else if let Some(test_module) = module.as_str().strip_prefix("test.") {
+                        NormalizedPackagePath::new(format!(
+                            "tests/{}.nexa",
+                            test_module.replace('.', "/")
+                        ))
+                        .expect("a validated test module maps to a normalized path")
+                    } else {
+                        module.source_path()
+                    };
+                    if key.path != expected {
+                        return Err(PackageArtifactIntegrityError::ModulePathMismatch {
+                            module: module.clone(),
+                            expected,
+                            actual: key.path.clone(),
+                        });
+                    }
                 }
-            } else if source.key.is_some() != source.module_path.is_some() {
+            } else if source.key.is_some() != source.module_path.is_some()
+                || source.virtual_module_path.is_some()
+            {
                 return Err(
                     PackageArtifactIntegrityError::IncompletePackageSourceIdentity {
                         identity: source.identity.clone(),
@@ -1366,12 +2127,12 @@ impl PackageSourceSnapshot {
 }
 
 /// Verified, statically linked output for one application Package.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompiledPackageArtifact {
     pub identity: CandidateIdentity,
     pub verified: VerifiedModule,
     pub source_files: PackageSourceSnapshot,
-    pub debug_info: PackageDebugInfo,
+    pub(crate) debug_info: PackageDebugInfo,
     pub state_surface: Arc<[PackageStateTypeInfo]>,
     pub compilation_evidence: PackageCompilationEvidence,
     pub source_set_fingerprint: SourceSetFingerprint,
@@ -1382,6 +2143,32 @@ pub struct CompiledPackageArtifact {
     pub dependency_closure: Arc<ResolvedDependencyGraph>,
     pub dependency_source_fingerprints: Arc<BTreeMap<PackageId, SourceSetFingerprint>>,
     pub analysis_revision: u64,
+}
+
+impl fmt::Debug for CompiledPackageArtifact {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledPackageArtifact")
+            .field("identity", &self.identity)
+            .field("source_files", &self.source_files.files().len())
+            .field("modules", &self.debug_info.modules.len())
+            .field("functions", &self.debug_info.functions.len())
+            .field("host_imports", &self.debug_info.host_imports.len())
+            .field("state_surface", &self.state_surface)
+            .field("compilation_evidence", &self.compilation_evidence)
+            .field("source_set_fingerprint", &self.source_set_fingerprint)
+            .field("public_api_fingerprint", &self.public_api_fingerprint)
+            .field("state_schema_fingerprint", &self.state_schema_fingerprint)
+            .field("build_fingerprint", &self.build_fingerprint)
+            .field("linked_state_fingerprint", &self.linked_state_fingerprint)
+            .field("dependency_closure", &self.dependency_closure)
+            .field(
+                "dependency_source_fingerprints",
+                &self.dependency_source_fingerprints,
+            )
+            .field("analysis_revision", &self.analysis_revision)
+            .finish_non_exhaustive()
+    }
 }
 
 fn package_compilation_evidence(
@@ -1423,6 +2210,281 @@ fn package_compilation_evidence(
     }
 }
 
+fn validate_repl_cell_source(
+    input: &ResolvedBuildInput,
+    cell: &ReplCellInput,
+) -> Result<SourceKey, PackageBuildError> {
+    let mut production = input.root_source_set.production_units();
+    let Some(unit) = production.next() else {
+        return Err(PackageBuildError::ReplCellSourceMismatch);
+    };
+    if unit.text.as_ref() != cell.text.as_ref() || production.next().is_some() {
+        return Err(PackageBuildError::ReplCellSourceMismatch);
+    }
+    Ok(unit.key.clone())
+}
+
+fn validate_repl_compiled_closure(
+    input: &ResolvedBuildInput,
+    snapshot: &ReplSessionSnapshot,
+    sources: &PackageSourceSnapshot,
+    debug_info: &PackageDebugInfo,
+    evidence: PackageCompilationEvidence,
+) -> Result<(), PackageBuildError> {
+    let mut expected_sources = snapshot
+        .candidate_ir()
+        .into_iter()
+        .flat_map(|candidate| candidate.modules())
+        .filter(|module| module.package_id.as_str() != nexa_stdlib::PACKAGE_ID)
+        .map(|module| module.source.clone())
+        .collect::<BTreeSet<_>>();
+    expected_sources.extend(
+        input
+            .all_source_sets()
+            .flat_map(PackageSourceSet::production_units)
+            .map(|unit| unit.key.clone()),
+    );
+    let actual_sources = sources
+        .files()
+        .iter()
+        .filter(|source| !source.compiler_provided)
+        .filter_map(|source| source.key.clone())
+        .collect::<BTreeSet<_>>();
+    if actual_sources != expected_sources {
+        return Err(PackageBuildError::CompilerSourceClosureMismatch);
+    }
+    let mut expected_source_authority = BTreeMap::new();
+    for module in snapshot
+        .candidate_ir()
+        .into_iter()
+        .flat_map(|candidate| candidate.modules())
+        .filter(|module| module.package_id.as_str() != nexa_stdlib::PACKAGE_ID)
+    {
+        let authority = (
+            module.module.to_string(),
+            Arc::<str>::from(module.syntax.source.as_str()),
+            module.virtual_module_path.as_ref().map(ToString::to_string),
+        );
+        if expected_source_authority
+            .insert(module.source.clone(), authority.clone())
+            .is_some_and(|previous| previous != authority)
+        {
+            return Err(PackageBuildError::CompilerSourceClosureMismatch);
+        }
+    }
+    for unit in input
+        .all_source_sets()
+        .flat_map(PackageSourceSet::production_units)
+    {
+        let authority = (
+            unit.expected_module_path()
+                .map_err(|_| PackageBuildError::CompilerSourceClosureMismatch)?
+                .to_string(),
+            Arc::clone(&unit.text),
+            unit.virtual_module_path().map(ToString::to_string),
+        );
+        if expected_source_authority
+            .insert(unit.key.clone(), authority.clone())
+            .is_some_and(|previous| previous != authority)
+        {
+            return Err(PackageBuildError::CompilerSourceClosureMismatch);
+        }
+    }
+    if compiled_source_authority(sources) != expected_source_authority {
+        return Err(PackageBuildError::CompilerSourceClosureMismatch);
+    }
+
+    let debug_files = debug_info
+        .modules
+        .iter()
+        .filter(|module| module.package_id != nexa_stdlib::PACKAGE_ID)
+        .map(|module| module.file)
+        .collect::<BTreeSet<_>>();
+    let source_files = sources
+        .files()
+        .iter()
+        .filter(|source| !source.compiler_provided && source.key.is_some())
+        .map(|source| source.file)
+        .collect::<BTreeSet<_>>();
+    if debug_files != source_files {
+        return Err(PackageBuildError::CompilerModuleClosureMismatch);
+    }
+
+    let actual_packages = actual_sources
+        .iter()
+        .map(|source| source.package_id.clone())
+        .collect::<BTreeSet<_>>();
+    if evidence.packages != actual_packages.len()
+        || evidence.modules != debug_info.modules.len()
+        || evidence.package_modules != actual_sources.len()
+        || evidence.package_symbols > evidence.symbols
+    {
+        return Err(PackageBuildError::CompilerCompilationEvidenceMismatch);
+    }
+    Ok(())
+}
+
+fn validate_repl_state_surface(
+    module: &nexa_bytecode::Module,
+    state_surface: &[PackageStateTypeInfo],
+    snapshot: &ReplSessionSnapshot,
+    staged: &ReplStagedCell,
+    cell: &PackageReplCellInfo,
+) -> Result<(), PackageBuildError> {
+    let expected_environment = snapshot.environment().class_symbol.0;
+    let [environment] = state_surface else {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    };
+    if environment.name != nexa_analysis::REPL_ENVIRONMENT_TYPE_NAME
+        || environment.stable_id.0 != expected_environment
+        || environment.version != nexa_analysis::REPL_ENVIRONMENT_STATE_VERSION
+        || cell.environment != expected_environment
+        || module.reload_metadata.migration_entry.is_some()
+        || module.reload_metadata.activation_entry.is_some()
+    {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    }
+
+    let mut expected_fields = snapshot
+        .environment()
+        .slots
+        .iter()
+        .map(|slot| slot.stable_id)
+        .collect::<Vec<_>>();
+    let staged_fields = staged
+        .bindings()
+        .iter()
+        .filter_map(|binding| binding.state_slot)
+        .collect::<Vec<_>>();
+    expected_fields.extend(staged_fields.iter().copied());
+    let compiled_new_fields = cell
+        .new_state_fields
+        .iter()
+        .map(|field| field.stable_id)
+        .collect::<Vec<_>>();
+    let actual_fields = environment
+        .fields
+        .iter()
+        .map(|field| field.stable_id.0)
+        .collect::<Vec<_>>();
+    let [schema_environment] = module.state_schema.types.as_slice() else {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    };
+    let schema_fields = schema_environment
+        .fields
+        .iter()
+        .map(|field| field.stable_id)
+        .collect::<Vec<_>>();
+    let schema_new_fields = schema_environment
+        .fields
+        .iter()
+        .skip(snapshot.environment().slots.len())
+        .map(|field| (field.stable_id, field.ty))
+        .collect::<Vec<_>>();
+    let compiled_new_fields_with_types = cell
+        .new_state_fields
+        .iter()
+        .map(|field| (field.stable_id, field.ty))
+        .collect::<Vec<_>>();
+    if compiled_new_fields != staged_fields
+        || schema_new_fields != compiled_new_fields_with_types
+        || actual_fields != expected_fields
+        || schema_fields != expected_fields
+        || schema_environment.stable_id != expected_environment
+        || schema_environment.version != nexa_analysis::REPL_ENVIRONMENT_STATE_VERSION
+        || module.state_schema.fingerprint() != module.state_schema_fingerprint
+        || module.reload_metadata.state_schema_fingerprint != module.state_schema_fingerprint
+    {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    }
+    Ok(())
+}
+
+fn validate_repl_state_identities(
+    ir: &nexa_analysis::TypedPackageIr,
+    states: &[PackageStateTypeInfo],
+    sources: &PackageSourceSnapshot,
+    debug_info: &PackageDebugInfo,
+) -> Result<(), PackageBuildError> {
+    let [state_ir] = ir.metadata().state_types.as_ref() else {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    };
+    let [state] = states else {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    };
+    let state_definition = ir
+        .definition(state_ir.definition)
+        .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+    let state_symbol = state_definition
+        .stable_symbol
+        .as_ref()
+        .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+    let state_source = sources
+        .source_by_key(&state_definition.span.source)
+        .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+    let state_span = SourceSpan::new(
+        state_source.file,
+        state_definition.span.start,
+        state_definition.span.end,
+    );
+    if state.stable_id != state_symbol.runtime_id
+        || state.canonical_identity != state_symbol.canonical
+        || state.package_id != state_definition.package_id.as_str()
+        || state.module_path != state_definition.module.as_str()
+        || state.name != state_definition.name
+        || state.definition_span != state_span
+        || state.fields.len() != state_ir.fields.len()
+    {
+        return Err(PackageBuildError::InvalidReplStateSurface);
+    }
+
+    let mut registry = BTreeMap::new();
+    validate_debug_symbol_identities(debug_info, sources, &mut registry)?;
+    validate_canonical_symbol(
+        state.stable_id,
+        &state.canonical_identity,
+        state_definition.package_id.as_str(),
+        &state.package_id,
+        &state.module_path,
+        state.canonical_identity.name(),
+        &[SymbolKind::Type],
+        &mut registry,
+    )?;
+    for (field, field_ir) in state.fields.iter().zip(state_ir.fields.iter()) {
+        let definition = ir
+            .definition(field_ir.definition)
+            .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+        let symbol = definition
+            .stable_symbol
+            .as_ref()
+            .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+        let source = sources
+            .source_by_key(&definition.span.source)
+            .ok_or(PackageBuildError::InvalidReplStateSurface)?;
+        let span = SourceSpan::new(source.file, definition.span.start, definition.span.end);
+        if field.stable_id != symbol.runtime_id
+            || field.stable_id != field_ir.stable_id
+            || field.canonical_identity != symbol.canonical
+            || field.name != definition.name
+            || field.definition_span != span
+        {
+            return Err(PackageBuildError::InvalidReplStateSurface);
+        }
+        validate_canonical_symbol(
+            field.stable_id,
+            &field.canonical_identity,
+            definition.package_id.as_str(),
+            definition.package_id.as_str(),
+            definition.module.as_str(),
+            field.canonical_identity.name(),
+            &[SymbolKind::Field],
+            &mut registry,
+        )?;
+        validate_span(field.definition_span, sources, "repl-state-field")?;
+    }
+    Ok(())
+}
+
 fn validate_compiled_closure(
     input: &ResolvedBuildInput,
     sources: &PackageSourceSnapshot,
@@ -1443,6 +2505,12 @@ fn validate_compiled_closure(
     if actual_sources != expected_sources {
         return Err(PackageBuildError::CompilerSourceClosureMismatch);
     }
+    validate_compiled_source_authority(
+        input
+            .all_source_sets()
+            .flat_map(PackageSourceSet::production_units),
+        sources,
+    )?;
 
     let expected_modules = input
         .all_source_sets()
@@ -1487,6 +2555,182 @@ fn validate_compiled_closure(
     Ok(())
 }
 
+fn validate_compiled_source_authority<'a>(
+    units: impl IntoIterator<Item = &'a nexa_analysis::SourceUnit>,
+    sources: &PackageSourceSnapshot,
+) -> Result<(), PackageBuildError> {
+    let expected = units
+        .into_iter()
+        .map(|unit| {
+            (
+                unit.key.clone(),
+                (
+                    unit.expected_module_path()
+                        .expect("resolved source module identity was validated")
+                        .to_string(),
+                    Arc::clone(&unit.text),
+                    unit.virtual_module_path().map(ToString::to_string),
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if compiled_source_authority(sources) != expected {
+        return Err(PackageBuildError::CompilerSourceClosureMismatch);
+    }
+    Ok(())
+}
+
+fn compiled_source_authority(
+    sources: &PackageSourceSnapshot,
+) -> BTreeMap<SourceKey, (String, Arc<str>, Option<String>)> {
+    sources
+        .files()
+        .iter()
+        .filter(|source| !source.compiler_provided)
+        .filter_map(|source| {
+            source.key.clone().map(|key| {
+                (
+                    key,
+                    (
+                        source.module_path.clone().unwrap_or_default(),
+                        Arc::clone(&source.text),
+                        source.virtual_module_path.clone(),
+                    ),
+                )
+            })
+        })
+        .collect()
+}
+
+fn validate_compiled_host_source(
+    sources: &PackageSourceSnapshot,
+    contract: &HostContractInput<'_>,
+) -> Result<(), PackageBuildError> {
+    let external = sources
+        .files()
+        .iter()
+        .filter(|source| source.key.is_none())
+        .collect::<Vec<_>>();
+    let [source] = external.as_slice() else {
+        return Err(PackageBuildError::HostContractSourceMismatch);
+    };
+    if source.identity != *contract.source().identity()
+        || source.text.as_ref() != contract.source().text().as_ref()
+        || source.module_path.is_some()
+        || source.virtual_module_path.is_some()
+        || source.compiler_provided
+    {
+        return Err(PackageBuildError::HostContractSourceMismatch);
+    }
+    Ok(())
+}
+
+fn validate_compiler_standard_library_sources(
+    sources: &PackageSourceSnapshot,
+) -> Result<(), PackageBuildError> {
+    let expected = nexa_stdlib::standard_library()
+        .modules()
+        .iter()
+        .map(|module| {
+            (
+                format!("stdlib/{}.nexa", module.path.replace('.', "/")),
+                (module.path, module.source),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let actual = sources
+        .files()
+        .iter()
+        .filter(|source| source.compiler_provided)
+        .map(|source| {
+            let key = source
+                .key
+                .as_ref()
+                .filter(|key| key.package_id.as_str() == nexa_stdlib::PACKAGE_ID)
+                .ok_or(PackageBuildError::CompilerStandardLibraryMismatch)?;
+            if source.virtual_module_path.is_some() {
+                return Err(PackageBuildError::CompilerStandardLibraryMismatch);
+            }
+            Ok((
+                key.path.as_str().to_owned(),
+                (
+                    source.module_path.as_deref().unwrap_or_default(),
+                    source.text.as_ref(),
+                ),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
+    if actual != expected {
+        return Err(PackageBuildError::CompilerStandardLibraryMismatch);
+    }
+    Ok(())
+}
+
+pub(crate) fn union_effective_contract_selection(
+    left: &nexa_idl::EffectiveContractSelection,
+    right: &nexa_idl::EffectiveContractSelection,
+) -> nexa_idl::EffectiveContractSelection {
+    let mut merged = left.clone();
+    merged
+        .referenced_types
+        .extend(right.referenced_types.iter().cloned());
+    merged
+        .host_functions
+        .extend(right.host_functions.iter().cloned());
+    merged
+        .required_nexa_entrypoints
+        .extend(right.required_nexa_entrypoints.iter().cloned());
+    merged
+        .present_optional_nexa_entrypoints
+        .extend(right.present_optional_nexa_entrypoints.iter().cloned());
+    merged
+        .present_optional_nexa_entrypoints
+        .retain(|name| !merged.required_nexa_entrypoints.contains(name));
+    merged
+}
+
+fn effective_selection_is_superset(
+    candidate: &nexa_idl::EffectiveContractSelection,
+    required: &nexa_idl::EffectiveContractSelection,
+) -> bool {
+    candidate
+        .referenced_types
+        .is_superset(&required.referenced_types)
+        && candidate
+            .host_functions
+            .is_superset(&required.host_functions)
+        && candidate
+            .required_nexa_entrypoints
+            .is_superset(&required.required_nexa_entrypoints)
+        && candidate
+            .present_optional_nexa_entrypoints
+            .is_superset(&required.present_optional_nexa_entrypoints)
+}
+
+fn retarget_host_contract(
+    input: &ResolvedBuildInput,
+    contract: &HostContractInput<'_>,
+    snapshot: &ReplSessionSnapshot,
+) -> Result<ResolvedBuildInput, PackageBuildError> {
+    let mut fingerprint_input = input.fingerprint_input.as_ref().clone();
+    fingerprint_input.host_contract = contract.effective_descriptor().as_bytes().to_vec();
+    fingerprint_input.repl_session_context = snapshot.canonical_build_context();
+    ResolvedBuildInput::new(
+        Arc::clone(&input.root_manifest),
+        Arc::clone(&input.root_source_set),
+        input.dependency_manifests.as_ref().clone(),
+        input.dependency_source_sets.as_ref().clone(),
+        Arc::clone(&input.dependency_graph),
+        input.lock.clone(),
+        Arc::<[u8]>::from(contract.effective_descriptor().as_bytes()),
+        Arc::clone(&input.host_contract_source_identity),
+        Arc::clone(&input.host_required_entrypoints_identity),
+        input.compilation_options,
+        fingerprint_input,
+    )
+    .map_err(PackageBuildError::InvalidResolvedInput)
+}
+
 fn validate_candidate(
     input: &ResolvedBuildInput,
     identity: &CandidateIdentity,
@@ -1510,7 +2754,7 @@ fn validate_host_contract(
     input: &ResolvedBuildInput,
     contract: &HostContractInput<'_>,
 ) -> Result<(), PackageBuildError> {
-    if input.canonical_host_contract.as_ref() != nexa_idl::canonical(contract.idl()).as_bytes() {
+    if input.canonical_host_contract.as_ref() != contract.effective_descriptor().as_bytes() {
         return Err(PackageBuildError::HostContractMismatch);
     }
     if input.host_contract_source_identity.as_ref()
@@ -1518,15 +2762,33 @@ fn validate_host_contract(
     {
         return Err(PackageBuildError::HostContractSourceMismatch);
     }
-    if input.host_required_exports_identity.as_ref()
-        != contract.canonical_required_exports().as_slice()
+    if input.host_required_entrypoints_identity.as_ref()
+        != contract.canonical_required_entrypoints().as_slice()
     {
-        return Err(PackageBuildError::HostRequiredExportsMismatch);
+        return Err(PackageBuildError::HostRequiredEntrypointsMismatch);
     }
-    if input.compilation_options != nexa_analysis::CompilationOptions::default()
-        || input.fingerprint_input.compiler_options != canonical_compilation_options()
+    let build_profile = match input.compilation_options.profile {
+        nexa_analysis::CompilationProfile::Package => crate::BuildProfile::Package,
+        nexa_analysis::CompilationProfile::Standalone => crate::BuildProfile::StandalonePackage,
+        nexa_analysis::CompilationProfile::Script => crate::BuildProfile::StandaloneScript,
+        nexa_analysis::CompilationProfile::ReplCell => crate::BuildProfile::ReplCell,
+    };
+    if input.compilation_options != build_profile.compilation_options()
+        || input.fingerprint_input.compiler_options
+            != canonical_compilation_options_for_profile(build_profile)
     {
         return Err(PackageBuildError::CompilationOptionsMismatch);
+    }
+    Ok(())
+}
+
+fn validate_compilation_profile(
+    input: &ResolvedBuildInput,
+    expected: nexa_analysis::CompilationProfile,
+) -> Result<(), PackageBuildError> {
+    let actual = input.compilation_options.profile;
+    if actual != expected {
+        return Err(PackageBuildError::CompilationProfileMismatch { expected, actual });
     }
     Ok(())
 }
@@ -1596,28 +2858,27 @@ fn validate_compiler_fingerprints(
     Ok(())
 }
 
-fn validate_host_exports(
+fn validate_host_entrypoints(
     module: &nexa_bytecode::Module,
     contract: &HostContractInput<'_>,
 ) -> Result<(), PackageBuildError> {
-    let interface = contract.idl();
-    if module.host_interface_hash != Some(nexa_idl::exact_hash(interface)) {
-        return Err(PackageBuildError::HostInterfaceHashMismatch);
+    if module.host_contract_id != Some(contract.runtime_id()) {
+        return Err(PackageBuildError::HostContractIdMismatch);
     }
-    for required in contract.required_exports() {
-        let stable_id = nexa_idl::export_stable_id(interface, required);
+    for required in contract.required_entrypoints() {
+        let stable_id = nexa_idl::entrypoint_stable_id(required);
         let Some(actual) = module
             .exports
             .iter()
             .find(|candidate| candidate.stable_id == stable_id)
         else {
-            return Err(PackageBuildError::MissingRequiredExport(
+            return Err(PackageBuildError::MissingRequiredEntrypoint(
                 required.name.clone(),
             ));
         };
-        let expected = nexa_idl::export_signature(interface, required);
+        let expected = nexa_idl::entrypoint_signature(required);
         if actual.signature != expected {
-            return Err(PackageBuildError::ExportSignatureMismatch {
+            return Err(PackageBuildError::EntrypointSignatureMismatch {
                 name: required.name.clone(),
                 expected,
                 actual: actual.signature.clone(),
@@ -1641,8 +2902,17 @@ pub enum PackageBuildError {
     ApplicationArtifactRequired(PackageId),
     HostContractMismatch,
     HostContractSourceMismatch,
-    HostRequiredExportsMismatch,
+    HostRequiredEntrypointsMismatch,
     CompilationOptionsMismatch,
+    CompilationProfileMismatch {
+        expected: nexa_analysis::CompilationProfile,
+        actual: nexa_analysis::CompilationProfile,
+    },
+    ExecutableProfileRequired,
+    ReplCellSourceMismatch,
+    ReplEffectiveContractNotMonotonic,
+    InvalidReplStateSurface,
+    HostContractSource(HostContractSourceError),
     Environment(crate::package_environment::PackageEnvironmentError),
     AnalysisFailed(DiagnosticBatch),
     MissingTypedPackageIr,
@@ -1656,13 +2926,13 @@ pub enum PackageBuildError {
     CompilerPublicApiFingerprintMismatch,
     CompilerStateSchemaFingerprintMismatch,
     CompilerStandardLibraryMismatch,
-    MissingRequiredExport(String),
-    ExportSignatureMismatch {
+    MissingRequiredEntrypoint(String),
+    EntrypointSignatureMismatch {
         name: String,
         expected: nexa_bytecode::Signature,
         actual: nexa_bytecode::Signature,
     },
-    HostInterfaceHashMismatch,
+    HostContractIdMismatch,
     MissingTestModule,
     MissingTestDebugInfo,
     InvalidTestArtifact(crate::PackageTestRunError),
@@ -1694,16 +2964,31 @@ impl fmt::Display for PackageBuildError {
             Self::HostContractSourceMismatch => formatter.write_str(
                 "Host contract source URI or raw text does not match resolved build input",
             ),
-            Self::HostRequiredExportsMismatch => {
-                formatter.write_str("Host required-export view does not match resolved build input")
-            }
-            Self::CompilationOptionsMismatch => formatter.write_str(
-                "resolved build input does not use the canonical M4 compilation options",
+            Self::HostRequiredEntrypointsMismatch => formatter
+                .write_str("Host required-entrypoint view does not match resolved build input"),
+            Self::CompilationOptionsMismatch => formatter
+                .write_str("resolved build input does not use its canonical compilation options"),
+            Self::CompilationProfileMismatch { expected, actual } => write!(
+                formatter,
+                "build requires compilation profile {expected:?}, found {actual:?}"
             ),
+            Self::ExecutableProfileRequired => {
+                formatter.write_str("standalone compilation requires Standalone or Script profile")
+            }
+            Self::ReplCellSourceMismatch => formatter.write_str(
+                "resolved REPL input does not retain the exact cell source identity and bytes",
+            ),
+            Self::ReplEffectiveContractNotMonotonic => formatter.write_str(
+                "REPL effective Contract omitted Host/type authority retained by this session",
+            ),
+            Self::InvalidReplStateSurface => formatter.write_str(
+                "compiled REPL candidate does not preserve its analyzer-owned environment schema",
+            ),
+            Self::HostContractSource(error) => error.fmt(formatter),
             Self::Environment(error) => error.fmt(formatter),
             Self::AnalysisFailed(diagnostics) => write!(
                 formatter,
-                "package analysis failed with {} diagnostic(s)",
+                "package analysis failed: {} diagnostic(s)",
                 diagnostics.len()
             ),
             Self::MissingTypedPackageIr => {
@@ -1731,15 +3016,15 @@ impl fmt::Display for PackageBuildError {
             Self::CompilerStandardLibraryMismatch => formatter.write_str(
                 "compiler standard-library identity does not match the canonical M4 descriptor",
             ),
-            Self::MissingRequiredExport(name) => {
-                write!(formatter, "missing required export {name}")
+            Self::MissingRequiredEntrypoint(name) => {
+                write!(formatter, "missing required entrypoint {name}")
             }
-            Self::ExportSignatureMismatch { name, .. } => {
-                write!(formatter, "export {name} has an incompatible signature")
+            Self::EntrypointSignatureMismatch { name, .. } => {
+                write!(formatter, "entrypoint {name} has an incompatible signature")
             }
-            Self::HostInterfaceHashMismatch => {
-                formatter.write_str("compiled Host interface hash does not match the exact IDL")
-            }
+            Self::HostContractIdMismatch => formatter.write_str(
+                "compiled Host contract runtime ID does not match the exact NIDL source",
+            ),
             Self::MissingTestModule => formatter.write_str("test build produced no test module"),
             Self::MissingTestDebugInfo => {
                 formatter.write_str("test build produced no test debug metadata")
@@ -1754,6 +3039,7 @@ impl std::error::Error for PackageBuildError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidResolvedInput(error) => Some(error),
+            Self::HostContractSource(error) => Some(error),
             Self::Environment(error) => Some(error),
             Self::Compile(error) => Some(error),
             Self::Verify(error) => Some(error),
@@ -1761,6 +3047,12 @@ impl std::error::Error for PackageBuildError {
             Self::Integrity(error) => Some(error.as_ref()),
             _ => None,
         }
+    }
+}
+
+impl From<HostContractSourceError> for PackageBuildError {
+    fn from(value: HostContractSourceError) -> Self {
+        Self::HostContractSource(value)
     }
 }
 
@@ -1789,7 +3081,7 @@ impl From<PackageArtifactIntegrityError> for PackageBuildError {
 }
 
 /// Explicit test-only artifact. It is never loadable as a product Package candidate.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CompiledPackageTests {
     package_id: PackageId,
     verified: VerifiedModule,
@@ -1798,6 +3090,20 @@ pub struct CompiledPackageTests {
     tests: Arc<[PackageTestInfo]>,
     call_graph: Arc<[PackageTestCallGraphNode]>,
     source_paths: Arc<BTreeMap<FileId, String>>,
+}
+
+impl fmt::Debug for CompiledPackageTests {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CompiledPackageTests")
+            .field("package_id", &self.package_id)
+            .field("source_files", &self.source_files.files().len())
+            .field("modules", &self.debug_info.modules.len())
+            .field("functions", &self.debug_info.functions.len())
+            .field("tests", &self.tests.len())
+            .field("call_graph_nodes", &self.call_graph.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CompiledPackageTests {
@@ -1905,7 +3211,7 @@ impl CompiledPackageArtifact {
         self.verified.module().encode()
     }
 
-    /// Borrows the verified product module for runtime loading and legacy inspection commands.
+    /// Borrows the verified product module for runtime loading and bytecode inspection.
     #[must_use]
     pub fn module(&self) -> &nexa_bytecode::Module {
         self.verified.module()
@@ -2082,8 +3388,45 @@ impl CompiledPackageArtifact {
 
 /// Verifies that every source-map and debug location resolves inside the immutable source
 /// snapshot, and that every debug function refers to the emitted bytecode function it describes.
+fn stable_function_identity(
+    module: &nexa_bytecode::Module,
+    debug_info: &PackageDebugInfo,
+    function: u32,
+) -> Option<nexa_core::StableId> {
+    debug_info
+        .functions
+        .iter()
+        .find(|candidate| candidate.function_index == function)
+        .map(|candidate| candidate.stable_id.0)
+        .or_else(|| {
+            module
+                .exports
+                .iter()
+                .find(|candidate| candidate.function == function)
+                .map(|candidate| candidate.stable_id)
+        })
+}
+
+fn stable_host_import_identity(
+    module: &nexa_bytecode::Module,
+    debug_info: &PackageDebugInfo,
+    import: u32,
+) -> Option<nexa_core::StableId> {
+    debug_info
+        .host_imports
+        .iter()
+        .find(|candidate| candidate.import_index == import)
+        .map(|candidate| candidate.stable_id)
+        .or_else(|| {
+            usize::try_from(import)
+                .ok()
+                .and_then(|index| module.host_imports.get(index))
+                .map(|candidate| candidate.stable_id)
+        })
+}
+
 #[allow(clippy::too_many_lines)]
-pub fn verify_package_artifact_integrity(
+pub(crate) fn verify_package_artifact_integrity(
     module: &nexa_bytecode::Module,
     sources: &PackageSourceSnapshot,
     debug_info: &PackageDebugInfo,
@@ -2099,14 +3442,14 @@ pub fn verify_package_artifact_integrity(
         let function = usize::try_from(entry.function).unwrap_or(usize::MAX);
         if function >= function_count {
             return Err(PackageArtifactIntegrityError::UnknownFunction {
-                function: entry.function,
+                function: stable_function_identity(module, debug_info, entry.function),
                 location: "source-map",
             });
         }
         let code_len = u32::try_from(module.functions[function].code.len()).unwrap_or(u32::MAX);
         if entry.pc_start >= entry.pc_end || entry.pc_end > code_len {
             return Err(PackageArtifactIntegrityError::InvalidProgramCounterRange {
-                function: entry.function,
+                function: stable_function_identity(module, debug_info, entry.function),
                 start: entry.pc_start,
                 end: entry.pc_end,
                 code_len,
@@ -2117,7 +3460,7 @@ pub fn verify_package_artifact_integrity(
             let covered = &mut source_coverage[function][pc_index];
             if *covered {
                 return Err(PackageArtifactIntegrityError::OverlappingSourceMap {
-                    function: entry.function,
+                    function: stable_function_identity(module, debug_info, entry.function),
                     pc,
                 });
             }
@@ -2128,7 +3471,11 @@ pub fn verify_package_artifact_integrity(
     for (function, coverage) in source_coverage.iter().enumerate() {
         if let Some(pc) = coverage.iter().position(|covered| !covered) {
             return Err(PackageArtifactIntegrityError::MissingSourceMap {
-                function: u32::try_from(function).unwrap_or(u32::MAX),
+                function: stable_function_identity(
+                    module,
+                    debug_info,
+                    u32::try_from(function).unwrap_or(u32::MAX),
+                ),
                 pc: u32::try_from(pc).unwrap_or(u32::MAX),
             });
         }
@@ -2137,16 +3484,16 @@ pub fn verify_package_artifact_integrity(
     let mut debug_functions = BTreeSet::new();
     for function in &debug_info.functions {
         if !debug_functions.insert(function.function_index) {
-            return Err(PackageArtifactIntegrityError::DuplicateDebugFunction(
-                function.function_index,
-            ));
+            return Err(PackageArtifactIntegrityError::DuplicateDebugFunction {
+                function: function.stable_id.0,
+            });
         }
         if usize::try_from(function.function_index)
             .ok()
             .is_none_or(|index| index >= function_count)
         {
             return Err(PackageArtifactIntegrityError::UnknownFunction {
-                function: function.function_index,
+                function: Some(function.stable_id.0),
                 location: "debug-info",
             });
         }
@@ -2172,9 +3519,9 @@ pub fn verify_package_artifact_integrity(
     for function in 0..function_count {
         let function = u32::try_from(function).unwrap_or(u32::MAX);
         if !debug_functions.contains(&function) {
-            return Err(PackageArtifactIntegrityError::MissingDebugFunction(
-                function,
-            ));
+            return Err(PackageArtifactIntegrityError::MissingDebugFunction {
+                function: stable_function_identity(module, debug_info, function),
+            });
         }
     }
 
@@ -2208,7 +3555,7 @@ pub fn verify_package_artifact_integrity(
                 .is_none_or(|index| index >= function_count)
             {
                 return Err(PackageArtifactIntegrityError::UnknownFunction {
-                    function: *function,
+                    function: stable_function_identity(module, debug_info, *function),
                     location: "module-debug-info",
                 });
             }
@@ -2221,7 +3568,7 @@ pub fn verify_package_artifact_integrity(
             ) {
                 return Err(
                     PackageArtifactIntegrityError::DuplicateModuleFunctionOwnership {
-                        function: *function,
+                        function: stable_function_identity(module, debug_info, *function),
                         first_package,
                         first_module,
                         second_package: source_module.package_id.clone(),
@@ -2238,7 +3585,7 @@ pub fn verify_package_artifact_integrity(
                 || debug.module_path != source_module.module_path
             {
                 return Err(PackageArtifactIntegrityError::ModuleFunctionMismatch {
-                    function: *function,
+                    function: Some(debug.stable_id.0),
                     owner_package: source_module.package_id.clone(),
                     owner_module: source_module.module_path.clone(),
                     debug_package: debug.package_id.clone(),
@@ -2249,7 +3596,11 @@ pub fn verify_package_artifact_integrity(
     }
     for function in &debug_functions {
         if !module_function_owners.contains_key(function) {
-            return Err(PackageArtifactIntegrityError::MissingModuleFunctionOwnership(*function));
+            return Err(
+                PackageArtifactIntegrityError::MissingModuleFunctionOwnership {
+                    function: stable_function_identity(module, debug_info, *function),
+                },
+            );
         }
     }
 
@@ -2264,45 +3615,43 @@ pub fn verify_package_artifact_integrity(
     let mut host_debug_imports = BTreeSet::new();
     for host in &debug_info.host_imports {
         if !host_debug_imports.insert(host.import_index) {
-            return Err(PackageArtifactIntegrityError::DuplicateHostDebugImport(
-                host.import_index,
-            ));
+            return Err(PackageArtifactIntegrityError::DuplicateHostDebugImport {
+                import: host.stable_id,
+            });
         }
         let Some(module_import) = usize::try_from(host.import_index)
             .ok()
             .and_then(|index| module.host_imports.get(index))
         else {
-            return Err(PackageArtifactIntegrityError::UnknownHostImport(
-                host.import_index,
-            ));
+            return Err(PackageArtifactIntegrityError::UnknownHostImport {
+                import: host.stable_id,
+            });
         };
         if module_import.stable_id != host.stable_id {
             return Err(PackageArtifactIntegrityError::HostImportStableIdMismatch {
-                import: host.import_index,
+                import: stable_host_import_identity(module, debug_info, host.import_index),
                 module: module_import.stable_id,
                 debug: host.stable_id,
             });
         }
-        if module.host_interface_hash != Some(host.interface_id) {
-            return Err(
-                PackageArtifactIntegrityError::HostInterfaceDebugIdMismatch {
-                    import: host.import_index,
-                    module: module.host_interface_hash,
-                    debug: host.interface_id,
-                },
-            );
-        }
-        if host.interface_name.is_empty() || host.function_name.is_empty() {
-            return Err(PackageArtifactIntegrityError::EmptyHostDebugName {
-                import: host.import_index,
+        if module.host_contract_id != Some(host.contract_id) {
+            return Err(PackageArtifactIntegrityError::HostContractDebugIdMismatch {
+                import: stable_host_import_identity(module, debug_info, host.import_index),
+                module: module.host_contract_id,
+                debug: host.contract_id,
             });
         }
-        validate_nonempty_span(host.interface_span, sources, "host-interface")?;
+        if host.contract_name.is_empty() || host.function_name.is_empty() {
+            return Err(PackageArtifactIntegrityError::EmptyHostDebugName {
+                import: stable_host_import_identity(module, debug_info, host.import_index),
+            });
+        }
+        validate_nonempty_span(host.contract_span, sources, "host-contract")?;
         validate_nonempty_span(host.declaration_span, sources, "host-declaration")?;
-        if host.interface_span.file != host.declaration_span.file {
+        if host.contract_span.file != host.declaration_span.file {
             return Err(PackageArtifactIntegrityError::HostDebugSourceMismatch {
-                import: host.import_index,
-                interface_file: host.interface_span.file,
+                import: stable_host_import_identity(module, debug_info, host.import_index),
+                contract_file: host.contract_span.file,
                 declaration_file: host.declaration_span.file,
             });
         }
@@ -2314,48 +3663,41 @@ pub fn verify_package_artifact_integrity(
         )?;
         if source.key.is_some() || source.module_path.is_some() {
             return Err(PackageArtifactIntegrityError::HostDebugSourceIsPackage {
-                import: host.import_index,
+                import: stable_host_import_identity(module, debug_info, host.import_index),
                 identity: source.identity.clone(),
             });
         }
-        let (_, source_map) = nexa_idl::parse_with_source_map(&source.text).map_err(|_| {
+        let parsed = nexa_idl::parse(&source.text).map_err(|_| {
             PackageArtifactIntegrityError::InvalidHostDebugSource {
-                import: host.import_index,
+                import: stable_host_import_identity(module, debug_info, host.import_index),
                 identity: source.identity.clone(),
             }
         })?;
-        let Some(function_source) = source_map.functions.get(&host.function_name) else {
+        let Some(function_source) = parsed
+            .host_functions
+            .iter()
+            .find(|function| function.name == host.function_name)
+        else {
             return Err(
                 PackageArtifactIntegrityError::HostDebugDeclarationMismatch {
-                    import: host.import_index,
+                    import: stable_host_import_identity(module, debug_info, host.import_index),
                 },
             );
         };
-        let expected_interface = SourceSpan::new(
-            host.interface_span.file,
-            u32::try_from(source_map.interface.declaration_start).unwrap_or(u32::MAX),
-            u32::try_from(source_map.interface.declaration_end).unwrap_or(u32::MAX),
-        );
+        let expected_contract =
+            SourceSpan::new(host.contract_span.file, parsed.span.start, parsed.span.end);
         let expected_declaration = SourceSpan::new(
             host.declaration_span.file,
-            u32::try_from(function_source.declaration_start).unwrap_or(u32::MAX),
-            u32::try_from(function_source.declaration_end).unwrap_or(u32::MAX),
+            function_source.span.start,
+            function_source.span.end,
         );
-        if source_map
-            .interface
-            .name_start
-            .checked_add(host.interface_name.len())
-            != Some(source_map.interface.name_end)
-            || source
-                .text
-                .get(source_map.interface.name_start..source_map.interface.name_end)
-                != Some(host.interface_name.as_str())
-            || host.interface_span != expected_interface
+        if parsed.name != host.contract_name
+            || host.contract_span != expected_contract
             || host.declaration_span != expected_declaration
         {
             return Err(
                 PackageArtifactIntegrityError::HostDebugDeclarationMismatch {
-                    import: host.import_index,
+                    import: stable_host_import_identity(module, debug_info, host.import_index),
                 },
             );
         }
@@ -2363,9 +3705,9 @@ pub fn verify_package_artifact_integrity(
     for expected in 0..module.host_imports.len() {
         let expected = u32::try_from(expected).unwrap_or(u32::MAX);
         if !host_debug_imports.contains(&expected) {
-            return Err(PackageArtifactIntegrityError::MissingHostDebugImport(
-                expected,
-            ));
+            return Err(PackageArtifactIntegrityError::MissingHostDebugImport {
+                import: stable_host_import_identity(module, debug_info, expected),
+            });
         }
     }
     Ok(())
@@ -2655,6 +3997,11 @@ pub enum PackageArtifactIntegrityError {
         expected: NormalizedPackagePath,
         actual: NormalizedPackagePath,
     },
+    VirtualModulePathMismatch {
+        key: SourceKey,
+        module: ModulePath,
+        virtual_module: ModulePath,
+    },
     BuildFingerprintMismatch {
         identity: BuildFingerprint,
         artifact: BuildFingerprint,
@@ -2715,35 +4062,41 @@ pub enum PackageArtifactIntegrityError {
         location: &'static str,
     },
     UnknownFunction {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         location: &'static str,
     },
     InvalidProgramCounterRange {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         start: u32,
         end: u32,
         code_len: u32,
     },
     MissingSourceMap {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         pc: u32,
     },
     OverlappingSourceMap {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         pc: u32,
     },
-    DuplicateDebugFunction(u32),
-    MissingDebugFunction(u32),
+    DuplicateDebugFunction {
+        function: nexa_core::StableId,
+    },
+    MissingDebugFunction {
+        function: Option<nexa_core::StableId>,
+    },
     DuplicateModuleFunctionOwnership {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         first_package: String,
         first_module: String,
         second_package: String,
         second_module: String,
     },
-    MissingModuleFunctionOwnership(u32),
+    MissingModuleFunctionOwnership {
+        function: Option<nexa_core::StableId>,
+    },
     ModuleFunctionMismatch {
-        function: u32,
+        function: Option<nexa_core::StableId>,
         owner_package: String,
         owner_module: String,
         debug_package: String,
@@ -2753,37 +4106,43 @@ pub enum PackageArtifactIntegrityError {
         expected: usize,
         actual: usize,
     },
-    DuplicateHostDebugImport(u32),
-    UnknownHostImport(u32),
-    MissingHostDebugImport(u32),
+    DuplicateHostDebugImport {
+        import: nexa_core::StableId,
+    },
+    UnknownHostImport {
+        import: nexa_core::StableId,
+    },
+    MissingHostDebugImport {
+        import: Option<nexa_core::StableId>,
+    },
     HostImportStableIdMismatch {
-        import: u32,
+        import: Option<nexa_core::StableId>,
         module: nexa_core::StableId,
         debug: nexa_core::StableId,
     },
-    HostInterfaceDebugIdMismatch {
-        import: u32,
+    HostContractDebugIdMismatch {
+        import: Option<nexa_core::StableId>,
         module: Option<nexa_core::StableId>,
         debug: nexa_core::StableId,
     },
     EmptyHostDebugName {
-        import: u32,
+        import: Option<nexa_core::StableId>,
     },
     HostDebugSourceMismatch {
-        import: u32,
-        interface_file: FileId,
+        import: Option<nexa_core::StableId>,
+        contract_file: FileId,
         declaration_file: FileId,
     },
     HostDebugSourceIsPackage {
-        import: u32,
+        import: Option<nexa_core::StableId>,
         identity: SourceIdentity,
     },
     InvalidHostDebugSource {
-        import: u32,
+        import: Option<nexa_core::StableId>,
         identity: SourceIdentity,
     },
     HostDebugDeclarationMismatch {
-        import: u32,
+        import: Option<nexa_core::StableId>,
     },
     EmptySourceRange {
         file: FileId,
@@ -2863,21 +4222,23 @@ mod tests {
             key: Some(key("src/main.nexa")),
             identity: SourceIdentity::package("example.app", "src/main.nexa"),
             module_path: Some(ModulePath::new("main").unwrap().to_string()),
-            text: Arc::from("module main;\nfn main() {}\n"),
+            virtual_module_path: None,
+            text: Arc::from("// fixture12\nfn main() {}\n"),
             compiler_provided: false,
         }])
         .unwrap()
     }
 
     fn snapshot_with_host() -> PackageSourceSnapshot {
-        let host: Arc<str> = Arc::from("interface Host { sync fn ping() -> i32; }\n");
+        let host: Arc<str> = Arc::from("contract Host { host { fn ping() -> i32; } }\n");
         PackageSourceSnapshot::new([
             CompiledSource {
                 file: FileId(1),
                 key: Some(key("src/main.nexa")),
                 identity: SourceIdentity::package("example.app", "src/main.nexa"),
                 module_path: Some(ModulePath::new("main").unwrap().to_string()),
-                text: Arc::from("module main;\nfn main() {}\n"),
+                virtual_module_path: None,
+                text: Arc::from("// fixture12\nfn main() {}\n"),
                 compiler_provided: false,
             },
             CompiledSource {
@@ -2885,6 +4246,7 @@ mod tests {
                 key: None,
                 identity: SourceIdentity::standalone("contracts/app api.nidl"),
                 module_path: None,
+                virtual_module_path: None,
                 text: host,
                 compiler_provided: false,
             },
@@ -2913,7 +4275,7 @@ activation = "default-enabled"
         sources
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\nfn main() {}\n",
+                "fn main() {}\n",
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
@@ -2949,8 +4311,9 @@ source_root = "src"
     fn resolved_input(
         manifest: PackageManifest,
         sources: PackageSourceSet,
-        contract: &nexa_idl::Idl,
+        contract: &nexa_idl::ValidatedContract,
     ) -> ResolvedBuildInput {
+        let contract_input = test_contract_input(contract);
         let source_id = SourceId::new("package-build-test").unwrap();
         let directory = NormalizedPackagePath::new("packages/example").unwrap();
         let graph = Arc::new(ResolvedDependencyGraph {
@@ -2967,12 +4330,12 @@ source_root = "src"
             )]),
             edges: BTreeSet::new(),
         });
-        let fingerprint_input = canonical_package_build_fingerprint_input(
+        let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
             &sources,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            contract,
+            &contract_input,
             None,
         );
         ResolvedBuildInput::new(
@@ -2982,16 +4345,29 @@ source_root = "src"
             BTreeMap::new(),
             graph,
             None,
-            Arc::<[u8]>::from(nexa_idl::canonical(contract).into_bytes()),
-            canonical_host_contract_source_identity(&HostContractInput::canonical(contract)),
-            fingerprint_input.host_required_exports.clone(),
+            Arc::<[u8]>::from(fingerprint_input.host_contract.clone()),
+            canonical_host_contract_source_identity(&contract_input),
+            fingerprint_input.host_required_entrypoints.clone(),
             nexa_analysis::CompilationOptions::default(),
             fingerprint_input,
         )
         .unwrap()
     }
 
-    fn canonical_artifact() -> (CompiledPackageArtifact, ResolvedBuildInput, nexa_idl::Idl) {
+    fn test_contract_input(contract: &nexa_idl::ValidatedContract) -> HostContractInput<'_> {
+        HostContractInput::with_source(
+            contract,
+            SourceIdentity::standalone("nidl://tests/package-build.nidl"),
+            Arc::<str>::from(contract.source.as_str()),
+        )
+        .unwrap()
+    }
+
+    fn canonical_artifact() -> (
+        CompiledPackageArtifact,
+        ResolvedBuildInput,
+        nexa_idl::ValidatedContract,
+    ) {
         let manifest = PackageManifest::parse(
             r#"
 schema = 2
@@ -3013,41 +4389,36 @@ activation = "programmatic"
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
                 concat!(
-                    "module main;\n",
                     "@stable(\"root-state\")\n",
-                    "@stateful(1)\n",
-                    "pub class Root { value: i32; }\n",
+                    "@state(version = 1)\n",
+                    "pub class Root { mut value: i32, }\n",
                     "pub fn value() -> i32 { return 7; }\n",
                 ),
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_idl::parse("interface Empty {}").unwrap();
+        let contract = nexa_idl::parse("contract Empty {}").unwrap();
         let input = resolved_input(manifest, builder.build().unwrap(), &contract);
         let identity =
             CandidateIdentity::new(input.root_manifest.id.clone(), 1, input.build_fingerprint)
                 .unwrap();
-        let artifact = compile_package(&input, &contract, identity).unwrap();
+        let contract_input = test_contract_input(&contract);
+        let artifact = compile_package_with_contract(&input, &contract_input, identity).unwrap();
         (artifact, input, contract)
     }
 
     #[test]
     fn library_check_rejects_both_directions_of_unit_return_mismatch() {
-        let contract = nexa_idl::parse("interface Empty {}").unwrap();
+        let contract = nexa_idl::parse("contract Empty {}").unwrap();
         for (source, expected_message) in [
-            (
-                "module main;\nfn bad() -> i32 { return; }\n",
-                "expected i32, found unit",
-            ),
-            (
-                "module main;\nfn bad() -> unit { return 1; }\n",
-                "expected unit, found i32",
-            ),
+            ("fn bad() -> i32 { return; }\n", "expected i32, found unit"),
+            ("fn bad() { return 1; }\n", "expected unit, found i32"),
         ] {
             let (manifest, sources) = library_manifest_and_sources(source);
             let input = resolved_input(manifest, sources, &contract);
+            let contract_input = test_contract_input(&contract);
             let error = PackageBuildSession::new()
-                .check_package(&input, &contract)
+                .check_package_with_contract(&input, &contract_input)
                 .unwrap_err();
             let PackageBuildError::AnalysisFailed(diagnostics) = error else {
                 panic!("library mismatch must fail semantic analysis: {error}");
@@ -3095,12 +4466,12 @@ activation = "programmatic"
 
     fn exact_host_build_fingerprint(
         input: &ResolvedBuildInput,
-        contract: &nexa_idl::Idl,
+        contract: &nexa_idl::ValidatedContract,
     ) -> BuildFingerprint {
         let exact_host = HostContractInput::with_source(
             contract,
             SourceIdentity::standalone("contracts/relocated-empty.nidl"),
-            nexa_idl::canonical_source(contract),
+            contract.source.clone(),
         )
         .unwrap();
         canonical_package_build_fingerprint_input_with_contract(
@@ -3131,7 +4502,7 @@ activation = "programmatic"
             input.lock.clone(),
             Arc::clone(&input.canonical_host_contract),
             Arc::clone(&input.host_contract_source_identity),
-            Arc::clone(&input.host_required_exports_identity),
+            Arc::clone(&input.host_required_entrypoints_identity),
             changed_options,
             fingerprint,
         )
@@ -3178,7 +4549,8 @@ activation = "programmatic"
             key: Some(key("src/main.nexa")),
             identity: SourceIdentity::package("example.app", "src/main.nexa"),
             module_path: Some("main".into()),
-            text: Arc::from("module main;"),
+            virtual_module_path: None,
+            text: Arc::from("fn main() {}"),
             compiler_provided: false,
         };
         let mut duplicate_file = base.clone();
@@ -3194,6 +4566,68 @@ activation = "programmatic"
         assert!(matches!(
             PackageSourceSnapshot::new([base, duplicate_key]),
             Err(PackageArtifactIntegrityError::DuplicateSourceKey { .. })
+        ));
+    }
+
+    #[test]
+    fn virtual_module_provenance_is_exact_and_rechecked_against_source_authority() {
+        let source_key = key("src/__repl/cell_1.nexa");
+        let semantic_module = ModulePath::new("repl.session").unwrap();
+        let source_text: Arc<str> = Arc::from("let value = 1;\n");
+        let compiled = CompiledSource {
+            file: FileId(1),
+            key: Some(source_key.clone()),
+            identity: SourceIdentity::package("example.app", "src/__repl/cell_1.nexa"),
+            module_path: Some(semantic_module.to_string()),
+            virtual_module_path: Some(semantic_module.to_string()),
+            text: Arc::clone(&source_text),
+            compiler_provided: false,
+        };
+        let snapshot = PackageSourceSnapshot::new([compiled.clone()]).unwrap();
+
+        let mut virtual_sources = nexa_analysis::SourceSetBuilder::new(
+            PackageId::new("example.app").unwrap(),
+            nexa_analysis::CompilationLimits::default(),
+        );
+        virtual_sources
+            .add_virtual_snippet(
+                source_key.path.clone(),
+                Arc::clone(&source_text),
+                semantic_module.clone(),
+            )
+            .unwrap();
+        let virtual_sources = virtual_sources.build().unwrap();
+        validate_compiled_source_authority(virtual_sources.production_units(), &snapshot).unwrap();
+
+        let mut omitted = compiled.clone();
+        omitted.virtual_module_path = None;
+        assert!(matches!(
+            PackageSourceSnapshot::new([omitted]),
+            Err(PackageArtifactIntegrityError::ModulePathMismatch { .. })
+        ));
+
+        let mut mismatched = compiled.clone();
+        mismatched.virtual_module_path = Some("repl.other".into());
+        assert!(matches!(
+            PackageSourceSnapshot::new([mismatched]),
+            Err(PackageArtifactIntegrityError::VirtualModulePathMismatch { .. })
+        ));
+
+        let mut ordinary_sources = nexa_analysis::SourceSetBuilder::new(
+            PackageId::new("example.app").unwrap(),
+            nexa_analysis::CompilationLimits::default(),
+        );
+        ordinary_sources
+            .add(
+                source_key.path,
+                source_text,
+                nexa_analysis::SourceRole::Production,
+            )
+            .unwrap();
+        let ordinary_sources = ordinary_sources.build().unwrap();
+        assert!(matches!(
+            validate_compiled_source_authority(ordinary_sources.production_units(), &snapshot,),
+            Err(PackageBuildError::CompilerSourceClosureMismatch)
         ));
     }
 
@@ -3263,7 +4697,7 @@ activation = "programmatic"
         }]);
         assert!(matches!(
             verify_package_artifact_integrity(&gap_builder.finish(), &sources, &debug_info(span)),
-            Err(PackageArtifactIntegrityError::MissingSourceMap { function: 0, pc: 1 })
+            Err(PackageArtifactIntegrityError::MissingSourceMap { pc: 1, .. })
         ));
 
         let mut overlap_builder = ModuleBuilder::new();
@@ -3288,27 +4722,29 @@ activation = "programmatic"
                 &sources,
                 &debug_info(span)
             ),
-            Err(PackageArtifactIntegrityError::OverlappingSourceMap { function: 0, pc: 1 })
+            Err(PackageArtifactIntegrityError::OverlappingSourceMap { pc: 1, .. })
         ));
     }
 
     #[test]
     fn host_debug_table_must_exactly_cover_bytecode_imports_and_external_source() {
         let mut builder = ModuleBuilder::new();
-        let interface_id = nexa_core::StableId::from_name("Host");
+        let contract_id = nexa_core::StableId::from_name("Host");
         let import_id = nexa_core::StableId::from_parts(&["Host", "::", "ping"]);
         builder
             .metadata(
-                interface_id,
+                contract_id,
                 nexa_analysis::StateSchemaFingerprint::from_bytes([0; 32]),
             )
             .host_import(HostImport {
                 stable_id: import_id,
+                declaration_fingerprint: [0; 32],
                 parameters: Vec::new(),
                 result: Some(nexa_bytecode::ValueType::I32),
                 mode: HostCallMode::Immediate,
                 fuel_cost: 1,
                 async_result: None,
+                capabilities: Vec::new(),
             });
         let mut function = FunctionBuilder::new(
             Signature {
@@ -3329,23 +4765,27 @@ activation = "programmatic"
         let sources = snapshot_with_host();
         let mut debug = debug_info(SourceSpan::new(FileId(1), 13, 26));
         let host_source = sources.source(FileId(2)).unwrap();
-        let (_, host_map) = nexa_idl::parse_with_source_map(&host_source.text).unwrap();
-        let function_source = host_map.functions.get("ping").unwrap();
+        let host_contract = nexa_idl::parse(&host_source.text).unwrap();
+        let function_source = host_contract
+            .host_functions
+            .iter()
+            .find(|function| function.name == "ping")
+            .unwrap();
         debug.host_imports.push(PackageHostImportDebugInfo {
             import_index: 0,
             stable_id: import_id,
-            interface_id,
-            interface_name: "Host".into(),
+            contract_id,
+            contract_name: "Host".into(),
             function_name: "ping".into(),
-            interface_span: SourceSpan::new(
+            contract_span: SourceSpan::new(
                 FileId(2),
-                u32::try_from(host_map.interface.declaration_start).unwrap(),
-                u32::try_from(host_map.interface.declaration_end).unwrap(),
+                host_contract.span.start,
+                host_contract.span.end,
             ),
             declaration_span: SourceSpan::new(
                 FileId(2),
-                u32::try_from(function_source.declaration_start).unwrap(),
-                u32::try_from(function_source.declaration_end).unwrap(),
+                function_source.span.start,
+                function_source.span.end,
             ),
         });
         verify_package_artifact_integrity(&module, &sources, &debug).unwrap();
@@ -3366,21 +4806,22 @@ activation = "programmatic"
     #[test]
     fn build_identity_includes_canonical_standard_library_descriptor() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_idl::parse("interface Empty {}").unwrap();
-        let first = canonical_package_build_fingerprint_input(
+        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract_input = test_contract_input(&contract);
+        let first = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
             &sources,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &contract,
+            &contract_input,
             None,
         );
-        let second = canonical_package_build_fingerprint_input(
+        let second = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
             &sources,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &contract,
+            &contract_input,
             None,
         );
         assert!(!first.standard_library_descriptor.is_empty());
@@ -3392,12 +4833,14 @@ activation = "programmatic"
     }
 
     #[test]
-    fn required_export_view_changes_identity_without_changing_the_complete_contract() {
+    fn required_entrypoint_view_changes_effective_identity_not_runtime_contract() {
         let (manifest, sources) = manifest_and_sources();
         let source: Arc<str> = Arc::from(
-            "interface Host {\n\
-             export Run() -> i32;\n\
-             export Reset() -> void;\n\
+            "contract Host {\n\
+             nexa {\n\
+                 fn run() -> i32;\n\
+                 fn reset();\n\
+             }\n\
              }\n",
         );
         let idl = nexa_idl::parse(&source).unwrap();
@@ -3408,12 +4851,12 @@ activation = "programmatic"
         )
         .unwrap();
         let run_then_reset = base
-            .requiring_exports(&["Run".to_owned(), "Reset".to_owned()])
+            .requiring_entrypoints(&["run".to_owned(), "reset".to_owned()])
             .unwrap();
         let reset_then_run = base
-            .requiring_exports(&["Reset".to_owned(), "Run".to_owned()])
+            .requiring_entrypoints(&["reset".to_owned(), "run".to_owned()])
             .unwrap();
-        let run_only = base.requiring_exports(&["Run".to_owned()]).unwrap();
+        let run_only = base.requiring_entrypoints(&["run".to_owned()]).unwrap();
         let full = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
             &sources,
@@ -3439,28 +4882,35 @@ activation = "programmatic"
             None,
         );
 
-        assert_eq!(full.host_contract, subset.host_contract);
+        assert_ne!(full.host_contract, subset.host_contract);
         assert_eq!(full.host_contract_source, subset.host_contract_source);
-        assert_eq!(full.host_required_exports, reordered.host_required_exports);
+        assert_eq!(
+            full.host_required_entrypoints,
+            reordered.host_required_entrypoints
+        );
         assert_eq!(full.fingerprint(), reordered.fingerprint());
-        assert_ne!(full.host_required_exports, subset.host_required_exports);
+        assert_ne!(
+            full.host_required_entrypoints,
+            subset.host_required_entrypoints
+        );
         assert_ne!(full.fingerprint(), subset.fingerprint());
         assert_eq!(
-            nexa_idl::exact_hash(base.idl()),
-            nexa_idl::exact_hash(run_only.idl())
+            nexa_idl::contract_runtime_id(base.contract()),
+            nexa_idl::contract_runtime_id(run_only.contract())
         );
     }
 
     #[test]
     fn package_fingerprint_uses_canonical_build_authorities() {
         let (manifest, sources) = manifest_and_sources();
-        let contract = nexa_idl::parse("interface Empty {}").unwrap();
-        let fingerprint = canonical_package_build_fingerprint_input(
+        let contract = nexa_idl::parse("contract Empty {}").unwrap();
+        let contract_input = test_contract_input(&contract);
+        let fingerprint = canonical_package_build_fingerprint_input_with_contract(
             &manifest,
             &sources,
             &BTreeMap::new(),
             &BTreeMap::new(),
-            &contract,
+            &contract_input,
             None,
         );
         let options = nexa_analysis::CompilationOptions::default();
@@ -3521,8 +4971,9 @@ activation = "programmatic"
             changed_options.build_fingerprint,
         )
         .unwrap();
+        let contract_input = test_contract_input(&contract);
         assert!(matches!(
-            compile_package(&changed_options, &contract, changed_identity),
+            compile_package_with_contract(&changed_options, &contract_input, changed_identity),
             Err(PackageBuildError::CompilationOptionsMismatch)
         ));
 
@@ -3533,14 +4984,14 @@ activation = "programmatic"
         changed_source_builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\npub fn changed() -> i32 { return 1; }\n",
+                "pub fn changed() -> i32 { return 1; }\n",
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
         let mut tampered = input.clone();
         tampered.root_source_set = Arc::new(changed_source_builder.build().unwrap());
         assert!(matches!(
-            check_package(&tampered, &contract),
+            check_package_with_contract(&tampered, &contract_input),
             Err(PackageBuildError::InvalidResolvedInput(
                 nexa_analysis::ResolvedBuildInputError::FingerprintRootSourceMismatch
             ))
@@ -3552,13 +5003,21 @@ activation = "programmatic"
         let (artifact, _input, contract) = canonical_artifact();
         assert!(!artifact.encode_module().is_empty());
         assert_eq!(
-            artifact.module().host_interface_hash,
-            Some(nexa_idl::exact_hash(&contract))
+            artifact.module().host_contract_id,
+            Some(nexa_idl::contract_runtime_id(&contract))
         );
-        assert!(artifact.source_files.files().iter().any(|source| {
-            source.key.is_none()
-                && source.identity.path() == crate::package_environment::CANONICAL_HOST_SOURCE_PATH
-        }));
+        let host_source = artifact
+            .source_files
+            .files()
+            .iter()
+            .find(|source| source.key.is_none())
+            .expect("the exact external Host source must be retained");
+        assert_eq!(
+            host_source.identity.path(),
+            "nidl://tests/package-build.nidl"
+        );
+        assert_eq!(host_source.text.as_ref(), contract.source);
+        assert!(!host_source.compiler_provided);
     }
 
     #[test]
@@ -3583,11 +5042,11 @@ activation = "programmatic"
         production
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;\n@stateful(1) pub class ProductState { value: i32; }\npub fn value() -> i32 { return 7; }\n",
+                "@state(version = 1)\npub class ProductState { mut value: i32, }\npub fn value() -> i32 { return 7; }\n",
                 nexa_analysis::SourceRole::Production,
             )
             .unwrap();
-        let contract = nexa_idl::parse("interface Empty {}").unwrap();
+        let contract = nexa_idl::parse("contract Empty {}").unwrap();
         let input = Arc::new(resolved_input(
             manifest,
             production.build().unwrap(),
@@ -3600,7 +5059,7 @@ activation = "programmatic"
         tests
             .add(
                 NormalizedPackagePath::new("tests/checks.nexa").unwrap(),
-                "module test.checks;\n@stateful(99) pub class TestOnlyState { ignored: string; }\n@test fn succeeds() -> bool { return true; }\n",
+                "@state(version = 99)\npub class TestOnlyState { mut ignored: string, }\n@test fn succeeds() -> bool { return true; }\n",
                 nexa_analysis::SourceRole::Test,
             )
             .unwrap();
@@ -3610,11 +5069,12 @@ activation = "programmatic"
             CandidateIdentity::new(input.root_package().clone(), 1, input.build_fingerprint)
                 .unwrap();
         let mut session = PackageBuildSession::new();
+        let contract_input = test_contract_input(&contract);
         let product = session
-            .compile_package(&input, &contract, identity.clone())
+            .compile_package_with_contract(&input, &contract_input, identity.clone())
             .expect("production artifact");
         let test = session
-            .compile_package_tests(&test_input, &contract, identity)
+            .compile_package_tests_with_contract(&test_input, &contract_input, identity)
             .expect("test artifact");
         let test_module = test.verified.module();
 

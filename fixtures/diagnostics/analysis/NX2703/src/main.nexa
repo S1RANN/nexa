@@ -1,6 +1,4 @@
-module main;
-
-import missing.target;
+use package::missing::target;
 
 pub fn entry() -> i32 {
     return 1;

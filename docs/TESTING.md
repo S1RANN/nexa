@@ -22,12 +22,22 @@ cargo xtask editor-check
 cargo xtask dev-loop-stress
 cargo xtask test-generation-accounting
 cargo xtask test-candidate-freshness
+cargo xtask test-language-v2
+cargo xtask test-object-model-v2
+cargo xtask test-async-v2
+cargo xtask test-nidl-v2
+cargo xtask test-structured-codegen
+cargo xtask test-standalone
+cargo xtask test-repl
+cargo xtask test-entrypoints
+cargo xtask m4r1-scale-stress
 cargo xtask check
 cargo xtask finalize-m1
 cargo xtask finalize-m2
 cargo xtask finalize-m3-r1
 cargo xtask finalize-m3-r2
 cargo xtask finalize-m3-r3
+cargo xtask finalize-m4-r1
 ```
 
 Unit tests cover parser, type checking, bytecode, verifier, migration, and
@@ -86,13 +96,14 @@ status documents and immutable predecessor tags, and requires the annotated
 `developer-loop-m3-complete-r3` tag at the final commit. Its report is written
 to `target/nexa-artifacts/m3r3-finalize/final-report.json`.
 
-`test-binding` includes all 20 textual IDL mutation crates against the
-handwritten `BusinessHostV1`. Every changed crate compiles its changed script
-against the changed NIDL and executes `heartbeat(41)` through
-`GeneratedHostRegistry<PatchedBusinessHost>`. It also runs the generated Combat
-Host binding lifecycle test. `test-task` runs the public lifecycle/resource
-suite and the external compile-fail test that closes Request/Waiting
-construction bypasses.
+`test-nidl-v2` mutates Contracts, `host`/`nexa` blocks, attributes, types,
+names, declaration uniqueness, recursive layouts, async declarations,
+comments, and source spans. `test-structured-codegen` sends every Binding Model
+through TokenStream, `syn`, `prettyplease`, a second `syn` parse, and
+`cargo check`; it also checks identifier-injection rejection and byte-for-byte
+determinism. `test-binding` retains the generated Combat Host binding lifecycle
+coverage. `test-task` runs the public lifecycle/resource suite and the external
+compile-fail test that closes Request/Waiting construction bypasses.
 `test-reload` runs 16 restart outcomes, including pre-commit rollback without
 Task revival, late-result discard, immediate old-module release, and
 post-publication activation failure.
@@ -112,3 +123,20 @@ ordinary test runner.
 Combat validates generated Binding-only Request, Token, and Typed Snapshot
 ownership for normal completion, explicit cancellation, and Restart Reload.
 Each release batch is exact, and its second and third drains are empty.
+
+`test-language-v2`, `test-object-model-v2`, and `test-async-v2` cover the
+frozen source surface, value/reference semantics, precise roots, `.await`
+chains, cancellation, Host waits, and Reload. `test-standalone` covers
+synchronous and asynchronous `main`, script lowering, arguments, Console Host,
+and exit codes. `test-repl` proves Cell persistence, rollback after failure,
+async cancellation, commands, and resource ceilings. `test-entrypoints`
+validates Required and Optional typed entrypoint dispatch, including the three
+Snake strategies. `m4r1-scale-stress` repeats the Package-scale and freshness
+thresholds on Language v2.
+
+`finalize-m4-r1` reruns workspace format, check, Clippy, tests, doc tests, the
+ten M4R1 gates, the repository check, legacy-surface audit, status and
+predecessor-tag checks, and clean annotated-tag validation. Its report is
+`target/nexa-artifacts/m4r1-finalize/final-report.json`. It cannot report PASS
+until `language-scale-m4-complete-r1` is an annotated tag targeting the same
+clean commit as `main`.

@@ -125,7 +125,7 @@
       ]
     },
     "attributes": {
-      "match": "(@)(stateful|activation|stable|test)\\b",
+      "match": "(@)(state|fuel|migration|activation|cleanup|immediate|stable|test)\\b",
       "captures": {
         "1": {
           "name": "punctuation.definition.annotation.nexa"
@@ -138,16 +138,16 @@
     "declarations": {
       "patterns": [
         {
-          "match": "\\b(module|import)\\s+([A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
+          "match": "\\b(use)\\s+([A-Za-z_][A-Za-z0-9_]*(?:::[A-Za-z_][A-Za-z0-9_]*)+)(?:\\s+(as)\\s+([A-Za-z_][A-Za-z0-9_]*))?",
           "captures": {
             "1": {
-              "name": "keyword.control.module.nexa"
+              "name": "keyword.control.namespace.nexa"
             },
             "2": {
               "name": "entity.name.namespace.nexa"
             },
             "3": {
-              "name": "keyword.control.module.nexa"
+              "name": "keyword.control.namespace.nexa"
             },
             "4": {
               "name": "entity.name.namespace.nexa"
@@ -166,12 +166,15 @@
           }
         },
         {
-          "match": "\\b(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
+          "match": "\\b(?:(async)\\s+)?(fn)\\s+([A-Za-z_][A-Za-z0-9_]*)",
           "captures": {
             "1": {
-              "name": "storage.type.function.nexa"
+              "name": "storage.modifier.async.nexa"
             },
             "2": {
+              "name": "storage.type.function.nexa"
+            },
+            "3": {
               "name": "entity.name.function.nexa"
             }
           }
@@ -199,13 +202,13 @@
     },
     "builtin-types": {
       "name": "support.type.builtin.nexa",
-      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Map|Buffer|Option|Result|Task|HostRequest|ResourceToken|Snapshot|StateHandle|StableId|StateHandleError)\\b"
+      "match": "\\b(?:i32|i64|f32|f64|bool|rune|string|Array|Map|Buffer|Option|Result|Token|Snapshot|StateHandle)\\b"
     },
     "keywords": {
       "patterns": [
         {
           "name": "keyword.control.nexa",
-          "match": "\\b(?:module|import|as|fn|struct|enum|class|const|pub|package|task|immediate|migration|cleanup|return|let|var|if|else|while|match|with|new|await|yield|defer|for|in|break|continue)\\b"
+          "match": "\\b(?:use|as|fn|struct|enum|class|const|pub|package|async|return|let|mut|if|else|while|match|new|await|yield|defer|for|in|break|continue)\\b"
         },
         {
           "name": "constant.language.boolean.nexa",
@@ -215,7 +218,7 @@
     },
     "function-calls": {
       "name": "entity.name.function.call.nexa",
-      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:<[^;{}()]+>)?\\s*\\()"
+      "match": "\\b[A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\.)[A-Za-z_][A-Za-z0-9_]*)*(?=\\s*(?:<[^;{}()]+>)?\\s*\\()"
     },
     "properties": {
       "name": "variable.other.property.nexa",
@@ -233,7 +236,7 @@
         },
         {
           "name": "keyword.operator.nexa",
-          "match": "&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]"
+          "match": "::|&&|\\|\\||==|!=|<=|>=|\\.\\.|[+*/=!<>?:@-]"
         }
       ]
     },

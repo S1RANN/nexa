@@ -7,10 +7,10 @@ use std::process::{Command, Output};
 use nexa_core::StableId;
 use serde_json::Value;
 
-pub const BASE_NIDL: &str = include_str!("fixtures/business_host/interface.nidl");
+pub const BASE_NIDL: &str = include_str!("fixtures/business_host/contract.nidl");
 pub const BUSINESS_HOST_V1: &str = include_str!("fixtures/business_host/business_host.rs");
-const BASE_NEXA_MODULE: &str = "module idl_e2e;\nimport host as engine;\n\
-pub fn Update(entity: i32) -> i32 { return engine.heartbeat(entity); }\n\
+const BASE_NEXA_MODULE: &str = "use host::game as engine;\n\
+pub fn update(entity: i32) -> i32 { return engine::heartbeat(entity); }\n\
 fn reset() -> i32 { return 0; }\n";
 const GENERATED_REGISTRY_RUNTIME_TEST: &str = r#"
 use super::*;
@@ -19,22 +19,31 @@ use std::fmt::Write as _;
 
 #[test]
 fn changed_binding_executes_through_generated_registry() {
-    let base_idl = nexa_idl::parse(include_str!("base_interface.nidl")).expect("base NIDL");
-    let changed_idl = nexa_idl::parse(include_str!("interface.nidl")).expect("changed NIDL");
-    assert_eq!(INTERFACE_HASH, nexa_idl::exact_hash(&changed_idl));
+    let base_idl = nexa_idl::parse(include_str!("base_contract.nidl")).expect("base NIDL");
+    let changed_idl = nexa_idl::parse(include_str!("contract.nidl")).expect("changed NIDL");
+    assert_eq!(
+        CONTRACT_RUNTIME_ID,
+        nexa_idl::contract_runtime_id(&changed_idl)
+    );
     let base_source = include_str!("base_module.nexa");
     let changed_source = include_str!("module.nexa");
     let old_module =
-        nexa_compiler::compile_with_interface(base_source, &base_idl).expect("old module");
+        nexa_compiler::compile_with_contract(base_source, &base_idl).expect("old module");
     let old_state_schema_fingerprint = old_module.module().state_schema_fingerprint;
     let changed_module =
-        nexa_compiler::compile_with_interface(changed_source, &changed_idl)
+        nexa_compiler::compile_with_contract(changed_source, &changed_idl)
             .expect("changed module");
     let changed_state_schema_fingerprint = changed_module.module().state_schema_fingerprint;
-    {
+    let affected_stable_id = {
+        let binding_model =
+            nexa_idl::BindingModel::from_contract(&changed_idl).expect("changed binding model");
         let changed_bytecode = changed_module.module();
+        assert_eq!(
+            changed_bytecode.host_contract_id,
+            Some(CONTRACT_RUNTIME_ID)
+        );
         __AFFECTED_IMPORT_ASSERTIONS__
-    }
+    };
 
     let runtime_host = nexa_runtime::RuntimeHost::new(8);
     let registry = GeneratedHostRegistry::new(BusinessHostV1);
@@ -48,7 +57,7 @@ fn changed_binding_executes_through_generated_registry() {
     let before = realm.inspection_snapshot();
     let old_load = realm.load_module(
         old_module,
-        INTERFACE_HASH,
+        CONTRACT_RUNTIME_ID,
         old_state_schema_fingerprint,
     );
     let old_bytecode_rejected =
@@ -63,7 +72,7 @@ fn changed_binding_executes_through_generated_registry() {
     let module = realm
         .load_module(
             changed_module,
-            INTERFACE_HASH,
+            CONTRACT_RUNTIME_ID,
             changed_state_schema_fingerprint,
         )
         .expect("changed module loads");
@@ -87,13 +96,13 @@ fn changed_binding_executes_through_generated_registry() {
                 limits: nexa_runtime::TaskLimits::default(),
             },
         )
-        .expect("spawn generated Update export");
+        .expect("spawn generated Update entrypoint");
     let heartbeat_result = match realm
         .poll_task(task, 64)
-        .expect("poll generated Update export")
+        .expect("poll generated Update entrypoint")
     {
         nexa_runtime::TaskPoll::Completed(nexa_runtime::RuntimeValue::I32(value)) => value,
-        other => panic!("generated Update export did not complete: {other:?}"),
+        other => panic!("generated Update entrypoint did not complete: {other:?}"),
     };
     assert_eq!(heartbeat_result, 42);
     let runtime_terminal_record = realm.terminal_record(task).is_some();
@@ -169,7 +178,7 @@ enum MutationProbe {
     FunctionRename,
     ParameterTypeChange,
     ReturnTypeChange,
-    SyncToRequest,
+    SyncToAsync,
     FuelCostChange,
     CancelPolicyChange,
     AbandonPolicyChange,
@@ -177,15 +186,15 @@ enum MutationProbe {
     StructFieldRename,
     SnapshotContentTypeChange,
     ResourceTokenDomainChange,
-    InterfaceRename,
-    OpaqueHandleRename,
+    ContractRename,
+    HandleRename,
     StructRename,
     EnumRename,
     EnumPayloadTypeChange,
     ParameterRename,
     ParameterAddition,
     StructFieldAddition,
-    ExportAddition,
+    EntrypointAddition,
 }
 
 #[derive(Clone, Copy)]
@@ -206,7 +215,7 @@ impl MutationProbe {
             "01" => Self::FunctionRename,
             "02" => Self::ParameterTypeChange,
             "03" => Self::ReturnTypeChange,
-            "04" => Self::SyncToRequest,
+            "04" => Self::SyncToAsync,
             "05" => Self::FuelCostChange,
             "06" => Self::CancelPolicyChange,
             "07" => Self::AbandonPolicyChange,
@@ -214,15 +223,15 @@ impl MutationProbe {
             "09" => Self::StructFieldRename,
             "10" => Self::SnapshotContentTypeChange,
             "11" => Self::ResourceTokenDomainChange,
-            "12" => Self::InterfaceRename,
-            "13" => Self::OpaqueHandleRename,
+            "12" => Self::ContractRename,
+            "13" => Self::HandleRename,
             "14" => Self::StructRename,
             "15" => Self::EnumRename,
             "16" => Self::EnumPayloadTypeChange,
             "17" => Self::ParameterRename,
             "18" => Self::ParameterAddition,
             "19" => Self::StructFieldAddition,
-            "20" => Self::ExportAddition,
+            "20" => Self::EntrypointAddition,
             _ => panic!("mutation must have a concrete generated-surface probe: {id}"),
         }
     }
@@ -235,99 +244,120 @@ impl MutationProbe {
             | Self::FuelCostChange
             | Self::ParameterRename
             | Self::ParameterAddition => "registry:GameHost.update",
-            Self::SyncToRequest => "registry:GameHost.update(request)",
+            Self::SyncToAsync => "registry:GameHost.update(async)",
             Self::CancelPolicyChange => "registry:GameHost.animation(cancel_task)",
             Self::AbandonPolicyChange => "registry:GameHost.animation(return_error)",
             Self::EnumVariantRename => "registry:AnimationError.MissingAsset",
             Self::StructFieldRename => "registry:EnemyView.hit_points",
             Self::SnapshotContentTypeChange => "registry:EnemyStateSnapshot",
             Self::ResourceTokenDomainChange => "registry:MotionLockToken",
-            Self::InterfaceRename => "registry:CombatHost.update",
-            Self::OpaqueHandleRename => "registry:Actor",
+            Self::ContractRename => "registry:CombatHost.update",
+            Self::HandleRename => "registry:Actor",
             Self::StructRename => "registry:EnemyStats",
             Self::EnumRename => "registry:PlaybackError",
             Self::EnumPayloadTypeChange => "registry:AnimationError.Code(i64)",
             Self::StructFieldAddition => "registry:EnemyView.armor",
-            Self::ExportAddition => "export:Reset",
+            Self::EntrypointAddition => "entrypoint:reset",
         }
     }
 
     fn import_assertions(self) -> String {
-        if matches!(self, Self::ExportAddition) {
+        if matches!(self, Self::EntrypointAddition) {
             return r#"
+        let binding_entrypoint = binding_model
+            .nexa_functions
+            .iter()
+            .find(|candidate| candidate.identity.source_name == "reset")
+            .expect("changed binding model contains reset");
+        let validated_entrypoint = changed_idl
+            .nexa_functions
+            .iter()
+            .find(|candidate| candidate.name == "reset")
+            .expect("changed contract contains reset");
+        assert_eq!(
+            binding_entrypoint.identity.stable_id,
+            validated_entrypoint.stable_id
+        );
+        assert_eq!(Reset::STABLE_ID, validated_entrypoint.stable_id);
         assert!(
             changed_bytecode
                 .exports
                 .iter()
-                .any(|export| export.stable_id == Reset::EXPORT_ID),
-            "changed bytecode must publish the generated Reset export marker"
+                .any(|entrypoint| entrypoint.stable_id == Reset::STABLE_ID),
+            "changed bytecode must publish the generated Reset entrypoint marker"
         );
-        assert_eq!(Reset::EXPORT_NAME, "Reset");
+        assert_eq!(Reset::NAME, "reset");
+        assert_eq!(
+            <Reset as nexa_runtime::ScriptExport>::effect(),
+            nexa_runtime::FunctionEffect::Ordinary
+        );
+        binding_entrypoint.identity.stable_id
 "#
             .to_owned();
         }
-        let (interface, function, index) = self.host_function();
-        let mode = if matches!(
+        let function = self.host_function_name();
+        let is_async = matches!(
             self,
-            Self::SyncToRequest | Self::CancelPolicyChange | Self::AbandonPolicyChange
-        ) {
-            "nexa_bytecode::HostCallMode::Async"
-        } else {
-            "nexa_bytecode::HostCallMode::Immediate"
-        };
+            Self::SyncToAsync | Self::CancelPolicyChange | Self::AbandonPolicyChange
+        );
         let mut assertions = format!(
             r#"
-        let affected_import = &changed_bytecode.host_imports[{index}];
-        assert_eq!(
-            affected_import.stable_id,
-            nexa_runtime::StableId::from_parts(&[{interface:?}, "::", {function:?}])
-        );
-        assert_eq!(affected_import.mode, {mode});
+        let affected_function = binding_model
+            .host_functions
+            .iter()
+            .find(|candidate| candidate.identity.source_name == {function:?})
+            .expect("changed binding model contains the affected Host function");
+        let validated_function = changed_idl
+            .host_functions
+            .iter()
+            .find(|candidate| candidate.name == {function:?})
+            .expect("changed contract contains the affected Host function");
+        assert_eq!(affected_function.identity.source_name, validated_function.name);
+        assert_eq!(affected_function.identity.stable_id, validated_function.stable_id);
+        assert_eq!(affected_function.is_async, {is_async});
 "#
         );
         match self {
-            Self::SyncToRequest => assertions.push_str(
+            Self::SyncToAsync => assertions.push_str(
                 r"
-        assert!(affected_import.async_result.is_some());
+        assert!(affected_function.is_async);
 ",
             ),
             Self::FuelCostChange => assertions.push_str(
                 r"
-        assert_eq!(affected_import.fuel_cost, 7);
+        assert_eq!(affected_function.fuel_cost, 7);
 ",
             ),
             Self::CancelPolicyChange => assertions.push_str(
-                r#"
+                r"
         assert_eq!(
-            affected_import
-                .async_result
-                .as_ref()
-                .expect("animation async result")
-                .cancel_policy,
-            nexa_bytecode::CancelPolicy::CancelTask
+            affected_function.cancel_policy,
+            nexa_idl::CancelPolicy::CancelTask
         );
-"#,
+",
             ),
             Self::AbandonPolicyChange => assertions.push_str(
-                r#"
+                r"
         assert_eq!(
-            affected_import
-                .async_result
-                .as_ref()
-                .expect("animation async result")
-                .abandon_policy,
-            nexa_bytecode::AbandonPolicy::ReturnError
+            affected_function.abandon_policy,
+            nexa_idl::AbandonPolicy::ReturnError
         );
-"#,
+",
             ),
             _ => {}
         }
+        assertions.push_str(
+            r"
+        affected_function.identity.stable_id
+",
+        );
         assertions
     }
 
     fn realm_probe(self) -> &'static str {
-        if matches!(self, Self::ExportAddition) {
+        if matches!(self, Self::EntrypointAddition) {
             r#"
+    assert_eq!(affected_stable_id, Reset::STABLE_ID);
     let reset_task = realm
         .spawn_export::<Reset>(
             module,
@@ -340,15 +370,15 @@ impl MutationProbe {
                 limits: nexa_runtime::TaskLimits::default(),
             },
         )
-        .expect("spawn generated Reset export");
+        .expect("spawn generated Reset entrypoint");
     affected_surface_result = match realm
         .poll_task(reset_task, 64)
-        .expect("poll generated Reset export")
+        .expect("poll generated Reset entrypoint")
     {
         nexa_runtime::TaskPoll::Completed(nexa_runtime::RuntimeValue::I32(value)) => {
             i64::from(value)
         }
-        other => panic!("generated Reset export did not complete: {other:?}"),
+        other => panic!("generated Reset entrypoint did not complete: {other:?}"),
     };
     affected_surface_pending = false;
     assert!(realm.terminal_record(reset_task).is_some());
@@ -358,12 +388,11 @@ impl MutationProbe {
         }
     }
 
-    fn registry_probe(self) -> String {
-        if matches!(self, Self::ExportAddition) {
+    fn registry_probe(self, contract: &nexa_idl::ValidatedContract) -> String {
+        if matches!(self, Self::EntrypointAddition) {
             return String::new();
         }
-        let (_, _, index) = self.host_function();
-        let arguments = self.registry_arguments();
+        let arguments = self.registry_arguments(contract);
         let outcome = self.probe_output();
         let outcome_check = match outcome {
             ProbeOutput::I32(expected) => format!(
@@ -442,7 +471,7 @@ impl MutationProbe {
         let mut probe_context = probe_resources.context(probe_task, 0, 1);
         probe_registry
             .call_runtime(
-                {index},
+                affected_stable_id,
                 &mut probe_context,
                 nexa_runtime::RuntimeHostArgs::new(
                     &probe_values,
@@ -460,161 +489,164 @@ impl MutationProbe {
         )
     }
 
-    const fn host_function(self) -> (&'static str, &'static str, usize) {
+    const fn host_function_name(self) -> &'static str {
         match self {
-            Self::FunctionRename => ("GameHost", "advance", 0),
+            Self::FunctionRename => "advance",
             Self::ParameterTypeChange
             | Self::ReturnTypeChange
-            | Self::SyncToRequest
+            | Self::SyncToAsync
             | Self::FuelCostChange
+            | Self::ContractRename
             | Self::ParameterRename
-            | Self::ParameterAddition => ("GameHost", "update", 0),
-            Self::CancelPolicyChange | Self::AbandonPolicyChange => ("GameHost", "animation", 1),
-            Self::EnumVariantRename | Self::EnumRename | Self::EnumPayloadTypeChange => {
-                ("GameHost", "classify", 6)
-            }
-            Self::StructFieldRename | Self::StructRename | Self::StructFieldAddition => {
-                ("GameHost", "score", 5)
-            }
-            Self::SnapshotContentTypeChange => ("GameHost", "view", 3),
-            Self::ResourceTokenDomainChange => ("GameHost", "lock", 2),
-            Self::InterfaceRename => ("CombatHost", "update", 0),
-            Self::OpaqueHandleRename => ("GameHost", "inspect", 4),
-            Self::ExportAddition => panic!("Reset is an export, not a Host function"),
+            | Self::ParameterAddition => "update",
+            Self::CancelPolicyChange | Self::AbandonPolicyChange => "animation",
+            Self::EnumVariantRename | Self::EnumRename | Self::EnumPayloadTypeChange => "classify",
+            Self::StructFieldRename | Self::StructRename | Self::StructFieldAddition => "score",
+            Self::SnapshotContentTypeChange => "view",
+            Self::ResourceTokenDomainChange => "lock",
+            Self::HandleRename => "inspect",
+            Self::EntrypointAddition => panic!("Reset is an entrypoint, not a Host function"),
         }
     }
 
-    fn registry_arguments(self) -> &'static str {
+    fn registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
         match self {
             Self::FunctionRename
             | Self::ReturnTypeChange
-            | Self::SyncToRequest
+            | Self::SyncToAsync
             | Self::FuelCostChange
-            | Self::InterfaceRename
-            | Self::ParameterRename => {
-                "vec![nexa_runtime::RuntimeValue::I32(40), \
+            | Self::ContractRename
+            | Self::ParameterRename => "vec![nexa_runtime::RuntimeValue::I32(40), \
                  nexa_runtime::RuntimeValue::I32(2)]"
-            }
-            Self::ParameterTypeChange => {
-                "vec![nexa_runtime::RuntimeValue::I64(40), \
+                .to_owned(),
+            Self::ParameterTypeChange => "vec![nexa_runtime::RuntimeValue::I64(40), \
                  nexa_runtime::RuntimeValue::I32(2)]"
-            }
+                .to_owned(),
             Self::CancelPolicyChange
             | Self::AbandonPolicyChange
-            | Self::ResourceTokenDomainChange => "vec![nexa_runtime::RuntimeValue::I32(41)]",
+            | Self::ResourceTokenDomainChange => {
+                "vec![nexa_runtime::RuntimeValue::I32(41)]".to_owned()
+            }
             Self::EnumVariantRename | Self::EnumRename | Self::EnumPayloadTypeChange => {
-                self.enum_registry_arguments()
+                self.enum_registry_arguments(contract)
             }
             Self::StructFieldRename | Self::StructRename | Self::StructFieldAddition => {
-                self.struct_registry_arguments()
+                self.struct_registry_arguments(contract)
             }
-            Self::SnapshotContentTypeChange => "Vec::new()",
-            Self::OpaqueHandleRename => {
-                r#"vec![nexa_runtime::RuntimeValue::Opaque {
+            Self::SnapshotContentTypeChange => "Vec::new()".to_owned(),
+            Self::HandleRename => {
+                let type_id = contract
+                    .handles
+                    .iter()
+                    .find(|handle| handle.name == "Actor")
+                    .expect("handle-rename contract contains Actor")
+                    .stable_id
+                    .0;
+                format!(
+                    r"vec![nexa_runtime::RuntimeValue::Opaque {{
         value: 41,
-        type_id: nexa_runtime::StableId::from_name("Actor"),
-    }]"#
+        type_id: nexa_runtime::StableId({type_id}),
+    }}]"
+                )
             }
-            Self::ParameterAddition => {
-                "vec![nexa_runtime::RuntimeValue::I32(39), \
+            Self::ParameterAddition => "vec![nexa_runtime::RuntimeValue::I32(39), \
                  nexa_runtime::RuntimeValue::I32(1), \
                  nexa_runtime::RuntimeValue::I32(2)]"
+                .to_owned(),
+            Self::EntrypointAddition => {
+                panic!("Reset uses its generated entrypoint marker")
             }
-            Self::ExportAddition => panic!("Reset uses its generated export marker"),
         }
     }
 
-    fn enum_registry_arguments(self) -> &'static str {
-        match self {
-            Self::EnumVariantRename => {
-                r#"{
-        let value = probe_heap
-            .allocate_enum(
-                nexa_runtime::StableId::from_name("AnimationError"),
-                nexa_runtime::StableId::from_parts(
-                    &["AnimationError", "::", "MissingAsset"],
-                ),
-                0,
-                None,
-            )
-            .expect("MissingAsset enum value");
-        vec![value]
-    }"#
-            }
-            Self::EnumRename => {
-                r#"{
-        let value = probe_heap
-            .allocate_enum(
-                nexa_runtime::StableId::from_name("PlaybackError"),
-                nexa_runtime::StableId::from_parts(
-                    &["PlaybackError", "::", "MissingClip"],
-                ),
-                0,
-                None,
-            )
-            .expect("PlaybackError enum value");
-        vec![value]
-    }"#
-            }
-            Self::EnumPayloadTypeChange => {
-                r#"{
-        let value = probe_heap
-            .allocate_enum(
-                nexa_runtime::StableId::from_name("AnimationError"),
-                nexa_runtime::StableId::from_parts(
-                    &["AnimationError", "::", "Code"],
-                ),
-                1,
-                Some(nexa_runtime::RuntimeValue::I64(41)),
-            )
-            .expect("AnimationError Code(i64) value");
-        vec![value]
-    }"#
-            }
+    fn enum_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+        let (enum_name, variant_name, payload, expectation) = match self {
+            Self::EnumVariantRename => (
+                "AnimationError",
+                "MissingAsset",
+                "None",
+                "MissingAsset enum value",
+            ),
+            Self::EnumRename => (
+                "PlaybackError",
+                "MissingClip",
+                "None",
+                "PlaybackError enum value",
+            ),
+            Self::EnumPayloadTypeChange => (
+                "AnimationError",
+                "Code",
+                "Some(nexa_runtime::RuntimeValue::I64(41))",
+                "AnimationError Code(i64) value",
+            ),
             _ => panic!("mutation does not probe a generated enum conversion"),
-        }
+        };
+        let enumeration = contract
+            .enums
+            .iter()
+            .find(|enumeration| enumeration.name == enum_name)
+            .unwrap_or_else(|| panic!("mutated contract contains enum {enum_name}"));
+        let (tag, variant) = enumeration
+            .variants
+            .iter()
+            .enumerate()
+            .find(|(_, variant)| variant.name == variant_name)
+            .unwrap_or_else(|| panic!("{enum_name} contains variant {variant_name}"));
+        let type_id = enumeration.stable_id.0;
+        let variant_id = variant.stable_id.0;
+        format!(
+            r"{{
+        let value = probe_heap
+            .allocate_enum(
+                nexa_runtime::StableId({type_id}),
+                nexa_runtime::StableId({variant_id}),
+                {tag},
+                {payload},
+            )
+            .expect({expectation:?});
+        vec![value]
+    }}"
+        )
     }
 
-    fn struct_registry_arguments(self) -> &'static str {
-        match self {
-            Self::StructFieldRename => {
-                r#"{
-        let value = probe_heap
-            .allocate_struct(
-                nexa_runtime::StableId::from_name("EnemyView"),
-                &[nexa_runtime::RuntimeValue::I32(40)],
-            )
-            .expect("EnemyView hit_points value");
-        vec![value]
-    }"#
-            }
-            Self::StructRename => {
-                r#"{
-        let value = probe_heap
-            .allocate_struct(
-                nexa_runtime::StableId::from_name("EnemyStats"),
-                &[nexa_runtime::RuntimeValue::I32(40)],
-            )
-            .expect("EnemyStats value");
-        vec![value]
-    }"#
-            }
-            Self::StructFieldAddition => {
-                r#"{
-        let value = probe_heap
-            .allocate_struct(
-                nexa_runtime::StableId::from_name("EnemyView"),
-                &[
-                    nexa_runtime::RuntimeValue::I32(40),
-                    nexa_runtime::RuntimeValue::I32(2),
-                ],
-            )
-            .expect("EnemyView health and armor value");
-        vec![value]
-    }"#
-            }
+    fn struct_registry_arguments(self, contract: &nexa_idl::ValidatedContract) -> String {
+        let (struct_name, values, expectation) = match self {
+            Self::StructFieldRename => (
+                "EnemyView",
+                "&[nexa_runtime::RuntimeValue::I32(40)]",
+                "EnemyView hit_points value",
+            ),
+            Self::StructRename => (
+                "EnemyStats",
+                "&[nexa_runtime::RuntimeValue::I32(40)]",
+                "EnemyStats value",
+            ),
+            Self::StructFieldAddition => (
+                "EnemyView",
+                "&[\n                    nexa_runtime::RuntimeValue::I32(40),\n                    \
+                 nexa_runtime::RuntimeValue::I32(2),\n                ]",
+                "EnemyView health and armor value",
+            ),
             _ => panic!("mutation does not probe a generated struct conversion"),
-        }
+        };
+        let type_id = contract
+            .structs
+            .iter()
+            .find(|structure| structure.name == struct_name)
+            .unwrap_or_else(|| panic!("mutated contract contains struct {struct_name}"))
+            .stable_id
+            .0;
+        format!(
+            r"{{
+        let value = probe_heap
+            .allocate_struct(
+                nexa_runtime::StableId({type_id}),
+                {values},
+            )
+            .expect({expectation:?});
+        vec![value]
+    }}"
+        )
     }
 
     const fn probe_output(self) -> ProbeOutput {
@@ -622,11 +654,11 @@ impl MutationProbe {
             Self::FunctionRename
             | Self::ParameterTypeChange
             | Self::FuelCostChange
-            | Self::InterfaceRename
+            | Self::ContractRename
             | Self::ParameterRename
             | Self::ParameterAddition => ProbeOutput::I32(42),
             Self::ReturnTypeChange => ProbeOutput::I64(42),
-            Self::SyncToRequest | Self::CancelPolicyChange | Self::AbandonPolicyChange => {
+            Self::SyncToAsync | Self::CancelPolicyChange | Self::AbandonPolicyChange => {
                 ProbeOutput::PendingRequest
             }
             Self::EnumVariantRename | Self::EnumRename => ProbeOutput::I32(1),
@@ -638,8 +670,10 @@ impl MutationProbe {
                 encoder_type: "EnemyStateSnapshotEncoder",
             },
             Self::ResourceTokenDomainChange => ProbeOutput::ResourceToken,
-            Self::OpaqueHandleRename | Self::EnumPayloadTypeChange => ProbeOutput::I32(41),
-            Self::ExportAddition => panic!("Reset result is observed through RealmRuntime"),
+            Self::HandleRename | Self::EnumPayloadTypeChange => ProbeOutput::I32(41),
+            Self::EntrypointAddition => {
+                panic!("Reset result is observed through RealmRuntime")
+            }
         }
     }
 }
@@ -651,7 +685,7 @@ pub struct MutationCase {
     pub unchanged_business_host_should_compile: bool,
     pub expected_diagnostic_symbols: &'static [&'static str],
     pub patch_business_host: fn(&str) -> String,
-    pub expected_changed_interface_hash: bool,
+    pub expected_changed_contract_runtime_id: bool,
     probe: MutationProbe,
 }
 
@@ -659,8 +693,8 @@ pub struct MutationCase {
 pub struct MutationEvidence {
     pub id: &'static str,
     pub name: &'static str,
-    pub base_interface_hash: StableId,
-    pub changed_interface_hash: StableId,
+    pub base_contract_runtime_id: StableId,
+    pub changed_contract_runtime_id: StableId,
     pub base_generated_hash: u64,
     pub changed_generated_hash: u64,
     pub unchanged_business_host_should_compile: bool,
@@ -740,8 +774,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "02",
             "parameter-type-change",
-            "update(entity: i32,",
-            "update(entity: i64,",
+            "fn update(entity: i32, delta: i32) -> i32;",
+            "fn update(entity: i64, delta: i32) -> i32;",
             false,
             &["update", "i64"],
             patch_parameter_type,
@@ -757,18 +791,18 @@ pub fn mutations() -> Vec<MutationCase> {
         ),
         changed(
             "04",
-            "sync-to-request",
-            "sync fuel 5 fn update(entity: i32, delta: i32) -> i32;",
-            "request(return_error, trap) fuel 5 fn update(entity: i32, delta: i32)\n        -> request<Result<i32, AnimationError>>;",
+            "sync-to-async",
+            "        @fuel(5)\n        fn update(entity: i32, delta: i32) -> i32;",
+            "        @fuel(5)\n        @cancel(return_error)\n        @abandon(trap)\n        async fn update(entity: i32, delta: i32) -> Result<i32, AnimationError>;",
             false,
             &["update", "HostRequestHandle"],
-            patch_sync_to_request,
+            patch_sync_to_async,
         ),
         changed(
             "05",
             "fuel-cost-change",
-            "fuel 5",
-            "fuel 7",
+            "@fuel(5)",
+            "@fuel(7)",
             true,
             &[],
             identity_patch,
@@ -776,8 +810,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "06",
             "cancel-policy-change",
-            "request(return_error, trap) fn animation",
-            "request(cancel_task, trap) fn animation",
+            "@cancel(return_error)",
+            "@cancel(cancel_task)",
             true,
             &[],
             identity_patch,
@@ -785,8 +819,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "07",
             "abandon-policy-change",
-            "request(return_error, trap) fn animation",
-            "request(return_error, return_error) fn animation",
+            "@abandon(trap)",
+            "@abandon(return_error)",
             true,
             &[],
             identity_patch,
@@ -803,8 +837,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "09",
             "struct-field-rename",
-            "EnemyView { health:",
-            "EnemyView { hit_points:",
+            "    struct EnemyView {\n        health: i32,\n    }",
+            "    struct EnemyView {\n        hit_points: i32,\n    }",
             false,
             &["health", "EnemyView"],
             patch_field_rename,
@@ -812,8 +846,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "10",
             "snapshot-content-type-change",
-            "snapshot<EnemyView>",
-            "snapshot<EnemyState>",
+            "Snapshot<EnemyView>",
+            "Snapshot<EnemyState>",
             false,
             &["EnemyViewSnapshot", "EnemyStateSnapshot"],
             patch_snapshot_content,
@@ -821,29 +855,29 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "11",
             "resource-token-domain-change",
-            "token<ActionLock>",
-            "token<MotionLock>",
+            "Token<ActionLock>",
+            "Token<MotionLock>",
             false,
             &["ActionLockToken", "MotionLockToken"],
             patch_token_domain,
         ),
         changed(
             "12",
-            "interface-rename",
-            "interface GameHost",
-            "interface CombatHost",
+            "contract-rename",
+            "contract Game {",
+            "contract Combat {",
             false,
             &["GameHost", "CombatHost"],
-            patch_interface_rename,
+            patch_contract_rename,
         ),
         changed(
             "13",
-            "opaque-handle-rename",
-            "opaque Entity;",
-            "opaque Actor;",
+            "handle-rename",
+            "handle Entity;",
+            "handle Actor;",
             false,
             &["Entity", "Actor"],
-            patch_opaque_rename,
+            patch_handle_rename,
         )
         .with_replacement("inspect(entity: Entity)", "inspect(entity: Actor)"),
         changed(
@@ -855,7 +889,7 @@ pub fn mutations() -> Vec<MutationCase> {
             &["EnemyView", "EnemyStats"],
             patch_struct_rename,
         )
-        .with_replacement("snapshot<EnemyView>", "snapshot<EnemyStats>")
+        .with_replacement("Snapshot<EnemyView>", "Snapshot<EnemyStats>")
         .with_replacement("score(view: EnemyView)", "score(view: EnemyStats)"),
         changed(
             "15",
@@ -883,8 +917,8 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "17",
             "parameter-rename",
-            "delta: i32",
-            "step: i32",
+            "fn update(entity: i32, delta: i32) -> i32;",
+            "fn update(entity: i32, step: i32) -> i32;",
             true,
             &[],
             identity_patch,
@@ -901,22 +935,33 @@ pub fn mutations() -> Vec<MutationCase> {
         changed(
             "19",
             "struct-field-addition",
-            "EnemyView { health: i32; }",
-            "EnemyView { health: i32; armor: i32; }",
+            "    struct EnemyView {\n        health: i32,\n    }",
+            "    struct EnemyView {\n        health: i32,\n        armor: i32,\n    }",
             false,
             &["EnemyView", "armor"],
             patch_struct_field_addition,
         ),
         changed(
             "20",
-            "export-addition",
-            "export Update(entity: i32) -> i32;",
-            "export Update(entity: i32) -> i32;\n    export Reset() -> i32;",
+            "entrypoint-addition",
+            "    nexa {\n        fn update(entity: i32) -> i32;\n    }",
+            "    nexa {\n        fn update(entity: i32) -> i32;\n        fn reset() -> i32;\n    }",
             true,
             &[],
             identity_patch,
         ),
     ]
+}
+
+#[test]
+fn nidl_v2_mutation_needles_match_the_multiline_contract_fixture() {
+    let mutations = mutations();
+    assert_eq!(mutations.len(), 20);
+    for mutation in mutations {
+        assert_ne!(mutation.mutated_nidl, BASE_NIDL, "{}", mutation.name);
+        nexa_idl::parse(&mutation.mutated_nidl)
+            .unwrap_or_else(|error| panic!("{} must remain valid NIDL v2: {error}", mutation.name));
+    }
 }
 
 impl MutationCase {
@@ -952,7 +997,7 @@ fn changed(
         unchanged_business_host_should_compile,
         expected_diagnostic_symbols,
         patch_business_host,
-        expected_changed_interface_hash: true,
+        expected_changed_contract_runtime_id: true,
         probe: MutationProbe::for_id(id),
     }
 }
@@ -987,7 +1032,7 @@ fn patch_return_type(source: &str) -> String {
     )
 }
 
-fn patch_sync_to_request(source: &str) -> String {
+fn patch_sync_to_async(source: &str) -> String {
     replace_block(
         source,
         "    fn update(",
@@ -1051,13 +1096,18 @@ fn patch_token_domain(source: &str) -> String {
             1,
         )
         .replacen(
-            ".map(ActionLockToken::from_raw)",
-            ".map(MotionLockToken::from_raw)",
+            "ActionLockToken::CONTENT_TYPE_ID",
+            "MotionLockToken::CONTENT_TYPE_ID",
+            1,
+        )
+        .replacen(
+            "ActionLockToken::try_from_raw",
+            "MotionLockToken::try_from_raw",
             1,
         )
 }
 
-fn patch_interface_rename(source: &str) -> String {
+fn patch_contract_rename(source: &str) -> String {
     source.replacen(
         "impl GameHost for BusinessHostV1",
         "impl CombatHost for BusinessHostV1",
@@ -1065,7 +1115,7 @@ fn patch_interface_rename(source: &str) -> String {
     )
 }
 
-fn patch_opaque_rename(source: &str) -> String {
+fn patch_handle_rename(source: &str) -> String {
     source.replacen("        entity: Entity,", "        entity: Actor,", 1)
 }
 
@@ -1126,6 +1176,7 @@ pub fn artifact_root() -> PathBuf {
 pub fn prepare_case(
     root: &Path,
     mutation: &MutationCase,
+    changed_contract: &nexa_idl::ValidatedContract,
     base_generated: &str,
     changed_generated: &str,
 ) -> PathBuf {
@@ -1133,9 +1184,9 @@ pub fn prepare_case(
     for directory in ["base", "mutated", "host/src", "script"] {
         fs::create_dir_all(case.join(directory)).expect("create E2E artifact directory");
     }
-    fs::write(case.join("base/interface.nidl"), BASE_NIDL).expect("write base NIDL");
+    fs::write(case.join("base/contract.nidl"), BASE_NIDL).expect("write base NIDL");
     fs::write(case.join("base/bindings.rs"), base_generated).expect("write base binding");
-    fs::write(case.join("mutated/interface.nidl"), &mutation.mutated_nidl)
+    fs::write(case.join("mutated/contract.nidl"), &mutation.mutated_nidl)
         .expect("write changed NIDL");
     for (index, generated) in [changed_generated, changed_generated, changed_generated]
         .iter()
@@ -1149,10 +1200,10 @@ pub fn prepare_case(
     }
     let changed_module = positive_module_source(mutation);
     fs::write(case.join("script/module.nexa"), &changed_module).expect("write positive script");
-    fs::write(case.join("host/src/base_interface.nidl"), BASE_NIDL)
-        .expect("write base interface fixture");
-    fs::write(case.join("host/src/interface.nidl"), &mutation.mutated_nidl)
-        .expect("write changed interface fixture");
+    fs::write(case.join("host/src/base_contract.nidl"), BASE_NIDL)
+        .expect("write base contract fixture");
+    fs::write(case.join("host/src/contract.nidl"), &mutation.mutated_nidl)
+        .expect("write changed contract fixture");
     fs::write(case.join("host/src/base_module.nexa"), BASE_NEXA_MODULE)
         .expect("write base script fixture");
     fs::write(case.join("host/src/module.nexa"), changed_module)
@@ -1203,7 +1254,7 @@ pub fn prepare_case(
         .replace("__AFFECTED_REALM_PROBE__", mutation.probe.realm_probe())
         .replace(
             "__AFFECTED_REGISTRY_PROBE__",
-            &mutation.probe.registry_probe(),
+            &mutation.probe.registry_probe(changed_contract),
         )
         .replace("__AFFECTED_SURFACE__", mutation.probe.affected_surface());
     assert!(
@@ -1217,14 +1268,14 @@ pub fn prepare_case(
 }
 
 fn positive_module_source(mutation: &MutationCase) -> String {
-    if mutation.id == "20" {
-        BASE_NEXA_MODULE.replacen(
+    match mutation.id {
+        "12" => BASE_NEXA_MODULE.replacen("use host::game", "use host::combat", 1),
+        "20" => BASE_NEXA_MODULE.replacen(
             "fn reset() -> i32 { return 0; }",
-            "pub fn Reset() -> i32 { return 0; }",
+            "pub fn reset() -> i32 { return 0; }",
             1,
-        )
-    } else {
-        BASE_NEXA_MODULE.to_owned()
+        ),
+        _ => BASE_NEXA_MODULE.to_owned(),
     }
 }
 
@@ -1401,20 +1452,20 @@ pub fn stable_bytes_hash(bytes: &str) -> u64 {
 }
 
 pub fn write_report(root: &Path, evidence: &[MutationEvidence]) {
-    let mut interface_hashes = BTreeSet::new();
+    let mut contract_runtime_ids = BTreeSet::new();
     let mut rows = String::new();
     for (index, item) in evidence.iter().enumerate() {
         assert!(
-            interface_hashes.insert(item.changed_interface_hash),
-            "mutations must have distinct Exact Hash values"
+            contract_runtime_ids.insert(item.changed_contract_runtime_id),
+            "mutations must have distinct contract runtime IDs"
         );
         if index != 0 {
             rows.push_str(",\n");
         }
         write!(
             rows,
-            "    {{\"id\":\"{}\",\"name\":\"{}\",\"base_interface_hash\":\"{:016x}\",\
-             \"changed_interface_hash\":\"{:016x}\",\"base_generated_hash\":\"{:016x}\",\
+            "    {{\"id\":\"{}\",\"name\":\"{}\",\"base_contract_runtime_id\":\"{:016x}\",\
+             \"changed_contract_runtime_id\":\"{:016x}\",\"base_generated_hash\":\"{:016x}\",\
              \"changed_generated_hash\":\"{:016x}\",\"unchanged_business_host_should_compile\":{},\
              \"patch_insertions\":{},\"patch_deletions\":{},\"old_bytecode_rejected\":{},\
              \"positive_registry\":\"{}\",\"patched_business_host_compiled\":{},\
@@ -1425,8 +1476,8 @@ pub fn write_report(root: &Path, evidence: &[MutationEvidence]) {
              \"affected_completion_records\":{},\"affected_release_records\":{}}}",
             item.id,
             item.name,
-            item.base_interface_hash.0,
-            item.changed_interface_hash.0,
+            item.base_contract_runtime_id.0,
+            item.changed_contract_runtime_id.0,
             item.base_generated_hash,
             item.changed_generated_hash,
             item.unchanged_business_host_should_compile,

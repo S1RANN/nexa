@@ -4,7 +4,11 @@ fn resource_token() {
         super::support::realm_with([nexa_bytecode::Instruction::Return { source: 0 }]);
     let (scope, task) = super::support::spawn_test_task(&mut realm, module);
     let token = realm
-        .create_resource_token(task, nexa_runtime::RuntimeHostDomain::Render)
+        .create_resource_token(
+            task,
+            nexa_core::StableId(0x5254_4241_5345_4c49),
+            nexa_runtime::RuntimeHostDomain::Render,
+        )
         .unwrap();
     let result = realm.poll_task(task, 16).unwrap();
     let report = realm

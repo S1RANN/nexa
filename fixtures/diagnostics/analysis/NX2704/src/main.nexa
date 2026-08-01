@@ -1,8 +1,6 @@
-module main;
-
-import left.shared as shared;
-import right.shared as shared;
+use package::left::shared as shared;
+use package::right::shared as shared;
 
 pub fn entry() -> i32 {
-    return shared.value();
+    return shared::value();
 }

@@ -1,6 +1,6 @@
 schema = 2
 contract = "language_scale.nidl"
-required_exports = ["OnEvent"]
+required_entrypoints = ["on_event"]
 
 [[sources]]
 id = "language-scale"

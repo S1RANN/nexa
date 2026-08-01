@@ -1,6 +1,5 @@
-module examples.hello;
-import host as console;
+use host::console;
 
-pub fn Main() -> i32 {
-    return console.log("hello, world");
+pub fn main() -> i32 {
+    return console::log("hello, world");
 }

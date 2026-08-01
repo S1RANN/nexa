@@ -1,7 +1,7 @@
 {
   "name": "nexa-language-support",
   "displayName": "Nexa Language Support",
-  "description": "Syntax highlighting and structural editing for Nexa and Nexa IDL.",
+  "description": "Syntax highlighting, structural editing, and diagnostics for Nexa v2 and NIDL v2.",
   "version": "0.2.0",
   "publisher": "s1rann",
   "license": "MIT OR Apache-2.0",

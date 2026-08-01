@@ -1,7 +1,5 @@
-module cycle.b;
-
-import cycle.a;
+use package::cycle::a;
 
 pub(package) fn value() -> i32 {
-    return a.entry();
+    return a::entry();
 }

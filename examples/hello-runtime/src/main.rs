@@ -39,6 +39,7 @@ fn policy() -> PackagePolicy {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    assert_eq!(generated::Main::NAME, "main");
     let source = MemorySource::new(SourceId::new("hello")?, policy()).package(
         MemoryPackage::new(
             "hello",

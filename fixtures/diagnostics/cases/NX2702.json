@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2702","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2702","expected":{"primary_text":"cycle.b","secondary_count":1,"related_messages":["imports"],"related_texts":["cycle.a"],"message_contains":"module cycle","notes":[]}}
+{"version":1,"code":"NX2702","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2702","expected":{"primary_text":"package::cycle::b","secondary_count":1,"related_messages":["uses"],"related_texts":["package::cycle::a"],"message_contains":"module cycle","notes":[]}}

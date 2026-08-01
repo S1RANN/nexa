@@ -1,12 +1,12 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use nexa::prelude::{
-    HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeValue, Signature, StableId,
-    ValueType,
+    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
+    ResourceContext, RuntimeValue, Signature, StableId, ValueType,
 };
 use nexa::{
     RuntimeHostArgs, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
@@ -15,27 +15,125 @@ use nexa::{
 use nexa_embed::{
     ActivationPolicy, ActivationSet, CandidateBuildContext, CandidateIdentity,
     CandidateTerminalKind, CapabilitySet, DevelopmentConfig, DevelopmentEvent, DiscoveredPackage,
-    EngineDiagnosticStage, EngineHealth, EngineTickReport, HostContract, MemoryPackage,
-    MemorySource, NexaEngine, PackageContext, PackageId, PackagePolicy, PackageRuntimeLimits,
-    PackageSource, PackageSourceError, ReloadReport, ReloadReportOutcome, SourceId, TrustLevel,
+    EngineDiagnosticStage, EngineError, EngineHealth, EngineTickReport, HostContract,
+    MemoryPackage, MemorySource, NexaEngine, PackageContext, PackageId, PackagePolicy,
+    PackageRuntimeLimits, PackageSource, PackageSourceError, ReloadReport, ReloadReportOutcome,
+    SourceId, TrustLevel,
 };
 use serde::Serialize;
 
-const IDL: &str = "interface TestHost {
-    enum WaitError { Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, WaitError>>;
-    export Run(value: i32) -> i32;
+const IDL: &str = "contract TestHost {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        fn run(value: i32) -> i32;
+    }
 }";
-const RUN_ID: StableId = StableId(0xf1c5_6273_0ddd_ab52);
+const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
 const ITERATIONS_PER_CLASS: u64 = 100;
 const ACTIVATION_RECOVERIES: u64 = 10;
 const WORKER_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn host_function_authority(
+    contract: &nexa::ValidatedContract,
+    name: &str,
+) -> HostFunctionAuthority {
+    let model =
+        nexa::BindingModel::from_contract(contract).expect("stress Contract runtime binding model");
+    let function = model
+        .host_functions
+        .iter()
+        .find(|function| function.identity.source_name == name)
+        .expect("stress Host function is declared");
+    let runtime = function
+        .host_contract
+        .as_ref()
+        .expect("Host function has runtime metadata");
+    let parameters = Box::leak(runtime.parameters.clone().into_boxed_slice());
+    let capabilities: &'static [&'static str] = Box::leak(
+        function
+            .capabilities
+            .iter()
+            .cloned()
+            .map(|capability| {
+                let capability: &'static str = Box::leak(capability.into_boxed_str());
+                capability
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    HostFunctionAuthority::new(
+        function.identity.stable_id,
+        function.declaration_fingerprint,
+        parameters,
+        runtime.result,
+        runtime.mode,
+        function.fuel_cost,
+        runtime.async_result,
+        capabilities,
+    )
+}
 
 #[derive(Clone)]
 struct ProjectSource {
     id: SourceId,
     policy: PackagePolicy,
     state: Arc<RwLock<ProjectState>>,
+}
+
+#[derive(Clone)]
+struct NidlReloadSource {
+    id: SourceId,
+    policy: PackagePolicy,
+    contract_source: Arc<RwLock<String>>,
+    script: Arc<RwLock<String>>,
+}
+
+impl PackageSource for NidlReloadSource {
+    fn id(&self) -> &SourceId {
+        &self.id
+    }
+
+    fn policy(&self) -> &PackagePolicy {
+        &self.policy
+    }
+
+    fn discover(
+        &self,
+        build: &CandidateBuildContext,
+    ) -> Result<Vec<DiscoveredPackage>, PackageSourceError> {
+        let manifest = "schema = 2
+kind = \"application\"
+id = \"stress.nidl\"
+name = \"M4R1 NIDL Reload Stress\"
+version = \"1.0.0\"
+source_root = \"src\"
+entry = \"stress.nidl\"
+activation = \"default-enabled\"
+handler_fuel = 20000
+capabilities = []
+";
+        let contract_source = self
+            .contract_source
+            .read()
+            .expect("NIDL stress Contract source lock")
+            .clone();
+        let changed_build = CandidateBuildContext::with_source(
+            nexa::SourceIdentity::standalone("contracts/m4r1-reload-stress.nidl"),
+            contract_source.into_bytes(),
+        )
+        .requiring_entrypoints(build.required_entrypoints.clone());
+        MemorySource::new(self.id.clone(), self.policy.clone())
+            .package(MemoryPackage::new("stress-nidl", manifest).source(
+                "src/stress/nidl.nexa",
+                self.script.read().expect("NIDL stress source lock").clone(),
+            ))
+            .discover(&changed_build)
+    }
 }
 
 #[derive(Clone)]
@@ -52,9 +150,9 @@ impl ProjectState {
     fn root_source(&self) -> String {
         self.root_override.clone().unwrap_or_else(|| {
             format!(
-                "module stress.app;\nimport support.library as support;\nimport host as stress;\n\
-                 @stateful({}) class Store {{ value: i32; }}\n\
-                 pub fn Run(value: i32) -> i32 {{ return support.revision() + value + {}; }}\n",
+                "use support::library as support;\nuse host::test_host as stress;\n\
+                 @state(version = {}) class Store {{ mut value: i32, }}\n\
+                 pub fn run(value: i32) -> i32 {{ return support::revision() + value + {}; }}\n",
                 self.state_version, self.delta,
             )
         })
@@ -62,7 +160,7 @@ impl ProjectState {
 
     fn dependency_source(&self) -> String {
         format!(
-            "module library;\npub fn revision() -> i32 {{ return {}; }}\n",
+            "pub fn revision() -> i32 {{ return {}; }}\n",
             self.dependency_revision
         )
     }
@@ -141,22 +239,60 @@ to = \"stress.library\"
 }
 
 struct Registry {
-    interface_hash: StableId,
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
     requests_created: Arc<AtomicU64>,
 }
 
-impl HostRegistry for Registry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.interface_hash)
+struct NidlReloadRegistry {
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
+    revision: i32,
+}
+
+impl HostRegistry for NidlReloadRegistry {
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
+        _: &mut ResourceContext<'_>,
+        args: RuntimeHostArgs<'_>,
+    ) -> Result<HostCallOutcome, HostTrap> {
+        if id != self.authority.stable_id() {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if !args.is_empty() {
+            return Err(HostTrap::Arity);
+        }
+        Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
+            self.revision,
+        )))
+    }
+}
+
+impl HostRegistry for Registry {
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
+    }
+
+    fn call_runtime(
+        &mut self,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 {
+        if id != self.authority.stable_id() {
             return Err(HostTrap::UnknownFunction(id));
         }
         let pending = context
@@ -174,13 +310,17 @@ impl ScriptExport for Run {
     type Output = i32;
 
     const STABLE_ID: StableId = RUN_ID;
-    const NAME: &'static str = "Run";
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
         Signature {
             parameters: vec![ValueType::I32],
             result: Some(ValueType::I32),
         }
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
     }
 
     fn argument_requirements(
@@ -219,6 +359,44 @@ struct StressReport {
     safety: BTreeMap<&'static str, u64>,
 }
 
+#[derive(Serialize)]
+struct NidlReloadTerminalReport {
+    created: u64,
+    terminal: u64,
+    duplicate: u64,
+    missing: u64,
+}
+
+#[derive(Serialize)]
+struct NidlReloadSafetyReport {
+    stale_candidate_committed: u64,
+    active_lkg_violation: u64,
+    duplicate_terminal: u64,
+    missing_terminal: u64,
+    task_request_resource_growth: u64,
+    release_queue_not_empty: u64,
+    worker_residual: u64,
+}
+
+#[derive(Serialize)]
+struct NidlReloadOutcomeReport {
+    nidl_rejected: u64,
+    restored_committed: u64,
+    host_contract_mismatch: u64,
+}
+
+#[derive(Serialize)]
+struct NidlReloadStressReport {
+    schema: u32,
+    status: &'static str,
+    iterations: u64,
+    nidl_changes: u64,
+    outcomes: NidlReloadOutcomeReport,
+    terminal: NidlReloadTerminalReport,
+    safety: NidlReloadSafetyReport,
+    failures: Vec<String>,
+}
+
 #[derive(Default)]
 struct StressTrace {
     events: Vec<DevelopmentEvent>,
@@ -239,18 +417,371 @@ impl StressTrace {
     }
 }
 
+fn nidl_reload_script(host_function: &str, delta: i32) -> String {
+    format!(
+        "use host::test_host as host;\n\
+         pub fn run(value: i32) -> i32 {{\n\
+             return host::{host_function}() + value + {delta};\n\
+         }}\n"
+    )
+}
+
+fn transient_resource_growth(before: EngineHealth, after: EngineHealth) -> bool {
+    after.tasks > before.tasks
+        || after.scopes > before.scopes
+        || after.continuations > before.continuations
+        || after.scheduler_tokens > before.scheduler_tokens
+        || after.requests > before.requests
+        || after.completion_reservations > before.completion_reservations
+        || after.tokens > before.tokens
+        || after.snapshots > before.snapshots
+        || after.release_reservations > before.release_reservations
+        || after.heap_objects > before.heap_objects
+        || after.state_objects > before.state_objects
+        || after.retired_modules > before.retired_modules
+        || after.host_pending_completions > before.host_pending_completions
+        || after.host_pending_releases > before.host_pending_releases
+}
+
+#[test]
+#[ignore = "M4R1 machine-evidence NIDL reload stress gate"]
+#[allow(clippy::too_many_lines)]
+fn m4r1_nidl_reload_stress() {
+    const ITERATIONS: u64 = 100;
+    const REVISION: i32 = 50;
+    const BASE_CONTRACT: &str = "contract TestHost {
+        host {
+            fn revision() -> i32;
+        }
+        nexa {
+            fn run(value: i32) -> i32;
+        }
+    }";
+
+    let mut contract_fingerprints = BTreeSet::new();
+    let mut stale_candidate_committed = 0_u64;
+    let mut active_lkg_violation = 0_u64;
+    let mut task_request_resource_growth = 0_u64;
+    let mut release_queue_not_empty = 0_u64;
+    let mut contract_mismatch_reason_missing = 0_u64;
+    let mut changed_reload_outcome_mismatch = 0_u64;
+    let mut restored_reload_outcome_mismatch = 0_u64;
+    let mut unchanged_candidate_fingerprint = 0_u64;
+    let mut nidl_rejected = 0_u64;
+    let mut restored_committed = 0_u64;
+    let mut host_contract_mismatch = 0_u64;
+    let base_contract = nexa::parse_nidl(BASE_CONTRACT).expect("base NIDL stress Contract");
+    let run = base_contract
+        .nexa_functions
+        .iter()
+        .find(|function| function.name == Run::NAME)
+        .expect("base NIDL stress Contract declares run");
+    assert_eq!(nexa::entrypoint_stable_id(run), RUN_ID);
+    let descriptor = nexa::abi_descriptor(&base_contract);
+    let fingerprint = descriptor.fingerprint.into_bytes();
+    let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+    let contract_runtime_id = nexa::contract_runtime_id(&base_contract);
+    let authority = host_function_authority(&base_contract, "revision");
+    let contract = HostContract::new(
+        "TestHost",
+        BASE_CONTRACT,
+        descriptor,
+        fingerprint,
+        contract_runtime_id,
+        nexa::HOST_CONTRACT_SCHEMA_VERSION,
+    );
+    let contract_source = Arc::new(RwLock::new(BASE_CONTRACT.to_owned()));
+    let script = Arc::new(RwLock::new(nidl_reload_script("revision", 1)));
+    let source = NidlReloadSource {
+        id: SourceId::new("m4r1-nidl-reload").expect("NIDL stress Source ID"),
+        policy: PackagePolicy {
+            trust: TrustLevel::FirstParty,
+            capability_ceiling: CapabilitySet::default(),
+            allowed_activation: ActivationSet::new([ActivationPolicy::DefaultEnabled]),
+            max_packages: 1,
+            runtime_limits: PackageRuntimeLimits::default(),
+            allow_entitlement: false,
+        },
+        contract_source: Arc::clone(&contract_source),
+        script: Arc::clone(&script),
+    };
+    let mut engine = NexaEngine::builder(contract)
+        .host_factory(move |_: &PackageContext| {
+            Box::new(NidlReloadRegistry {
+                contract_runtime_id,
+                authority: authority.clone(),
+                revision: REVISION,
+            }) as Box<dyn HostRegistry>
+        })
+        .package_source(source)
+        .require_export::<Run>()
+        .build()
+        .expect("build NIDL reload stress Engine");
+    engine.discover().expect("discover NIDL stress Package");
+    engine
+        .enable_defaults()
+        .expect("enable NIDL stress Package");
+    let package_id = PackageId::new("stress.nidl").expect("NIDL stress Package ID");
+    assert_eq!(
+        engine
+            .call::<Run>(&package_id, &7)
+            .expect("initial NIDL stress call")
+            .value,
+        REVISION + 8
+    );
+    engine.tick().expect("settle initial NIDL stress call");
+    let baseline_health = engine.health();
+    let baseline_development = engine.inspection().development;
+    let mut active_delta = 1_i32;
+
+    for iteration in 0..ITERATIONS {
+        let host_function = format!("revision_{iteration:03}");
+        let changed_contract_source = format!(
+            "contract TestHost {{\n\
+                 host {{\n\
+                     fn {host_function}() -> i32;\n\
+                 }}\n\
+                 nexa {{\n\
+                     fn run(value: i32) -> i32;\n\
+                 }}\n\
+             }}\n"
+        );
+        let changed_contract =
+            nexa::parse_nidl(&changed_contract_source).expect("changed NIDL stress Contract");
+        assert!(
+            contract_fingerprints.insert(nexa::contract_fingerprint(&changed_contract)),
+            "iteration {iteration} reused a Contract ABI fingerprint"
+        );
+        let before_identity = engine
+            .inspection()
+            .packages
+            .iter()
+            .find(|package| package.package_id == package_id)
+            .and_then(|package| package.active_identity.clone())
+            .expect("active identity before changed Contract candidate");
+        let before_fingerprint = before_identity.build_fingerprint;
+
+        *contract_source
+            .write()
+            .expect("NIDL stress Contract source lock") = changed_contract_source;
+        *script.write().expect("NIDL stress source lock") =
+            nidl_reload_script(&host_function, active_delta.saturating_add(10_000));
+        let changed_result = engine.reload(&package_id);
+        nidl_rejected += u64::from(changed_result.is_err());
+        let precise_host_contract_mismatch = matches!(
+            &changed_result,
+            Err(EngineError::Diagnostic(diagnostic))
+                if diagnostic.stage == EngineDiagnosticStage::Compile
+                    && diagnostic.diagnostic.code == nexa::ErrorCode::NX7001
+                    && diagnostic.diagnostic.message.to_string()
+                        == "Host contract does not match resolved build input"
+        );
+        host_contract_mismatch += u64::from(precise_host_contract_mismatch);
+        contract_mismatch_reason_missing += u64::from(!precise_host_contract_mismatch);
+        stale_candidate_committed += u64::from(changed_result.is_ok());
+        let rejected_inspection = engine.inspection();
+        changed_reload_outcome_mismatch += u64::from(
+            rejected_inspection
+                .recent_reloads
+                .last()
+                .map(|reload| reload.outcome)
+                != Some(ReloadReportOutcome::CompileFailed),
+        );
+        let rejected_package = rejected_inspection
+            .packages
+            .iter()
+            .find(|package| package.package_id == package_id)
+            .expect("Package inspection after changed Contract candidate");
+        let rejected_identity = rejected_package
+            .active_identity
+            .clone()
+            .expect("active identity after changed Contract candidate");
+        stale_candidate_committed += u64::from(rejected_identity != before_identity);
+        unchanged_candidate_fingerprint +=
+            u64::from(rejected_package.desired_build_fingerprint == Some(before_fingerprint));
+        let lkg_value = engine
+            .call::<Run>(&package_id, &7)
+            .ok()
+            .map(|output| output.value);
+        active_lkg_violation += u64::from(lkg_value != Some(REVISION + 7 + active_delta));
+
+        active_delta = i32::try_from(iteration)
+            .expect("NIDL stress iteration fits i32")
+            .saturating_add(2);
+        *contract_source
+            .write()
+            .expect("NIDL stress Contract source lock") = BASE_CONTRACT.to_owned();
+        *script.write().expect("NIDL stress source lock") =
+            nidl_reload_script("revision", active_delta);
+        let restored_result = engine.reload(&package_id);
+        let restored_inspection = engine.inspection();
+        let restore_has_committed_outcome = restored_inspection
+            .recent_reloads
+            .last()
+            .is_some_and(|reload| reload.outcome == ReloadReportOutcome::Committed);
+        restored_committed += u64::from(restored_result.is_ok() && restore_has_committed_outcome);
+        restored_reload_outcome_mismatch +=
+            u64::from(restored_result.is_err() || !restore_has_committed_outcome);
+        let active_value = engine
+            .call::<Run>(&package_id, &7)
+            .ok()
+            .map(|output| output.value);
+        active_lkg_violation += u64::from(active_value != Some(REVISION + 7 + active_delta));
+        for _ in 0..4 {
+            engine.tick().expect("settle NIDL stress reload");
+        }
+
+        let health = engine.health();
+        task_request_resource_growth +=
+            u64::from(transient_resource_growth(baseline_health, health));
+        release_queue_not_empty += u64::from(
+            health.queued_releases != 0
+                || health.host_pending_releases != 0
+                || health.host_pending_completions != 0,
+        );
+    }
+
+    let nidl_changes =
+        u64::try_from(contract_fingerprints.len()).expect("NIDL stress fingerprint count fits u64");
+    let inspection = engine.inspection();
+    let created = inspection
+        .development
+        .created_generations
+        .saturating_sub(baseline_development.created_generations);
+    let terminal = inspection
+        .development
+        .terminal_generations
+        .saturating_sub(baseline_development.terminal_generations);
+    let duplicate = inspection
+        .development
+        .duplicate_terminals
+        .saturating_sub(baseline_development.duplicate_terminals);
+    let missing = inspection.development.generations_without_terminal;
+    engine.shutdown().expect("shutdown NIDL stress Engine");
+    let development = engine.inspection().development;
+    let worker_residual = u64::from(
+        development.worker_running
+            || development.queued_candidates != 0
+            || development.generations_without_terminal != 0
+            || development.worker.queued_packages != 0
+            || development.worker.in_flight_package.is_some()
+            || development.worker.completed_results != 0,
+    );
+    let safety = NidlReloadSafetyReport {
+        stale_candidate_committed,
+        active_lkg_violation,
+        duplicate_terminal: duplicate,
+        missing_terminal: missing,
+        task_request_resource_growth,
+        release_queue_not_empty,
+        worker_residual,
+    };
+    let mut failures = Vec::new();
+    let expected_terminals = ITERATIONS.saturating_mul(2);
+    if created != expected_terminals || terminal != expected_terminals {
+        failures.push(format!(
+            "terminal accounting mismatch: expected={expected_terminals}, created={created}, terminal={terminal}"
+        ));
+    }
+    if nidl_changes != ITERATIONS {
+        failures.push(format!(
+            "NIDL changes were not unique: expected={ITERATIONS}, actual={nidl_changes}"
+        ));
+    }
+    if contract_mismatch_reason_missing != 0 {
+        failures.push(format!(
+            "{contract_mismatch_reason_missing} changed Contracts lacked precise mismatch evidence"
+        ));
+    }
+    if changed_reload_outcome_mismatch != 0 {
+        failures.push(format!(
+            "{changed_reload_outcome_mismatch} changed Contracts lacked CompileFailed reload outcomes"
+        ));
+    }
+    if restored_reload_outcome_mismatch != 0 {
+        failures.push(format!(
+            "{restored_reload_outcome_mismatch} restored Contracts lacked Committed reload outcomes"
+        ));
+    }
+    if nidl_rejected != ITERATIONS
+        || restored_committed != ITERATIONS
+        || host_contract_mismatch != ITERATIONS
+    {
+        failures.push(format!(
+            "outcome accounting mismatch: nidl_rejected={nidl_rejected}, restored_committed={restored_committed}, host_contract_mismatch={host_contract_mismatch}"
+        ));
+    }
+    if unchanged_candidate_fingerprint != 0 {
+        failures.push(format!(
+            "{unchanged_candidate_fingerprint} NIDL changes did not change the candidate fingerprint"
+        ));
+    }
+    if safety.stale_candidate_committed != 0
+        || safety.active_lkg_violation != 0
+        || safety.duplicate_terminal != 0
+        || safety.missing_terminal != 0
+        || safety.task_request_resource_growth != 0
+        || safety.release_queue_not_empty != 0
+        || safety.worker_residual != 0
+    {
+        failures.push("one or more NIDL reload safety counters were non-zero".into());
+    }
+    let status = if failures.is_empty() { "PASS" } else { "FAIL" };
+    let report = NidlReloadStressReport {
+        schema: 1,
+        status,
+        iterations: ITERATIONS,
+        nidl_changes,
+        outcomes: NidlReloadOutcomeReport {
+            nidl_rejected,
+            restored_committed,
+            host_contract_mismatch,
+        },
+        terminal: NidlReloadTerminalReport {
+            created,
+            terminal,
+            duplicate,
+            missing,
+        },
+        safety,
+        failures,
+    };
+    let report_json =
+        serde_json::to_string_pretty(&report).expect("serialize M4R1 NIDL reload report");
+    if let Some(path) = std::env::var_os("NEXA_M4R1_NIDL_RELOAD_STRESS_REPORT") {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(path.parent().expect("NIDL reload report parent"))
+            .expect("create NIDL reload report directory");
+        std::fs::write(path, format!("{report_json}\n")).expect("write M4R1 NIDL reload report");
+    }
+    println!("{report_json}");
+    assert_eq!(report.status, "PASS", "{:#?}", report.failures);
+}
+
 #[test]
 #[ignore = "M4 machine-evidence stress gate"]
 #[allow(clippy::too_many_lines)]
 fn m4_reload_stress() {
-    let idl = nexa::parse(IDL).expect("stress Host contract");
-    let contract = HostContract {
-        interface_name: "TestHost",
-        canonical_idl: IDL,
-        interface_hash: nexa::exact_hash(&idl),
-        generator_schema_version: nexa::HOST_CONTRACT_SCHEMA_VERSION,
-    };
-    let interface_hash = contract.interface_hash;
+    let idl = nexa::parse_nidl(IDL).expect("stress Host contract");
+    let run = idl
+        .nexa_functions
+        .iter()
+        .find(|function| function.name == Run::NAME)
+        .expect("stress Host Contract declares run");
+    assert_eq!(nexa::entrypoint_stable_id(run), RUN_ID);
+    let descriptor = nexa::abi_descriptor(&idl);
+    let fingerprint = descriptor.fingerprint.into_bytes();
+    let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+    let contract = HostContract::new(
+        "TestHost",
+        IDL,
+        descriptor,
+        fingerprint,
+        nexa::contract_runtime_id(&idl),
+        nexa::HOST_CONTRACT_SCHEMA_VERSION,
+    );
+    let contract_runtime_id = contract.contract_runtime_id();
+    let authority = host_function_authority(&idl, "wait");
     let state = Arc::new(RwLock::new(ProjectState {
         delta: 0,
         state_version: 1,
@@ -276,7 +807,8 @@ fn m4_reload_stress() {
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &PackageContext| {
             Box::new(Registry {
-                interface_hash,
+                contract_runtime_id,
+                authority: authority.clone(),
                 requests_created: Arc::clone(&registry_requests),
             }) as Box<dyn HostRegistry>
         })
@@ -312,11 +844,11 @@ fn m4_reload_stress() {
         .write()
         .expect("stress project write lock")
         .root_override = Some(
-        "module stress.app;\nimport support.library as support;\nimport host as stress;\n\
-         @stateful(1) class Store { value: i32; }\n\
-         pub task fn Run(value: i32) -> i32 {\n\
-             let result: Result<i32, stress.WaitError> = await stress.wait(value);\n\
-             return match result { Ok(found) => found, Err(error) => 0 };\n\
+        "use support::library as support;\nuse host::test_host as stress;\n\
+         @state(version = 1) class Store { mut value: i32, }\n\
+         pub async fn run(value: i32) -> i32 {\n\
+             let result: Result<i32, stress::WaitError> = stress::wait(value).await;\n\
+             return match result { Result::Ok(found) => found, Result::Err(error) => 0 };\n\
          }\n"
         .into(),
     );
@@ -436,7 +968,7 @@ path = \"library\"
         state
             .write()
             .expect("stress project write lock")
-            .root_override = Some(format!("module stress.app;\n# invalid_{iteration}\n"));
+            .root_override = Some(format!("# invalid_{iteration}\n"));
         let identity = queue_late_result(&mut engine, &mut trace, &package_id, "syntax failure");
         drain_late_result(
             &mut engine,
@@ -495,9 +1027,9 @@ path = \"library\"
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "module stress.app;\nimport support.library as support;\nimport host as stress;\n\
-                 @stateful(1) class Store {{ value: i32; }}\n\
-                 pub fn Run(value: i32) -> i32 {{ return support.revision() + missing_{iteration}; }}\n"
+            "use support::library as support;\nuse host::test_host as stress;\n\
+                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+                 pub fn run(value: i32) -> i32 {{ return support::revision() + missing_{iteration}; }}\n"
         ));
         let identity = queue_late_result(&mut engine, &mut trace, &package_id, "type failure");
         drain_late_result(
@@ -536,13 +1068,14 @@ path = \"library\"
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "module stress.app;\nimport support.library as support;\nimport host as stress;\n\
-                 @stateful(1) class Store {{ value: i32; }}\n\
-                 pub immediate fn Run(value: i32) -> i32 {{\n\
+            "use support::library as support;\nuse host::test_host as stress;\n\
+                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+                 @immediate\n\
+                 pub fn run(value: i32) -> i32 {{\n\
                      for step in 0..{bound} {{\n\
                          if step == {} {{ return value; }}\n\
                      }}\n\
-                     return support.revision() + value;\n\
+                     return support::revision() + value;\n\
                  }}\n",
             bound.saturating_sub(1)
         ));
@@ -637,7 +1170,7 @@ path = \"library\"
             .extra_sources
             .insert(
                 "src/stress/extra.nexa".into(),
-                "module stress.extra;\npub fn marker() -> i32 { return 1; }\n".into(),
+                "pub fn marker() -> i32 { return 1; }\n".into(),
             );
         let added = queue_late_result_after_stale(
             &mut engine,
@@ -671,10 +1204,9 @@ path = \"library\"
             .extra_sources
             .remove("src/stress/extra.nexa")
             .expect("source to rename");
-        project.extra_sources.insert(
-            "src/stress/renamed.nexa".into(),
-            renamed_source.replace("stress.extra", "stress.renamed"),
-        );
+        project
+            .extra_sources
+            .insert("src/stress/renamed.nexa".into(), renamed_source);
         drop(project);
         let renamed = queue_late_result_after_stale(
             &mut engine,
@@ -748,13 +1280,17 @@ path = \"library\"
 
     for iteration in 0..ACTIVATION_RECOVERIES {
         let before = active_identity(&engine, &package_id);
+        let before_value = engine
+            .call::<Run>(&package_id, &1)
+            .expect("call Active/LKG before activation-fault Candidate")
+            .value;
         state
             .write()
             .expect("stress project write lock")
             .root_override = Some(format!(
-            "module stress.app;\nimport support.library as support;\nimport host as stress;\n\
-                 @stateful(1) class Store {{ value: i32; }}\n\
-                 pub fn Run(value: i32) -> i32 {{ return support.revision() + value; }}\n\
+            "use support::library as support;\nuse host::test_host as stress;\n\
+                 @state(version = 1) class Store {{ mut value: i32, }}\n\
+                 pub fn run(value: i32) -> i32 {{ return support::revision() + value; }}\n\
                  @activation pub fn activate() -> i32 {{\n\
                      let marker: i32 = {};\n\
                      let zero: i32 = 0;\n\
@@ -771,6 +1307,11 @@ path = \"library\"
             &identity,
             ReloadReportOutcome::ActivationFaulted,
         );
+        let activation_lkg_preserved = active_identity(&engine, &package_id) == before
+            && engine
+                .call::<Run>(&package_id, &1)
+                .is_ok_and(|output| output.value == before_value);
+        trace.active_lkg_violations += u64::from(!activation_lkg_preserved);
         state
             .write()
             .expect("stress project write lock")

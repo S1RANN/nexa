@@ -8,7 +8,7 @@ use crate::{ModuleHandle, RuntimeMessage};
 pub enum ReloadError {
     InvalidState,
     EpochNotNewer,
-    HostHashMismatch,
+    HostContractIdMismatch,
     StagingCapacity,
     MigrationNoOutput,
     MigrationNotFinished,

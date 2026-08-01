@@ -1,1 +1,1 @@
-{"version":1,"code":"NX7010","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"missing required export MissingRun","notes":[]}}
+{"version":1,"code":"NX7010","category":"diagnostic","pipeline":"engine","input":"","expected":{"primary_text":"","secondary_count":0,"message_contains":"missing required entrypoint missing_run","notes":[]}}

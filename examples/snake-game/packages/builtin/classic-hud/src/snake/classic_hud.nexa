@@ -1,34 +1,28 @@
-module snake.classic_hud;
-import host as snake;
-import std.collections as collections;
+use host::snake;
 
-fn empty() -> Array<snake.SnakeCommand> {
-    return [];
+fn empty() -> Array<snake::SnakeCommand> {
+    return Array::new();
 }
 
-fn register() -> Array<snake.SnakeCommand> {
-    let commands: Array<snake.SnakeCommand> = [];
-    collections.array_push(commands, snake.RegisterWidget("score"));
-    return commands;
+fn register() -> Array<snake::SnakeCommand> {
+    return [snake::SnakeCommand::RegisterWidget("score")];
 }
 
-fn update(snapshot: snake.GameSnapshot) -> Array<snake.SnakeCommand> {
-    let commands: Array<snake.SnakeCommand> = [];
-    let stats: snake.GameStats = snapshot.stats;
-    let text: string = snake.format_score(stats.score);
-    collections.array_push(commands, snake.SetWidgetText(snake.WidgetText { local_id: "score", text: text }));
-    return commands;
+fn update(snapshot: snake::GameSnapshot) -> Array<snake::SnakeCommand> {
+    let stats: snake::GameStats = snapshot.stats;
+    let text: string = snake::format_score(stats.score);
+    return [snake::SnakeCommand::SetWidgetText(snake::WidgetText { local_id: "score", text: text })];
 }
 
-pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
     return match event {
-        snake.PackageEnabled(snapshot) => register(),
-        snake.GameStarted(snapshot) => empty(),
-        snake.GameTick(snapshot) => update(snapshot),
-        snake.ScoreChanged(snapshot) => update(snapshot),
-        snake.FoodSpawnRequested(snapshot) => empty(),
-        snake.FoodEaten(snapshot) => empty(),
-        snake.GameEnded(snapshot) => empty(),
-        snake.SettingsChanged(snapshot) => empty(),
+        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
+        snake::SnakeEvent::GameStarted(snapshot) => empty(),
+        snake::SnakeEvent::GameTick(snapshot) => update(snapshot),
+        snake::SnakeEvent::ScoreChanged(snapshot) => update(snapshot),
+        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
+        snake::SnakeEvent::GameEnded(snapshot) => empty(),
+        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

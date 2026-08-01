@@ -1,27 +1,60 @@
-interface SnakeHost {
-    struct Cell { x: i32; y: i32; }
-    struct AvailableCells { values: array<Cell>; }
-    struct FoodInstance { kind: string; cell: Cell; }
+contract Snake {
+    struct Cell {
+        x: i32,
+        y: i32,
+    }
+
+    struct AvailableCells {
+        values: Array<Cell>,
+    }
+
+    struct FoodInstance {
+        kind: string,
+        cell: Cell,
+    }
+
     struct GameStats {
-        score: i32;
-        total_plays: i64;
-        foods: i32;
-        snake_length: i32;
+        score: i32,
+        total_plays: i64,
+        foods: i32,
+        snake_length: i32,
     }
+
     struct GameSnapshot {
-        stats: GameStats;
-        width: i32;
-        height: i32;
-        food: Option<FoodInstance>;
-        available: AvailableCells;
+        stats: GameStats,
+        width: i32,
+        height: i32,
+        food: Option<FoodInstance>,
+        available: AvailableCells,
     }
-    struct WidgetText { local_id: string; text: string; }
+
+    struct WidgetText {
+        local_id: string,
+        text: string,
+    }
+
     struct FoodDefinition {
-        local_id: string;
-        length_delta: i32;
-        score_delta: i32;
-        speed_delta: i32;
+        local_id: string,
+        length_delta: i32,
+        score_delta: i32,
+        speed_delta: i32,
     }
+
+    struct FoodSpawnContext {
+        snapshot: GameSnapshot,
+    }
+
+    struct FoodEatenContext {
+        snapshot: GameSnapshot,
+        food: FoodInstance,
+    }
+
+    struct FoodEffect {
+        length_delta: i32,
+        score_delta: i32,
+        speed_delta: i32,
+    }
+
     enum SnakeEvent {
         PackageEnabled(GameSnapshot),
         GameStarted(GameSnapshot),
@@ -30,8 +63,9 @@ interface SnakeHost {
         FoodSpawnRequested(GameSnapshot),
         FoodEaten(GameSnapshot),
         GameEnded(GameSnapshot),
-        SettingsChanged(GameSnapshot)
+        SettingsChanged(GameSnapshot),
     }
+
     enum SnakeCommand {
         RegisterWidget(string),
         SetWidgetText(WidgetText),
@@ -42,10 +76,36 @@ interface SnakeHost {
         ResizeSnake(i32),
         SetSpeed(i32),
         ProposeFoodSpawn(Cell),
-        ShowToast(string)
+        ShowToast(string),
     }
-    sync fn format_score(score: i32) -> string;
-    sync fn format_stats(score: i32, total_plays: i64, foods: i32) -> string;
-    sync fn log(message: string) -> i32;
-    export OnEvent(event: SnakeEvent) -> array<SnakeCommand>;
+
+    host {
+        fn format_score(
+            score: i32,
+        ) -> string;
+
+        fn format_stats(
+            score: i32,
+            total_plays: i64,
+            foods: i32,
+        ) -> string;
+
+        fn log(
+            message: string,
+        ) -> i32;
+    }
+
+    nexa {
+        fn on_event(
+            event: SnakeEvent,
+        ) -> Array<SnakeCommand>;
+
+        fn choose_food_spawn(
+            context: FoodSpawnContext,
+        ) -> Option<Cell>;
+
+        fn calculate_food_effect(
+            context: FoodEatenContext,
+        ) -> FoodEffect;
+    }
 }

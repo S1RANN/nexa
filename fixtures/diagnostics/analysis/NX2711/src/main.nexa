@@ -1,5 +1,3 @@
-module main;
-
 @stable("same-id")
 pub fn first() -> i32 {
     return 1;

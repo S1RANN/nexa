@@ -1,1 +1,1 @@
-pub migration fn migrate() -> bool { preserve(legacy); preserve(legacy); finish_migration(); return true; }
+@migration pub fn migrate() -> bool { preserve(legacy); preserve(legacy); finish_migration(); return true; }

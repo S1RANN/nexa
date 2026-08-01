@@ -1,1 +1,1 @@
-pub migration fn migrate() -> bool { return true; }
+@migration pub fn migrate() -> bool { return true; }

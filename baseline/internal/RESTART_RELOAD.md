@@ -13,7 +13,7 @@ stop new Task admission
 → load and verify the candidate
 → run pure migration on staging state
 → commit the new root
-→ invoke on_reload_start / activation
+→ invoke the `@activation` function
 → resume admission
 ```
 

@@ -1,8 +1,36 @@
-interface GameHost {
-    opaque Entity;
-    struct Score { value: i32; }
-    enum Food { Normal, Poison(i32) }
-    sync fuel 5 fn update(entity: i32, delta: i32) -> i32;
-    request(return_error, trap) fn animation(entity: i32) -> request<Result<i32, string>>;
-    export Update(entity: i32) -> i32;
+contract Game {
+    handle Entity;
+
+    struct Score {
+        value: i32,
+    }
+
+    enum Food {
+        Normal,
+        Poison(i32),
+    }
+
+    enum AnimationError {
+        Cancelled,
+    }
+
+    host {
+        @fuel(5)
+        fn update(
+            entity: i32,
+            delta: i32,
+        ) -> i32;
+
+        @cancel(return_error)
+        @abandon(trap)
+        async fn animation(
+            entity: i32,
+        ) -> Result<i32, AnimationError>;
+    }
+
+    nexa {
+        fn update(
+            entity: i32,
+        ) -> i32;
+    }
 }

@@ -1,4 +1,4 @@
-# Nexa Internal Language Bytecode 5
+# Nexa Internal Language Bytecode 6
 
 The bytecode is a fixed-endian, sectioned, versioned typed-register format. Runtime execution
 accepts only a `VerifiedModule`.
@@ -25,10 +25,11 @@ register types, call signatures, field slots, root bitmaps, safepoints, frame qu
 signatures, and immediate-function WCET. Immediate loops require an explicit static upper bound;
 recursive immediate call graphs are rejected.
 
-Bytecode version 5 is the only accepted wire version. Old bytecode fixtures are
-not decoded through a compatibility path.
+Bytecode version 6 is the only accepted wire version. Every other version,
+including v5, is rejected from the Header before section decoding; there is no
+product compatibility path.
 
-Version 5 adds typed scalar-to-string instructions for deterministic
+Version 6 includes typed scalar-to-string instructions for deterministic
 interpolation:
 
 ```text
@@ -45,9 +46,11 @@ It also adds typed numeric less-than instructions used by non-unrolled range
 loops. Conversion results are GC-rooted Strings; every conversion is covered
 by Fuel accounting, Safepoints, Root Maps, the Verifier, and Source Maps.
 
-Earlier enum, typed async-result, state migration, collection, and state-handle
-metadata remains part of version 5. Async HostImports must reference a matching
-builtin Result enum.
+Enum, typed async-result, state migration, collection, state-handle, exact
+object-root, and Class write-barrier metadata are part of version 6. Async
+HostImports must reference a matching builtin Result enum. Source-level
+postfix `.await` is fully lowered before encoding and introduces no public
+Future or Awaitable wire type.
 
 The compiler lowers `None`, `Some`, `Ok`, `Err`, exhaustive enum `match`, and exact-error `?` to the
 enum instructions. Migration source intrinsics lower to old-state reads, staging writes, explicit

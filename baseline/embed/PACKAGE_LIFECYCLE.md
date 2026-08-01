@@ -6,8 +6,8 @@ The only package states are `Discovered`, `Locked`, `Disabled`, `Enabling`,
 `Enabled`, `Reloading`, `Disabling`, `Faulted`, and `Incompatible`. Every
 transition is checked by `PackageLifecycle`.
 
-Enable revalidates the candidate, compiles with the exact Host interface,
-verifies bytecode, validates required export stable IDs and signatures, creates
+Enable revalidates the Candidate, compiles with the effective Host Contract,
+verifies Bytecode v6, validates required entrypoint stable IDs and signatures, creates
 an independent Host registry, Realm, Module, and root Scope, then publishes
 `Enabled`. Temporary state is dropped on failure. A failed package cannot
 invalidate another package.
@@ -26,8 +26,9 @@ keeps the old module enabled. A committed activation failure faults only that
 package. Successful restart keeps compatible typed state and cancels old
 Tasks. Old Tasks are never restored.
 
-Development change scan compares manifest and entry hashes at a deterministic
-tick interval. It uses no background thread or platform watcher.
+Development change scan compares the canonical resolved Build Input and
+Build Fingerprint at a deterministic tick interval. It uses no platform
+watcher.
 
 Only user enable/disable selections persist across processes. Heap, Tasks, and
 script state do not. Persistence uses a temporary file, file sync, atomic

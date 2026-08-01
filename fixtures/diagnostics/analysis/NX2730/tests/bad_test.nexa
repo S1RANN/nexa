@@ -1,5 +1,3 @@
-module test.bad_test;
-
 @test
 fn bad_test(value: i32) -> bool {
     return value == 1;

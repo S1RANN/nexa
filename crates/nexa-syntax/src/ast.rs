@@ -8,16 +8,24 @@ use crate::{Keyword, SyntaxLanguage, SyntaxTree, TextRange, TextSize, Token, Tok
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NexaAst {
-    pub module: Option<ModuleDeclaration>,
-    pub imports: Vec<ImportDeclaration>,
+    pub uses: Vec<UseDeclaration>,
     pub declarations: Vec<Declaration>,
+    pub top_level_statements: Vec<Statement>,
+    pub top_level_tail: Option<Box<Expression>>,
     pub errors: Vec<AstError>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AstError {
+    pub kind: AstErrorKind,
     pub range: TextRange,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AstErrorKind {
+    InvalidSyntax,
+    LegacyModuleDeclaration { path: TextRange },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -39,7 +47,7 @@ impl QualifiedName {
             .iter()
             .map(|segment| segment.text.as_str())
             .collect::<Vec<_>>()
-            .join(".")
+            .join("::")
     }
 
     #[must_use]
@@ -48,15 +56,26 @@ impl QualifiedName {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ModuleDeclaration {
-    pub path: QualifiedName,
-    pub range: TextRange,
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum UsePathRootKind {
+    Package,
+    Self_,
+    Super,
+    Host,
+    Std,
+    Dependency,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct UsePathRoot {
+    pub kind: UsePathRootKind,
+    pub name: Identifier,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ImportDeclaration {
-    pub path: QualifiedName,
+pub struct UseDeclaration {
+    pub root: UsePathRoot,
+    pub segments: Vec<Identifier>,
     pub alias: Option<Identifier>,
     pub range: TextRange,
 }
@@ -94,8 +113,18 @@ pub enum AttributeArgumentKind {
     Tokens,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AttributeArgumentClassification {
+    Positional,
+    Named,
+    Duplicate,
+    Unknown,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AttributeArgument {
+    pub name: Option<Identifier>,
+    pub classification: AttributeArgumentClassification,
     pub kind: AttributeArgumentKind,
     pub text: String,
     pub range: TextRange,
@@ -117,19 +146,9 @@ pub enum DeclarationKind {
     Error,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum FunctionEffect {
-    Ordinary,
-    Task,
-    Immediate,
-    Migration,
-    Activation,
-    Cleanup,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FunctionDeclaration {
-    pub effect: FunctionEffect,
+    pub is_async: bool,
     pub name: Identifier,
     pub parameters: Vec<Parameter>,
     pub result: Option<TypeRef>,
@@ -149,7 +168,6 @@ pub enum TypeDeclarationKind {
     Struct,
     Enum,
     Class,
-    Stateful,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -165,6 +183,7 @@ pub struct TypeDeclaration {
 pub struct FieldDeclaration {
     pub docs: Vec<DocComment>,
     pub attributes: Vec<Attribute>,
+    pub mutable: bool,
     pub name: Identifier,
     pub ty: TypeRef,
     pub range: TextRange,
@@ -175,7 +194,23 @@ pub struct VariantDeclaration {
     pub docs: Vec<DocComment>,
     pub attributes: Vec<Attribute>,
     pub name: Identifier,
-    pub payload: Vec<TypeRef>,
+    pub payload: VariantPayload,
+    pub range: TextRange,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum VariantPayload {
+    Unit,
+    Tuple(Vec<TypeRef>),
+    Struct(Vec<VariantFieldDeclaration>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VariantFieldDeclaration {
+    pub docs: Vec<DocComment>,
+    pub attributes: Vec<Attribute>,
+    pub name: Identifier,
+    pub ty: TypeRef,
     pub range: TextRange,
 }
 
@@ -306,16 +341,16 @@ pub enum ExpressionKind {
     Construct {
         ty: QualifiedName,
         fields: Vec<FieldInitializer>,
+        update: Option<Box<Expression>>,
     },
     New {
         ty: TypeRef,
         fields: Vec<FieldInitializer>,
+        update: Option<Box<Expression>>,
     },
-    With {
-        value: Box<Expression>,
-        fields: Vec<FieldInitializer>,
+    Await {
+        operand: Box<Expression>,
     },
-    Await(Box<Expression>),
     Try(Box<Expression>),
     Match {
         value: Box<Expression>,
@@ -439,10 +474,12 @@ pub enum InterpolationPart {
 pub fn parse_nexa_ast(tree: &SyntaxTree) -> NexaAst {
     if tree.language != SyntaxLanguage::Nexa {
         return NexaAst {
-            module: None,
-            imports: Vec::new(),
+            uses: Vec::new(),
             declarations: Vec::new(),
+            top_level_statements: Vec::new(),
+            top_level_tail: None,
             errors: vec![AstError {
+                kind: AstErrorKind::InvalidSyntax,
                 range: tree.root.range,
                 message: "a Nexa AST requires Nexa source".into(),
             }],
@@ -474,61 +511,171 @@ impl<'a> Parser<'a> {
     }
 
     fn parse(mut self) -> NexaAst {
-        let mut module = None;
-        let mut imports = Vec::new();
+        let mut uses = Vec::new();
         let mut declarations = Vec::new();
+        let mut top_level_statements = Vec::new();
+        let mut top_level_tail = None;
         while !self.at_end() {
-            if self.at_keyword(Keyword::Module) {
-                let parsed = self.parse_module();
-                if module.is_some() {
-                    self.error(parsed.range, "duplicate module declaration");
-                } else {
-                    module = Some(parsed);
-                }
+            if self.reject_legacy_module_declaration() {
                 continue;
             }
-            if self.at_keyword(Keyword::Import) {
-                imports.push(self.parse_import());
+            if self.at_keyword(Keyword::Use) {
+                uses.push(self.parse_use());
                 continue;
             }
+            self.reject_legacy_top_level_syntax();
             let before = self.cursor;
-            declarations.push(self.parse_declaration());
+            if self.declaration_starts_here() {
+                declarations.push(self.parse_declaration());
+            } else {
+                match self.statement(true) {
+                    ParsedStatement::Statement(statement) => top_level_statements.push(statement),
+                    ParsedStatement::Tail(expression) => {
+                        top_level_tail = Some(Box::new(expression));
+                    }
+                }
+            }
             if self.cursor == before {
                 self.bump();
             }
         }
         NexaAst {
-            module,
-            imports,
+            uses,
             declarations,
+            top_level_statements,
+            top_level_tail,
             errors: self.errors,
         }
     }
 
-    fn parse_module(&mut self) -> ModuleDeclaration {
-        let start = self.bump_range();
-        let path = self.qualified_name();
-        let end = self.expect(TokenKind::Semicolon, "expected `;` after module path");
-        ModuleDeclaration {
-            path,
-            range: cover(start, end),
+    fn reject_legacy_module_declaration(&mut self) -> bool {
+        let Some(keyword) = self
+            .significant
+            .get(self.cursor)
+            .map(|index| self.tree.tokens[*index])
+        else {
+            return false;
+        };
+        if keyword.kind != TokenKind::Identifier || self.token_text(keyword) != "module" {
+            return false;
+        }
+
+        let path_start_cursor = self.cursor + 1;
+        let Some(first_segment) = self
+            .significant
+            .get(path_start_cursor)
+            .map(|index| self.tree.tokens[*index])
+            .filter(|token| token.kind == TokenKind::Identifier)
+        else {
+            return false;
+        };
+        let mut cursor = path_start_cursor + 1;
+        let mut last_segment = first_segment;
+        while self.kind_at(cursor) == Some(TokenKind::Dot)
+            && self.kind_at(cursor + 1) == Some(TokenKind::Identifier)
+        {
+            last_segment = self.token_at_cursor(cursor + 1);
+            cursor += 2;
+        }
+        if self.kind_at(cursor) != Some(TokenKind::Semicolon) {
+            return false;
+        }
+
+        self.errors.push(AstError {
+            kind: AstErrorKind::LegacyModuleDeclaration {
+                path: cover(first_segment.range, last_segment.range),
+            },
+            range: keyword.range,
+            message: "legacy module declarations were removed in Nexa v2".into(),
+        });
+        self.cursor = cursor + 1;
+        true
+    }
+
+    fn reject_legacy_top_level_syntax(&mut self) {
+        let Some(token) = self
+            .significant
+            .get(self.cursor)
+            .map(|index| self.tree.tokens[*index])
+        else {
+            return;
+        };
+        if token.kind != TokenKind::Identifier {
+            return;
+        }
+        let text = self.token_text(token);
+        let looks_legacy = match text {
+            "module" | "import" => self
+                .kind_at(self.cursor + 1)
+                .is_some_and(|kind| matches!(kind, TokenKind::Identifier | TokenKind::Keyword(_))),
+            "task" | "immediate" | "migration" | "activation" | "cleanup" => {
+                self.kind_at(self.cursor + 1) == Some(TokenKind::Keyword(Keyword::Fn))
+            }
+            "stateful" => self.kind_at(self.cursor + 1) == Some(TokenKind::Keyword(Keyword::Class)),
+            _ => false,
+        };
+        if looks_legacy {
+            self.error(
+                token.range,
+                &format!("legacy `{text}` syntax was removed in Nexa v2"),
+            );
         }
     }
 
-    fn parse_import(&mut self) -> ImportDeclaration {
+    fn parse_use(&mut self) -> UseDeclaration {
         let start = self.bump_range();
-        let path = self.qualified_name();
+        let root_name = self.path_root_identifier();
+        let root = UsePathRoot {
+            kind: match root_name.text.as_str() {
+                "package" => UsePathRootKind::Package,
+                "self" => UsePathRootKind::Self_,
+                "super" => UsePathRootKind::Super,
+                "host" => UsePathRootKind::Host,
+                "std" => UsePathRootKind::Std,
+                _ => UsePathRootKind::Dependency,
+            },
+            name: root_name,
+        };
+        let mut segments = Vec::new();
+        while self.take(TokenKind::ColonColon).is_some() {
+            segments.push(self.member_identifier());
+        }
+        if segments.is_empty() {
+            self.error(
+                root.name.range,
+                "use path must include at least one segment",
+            );
+        }
         let alias = if self.take_keyword(Keyword::As).is_some() {
             Some(self.identifier())
         } else {
             None
         };
-        let end = self.expect(TokenKind::Semicolon, "expected `;` after import");
-        ImportDeclaration {
-            path,
+        let end = self.expect(TokenKind::Semicolon, "expected `;` after use declaration");
+        UseDeclaration {
+            root,
+            segments,
             alias,
             range: cover(start, end),
         }
+    }
+
+    fn declaration_starts_here(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            Some(
+                TokenKind::At
+                    | TokenKind::Keyword(
+                        Keyword::Pub
+                            | Keyword::Async
+                            | Keyword::Fn
+                            | Keyword::Struct
+                            | Keyword::Enum
+                            | Keyword::Class
+                            | Keyword::Const
+                    )
+            )
+        )
     }
 
     fn parse_declaration(&mut self) -> Declaration {
@@ -540,28 +687,13 @@ impl<'a> Parser<'a> {
         let attributes = self.attributes();
         let visibility = self.visibility();
         let kind = if self.function_starts_here() {
-            DeclarationKind::Function(self.function(&attributes))
+            DeclarationKind::Function(self.function())
         } else if self.at_keyword(Keyword::Struct) {
             DeclarationKind::Type(self.type_declaration(TypeDeclarationKind::Struct))
         } else if self.at_keyword(Keyword::Enum) {
             DeclarationKind::Type(self.type_declaration(TypeDeclarationKind::Enum))
         } else if self.at_keyword(Keyword::Class) {
-            let stateful = attributes
-                .iter()
-                .any(|attribute| attribute.name.text == "stateful");
-            DeclarationKind::Type(self.type_declaration(if stateful {
-                TypeDeclarationKind::Stateful
-            } else {
-                TypeDeclarationKind::Class
-            }))
-        } else if self.at_keyword(Keyword::Stateful) {
-            self.bump();
-            if self.at_keyword(Keyword::Class) {
-                DeclarationKind::Type(self.type_declaration(TypeDeclarationKind::Stateful))
-            } else {
-                self.error_current("expected `class` after `stateful`");
-                DeclarationKind::Error
-            }
+            DeclarationKind::Type(self.type_declaration(TypeDeclarationKind::Class))
         } else if self.at_keyword(Keyword::Const) {
             DeclarationKind::Const(self.constant())
         } else {
@@ -582,14 +714,7 @@ impl<'a> Parser<'a> {
     fn function_starts_here(&self) -> bool {
         matches!(
             self.current_kind(),
-            Some(TokenKind::Keyword(
-                Keyword::Fn
-                    | Keyword::Task
-                    | Keyword::Immediate
-                    | Keyword::Migration
-                    | Keyword::Activation
-                    | Keyword::Cleanup
-            ))
+            Some(TokenKind::Keyword(Keyword::Fn | Keyword::Async))
         )
     }
 
@@ -642,6 +767,7 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
+            Self::classify_attribute_arguments(&name, &mut arguments);
             attributes.push(Attribute {
                 name,
                 arguments,
@@ -655,7 +781,13 @@ impl<'a> Parser<'a> {
         let first = self.token_at_cursor(start);
         let last = self.token_at_cursor(end.saturating_sub(1));
         let range = cover(first.range, last.range);
-        let kind = match first.kind {
+        let named = first.kind == TokenKind::Identifier
+            && self.kind_at(start + 1) == Some(TokenKind::Equal)
+            && start + 2 < end;
+        let value_start = if named { start + 2 } else { start };
+        let value_first = self.token_at_cursor(value_start);
+        let value_range = cover(value_first.range, last.range);
+        let kind = match value_first.kind {
             TokenKind::StringStart => AttributeArgumentKind::String,
             TokenKind::Integer => AttributeArgumentKind::Integer,
             TokenKind::Float => AttributeArgumentKind::Float,
@@ -665,9 +797,35 @@ impl<'a> Parser<'a> {
             _ => AttributeArgumentKind::Tokens,
         };
         AttributeArgument {
+            name: named.then(|| Identifier {
+                text: self.token_text(first).to_owned(),
+                range: first.range,
+            }),
+            classification: if named {
+                AttributeArgumentClassification::Named
+            } else {
+                AttributeArgumentClassification::Positional
+            },
             kind,
-            text: self.text(range).to_owned(),
+            text: self.text(value_range).to_owned(),
             range,
+        }
+    }
+
+    fn classify_attribute_arguments(name: &Identifier, arguments: &mut [AttributeArgument]) {
+        for index in 0..arguments.len() {
+            let Some(argument_name) = arguments[index].name.as_ref() else {
+                continue;
+            };
+            if arguments[..index]
+                .iter()
+                .filter_map(|argument| argument.name.as_ref())
+                .any(|previous| previous.text == argument_name.text)
+            {
+                arguments[index].classification = AttributeArgumentClassification::Duplicate;
+            } else if name.text != "state" || argument_name.text != "version" {
+                arguments[index].classification = AttributeArgumentClassification::Unknown;
+            }
         }
     }
 
@@ -684,44 +842,18 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn function(&mut self, attributes: &[Attribute]) -> FunctionDeclaration {
+    fn function(&mut self) -> FunctionDeclaration {
         let start = self.current_range();
-        let mut effect = match self.current_kind() {
-            Some(TokenKind::Keyword(Keyword::Task)) => {
-                self.bump();
-                FunctionEffect::Task
-            }
-            Some(TokenKind::Keyword(Keyword::Immediate)) => {
-                self.bump();
-                FunctionEffect::Immediate
-            }
-            Some(TokenKind::Keyword(Keyword::Migration)) => {
-                self.bump();
-                FunctionEffect::Migration
-            }
-            Some(TokenKind::Keyword(Keyword::Activation)) => {
-                self.bump();
-                FunctionEffect::Activation
-            }
-            Some(TokenKind::Keyword(Keyword::Cleanup)) => {
-                self.bump();
-                FunctionEffect::Cleanup
-            }
-            _ => FunctionEffect::Ordinary,
-        };
-        if attributes
-            .iter()
-            .any(|attribute| attribute.name.text == "activation")
-        {
-            effect = FunctionEffect::Activation;
-        }
+        let is_async = self.take_keyword(Keyword::Async).is_some();
         self.expect_keyword(Keyword::Fn, "expected `fn`");
         let name = self.identifier();
+        self.require_snake_case(&name, "function");
         self.expect(TokenKind::LParen, "expected `(` after function name");
         let mut parameters = Vec::new();
         while !self.at_end() && !self.at(TokenKind::RParen) {
             let parameter_start = self.current_range();
             let parameter_name = self.identifier();
+            self.require_snake_case(&parameter_name, "parameter");
             self.expect(TokenKind::Colon, "expected `:` after parameter name");
             let ty = self.ty();
             parameters.push(Parameter {
@@ -734,15 +866,10 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RParen, "expected `)` after parameters");
-        let result = if self.take(TokenKind::Arrow).is_some() {
-            Some(self.ty())
-        } else {
-            self.error_current("expected `->` and a function result type");
-            None
-        };
+        let result = self.take(TokenKind::Arrow).map(|_| self.ty());
         let body = self.block();
         FunctionDeclaration {
-            effect,
+            is_async,
             name,
             parameters,
             result,
@@ -754,6 +881,7 @@ impl<'a> Parser<'a> {
     fn type_declaration(&mut self, kind: TypeDeclarationKind) -> TypeDeclaration {
         let start = self.bump_range();
         let name = self.identifier();
+        self.require_pascal_case(&name, "type");
         self.expect(TokenKind::LBrace, "expected `{` after type name");
         let mut fields = Vec::new();
         let mut variants = Vec::new();
@@ -764,22 +892,39 @@ impl<'a> Parser<'a> {
                 .first()
                 .map_or_else(|| self.current_range(), |doc| doc.range);
             let attributes = self.attributes();
+            let mutable_range = self.take_keyword(Keyword::Mut);
+            let mutable = mutable_range.is_some();
+            if mutable && kind != TypeDeclarationKind::Class {
+                self.error(
+                    mutable_range.expect("mutable range exists"),
+                    "`mut` is only allowed on class fields",
+                );
+            }
             let member_name = self.identifier();
             if kind == TypeDeclarationKind::Enum {
-                let mut payload = Vec::new();
-                if self.take(TokenKind::LParen).is_some() {
+                self.require_pascal_case(&member_name, "enum variant");
+                let payload = if self.take(TokenKind::LParen).is_some() {
+                    let mut elements = Vec::new();
                     while !self.at_end() && !self.at(TokenKind::RParen) {
-                        payload.push(self.ty());
+                        elements.push(self.ty());
                         if self.take(TokenKind::Comma).is_none() {
                             break;
                         }
                     }
                     self.expect(TokenKind::RParen, "expected `)` after enum payload");
-                }
-                let end = self
-                    .take(TokenKind::Comma)
-                    .or_else(|| self.take(TokenKind::Semicolon))
-                    .unwrap_or_else(|| self.previous_range());
+                    VariantPayload::Tuple(elements)
+                } else if self.take(TokenKind::LBrace).is_some() {
+                    VariantPayload::Struct(self.variant_struct_fields())
+                } else {
+                    VariantPayload::Unit
+                };
+                let end = if let Some(comma) = self.take(TokenKind::Comma) {
+                    comma
+                } else if self.at(TokenKind::RBrace) {
+                    self.previous_range()
+                } else {
+                    self.expect(TokenKind::Comma, "expected `,` after enum variant")
+                };
                 variants.push(VariantDeclaration {
                     docs,
                     attributes,
@@ -788,12 +933,20 @@ impl<'a> Parser<'a> {
                     range: cover(member_start, end),
                 });
             } else {
+                self.require_snake_case(&member_name, "field");
                 self.expect(TokenKind::Colon, "expected `:` after field name");
                 let ty = self.ty();
-                let end = self.expect(TokenKind::Semicolon, "expected `;` after field");
+                let end = if let Some(comma) = self.take(TokenKind::Comma) {
+                    comma
+                } else if self.at(TokenKind::RBrace) {
+                    ty.range
+                } else {
+                    self.expect(TokenKind::Comma, "expected `,` after field")
+                };
                 fields.push(FieldDeclaration {
                     docs,
                     attributes,
+                    mutable,
                     name: member_name,
                     ty,
                     range: cover(member_start, end),
@@ -810,9 +963,45 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn variant_struct_fields(&mut self) -> Vec<VariantFieldDeclaration> {
+        let mut fields = Vec::new();
+        while !self.at_end() && !self.at(TokenKind::RBrace) {
+            let original = self.current_original_index();
+            let docs = self.leading_docs(original);
+            let start = docs
+                .first()
+                .map_or_else(|| self.current_range(), |doc| doc.range);
+            let attributes = self.attributes();
+            if let Some(range) = self.take_keyword(Keyword::Mut) {
+                self.error(range, "`mut` is not allowed on enum payload fields");
+            }
+            let name = self.identifier();
+            self.require_snake_case(&name, "enum payload field");
+            self.expect(TokenKind::Colon, "expected `:` after payload field name");
+            let ty = self.ty();
+            let end = if let Some(comma) = self.take(TokenKind::Comma) {
+                comma
+            } else if self.at(TokenKind::RBrace) {
+                ty.range
+            } else {
+                self.expect(TokenKind::Comma, "expected `,` after payload field")
+            };
+            fields.push(VariantFieldDeclaration {
+                docs,
+                attributes,
+                name,
+                ty,
+                range: cover(start, end),
+            });
+        }
+        self.expect(TokenKind::RBrace, "expected `}` after enum struct payload");
+        fields
+    }
+
     fn constant(&mut self) -> ConstDeclaration {
         let start = self.bump_range();
         let name = self.identifier();
+        self.require_screaming_snake_case(&name);
         self.expect(TokenKind::Colon, "expected `:` after constant name");
         let ty = self.ty();
         self.expect(TokenKind::Equal, "expected `=` in constant declaration");
@@ -890,7 +1079,7 @@ impl<'a> Parser<'a> {
         let mut tail = None;
         while !self.at_end() && !self.at(TokenKind::RBrace) {
             let before = self.cursor;
-            let parsed = self.statement();
+            let parsed = self.statement(false);
             match parsed {
                 ParsedStatement::Statement(statement) => statements.push(statement),
                 ParsedStatement::Tail(expression) => {
@@ -913,8 +1102,19 @@ impl<'a> Parser<'a> {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn statement(&mut self) -> ParsedStatement {
+    fn statement(&mut self, allow_eof_tail: bool) -> ParsedStatement {
         let start = self.current_range();
+        if self.current_identifier_text() == Some("var")
+            && self.kind_at(self.cursor + 1) == Some(TokenKind::Identifier)
+        {
+            let range = self.bump_range();
+            self.error(range, "legacy `var` binding was removed; write `let mut`");
+            self.synchronize_statement();
+            return ParsedStatement::Statement(Statement {
+                kind: StatementKind::Error,
+                range: cover(start, self.previous_range()),
+            });
+        }
         if self.take_keyword(Keyword::Return).is_some() {
             let value = if self.at(TokenKind::Semicolon) {
                 None
@@ -927,10 +1127,10 @@ impl<'a> Parser<'a> {
                 range: cover(start, end),
             });
         }
-        if self.at_keyword(Keyword::Let) || self.at_keyword(Keyword::Var) {
-            let mutable = self.at_keyword(Keyword::Var);
-            self.bump();
+        if self.take_keyword(Keyword::Let).is_some() {
+            let mutable = self.take_keyword(Keyword::Mut).is_some();
             let name = self.identifier();
+            self.require_snake_case(&name, "local variable");
             let ty = self.take(TokenKind::Colon).map(|_| self.ty());
             self.expect(TokenKind::Equal, "expected `=` in binding");
             let value = self.expression(0);
@@ -958,6 +1158,7 @@ impl<'a> Parser<'a> {
         }
         if self.take_keyword(Keyword::For).is_some() {
             let binding = self.identifier();
+            self.require_snake_case(&binding, "loop binding");
             self.expect_keyword(Keyword::In, "expected `in` after loop binding");
             let range_start = self.expression(0);
             self.expect(TokenKind::DotDot, "expected `..` in static range");
@@ -1016,7 +1217,7 @@ impl<'a> Parser<'a> {
                 range: cover(start, end),
                 kind: StatementKind::Expression(target),
             })
-        } else if self.at(TokenKind::RBrace) {
+        } else if self.at(TokenKind::RBrace) || (allow_eof_tail && self.at_end()) {
             ParsedStatement::Tail(target)
         } else {
             self.error_current("expected `;` or `}` after expression");
@@ -1106,11 +1307,15 @@ impl<'a> Parser<'a> {
                 }
             }
             Some(TokenKind::Keyword(Keyword::Await)) => {
-                self.bump();
+                let await_range = self.bump_range();
+                self.error(
+                    await_range,
+                    "prefix `await` is not supported: write `.await` after the operand",
+                );
                 let expression = self.expression(7);
                 Expression {
                     range: cover(start, expression.range),
-                    kind: ExpressionKind::Await(Box::new(expression)),
+                    kind: ExpressionKind::Error,
                 }
             }
             Some(TokenKind::Keyword(Keyword::Match)) => self.match_expression(),
@@ -1120,6 +1325,7 @@ impl<'a> Parser<'a> {
                 self.keyword_qualified_expression()
             }
             Some(TokenKind::Keyword(Keyword::New)) => self.new_expression(),
+            Some(TokenKind::Keyword(Keyword::Package)) => self.keyword_qualified_expression(),
             Some(TokenKind::Integer) => self.literal_expression(LiteralKind::Integer),
             Some(TokenKind::Float) => self.literal_expression(LiteralKind::Float),
             Some(TokenKind::Rune) => self.literal_expression(LiteralKind::Rune),
@@ -1132,10 +1338,14 @@ impl<'a> Parser<'a> {
                 if self.at(TokenKind::LBrace)
                     && name.last().is_some_and(|last| starts_uppercase(&last.text))
                 {
-                    let fields = self.field_initializers();
+                    let (fields, update) = self.field_initializers();
                     Expression {
                         range: cover(start, self.previous_range()),
-                        kind: ExpressionKind::Construct { ty: name, fields },
+                        kind: ExpressionKind::Construct {
+                            ty: name,
+                            fields,
+                            update,
+                        },
                     }
                 } else {
                     Expression {
@@ -1160,6 +1370,17 @@ impl<'a> Parser<'a> {
     fn postfix_expression(&mut self, receiver: Expression) -> Option<Expression> {
         let start = receiver.range;
         if self.take(TokenKind::Dot).is_some() {
+            if let Some(end) = self.take_keyword(Keyword::Await) {
+                if self.at(TokenKind::LParen) {
+                    self.error_current("postfix `.await` does not take parentheses");
+                }
+                return Some(Expression {
+                    kind: ExpressionKind::Await {
+                        operand: Box::new(receiver),
+                    },
+                    range: cover(start, end),
+                });
+            }
             let member = self.member_identifier();
             let range = cover(start, member.range);
             return Some(Expression {
@@ -1206,20 +1427,24 @@ impl<'a> Parser<'a> {
                 range: cover(start, end),
             });
         }
-        if self.take_keyword(Keyword::With).is_some() {
-            let fields = self.field_initializers();
-            return Some(Expression {
-                range: cover(start, self.previous_range()),
-                kind: ExpressionKind::With {
-                    value: Box::new(receiver),
-                    fields,
-                },
-            });
-        }
         if let Some(end) = self.take(TokenKind::Question) {
             return Some(Expression {
                 kind: ExpressionKind::Try(Box::new(receiver)),
                 range: cover(start, end),
+            });
+        }
+        if self.current_identifier_text() == Some("with")
+            && self.kind_at(self.cursor + 1) == Some(TokenKind::LBrace)
+        {
+            let legacy = self.bump_range();
+            self.error(
+                legacy,
+                "legacy `with` update was removed; use `{ fields, ..value }`",
+            );
+            let _ = self.field_initializers();
+            return Some(Expression {
+                kind: ExpressionKind::Error,
+                range: cover(start, self.previous_range()),
             });
         }
         None
@@ -1342,14 +1567,14 @@ impl<'a> Parser<'a> {
     fn new_expression(&mut self) -> Expression {
         let start = self.bump_range();
         let ty = self.ty();
-        let fields = if self.at(TokenKind::LBrace) {
+        let (fields, update) = if self.at(TokenKind::LBrace) {
             self.field_initializers()
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         Expression {
             range: cover(start, self.previous_range()),
-            kind: ExpressionKind::New { ty, fields },
+            kind: ExpressionKind::New { ty, fields, update },
         }
     }
 
@@ -1360,7 +1585,7 @@ impl<'a> Parser<'a> {
             range: token.range,
         };
         let mut segments = vec![first];
-        while self.take(TokenKind::Dot).is_some() {
+        while self.take(TokenKind::ColonColon).is_some() {
             segments.push(self.member_identifier());
         }
         let range = cover(
@@ -1519,10 +1744,21 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn field_initializers(&mut self) -> Vec<FieldInitializer> {
+    fn field_initializers(&mut self) -> (Vec<FieldInitializer>, Option<Box<Expression>>) {
         self.expect(TokenKind::LBrace, "expected `{` before fields");
         let mut fields = Vec::new();
+        let mut update = None;
         while !self.at_end() && !self.at(TokenKind::RBrace) {
+            if self.take(TokenKind::DotDot).is_some() {
+                let value = self.expression(0);
+                update = Some(Box::new(value));
+                self.take(TokenKind::Comma);
+                if !self.at(TokenKind::RBrace) {
+                    self.error_current("struct update must be the final initializer");
+                    self.synchronize_field();
+                }
+                break;
+            }
             let start = self.current_range();
             let name = self.identifier();
             self.expect(TokenKind::Colon, "expected `:` after field name");
@@ -1539,7 +1775,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(TokenKind::RBrace, "expected `}` after fields");
-        fields
+        (fields, update)
     }
 
     fn type_arguments(&mut self) -> Vec<TypeRef> {
@@ -1597,9 +1833,10 @@ impl<'a> Parser<'a> {
     }
 
     fn qualified_name(&mut self) -> QualifiedName {
-        let first = self.identifier();
+        let first = self.path_root_identifier();
         let mut segments = vec![first];
-        while self.at(TokenKind::Dot) && self.kind_at(self.cursor + 1).is_some_and(identifier_like)
+        while self.at(TokenKind::ColonColon)
+            && self.kind_at(self.cursor + 1).is_some_and(identifier_like)
         {
             self.bump();
             segments.push(self.member_identifier());
@@ -1613,6 +1850,31 @@ impl<'a> Parser<'a> {
                 .map_or_else(|| self.previous_range(), |segment| segment.range),
         );
         QualifiedName { segments, range }
+    }
+
+    fn path_root_identifier(&mut self) -> Identifier {
+        let Some(token) = self.bump() else {
+            let range = self.current_range();
+            self.error(range, "expected path segment");
+            return Identifier {
+                text: "<missing>".into(),
+                range,
+            };
+        };
+        if !matches!(
+            token.kind,
+            TokenKind::Identifier | TokenKind::Keyword(Keyword::Package)
+        ) {
+            self.error(token.range, "expected ASCII path segment");
+            return Identifier {
+                text: "<error>".into(),
+                range: token.range,
+            };
+        }
+        Identifier {
+            text: self.token_text(token).to_owned(),
+            range: token.range,
+        }
     }
 
     fn identifier(&mut self) -> Identifier {
@@ -1863,6 +2125,38 @@ impl<'a> Parser<'a> {
         self.tree.token_text(&token)
     }
 
+    fn current_identifier_text(&self) -> Option<&str> {
+        let token = self
+            .significant
+            .get(self.cursor)
+            .map(|index| self.tree.tokens[*index])?;
+        (token.kind == TokenKind::Identifier).then(|| self.token_text(token))
+    }
+
+    fn require_snake_case(&mut self, identifier: &Identifier, role: &str) {
+        if !is_snake_case(&identifier.text) {
+            self.error(
+                identifier.range,
+                &format!("{role} name must use snake_case"),
+            );
+        }
+    }
+
+    fn require_pascal_case(&mut self, identifier: &Identifier, role: &str) {
+        if !is_pascal_case(&identifier.text) {
+            self.error(
+                identifier.range,
+                &format!("{role} name must use PascalCase"),
+            );
+        }
+    }
+
+    fn require_screaming_snake_case(&mut self, identifier: &Identifier) {
+        if !is_screaming_snake_case(&identifier.text) {
+            self.error(identifier.range, "const name must use SCREAMING_SNAKE_CASE");
+        }
+    }
+
     fn text(&self, range: TextRange) -> &str {
         self.tree.source.slice(range).unwrap_or("")
     }
@@ -1873,6 +2167,7 @@ impl<'a> Parser<'a> {
 
     fn error(&mut self, range: TextRange, message: &str) {
         self.errors.push(AstError {
+            kind: AstErrorKind::InvalidSyntax,
             range,
             message: message.into(),
         });
@@ -1929,25 +2224,52 @@ fn top_level_start(kind: TokenKind) -> bool {
         TokenKind::At
             | TokenKind::Keyword(
                 Keyword::Pub
+                    | Keyword::Async
                     | Keyword::Fn
-                    | Keyword::Task
-                    | Keyword::Immediate
-                    | Keyword::Migration
-                    | Keyword::Activation
-                    | Keyword::Cleanup
                     | Keyword::Struct
                     | Keyword::Enum
                     | Keyword::Class
-                    | Keyword::Stateful
                     | Keyword::Const
-                    | Keyword::Module
-                    | Keyword::Import
+                    | Keyword::Use
             )
     )
 }
 
 fn starts_uppercase(text: &str) -> bool {
     text.chars().next().is_some_and(char::is_uppercase)
+}
+
+fn is_snake_case(text: &str) -> bool {
+    let mut characters = text.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_lowercase())
+        && characters.all(|character| {
+            character == '_' || character.is_ascii_lowercase() || character.is_ascii_digit()
+        })
+        && !text.ends_with('_')
+        && !text.contains("__")
+}
+
+fn is_pascal_case(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+        && text
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn is_screaming_snake_case(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+        && text.chars().all(|character| {
+            character == '_' || character.is_ascii_uppercase() || character.is_ascii_digit()
+        })
+        && !text.ends_with('_')
+        && !text.contains("__")
 }
 
 fn literal_cooked(kind: LiteralKind, raw: &str) -> Option<String> {

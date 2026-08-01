@@ -1,0 +1,64 @@
+use host::realm_v6_host as fixture_host;
+
+@state(version = 3)
+class ModelState {
+    mut value: i32,
+    mut replacement: i32,
+    mut generation: i32,
+}
+
+@cleanup
+pub fn finalize(value: i32) -> i32 {
+    return value;
+}
+
+pub async fn normal(value: i32) -> i32 {
+    defer finalize(value);
+    return value;
+}
+
+pub async fn fuel(value: i32) -> i32 {
+    defer finalize(value);
+    for index in 0..32 {
+        value + index;
+    }
+    return value;
+}
+
+pub async fn explicit(value: i32) -> i32 {
+    defer finalize(value);
+    yield;
+    return value;
+}
+
+pub async fn request(value: i32) -> Result<i32, fixture_host::WaitError> {
+    defer finalize(value);
+    for index in 0..8 {
+        value + index;
+    }
+    yield;
+    let completed: i32 = fixture_host::wait(value).await?;
+    return Result::Ok(completed);
+}
+
+@migration
+pub fn migrate() -> bool {
+    let old_state: ModelState = old.get<ModelState>(seed);
+    let value: i32 = old.field<i32>(old_state, ModelState::value);
+    let replacement: i32 = old.field<i32>(old_state, ModelState::replacement);
+    let next: ModelState = new.create<ModelState>(seed);
+    new.set(next, ModelState::value, value);
+    new.set(next, ModelState::replacement, replacement);
+    new.set(next, ModelState::generation, 3);
+    replace(seed, next);
+    finish_migration();
+    return true;
+}
+
+@activation
+pub fn activate(fail: bool) -> bool {
+    if fail {
+        let trapped: i32 = 1 / 0;
+    }
+    return true;
+}

@@ -18,74 +18,57 @@ const DEPENDENCY_PACKAGE: &str = "incremental.lib";
 const SOURCE_ID: &str = "incremental-workspace";
 const ROOT_DIRECTORY: &str = "workspace/app";
 const DEPENDENCY_DIRECTORY: &str = "workspace/lib";
-const CONTRACT_A: &[u8] = b"interface Host { sync fn version() -> i32; }\n";
+const CONTRACT_A: &[u8] = b"contract Host { host { fn version() -> i32; } }\n";
 const CONTRACT_B: &[u8] =
-    b"interface Host { sync fn version() -> i32; sync fn revision() -> i32; }\n";
+    b"contract Host { host { fn version() -> i32; fn revision() -> i32; } }\n";
 const CONTRACT_SOURCE_IDENTITY: &[u8] = b"standalone:contracts/incremental.nidl";
 
-const LOCAL_A: &str = r"module app.a;
-pub(package) fn package_value() -> i32 { return 1; }
+const LOCAL_A: &str = r"pub(package) fn package_value() -> i32 { return 1; }
 pub fn public_value() -> i32 { return 1; }
 ";
-const LOCAL_A_PRIVATE_B: &str = r"module app.a;
-pub(package) fn package_value() -> i32 { return 2; }
+const LOCAL_A_PRIVATE_B: &str = r"pub(package) fn package_value() -> i32 { return 2; }
 pub fn public_value() -> i32 { return 1; }
 ";
-const LOCAL_A_PACKAGE_API_B: &str = r"module app.a;
-pub(package) fn package_value() -> i64 { return 1; }
+const LOCAL_A_PACKAGE_API_B: &str = r"pub(package) fn package_value() -> i64 { return 1; }
 pub fn public_value() -> i32 { return 1; }
 ";
-const LOCAL_RENAMED: &str = r"module app.renamed;
-pub(package) fn package_value() -> i32 { return 1; }
+const LOCAL_RENAMED: &str = r"pub(package) fn package_value() -> i32 { return 1; }
 pub fn public_value() -> i32 { return 1; }
 ";
-const LOCAL_B: &str = r"module app.b;
-import app.a as a;
+const LOCAL_B: &str = r"use package::app::a;
 pub fn entry() -> i32 { return 0; }
 ";
-const LOCAL_B_WITHOUT_IMPORT: &str = r"module app.b;
+const LOCAL_B_WITHOUT_IMPORT: &str = r"pub fn entry() -> i32 { return 0; }
+";
+const LOCAL_B_RENAMED_IMPORT: &str = r"use package::app::renamed;
 pub fn entry() -> i32 { return 0; }
 ";
-const LOCAL_B_RENAMED_IMPORT: &str = r"module app.b;
-import app.renamed as renamed;
-pub fn entry() -> i32 { return 0; }
+const LOCAL_UNRELATED: &str = r"pub fn value() -> i32 { return 7; }
 ";
-const LOCAL_UNRELATED: &str = r"module app.unrelated;
-pub fn value() -> i32 { return 7; }
-";
-const LOCAL_NEW: &str = r"module app.added;
-pub fn value() -> i32 { return 9; }
+const LOCAL_NEW: &str = r"pub fn value() -> i32 { return 9; }
 ";
 
-const DEPENDENCY_API_A: &str = r"module api;
-pub fn value() -> i32 { return 1; }
+const DEPENDENCY_API_A: &str = r"pub fn value() -> i32 { return 1; }
 ";
-const DEPENDENCY_API_PRIVATE_B: &str = r"module api;
-pub fn value() -> i32 { return 2; }
+const DEPENDENCY_API_PRIVATE_B: &str = r"pub fn value() -> i32 { return 2; }
 ";
-const DEPENDENCY_API_PUBLIC_B: &str = r"module api;
-pub fn value() -> i64 { return 1; }
+const DEPENDENCY_API_PUBLIC_B: &str = r"pub fn value() -> i64 { return 1; }
 ";
-const CONSUMER_CALL: &str = r"module app.consumer;
-import shared.api as shared;
+const CONSUMER_CALL: &str = r"use shared::api as shared;
 pub fn entry() -> i32 {
-    let ignored = shared.value();
+    let ignored = shared::value();
     return 0;
 }
 ";
-const DEPENDENCY_OTHER: &str = r"module other;
-pub fn value() -> i32 { return 5; }
+const DEPENDENCY_OTHER: &str = r"pub fn value() -> i32 { return 5; }
 ";
-const CONSUMER: &str = r"module app.consumer;
-import shared.api as shared;
+const CONSUMER: &str = r"use shared::api as shared;
 pub fn entry() -> i32 { return 0; }
 ";
-const DOWNSTREAM: &str = r"module app.downstream;
-import app.consumer as consumer;
+const DOWNSTREAM: &str = r"use package::app::consumer;
 pub fn value() -> i32 { return 0; }
 ";
-const DEPENDENCY_UNRELATED: &str = r"module app.unrelated;
-import shared.other as other;
+const DEPENDENCY_UNRELATED: &str = r"use shared::other;
 pub fn value() -> i32 { return 0; }
 ";
 
@@ -295,8 +278,9 @@ fn resolved_input(fixture: &Fixture) -> ResolvedBuildInput {
             .collect(),
         host_contract: fixture.contract.to_vec(),
         host_contract_source: CONTRACT_SOURCE_IDENTITY.to_vec(),
-        host_required_exports: Vec::new(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: Vec::new(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -316,7 +300,7 @@ fn resolved_input(fixture: &Fixture) -> ResolvedBuildInput {
         lock,
         fixture.contract,
         CONTRACT_SOURCE_IDENTITY,
-        fingerprint_input.host_required_exports.clone(),
+        fingerprint_input.host_required_entrypoints.clone(),
         options,
         fingerprint_input,
     )

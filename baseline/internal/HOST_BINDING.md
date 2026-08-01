@@ -1,36 +1,54 @@
 # Host Binding
 
-Version: **1.0.0**
+Version: **2.0.0**
 
-The `.nidl` file is the only authoritative Host API definition.
+Status: **COMPLETE**
 
-`nexa-idl` deterministically generates into `OUT_DIR`:
+The `.nidl` file is the only authoritative Host Contract definition. The
+normative NIDL, Descriptor, and generator rules are:
+
+- [`../abi/NIDL_V2.md`](../abi/NIDL_V2.md)
+- [`../abi/CONTRACT_DESCRIPTOR_V2.md`](../abi/CONTRACT_DESCRIPTOR_V2.md)
+- [`../abi/BINDING_CODEGEN_V2.md`](../abi/BINDING_CODEGEN_V2.md)
+
+`nexa-idl` consumes the shared lossless NIDL Syntax Tree, produces a
+source-preserving `NidlAst`, validates it once into `ValidatedContract`, and
+derives both ABI Descriptor v2 and a semantic `BindingModel`. No generator
+backend performs new name, type, or policy decisions while emitting code.
+
+The Rust backend deterministically generates into `OUT_DIR`:
 
 - the Rust Host Trait and test Stub;
-- the Host Dispatcher;
+- the Host Dispatcher and generated Registry;
 - borrowed argument decoding and return encoding;
-- typed error/completion conversion;
-- stable function identifiers;
-- the Exact Interface Hash;
-- the Nexa module declaration and typed export markers.
+- typed error and completion conversion for async Host functions;
+- stable function identifiers and per-declaration fingerprints;
+- the full ABI Descriptor v2 and full Contract fingerprint;
+- Nexa entrypoint marker, argument, and output types.
 
-Host crates include the generated file and implement only the generated Trait.
-They must not hand-maintain function-name matching, argument slots, return
-slots, stable ID tables, or interface hash tables.
+The backend constructs `proc_macro2::TokenStream` values with `quote`, parses
+the complete output as `syn::File`, formats it with `prettyplease`, parses the
+formatted source again, and only then writes it. Host crates include that
+generated file and implement only the generated Trait. They do not maintain
+function-name matching, argument slots, return slots, stable-ID tables, ABI
+fingerprints, or generated entrypoint metadata by hand.
 
-Loading a module compares its embedded Exact Interface Hash with the generated
-Host Registry before interpreter execution. Any incompatible `.nidl` change
-therefore rejects old bytecode before gameplay code runs.
+A resolved Package build derives its effective Descriptor and fingerprint from
+the referenced subset authorized by that generated full Contract. Loading
+compares the Package's embedded effective fingerprint, Host imports, and
+entrypoint signatures with the generated Host Registry before interpreter
+execution. A required entrypoint must exist with the exact signature. An
+optional entrypoint may be absent, but an implementation with a mismatched
+signature rejects the Package.
 
-The binding gate applies 20 legal textual schema mutations. Every mutation is
-parsed, validated, generated three times byte-for-byte, compiled in an
-independent Host crate, and checked against old bytecode before interpreter
-admission. A Host implementation is patched only when its generated Trait
-contract actually changes.
+The binding gate mutates legal and illegal Contracts, validates source spans
+and diagnostics, generates each valid model repeatedly for byte-identical
+output, reparses and compiles the output in an independent Host crate, and
+rejects mismatched Bytecode before Runtime admission. Compatibility is checked
+against handwritten business code, never a generated Stub. Each incompatible
+case applies an explicit minimal business-code patch before executing the
+changed binding.
 
-Compatibility is decided against the handwritten `BusinessHostV1`, never a
-generated Stub. Rust JSON diagnostics must point into `business_host.rs` and
-name an affected business symbol. Each incompatible case applies an explicit
-minimal business-code patch; every changed binding then loads and executes the
-stable `heartbeat` function. Generated binding and Dispatcher files are never
-hand-edited.
+The active product contains no legacy function index, old export alias,
+formatted canonical-string hash, second private NIDL parser, or string-based
+Rust expression generator.

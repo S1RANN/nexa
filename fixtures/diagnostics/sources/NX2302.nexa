@@ -1,2 +1,2 @@
-task fn work() -> i32 { return 1; }
-task fn main() -> i32 { return work(); }
+async fn work() -> i32 { return 1; }
+async fn main() -> i32 { return work(); }

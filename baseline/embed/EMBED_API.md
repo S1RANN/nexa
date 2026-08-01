@@ -1,6 +1,6 @@
 # Nexa Embed API
 
-Status: M3R3 COMPLETE
+Status: M4 COMPLETE; M4R1 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust
 application and Nexa Runtime. Applications provide a generated `HostContract`,
@@ -14,17 +14,39 @@ points are `discover`, `enable_defaults`, `enable`,
 `shutdown`. The application never needs Realm, Module, Scope, Task, release
 queue, or raw `RuntimeValue` operations.
 
-Generated bindings expose canonical NIDL, its exact interface hash, a
-`HostContract`, a registry factory, and a `ScriptExport` marker for every
-export. `ScriptExport` owns argument requirements, transactional encoding,
-expected signature, and owned output decoding. Export lookup is by stable ID,
-never by a caller-authored function index.
+Generated bindings expose the validated NIDL v2 Contract, its full ABI
+Descriptor v2 and full Contract fingerprint, a `HostContract`, a Registry
+factory, and a typed marker for every Nexa entrypoint. Each resolved Package
+build derives its own effective Descriptor and fingerprint from that full
+authority. Each marker owns argument requirements, transactional encoding,
+expected signature, and owned output decoding. Entrypoint lookup is by marker
+and stable ID, never by a caller-authored numeric position or string.
+
+`require_export::<E>()` selects a globally Required typed entrypoint.
+`has_export::<E>(package_id)`, `call_optional::<E>(package_id, args)`, and
+`dispatch_optional::<E>(args)` inspect or call Optional typed entrypoints.
+Absence is legal for Optional entrypoints; an implementation with the wrong
+signature rejects the Package at load time.
+
+Schema 2 project TOML expresses the same Host selection with
+`required_entrypoints = ["on_event"]`. Values are exact `snake_case` names
+from the Contract's `nexa {}` block. An empty list makes the surface Optional;
+an omitted key selects the complete Contract surface. The legacy
+`required_exports` key is rejected rather than aliased. The Rust method name
+`require_export::<E>()` is intentionally retained by the M4R1 contract.
 
 M2 handlers use `MustCompletePolicy`. Completion is decoded. Fuel or explicit
-yield, Host wait, trap, missing export, and signature mismatch are terminal
-errors for that package invocation. Argument allocation is preflighted and
-committed as one transaction, so a failed encode cannot publish a partial
-object graph.
+yield, Host wait, trap, missing required entrypoint, and signature mismatch
+are terminal errors for that package invocation. Argument allocation is
+preflighted and committed as one transaction, so a failed encode cannot
+publish a partial object graph.
+
+For a resolved Application build, the effective Contract selection is the
+canonical union of Host functions and shared types referenced by the root
+Package and every linked local Library, plus Required and root-implemented
+Nexa entrypoints. Its raw 32-byte fingerprint is a field of the cumulative
+Build Fingerprint. Unused Optional Contract declarations do not affect that
+Package identity.
 
 `dispatch` returns provenance-bearing `PackageOutput<T>` values. Package ID,
 source ID, trust, and effective capabilities come from the host-owned package
@@ -58,5 +80,7 @@ completed compilation before the source changed.
 Engine, Package, development, diagnostic, Reload, and metric DTOs. These APIs
 do not expose Realm, Runtime Host objects, or raw handles.
 
-The immutable M3, M3R1, and M3R2 completion tags remain historical boundaries.
-M4 has not started.
+The immutable M1 through M3R3 completion tags remain historical boundaries.
+M4 is complete at `language-scale-m4-complete`. M4R1 completes the breaking
+Language v2, NIDL v2, structured binding, Standalone, REPL, and
+multiple-entrypoint surfaces.

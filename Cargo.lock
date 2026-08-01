@@ -490,6 +490,7 @@ dependencies = [
  "nexa-idl",
  "nexa-runtime",
  "nexa-stdlib",
+ "nexa-syntax",
  "nexa-test-runner",
  "nexa-verifier",
  "serde",
@@ -503,6 +504,7 @@ dependencies = [
  "nexa-bytecode",
  "nexa-core",
  "nexa-diagnostics",
+ "nexa-idl",
  "nexa-stdlib",
  "nexa-syntax",
  "semver",
@@ -543,6 +545,7 @@ dependencies = [
  "nexa-machine",
  "nexa-migrate",
  "nexa-model",
+ "nexa-syntax",
  "serde",
  "serde_json",
  "toml",
@@ -597,13 +600,18 @@ dependencies = [
 name = "nexa-idl"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "nexa-bytecode",
  "nexa-compiler",
  "nexa-core",
  "nexa-runtime",
  "nexa-syntax",
  "nexa-verifier",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
  "serde_json",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -611,6 +619,10 @@ name = "nexa-machine"
 version = "0.1.0"
 dependencies = [
  "nexa-core",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -744,6 +756,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0103b1cef7ec0cf76490e969665504990193874ea05c85ff9bab8b911d0a0564"
 dependencies = [
  "zerovec",
+]
+
+[[package]]
+name = "prettyplease"
+version = "0.2.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "479ca8adacdd7ce8f1fb39ce9ecccbfe93a3f1344b3d0d97f20bc0196208f62b"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
 ]
 
 [[package]]

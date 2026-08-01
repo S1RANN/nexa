@@ -1,6 +1,4 @@
-module language_scale.rules;
-
-import scale_common.math as math;
+use scale_common::math as math;
 
 /// This identity stays explicit if the declaration moves.
 @stable("language-scale.base-score")
@@ -8,7 +6,7 @@ pub const BASE_SCORE: i32 = 10;
 
 /* Consumers of this Package cannot call normalize directly. */
 pub(package) fn normalize(value: i32) -> i32 {
-    return math.twice(value);
+    return math::twice(value);
 }
 
 fn add_base(value: i32) -> i32 {

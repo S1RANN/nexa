@@ -112,7 +112,6 @@ pub enum HeaderDeclarationKind {
     Struct,
     Enum,
     Class,
-    Stateful,
     Const,
 }
 
@@ -200,7 +199,7 @@ pub enum ChangeImpact {
     PackageApi,
     /// A `pub` surface changed and dependency consumers may need re-analysis.
     PublicApi,
-    /// Stateful layout changed.
+    /// Persistent-state layout changed.
     StateSchema,
 }
 
@@ -1101,7 +1100,10 @@ impl QueryDatabase {
                 exact.extend([QueryKey::Parse(source), QueryKey::TypedModule(module)]);
             }
         }
-        let mut invalidation = self.invalidate_exact(exact);
+        // Direct source-set updates are public invalidation inputs, not merely scheduling hints.
+        // Follow reverse dependencies so a consumer TypedModule eviction also removes every linked
+        // artifact derived from it; otherwise delete/rename/ABA can leave a stale artifact cached.
+        let mut invalidation = self.invalidate_keys(exact);
         invalidation.parsed_sources.extend(scheduled_sources);
         invalidation.analyzed_modules.extend(scheduled_modules);
         BuildInputUpdate {
@@ -1417,19 +1419,18 @@ fn extract_module_header(
     source: &SourceKey,
 ) -> Result<ModuleHeader, HeaderError> {
     let ast = nexa_syntax::ast::parse_nexa_ast(tree);
-    let declared = ast
-        .module
-        .as_ref()
-        .map(|module| module.path.text())
-        .ok_or_else(|| HeaderError::MissingModule(source.clone()))?;
-    let module = ModulePath::new(declared).map_err(HeaderError::InvalidIdentity)?;
+    let module = module_path_for_source(source).map_err(HeaderError::InvalidIdentity)?;
     let imports = ast
-        .imports
+        .uses
         .iter()
-        .map(|import| {
+        .map(|usage| {
+            let path = std::iter::once(usage.root.name.text.as_str())
+                .chain(usage.segments.iter().map(|segment| segment.text.as_str()))
+                .collect::<Vec<_>>()
+                .join(".");
             Ok(ImportHeader {
-                path: ModulePath::new(import.path.text()).map_err(HeaderError::InvalidIdentity)?,
-                alias: import.alias.as_ref().map(|alias| alias.text.clone()),
+                path: ModulePath::new(path).map_err(HeaderError::InvalidIdentity)?,
+                alias: usage.alias.as_ref().map(|alias| alias.text.clone()),
             })
         })
         .collect::<Result<Vec<_>, HeaderError>>()?;
@@ -1450,9 +1451,6 @@ fn extract_module_header(
                         nexa_syntax::ast::TypeDeclarationKind::Enum => HeaderDeclarationKind::Enum,
                         nexa_syntax::ast::TypeDeclarationKind::Class => {
                             HeaderDeclarationKind::Class
-                        }
-                        nexa_syntax::ast::TypeDeclarationKind::Stateful => {
-                            HeaderDeclarationKind::Stateful
                         }
                     },
                 ),
@@ -1485,6 +1483,18 @@ fn extract_module_header(
         declarations,
         syntax_error_count: tree.errors.len().saturating_add(ast.errors.len()),
     })
+}
+
+fn module_path_for_source(source: &SourceKey) -> Result<ModulePath, crate::IdentityError> {
+    if let Some(relative) = source
+        .path
+        .as_str()
+        .strip_prefix("tests/")
+        .and_then(|path| path.strip_suffix(".nexa"))
+    {
+        return ModulePath::new(format!("test.{}", relative.replace('/', ".")));
+    }
+    ModulePath::from_source_path(&source.path)
 }
 
 fn declaration_surface(
@@ -1525,7 +1535,13 @@ fn classify_header_change(old: &ModuleHeader, new: &ModuleHeader) -> ChangeImpac
         header
             .declarations
             .iter()
-            .filter(|declaration| declaration.kind == HeaderDeclarationKind::Stateful)
+            .filter(|declaration| {
+                declaration.kind == HeaderDeclarationKind::Class
+                    && declaration
+                        .attributes
+                        .iter()
+                        .any(|attribute| attribute == "state")
+            })
             .cloned()
             .collect::<Vec<_>>()
     };
@@ -1558,7 +1574,6 @@ fn classify_header_change(old: &ModuleHeader, new: &ModuleHeader) -> ChangeImpac
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HeaderError {
     SourceNotParsed(SourceKey),
-    MissingModule(SourceKey),
     InvalidImport(SourceKey),
     InvalidIdentity(crate::IdentityError),
 }
@@ -1652,8 +1667,14 @@ pub(crate) fn typed_module_semantic_context(input: &ResolvedBuildInput) -> [u8; 
         &input.dependency_graph.canonical_identity_bytes(),
     );
     builder.field_bytes("host-contract", &fingerprint.host_contract);
-    builder.field_bytes("host-required-exports", &fingerprint.host_required_exports);
-    builder.field_str("language-version", &fingerprint.language_version);
+    builder.field_bytes(
+        "host-required-exports",
+        &fingerprint.host_required_entrypoints,
+    );
+    builder.field_bytes(
+        "language-version",
+        &fingerprint.language_version.to_le_bytes(),
+    );
     builder.field_str(
         "standard-library-version",
         &fingerprint.standard_library_version,
@@ -1745,7 +1766,7 @@ fn canonical_host_contract_query_value(input: &ResolvedBuildInput) -> [u8; 32] {
     builder.field_bytes("source-identity", &input.host_contract_source_identity);
     builder.field_bytes(
         "required-exports",
-        &input.fingerprint_input.host_required_exports,
+        &input.fingerprint_input.host_required_entrypoints,
     );
     builder.finish_bytes()
 }
@@ -1895,11 +1916,8 @@ mod tests {
         let module = module("example.app", "main");
         let source = source(&module);
         let mut db = QueryDatabase::new();
-        db.parse(
-            source.clone(),
-            "module main;\npub fn value() -> i32 { return 1; }",
-        )
-        .unwrap();
+        db.parse(source.clone(), "pub fn value() -> i32 { return 1; }")
+            .unwrap();
         db.module_header(&source).unwrap();
         db.insert(
             QueryKey::ResolvedImports(module.clone()),
@@ -1917,7 +1935,7 @@ mod tests {
             [QueryKey::TypedModule(module.clone())],
         );
         let update = db
-            .update_source(source, "module main;\npub fn value() -> i32 { return 2; }")
+            .update_source(source, "pub fn value() -> i32 { return 2; }")
             .unwrap();
         assert_eq!(update.impact, ChangeImpact::PrivateImplementation);
         assert!(

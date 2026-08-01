@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use nexa as nexa_idl;
 use nexa::prelude as nexa_runtime;
@@ -12,32 +12,97 @@ use nexa_embed::{
     PackageStatus, SourceId, TrustLevel,
 };
 use nexa_runtime::{
-    HostCallOutcome, HostRegistry, HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue,
-    ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
-    ScriptOutputReader, Signature, StableId, ValueType,
+    FunctionEffect, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap,
+    ResourceContext, RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements, ScriptCallError,
+    ScriptCallWriter, ScriptExport, ScriptOutputReader, Signature, StableId, ValueType,
 };
 
-const IDL_SOURCE: &str = "interface TestHost {
-    enum WaitError { Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, WaitError>>;
-    export Run(value: i32) -> i32;
+const IDL_SOURCE: &str = "contract TestHost {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        fn run(value: i32) -> i32;
+    }
 }";
-const RUN_ID: StableId = StableId(0xf1c5_6273_0ddd_ab52);
+const TASK_IDL_SOURCE: &str = "contract TestHost {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        async fn run(value: i32) -> i32;
+    }
+}";
+const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
+const METER_RUN_ID: StableId = StableId(0x39e3_0598_78a5_d67d);
 
-struct Registry(StableId);
+fn host_function_authority(
+    contract: &nexa_idl::ValidatedContract,
+    name: &str,
+) -> HostFunctionAuthority {
+    let model = nexa_idl::BindingModel::from_contract(contract)
+        .expect("test Host Contract has a runtime binding model");
+    let function = model
+        .host_functions
+        .iter()
+        .find(|function| function.identity.source_name == name)
+        .expect("test Host function is declared");
+    let runtime = function
+        .host_contract
+        .as_ref()
+        .expect("Host function has runtime metadata");
+    let parameters = Box::leak(runtime.parameters.clone().into_boxed_slice());
+    let capabilities: &'static [&'static str] = Box::leak(
+        function
+            .capabilities
+            .iter()
+            .cloned()
+            .map(|capability| {
+                let capability: &'static str = Box::leak(capability.into_boxed_str());
+                capability
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    HostFunctionAuthority::new(
+        function.identity.stable_id,
+        function.declaration_fingerprint,
+        parameters,
+        runtime.result,
+        runtime.mode,
+        function.fuel_cost,
+        runtime.async_result,
+        capabilities,
+    )
+}
+
+struct Registry {
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
+}
 
 impl HostRegistry for Registry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id == 0 {
+        if id == self.authority.stable_id() {
             let pending = context
                 .create_request()
                 .map_err(|_| HostTrap::ResourceCapacity)?;
@@ -48,37 +113,55 @@ impl HostRegistry for Registry {
     }
 }
 
-struct TrappingRegistry(StableId);
+struct TrappingRegistry {
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
+}
 
 impl HostRegistry for TrappingRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        _: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::Panicked)
+        if id == self.authority.stable_id() {
+            Err(HostTrap::Panicked)
+        } else {
+            Err(HostTrap::UnknownFunction(id))
+        }
     }
 }
 
-struct MeteredRegistry(StableId);
+struct MeteredRegistry {
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
+}
 
 impl HostRegistry for MeteredRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 {
+        if id != self.authority.stable_id() {
             return Err(HostTrap::UnknownFunction(id));
         }
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
@@ -94,13 +177,17 @@ impl ScriptExport for Run {
     type Output = i32;
 
     const STABLE_ID: StableId = RUN_ID;
-    const NAME: &'static str = "Run";
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
         Signature {
             parameters: vec![ValueType::I32],
             result: Some(ValueType::I32),
         }
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
     }
 
     fn argument_requirements(
@@ -133,11 +220,53 @@ impl ScriptExport for MeterRun {
     type Args = i32;
     type Output = i32;
 
-    const STABLE_ID: StableId = StableId(0x45a3_6e76_9a57_b233);
-    const NAME: &'static str = "Run";
+    const STABLE_ID: StableId = METER_RUN_ID;
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
         Run::signature()
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
+    }
+
+    fn argument_requirements(
+        args: &Self::Args,
+    ) -> Result<ScriptArgumentRequirements, ScriptCallError> {
+        Run::argument_requirements(args)
+    }
+
+    fn encode_args(
+        writer: &mut ScriptCallWriter<'_>,
+        args: &Self::Args,
+    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+        Run::encode_args(writer, args)
+    }
+
+    fn decode_output(
+        reader: &ScriptOutputReader<'_>,
+        value: RuntimeValue,
+    ) -> Result<Self::Output, ScriptCallError> {
+        Run::decode_output(reader, value)
+    }
+}
+
+struct TaskRun;
+
+impl ScriptExport for TaskRun {
+    type Args = i32;
+    type Output = i32;
+
+    const STABLE_ID: StableId = RUN_ID;
+    const NAME: &'static str = "run";
+
+    fn signature() -> Signature {
+        Run::signature()
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Task
     }
 
     fn argument_requirements(
@@ -162,13 +291,52 @@ impl ScriptExport for MeterRun {
 }
 
 fn contract() -> HostContract {
-    let idl = nexa_idl::parse(IDL_SOURCE).expect("test IDL");
-    HostContract {
-        interface_name: "TestHost",
-        canonical_idl: IDL_SOURCE,
-        interface_hash: nexa_idl::exact_hash(&idl),
-        generator_schema_version: nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
-    }
+    static CONTRACT: OnceLock<HostContract> = OnceLock::new();
+    *CONTRACT.get_or_init(|| {
+        let idl = nexa_idl::parse_nidl(IDL_SOURCE).expect("test NIDL");
+        let run = idl
+            .nexa_functions
+            .iter()
+            .find(|function| function.name == Run::NAME)
+            .expect("test NIDL declares the run entrypoint");
+        assert_eq!(nexa_idl::entrypoint_stable_id(run), RUN_ID);
+        let descriptor = nexa_idl::abi_descriptor(&idl);
+        let fingerprint = descriptor.fingerprint.into_bytes();
+        let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+        HostContract::new(
+            "TestHost",
+            IDL_SOURCE,
+            descriptor,
+            fingerprint,
+            nexa_idl::contract_runtime_id(&idl),
+            nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
+        )
+    })
+}
+
+fn task_contract() -> HostContract {
+    static CONTRACT: OnceLock<HostContract> = OnceLock::new();
+    *CONTRACT.get_or_init(|| {
+        let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+        let run = idl
+            .nexa_functions
+            .iter()
+            .find(|function| function.name == TaskRun::NAME)
+            .expect("test Task NIDL declares the run entrypoint");
+        assert!(run.is_async);
+        assert_eq!(nexa_idl::entrypoint_stable_id(run), RUN_ID);
+        let descriptor = nexa_idl::abi_descriptor(&idl);
+        let fingerprint = descriptor.fingerprint.into_bytes();
+        let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+        HostContract::new(
+            "TestHost",
+            TASK_IDL_SOURCE,
+            descriptor,
+            fingerprint,
+            nexa_idl::contract_runtime_id(&idl),
+            nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
+        )
+    })
 }
 
 fn policy(activation: impl IntoIterator<Item = ActivationPolicy>) -> PackagePolicy {
@@ -225,20 +393,41 @@ fn source(id: &str, package: &str, activation: &str, script: &str) -> MemorySour
         let module = module_name(package);
         MemoryPackage::new(package.replace('.', "-"), manifest(package, activation, "")).source(
             source_path(&module),
-            format!("module {module};\nimport host as test;\n{script}"),
+            format!("use host::test_host as test;\n{script}"),
         )
     })
 }
 
 fn builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilder {
     let contract = contract();
-    let hash = contract.interface_hash;
+    let hash = contract.contract_runtime_id();
+    let idl = nexa_idl::parse_nidl(IDL_SOURCE).expect("test NIDL");
+    let authority = host_function_authority(&idl, "wait");
     NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
-            Box::new(Registry(hash)) as Box<dyn HostRegistry>
+            Box::new(Registry {
+                contract_runtime_id: hash,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(source)
         .require_export::<Run>()
+}
+
+fn task_builder(source: impl PackageSource + 'static) -> nexa_embed::NexaEngineBuilder {
+    let contract = task_contract();
+    let hash = contract.contract_runtime_id();
+    let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+    let authority = host_function_authority(&idl, "wait");
+    NexaEngine::builder(contract)
+        .host_factory(move |_: &nexa_embed::PackageContext| {
+            Box::new(Registry {
+                contract_runtime_id: hash,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
+        })
+        .package_source(source)
+        .require_export::<TaskRun>()
 }
 
 #[test]
@@ -248,7 +437,7 @@ fn exact_host_source_identity_and_raw_text_enter_candidate_fingerprint() {
             "exact-host-source",
             "tests.exact_host_source",
             "user-controlled",
-            "pub fn Run(value: i32) -> i32 { return value; }",
+            "pub fn run(value: i32) -> i32 { return value; }",
         )
         .discover(&build)
         .expect("discover exact Host source")
@@ -282,11 +471,11 @@ fn builder_rejects_exact_host_source_parse_mismatch() {
         "mismatched-host-source",
         "tests.mismatched_host_source",
         "user-controlled",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     ))
     .host_contract_source(
         nexa::SourceIdentity::standalone("contracts/mismatch.nidl"),
-        "interface OtherHost { export Run(value: i32) -> i32; }",
+        "contract OtherHost { nexa { fn run(value: i32) -> i32; } }",
     )
     .build();
 
@@ -301,7 +490,7 @@ fn package_analysis_batch_retains_every_diagnostic_and_one_shared_snapshot() {
         "user-controlled",
         "fn bad_a() -> i32 { return missing_a; }\n\
          fn bad_b() -> i32 { return missing_b; }\n\
-         pub fn Run(value: i32) -> i32 { return value; }",
+         pub fn run(value: i32) -> i32 { return value; }",
     ))
     .build()
     .expect("build");
@@ -341,7 +530,7 @@ fn memory_source_enables_calls_disables_and_shuts_down() {
         "memory",
         "tests.basic",
         "default-enabled",
-        "pub fn Run(value: i32) -> i32 { return value + 1; }",
+        "pub fn run(value: i32) -> i32 { return value + 1; }",
     ))
     .build()
     .expect("build");
@@ -358,18 +547,35 @@ fn memory_source_enables_calls_disables_and_shuts_down() {
 
 #[test]
 fn engine_records_instruction_count_independently_from_fuel_charge() {
-    const METER_IDL: &str = "interface MeterHost {
-        sync fuel 11 fn expensive(value: i32) -> i32;
-        export Run(value: i32) -> i32;
+    const METER_IDL: &str = "contract MeterHost {
+        host {
+            @fuel(11)
+            fn expensive(value: i32) -> i32;
+        }
+        nexa {
+            fn run(value: i32) -> i32;
+        }
     }";
-    let idl = nexa_idl::parse(METER_IDL).expect("meter IDL");
-    let contract = HostContract {
-        interface_name: "MeterHost",
-        canonical_idl: METER_IDL,
-        interface_hash: nexa_idl::exact_hash(&idl),
-        generator_schema_version: nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
-    };
-    let hash = contract.interface_hash;
+    let idl = nexa_idl::parse_nidl(METER_IDL).expect("meter NIDL");
+    let run = idl
+        .nexa_functions
+        .iter()
+        .find(|function| function.name == MeterRun::NAME)
+        .expect("meter NIDL declares the run entrypoint");
+    assert_eq!(nexa_idl::entrypoint_stable_id(run), METER_RUN_ID);
+    let descriptor = nexa_idl::abi_descriptor(&idl);
+    let fingerprint = descriptor.fingerprint.into_bytes();
+    let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
+    let contract = HostContract::new(
+        "MeterHost",
+        METER_IDL,
+        descriptor,
+        fingerprint,
+        nexa_idl::contract_runtime_id(&idl),
+        nexa_runtime::HOST_CONTRACT_SCHEMA_VERSION,
+    );
+    let hash = contract.contract_runtime_id();
+    let authority = host_function_authority(&idl, "expensive");
     let source = MemorySource::new(
         SourceId::new("meter").expect("source ID"),
         policy([ActivationPolicy::DefaultEnabled]),
@@ -381,14 +587,16 @@ fn engine_records_instruction_count_independently_from_fuel_charge() {
         )
         .source(
             "src/tests/meter.nexa",
-            "module tests.meter;
-             import host as meter;
-             pub fn Run(value: i32) -> i32 { return meter.expensive(value); }",
+            "use host::meter_host as meter;
+             pub fn run(value: i32) -> i32 { return meter::expensive(value); }",
         ),
     );
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
-            Box::new(MeteredRegistry(hash)) as Box<dyn HostRegistry>
+            Box::new(MeteredRegistry {
+                contract_runtime_id: hash,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(source)
         .require_export::<MeterRun>()
@@ -421,13 +629,13 @@ fn duplicate_source_and_package_ids_are_rejected_deterministically() {
         "same",
         "tests.left",
         "user-controlled",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     );
     let right = source(
         "same",
         "tests.right",
         "user-controlled",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     );
     assert!(matches!(
         builder(left).package_source(right).build(),
@@ -438,13 +646,13 @@ fn duplicate_source_and_package_ids_are_rejected_deterministically() {
         "left",
         "tests.duplicate",
         "user-controlled",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     ))
     .package_source(source(
         "right",
         "tests.duplicate",
         "user-controlled",
-        "pub fn Run(value: i32) -> i32 { return value + 1; }",
+        "pub fn run(value: i32) -> i32 { return value + 1; }",
     ))
     .build()
     .expect("build duplicate candidates");
@@ -481,9 +689,8 @@ fn entitlement_lock_unlock_and_required_policy_are_enforced() {
         )
         .source(
             "src/tests/licensed.nexa",
-            "module tests.licensed;\n\
-             import host as test;\n\
-             pub fn Run(value: i32) -> i32 { return value; }",
+            "use host::test_host as test;\n\
+             pub fn run(value: i32) -> i32 { return value; }",
         ),
     );
     let mut engine = builder(licensed)
@@ -506,7 +713,7 @@ fn entitlement_lock_unlock_and_required_policy_are_enforced() {
         "required",
         "tests.required",
         "required",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     ))
     .build()
     .expect("build");
@@ -589,8 +796,8 @@ impl PackageSource for RemovableSource {
 #[test]
 fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
     let script = Arc::new(RwLock::new(
-        "module tests.reload;\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 { return value + 1; }"
+        "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
     let source = SharedSource {
@@ -604,12 +811,12 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
     engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.reload").expect("package ID");
     assert_eq!(engine.call::<Run>(&id, &1).expect("call v1").value, 2);
-    *script.write().expect("source lock") = "module tests.reload;\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 { return value + 2; }"
+    *script.write().expect("source lock") = "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 { return value + 2; }"
         .into();
     engine.reload(&id).expect("reload v2");
     assert_eq!(engine.call::<Run>(&id, &1).expect("call v2").value, 3);
-    *script.write().expect("source lock") = "pub fn Run(".into();
+    *script.write().expect("source lock") = "pub fn run(".into();
     assert!(matches!(
         engine.reload(&id),
         Err(EngineError::Source { .. } | EngineError::Diagnostic(_))
@@ -618,7 +825,7 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
     assert_eq!(
         engine
             .call::<Run>(&id, &1)
-            .expect("old module retained")
+            .expect("last known good artifact retained")
             .value,
         3
     );
@@ -626,23 +833,23 @@ fn reload_uses_fresh_source_and_rolls_back_compile_failure() {
 
 #[test]
 fn handler_yield_fault_isolated_and_dispatch_order_is_stable() {
-    let mut engine = builder(source(
+    let mut engine = task_builder(source(
         "normal",
         "tests.a-normal",
         "default-enabled",
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub async fn run(value: i32) -> i32 { return value; }",
     ))
     .package_source(source(
         "yielding",
         "tests.z-yield",
         "default-enabled",
-        "pub task fn Run(value: i32) -> i32 { yield; return value; }",
+        "pub async fn run(value: i32) -> i32 { yield; return value; }",
     ))
     .build()
     .expect("build");
     engine.discover().expect("discover");
     engine.enable_defaults().expect("enable");
-    let results = engine.dispatch::<Run>(&7);
+    let results = engine.dispatch::<TaskRun>(&7);
     assert_eq!(results.len(), 2);
     assert_eq!(
         results[0]
@@ -665,26 +872,29 @@ fn handler_yield_fault_isolated_and_dispatch_order_is_stable() {
 
 #[test]
 fn trap_fuel_yield_and_host_wait_are_distinct_package_failures() {
-    for (source_id, package_id, manifest_patch, script) in [
+    for (source_id, package_id, manifest_patch, is_task, script) in [
         (
             "trap",
             "tests.trap",
             "",
-            "pub fn Run(value: i32) -> i32 { let zero: i32 = 0; return value / zero; }",
+            false,
+            "pub fn run(value: i32) -> i32 { let zero: i32 = 0; return value / zero; }",
         ),
         (
             "fuel",
             "tests.fuel",
             "handler_fuel = 1",
-            "pub fn Run(value: i32) -> i32 { return value + 1; }",
+            false,
+            "pub fn run(value: i32) -> i32 { return value + 1; }",
         ),
         (
             "wait",
             "tests.wait",
             "",
-            "pub task fn Run(value: i32) -> i32 {
-                 let result: Result<i32, test.WaitError> = await test.wait(value);
-                 return match result { Ok(found) => found, Err(error) => 0 };
+            true,
+            "pub async fn run(value: i32) -> i32 {
+                 let result: Result<i32, test::WaitError> = test::wait(value).await;
+                 return match result { Result::Ok(found) => found, Result::Err(error) => 0 };
              }",
         ),
     ] {
@@ -698,17 +908,25 @@ fn trap_fuel_yield_and_host_wait_are_distinct_package_failures() {
             let module = module_name(package_id);
             MemoryPackage::new(package_id.replace('.', "-"), raw_manifest).source(
                 source_path(&module),
-                format!("module {module};\nimport host as test;\n{script}"),
+                format!("use host::test_host as test;\n{script}"),
             )
         });
-        let mut engine = builder(source).build().expect("build");
+        let mut engine = if is_task {
+            task_builder(source)
+        } else {
+            builder(source)
+        }
+        .build()
+        .expect("build");
         engine.discover().expect("discover");
         engine.enable_defaults().expect("enable");
         let id = PackageId::new(package_id).expect("package ID");
-        assert!(matches!(
-            engine.call::<Run>(&id, &7),
-            Err(EngineError::Handler(_, _))
-        ));
+        let result = if is_task {
+            engine.call::<TaskRun>(&id, &7)
+        } else {
+            engine.call::<Run>(&id, &7)
+        };
+        assert!(matches!(result, Err(EngineError::Handler(_, _))));
         assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
         assert_eq!(engine.health().host_pending_releases, 0);
         assert!(
@@ -726,26 +944,31 @@ fn runtime_trap_diagnostic_contains_script_stack_and_host_boundary() {
         "host-trap",
         "tests.host-trap",
         "default-enabled",
-        "pub task fn Run(value: i32) -> i32 {
-             let result: Result<i32, test.WaitError> = await test.wait(value);
-             return match result { Ok(found) => found, Err(error) => 0 };
+        "pub async fn run(value: i32) -> i32 {
+             let result: Result<i32, test::WaitError> = test::wait(value).await;
+             return match result { Result::Ok(found) => found, Result::Err(error) => 0 };
          }",
     );
-    let contract = contract();
-    let hash = contract.interface_hash;
+    let contract = task_contract();
+    let hash = contract.contract_runtime_id();
+    let idl = nexa_idl::parse_nidl(TASK_IDL_SOURCE).expect("test Task NIDL");
+    let authority = host_function_authority(&idl, "wait");
     let mut engine = NexaEngine::builder(contract)
         .host_factory(move |_: &nexa_embed::PackageContext| {
-            Box::new(TrappingRegistry(hash)) as Box<dyn HostRegistry>
+            Box::new(TrappingRegistry {
+                contract_runtime_id: hash,
+                authority: authority.clone(),
+            }) as Box<dyn HostRegistry>
         })
         .package_source(source)
-        .require_export::<Run>()
+        .require_export::<TaskRun>()
         .build()
         .expect("build");
     engine.discover().expect("discover");
     engine.enable_defaults().expect("enable");
     let id = PackageId::new("tests.host-trap").expect("package ID");
     assert!(matches!(
-        engine.call::<Run>(&id, &7),
+        engine.call::<TaskRun>(&id, &7),
         Err(EngineError::Handler(_, _))
     ));
     let diagnostic = engine
@@ -754,12 +977,12 @@ fn runtime_trap_diagnostic_contains_script_stack_and_host_boundary() {
         .find(|diagnostic| diagnostic.package_id.as_ref() == Some(&id))
         .expect("runtime diagnostic");
     assert!(diagnostic.file.is_some());
-    assert_eq!(diagnostic.context.export.as_deref(), Some("Run"));
+    assert_eq!(diagnostic.context.export.as_deref(), Some("run"));
     assert!(
         diagnostic
             .related
             .iter()
-            .any(|related| related.message.contains("at Run"))
+            .any(|related| related.message.contains("at run"))
     );
     assert!(
         diagnostic
@@ -790,12 +1013,10 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
             SourceId::new("policy-capability").expect("source ID"),
             policy.clone(),
         )
-        .package(
-            MemoryPackage::new("tests-policy", excessive).source(
-                "src/tests/policy.nexa",
-                "module tests.policy;\nimport host as test;\npub fn Run(value: i32) -> i32 { return value; }",
-            ),
-        )
+        .package(MemoryPackage::new("tests-policy", excessive).source(
+            "src/tests/policy.nexa",
+            "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value; }",
+        ),)
         .discover(&CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec())),
         Err(PackageSourceError::Policy(
             nexa_embed::ManifestError::CapabilityCeiling
@@ -810,7 +1031,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
         .package(
             MemoryPackage::new("tests-policy", illegal_activation).source(
                 "src/tests/policy.nexa",
-                "module tests.policy;\nimport host as test;\npub fn Run(value: i32) -> i32 { return value; }",
+                "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value; }",
             ),
         )
         .discover(&CandidateBuildContext::new(IDL_SOURCE.as_bytes().to_vec())),
@@ -823,7 +1044,7 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
         "broken",
         "tests.broken",
         "default-enabled",
-        "pub fn Run(",
+        "pub fn run(",
     ))
     .build()
     .expect("build");
@@ -838,9 +1059,9 @@ fn policy_rejections_and_enable_failure_leave_no_runtime() {
 #[test]
 fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
     let script = Arc::new(RwLock::new(
-        "module tests.state;\nimport host as test;\n\
-         @stateful(1) class Store { value: i32; }\n\
-         pub fn Run(value: i32) -> i32 { return value + 1; }"
+        "use host::test_host as test;\n\
+         @state(version = 1) class Store { mut value: i32, }\n\
+         pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
     let source = SharedSource {
@@ -857,9 +1078,9 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         .set_state_i32(&id, "store", "Store", 1, "value", 9)
         .expect("insert state");
 
-    *script.write().expect("source lock") = "module tests.state;\nimport host as test;\n\
-         @stateful(1) class Store { value: i32; }\n\
-         pub fn Run(value: i32) -> i32 { return value + 2; }"
+    *script.write().expect("source lock") = "use host::test_host as test;\n\
+         @state(version = 1) class Store { mut value: i32, }\n\
+         pub fn run(value: i32) -> i32 { return value + 2; }"
         .into();
     assert_eq!(engine.reload_changed().expect("change scan reload"), 1);
     assert_eq!(engine.call::<Run>(&id, &1).expect("v2").value, 3);
@@ -870,17 +1091,17 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         Some(9)
     );
 
-    *script.write().expect("source lock") = "module tests.state;\nimport host as test;\n\
-         @stateful(2) class Store { value: i32; extra: i32; }\n\
-         pub fn Run(value: i32) -> i32 { return value + 3; }"
+    *script.write().expect("source lock") = "use host::test_host as test;\n\
+         @state(version = 2) class Store { mut value: i32, mut extra: i32, }\n\
+         pub fn run(value: i32) -> i32 { return value + 3; }"
         .into();
     assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
     assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
     assert_eq!(engine.call::<Run>(&id, &1).expect("rollback old").value, 3);
 
-    *script.write().expect("source lock") = "module tests.state;\nimport host as test;\n\
-         @stateful(1) class Store { value: i32; }\n\
-         pub fn Run(value: i32) -> i32 { return value + 4; }\n\
+    *script.write().expect("source lock") = "use host::test_host as test;\n\
+         @state(version = 1) class Store { mut value: i32, }\n\
+         pub fn run(value: i32) -> i32 { return value + 4; }\n\
          @activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
         .into();
     assert!(matches!(
@@ -894,9 +1115,9 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
 #[test]
 fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     let script = Arc::new(RwLock::new(
-        "module tests.stress;\nimport host as test;\n\
-         @stateful(1) class Store { value: i32; }\n\
-         pub fn Run(value: i32) -> i32 { return value; }"
+        "use host::test_host as test;\n\
+         @state(version = 1) class Store { mut value: i32, }\n\
+         pub fn run(value: i32) -> i32 { return value; }"
             .to_owned(),
     ));
     let source = SharedSource {
@@ -915,9 +1136,9 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
 
     for generation in 1..=100 {
         *script.write().expect("source lock") = format!(
-            "module tests.stress;\nimport host as test;\n\
-             @stateful(1) class Store {{ value: i32; }}\n\
-             pub fn Run(value: i32) -> i32 {{ return value + {generation}; }}"
+            "use host::test_host as test;\n\
+             @state(version = 1) class Store {{ mut value: i32, }}\n\
+             pub fn run(value: i32) -> i32 {{ return value + {generation}; }}"
         );
         engine.reload(&id).expect("successful reload");
         engine.tick().expect("maintenance tick");
@@ -931,7 +1152,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     assert_eq!(engine.call::<Run>(&id, &1).expect("latest").value, 101);
 
     for _ in 0..100 {
-        *script.write().expect("source lock") = "pub fn Run(".into();
+        *script.write().expect("source lock") = "pub fn run(".into();
         assert!(matches!(
             engine.reload(&id),
             Err(EngineError::Source { .. } | EngineError::Diagnostic(_))
@@ -940,7 +1161,7 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     }
     for _ in 0..100 {
         *script.write().expect("source lock") =
-            "module tests.stress;\nimport host as test;\npub fn Run(value: i32) -> i32 { return missing; }"
+            "use host::test_host as test;\npub fn run(value: i32) -> i32 { return missing; }"
                 .into();
         assert!(matches!(
             engine.reload(&id),
@@ -949,9 +1170,9 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
         assert_eq!(engine.call::<Run>(&id, &1).expect("type LKG").value, 101);
     }
     for _ in 0..100 {
-        *script.write().expect("source lock") = "module tests.stress;\nimport host as test;\n\
-             @stateful(2) class Store { value: i32; extra: i32; }\n\
-             pub fn Run(value: i32) -> i32 { return value + 999; }"
+        *script.write().expect("source lock") = "use host::test_host as test;\n\
+             @state(version = 2) class Store { mut value: i32, mut extra: i32, }\n\
+             pub fn run(value: i32) -> i32 { return value + 999; }"
             .into();
         assert!(matches!(engine.reload(&id), Err(EngineError::Reload(_, _))));
         assert_eq!(
@@ -961,9 +1182,9 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     }
 
     for generation in 1..=10 {
-        *script.write().expect("source lock") = "module tests.stress;\nimport host as test;\n\
-             @stateful(1) class Store { value: i32; }\n\
-             pub fn Run(value: i32) -> i32 { return value; }\n\
+        *script.write().expect("source lock") = "use host::test_host as test;\n\
+             @state(version = 1) class Store { mut value: i32, }\n\
+             pub fn run(value: i32) -> i32 { return value; }\n\
              @activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
             .into();
         assert!(matches!(
@@ -973,9 +1194,9 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
         assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
 
         *script.write().expect("source lock") = format!(
-            "module tests.stress;\nimport host as test;\n\
-             @stateful(1) class Store {{ value: i32; }}\n\
-             pub fn Run(value: i32) -> i32 {{ return value + {generation}; }}"
+            "use host::test_host as test;\n\
+             @state(version = 1) class Store {{ mut value: i32, }}\n\
+             pub fn run(value: i32) -> i32 {{ return value + {generation}; }}"
         );
         engine.reload(&id).expect("fault recovery reload");
         assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
@@ -1004,8 +1225,8 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
 #[allow(clippy::too_many_lines)]
 fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     let script = Arc::new(RwLock::new(
-        "module tests.dev;\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 { return value + 1; }"
+        "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
     let source = SharedSource {
@@ -1027,8 +1248,7 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     let id = PackageId::new("tests.dev").expect("package ID");
 
     *script.write().expect("source lock") =
-        "module tests.dev;\nimport host as test;\npub fn Run(value: i32) -> i32 { return value + 2; }"
-            .into();
+        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value + 2; }".into();
     let observed = engine.tick().expect("observe save");
     assert!(
         observed
@@ -1091,8 +1311,7 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
     assert_eq!(engine.call::<Run>(&id, &1).expect("new active").value, 3);
 
     *script.write().expect("source lock") =
-        "module tests.dev;\nimport host as test;\npub fn Run(value: i32) -> i32 { return missing; }"
-            .into();
+        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return missing; }".into();
     engine.tick().expect("observe invalid");
     engine.tick().expect("queue invalid");
     let mut failed = false;
@@ -1121,8 +1340,8 @@ fn dev_engine_stabilizes_saves_and_commits_only_from_tick() {
 #[test]
 fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearance() {
     let script = Arc::new(RwLock::new(
-        "module tests.removable;\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 { return value + 1; }"
+        "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
     let available = Arc::new(RwLock::new(true));
@@ -1148,8 +1367,7 @@ fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearanc
     let package_id = PackageId::new("tests.removable").expect("package ID");
 
     *script.write().expect("source lock") =
-        "module tests.removable;\nimport host as test;\npub fn Run(value: i32) -> i32 { return value + 2; }"
-            .into();
+        "use host::test_host as test;\npub fn run(value: i32) -> i32 { return value + 2; }".into();
     engine.tick().expect("queue changed source");
     *available.write().expect("availability lock") = false;
     let missing = engine.tick().expect("observe source removal");
@@ -1213,8 +1431,8 @@ fn source_removal_cancels_generation_keeps_active_and_recovers_after_reappearanc
 #[test]
 fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
     let script = Arc::new(RwLock::new(
-        "module tests.disable_race;\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 { return value + 1; }"
+        "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 { return value + 1; }"
             .to_owned(),
     ));
     let source = SharedSource {
@@ -1234,9 +1452,7 @@ fn engine_disable_cancels_in_flight_candidate_without_late_ready_state() {
     engine.discover().expect("discover");
     let package_id = PackageId::new("tests.disable-race").expect("package ID");
     engine.enable(&package_id).expect("enable");
-    let mut slow = String::from(
-        "module tests.disable_race;\nimport host as test;\npub fn Run(value: i32) -> i32 {\n",
-    );
+    let mut slow = String::from("use host::test_host as test;\npub fn run(value: i32) -> i32 {\n");
     for index in 0..1_000 {
         writeln!(&mut slow, "let value_{index}: i32 = {index};").expect("write slow source");
     }
@@ -1297,10 +1513,10 @@ struct GenerationAccountingEvidence {
     missing: u64,
 }
 
-fn accounting_script(module: &str, delta: i32) -> String {
+fn accounting_script(_module: &str, delta: i32) -> String {
     format!(
-        "module {module};\nimport host as test;\n\
-         pub fn Run(value: i32) -> i32 {{ return value + {delta}; }}"
+        "use host::test_host as test;\n\
+         pub fn run(value: i32) -> i32 {{ return value + {delta}; }}"
     )
 }
 
@@ -1611,7 +1827,7 @@ fn directory_source_rejects_traversal_and_persistence_restores_selection() {
     .expect("write manifest");
     std::fs::write(
         root.join("outside.nexa"),
-        "pub fn Run(value: i32) -> i32 { return value; }",
+        "pub fn run(value: i32) -> i32 { return value; }",
     )
     .expect("write outside script");
     let directory = DirectorySource::new(
@@ -1631,7 +1847,7 @@ fn directory_source_rejects_traversal_and_persistence_restores_selection() {
             "persisted",
             "tests.persisted",
             "user-controlled",
-            "pub fn Run(value: i32) -> i32 { return value; }",
+            "pub fn run(value: i32) -> i32 { return value; }",
         ))
         .storage_dir(&storage)
         .build()

@@ -1,7 +1,8 @@
-@stateful(1) class FixtureState {
-    value: i32;
+@state(version = 1)
+class FixtureState {
+    mut value: i32,
 }
 
-task fn update(value: i32) -> i32 {
+async fn update(value: i32) -> i32 {
     return value;
 }

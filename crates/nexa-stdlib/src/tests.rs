@@ -28,7 +28,8 @@ fn versioned_module_set_is_fixed_and_resolvable() {
         ]
     );
     assert!(library.module("string").is_some());
-    assert!(library.module("std.string").is_some());
+    assert!(library.module("std::string").is_some());
+    assert!(library.module("std.string").is_none());
     assert!(library.module("missing").is_none());
 }
 
@@ -138,7 +139,7 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(library.modules().len(), expected_modules.len());
     assert!(
         library.modules().iter().all(|module| !module.prelude),
-        "every stdlib module must require an explicit namespace import"
+        "every stdlib module must require an explicit namespace use"
     );
     for (module, (expected_name, expected_types, expected_functions)) in
         library.modules().iter().zip(expected_modules)
@@ -163,39 +164,39 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     }
 
     let required_intrinsics = [
-        ("core.is_ok", Intrinsic::ResultIsOk),
-        ("core.is_err", Intrinsic::ResultIsErr),
-        ("core.option_unwrap_or", Intrinsic::OptionUnwrapOr),
-        ("core.result_unwrap_or", Intrinsic::ResultUnwrapOr),
-        ("core.to_string_string", Intrinsic::StringToString),
-        ("core.to_string_i32", Intrinsic::I32ToString),
-        ("core.to_string_i64", Intrinsic::I64ToString),
-        ("core.to_string_f32", Intrinsic::F32ToString),
-        ("core.to_string_f64", Intrinsic::F64ToString),
-        ("core.to_string_bool", Intrinsic::BoolToString),
-        ("core.to_string_rune", Intrinsic::RuneToString),
-        ("math.floor_f32", Intrinsic::F32Floor),
-        ("math.floor_f64", Intrinsic::F64Floor),
-        ("math.ceil_f32", Intrinsic::F32Ceil),
-        ("math.ceil_f64", Intrinsic::F64Ceil),
-        ("math.round_f32", Intrinsic::F32Round),
-        ("math.round_f64", Intrinsic::F64Round),
-        ("math.sqrt_f32", Intrinsic::F32Sqrt),
-        ("math.sqrt_f64", Intrinsic::F64Sqrt),
-        ("math.sin_f32", Intrinsic::F32Sin),
-        ("math.sin_f64", Intrinsic::F64Sin),
-        ("math.cos_f32", Intrinsic::F32Cos),
-        ("math.cos_f64", Intrinsic::F64Cos),
-        ("string.len", Intrinsic::StringLen),
-        ("string.byte_len", Intrinsic::StringByteLen),
-        ("string.trim", Intrinsic::StringTrim),
-        ("string.split", Intrinsic::StringSplit),
-        ("collections.array_push", Intrinsic::ArrayPush),
-        ("collections.array_pop", Intrinsic::ArrayPop),
-        ("collections.map_insert", Intrinsic::MapInsert),
-        ("collections.map_remove", Intrinsic::MapRemove),
-        ("debug.assert", Intrinsic::DebugAssert),
-        ("debug.trap", Intrinsic::DebugTrap),
+        ("core::is_ok", Intrinsic::ResultIsOk),
+        ("core::is_err", Intrinsic::ResultIsErr),
+        ("core::option_unwrap_or", Intrinsic::OptionUnwrapOr),
+        ("core::result_unwrap_or", Intrinsic::ResultUnwrapOr),
+        ("core::to_string_string", Intrinsic::StringToString),
+        ("core::to_string_i32", Intrinsic::I32ToString),
+        ("core::to_string_i64", Intrinsic::I64ToString),
+        ("core::to_string_f32", Intrinsic::F32ToString),
+        ("core::to_string_f64", Intrinsic::F64ToString),
+        ("core::to_string_bool", Intrinsic::BoolToString),
+        ("core::to_string_rune", Intrinsic::RuneToString),
+        ("math::floor_f32", Intrinsic::F32Floor),
+        ("math::floor_f64", Intrinsic::F64Floor),
+        ("math::ceil_f32", Intrinsic::F32Ceil),
+        ("math::ceil_f64", Intrinsic::F64Ceil),
+        ("math::round_f32", Intrinsic::F32Round),
+        ("math::round_f64", Intrinsic::F64Round),
+        ("math::sqrt_f32", Intrinsic::F32Sqrt),
+        ("math::sqrt_f64", Intrinsic::F64Sqrt),
+        ("math::sin_f32", Intrinsic::F32Sin),
+        ("math::sin_f64", Intrinsic::F64Sin),
+        ("math::cos_f32", Intrinsic::F32Cos),
+        ("math::cos_f64", Intrinsic::F64Cos),
+        ("string::len", Intrinsic::StringLen),
+        ("string::byte_len", Intrinsic::StringByteLen),
+        ("string::trim", Intrinsic::StringTrim),
+        ("string::split", Intrinsic::StringSplit),
+        ("collections::array_push", Intrinsic::ArrayPush),
+        ("collections::array_pop", Intrinsic::ArrayPop),
+        ("collections::map_insert", Intrinsic::MapInsert),
+        ("collections::map_remove", Intrinsic::MapRemove),
+        ("debug::assert", Intrinsic::DebugAssert),
+        ("debug::trap", Intrinsic::DebugTrap),
     ];
     for (qualified_name, expected_intrinsic) in required_intrinsics {
         let (_, function) = library
@@ -238,16 +239,16 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(library.version.to_string(), "1.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0x0f26_2e7b_37fa_52e4);
+    assert_eq!(library.descriptor_hash().0, 0x0b8d_0af1_0914_42c6);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
     assert_eq!(library.symbols().count(), 75);
 
     let canonical_lower = canonical.to_ascii_lowercase();
     for forbidden in [
-        "import host",
+        "use host::",
         "capability",
         "realm",
-        "task fn",
+        "async fn",
         "log(",
         "print(",
     ] {
@@ -265,7 +266,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0x0f26_2e7b_37fa_52e4);
+    assert_eq!(library.descriptor_hash().0, 0x0b8d_0af1_0914_42c6);
 
     let symbols = library
         .symbols()
@@ -278,7 +279,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     }));
 
     let (module, function) = library
-        .function("std.math.clamp_i32")
+        .function("std::math::clamp_i32")
         .expect("canonical standard function");
     assert_eq!(module.name, "math");
     assert_eq!(
@@ -286,7 +287,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
         "pub fn clamp_i32(value:i32,low:i32,high:i32)->i32"
     );
     let (module, ty) = library
-        .ty("std.math.Vec2")
+        .ty("std::math::Vec2")
         .expect("canonical standard type");
     assert_eq!(module.name, "math");
     assert_eq!(ty.canonical_declaration(), "pub struct Vec2{x:f32,y:f32}");
@@ -321,10 +322,10 @@ fn descriptors_are_static_deterministic_and_have_no_ambient_authority() {
     for module in library.modules() {
         let source = module.source.to_ascii_lowercase();
         for forbidden in [
-            "import host",
+            "use host::",
             "capability",
             "realm",
-            "task fn",
+            "async fn",
             "log(",
             "print(",
         ] {
@@ -334,7 +335,11 @@ fn descriptors_are_static_deterministic_and_have_no_ambient_authority() {
                 module.path
             );
         }
-        assert!(source.starts_with(&format!("module {};", module.path)));
+        assert!(
+            !source.trim_start().starts_with("module "),
+            "{} source declares a module instead of deriving it from its path",
+            module.path
+        );
         assert!(module.functions.iter().all(|function| matches!(
             function.behavior.effect,
             Effect::Pure | Effect::LocalMutation
@@ -355,10 +360,10 @@ fn core_option_and_result_helpers_have_reference_and_intrinsic_models() {
 
     let library = standard_library();
     for (name, intrinsic) in [
-        ("core.is_ok", Intrinsic::ResultIsOk),
-        ("core.is_err", Intrinsic::ResultIsErr),
-        ("core.option_unwrap_or", Intrinsic::OptionUnwrapOr),
-        ("core.result_unwrap_or", Intrinsic::ResultUnwrapOr),
+        ("core::is_ok", Intrinsic::ResultIsOk),
+        ("core::is_err", Intrinsic::ResultIsErr),
+        ("core::option_unwrap_or", Intrinsic::OptionUnwrapOr),
+        ("core::result_unwrap_or", Intrinsic::ResultUnwrapOr),
     ] {
         let (_, function) = library.function(name).expect("core descriptor");
         assert_eq!(function.lowering, Lowering::CompilerIntrinsic(intrinsic));
@@ -404,15 +409,15 @@ fn scalar_to_string_trim_and_split_are_locale_free() {
 
     let library = standard_library();
     for (name, intrinsic) in [
-        ("core.to_string_string", Intrinsic::StringToString),
-        ("core.to_string_i32", Intrinsic::I32ToString),
-        ("core.to_string_i64", Intrinsic::I64ToString),
-        ("core.to_string_f32", Intrinsic::F32ToString),
-        ("core.to_string_f64", Intrinsic::F64ToString),
-        ("core.to_string_bool", Intrinsic::BoolToString),
-        ("core.to_string_rune", Intrinsic::RuneToString),
-        ("string.trim", Intrinsic::StringTrim),
-        ("string.split", Intrinsic::StringSplit),
+        ("core::to_string_string", Intrinsic::StringToString),
+        ("core::to_string_i32", Intrinsic::I32ToString),
+        ("core::to_string_i64", Intrinsic::I64ToString),
+        ("core::to_string_f32", Intrinsic::F32ToString),
+        ("core::to_string_f64", Intrinsic::F64ToString),
+        ("core::to_string_bool", Intrinsic::BoolToString),
+        ("core::to_string_rune", Intrinsic::RuneToString),
+        ("string::trim", Intrinsic::StringTrim),
+        ("string::split", Intrinsic::StringSplit),
     ] {
         let (_, function) = library.function(name).expect("stdlib descriptor");
         assert_eq!(function.lowering, Lowering::CompilerIntrinsic(intrinsic));
@@ -463,8 +468,8 @@ fn extended_math_and_vector_operations_have_catalog_entries() {
     assert!((math::vec3_length(first) - 3.0).abs() < f32::EPSILON);
 
     let library = standard_library();
-    assert!(library.ty("math.Vec2").is_some());
-    assert!(library.ty("math.Vec3").is_some());
+    assert!(library.ty("math::Vec2").is_some());
+    assert!(library.ty("math::Vec3").is_some());
     for name in [
         "floor_f32",
         "floor_f64",
@@ -492,7 +497,7 @@ fn extended_math_and_vector_operations_have_catalog_entries() {
         "vec3_length",
     ] {
         assert!(
-            library.function(&format!("math.{name}")).is_some(),
+            library.function(&format!("math::{name}")).is_some(),
             "missing math descriptor {name}"
         );
     }
@@ -598,10 +603,10 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
 
     let library = standard_library();
     for (name, intrinsic) in [
-        ("collections.array_push", Intrinsic::ArrayPush),
-        ("collections.array_pop", Intrinsic::ArrayPop),
-        ("collections.map_insert", Intrinsic::MapInsert),
-        ("collections.map_remove", Intrinsic::MapRemove),
+        ("collections::array_push", Intrinsic::ArrayPush),
+        ("collections::array_pop", Intrinsic::ArrayPop),
+        ("collections::map_insert", Intrinsic::MapInsert),
+        ("collections::map_remove", Intrinsic::MapRemove),
     ] {
         let (_, function) = library.function(name).expect("collection descriptor");
         assert_eq!(function.lowering, Lowering::CompilerIntrinsic(intrinsic));
@@ -621,7 +626,7 @@ fn debug_operations_return_traps_as_data_and_never_log() {
     assert_eq!(explicit.message, "stop");
 
     let library = standard_library();
-    let (_, trap) = library.function("debug.trap").expect("trap descriptor");
+    let (_, trap) = library.function("debug::trap").expect("trap descriptor");
     assert_eq!(
         trap.lowering,
         Lowering::CompilerIntrinsic(Intrinsic::DebugTrap)

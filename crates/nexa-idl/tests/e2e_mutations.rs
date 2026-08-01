@@ -17,12 +17,12 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
     clear_case_artifacts(&root);
     let shared_target = root.join("cargo-target");
     let base_idl = nexa_idl::parse(e2e_support::BASE_NIDL).expect("base NIDL parses");
-    let base_hash = nexa_idl::exact_hash(&base_idl);
-    let base_generated = nexa_idl::generate_rust(&base_idl);
+    let base_contract_runtime_id = nexa_idl::contract_runtime_id(&base_idl);
+    let base_generated = nexa_idl::generate_rust(&base_idl).expect("base bindings generate");
     let context = CaseContext {
         root: &root,
         shared_target: &shared_target,
-        base_hash,
+        base_contract_runtime_id,
         base_generated: &base_generated,
     };
     let evidence = mutations()
@@ -36,7 +36,7 @@ fn twenty_real_nidl_mutations_close_the_binding_contract_end_to_end() {
 struct CaseContext<'a> {
     root: &'a Path,
     shared_target: &'a Path,
-    base_hash: StableId,
+    base_contract_runtime_id: StableId,
     base_generated: &'a str,
 }
 
@@ -59,17 +59,27 @@ fn clear_case_artifacts(root: &Path) {
 fn execute_mutation(context: &CaseContext<'_>, mutation: &MutationCase) -> MutationEvidence {
     let changed_idl = nexa_idl::parse(&mutation.mutated_nidl)
         .unwrap_or_else(|error| panic!("{} must parse: {error}", mutation.name));
-    let changed_hash = nexa_idl::exact_hash(&changed_idl);
-    if mutation.expected_changed_interface_hash {
-        assert_ne!(changed_hash, context.base_hash, "{}", mutation.name);
+    let changed_contract_runtime_id = nexa_idl::contract_runtime_id(&changed_idl);
+    if mutation.expected_changed_contract_runtime_id {
+        assert_ne!(
+            changed_contract_runtime_id, context.base_contract_runtime_id,
+            "{}",
+            mutation.name
+        );
     }
-    let first = nexa_idl::generate_rust(&changed_idl);
-    let second = nexa_idl::generate_rust(&changed_idl);
-    let third = nexa_idl::generate_rust(&changed_idl);
+    let first = nexa_idl::generate_rust(&changed_idl).expect("first binding generation");
+    let second = nexa_idl::generate_rust(&changed_idl).expect("second binding generation");
+    let third = nexa_idl::generate_rust(&changed_idl).expect("third binding generation");
     assert_eq!(first, second, "{} generation 1/2", mutation.name);
     assert_eq!(second, third, "{} generation 2/3", mutation.name);
 
-    let case = prepare_case(context.root, mutation, context.base_generated, &first);
+    let case = prepare_case(
+        context.root,
+        mutation,
+        &changed_idl,
+        context.base_generated,
+        &first,
+    );
     let unchanged = check_business_host(&case, &first, BUSINESS_HOST_V1, context.shared_target);
     assert_eq!(
         unchanged.status.success(),
@@ -116,8 +126,8 @@ fn execute_mutation(context: &CaseContext<'_>, mutation: &MutationCase) -> Mutat
     MutationEvidence {
         id: mutation.id,
         name: mutation.name,
-        base_interface_hash: context.base_hash,
-        changed_interface_hash: changed_hash,
+        base_contract_runtime_id: context.base_contract_runtime_id,
+        changed_contract_runtime_id,
         base_generated_hash: stable_bytes_hash(context.base_generated),
         changed_generated_hash: stable_bytes_hash(&first),
         unchanged_business_host_should_compile: mutation.unchanged_business_host_should_compile,

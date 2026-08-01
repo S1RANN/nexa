@@ -415,8 +415,34 @@ impl FrameArena {
         }
     }
 
+    pub(crate) fn peek_defer_for_current_frame(&self) -> Result<Option<DeferAction>, FrameError> {
+        self.peek_defer_for_frame(self.depth().checked_sub(1).ok_or(FrameError::NoFrame)?)
+    }
+
+    pub(crate) fn peek_defer_for_frame(
+        &self,
+        frame_index: usize,
+    ) -> Result<Option<DeferAction>, FrameError> {
+        let frame = self.frames.get(frame_index).ok_or(FrameError::NoFrame)?;
+        let defer_end = self
+            .frames
+            .get(frame_index + 1)
+            .map_or(self.defer_records.len(), |child| child.defer_start as usize);
+        let defer_start = frame.defer_start as usize;
+        if defer_end > defer_start {
+            Ok(self.defer_records.get(defer_end - 1).copied())
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn defers_rev(&self) -> impl Iterator<Item = DeferAction> + '_ {
         self.defer_records.iter().rev().copied()
+    }
+
+    #[must_use]
+    pub(crate) fn defer_len(&self) -> usize {
+        self.defer_records.len()
     }
 
     #[must_use]

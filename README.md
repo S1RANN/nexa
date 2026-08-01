@@ -33,6 +33,13 @@ Task Runtime Stabilization = COMPLETE
 Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
+Nexa M4R1 Language Surface Reset = COMPLETE
+Nexa Language v2 = COMPLETE
+NIDL v2 = COMPLETE
+Structured Codegen v2 = COMPLETE
+Standalone Profile v1 = COMPLETE
+REPL v1 = COMPLETE
+Multiple Entrypoint Model = COMPLETE
 Multi-file Source Modules = COMPLETE
 Static Local Libraries = COMPLETE
 Incremental Analysis = COMPLETE
@@ -62,32 +69,44 @@ Nexa source
 
 M4 keeps Runtime isolation simple while scaling the language frontend. A
 schema 2 Application and its lockfile-pinned local Library closure compile to
-one deterministic Package Artifact, one Realm, and one Epoch. Imports always
-bind namespaces, Host access is explicit (`import host as app;`), and
-module-private, `pub(package)`, and `pub` visibility are distinct.
+one deterministic Package Artifact, one Realm, and one Epoch. M4R1 freezes the
+breaking Language v2 surface: modules are derived from source paths, `use`
+binds namespaces, Host access is explicit (`use host::app;`), and
+module-private, `pub(package)`, and `pub` visibility remain distinct. There is
+no source-level compatibility mode for the M4 syntax.
 
 M4 completion is enforced by the source, semantics, incremental, tooling, and
 scale-stress gates in `cargo xtask check`. Publication is finalized from the
 annotated `language-scale-m4-complete` tag, with the clean-HEAD report written
 to `target/nexa-artifacts/m4-finalize/final-report.json`.
 
+M4R1 completion is enforced by `cargo xtask finalize-m4-r1`; the clean tagged
+report is written to
+`target/nexa-artifacts/m4r1-finalize/final-report.json`, and the publication
+authority is the annotated `language-scale-m4-complete-r1` tag.
+
 See [Source Modules](docs/MODULES.md),
 [Local Libraries](docs/LOCAL_LIBRARIES.md),
 [Incremental Analysis](docs/INCREMENTAL_ANALYSIS.md),
 [M4 Language Additions](docs/M4_LANGUAGE.md),
 [Standard Library](docs/STANDARD_LIBRARY.md),
-[Package Tests](docs/PACKAGE_TESTS.md), and the
+[Package Tests](docs/PACKAGE_TESTS.md),
+[NIDL v2](docs/NIDL.md),
+[Standalone](docs/STANDALONE.md),
+[REPL](docs/REPL.md), and the
 [schema 2 migration guide](docs/MIGRATING_TO_M4.md).
 
 `examples/hello-runtime` is the minimal high-level onboarding example. It uses
 `nexa-embed` to discover one in-memory package, enable it, call a generated
-typed export, and print `hello, world`; it does not manage Realm, Scope, Task,
-or release queues. `examples/combat-runtime` remains the low-level consistency
-example. Its
+typed entrypoint, and print `hello, world`; it does not manage Realm, Scope,
+Task, or release queues. `examples/combat-runtime` remains the low-level
+consistency example. Its
 `combat_api.nidl` is the only Host API source and generates the Rust Trait,
-Dispatcher, codecs, stable function IDs, Exact Interface Hash, Nexa
-declaration, and test Stub into `OUT_DIR`. The Host implements only that
-Trait.
+Dispatcher, codecs, stable function IDs, full ABI Descriptor v2 and Contract
+fingerprint, typed Nexa entrypoint markers, and test Stub into `OUT_DIR`. A
+Package build derives its smaller effective Contract fingerprint from the
+surface actually used by its linked closure. The Host implements only the
+generated Trait.
 
 Restart Reload stops admission, cancels old Tasks, detaches old Requests,
 migrates state on staging, commits the new root, then activates it. Migration
@@ -135,6 +154,8 @@ The repository pins Rust `1.97.1` in `rust-toolchain.toml`.
 cargo run -p nexa-cli -- compile examples/add.nexa
 cargo run -p nexa-cli -- check --project nexa.dev.toml
 cargo run -p nexa-cli -- dev --project nexa.dev.toml
+cargo run -p nexa-cli -- run examples/hello-runtime/hello.nexa -- Alice
+cargo run -p nexa-cli -- repl
 cargo run -p hello-runtime
 cargo run -p combat-runtime
 cargo run -p snake-game
@@ -143,6 +164,7 @@ cargo xtask finalize-m1
 cargo xtask finalize-m3-r1
 cargo xtask finalize-m3-r2
 cargo xtask finalize-m3-r3
+cargo xtask finalize-m4-r1
 ```
 
 Focused commands are documented in [Testing](docs/TESTING.md). Generated

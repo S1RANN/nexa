@@ -1,44 +1,111 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nexa_bytecode::{
     AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-    ModuleBuilder, RootMap, Signature, SourceMapEntry, StandardIntrinsic, StructField, StructType,
-    ValueType,
+    ModuleBuilder, RootMap, ScriptExport, Signature, SourceMapEntry, StandardIntrinsic,
+    StructField, StructType, ValueType,
 };
 use nexa_core::{FileId, SourceSpan, StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostPayload,
-    HostRegistry, HostRequestError, HostTrap, Object, PendingHostRequest, RealmConfig, RealmError,
-    RealmRuntime, ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint, RuntimeHost,
-    RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
+    CancelReason, HostCallOutcome, HostCompletionResult, HostErrorPayload, HostFunctionAuthority,
+    HostPayload, HostRegistry, HostRequestError, HostTrap, Object, PendingHostRequest, RealmConfig,
+    RealmError, RealmRuntime, ReleaseKind, ResourceContext, RuntimeError, RuntimeFailurePoint,
+    RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig, TaskHandle, TaskLimits, TaskPoll,
     TaskTerminalReason, TickBudget, YieldReason,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const HOST: StableId = StableId(0x5441_534b_484f_5354);
-
+const ASYNC_EXPORT: StableId = StableId(0x544c_4153_594e_4301);
+const NOMINAL_ASYNC_EXPORT: StableId = StableId(0x544c_4153_594e_4302);
+const IMMEDIATE_EXPORT: StableId = StableId(0x544c_494d_4d45_4401);
+const YIELDING_EXPORT: StableId = StableId(0x544c_5949_454c_4401);
+const BUDGET_EXPORT: StableId = StableId(0x544c_4255_4447_4501);
 fn schema() -> StateSchemaFingerprint {
     nexa_bytecode::StateSchema::default().fingerprint()
 }
 
 struct AsyncRegistry {
+    contract_runtime_id: StableId,
     pending: Arc<Mutex<Option<PendingHostRequest>>>,
     panic: bool,
 }
 
 impl HostRegistry for AsyncRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(HOST)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        static REQUEST: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        static TYPED_ERROR: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        if id == StableId::from_name("TaskHost::request") {
+            return Some(REQUEST.get_or_init(|| {
+                let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+                HostFunctionAuthority::new(
+                    id,
+                    [0; 32],
+                    &[],
+                    Some(ValueType::Named(result.type_id)),
+                    HostCallMode::Async,
+                    1,
+                    Some(AsyncResultType {
+                        result_type: result.type_id,
+                        success: ValueType::I32,
+                        error: ValueType::I32,
+                        cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                        cancel_error: Some(1),
+                        abandon_error: None,
+                    }),
+                    &[],
+                )
+            }));
+        }
+        if id == StableId::from_name("TaskHost::typed_error") {
+            return Some(TYPED_ERROR.get_or_init(|| {
+                let success = ValueType::Named(StableId::from_name("Payload"));
+                let error = ValueType::Named(StableId::from_name("Failure"));
+                let result = nexa_bytecode::result_type(success, error);
+                HostFunctionAuthority::new(
+                    id,
+                    [0; 32],
+                    &[],
+                    Some(ValueType::Named(result.type_id)),
+                    HostCallMode::Async,
+                    1,
+                    Some(AsyncResultType {
+                        result_type: result.type_id,
+                        success,
+                        error,
+                        cancel_policy: nexa_bytecode::CancelPolicy::CancelTask,
+                        abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                        cancel_error: None,
+                        abandon_error: None,
+                    }),
+                    &[],
+                )
+            }));
+        }
+        None
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
         assert!(!self.panic, "injected host panic");
-        if id != 0 || !arguments.is_empty() {
+        if ![
+            StableId::from_name("TaskHost::request"),
+            StableId::from_name("TaskHost::typed_error"),
+        ]
+        .contains(&id)
+        {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if !arguments.is_empty() {
             return Err(HostTrap::Arity);
         }
         let pending = context
@@ -55,6 +122,10 @@ impl HostRegistry for AsyncRegistry {
 
 fn async_module() -> VerifiedModule {
     let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: Some(ValueType::Named(result.type_id)),
+    };
     let async_result = AsyncResultType {
         result_type: result.type_id,
         success: ValueType::I32,
@@ -64,13 +135,7 @@ fn async_module() -> VerifiedModule {
         cancel_error: Some(1),
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: Some(ValueType::Named(result.type_id)),
-        },
-        1,
-    );
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -97,13 +162,21 @@ fn async_module() -> VerifiedModule {
     module.metadata(HOST, schema()).enum_type(result);
     module.host_import(HostImport {
         stable_id: StableId::from_name("TaskHost::request"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: Vec::new(),
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
         fuel_cost: 1,
         async_result: Some(async_result),
     });
-    module.function(function);
+    let function = module.function(function);
+    module.script_export(ScriptExport {
+        stable_id: ASYNC_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("verified async module")
 }
 
@@ -114,6 +187,10 @@ fn async_nominal_result_module() -> VerifiedModule {
     let payload = ValueType::Named(payload_type);
     let failure = ValueType::Named(failure_type);
     let result = nexa_bytecode::result_type(payload, failure);
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: Some(ValueType::Named(result.type_id)),
+    };
     let async_result = AsyncResultType {
         result_type: result.type_id,
         success: payload,
@@ -123,13 +200,7 @@ fn async_nominal_result_module() -> VerifiedModule {
         cancel_error: None,
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: Some(ValueType::Named(result.type_id)),
-        },
-        1,
-    );
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -184,61 +255,73 @@ fn async_nominal_result_module() -> VerifiedModule {
         .enum_type(result)
         .host_import(HostImport {
             stable_id: StableId::from_name("TaskHost::typed_error"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
             parameters: Vec::new(),
             result: Some(ValueType::Named(async_result.result_type)),
             mode: HostCallMode::Async,
             fuel_cost: 1,
             async_result: Some(async_result),
         });
-    module.function(function);
+    let function = module.function(function);
+    module.script_export(ScriptExport {
+        stable_id: NOMINAL_ASYNC_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("verified nominal-result module")
 }
 
 fn immediate_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        1,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
-    module
-        .metadata(HOST, schema())
-        .function(function.finish().expect("immediate function"));
+    module.metadata(HOST, schema());
+    let function = module.function(function.finish().expect("immediate function"));
+    module.script_export(ScriptExport {
+        stable_id: IMMEDIATE_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("verified immediate module")
 }
 
 fn yielding_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        1,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::Yield)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
-    module
-        .metadata(HOST, schema())
-        .function(function.finish().expect("yielding function"));
+    module.metadata(HOST, schema());
+    let function = module.function(function.finish().expect("yielding function"));
+    module.script_export(ScriptExport {
+        stable_id: YIELDING_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("verified yielding module")
 }
 
 fn nested_budget_module() -> VerifiedModule {
-    let mut entry = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::F64],
-            result: Some(ValueType::F64),
-        },
-        2,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::F64],
+        result: Some(ValueType::F64),
+    };
+    let mut entry = FunctionBuilder::new(signature.clone(), 2);
     entry
         .effect(FunctionEffect::Task)
         .emit(Instruction::Call {
@@ -268,8 +351,14 @@ fn nested_budget_module() -> VerifiedModule {
     let callee_intrinsic = SourceSpan::new(FileId(5), 40, 52);
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, schema());
-    module.function(entry.finish().expect("entry"));
+    let entry = module.function(entry.finish().expect("entry"));
     module.function(callee.finish().expect("callee"));
+    module.script_export(ScriptExport {
+        stable_id: BUDGET_EXPORT,
+        function: entry,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     module.source_map([
         SourceMapEntry {
             function: 0,
@@ -310,7 +399,7 @@ fn budget_exhaustion_retains_exact_leaf_to_root_stack_and_final_charge() {
     let task = realm
         .spawn_task(
             module,
-            0,
+            BUDGET_EXPORT,
             &[RuntimeValue::F64(0.5_f64.to_bits())],
             StepConfig {
                 owner: scope,
@@ -332,7 +421,7 @@ fn budget_exhaustion_retains_exact_leaf_to_root_stack_and_final_charge() {
         TaskTerminalReason::Cancelled(CancelReason::BudgetExceeded)
     );
     assert_eq!(terminal.final_charge.instructions, 1);
-    assert_eq!(terminal.final_charge.fuel_used, 1);
+    assert_eq!(terminal.final_charge.fuel_used, 2);
     let stack = terminal
         .script_call_stack
         .as_ref()
@@ -367,19 +456,21 @@ fn hosted(
     RuntimeHost,
     Arc<Mutex<Option<PendingHostRequest>>>,
 ) {
+    let contract_runtime_id = module.module().host_contract_id.unwrap_or(HOST);
     let pending = Arc::new(Mutex::new(None));
     let host = RuntimeHost::new(64);
     let mut realm = RealmRuntime::hosted(
         config,
         host.clone(),
         Box::new(AsyncRegistry {
+            contract_runtime_id,
             pending: Arc::clone(&pending),
             panic,
         }),
     )
     .expect("hosted realm");
     let module = realm
-        .load_module(module, HOST, schema())
+        .load_module(module, contract_runtime_id, schema())
         .expect("loaded module");
     (realm, module, host, pending)
 }
@@ -387,11 +478,12 @@ fn hosted(
 fn spawn(
     realm: &mut RealmRuntime,
     module: nexa_runtime::ModuleHandle,
+    export: StableId,
     arguments: &[RuntimeValue],
 ) -> TaskHandle {
     let scope = realm.create_scope(None).expect("scope");
     realm
-        .spawn_task(module, 0, arguments, config(scope))
+        .spawn_task(module, export, arguments, config(scope))
         .expect("task")
 }
 
@@ -409,7 +501,7 @@ fn complete_nominal_result_and_collect(
     ticket: u64,
     label: &str,
 ) -> (RetainedNominalResult, nexa_runtime::CollectionStats) {
-    let task = spawn(realm, module, &[]);
+    let task = spawn(realm, module, NOMINAL_ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait for nominal result")
     else {
         panic!("nominal result task must wait for its Host request");
@@ -574,7 +666,12 @@ fn assert_request_error(
 #[test]
 fn normal_completion() {
     let (mut realm, module, host, _) = hosted(immediate_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[RuntimeValue::I32(7)]);
+    let task = spawn(
+        &mut realm,
+        module,
+        IMMEDIATE_EXPORT,
+        &[RuntimeValue::I32(7)],
+    );
     assert_eq!(
         realm.poll_task(task, 64).expect("poll"),
         TaskPoll::Completed(RuntimeValue::I32(7))
@@ -585,7 +682,7 @@ fn normal_completion() {
 #[test]
 fn host_error_is_a_typed_completion() {
     let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("request handle must only come from Waiting");
     };
@@ -609,7 +706,7 @@ fn host_error_is_a_typed_completion() {
 fn host_error_preserves_the_declared_nominal_payload() {
     let (mut realm, module, host, _) =
         hosted(async_nominal_result_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, NOMINAL_ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("request handle must only come from Waiting");
     };
@@ -670,7 +767,7 @@ fn host_error_preserves_the_declared_nominal_payload() {
 fn host_success_preserves_the_declared_nominal_payload() {
     let (mut realm, module, host, _) =
         hosted(async_nominal_result_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, NOMINAL_ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("request handle must only come from Waiting");
     };
@@ -749,7 +846,12 @@ fn completed_tombstones_root_nested_results_until_eviction() {
     let eviction_module = realm
         .load_module(immediate_module(), HOST, schema())
         .expect("load tombstone eviction module");
-    let eviction_task = spawn(&mut realm, eviction_module, &[RuntimeValue::I32(7)]);
+    let eviction_task = spawn(
+        &mut realm,
+        eviction_module,
+        IMMEDIATE_EXPORT,
+        &[RuntimeValue::I32(7)],
+    );
     let eviction_report = realm
         .tick(TickBudget {
             max_tasks: 1,
@@ -799,7 +901,7 @@ fn completed_tombstones_root_nested_results_until_eviction() {
 #[test]
 fn completion_is_idempotent_and_releases_once() {
     let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("expected request");
     };
@@ -833,7 +935,7 @@ fn request_handle_errors_are_distinct() {
         ..RealmConfig::default()
     };
     let (mut first, module, host, pending) = hosted(async_module(), limits, false);
-    let first_task = spawn(&mut first, module, &[]);
+    let first_task = spawn(&mut first, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(first_request) = first.poll_task(first_task, 64).expect("first wait")
     else {
         panic!("expected first request");
@@ -871,7 +973,7 @@ fn request_handle_errors_are_distinct() {
         Ok(TaskPoll::Completed(_))
     ));
 
-    let second_task = spawn(&mut first, module, &[]);
+    let second_task = spawn(&mut first, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(second_request) = first.poll_task(second_task, 64).expect("second wait")
     else {
         panic!("expected second request");
@@ -916,7 +1018,7 @@ fn reload_detached_request_is_reported_distinctly() {
     let definition = async_module();
     let (mut realm, module, host, pending) =
         hosted(definition.clone(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("expected request");
     };
@@ -959,7 +1061,7 @@ fn reload_detached_request_is_reported_distinctly() {
 #[test]
 fn host_panic_is_isolated_as_a_trap() {
     let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), true);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Trapped(_))
@@ -970,7 +1072,7 @@ fn host_panic_is_isolated_as_a_trap() {
 #[test]
 fn task_cancel_returns_terminal_poll() {
     let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     assert!(matches!(
         realm.poll_task(task, 64).expect("wait"),
         TaskPoll::Waiting(_)
@@ -987,7 +1089,7 @@ fn task_cancel_returns_terminal_poll() {
 #[test]
 fn request_abandon_traps_without_invalid_task_state() {
     let (mut realm, module, host, _) = hosted(async_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     let TaskPoll::Waiting(request) = realm.poll_task(task, 64).expect("wait") else {
         panic!("expected host request");
     };
@@ -1014,11 +1116,16 @@ fn task_capacity_is_reported_at_admission() {
         },
         false,
     );
-    let first = spawn(&mut realm, module, &[RuntimeValue::I32(1)]);
+    let first = spawn(&mut realm, module, YIELDING_EXPORT, &[RuntimeValue::I32(1)]);
     let scope = realm.create_scope(None).expect("second scope");
     assert!(
         realm
-            .spawn_task(module, 0, &[RuntimeValue::I32(2)], config(scope))
+            .spawn_task(
+                module,
+                YIELDING_EXPORT,
+                &[RuntimeValue::I32(2)],
+                config(scope),
+            )
             .is_err()
     );
     realm
@@ -1033,7 +1140,7 @@ fn request_capacity_probe_is_consumed() {
     let probe = realm
         .failure_injector()
         .arm_once(RuntimeFailurePoint::RequestSlot);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Trapped(_))
@@ -1048,7 +1155,7 @@ fn completion_capacity_probe_is_consumed() {
     let probe = realm
         .failure_injector()
         .arm_once(RuntimeFailurePoint::CompletionSlot);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Trapped(_))
@@ -1059,27 +1166,43 @@ fn completion_capacity_probe_is_consumed() {
     assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::NONE);
 }
 
-fn cleanup_realm() -> (RealmRuntime, nexa_runtime::ModuleHandle, RuntimeHost) {
+fn cleanup_realm() -> (
+    RealmRuntime,
+    nexa_runtime::ModuleHandle,
+    RuntimeHost,
+    StableId,
+) {
+    let contract = nexa_idl::parse(
+        r"
+            contract CleanupTask {
+                nexa {
+                    async fn work(value: i32) -> i32;
+                }
+            }
+        ",
+    )
+    .expect("cleanup contract");
+    let export = contract.nexa_functions[0].stable_id;
     let source = "
         fn finalize(value: i32) -> i32 { return value; }
-        task fn work(value: i32) -> i32 {
+        pub async fn work(value: i32) -> i32 {
             defer finalize(value);
             yield;
             let next: i32 = value + 1;
             return next;
         }
     ";
-    let module = nexa_compiler::compile_with_metadata(source, HOST).expect("cleanup module");
+    let module = nexa_compiler::compile_with_contract(source, &contract).expect("cleanup module");
     let (realm, handle, host, _) = hosted(module, RealmConfig::default(), false);
-    (realm, handle, host)
+    (realm, handle, host, export)
 }
 
 #[test]
 fn cleanup_succeeds_and_balances_resources() {
-    let (mut realm, module, host) = cleanup_realm();
+    let (mut realm, module, host, export) = cleanup_realm();
     let scope = realm.create_scope(None).expect("cleanup scope");
     let task = realm
-        .spawn_task(module, 1, &[RuntimeValue::I32(1)], config(scope))
+        .spawn_task(module, export, &[RuntimeValue::I32(1)], config(scope))
         .expect("cleanup task");
     let first = realm.poll_task(task, 64);
     assert!(
@@ -1095,10 +1218,10 @@ fn cleanup_succeeds_and_balances_resources() {
 
 #[test]
 fn cleanup_trap_probe_is_consumed() {
-    let (mut realm, module, host) = cleanup_realm();
+    let (mut realm, module, host, export) = cleanup_realm();
     let scope = realm.create_scope(None).expect("cleanup scope");
     let task = realm
-        .spawn_task(module, 1, &[RuntimeValue::I32(1)], config(scope))
+        .spawn_task(module, export, &[RuntimeValue::I32(1)], config(scope))
         .expect("cleanup task");
     let first = realm.poll_task(task, 64);
     assert!(
@@ -1119,7 +1242,7 @@ fn cleanup_trap_probe_is_consumed() {
 #[test]
 fn realm_drop_releases_live_task_resources_once() {
     let (mut realm, module, host, pending) = hosted(async_module(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[]);
+    let task = spawn(&mut realm, module, ASYNC_EXPORT, &[]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Waiting(_))
@@ -1149,7 +1272,7 @@ fn module_restart_cancels_old_task_and_starts_new_module() {
     let module_definition = yielding_module();
     let (mut realm, module, host, _) =
         hosted(module_definition.clone(), RealmConfig::default(), false);
-    let task = spawn(&mut realm, module, &[RuntimeValue::I32(1)]);
+    let task = spawn(&mut realm, module, YIELDING_EXPORT, &[RuntimeValue::I32(1)]);
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Yielded(_))
@@ -1168,7 +1291,12 @@ fn module_restart_cancels_old_task_and_starts_new_module() {
         realm.terminal_record(task).map(|record| &record.reason),
         Some(TaskTerminalReason::Cancelled(CancelReason::ReloadCommit))
     ));
-    let new_task = spawn(&mut realm, candidate, &[RuntimeValue::I32(2)]);
+    let new_task = spawn(
+        &mut realm,
+        candidate,
+        YIELDING_EXPORT,
+        &[RuntimeValue::I32(2)],
+    );
     assert!(matches!(
         realm.poll_task(new_task, 64),
         Ok(TaskPoll::Yielded(_))
@@ -1182,7 +1310,12 @@ fn module_restart_cancels_old_task_and_starts_new_module() {
 #[test]
 fn stale_and_cross_realm_task_handles_are_distinct() {
     let (mut first, module, _, _) = hosted(immediate_module(), RealmConfig::default(), false);
-    let task = spawn(&mut first, module, &[RuntimeValue::I32(1)]);
+    let task = spawn(
+        &mut first,
+        module,
+        IMMEDIATE_EXPORT,
+        &[RuntimeValue::I32(1)],
+    );
     first.poll_task(task, 64).expect("complete");
     assert_eq!(
         first.poll_task(task, 64),

@@ -1,23 +1,28 @@
-(interface_keyword) @keyword
-(opaque_keyword) @keyword
+(doc_comment) @comment.documentation
+(line_comment) @comment
+(block_comment) @comment
+
+(contract_keyword) @keyword
+(handle_keyword) @keyword
 (nidl_struct_keyword) @keyword
 (nidl_enum_keyword) @keyword
+(host_keyword) @keyword
+(nexa_keyword) @keyword
+(async_keyword) @keyword
 (nidl_function_keyword) @keyword
-(export_keyword) @keyword
-(host_mode_keyword) @keyword
-(fuel_keyword) @keyword
 
-(cancel_policy_keyword) @constant
-(abandon_policy_keyword) @constant
+(nidl_attribute
+  "@" @punctuation.delimiter
+  name: (nidl_attribute_name) @attribute)
 
+(policy_value) @constant
 (nidl_builtin_type) @type.builtin
-(void_type) @type.builtin
 (nidl_type_identifier) @type
 
 (nidl_document
   name: (nidl_type_identifier) @type)
 
-(opaque_declaration
+(handle_declaration
   name: (nidl_type_identifier) @type)
 
 (nidl_struct_declaration
@@ -29,8 +34,8 @@
 (host_function_declaration
   name: (nidl_identifier) @function)
 
-(export_declaration
-  name: (_) @function)
+(nexa_function_declaration
+  name: (nidl_identifier) @function)
 
 (nidl_parameter
   name: (nidl_identifier) @variable.parameter)
@@ -42,10 +47,13 @@
   name: (_) @constructor)
 
 (integer_literal) @number
+(string_literal) @string
+(string_content) @string
+(escape_sequence) @string.escape
 (return_arrow_operator) @operator
 
-[":" "<" ">"] @operator
+["=" ":" "<" ">"] @operator
 
 ["(" ")" "{" "}" "<" ">"] @punctuation.bracket
 
-["," ";"] @punctuation.delimiter
+["," ";" "@"] @punctuation.delimiter

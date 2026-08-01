@@ -1,4 +1,6 @@
-// NIDL intentionally does not support comments.
-interface InvalidHost {
-    sync fn value() -> i32;
+// Ordinary NIDL comments are part of the v2 language surface.
+contract CommentFixture {
+    host {
+        fn value() -> i32;
+    }
 }

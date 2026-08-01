@@ -3,7 +3,7 @@ name = "Nexa"
 version = "0.2.0"
 schema_version = 1
 authors = ["Nexa Contributors"]
-description = "Syntax highlighting and structural editing for Nexa and Nexa IDL."
+description = "Syntax highlighting, outlines, and diagnostics for Nexa v2 and NIDL v2."
 repository = "https://github.com/S1RANN/nexa"
 languages = ["languages/nexa", "languages/nexa-idl"]
 

@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nexa_analysis::{
-    CompilationLimits, NormalizedPackagePath, PackageKind, PackageLoadError, PackageManifest,
-    SourceRole, load_package_directory, validate_module_source_for_role,
+    CompilationLimits, NormalizedPackagePath, PackageKind, PackageManifest, SourceRole,
+    load_package_directory, validate_module_source_for_role,
 };
 
 static NEXT_TEMP: AtomicU64 = AtomicU64::new(1);
@@ -56,11 +56,11 @@ activation = "programmatic"
     );
     write(
         &tree.path().join("src/food/effects.nexa"),
-        "/// Food effects\nmodule food.effects;\npub fn effect() -> i32 { return 1; }\n",
+        "/// Food effects\npub fn effect() -> i32 { return 1; }\n",
     );
     write(
         &tree.path().join("tests/food/effect_test.nexa"),
-        "module test.food.effect_test;\n@test fn effect_works() -> bool { return true; }\n",
+        "@test fn effect_works() -> bool { return true; }\n",
     );
     let loaded = load_package_directory(tree.path(), CompilationLimits::default()).unwrap();
     assert_eq!(loaded.manifest.kind, PackageKind::Application);
@@ -70,8 +70,8 @@ activation = "programmatic"
 }
 
 #[test]
-fn loader_rejects_module_path_mismatch() {
-    let tree = TempTree::new("mismatch");
+fn loader_derives_module_identity_from_the_source_path() {
+    let tree = TempTree::new("path-derived-module");
     write(
         &tree.path().join("package.toml"),
         r#"
@@ -85,12 +85,18 @@ source_root = "src"
     );
     write(
         &tree.path().join("src/food/effects.nexa"),
-        "module food.wrong;",
+        "pub fn effect() -> i32 { return 1; }\n",
     );
-    assert!(matches!(
-        load_package_directory(tree.path(), CompilationLimits::default()),
-        Err(PackageLoadError::ModulePathMismatch { .. })
-    ));
+    let loaded = load_package_directory(tree.path(), CompilationLimits::default()).unwrap();
+    let unit = loaded
+        .production_sources
+        .production_units()
+        .next()
+        .expect("source unit");
+    assert_eq!(
+        unit.expected_module_path().unwrap().as_str(),
+        "food.effects"
+    );
 }
 
 #[test]
@@ -111,9 +117,9 @@ activation = "programmatic"
     );
     write(
         &tree.path().join("src/main.nexa"),
-        "module main;\npub fn value() -> i32 { return 1; }\n",
+        "pub fn value() -> i32 { return 1; }\n",
     );
-    let invalid_test = "module test.wrong;\n@test fn broken( -> bool { return true; }\n";
+    let invalid_test = "@test fn broken( -> bool { return true; }\n";
     write(&tree.path().join("tests/checks.nexa"), invalid_test);
 
     let loaded = load_package_directory(tree.path(), CompilationLimits::default())
@@ -124,13 +130,15 @@ activation = "programmatic"
         .next()
         .expect("invalid test source remains available to the test target");
     assert_eq!(test.text.as_ref(), invalid_test);
-    assert!(
+    assert_eq!(
         validate_module_source_for_role(
             &NormalizedPackagePath::new("tests/checks.nexa").unwrap(),
             invalid_test,
             SourceRole::Test,
         )
-        .is_err()
+        .expect("syntax validation is deferred to the test target")
+        .as_str(),
+        "test.checks"
     );
 }
 
@@ -179,7 +187,10 @@ version = "1.0.0"
 source_root = "src"
 "#,
     );
-    write(&tree.path().join("outside.nexa"), "module escaped;");
+    write(
+        &tree.path().join("outside.nexa"),
+        "pub fn escaped() -> i32 { return 0; }\n",
+    );
     fs::create_dir_all(tree.path().join("src")).unwrap();
     symlink(
         tree.path().join("outside.nexa"),

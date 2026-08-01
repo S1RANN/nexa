@@ -16,7 +16,7 @@
   "metadata": {
     "version": "0.2.0",
     "license": "MIT OR Apache-2.0",
-    "description": "Tree-sitter grammar for Nexa source.",
+    "description": "Tree-sitter grammar for Nexa v2 source.",
     "authors": [
       {
         "name": "Nexa Contributors"

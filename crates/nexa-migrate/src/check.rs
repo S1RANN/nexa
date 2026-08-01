@@ -401,13 +401,16 @@ mod tests {
     #[test]
     fn migrate_check_uses_decoder_verifier_interpreter_context_and_registry() {
         let old = nexa_compiler::compile(
-            "@stateful class Store { value: i32; }
+            "@state(version = 1)
+             class Store { mut value: i32, }
              fn read(value: i32) -> i32 { return value; }",
         )
         .unwrap();
         let new = nexa_compiler::compile(
-            "@stateful class Store { value: i32; }
-             pub migration fn migrate() -> bool {
+            "@state(version = 1)
+             class Store { mut value: i32, }
+             @migration
+             pub fn migrate() -> bool {
                  finish_migration();
                  return true;
              }",

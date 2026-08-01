@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::time::{Duration, Instant};
 
 use nexa as nexa_idl;
@@ -11,7 +10,7 @@ use nexa_embed::{
     PackageSource, SourceFileRegistry, SourceId, TrustLevel,
 };
 
-const IDL: &str = "interface TestHost { export Value() -> i32; }";
+const IDL: &str = "contract TestHost { nexa { fn value() -> i32; } }";
 const MANIFEST: &str = "schema = 2
 kind = \"application\"
 id = \"tests.development\"
@@ -35,14 +34,24 @@ fn policy() -> PackagePolicy {
     }
 }
 
+fn candidate_build_context() -> CandidateBuildContext {
+    let contract = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    CandidateBuildContext::new(IDL.as_bytes().to_vec()).requiring_entrypoints(
+        contract
+            .nexa_functions
+            .iter()
+            .map(|entrypoint| entrypoint.name.clone()),
+    )
+}
+
 fn candidate(source: &str) -> nexa_embed::DiscoveredPackage {
-    let source = format!("module tests.development;\nimport host as test;\n{source}");
+    let source = source.to_owned();
     MemorySource::new(SourceId::new("tests").expect("source id"), policy())
         .package(
             MemoryPackage::new("development", MANIFEST)
                 .source("src/tests/development.nexa", source),
         )
-        .discover(&CandidateBuildContext::new(IDL.as_bytes().to_vec()))
+        .discover(&candidate_build_context())
         .expect("candidate discovery")
         .remove(0)
 }
@@ -62,7 +71,7 @@ handler_fuel = 20000
 capabilities = []
 "
     );
-    let source = format!("module {module};\nimport host as test;\n{source}");
+    let source = source.to_owned();
     MemorySource::new(
         SourceId::new(format!("source-{}", package.replace('.', "-"))).expect("source id"),
         policy(),
@@ -71,17 +80,18 @@ capabilities = []
         MemoryPackage::new(package.replace('.', "-"), manifest)
             .source(format!("src/{}.nexa", module.replace('.', "/")), source),
     )
-    .discover(&CandidateBuildContext::new(IDL.as_bytes().to_vec()))
+    .discover(&candidate_build_context())
     .expect("candidate discovery")
     .remove(0)
 }
 
-fn requirement(idl: &nexa_idl::Idl) -> ExportRequirement {
-    let export = &idl.exports[0];
+fn requirement(contract: &nexa_idl::ValidatedContract) -> ExportRequirement {
+    let entrypoint = &contract.nexa_functions[0];
     ExportRequirement {
-        name: export.name.clone(),
-        stable_id: nexa_idl::export_stable_id(idl, export),
-        signature: nexa_idl::export_signature(idl, export),
+        name: entrypoint.name.clone(),
+        stable_id: nexa_idl::entrypoint_stable_id(entrypoint),
+        signature: nexa_idl::entrypoint_signature(entrypoint),
+        effect: nexa::prelude::FunctionEffect::Ordinary,
     }
 }
 
@@ -123,19 +133,30 @@ fn await_compile_started(compiler: &DevelopmentCompiler, expected_generation: u6
 
 #[test]
 fn diagnostic_renderer_preserves_utf16_ranges_and_schema() {
-    let source = "fn Value() -> i32 {\n    return \"界\";\n}\n";
+    let source = "fn value() -> i32 {\n    return \"界\";\n}\n";
     let registry =
         SourceFileRegistry::from_files([("main.nexa", source)]).expect("source registry");
     let file = registry.file_id("main.nexa").expect("file id");
-    let error = nexa::compile_file(source, file).expect_err("type error");
-    let nexa::NexaError::Diagnostic(leaf) = error else {
-        panic!("expected compiler diagnostic");
-    };
+    let literal_start = source.find("\"界\"").expect("UTF-8 literal");
+    let literal_end = literal_start.saturating_add("\"界\"".len());
+    let leaf = nexa::Diagnostic::from_parts(
+        nexa::ErrorCode::NX2101,
+        nexa::Severity::Error,
+        nexa::RuntimeMessage::Static("type mismatch"),
+        nexa::Label {
+            span: nexa::prelude::SourceSpan::new(
+                file,
+                u32::try_from(literal_start).expect("literal start fits u32"),
+                u32::try_from(literal_end).expect("literal end fits u32"),
+            ),
+            message: nexa::RuntimeMessage::Static("expected i32, found String"),
+        },
+    );
     let diagnostic = EngineDiagnostic::from_leaf(
         None,
         SourceId::new("editor").ok(),
         EngineDiagnosticStage::TypeCheck,
-        *leaf,
+        leaf,
         Some(&registry),
     );
     let rendered = DiagnosticRenderer::json(&diagnostic).expect("diagnostic JSON");
@@ -163,11 +184,11 @@ fn source_registry_is_deterministic_bounded_and_unicode_safe() {
 
 #[test]
 fn dev_loop_only_latest_generation_becomes_ready() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
     let mut terminals = Vec::new();
     for generation in 1..=20 {
-        let candidate = candidate(&format!("pub fn Value() -> i32 {{ return {generation}; }}"));
+        let candidate = candidate(&format!("pub fn value() -> i32 {{ return {generation}; }}"));
         match compiler.submit(DevelopmentCompileRequest {
             source_id: SourceId::new("tests").expect("source id"),
             identity: candidate.identity(generation).expect("candidate identity"),
@@ -221,14 +242,14 @@ fn dev_loop_only_latest_generation_becomes_ready() {
 
 #[test]
 fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         result_queue_capacity: 1,
         ..DevelopmentConfig::default()
     })
     .expect("worker");
     let request = |generation| {
-        let candidate = candidate(&format!("pub fn Value() -> i32 {{ return {generation}; }}"));
+        let candidate = candidate(&format!("pub fn value() -> i32 {{ return {generation}; }}"));
         DevelopmentCompileRequest {
             source_id: SourceId::new("tests").expect("source id"),
             identity: candidate.identity(generation).expect("candidate identity"),
@@ -272,7 +293,7 @@ fn supersession_is_rechecked_while_a_compiled_result_waits_for_capacity() {
 
 #[test]
 fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -280,7 +301,7 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
     })
     .expect("worker");
     for generation in 1..=100 {
-        let source = format!("pub fn Value() -> i32 {{ return {generation}; }}");
+        let source = format!("pub fn value() -> i32 {{ return {generation}; }}");
         assert!(matches!(
             compiler.submit({
                 let candidate = candidate(&source);
@@ -310,7 +331,7 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
     for generation in 101..=200 {
         assert!(matches!(
             compiler.submit({
-                let candidate = candidate("pub fn Value() -> i32 { return missing; }");
+                let candidate = candidate("pub fn value() -> i32 { return missing; }");
                 DevelopmentCompileRequest {
                     source_id: SourceId::new("tests").expect("source id"),
                     identity: candidate.identity(generation).expect("candidate identity"),
@@ -351,14 +372,14 @@ fn stress_100_success_and_failure_candidates_shutdown_cleanly() {
 
 fn submit_distinct_packages(
     compiler: &DevelopmentCompiler,
-    idl: &nexa_idl::Idl,
+    idl: &nexa_idl::ValidatedContract,
     count: usize,
 ) -> (Vec<CompileJob>, Vec<CandidateTerminal>) {
     let mut backpressured = Vec::new();
     let mut terminals = Vec::new();
     for index in 0..count {
         let package = format!("tests.dev{index}");
-        let candidate = candidate_for(&package, "pub fn Value() -> i32 { return 1; }");
+        let candidate = candidate_for(&package, "pub fn value() -> i32 { return 1; }");
         match compiler.submit(DevelopmentCompileRequest {
             source_id: SourceId::new(format!("source-{index}")).expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
@@ -404,7 +425,7 @@ fn drain_all_distinct(
         std::thread::yield_now();
     }
     panic!(
-        "only {} terminals observed with {} Jobs still backpressured",
+        "only {} terminals observed; {} Jobs still backpressured",
         terminals.len(),
         backpressured.len()
     );
@@ -412,7 +433,7 @@ fn drain_all_distinct(
 
 #[test]
 fn worker_queue_backpressure_preserves_32_distinct_packages() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -444,7 +465,7 @@ fn worker_queue_backpressure_preserves_32_distinct_packages() {
 
 #[test]
 fn worker_result_backpressure_never_discards_completed_results() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
     let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig {
         compile_queue_capacity: 4,
         result_queue_capacity: 4,
@@ -470,13 +491,32 @@ fn worker_result_backpressure_never_discards_completed_results() {
     assert!(compiler.shutdown().is_empty());
 }
 
-fn slow_candidate(package: &str) -> nexa_embed::DiscoveredPackage {
-    let mut body = String::from("pub fn Value() -> i32 {\n");
-    for index in 0..8_000 {
-        writeln!(&mut body, "let value_{index}: i32 = {index};").expect("write slow source");
+fn compiler_with_saturated_result_queue(
+    idl: &nexa_idl::ValidatedContract,
+) -> (DevelopmentCompiler, PackageId) {
+    let compiler = DevelopmentCompiler::start(&DevelopmentConfig {
+        result_queue_capacity: 1,
+        ..DevelopmentConfig::default()
+    })
+    .expect("worker");
+    let package_id = PackageId::new("tests.result-buffer").expect("package id");
+    let candidate = candidate_for(package_id.as_str(), "pub fn value() -> i32 { return 1; }");
+    assert!(matches!(
+        compiler.submit(DevelopmentCompileRequest {
+            source_id: SourceId::new("result-buffer").expect("source id"),
+            identity: candidate.identity(1).expect("candidate identity"),
+            build_input: candidate.build_input,
+            idl: idl.clone(),
+            required_exports: vec![requirement(idl)],
+        }),
+        EnqueueOutcome::Accepted
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while compiler.inspection().completed_results != 1 && Instant::now() < deadline {
+        std::thread::yield_now();
     }
-    body.push_str("return 1;\n}\n");
-    candidate_for(package, &body)
+    assert_eq!(compiler.inspection().completed_results, 1);
+    (compiler, package_id)
 }
 
 fn wait_until_in_flight(compiler: &DevelopmentCompiler, package_id: &PackageId) {
@@ -492,13 +532,13 @@ fn wait_until_in_flight(compiler: &DevelopmentCompiler, package_id: &PackageId) 
 
 #[test]
 fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
-    let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
-    let package_id = PackageId::new("tests.slow-disable").expect("package id");
-    let candidate = slow_candidate(package_id.as_str());
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let (mut compiler, buffered_package_id) = compiler_with_saturated_result_queue(&idl);
+    let package_id = PackageId::new("tests.in-flight-disable").expect("package id");
+    let candidate = candidate_for(package_id.as_str(), "pub fn value() -> i32 { return 2; }");
     assert!(matches!(
         compiler.submit(DevelopmentCompileRequest {
-            source_id: SourceId::new("slow-disable").expect("source id"),
+            source_id: SourceId::new("in-flight-disable").expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
             idl: idl.clone(),
@@ -513,8 +553,13 @@ fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
         terminals[0],
         CandidateTerminal::CancelledByDisable(_)
     ));
+    let buffered = compiler.poll();
+    assert_eq!(buffered.len(), 1);
     assert!(
-        compiler.poll().is_empty(),
+        buffered.iter().all(|terminal| {
+            terminal.data().identity.package_id == buffered_package_id
+                && matches!(terminal, CandidateTerminal::Compiled { .. })
+        }),
         "an in-flight cancellation terminal must not be duplicated through the result queue"
     );
     assert!(compiler.shutdown().is_empty());
@@ -522,13 +567,13 @@ fn disabling_an_in_flight_generation_has_one_cancelled_terminal() {
 
 #[test]
 fn shutdown_accounts_for_an_in_flight_generation_without_deadlock() {
-    let idl = nexa_idl::parse(IDL).expect("IDL");
-    let mut compiler = DevelopmentCompiler::start(&DevelopmentConfig::default()).expect("worker");
-    let package_id = PackageId::new("tests.slow-shutdown").expect("package id");
-    let candidate = slow_candidate(package_id.as_str());
+    let idl = nexa_idl::parse_nidl(IDL).expect("NIDL");
+    let (mut compiler, buffered_package_id) = compiler_with_saturated_result_queue(&idl);
+    let package_id = PackageId::new("tests.in-flight-shutdown").expect("package id");
+    let candidate = candidate_for(package_id.as_str(), "pub fn value() -> i32 { return 2; }");
     assert!(matches!(
         compiler.submit(DevelopmentCompileRequest {
-            source_id: SourceId::new("slow-shutdown").expect("source id"),
+            source_id: SourceId::new("in-flight-shutdown").expect("source id"),
             identity: candidate.identity(1).expect("candidate identity"),
             build_input: candidate.build_input,
             idl: idl.clone(),
@@ -537,15 +582,39 @@ fn shutdown_accounts_for_an_in_flight_generation_without_deadlock() {
         EnqueueOutcome::Accepted
     ));
     wait_until_in_flight(&compiler, &package_id);
-    let started = Instant::now();
-    let terminals = compiler.shutdown();
-    assert!(started.elapsed() < Duration::from_secs(10));
-    assert_eq!(terminals.len(), 1);
-    assert!(matches!(
-        terminals[0],
-        CandidateTerminal::CancelledByShutdown(_)
-    ));
-    assert!(compiler.inspection().in_flight_package.is_none());
-    assert_eq!(compiler.inspection().queued_packages, 0);
-    assert_eq!(compiler.inspection().completed_results, 0);
+    let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+    let shutdown_thread = std::thread::spawn(move || {
+        let terminals = compiler.shutdown();
+        let inspection = compiler.inspection();
+        let _ = finished_tx.send((terminals, inspection));
+    });
+    let (terminals, inspection) = finished_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("shutdown deadlocked while an in-flight result waited for queue capacity");
+    shutdown_thread.join().expect("shutdown thread");
+
+    assert_eq!(terminals.len(), 2);
+    assert_eq!(
+        terminals
+            .iter()
+            .filter(|terminal| {
+                terminal.data().identity.package_id == package_id
+                    && matches!(terminal, CandidateTerminal::CancelledByShutdown(_))
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        terminals
+            .iter()
+            .filter(|terminal| {
+                terminal.data().identity.package_id == buffered_package_id
+                    && matches!(terminal, CandidateTerminal::Compiled { .. })
+            })
+            .count(),
+        1
+    );
+    assert!(inspection.in_flight_package.is_none());
+    assert_eq!(inspection.queued_packages, 0);
+    assert_eq!(inspection.completed_results, 0);
 }

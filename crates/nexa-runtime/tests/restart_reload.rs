@@ -1,22 +1,31 @@
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use nexa_bytecode::{
     AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
-    ModuleBuilder, RootMap, Signature, ValueType,
+    ModuleBuilder, RootMap, ScriptExport, Signature, ValueType,
 };
-use nexa_core::{CanonicalSymbolIdentity, StableId, SymbolKind};
+use nexa_core::{CanonicalSymbolIdentity, FileId, StableId, SymbolKind};
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest,
-    RealmConfig, RealmRuntime, ReleaseKind, ResourceContext, RestartReloadOutcome,
-    RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeValue,
-    StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, TickBudget,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
+    PendingHostRequest, RealmConfig, RealmRuntime, ReleaseKind, ResourceContext,
+    RestartReloadOutcome, RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs,
+    RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TaskTerminalReason,
+    TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const HOST: StableId = StableId(0x5245_4c4f_4144_484f);
+const ASYNC_MODULE_EXPORT: StableId = StableId(0x5252_4153_594e_4301);
 const SNIPPET_PACKAGE: &str = "nexa.snippet";
-const COMBAT_MODULE: &str = "game.combat";
+const SNIPPET_MODULE: &str = "main";
+const RELOAD_CONTRACT: &str = "
+contract ReloadHost {
+    nexa {
+        async fn update(value: i32) -> i32;
+    }
+}
+";
 
 const V1: &str = include_str!("../../../examples/combat-runtime/reload/v1.nexa");
 const V2: &str = include_str!("../../../examples/combat-runtime/reload/v2.nexa");
@@ -26,17 +35,46 @@ struct Host {
 }
 
 impl HostRegistry for Host {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(HOST)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        let authority = AUTHORITY.get_or_init(|| {
+            let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+            HostFunctionAuthority::new(
+                StableId::from_name("ReloadHost::request"),
+                [0; 32],
+                &[],
+                Some(ValueType::Named(result.type_id)),
+                HostCallMode::Async,
+                1,
+                Some(AsyncResultType {
+                    result_type: result.type_id,
+                    success: ValueType::I32,
+                    error: ValueType::I32,
+                    cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                    abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                    cancel_error: Some(1),
+                    abandon_error: None,
+                }),
+                &[],
+            )
+        });
+        (id == authority.stable_id()).then_some(authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         arguments: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || !arguments.is_empty() {
+        if id != StableId::from_name("ReloadHost::request") {
+            return Err(HostTrap::UnknownFunction(id));
+        }
+        if !arguments.is_empty() {
             return Err(HostTrap::Arity);
         }
         let pending = context
@@ -69,11 +107,26 @@ fn realm(module: VerifiedModule) -> (RealmRuntime, nexa_runtime::ModuleHandle) {
 }
 
 fn compile(source: &str) -> VerifiedModule {
-    nexa_compiler::compile_with_metadata(source, HOST).expect("compile reload module")
+    let contract = nexa_idl::parse(RELOAD_CONTRACT).expect("parse reload Contract");
+    let mut module =
+        nexa_compiler::compile_module_with_contract_file(source, FileId::default(), &contract)
+            .expect("compile reload module");
+    module.host_contract_id = Some(HOST);
+    verify(module, VerifierLimits::default()).expect("verify reload module")
+}
+
+fn update_export_id() -> StableId {
+    let contract = nexa_idl::parse(RELOAD_CONTRACT).expect("parse reload Contract");
+    let update = contract
+        .nexa_functions
+        .iter()
+        .find(|entrypoint| entrypoint.name == "update")
+        .expect("reload Contract declares update");
+    nexa_idl::entrypoint_stable_id(update)
 }
 
 fn state_type_id(name: &str) -> StableId {
-    CanonicalSymbolIdentity::automatic(SNIPPET_PACKAGE, COMBAT_MODULE, SymbolKind::Type, name)
+    CanonicalSymbolIdentity::automatic(SNIPPET_PACKAGE, SNIPPET_MODULE, SymbolKind::Type, name)
         .runtime_id()
         .0
 }
@@ -81,7 +134,7 @@ fn state_type_id(name: &str) -> StableId {
 fn state_field_id(owner: &str, name: &str) -> StableId {
     CanonicalSymbolIdentity::automatic(
         SNIPPET_PACKAGE,
-        COMBAT_MODULE,
+        SNIPPET_MODULE,
         SymbolKind::Field,
         format!("{owner}.{name}"),
     )
@@ -181,7 +234,7 @@ fn commit_stateful(scenario: &mut StatefulScenario) -> nexa_runtime::ModuleHandl
 }
 
 fn simple_yielding() -> VerifiedModule {
-    compile("task fn update(value: i32) -> i32 { yield; return value; }")
+    compile("pub async fn update(value: i32) -> i32 { yield; return value; }")
 }
 
 #[test]
@@ -327,14 +380,15 @@ fn delete_removes_state_and_invalidates_handle() {
 fn migration_error_rolls_back_before_commit() {
     let mut scenario = stateful_scenario();
     let failing = compile(
-        "@stateful(2) class EnemyBrain { phase: i32; aggression: i32; }
-         @stateful(1) class StableBrain { phase: i32; }
-         pub migration fn migrate(value: i32) -> i32 {
+        "@state(version = 2) class EnemyBrain { mut phase: i32, mut aggression: i32, }
+         @state(version = 1) class StableBrain { mut phase: i32, }
+         @migration
+         pub fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
-         task fn update(value: i32) -> i32 { return value; }",
+         pub async fn update(value: i32) -> i32 { return value; }",
     );
     assert!(matches!(
         scenario
@@ -358,10 +412,20 @@ fn restart_cancels_every_old_task() {
     let (mut realm, old) = realm(module.clone());
     let scope = realm.create_scope(None).expect("scope");
     let first = realm
-        .spawn_task(old, 0, &[RuntimeValue::I32(1)], config(scope))
+        .spawn_task(
+            old,
+            update_export_id(),
+            &[RuntimeValue::I32(1)],
+            config(scope),
+        )
         .expect("first");
     let second = realm
-        .spawn_task(old, 0, &[RuntimeValue::I32(2)], config(scope))
+        .spawn_task(
+            old,
+            update_export_id(),
+            &[RuntimeValue::I32(2)],
+            config(scope),
+        )
         .expect("second");
     assert!(matches!(
         realm.poll_task(first, 64),
@@ -384,6 +448,10 @@ fn restart_cancels_every_old_task() {
 
 fn async_module() -> VerifiedModule {
     let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+    let signature = Signature {
+        parameters: Vec::new(),
+        result: Some(ValueType::Named(result.type_id)),
+    };
     let async_result = AsyncResultType {
         result_type: result.type_id,
         success: ValueType::I32,
@@ -393,13 +461,7 @@ fn async_module() -> VerifiedModule {
         cancel_error: Some(1),
         abandon_error: None,
     };
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: Vec::new(),
-            result: Some(ValueType::Named(result.type_id)),
-        },
-        1,
-    );
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -428,13 +490,21 @@ fn async_module() -> VerifiedModule {
         .enum_type(result);
     module.host_import(HostImport {
         stable_id: StableId::from_name("ReloadHost::request"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: Vec::new(),
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
         fuel_cost: 1,
         async_result: Some(async_result),
     });
-    module.function(function);
+    let function = module.function(function);
+    module.script_export(ScriptExport {
+        stable_id: ASYNC_MODULE_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("verified async module")
 }
 
@@ -466,7 +536,9 @@ fn async_realm() -> (
 fn late_completion_from_old_epoch_is_discarded() {
     let (mut realm, old, _, pending) = async_realm();
     let scope = realm.create_scope(None).expect("scope");
-    let task = realm.spawn_task(old, 0, &[], config(scope)).expect("task");
+    let task = realm
+        .spawn_task(old, ASYNC_MODULE_EXPORT, &[], config(scope))
+        .expect("task");
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Waiting(_))
@@ -491,7 +563,7 @@ fn activation_fault_is_observable_after_commit() {
     let old_module = simple_yielding();
     let (mut realm, old) = realm(old_module);
     let candidate = compile(
-        "task fn update(value: i32) -> i32 { return value; }
+        "pub async fn update(value: i32) -> i32 { return value; }
          @activation pub fn activate() -> i32 { return 1; }",
     );
     let probe = realm
@@ -516,7 +588,7 @@ fn old_request_releases_once_and_new_entry_starts() {
     let (mut realm, old, host, pending) = async_realm();
     let scope = realm.create_scope(None).expect("scope");
     let old_task = realm
-        .spawn_task(old, 0, &[], config(scope))
+        .spawn_task(old, ASYNC_MODULE_EXPORT, &[], config(scope))
         .expect("old task");
     assert!(matches!(
         realm.poll_task(old_task, 64),
@@ -543,7 +615,7 @@ fn old_request_releases_once_and_new_entry_starts() {
             .take(),
     );
     let new_task = realm
-        .spawn_task(candidate, 0, &[], config(scope))
+        .spawn_task(candidate, ASYNC_MODULE_EXPORT, &[], config(scope))
         .expect("new entry");
     assert!(matches!(
         realm.poll_task(new_task, 64),
@@ -560,19 +632,25 @@ fn migration_rollback_does_not_restore_cancelled_old_tasks() {
     let (mut realm, old) = realm(old_definition);
     let scope = realm.create_scope(None).expect("scope");
     let task = realm
-        .spawn_task(old, 0, &[RuntimeValue::I32(1)], config(scope))
+        .spawn_task(
+            old,
+            update_export_id(),
+            &[RuntimeValue::I32(1)],
+            config(scope),
+        )
         .expect("old task");
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Yielded(_))
     ));
     let failing = compile(
-        "pub migration fn migrate(value: i32) -> i32 {
+        "@migration
+         pub fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
-         task fn update(value: i32) -> i32 { return value; }",
+         pub async fn update(value: i32) -> i32 { return value; }",
     );
     assert!(matches!(
         realm
@@ -591,18 +669,21 @@ fn migration_rollback_does_not_restore_cancelled_old_tasks() {
 fn migration_rollback_discards_late_old_request_completion() {
     let (mut realm, old, _, pending) = async_realm();
     let scope = realm.create_scope(None).expect("scope");
-    let task = realm.spawn_task(old, 0, &[], config(scope)).expect("task");
+    let task = realm
+        .spawn_task(old, ASYNC_MODULE_EXPORT, &[], config(scope))
+        .expect("task");
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Waiting(_))
     ));
     let failing = compile(
-        "pub migration fn migrate(value: i32) -> i32 {
+        "@migration
+         pub fn migrate(value: i32) -> i32 {
              let failure: i32 = 1 / 0;
              finish_migration();
              return value + failure;
          }
-         task fn update(value: i32) -> i32 { return value; }",
+         pub async fn update(value: i32) -> i32 { return value; }",
     );
     assert!(matches!(
         realm
@@ -652,7 +733,9 @@ fn old_module_slot_is_released_after_publication() {
 fn late_completion_cannot_resume_cancelled_old_task() {
     let (mut realm, old, _, pending) = async_realm();
     let scope = realm.create_scope(None).expect("scope");
-    let task = realm.spawn_task(old, 0, &[], config(scope)).expect("task");
+    let task = realm
+        .spawn_task(old, ASYNC_MODULE_EXPORT, &[], config(scope))
+        .expect("task");
     assert!(matches!(
         realm.poll_task(task, 64),
         Ok(TaskPoll::Waiting(_))

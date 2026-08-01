@@ -1,6 +1,6 @@
 # Nexa Local Static Libraries
 
-Status: M4 COMPLETE
+Status: M4 COMPLETE; M4R1 COMPLETE
 
 M4 resolves only explicit local path dependencies in the same `PackageSource`
 root and `SourceId`. Network, Git, registry, remote download, version ranges,
@@ -18,7 +18,7 @@ identifier. A resolved closure may contain only one version and one path for a
 Package ID, and dependency cycles are rejected.
 
 Library Manifests contain only common identity fields, `source_root`, and
-dependencies. They cannot declare an Entry, Activation, Migration, Export,
+dependencies. They cannot declare an Entry, Activation, Migration, entrypoint,
 Capability, Entitlement, or Runtime lifecycle configuration. Library code is
 statically analyzed and linked against the consuming Application's Host
 Contract and effective Capability set; it never creates a Realm.

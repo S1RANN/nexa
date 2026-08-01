@@ -10,7 +10,6 @@ pub const DEFAULT_SNIPPET_MODULE: &str = "main";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SnippetModuleInferenceErrorKind {
     SourceTooLarge { bytes: usize, limit: usize },
-    InvalidModulePath { path: String },
 }
 
 /// A source-backed virtual-snippet module inference failure.
@@ -29,12 +28,11 @@ impl fmt::Display for SnippetModuleInferenceError {
 
 impl std::error::Error for SnippetModuleInferenceError {}
 
-/// Infers the semantic module identity for one source-preserving virtual snippet.
+/// Returns the compiler-owned module identity for one source-preserving virtual snippet.
 ///
-/// The source is never rewritten. An omitted declaration maps to `main`; an explicit declaration
-/// is validated as a canonical [`ModulePath`]. The same byte limit later used by
-/// [`crate::SourceSetBuilder`] is accepted explicitly so callers cannot parse a snippet which the
-/// package source set would subsequently reject.
+/// Language v2 has no source-level module declaration. The source is never rewritten and always
+/// maps to `main`; the same byte limit later used by [`crate::SourceSetBuilder`] is accepted
+/// explicitly so callers cannot scan a snippet which the package source set would reject.
 pub fn infer_snippet_module(
     source: &str,
     source_file_bytes: usize,
@@ -52,34 +50,13 @@ pub fn infer_snippet_module(
             ),
         });
     }
-    let syntax = nexa_syntax::parse_nexa(source).map_err(|error| SnippetModuleInferenceError {
+    ModulePath::new(DEFAULT_SNIPPET_MODULE).map_err(|error| SnippetModuleInferenceError {
         kind: SnippetModuleInferenceErrorKind::SourceTooLarge {
-            bytes: error.bytes,
-            limit: u32::MAX as usize,
+            bytes: source.len(),
+            limit: source_file_bytes,
         },
         range: whole_source_range(source),
         message: error.to_string(),
-    })?;
-    let ast = nexa_syntax::ast::parse_nexa_ast(&syntax);
-    let Some(declaration) = ast.module else {
-        return ModulePath::new(DEFAULT_SNIPPET_MODULE).map_err(|error| {
-            SnippetModuleInferenceError {
-                kind: SnippetModuleInferenceErrorKind::InvalidModulePath {
-                    path: DEFAULT_SNIPPET_MODULE.to_owned(),
-                },
-                range: ByteRange::default(),
-                message: error.to_string(),
-            }
-        });
-    };
-    let path = declaration.path.text();
-    ModulePath::new(path.clone()).map_err(|_| SnippetModuleInferenceError {
-        kind: SnippetModuleInferenceErrorKind::InvalidModulePath { path: path.clone() },
-        range: ByteRange::new(
-            declaration.path.range.start.get(),
-            declaration.path.range.end.get(),
-        ),
-        message: format!("invalid module path `{path}`"),
     })
 }
 
@@ -98,31 +75,6 @@ mod tests {
         let source = "fn main() -> i32 { return 0; }\r\n";
         let module = infer_snippet_module(source, source.len()).unwrap();
         assert_eq!(module.as_str(), "main");
-    }
-
-    #[test]
-    fn explicit_module_preserves_the_declared_identity() {
-        let source = "module game.combat;\nfn main() -> i32 { return 0; }\n";
-        let module = infer_snippet_module(source, source.len()).unwrap();
-        assert_eq!(module.as_str(), "game.combat");
-    }
-
-    #[test]
-    fn invalid_module_reports_the_exact_path_bytes_and_text() {
-        let source = "module Game.Combat;\nfn main() -> i32 { return 0; }\n";
-        let error = infer_snippet_module(source, source.len()).unwrap_err();
-        assert_eq!(
-            error.kind,
-            SnippetModuleInferenceErrorKind::InvalidModulePath {
-                path: "Game.Combat".into()
-            }
-        );
-        assert_eq!(error.range, ByteRange::new(7, 18));
-        assert_eq!(
-            &source[error.range.start as usize..error.range.end as usize],
-            "Game.Combat"
-        );
-        assert_eq!(error.message, "invalid module path `Game.Combat`");
     }
 
     #[test]

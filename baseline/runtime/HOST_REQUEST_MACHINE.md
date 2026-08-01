@@ -15,6 +15,7 @@ one of `complete`, `fail`, `cancelled`, or `abandon`; Drop submits `Abandoned`. 
 operation is rejected without consuming another slot.
 
 Worker threads only consume tickets. Only the VM thread resolves tasks or epoch state. Success
-writes the destination and resumes the task, expected host failure traps until language `Result`
-is available, host cancellation cancels the task, and abandonment traps. Detached physical work
-retains the ticket but cannot deliver to the released request generation.
+writes the destination and resumes the task. A declared Host error resumes with `Result::Err`;
+an ABI, transport, or other undeclared failure traps. Host cancellation cancels the task, and
+abandonment traps. Detached physical work retains the ticket but cannot deliver to the released
+request generation.

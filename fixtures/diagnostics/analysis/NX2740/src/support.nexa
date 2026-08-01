@@ -1,6 +1,4 @@
-module support;
-
 @activation
-pub fn Activate() -> bool {
+pub fn activate() -> bool {
     return true;
 }

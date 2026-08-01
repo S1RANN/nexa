@@ -1,1 +1,1 @@
-{"version":1,"code":"NX4001","category":"host","pipeline":"runtime","input":"../runtime/NX4001.runtime","expected":{"primary_text":"","secondary_count":0,"message_contains":"host interface mismatch","notes":[]}}
+{"version":1,"code":"NX4001","category":"host","pipeline":"runtime","input":"../runtime/NX4001.runtime","expected":{"primary_text":"","secondary_count":0,"message_contains":"host contract mismatch","notes":[]}}

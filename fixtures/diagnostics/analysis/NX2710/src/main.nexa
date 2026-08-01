@@ -1,5 +1,3 @@
-module main;
-
 @stable("bad stable id")
 pub fn entry() -> i32 {
     return 1;

@@ -6,7 +6,9 @@
 
 mod analyzer;
 mod candidate;
+mod contract_scan;
 mod development;
+mod entrypoints;
 mod fingerprint;
 mod graph;
 mod identity;
@@ -16,6 +18,7 @@ mod lockfile;
 mod manifest;
 mod options;
 mod query;
+mod repl;
 mod snippet;
 mod source;
 
@@ -24,7 +27,13 @@ pub use candidate::{
     CandidateError, CandidateIdentity, FreshnessMismatch, FreshnessOutcome, PackageCandidate,
     ResolvedBuildInput, ResolvedBuildInputError, ResolvedTestInput,
 };
+pub use contract_scan::{
+    EffectiveContractReferences, EffectiveContractScanError, effective_contract_references,
+};
 pub use development::*;
+pub use entrypoints::{
+    EffectiveEntrypointScanError, EffectiveEntrypointSet, effective_entrypoint_set,
+};
 pub use fingerprint::{
     BuildFingerprint, BuildFingerprintInput, FingerprintBuilder, LinkedStateFingerprint,
     PublicApiFingerprint, SemanticFingerprintRecord, SourceSetFingerprint, StateSchemaFingerprint,
@@ -45,12 +54,12 @@ pub use ir::{
     HostAsyncResultIr, HostBindingIr, HostFieldBindingIr, HostFunctionBindingIr,
     HostNamespaceBindingIr, HostTypeBindingIr, HostTypeLayoutIr, HostVariantBindingIr,
     IrAbandonPolicy, IrCancelPolicy, IrCompilationKind, IrEffect, IrHostFunctionMode, IrLiteral,
-    IrType, LifecycleBindingsIr, MigrationIntrinsicIr, PackageSemanticMetadata, ResolvedReference,
-    SourceRange, StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr, StateTypeIr,
-    TestDefinitionIr, TypedBlockIr, TypedDeclarationBody, TypedDeclarationIr, TypedExpressionIr,
-    TypedExpressionKind, TypedFunctionIr, TypedIrError, TypedMatchArmIr, TypedModuleIr,
-    TypedPackageIr, TypedPatternIr, TypedPatternKind, TypedPlaceIr, TypedStatementIr,
-    TypedTypeLayoutIr, UnaryOperator, VariantLayoutIr,
+    IrType, LifecycleBindingsIr, MigrationIntrinsicIr, PackageSemanticMetadata, ReplEntrypointIr,
+    ResolvedReference, SourceRange, StableSymbolIdentity, StandardFunctionBindingIr, StateFieldIr,
+    StateMetadataIr, StateTypeIr, TestDefinitionIr, TypedBlockIr, TypedDeclarationBody,
+    TypedDeclarationIr, TypedExpressionIr, TypedExpressionKind, TypedFunctionIr, TypedIrError,
+    TypedMatchArmIr, TypedModuleIr, TypedPackageIr, TypedPatternIr, TypedPatternKind, TypedPlaceIr,
+    TypedStatementIr, TypedTypeLayoutIr, UnaryOperator, VariantLayoutIr,
 };
 pub use loader::{
     LoadedPackageDirectory, PackageLoadError, load_package_directory,
@@ -62,8 +71,8 @@ pub use manifest::{
     PathDependency,
 };
 pub use options::{
-    COMPILATION_OPTIONS_SCHEMA_VERSION, CompilationOptions, DEFAULT_MAX_WHILE_ITERATIONS,
-    NEXA_LANGUAGE_VERSION, canonical_compilation_options,
+    COMPILATION_OPTIONS_SCHEMA_VERSION, CompilationOptions, CompilationProfile,
+    DEFAULT_MAX_WHILE_ITERATIONS, NEXA_LANGUAGE_VERSION, canonical_compilation_options,
 };
 pub use query::{
     BuildInputUpdate, CachedTypedModule, ChangeImpact, DeclarationHeader, DeclarationVisibility,
@@ -71,6 +80,7 @@ pub use query::{
     QueryDatabase, QueryExecutionReport, QueryKey, QueryStats, QueryValue, SourceSetChange,
     SourceUpdate, SourceUpdateError,
 };
+pub use repl::*;
 pub use snippet::{
     DEFAULT_SNIPPET_MODULE, SnippetModuleInferenceError, SnippetModuleInferenceErrorKind,
     infer_snippet_module,

@@ -12,7 +12,8 @@ use nexa_core::{
         canonicalize_nan_f32, canonicalize_nan_f64, ceil_f32 as deterministic_ceil_f32,
         ceil_f64 as deterministic_ceil_f64, cos_f32 as deterministic_cos_f32,
         cos_f64 as deterministic_cos_f64, floor_f32 as deterministic_floor_f32,
-        floor_f64 as deterministic_floor_f64, round_f32 as deterministic_round_f32,
+        floor_f64 as deterministic_floor_f64, rem_f32 as deterministic_rem_f32,
+        rem_f64 as deterministic_rem_f64, round_f32 as deterministic_round_f32,
         round_f64 as deterministic_round_f64, sin_f32 as deterministic_sin_f32,
         sin_f64 as deterministic_sin_f64, sqrt_f32 as deterministic_sqrt_f32,
         sqrt_f64 as deterministic_sqrt_f64,
@@ -22,7 +23,7 @@ use nexa_verifier::VerifiedModule;
 
 use crate::{
     ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, Heap, HeapError,
-    MapSetOutcome, RuntimeValue,
+    MapSetOutcome, RuntimeMessage, RuntimeValue,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,6 +135,7 @@ impl InterpreterContinuation {
         if expected.is_some() {
             set_register(&mut self.arena, destination, value)?;
         }
+        increment_pc(&mut self.arena)?;
         self.host_call_boundary = None;
         Ok(())
     }
@@ -150,13 +152,6 @@ impl InterpreterContinuation {
                             .root_maps
                             .iter()
                             .find(|root_map| root_map.pc == pc)
-                            .or_else(|| {
-                                function
-                                    .root_maps
-                                    .iter()
-                                    .filter(|root_map| root_map.pc <= pc)
-                                    .max_by_key(|root_map| root_map.pc)
-                            })
                             .map(|root_map| root_map.bitmap.clone())
                     })
             })
@@ -396,6 +391,7 @@ pub enum InterpreterError {
     HeapUnavailable,
     StringLengthOverflow,
     FuelCostOverflow,
+    OpcodeCostTableVersion { expected: u32, actual: u32 },
     Host(crate::HostTrap),
     Migration(crate::RuntimeMessage),
     Heap(HeapError),
@@ -463,21 +459,30 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 105],
+    costs: [u16; 107],
 }
 
 impl Default for OpcodeCostTable {
     fn default() -> Self {
         Self {
             version: OPCODE_COST_TABLE_VERSION,
-            costs: [1; 105],
+            costs: DEFAULT_OPCODE_COSTS,
         }
     }
 }
 
 impl OpcodeCostTable {
-    #[must_use]
-    pub fn cost(&self, instruction: Instruction) -> u64 {
+    fn validate_version(&self) -> Result<(), InterpreterError> {
+        if self.version != OPCODE_COST_TABLE_VERSION {
+            return Err(InterpreterError::OpcodeCostTableVersion {
+                expected: OPCODE_COST_TABLE_VERSION,
+                actual: self.version,
+            });
+        }
+        Ok(())
+    }
+
+    fn cost(&self, instruction: Instruction) -> u64 {
         if let Instruction::StandardIntrinsic { intrinsic, .. } = instruction {
             u64::from(intrinsic.base_fuel_cost())
         } else {
@@ -533,6 +538,29 @@ pub trait InterpreterMigration {
 }
 
 pub trait InterpreterState {
+    fn current_object(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+    ) -> Result<RuntimeValue, crate::RuntimeMessage>;
+
+    fn object_field(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, crate::RuntimeMessage>;
+
+    fn set_object_field(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), crate::RuntimeMessage>;
+
     fn resolve(
         &mut self,
         handle: crate::StateHandle,
@@ -788,11 +816,8 @@ impl CheckedInterpreter {
         max_fuel: u64,
         costs: &OpcodeCostTable,
     ) -> Result<Result<ExecutionCharge, Trap>, InterpreterError> {
-        let exceeds_budget = continuation
-            .arena
-            .defers_rev()
-            .nth(max_ops as usize)
-            .is_some();
+        costs.validate_version()?;
+        let exceeds_budget = continuation.arena.defer_len() > max_ops as usize;
         if exceeds_budget {
             return Ok(Err(Trap::from_continuation(
                 module,
@@ -802,16 +827,51 @@ impl CheckedInterpreter {
             )));
         }
         continuation.cleanup_mode = true;
-        if !start_next_defer(module, &mut continuation.arena)? {
-            return Ok(Ok(ExecutionCharge::default()));
+        let mut initial_fuel = 0_u64;
+        loop {
+            let Some(action) = continuation.arena.peek_defer_for_current_frame()? else {
+                return Ok(Ok(ExecutionCharge {
+                    instructions: 0,
+                    fuel_used: initial_fuel,
+                }));
+            };
+            let attempt = defer_action_attempt_fuel(module.module(), &action)?;
+            let cumulative_after = initial_fuel
+                .checked_add(attempt)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            if cumulative_after > max_fuel {
+                return Ok(Err(Trap::from_continuation(
+                    module,
+                    &continuation,
+                    TrapKind::CleanupBudgetExceeded,
+                    "cleanup attempted to suspend or exhausted fuel",
+                )));
+            }
+            initial_fuel = cumulative_after;
+            let starts_call = matches!(action, crate::DeferAction::Call { .. });
+            if !start_next_defer(module, &mut continuation.arena)? {
+                return Ok(Ok(ExecutionCharge {
+                    instructions: 0,
+                    fuel_used: initial_fuel,
+                }));
+            }
+            if starts_call {
+                break;
+            }
         }
         match Self::poll(
             module,
             continuation,
-            FuelState::new(max_fuel, 0, max_fuel),
+            FuelState::new(max_fuel - initial_fuel, initial_fuel, max_fuel),
             costs,
         )? {
-            InterpreterOutcome::Returned { charge, .. } => Ok(Ok(charge)),
+            InterpreterOutcome::Returned { mut charge, .. } => {
+                charge.fuel_used = charge
+                    .fuel_used
+                    .checked_add(initial_fuel)
+                    .ok_or(InterpreterError::FuelCostOverflow)?;
+                Ok(Ok(charge))
+            }
             InterpreterOutcome::Trapped { trap, .. } => Ok(Err(trap)),
             InterpreterOutcome::HostPending { continuation, .. } => {
                 Ok(Err(Trap::from_continuation(
@@ -841,6 +901,7 @@ impl CheckedInterpreter {
         mut state_registry: Option<&mut dyn InterpreterState>,
         mut heap: Option<&mut Heap>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
+        costs.validate_version()?;
         continuation.suspend_reason = None;
         continuation.cumulative_exhausted = false;
         let mut charge = ExecutionCharge::default();
@@ -927,6 +988,26 @@ impl CheckedInterpreter {
                 }
             };
         }
+        macro_rules! state_operation {
+            ($operation:expr) => {
+                match $operation {
+                    Ok(value) => value,
+                    Err(message) => {
+                        settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
+                        return Ok(InterpreterOutcome::Trapped {
+                            trap: Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::BytecodeTrap,
+                                message,
+                            ),
+                            charge,
+                            fuel,
+                        });
+                    }
+                }
+            };
+        }
         if let Some(migration) = migration.as_deref_mut() {
             migration.observe_call_depth(continuation.arena.depth());
         }
@@ -944,6 +1025,7 @@ impl CheckedInterpreter {
                 .ok_or(InterpreterError::FellOffFunction)?;
             let instruction_cost = instruction_attempt_fuel(
                 module.module(),
+                module.nominal_index_shape(),
                 instruction,
                 &continuation.arena,
                 heap.as_deref(),
@@ -1136,7 +1218,7 @@ impl CheckedInterpreter {
                         Instruction::SubF32 { .. } => canonicalize_nan_f32(lhs - rhs),
                         Instruction::MulF32 { .. } => canonicalize_nan_f32(lhs * rhs),
                         Instruction::DivF32 { .. } => canonicalize_nan_f32(lhs / rhs),
-                        Instruction::RemF32 { .. } => canonicalize_nan_f32(lhs % rhs),
+                        Instruction::RemF32 { .. } => deterministic_rem_f32(lhs, rhs),
                         _ => unreachable!(),
                     };
                     set_register(
@@ -1164,7 +1246,7 @@ impl CheckedInterpreter {
                         Instruction::SubF64 { .. } => canonicalize_nan_f64(lhs - rhs),
                         Instruction::MulF64 { .. } => canonicalize_nan_f64(lhs * rhs),
                         Instruction::DivF64 { .. } => canonicalize_nan_f64(lhs / rhs),
-                        Instruction::RemF64 { .. } => canonicalize_nan_f64(lhs % rhs),
+                        Instruction::RemF64 { .. } => deterministic_rem_f64(lhs, rhs),
                         _ => unreachable!(),
                     };
                     set_register(
@@ -1404,7 +1486,11 @@ impl CheckedInterpreter {
                     {
                         return Err(InterpreterError::TypeMismatch);
                     }
-                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(lhs == rhs))?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Bool(runtime_values_equal(lhs, rhs)),
+                    )?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::Jump { target } => {
@@ -1517,7 +1603,7 @@ impl CheckedInterpreter {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
                             let (code, argument) = match error {
                                 crate::HostTrap::UnknownFunction(function) => {
-                                    ("NX4001", u64::from(function))
+                                    ("NX4001", function.0)
                                 }
                                 crate::HostTrap::Arity => ("NX4003", 0),
                                 crate::HostTrap::Type => ("NX4003", 1),
@@ -1581,7 +1667,6 @@ impl CheckedInterpreter {
                                     fuel,
                                 });
                             }
-                            increment_pc(&mut continuation.arena)?;
                             continuation.suspend_reason = Some(SuspendReason::HostRequest);
                             continuation.pending_fuel = pending_cost;
                             return Ok(InterpreterOutcome::HostPending {
@@ -1595,6 +1680,26 @@ impl CheckedInterpreter {
                             });
                         }
                     }
+                }
+                Instruction::StateCurrentGet {
+                    stable_id,
+                    type_id,
+                    dst,
+                } => {
+                    let current = state_registry.as_deref_mut().map_or_else(
+                        || {
+                            Err(RuntimeMessage::Static(
+                                "current state registry is unavailable",
+                            ))
+                        },
+                        |registry| registry.current_object(stable_id, type_id),
+                    );
+                    let value = state_operation!(current);
+                    if runtime_value_type(value) != Some(ValueType::Named(type_id)) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::StateOldGet { stable_id, ty, dst } => {
                     let value = migration
@@ -1792,16 +1897,7 @@ impl CheckedInterpreter {
                     dst,
                 } => {
                     let variant = module
-                        .module()
-                        .enum_types
-                        .iter()
-                        .find(|enum_type| enum_type.type_id == type_id)
-                        .and_then(|enum_type| {
-                            enum_type
-                                .variants
-                                .iter()
-                                .find(|candidate| candidate.stable_id == variant)
-                        })
+                        .enum_variant(type_id.0, variant.0)
                         .ok_or(InterpreterError::TypeMismatch)?;
                     let payload = payload
                         .map(|payload| register(&continuation.arena, payload))
@@ -1837,6 +1933,17 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, payload)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::EnumEqual { lhs, rhs, dst } => {
+                    let lhs = register(&continuation.arena, lhs)?;
+                    let rhs = register(&continuation.arena, rhs)?;
+                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+                    set_register(
+                        &mut continuation.arena,
+                        dst,
+                        RuntimeValue::Bool(heap.enum_equal(lhs, rhs)?),
+                    )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::StructNew {
                     type_id,
                     fields_base,
@@ -1866,16 +1973,8 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = module
-                        .module()
-                        .struct_types
-                        .iter()
-                        .find(|struct_type| struct_type.type_id == type_id)
-                        .and_then(|struct_type| {
-                            struct_type
-                                .fields
-                                .iter()
-                                .position(|candidate| candidate.stable_id == field)
-                        })
+                        .struct_field(type_id.0, field.0)
+                        .map(|(index, _)| index)
                         .ok_or(InterpreterError::TypeMismatch)?;
                     let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
                     set_register(
@@ -1897,16 +1996,8 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = module
-                        .module()
-                        .struct_types
-                        .iter()
-                        .find(|struct_type| struct_type.type_id == type_id)
-                        .and_then(|struct_type| {
-                            struct_type
-                                .fields
-                                .iter()
-                                .position(|candidate| candidate.stable_id == field)
-                        })
+                        .struct_field(type_id.0, field.0)
+                        .map(|(index, _)| index)
                         .ok_or(InterpreterError::TypeMismatch)?;
                     let heap = heap
                         .as_deref_mut()
@@ -1954,27 +2045,46 @@ impl CheckedInterpreter {
                 }
                 Instruction::ClassGet { source, field, dst } => {
                     let value = register(&continuation.arena, source)?;
-                    let RuntimeValue::NamedRef { type_id, .. } = value else {
+                    let (RuntimeValue::NamedRef { type_id, .. }
+                    | RuntimeValue::Opaque { type_id, .. }) = value
+                    else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = module
-                        .module()
-                        .class_types
-                        .iter()
-                        .find(|class_type| class_type.type_id == type_id)
-                        .and_then(|class_type| {
-                            class_type
-                                .fields
-                                .iter()
-                                .position(|candidate| candidate.stable_id == field)
-                        })
+                    let (index, expected) = module
+                        .class_field(type_id.0, field.0)
+                        .map(|(index, field)| (index, field.ty))
                         .ok_or(InterpreterError::TypeMismatch)?;
-                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        heap.class_field(value, index)?,
-                    )?;
+                    let field_value = match value {
+                        RuntimeValue::NamedRef { .. } => heap
+                            .as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .class_field(value, index)?,
+                        RuntimeValue::Opaque {
+                            value: stable_id, ..
+                        } => {
+                            let field_value = state_registry.as_deref_mut().map_or_else(
+                                || {
+                                    Err(RuntimeMessage::Static(
+                                        "current state registry is unavailable",
+                                    ))
+                                },
+                                |registry| {
+                                    registry.object_field(
+                                        StableId(stable_id),
+                                        type_id,
+                                        field,
+                                        expected,
+                                    )
+                                },
+                            );
+                            state_operation!(field_value)
+                        }
+                        _ => unreachable!("class receiver was checked above"),
+                    };
+                    if runtime_value_type(field_value) != Some(expected) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    set_register(&mut continuation.arena, dst, field_value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ClassSet {
@@ -1984,43 +2094,75 @@ impl CheckedInterpreter {
                 } => {
                     let object = register(&continuation.arena, source)?;
                     let replacement = register(&continuation.arena, value)?;
-                    let RuntimeValue::NamedRef { type_id, .. } = object else {
+                    let (RuntimeValue::NamedRef { type_id, .. }
+                    | RuntimeValue::Opaque { type_id, .. }) = object
+                    else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = module
-                        .module()
-                        .class_types
-                        .iter()
-                        .find(|class_type| class_type.type_id == type_id)
-                        .and_then(|class_type| {
-                            class_type
-                                .fields
-                                .iter()
-                                .position(|candidate| candidate.stable_id == field)
-                        })
+                    let (index, expected) = module
+                        .class_field(type_id.0, field.0)
+                        .map(|(index, field)| (index, field.ty))
                         .ok_or(InterpreterError::TypeMismatch)?;
-                    heap.as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?
-                        .set_class_field(object, index, replacement)?;
+                    if runtime_value_type(replacement) != Some(expected) {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
+                    match object {
+                        RuntimeValue::NamedRef { .. } => heap
+                            .as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .set_class_field(object, index, replacement)?,
+                        RuntimeValue::Opaque {
+                            value: stable_id, ..
+                        } => {
+                            let update = state_registry.as_deref_mut().map_or_else(
+                                || {
+                                    Err(RuntimeMessage::Static(
+                                        "current state registry is unavailable",
+                                    ))
+                                },
+                                |registry| {
+                                    registry.set_object_field(
+                                        StableId(stable_id),
+                                        type_id,
+                                        field,
+                                        expected,
+                                        replacement,
+                                    )
+                                },
+                            );
+                            state_operation!(update);
+                        }
+                        _ => unreachable!("class receiver was checked above"),
+                    }
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ClassEqual { lhs, rhs, dst } => {
                     let lhs = register(&continuation.arena, lhs)?;
                     let rhs = register(&continuation.arena, rhs)?;
-                    let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
-                    set_register(
-                        &mut continuation.arena,
-                        dst,
-                        RuntimeValue::Bool(heap.class_equal(lhs, rhs)?),
-                    )?;
+                    let equal = match (lhs, rhs) {
+                        (
+                            RuntimeValue::Opaque {
+                                value: lhs,
+                                type_id: lhs_type,
+                            },
+                            RuntimeValue::Opaque {
+                                value: rhs,
+                                type_id: rhs_type,
+                            },
+                        ) => lhs == rhs && lhs_type == rhs_type,
+                        (RuntimeValue::Opaque { .. }, RuntimeValue::NamedRef { .. })
+                        | (RuntimeValue::NamedRef { .. }, RuntimeValue::Opaque { .. }) => false,
+                        _ => heap
+                            .as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .class_equal(lhs, rhs)?,
+                    };
+                    set_register(&mut continuation.arena, dst, RuntimeValue::Bool(equal))?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayNew { type_id, dst } => {
                     let element_type = module
-                        .module()
-                        .array_types
-                        .iter()
-                        .find(|array_type| array_type.type_id == type_id)
+                        .array_type(type_id.0)
                         .map(|array_type| array_type.element)
                         .ok_or(InterpreterError::TypeMismatch)?;
                     let value = heap
@@ -2137,10 +2279,7 @@ impl CheckedInterpreter {
                 }
                 Instruction::MapNew { type_id, dst } => {
                     let map_type = module
-                        .module()
-                        .map_types
-                        .iter()
-                        .find(|map_type| map_type.type_id == type_id)
+                        .map_type(type_id.0)
                         .ok_or(InterpreterError::TypeMismatch)?;
                     let value = heap
                         .as_deref_mut()
@@ -2514,31 +2653,29 @@ fn start_next_defer(
     module: &VerifiedModule,
     arena: &mut FrameArena,
 ) -> Result<bool, InterpreterError> {
-    loop {
-        let Some(action) = arena.pop_defer_for_current_frame()? else {
-            return Ok(false);
-        };
-        match action {
-            crate::DeferAction::Call {
-                function,
-                args,
-                args_count,
-            } => {
-                let cleanup = module
-                    .module()
-                    .functions
-                    .get(function as usize)
-                    .ok_or(InterpreterError::MissingFunction(function))?;
-                arena.push_call(function, cleanup.registers, None)?;
-                for (index, value) in args[..usize::from(args_count)].iter().copied().enumerate() {
-                    arena.set_register(index, value)?;
-                }
-                return Ok(true);
+    let Some(action) = arena.pop_defer_for_current_frame()? else {
+        return Ok(false);
+    };
+    match action {
+        crate::DeferAction::Call {
+            function,
+            args,
+            args_count,
+        } => {
+            let cleanup = module
+                .module()
+                .functions
+                .get(function as usize)
+                .ok_or(InterpreterError::MissingFunction(function))?;
+            arena.push_call(function, cleanup.registers, None)?;
+            for (index, value) in args[..usize::from(args_count)].iter().copied().enumerate() {
+                arena.set_register(index, value)?;
             }
-            crate::DeferAction::Trap => return Err(InterpreterError::TypeMismatch),
-            crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
         }
+        crate::DeferAction::Trap => return Err(InterpreterError::TypeMismatch),
+        crate::DeferAction::ReleaseCounter(_) | crate::DeferAction::SetFlag(_) => {}
     }
+    Ok(true)
 }
 
 enum StandardIntrinsicOutcome {
@@ -2550,6 +2687,7 @@ enum StandardIntrinsicOutcome {
 #[allow(clippy::too_many_lines)]
 fn instruction_attempt_fuel(
     module: &nexa_bytecode::Module,
+    nominal_shape: nexa_verifier::NominalIndexShape,
     instruction: Instruction,
     arena: &FrameArena,
     heap: Option<&Heap>,
@@ -2607,21 +2745,63 @@ fn instruction_attempt_fuel(
                 .checked_mul(SCALAR_TO_STRING_FUEL_PASSES)
                 .ok_or(InterpreterError::FuelCostOverflow)?
         }
-        Instruction::StructEqual { lhs, .. } => {
+        Instruction::Call {
+            function,
+            args_count,
+            ..
+        } => call_frame_attempt_fuel(module, function, args_count)?,
+        Instruction::Return { .. } | Instruction::ReturnVoid | Instruction::CleanupReturn => {
+            return_defer_attempt_fuel(module, instruction, arena)?
+        }
+        Instruction::EnumNew { .. } => nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
+        Instruction::StructNew {
+            fields_base,
+            fields_count,
+            ..
+        } => register_structural_hash_fuel(arena, heap_required()?, fields_base, fields_count)?,
+        Instruction::StructGet { .. } => nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
+        Instruction::StructWith { source, value, .. } => {
+            let heap = heap_required()?;
+            let source = register(arena, source)?;
+            let replacement = register(arena, value)?;
+            let fields = heap.struct_fields(source)?;
+            fuel_add(
+                nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
+                fuel_add(
+                    runtime_values_hash_fuel(heap, fields)?,
+                    fuel_add(
+                        value_visit_fuel(1, 1)?,
+                        runtime_value_hash_fuel(heap, replacement)?,
+                    )?,
+                )?,
+            )?
+        }
+        Instruction::EnumEqual { lhs, .. } | Instruction::StructEqual { lhs, .. } => {
             runtime_value_comparison_fuel(heap_required()?, register(arena, lhs)?)?
         }
+        Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
+        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
+            nominal_index_lookup_fuel(nominal_shape.class_fields)?
+        }
+        Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
         Instruction::ArrayPush { source, .. } | Instruction::ArrayInsert { source, .. } => {
-            let length = heap_required()?
-                .array_len(register(arena, source)?)?
+            let heap = heap_required()?;
+            let array = register(arena, source)?;
+            let old_length = heap.array_len(array)?;
+            let new_length = old_length
                 .checked_add(1)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-            fuel_blocks(fuel_usize(length)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+            array_replace_attempt_fuel(heap, old_length, new_length)?
         }
-        Instruction::ArrayPop { source, .. }
-        | Instruction::ArrayRemove { source, .. }
-        | Instruction::ArrayClear { source } => {
-            let length = heap_required()?.array_len(register(arena, source)?)?;
-            fuel_blocks(fuel_usize(length)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+        Instruction::ArrayPop { source, .. } | Instruction::ArrayRemove { source, .. } => {
+            let heap = heap_required()?;
+            let old_length = heap.array_len(register(arena, source)?)?;
+            array_replace_attempt_fuel(heap, old_length, old_length.saturating_sub(1))?
+        }
+        Instruction::ArrayClear { source } => {
+            let heap = heap_required()?;
+            let old_length = heap.array_len(register(arena, source)?)?;
+            array_replace_attempt_fuel(heap, old_length, 0)?
         }
         Instruction::MapGet { source, key, .. }
         | Instruction::MapRemove { source, key, .. }
@@ -2635,6 +2815,7 @@ fn instruction_attempt_fuel(
             register(arena, source)?,
             register(arena, key)?,
         )?,
+        Instruction::MapNew { .. } => nominal_index_lookup_fuel(nominal_shape.map_types)?,
         Instruction::MapClear { source } => {
             let shape = heap_required()?.map_fuel_shape(register(arena, source)?)?;
             let slots = fuel_usize(shape.current_slots)?
@@ -2645,7 +2826,16 @@ fn instruction_attempt_fuel(
                 .ok_or(InterpreterError::FuelCostOverflow)?;
             fuel_blocks(slots, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
         }
-        Instruction::BufferSlice { length, .. } | Instruction::BufferCopy { length, .. } => {
+        Instruction::BufferSlice { length, .. } => {
+            let work = match register(arena, length)? {
+                RuntimeValue::I32(length) => u64::try_from(length).unwrap_or(0),
+                _ => return Err(InterpreterError::TypeMismatch),
+            };
+            let element_work = fuel_blocks(work, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            let metadata_work = collection_arena_metadata_fuel(heap_required()?, work != 0, false)?;
+            fuel_add(element_work, metadata_work)?
+        }
+        Instruction::BufferCopy { length, .. } => {
             let work = match register(arena, length)? {
                 RuntimeValue::I32(length) => u64::try_from(length).unwrap_or(0),
                 _ => return Err(InterpreterError::TypeMismatch),
@@ -2655,6 +2845,101 @@ fn instruction_attempt_fuel(
         _ => 0,
     };
     fuel_add(base, work)
+}
+
+fn call_frame_attempt_fuel(
+    module: &nexa_bytecode::Module,
+    function: u32,
+    args_count: u16,
+) -> Result<u64, InterpreterError> {
+    let callee = module
+        .functions
+        .get(function as usize)
+        .ok_or(InterpreterError::MissingFunction(function))?;
+    // Arguments are first type-checked in the caller frame and then copied to
+    // the freshly initialized callee frame.
+    frame_initialization_fuel(callee.registers, args_count, 2)
+}
+
+fn return_defer_attempt_fuel(
+    module: &nexa_bytecode::Module,
+    instruction: Instruction,
+    arena: &FrameArena,
+) -> Result<u64, InterpreterError> {
+    let action = match instruction {
+        Instruction::CleanupReturn => {
+            let Some(parent_index) = arena.depth().checked_sub(2) else {
+                return Ok(0);
+            };
+            arena.peek_defer_for_frame(parent_index)?
+        }
+        Instruction::Return { .. } | Instruction::ReturnVoid => {
+            if let Some(action) = arena.peek_defer_for_current_frame()? {
+                Some(action)
+            } else {
+                let current = arena.current()?;
+                if current.return_target.is_none() {
+                    arena
+                        .depth()
+                        .checked_sub(2)
+                        .map(|parent_index| arena.peek_defer_for_frame(parent_index))
+                        .transpose()?
+                        .flatten()
+                } else {
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    action.map_or(Ok(0), |action| defer_action_attempt_fuel(module, &action))
+}
+
+fn defer_action_attempt_fuel(
+    module: &nexa_bytecode::Module,
+    action: &crate::DeferAction,
+) -> Result<u64, InterpreterError> {
+    match *action {
+        crate::DeferAction::Call {
+            function,
+            args_count,
+            ..
+        } => {
+            let cleanup = module
+                .functions
+                .get(function as usize)
+                .ok_or(InterpreterError::MissingFunction(function))?;
+            frame_initialization_fuel(cleanup.registers, u16::from(args_count), 1)
+        }
+        crate::DeferAction::ReleaseCounter(_)
+        | crate::DeferAction::SetFlag(_)
+        | crate::DeferAction::Trap => Ok(1),
+    }
+}
+
+fn frame_initialization_fuel(
+    registers: u16,
+    args_count: u16,
+    argument_passes: u64,
+) -> Result<u64, InterpreterError> {
+    let argument_work = u64::from(args_count)
+        .checked_mul(argument_passes)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let work = u64::from(registers)
+        .checked_add(argument_work)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel_blocks(work, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
+}
+
+fn nominal_index_lookup_fuel(entries: usize) -> Result<u64, InterpreterError> {
+    let entries = fuel_usize(entries)?;
+    if entries == 0 {
+        return Ok(0);
+    }
+    let comparisons = u64::from(entries.ilog2())
+        .checked_add(1)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel_blocks(comparisons, 8)
 }
 
 fn register_string_bytes(
@@ -2682,6 +2967,94 @@ fn runtime_value_comparison_fuel(
         .ok_or(InterpreterError::FuelCostOverflow)?;
     let structural_work = fuel_blocks(structural_values, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
     fuel_add(string_work, structural_work)
+}
+
+fn register_structural_hash_fuel(
+    arena: &FrameArena,
+    heap: &Heap,
+    fields_base: u16,
+    fields_count: u16,
+) -> Result<u64, InterpreterError> {
+    if usize::from(fields_count) > nexa_bytecode::MAX_STRUCT_FIELDS {
+        return Err(InterpreterError::TypeMismatch);
+    }
+    let mut work = value_visit_fuel(u64::from(fields_count), 3)?;
+    for offset in 0..fields_count {
+        let field = fields_base
+            .checked_add(offset)
+            .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+        work = fuel_add(
+            work,
+            runtime_value_hash_fuel(heap, register(arena, field)?)?,
+        )?;
+    }
+    Ok(work)
+}
+
+fn runtime_values_hash_fuel(heap: &Heap, values: &[RuntimeValue]) -> Result<u64, InterpreterError> {
+    let mut work = value_visit_fuel(fuel_usize(values.len())?, 3)?;
+    for value in values {
+        work = fuel_add(work, runtime_value_hash_fuel(heap, *value)?)?;
+    }
+    Ok(work)
+}
+
+fn value_visit_fuel(values: u64, passes: u64) -> Result<u64, InterpreterError> {
+    let work = values
+        .checked_mul(passes)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel_blocks(work, 8)
+}
+
+fn array_replace_attempt_fuel(
+    heap: &Heap,
+    old_length: usize,
+    new_length: usize,
+) -> Result<u64, InterpreterError> {
+    // Replacing an arena range copies the new values and clears the released
+    // old values. Both passes are visible work even though the arena storage
+    // itself was reserved at Realm admission.
+    let elements = fuel_usize(old_length)?
+        .checked_add(fuel_usize(new_length)?)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let element_work = fuel_blocks(elements, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+    let metadata_work = collection_arena_metadata_fuel(heap, new_length != 0, old_length != 0)?;
+    fuel_add(element_work, metadata_work)
+}
+
+fn collection_arena_metadata_fuel(
+    heap: &Heap,
+    claim: bool,
+    release: bool,
+) -> Result<u64, InterpreterError> {
+    if !claim && !release {
+        return Ok(0);
+    }
+
+    let ranges = fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?;
+    let mut metadata_steps = 0_u64;
+    if claim {
+        // find_free scan + claim position scan + one Vec remove/insert shift.
+        metadata_steps = ranges
+            .checked_mul(3)
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+    }
+    if release {
+        // A splitting claim can add one range, and release inserts another.
+        // Account for partition search, insertion shift, the merge scan, and
+        // both possible adjacent-range removal shifts.
+        let release_ranges = ranges
+            .checked_add(2)
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+        metadata_steps = metadata_steps
+            .checked_add(
+                release_ranges
+                    .checked_mul(5)
+                    .ok_or(InterpreterError::FuelCostOverflow)?,
+            )
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+    }
+    fuel_blocks(metadata_steps, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)
 }
 
 fn standard_intrinsic_arguments(
@@ -2734,30 +3107,35 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::StringSplit => {
             let (value, delimiter) = string_pair(&arguments)?;
-            let shape = heap_required()?.split_fuel_shape(value, delimiter)?;
+            let heap = heap_required()?;
+            let shape = heap.split_fuel_shape(value, delimiter)?;
             let bytes = fuel_usize(shape.source_bytes)?
                 .checked_add(fuel_usize(shape.delimiter_bytes)?)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
             let scan_copy_and_hash = fuel_blocks(bytes, STANDARD_STRING_FUEL_BLOCK_BYTES)?
                 .checked_mul(4)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-            scan_copy_and_hash
+            let value_work = scan_copy_and_hash
                 .checked_add(fuel_usize(shape.parts)?)
                 .and_then(|work| work.checked_add(1))
-                .ok_or(InterpreterError::FuelCostOverflow)?
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            // The result reservation can be released after any later
+            // fallible temporary allocation, so charge both claim and rollback
+            // metadata before split scans or allocation begin.
+            let metadata_work = collection_arena_metadata_fuel(heap, shape.parts != 0, true)?;
+            fuel_add(value_work, metadata_work)?
         }
         StandardIntrinsicFuelModel::ArrayCopy => {
             let heap = heap_required()?;
-            let mut elements = heap.array_len(arguments[0])?;
-            if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
-                elements = elements
+            let old_length = heap.array_len(arguments[0])?;
+            let new_length = if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
+                old_length
                     .checked_add(1)
-                    .ok_or(InterpreterError::FuelCostOverflow)?;
-            }
-            fuel_blocks(
-                fuel_usize(elements)?,
-                STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
-            )?
+                    .ok_or(InterpreterError::FuelCostOverflow)?
+            } else {
+                old_length.saturating_sub(1)
+            };
+            array_replace_attempt_fuel(heap, old_length, new_length)?
         }
         StandardIntrinsicFuelModel::MapLookup => {
             map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
@@ -3289,6 +3667,19 @@ fn increment_pc(arena: &mut FrameArena) -> Result<(), InterpreterError> {
     Ok(())
 }
 
+#[allow(clippy::float_cmp)]
+fn runtime_values_equal(lhs: RuntimeValue, rhs: RuntimeValue) -> bool {
+    match (lhs, rhs) {
+        (RuntimeValue::F32(lhs), RuntimeValue::F32(rhs)) => {
+            f32::from_bits(lhs) == f32::from_bits(rhs)
+        }
+        (RuntimeValue::F64(lhs), RuntimeValue::F64(rhs)) => {
+            f64::from_bits(lhs) == f64::from_bits(rhs)
+        }
+        _ => lhs == rhs,
+    }
+}
+
 fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
     match value {
         RuntimeValue::I32(_) => Some(ValueType::I32),
@@ -3309,9 +3700,7 @@ fn runtime_value_type(value: RuntimeValue) -> Option<ValueType> {
         RuntimeValue::HostRequest(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
             "HostRequest",
         ))),
-        RuntimeValue::ResourceToken(_) => Some(ValueType::Named(nexa_core::StableId::from_name(
-            "ResourceToken",
-        ))),
+        RuntimeValue::ResourceToken(token) => Some(ValueType::Named(token.token_type())),
         RuntimeValue::Snapshot(snapshot) => Some(ValueType::Named(snapshot.type_id())),
         RuntimeValue::Unit => None,
     }
@@ -3376,10 +3765,14 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::StringToString { .. }
         | Instruction::StandardIntrinsic { .. }
         | Instruction::EnumNew { .. }
+        | Instruction::EnumEqual { .. }
         | Instruction::StructNew { .. }
+        | Instruction::StructGet { .. }
         | Instruction::StructWith { .. }
         | Instruction::StructEqual { .. }
         | Instruction::ClassNew { .. }
+        | Instruction::ClassGet { .. }
+        | Instruction::ClassSet { .. }
         | Instruction::ArrayNew { .. }
         | Instruction::ArrayLen { .. }
         | Instruction::ArrayGet { .. }
@@ -3403,6 +3796,7 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::BufferCopy { .. }
         | Instruction::Call { .. }
         | Instruction::HostCall { .. }
+        | Instruction::StateCurrentGet { .. }
         | Instruction::StateHandleResolve { .. }
         | Instruction::Return { .. }
         | Instruction::ReturnVoid
@@ -3413,129 +3807,394 @@ fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
     }
 }
 
-#[allow(clippy::too_many_lines)]
-fn opcode_index(instruction: Instruction) -> usize {
-    match instruction {
-        Instruction::LoadI32 { .. } => 0,
-        Instruction::LoadBool { .. } => 1,
-        Instruction::Move { .. } => 2,
-        Instruction::Add { .. } => 3,
-        Instruction::Sub { .. } => 4,
-        Instruction::Mul { .. } => 5,
-        Instruction::CompareEq { .. } => 6,
-        Instruction::Jump { .. } => 7,
-        Instruction::JumpIfFalse { .. } => 8,
-        Instruction::Call { .. } => 9,
-        Instruction::Return { .. } => 10,
-        Instruction::ReturnVoid => 11,
-        Instruction::Safepoint => 12,
-        Instruction::Yield => 13,
-        Instruction::Trap => 14,
-        Instruction::DeferPush { .. } => 15,
-        Instruction::DeferPop => 16,
-        Instruction::CleanupReturn => 17,
-        Instruction::HostCall { .. } => 18,
-        Instruction::StateOldGet { .. } => 19,
-        Instruction::StateNewCreate { .. } => 20,
-        Instruction::StateNewSet { .. } => 21,
-        Instruction::StateReplace { .. } => 22,
-        Instruction::StateDelete { .. } => 23,
-        Instruction::EnumNew { .. } => 24,
-        Instruction::EnumTag { .. } => 25,
-        Instruction::EnumPayload { .. } => 26,
-        Instruction::StatePreserve { .. } => 27,
-        Instruction::StateFinish => 28,
-        Instruction::StateOldFieldGet { .. } => 29,
-        Instruction::StateHandleResolve { .. } => 30,
-        Instruction::StateHandleIsAlive { .. } => 31,
-        Instruction::StateHandleStableId { .. } => 32,
-        Instruction::StateHandleGeneration { .. } => 33,
-        Instruction::StateHandleEqual { .. } => 34,
-        Instruction::StateHandleHash { .. } => 35,
-        Instruction::LoadI64 { .. } => 36,
-        Instruction::LoadF32 { .. } => 37,
-        Instruction::LoadF64 { .. } => 38,
-        Instruction::LoadRune { .. } => 39,
-        Instruction::AddI64 { .. } => 40,
-        Instruction::SubI64 { .. } => 41,
-        Instruction::MulI64 { .. } => 42,
-        Instruction::DivI64 { .. } => 43,
-        Instruction::Div { .. } => 44,
-        Instruction::AddF32 { .. } => 45,
-        Instruction::SubF32 { .. } => 46,
-        Instruction::MulF32 { .. } => 47,
-        Instruction::DivF32 { .. } => 48,
-        Instruction::AddF64 { .. } => 49,
-        Instruction::SubF64 { .. } => 50,
-        Instruction::MulF64 { .. } => 51,
-        Instruction::DivF64 { .. } => 52,
-        Instruction::RemI32 { .. } => 101,
-        Instruction::RemI64 { .. } => 102,
-        Instruction::RemF32 { .. } => 103,
-        Instruction::RemF64 { .. } => 104,
-        Instruction::LoadString { .. } => 53,
-        Instruction::StringLen { .. } => 54,
-        Instruction::StringByteLen { .. } => 55,
-        Instruction::StringEqual { .. } => 56,
-        Instruction::StringConcat { .. } => 57,
-        Instruction::StringRuneAt { .. } => 58,
-        Instruction::StringHash { .. } => 59,
-        Instruction::StructNew { .. } => 60,
-        Instruction::StructGet { .. } => 61,
-        Instruction::StructWith { .. } => 62,
-        Instruction::StructEqual { .. } => 63,
-        Instruction::ClassNew { .. } => 64,
-        Instruction::ClassGet { .. } => 65,
-        Instruction::ClassSet { .. } => 66,
-        Instruction::ClassEqual { .. } => 67,
-        Instruction::ArrayNew { .. } => 68,
-        Instruction::ArrayLen { .. } => 69,
-        Instruction::ArrayGet { .. } => 70,
-        Instruction::ArraySet { .. } => 71,
-        Instruction::ArrayPush { .. } => 72,
-        Instruction::ArrayPop { .. } => 73,
-        Instruction::ArrayInsert { .. } => 74,
-        Instruction::ArrayRemove { .. } => 75,
-        Instruction::ArrayClear { .. } => 76,
-        Instruction::MapNew { .. } => 77,
-        Instruction::MapLen { .. } => 78,
-        Instruction::MapGet { .. } => 79,
-        Instruction::MapSet { .. } => 80,
-        Instruction::MapRemove { .. } => 81,
-        Instruction::MapContains { .. } => 82,
-        Instruction::MapClear { .. } => 83,
-        Instruction::BufferLen { .. } => 84,
-        Instruction::BufferGet { .. } => 85,
-        Instruction::BufferSet { .. } => 86,
-        Instruction::BufferSlice { .. } => 87,
-        Instruction::BufferCopy { .. } => 88,
-        Instruction::I32ToString { .. } => 89,
-        Instruction::I64ToString { .. } => 90,
-        Instruction::F32ToString { .. } => 91,
-        Instruction::F64ToString { .. } => 92,
-        Instruction::BoolToString { .. } => 93,
-        Instruction::RuneToString { .. } => 94,
-        Instruction::CompareLtI32 { .. } => 95,
-        Instruction::CompareLtI64 { .. } => 96,
-        Instruction::CompareLtF32 { .. } => 97,
-        Instruction::CompareLtF64 { .. } => 98,
-        Instruction::StringToString { .. } => 99,
-        Instruction::StandardIntrinsic { .. } => 100,
-    }
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpcodeCostScheduleEntry {
+    index: usize,
+    name: &'static str,
+    base_cost: u16,
+    intrinsic_scaled: bool,
+    dynamic_work: &'static str,
+}
+
+#[allow(unused_macros)]
+macro_rules! opcode_dynamic_work {
+    () => {
+        "fixed"
+    };
+    ($dynamic_work:literal) => {
+        $dynamic_work
+    };
+}
+
+#[allow(unused_macros)]
+macro_rules! opcode_intrinsic_scaled {
+    () => {
+        false
+    };
+    ($intrinsic_scaled:literal) => {
+        $intrinsic_scaled
+    };
+}
+
+macro_rules! define_opcode_cost_schedule {
+    (
+        $(
+            $pattern:pat => {
+                index: $index:literal,
+                name: $name:literal,
+                base_cost: $base_cost:literal
+                $(, intrinsic_scaled: $intrinsic_scaled:literal)?
+                $(, dynamic_work: $dynamic_work:literal)?
+            }
+        ),+ $(,)?
+    ) => {
+        const DEFAULT_OPCODE_COSTS: [u16; 107] = [$($base_cost),+];
+
+        #[cfg(test)]
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 107] = [
+            $(
+                OpcodeCostScheduleEntry {
+                    index: $index,
+                    name: $name,
+                    base_cost: $base_cost,
+                    intrinsic_scaled: opcode_intrinsic_scaled!($($intrinsic_scaled)?),
+                    dynamic_work: opcode_dynamic_work!($($dynamic_work)?),
+                },
+            )+
+        ];
+
+        #[allow(clippy::too_many_lines)]
+        fn opcode_index(instruction: Instruction) -> usize {
+            match instruction {
+                $($pattern => $index,)+
+            }
+        }
+    };
+}
+
+define_opcode_cost_schedule! {
+    Instruction::LoadI32 { .. } => { index: 0, name: "LoadI32", base_cost: 1 },
+    Instruction::LoadBool { .. } => { index: 1, name: "LoadBool", base_cost: 1 },
+    Instruction::Move { .. } => { index: 2, name: "Move", base_cost: 1 },
+    Instruction::Add { .. } => { index: 3, name: "Add", base_cost: 1 },
+    Instruction::Sub { .. } => { index: 4, name: "Sub", base_cost: 1 },
+    Instruction::Mul { .. } => { index: 5, name: "Mul", base_cost: 1 },
+    Instruction::CompareEq { .. } => { index: 6, name: "CompareEq", base_cost: 1 },
+    Instruction::Jump { .. } => { index: 7, name: "Jump", base_cost: 1 },
+    Instruction::JumpIfFalse { .. } => { index: 8, name: "JumpIfFalse", base_cost: 1 },
+    Instruction::Call { .. } => {
+        index: 9,
+        name: "Call",
+        base_cost: 1,
+        dynamic_work: "ceil((callee_registers+2*args_count)/8)"
+    },
+    Instruction::Return { .. } => {
+        index: 10,
+        name: "Return",
+        base_cost: 1,
+        dynamic_work: "next_defer?(call:ceil((cleanup_registers+args_count)/8),other:1):0"
+    },
+    Instruction::ReturnVoid => {
+        index: 11,
+        name: "ReturnVoid",
+        base_cost: 1,
+        dynamic_work: "next_defer?(call:ceil((cleanup_registers+args_count)/8),other:1):0"
+    },
+    Instruction::Safepoint => { index: 12, name: "Safepoint", base_cost: 1 },
+    Instruction::Yield => { index: 13, name: "Yield", base_cost: 1 },
+    Instruction::Trap => { index: 14, name: "Trap", base_cost: 1 },
+    Instruction::DeferPush { .. } => { index: 15, name: "DeferPush", base_cost: 1 },
+    Instruction::DeferPop => { index: 16, name: "DeferPop", base_cost: 1 },
+    Instruction::CleanupReturn => {
+        index: 17,
+        name: "CleanupReturn",
+        base_cost: 1,
+        dynamic_work: "next_parent_defer?(call:ceil((cleanup_registers+args_count)/8),other:1):0"
+    },
+    Instruction::HostCall { .. } => { index: 18, name: "HostCall", base_cost: 1 },
+    Instruction::StateOldGet { .. } => { index: 19, name: "StateOldGet", base_cost: 1 },
+    Instruction::StateNewCreate { .. } => { index: 20, name: "StateNewCreate", base_cost: 1 },
+    Instruction::StateNewSet { .. } => { index: 21, name: "StateNewSet", base_cost: 1 },
+    Instruction::StateReplace { .. } => { index: 22, name: "StateReplace", base_cost: 1 },
+    Instruction::StateDelete { .. } => { index: 23, name: "StateDelete", base_cost: 1 },
+    Instruction::EnumNew { .. } => {
+        index: 24,
+        name: "EnumNew",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(enum_variant_index_entries)"
+    },
+    Instruction::EnumTag { .. } => { index: 25, name: "EnumTag", base_cost: 1 },
+    Instruction::EnumPayload { .. } => { index: 26, name: "EnumPayload", base_cost: 1 },
+    Instruction::StatePreserve { .. } => { index: 27, name: "StatePreserve", base_cost: 1 },
+    Instruction::StateFinish => { index: 28, name: "StateFinish", base_cost: 1 },
+    Instruction::StateOldFieldGet { .. } => { index: 29, name: "StateOldFieldGet", base_cost: 1 },
+    Instruction::StateHandleResolve { .. } => { index: 30, name: "StateHandleResolve", base_cost: 1 },
+    Instruction::StateHandleIsAlive { .. } => { index: 31, name: "StateHandleIsAlive", base_cost: 1 },
+    Instruction::StateHandleStableId { .. } => { index: 32, name: "StateHandleStableId", base_cost: 1 },
+    Instruction::StateHandleGeneration { .. } => { index: 33, name: "StateHandleGeneration", base_cost: 1 },
+    Instruction::StateHandleEqual { .. } => { index: 34, name: "StateHandleEqual", base_cost: 1 },
+    Instruction::StateHandleHash { .. } => { index: 35, name: "StateHandleHash", base_cost: 1 },
+    Instruction::LoadI64 { .. } => { index: 36, name: "LoadI64", base_cost: 1 },
+    Instruction::LoadF32 { .. } => { index: 37, name: "LoadF32", base_cost: 1 },
+    Instruction::LoadF64 { .. } => { index: 38, name: "LoadF64", base_cost: 1 },
+    Instruction::LoadRune { .. } => { index: 39, name: "LoadRune", base_cost: 1 },
+    Instruction::AddI64 { .. } => { index: 40, name: "AddI64", base_cost: 1 },
+    Instruction::SubI64 { .. } => { index: 41, name: "SubI64", base_cost: 1 },
+    Instruction::MulI64 { .. } => { index: 42, name: "MulI64", base_cost: 1 },
+    Instruction::DivI64 { .. } => { index: 43, name: "DivI64", base_cost: 1 },
+    Instruction::Div { .. } => { index: 44, name: "Div", base_cost: 1 },
+    Instruction::AddF32 { .. } => { index: 45, name: "AddF32", base_cost: 1 },
+    Instruction::SubF32 { .. } => { index: 46, name: "SubF32", base_cost: 1 },
+    Instruction::MulF32 { .. } => { index: 47, name: "MulF32", base_cost: 1 },
+    Instruction::DivF32 { .. } => { index: 48, name: "DivF32", base_cost: 1 },
+    Instruction::AddF64 { .. } => { index: 49, name: "AddF64", base_cost: 1 },
+    Instruction::SubF64 { .. } => { index: 50, name: "SubF64", base_cost: 1 },
+    Instruction::MulF64 { .. } => { index: 51, name: "MulF64", base_cost: 1 },
+    Instruction::DivF64 { .. } => { index: 52, name: "DivF64", base_cost: 1 },
+    Instruction::LoadString { .. } => {
+        index: 53,
+        name: "LoadString",
+        base_cost: 1,
+        dynamic_work: "ceil(pool_bytes/32)*2"
+    },
+    Instruction::StringLen { .. } => {
+        index: 54,
+        name: "StringLen",
+        base_cost: 1,
+        dynamic_work: "ceil(source_bytes/32)"
+    },
+    Instruction::StringByteLen { .. } => { index: 55, name: "StringByteLen", base_cost: 1 },
+    Instruction::StringEqual { .. } => {
+        index: 56,
+        name: "StringEqual",
+        base_cost: 1,
+        dynamic_work: "ceil(min(lhs_bytes,rhs_bytes)/32)"
+    },
+    Instruction::StringConcat { .. } => {
+        index: 57,
+        name: "StringConcat",
+        base_cost: 1,
+        dynamic_work: "ceil((lhs_bytes+rhs_bytes)/32)*2"
+    },
+    Instruction::StringRuneAt { .. } => {
+        index: 58,
+        name: "StringRuneAt",
+        base_cost: 1,
+        dynamic_work: "ceil(source_bytes/32)"
+    },
+    Instruction::StringHash { .. } => { index: 59, name: "StringHash", base_cost: 1 },
+    Instruction::StructNew { .. } => {
+        index: 60,
+        name: "StructNew",
+        base_cost: 1,
+        dynamic_work: "ceil(fields_count*3/8)+sum(field_recursive_hash_shape)"
+    },
+    Instruction::StructGet { .. } => {
+        index: 61,
+        name: "StructGet",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(struct_field_index_entries)"
+    },
+    Instruction::StructWith { .. } => {
+        index: 62,
+        name: "StructWith",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(struct_field_index_entries)+ceil(existing_fields*3/8)+sum(existing_recursive_hash_shape)+ceil(1/8)+replacement_recursive_hash_shape"
+    },
+    Instruction::StructEqual { .. } => {
+        index: 63,
+        name: "StructEqual",
+        base_cost: 1,
+        dynamic_work: "lhs_structural_comparison_shape"
+    },
+    Instruction::ClassNew { .. } => {
+        index: 64,
+        name: "ClassNew",
+        base_cost: 1,
+        dynamic_work: "ceil(fields_count*2/8)"
+    },
+    Instruction::ClassGet { .. } => {
+        index: 65,
+        name: "ClassGet",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(class_field_index_entries)"
+    },
+    Instruction::ClassSet { .. } => {
+        index: 66,
+        name: "ClassSet",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(class_field_index_entries)"
+    },
+    Instruction::ClassEqual { .. } => { index: 67, name: "ClassEqual", base_cost: 1 },
+    Instruction::ArrayNew { .. } => {
+        index: 68,
+        name: "ArrayNew",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(array_type_index_entries)"
+    },
+    Instruction::ArrayLen { .. } => { index: 69, name: "ArrayLen", base_cost: 1 },
+    Instruction::ArrayGet { .. } => { index: 70, name: "ArrayGet", base_cost: 1 },
+    Instruction::ArraySet { .. } => { index: 71, name: "ArraySet", base_cost: 1 },
+    Instruction::ArrayPush { .. } => {
+        index: 72,
+        name: "ArrayPush",
+        base_cost: 1,
+        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+    },
+    Instruction::ArrayPop { .. } => {
+        index: 73,
+        name: "ArrayPop",
+        base_cost: 1,
+        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+    },
+    Instruction::ArrayInsert { .. } => {
+        index: 74,
+        name: "ArrayInsert",
+        base_cost: 1,
+        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+    },
+    Instruction::ArrayRemove { .. } => {
+        index: 75,
+        name: "ArrayRemove",
+        base_cost: 1,
+        dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata"
+    },
+    Instruction::ArrayClear { .. } => {
+        index: 76,
+        name: "ArrayClear",
+        base_cost: 1,
+        dynamic_work: "ceil(old_len/8)+collection_release_metadata"
+    },
+    Instruction::MapNew { .. } => {
+        index: 77,
+        name: "MapNew",
+        base_cost: 1,
+        dynamic_work: "binary_search_fuel(map_type_index_entries)"
+    },
+    Instruction::MapLen { .. } => { index: 78, name: "MapLen", base_cost: 1 },
+    Instruction::MapGet { .. } => {
+        index: 79,
+        name: "MapGet",
+        base_cost: 1,
+        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::MapSet { .. } => {
+        index: 80,
+        name: "MapSet",
+        base_cost: 1,
+        dynamic_work: "map_insert_attempt_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::MapRemove { .. } => {
+        index: 81,
+        name: "MapRemove",
+        base_cost: 1,
+        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::MapContains { .. } => {
+        index: 82,
+        name: "MapContains",
+        base_cost: 1,
+        dynamic_work: "map_lookup_slots+key_hash_and_comparison_shape"
+    },
+    Instruction::MapClear { .. } => {
+        index: 83,
+        name: "MapClear",
+        base_cost: 1,
+        dynamic_work: "ceil((current_slots+old_slots+new_slots)/8)"
+    },
+    Instruction::BufferLen { .. } => { index: 84, name: "BufferLen", base_cost: 1 },
+    Instruction::BufferGet { .. } => { index: 85, name: "BufferGet", base_cost: 1 },
+    Instruction::BufferSet { .. } => { index: 86, name: "BufferSet", base_cost: 1 },
+    Instruction::BufferSlice { .. } => {
+        index: 87,
+        name: "BufferSlice",
+        base_cost: 1,
+        dynamic_work: "ceil(requested_len/8)+collection_claim_metadata"
+    },
+    Instruction::BufferCopy { .. } => {
+        index: 88,
+        name: "BufferCopy",
+        base_cost: 1,
+        dynamic_work: "ceil(requested_len/8)"
+    },
+    Instruction::I32ToString { .. } => {
+        index: 89,
+        name: "I32ToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::I64ToString { .. } => {
+        index: 90,
+        name: "I64ToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::F32ToString { .. } => {
+        index: 91,
+        name: "F32ToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::F64ToString { .. } => {
+        index: 92,
+        name: "F64ToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::BoolToString { .. } => {
+        index: 93,
+        name: "BoolToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::RuneToString { .. } => {
+        index: 94,
+        name: "RuneToString",
+        base_cost: 1,
+        dynamic_work: "ceil(64/32)*3"
+    },
+    Instruction::CompareLtI32 { .. } => { index: 95, name: "CompareLtI32", base_cost: 1 },
+    Instruction::CompareLtI64 { .. } => { index: 96, name: "CompareLtI64", base_cost: 1 },
+    Instruction::CompareLtF32 { .. } => { index: 97, name: "CompareLtF32", base_cost: 1 },
+    Instruction::CompareLtF64 { .. } => { index: 98, name: "CompareLtF64", base_cost: 1 },
+    Instruction::StringToString { .. } => { index: 99, name: "StringToString", base_cost: 1 },
+    Instruction::StandardIntrinsic { .. } => {
+        index: 100,
+        name: "StandardIntrinsic",
+        base_cost: 1,
+        intrinsic_scaled: true,
+        dynamic_work: "intrinsic.fuel_model(args,heap)+collection_metadata"
+    },
+    Instruction::RemI32 { .. } => { index: 101, name: "RemI32", base_cost: 1 },
+    Instruction::RemI64 { .. } => { index: 102, name: "RemI64", base_cost: 1 },
+    Instruction::RemF32 { .. } => { index: 103, name: "RemF32", base_cost: 1 },
+    Instruction::RemF64 { .. } => { index: 104, name: "RemF64", base_cost: 1 },
+    Instruction::StateCurrentGet { .. } => { index: 105, name: "StateCurrentGet", base_cost: 1 },
+    Instruction::EnumEqual { .. } => {
+        index: 106,
+        name: "EnumEqual",
+        base_cost: 1,
+        dynamic_work: "lhs_recursive_enum_comparison_shape"
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fmt::Write as _;
+
     use nexa_bytecode::{
-        FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, RootMap,
-        STANDARD_STRING_FUEL_BLOCK_BYTES, Signature, SourceMapEntry, StandardIntrinsic, ValueType,
+        AsyncResultType, FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction,
+        ModuleBuilder, RootMap, SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES,
+        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, STANDARD_STRING_FUEL_BLOCK_BYTES, Signature,
+        SourceMapEntry, StandardIntrinsic, ValueType,
     };
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, FileId, SourceSpan, StableId};
     use nexa_verifier::{VerifierLimits, verify};
 
     use super::{
-        CheckedInterpreter, FuelState, InterpreterMigration, InterpreterOutcome,
-        StandardIntrinsicOutcome, SuspendReason, allocate_runtime_string,
+        CheckedInterpreter, FuelState, InterpreterError, InterpreterMigration, InterpreterOutcome,
+        OPCODE_COST_SCHEDULE, StandardIntrinsicOutcome, SuspendReason, allocate_runtime_string,
         ensure_host_call_available, fuel_add, fuel_blocks, run_standard_intrinsic,
     };
     use crate::{
@@ -3544,12 +4203,176 @@ mod tests {
     };
 
     #[test]
+    fn bytecode_v6_opcode_cost_schedule_matches_the_frozen_fixture() {
+        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 6);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 107);
+        assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
+        assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
+        assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);
+        assert_eq!(SCALAR_TO_STRING_FUEL_PASSES, 3);
+
+        let table = OpcodeCostTable::default();
+        let mut rendered = String::new();
+        writeln!(
+            rendered,
+            "bytecode_version={}",
+            nexa_bytecode::BYTECODE_VERSION
+        )
+        .unwrap();
+        writeln!(rendered, "opcode_cost_table_version={}", table.version).unwrap();
+        writeln!(rendered, "entries={}", OPCODE_COST_SCHEDULE.len()).unwrap();
+        writeln!(
+            rendered,
+            "index\tname\ttable_base\teffective_base\tdynamic_work"
+        )
+        .unwrap();
+        for (expected_index, entry) in OPCODE_COST_SCHEDULE.iter().enumerate() {
+            assert_eq!(entry.index, expected_index);
+            assert_eq!(table.costs[entry.index], entry.base_cost);
+            let effective = if entry.intrinsic_scaled {
+                "intrinsic.base_fuel_cost"
+            } else {
+                "fixed"
+            };
+            writeln!(
+                rendered,
+                "{:03}\t{}\t{}\t{effective}\t{}",
+                entry.index, entry.name, entry.base_cost, entry.dynamic_work
+            )
+            .unwrap();
+        }
+        writeln!(rendered, "runtime_transitions=1").unwrap();
+        writeln!(
+            rendered,
+            "run_cleanup_initial_defer\tsum_until_call(call:ceil((cleanup_registers+args_count)/8),other:1)"
+        )
+        .unwrap();
+        assert_eq!(
+            rendered,
+            include_str!("../fixtures/opcode-cost-table-v6.txt")
+        );
+
+        let mut mismatched = table;
+        mismatched.version = mismatched.version.saturating_sub(1);
+        assert_eq!(
+            mismatched.validate_version(),
+            Err(InterpreterError::OpcodeCostTableVersion {
+                expected: nexa_core::OPCODE_COST_TABLE_VERSION,
+                actual: mismatched.version,
+            })
+        );
+    }
+
+    #[test]
     fn migration_execution_rejects_host_calls_defensively() {
         assert_eq!(
             ensure_host_call_available(true),
             Err(super::InterpreterError::HostUnavailable)
         );
         assert_eq!(ensure_host_call_available(false), Ok(()));
+    }
+
+    #[test]
+    fn async_host_pending_uses_pre_call_root_map_until_resume_value_is_written() {
+        let result = nexa_bytecode::result_type(ValueType::Ref, ValueType::I32);
+        let result_type = result.type_id;
+        let signature = Signature {
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(result_type)),
+        };
+        let async_result = AsyncResultType {
+            result_type,
+            success: ValueType::Ref,
+            error: ValueType::I32,
+            cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+            abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+            cancel_error: Some(1),
+            abandon_error: None,
+        };
+        let mut function = FunctionBuilder::new(signature, 1);
+        function
+            .effect(FunctionEffect::Task)
+            .emit(Instruction::HostCall {
+                import: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            })
+            .emit(Instruction::Return { source: 0 });
+        let mut function = function.finish().unwrap();
+        function.root_bitmap = vec![true];
+        function.safepoints = vec![0, 1];
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![true],
+            },
+        ];
+
+        let host_contract = StableId::from_name("test::async-root-host");
+        let mut module = ModuleBuilder::new();
+        module
+            .metadata(
+                host_contract,
+                nexa_bytecode::StateSchema::default().fingerprint(),
+            )
+            .enum_type(result);
+        module.host_import(HostImport {
+            stable_id: StableId::from_name("test::async-root-host::request"),
+            declaration_fingerprint: [0; 32],
+            capabilities: Vec::new(),
+            parameters: Vec::new(),
+            result: Some(ValueType::Named(result_type)),
+            mode: HostCallMode::Async,
+            fuel_cost: 1,
+            async_result: Some(async_result),
+        });
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+
+        let limits = FrameLimits::default();
+        let mut continuation = CheckedInterpreter::start(
+            &module,
+            0,
+            &[],
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )
+        .unwrap();
+        continuation.host_call_boundary = Some(super::HostCallBoundary {
+            import: 0,
+            function: 0,
+            pc: 0,
+            source_span: None,
+        });
+
+        assert!(
+            continuation.checked_gc_roots(&module).unwrap().is_empty(),
+            "the pending destination is still Unit and must use the pre-call root map"
+        );
+
+        let mut heap = Heap::new(1);
+        let reference = heap.allocate(Object::String("host result".into())).unwrap();
+        continuation
+            .write_resume_value(
+                0,
+                Some(ValueType::Named(result_type)),
+                RuntimeValue::NamedRef {
+                    type_id: result_type,
+                    reference,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(
+            continuation.checked_gc_roots(&module).unwrap(),
+            vec![reference],
+            "the resumed destination becomes live only after the Host result is written"
+        );
     }
 
     #[derive(Default)]
@@ -3986,7 +4809,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true, true],
+                bitmap: vec![false, true],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -4082,6 +4905,76 @@ mod tests {
     }
 
     #[test]
+    fn scalar_float_equality_uses_ieee_semantics() {
+        fn compare(source_type: ValueType, lhs: RuntimeValue, rhs: RuntimeValue) -> bool {
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters: vec![source_type, source_type],
+                    result: Some(ValueType::Bool),
+                },
+                3,
+            );
+            function
+                .emit(Instruction::CompareEq {
+                    dst: 2,
+                    lhs: 0,
+                    rhs: 1,
+                })
+                .emit(Instruction::Return { source: 2 });
+            let mut module = ModuleBuilder::new();
+            module.function(function.finish().unwrap());
+            let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+            let InterpreterOutcome::Returned {
+                value: Some(RuntimeValue::Bool(value)),
+                ..
+            } = CheckedInterpreter::run(&module, 0, &[lhs, rhs], 16).unwrap()
+            else {
+                panic!("equality must return bool");
+            };
+            value
+        }
+
+        assert!(compare(
+            ValueType::F32,
+            RuntimeValue::F32(0.0_f32.to_bits()),
+            RuntimeValue::F32((-0.0_f32).to_bits()),
+        ));
+        assert!(!compare(
+            ValueType::F32,
+            RuntimeValue::F32(CANONICAL_NAN_F32_BITS),
+            RuntimeValue::F32(CANONICAL_NAN_F32_BITS),
+        ));
+        assert!(compare(
+            ValueType::F64,
+            RuntimeValue::F64(0.0_f64.to_bits()),
+            RuntimeValue::F64((-0.0_f64).to_bits()),
+        ));
+        assert!(!compare(
+            ValueType::F64,
+            RuntimeValue::F64(CANONICAL_NAN_F64_BITS),
+            RuntimeValue::F64(CANONICAL_NAN_F64_BITS),
+        ));
+
+        let class_type = StableId::from_name("ClassIdentity");
+        let first = RuntimeValue::NamedRef {
+            reference: crate::GcRef {
+                index: 1,
+                generation: 1,
+            },
+            type_id: class_type,
+        };
+        let second = RuntimeValue::NamedRef {
+            reference: crate::GcRef {
+                index: 2,
+                generation: 1,
+            },
+            type_id: class_type,
+        };
+        assert!(super::runtime_values_equal(first, first));
+        assert!(!super::runtime_values_equal(first, second));
+    }
+
+    #[test]
     fn frame_arena_continuation_yields_and_resumes_without_repeating_add() {
         let mut function = FunctionBuilder::new(
             Signature {
@@ -4169,7 +5062,7 @@ mod tests {
 
     #[test]
     #[allow(clippy::similar_names)]
-    fn call_preserves_pre_call_reference_until_scalar_result_returns() {
+    fn call_drops_dead_pre_call_reference_before_scalar_result_returns() {
         let mut caller = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),
@@ -4197,7 +5090,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true],
+                bitmap: vec![false],
             },
             RootMap {
                 pc: 2,
@@ -4230,16 +5123,15 @@ mod tests {
             panic!("callee must yield");
         };
         let roots = continuation.checked_gc_roots(&module).unwrap();
-        assert_eq!(roots.len(), 1);
-        assert_eq!(
-            heap.collect(&GcRoots {
+        assert!(roots.is_empty());
+        let collection = heap
+            .collect(&GcRoots {
                 suspended_tasks: roots,
                 ..GcRoots::default()
             })
-            .unwrap()
-            .live,
-            1
-        );
+            .unwrap();
+        assert_eq!(collection.reclaimed, 1);
+        assert_eq!(collection.live, 0);
         assert!(matches!(
             CheckedInterpreter::poll_with_heap(
                 &module,
@@ -4254,7 +5146,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(heap.collect(&GcRoots::default()).unwrap().reclaimed, 1);
+        assert_eq!(heap.collect(&GcRoots::default()).unwrap().reclaimed, 0);
     }
 
     #[test]
@@ -4286,11 +5178,11 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true, true],
+                bitmap: vec![false, true],
             },
             RootMap {
                 pc: 2,
-                bitmap: vec![true, true],
+                bitmap: vec![false, true],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -4315,7 +5207,9 @@ mod tests {
             suspended_tasks: continuation.checked_gc_roots(&module).unwrap(),
             ..GcRoots::default()
         };
-        assert_eq!(heap.collect(&roots).unwrap().live, 2);
+        let collection = heap.collect(&roots).unwrap();
+        assert_eq!(collection.live, 1);
+        assert_eq!(collection.reclaimed, 1);
         assert_eq!(heap.string(trimmed).unwrap(), "rooted 😀");
 
         assert!(matches!(
@@ -4368,7 +5262,7 @@ mod tests {
             },
             nexa_bytecode::RootMap {
                 pc: 3,
-                bitmap: vec![false, true, false],
+                bitmap: vec![false, false, false],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -5356,7 +6250,7 @@ mod tests {
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![true, true, true],
+                bitmap: vec![false, false, true],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -5436,7 +6330,7 @@ mod tests {
                 },
                 RootMap {
                     pc: 1,
-                    bitmap: vec![true, true, true],
+                    bitmap: vec![false, false, true],
                 },
             ];
             let mut module = ModuleBuilder::new();
@@ -5459,8 +6353,8 @@ mod tests {
             };
             charge.fuel_used
         };
-        assert_eq!(execute("a,b"), 22);
-        assert_eq!(execute("a long prefix without delimiters,b"), 57);
+        assert_eq!(execute("a,b"), 25);
+        assert_eq!(execute("a long prefix without delimiters,b"), 60);
 
         let mut heap = Heap::new_with_arena_limits(64, 4096, 64, 256, 64);
         let text = allocate_runtime_string(&mut heap, "a,b").unwrap();
@@ -5480,14 +6374,14 @@ mod tests {
         let InterpreterOutcome::Returned { charge, .. } = CheckedInterpreter::poll_with_heap(
             &module,
             continuation,
-            FuelState::new(22, 0, u64::MAX),
+            FuelState::new(25, 0, u64::MAX),
             &OpcodeCostTable::default(),
             &mut heap,
         )
         .unwrap() else {
             panic!("one funded retry must finish the split exactly once");
         };
-        assert_eq!(charge.fuel_used, 22);
+        assert_eq!(charge.fuel_used, 25);
     }
 
     #[test]
@@ -5514,10 +6408,21 @@ mod tests {
                     dst: 3,
                 })
                 .emit(Instruction::Return { source: 3 });
+            let mut function = function.finish().unwrap();
+            function.root_maps = vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: vec![true, false, false, false],
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: vec![false, false, false, false],
+                },
+            ];
             let mut module = ModuleBuilder::new();
             module
                 .map_type(nexa_bytecode::MapType::new(ValueType::I32, ValueType::I32))
-                .function(function.finish().unwrap());
+                .function(function);
             verify(module.finish(), VerifierLimits::default()).unwrap()
         }
 

@@ -90,6 +90,11 @@ macro_rules! string_registry {
                 self.entries.contains_key(id)
             }
 
+            #[must_use]
+            pub fn owner(&self, id: &str) -> Option<&PackageId> {
+                self.entries.get(id).map(|entry| &entry.owner)
+            }
+
             pub fn first_id(&self) -> Option<String> {
                 self.entries.keys().next().cloned()
             }
@@ -155,6 +160,11 @@ impl FoodRegistry {
             .iter()
             .nth(index % self.entries.len())
             .map(|(id, entry)| (id.as_str(), &entry.value))
+    }
+
+    #[must_use]
+    pub fn owner(&self, id: &str) -> Option<&PackageId> {
+        self.entries.get(id).map(|entry| &entry.owner)
     }
 }
 

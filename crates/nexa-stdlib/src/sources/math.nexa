@@ -1,14 +1,12 @@
-module std.math;
-
 pub struct Vec2 {
-    x: f32;
-    y: f32;
+    x: f32,
+    y: f32,
 }
 
 pub struct Vec3 {
-    x: f32;
-    y: f32;
-    z: f32;
+    x: f32,
+    y: f32,
+    z: f32,
 }
 
 pub fn clamp_i32(value: i32, low: i32, high: i32) -> i32 {

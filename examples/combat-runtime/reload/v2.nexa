@@ -1,18 +1,19 @@
-module game.combat;
-
-@stateful(2) class EnemyBrain {
-    phase: i32;
-    aggression: i32;
+@state(version = 2)
+class EnemyBrain {
+    mut phase: i32,
+    mut aggression: i32,
 }
-@stateful(1) class StableBrain {
-    phase: i32;
+@state(version = 1)
+class StableBrain {
+    mut phase: i32,
 }
-pub migration fn migrate(value: i32) -> i32 {
-    let old_brain: EnemyBrain = old.get<EnemyBrain>(boss);
-    let phase: i32 = old.field<i32>(old_brain, EnemyBrain.phase);
-    let brain: EnemyBrain = new.create<EnemyBrain>(boss);
-    new.set(brain, EnemyBrain.phase, phase);
-    new.set(brain, EnemyBrain.aggression, 0);
+@migration
+pub fn migrate(value: i32) -> i32 {
+    let old_brain: EnemyBrain = old.get(boss);
+    let phase: i32 = old.field(old_brain, EnemyBrain::phase);
+    let brain: EnemyBrain = new.create(boss);
+    new.set(brain, EnemyBrain::phase, phase);
+    new.set(brain, EnemyBrain::aggression, 0);
     replace(boss, brain);
     preserve(preserved);
     delete(deleted);
@@ -20,6 +21,6 @@ pub migration fn migrate(value: i32) -> i32 {
     return value;
 }
 fn identity(value: i32) -> i32 { return value; }
-pub task fn Update(value: i32) -> i32 { return value + 1; }
+pub async fn update(value: i32) -> i32 { return value + 1; }
 @activation
-pub fn Activate(value: i32) -> i32 { return value; }
+pub fn activate(value: i32) -> i32 { return value; }

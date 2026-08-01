@@ -1,9 +1,24 @@
 use crate::CompilationLimits;
 
-/// Canonical language revision embedded in every M4 build fingerprint.
-pub const NEXA_LANGUAGE_VERSION: &str = "m4";
-pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 = 3;
+/// Canonical Nexa language revision embedded in every build fingerprint.
+pub const NEXA_LANGUAGE_VERSION: u16 = 2;
+pub const COMPILATION_OPTIONS_SCHEMA_VERSION: u32 = 4;
 pub const DEFAULT_MAX_WHILE_ITERATIONS: u32 = 1_000_000;
+
+/// Source profile whose surface rules are applied by analysis.
+///
+/// The profile is a real compiler input: package modules reject executable top-level statements,
+/// while scripts and REPL cells lower them into a synthetic `main`. Keeping it in the canonical
+/// options prevents two semantically different builds from sharing one build fingerprint.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CompilationProfile {
+    #[default]
+    Package = 0,
+    Standalone = 1,
+    Script = 2,
+    ReplCell = 3,
+}
 
 /// Complete set of caller-selectable inputs that can change analysis or emitted bytecode.
 ///
@@ -11,6 +26,7 @@ pub const DEFAULT_MAX_WHILE_ITERATIONS: u32 = 1_000_000;
 /// prevents a caller from hashing one option set and compiling with another.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompilationOptions {
+    pub profile: CompilationProfile,
     pub limits: CompilationLimits,
     pub max_while_iterations: u32,
 }
@@ -18,6 +34,7 @@ pub struct CompilationOptions {
 impl Default for CompilationOptions {
     fn default() -> Self {
         Self {
+            profile: CompilationProfile::Package,
             limits: CompilationLimits::default(),
             max_while_iterations: DEFAULT_MAX_WHILE_ITERATIONS,
         }
@@ -34,6 +51,7 @@ pub fn canonical_compilation_options(options: &CompilationOptions) -> Vec<u8> {
     let limits = &options.limits;
     let mut bytes = b"nexa.compilation-options\0".to_vec();
     bytes.extend_from_slice(&COMPILATION_OPTIONS_SCHEMA_VERSION.to_le_bytes());
+    bytes.push(options.profile as u8);
     for value in [
         limits.modules_per_package,
         limits.source_file_bytes,
@@ -56,7 +74,8 @@ pub fn canonical_compilation_options(options: &CompilationOptions) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPILATION_OPTIONS_SCHEMA_VERSION, CompilationOptions, canonical_compilation_options,
+        COMPILATION_OPTIONS_SCHEMA_VERSION, CompilationOptions, CompilationProfile,
+        canonical_compilation_options,
     };
     use crate::CompilationLimits;
 
@@ -74,6 +93,7 @@ mod tests {
             options.len(),
             PREFIX.len()
                 + std::mem::size_of::<u32>()
+                + std::mem::size_of::<u8>()
                 + 8 * std::mem::size_of::<u64>()
                 + 2 * std::mem::size_of::<u32>()
         );
@@ -162,6 +182,21 @@ mod tests {
 
         for variant in variants {
             assert_ne!(canonical_compilation_options(&variant), canonical);
+        }
+    }
+
+    #[test]
+    fn compilation_profile_changes_canonical_options() {
+        let package = CompilationOptions::default();
+        for profile in [
+            CompilationProfile::Standalone,
+            CompilationProfile::Script,
+            CompilationProfile::ReplCell,
+        ] {
+            assert_ne!(
+                canonical_compilation_options(&package),
+                canonical_compilation_options(&CompilationOptions { profile, ..package })
+            );
         }
     }
 

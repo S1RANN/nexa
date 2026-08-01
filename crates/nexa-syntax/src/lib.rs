@@ -5,17 +5,24 @@
 
 pub mod ast;
 mod lexer;
+pub mod nidl;
 mod text;
 mod tree;
 
 pub use lexer::{Lexed, lex_nexa, lex_nidl};
+pub use nidl::{
+    NidlAst, NidlAstError, NidlAttribute, NidlAttributeArgument, NidlAttributeValue, NidlContract,
+    NidlContractItem, NidlDocComment, NidlEnum, NidlField, NidlFunction, NidlFunctionBlock,
+    NidlFunctionBlockKind, NidlHandle, NidlParameter, NidlStruct, NidlTypeRef, NidlVariant,
+    parse_nidl_ast,
+};
 pub use text::{
     LineColumn, LineIndex, SourceText, SourceTooLarge, TextEncoding, TextRange, TextSize,
 };
 pub use tree::{
-    AstRoot, Declaration, DeclarationKind, ImportDeclaration, ModuleDeclaration, NidlRoot,
-    NodeKind, SyntaxError, SyntaxErrorKind, SyntaxLanguage, SyntaxNode, SyntaxTree, Visibility,
-    parse_nexa, parse_nidl,
+    AstRoot, CellCompleteness, Declaration, DeclarationKind, NidlRoot, NodeKind, SyntaxError,
+    SyntaxErrorKind, SyntaxLanguage, SyntaxNode, SyntaxTree, UseDeclaration, Visibility,
+    classify_cell_completeness, parse_nexa, parse_nidl,
 };
 
 /// A lossless lexical category.
@@ -25,7 +32,6 @@ pub enum TokenKind {
     LineComment,
     DocComment,
     BlockComment,
-    InvalidComment,
     Identifier,
     Integer,
     Float,
@@ -43,6 +49,7 @@ pub enum TokenKind {
     LBracket,
     RBracket,
     Colon,
+    ColonColon,
     Comma,
     Semicolon,
     Arrow,
@@ -82,7 +89,7 @@ impl TokenKind {
     pub const fn is_comment(self) -> bool {
         matches!(
             self,
-            Self::LineComment | Self::DocComment | Self::BlockComment | Self::InvalidComment
+            Self::LineComment | Self::DocComment | Self::BlockComment
         )
     }
 }
@@ -92,19 +99,14 @@ impl TokenKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Keyword {
     Fn,
-    Task,
-    Immediate,
-    Migration,
-    Activation,
-    Cleanup,
+    Async,
     Return,
     Let,
-    Var,
+    Mut,
     If,
     Else,
     While,
     Match,
-    With,
     New,
     Await,
     Yield,
@@ -113,9 +115,7 @@ pub enum Keyword {
     Struct,
     Enum,
     Class,
-    Stateful,
-    Module,
-    Import,
+    Use,
     As,
     In,
     True,
@@ -125,13 +125,10 @@ pub enum Keyword {
     Const,
     Break,
     Continue,
-    Interface,
-    Opaque,
-    Sync,
-    Request,
-    Fuel,
-    Policy,
-    Export,
+    Contract,
+    Host,
+    Nexa,
+    Handle,
 }
 
 /// A token references its exact byte range in the owning [`SourceText`].

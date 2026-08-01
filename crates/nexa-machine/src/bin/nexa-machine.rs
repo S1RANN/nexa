@@ -1,9 +1,6 @@
-use std::fmt::Write as _;
-use std::io::Write as _;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
-use nexa_machine::{MachineSpec, stable_id_map};
+use nexa_machine::{MachineSpec, generate_rust_modules, stable_id_map};
 
 const DEFAULT_SPECS: &str = "specs/machines";
 const DEFAULT_GENERATED: &str = "crates/nexa-runtime/src/generated/machines.rs";
@@ -47,7 +44,7 @@ fn check(path: &Path) -> Result<(), String> {
         stable_id_map(spec).map_err(|error| format!("{}: {error}", path.display()))?;
     }
     println!(
-        "validated {} machine specifications with {transition_count} transitions",
+        "validated {} machine specifications; {transition_count} transitions",
         specs.len()
     );
     Ok(())
@@ -81,38 +78,7 @@ fn check_generated(path: &Path, output: &Path) -> Result<(), String> {
 
 fn generate_source(path: &Path) -> Result<String, String> {
     let specs = load_specs(path)?;
-    let mut generated = String::new();
-    for (_, spec) in specs {
-        writeln!(generated, "{}", spec.generate_rust()).expect("writing String cannot fail");
-    }
-    format_generated(&generated)
-}
-
-fn format_generated(source: &str) -> Result<String, String> {
-    let mut child = Command::new("rustfmt")
-        .args(["--edition", "2024"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("could not start rustfmt: {error}"))?;
-    child
-        .stdin
-        .take()
-        .expect("piped rustfmt stdin")
-        .write_all(source.as_bytes())
-        .map_err(|error| format!("could not send generated code to rustfmt: {error}"))?;
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("could not wait for rustfmt: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "rustfmt rejected generated code: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    String::from_utf8(output.stdout)
-        .map_err(|error| format!("rustfmt returned non-UTF-8 output: {error}"))
+    Ok(generate_rust_modules(specs.iter().map(|(_, spec)| spec)))
 }
 
 fn load_specs(path: &Path) -> Result<Vec<(std::path::PathBuf, MachineSpec)>, String> {

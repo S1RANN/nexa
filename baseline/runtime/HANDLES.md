@@ -23,5 +23,11 @@ State handles are the exception to module-slot identity. They use:
 { domain: StatefulDomainId, stable_id: StableId, generation: u32 }
 ```
 
-The Stateful Domain survives reload. `STATE_PRESERVE` retains generation, `STATE_REPLACE`
-increments it, and `STATE_DELETE` leaves old handles permanently stale.
+`StatefulDomainId` and “Stateful Domain” are retained names of this internal
+Runtime ledger only. They are not Nexa source type kinds. Reader-facing state
+is always an ordinary `@state(version = N) class`; analysis represents it as
+Class plus state metadata.
+
+The internal Stateful Domain survives reload. `STATE_PRESERVE` retains
+generation, `STATE_REPLACE` increments it, and `STATE_DELETE` leaves old
+handles permanently stale.

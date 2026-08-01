@@ -538,21 +538,21 @@ mod tests {
     fn replacement_fix_keeps_standalone_nidl_identity_and_utf16_range_in_json_and_ndjson() {
         let usage = SourceIdentity::package("root.app", "src/main.nexa");
         let contract = SourceIdentity::standalone("/tmp/Host 合同.nidl");
-        let usage_text = "fn main() {\r\n    let marker = \"🚀\";\r\n    Host.ping();\r\n}\r\n";
-        let contract_text =
-            "interface Host {\r\n    sync fn ping(message: string) -> i32;\r\n}\r\n";
+        let usage_text = "use host::host;\r\nfn main() {\r\n    let marker = \"🚀\";\r\n    host::ping();\r\n}\r\n";
+        let contract_text = "contract Host {\r\n    host {\r\n        fn ping(message: string) \
+                             -> i32;\r\n    }\r\n}\r\n";
         let mut sources = SourceSnapshotRegistry::builder();
         sources.insert(usage.clone(), usage_text).unwrap();
         sources.insert(contract.clone(), contract_text).unwrap();
         let mut batch = DiagnosticBatch::with_default_limits(sources.build());
-        let usage_start = u32::try_from(usage_text.find("Host.ping").unwrap()).unwrap();
+        let usage_start = u32::try_from(usage_text.find("host::ping").unwrap()).unwrap();
         let contract_start = u32::try_from(contract_text.find("ping").unwrap()).unwrap();
         let contract_end = contract_start + u32::try_from("ping".len()).unwrap();
         batch.push(
-            Diagnostic::new(ErrorCode::NX2703, Severity::Error, "unknown Host import")
+            Diagnostic::new(ErrorCode::NX2703, Severity::Error, "unknown Host use path")
                 .with_label(Label::primary(
                     usage,
-                    ByteRange::new(usage_start, usage_start + 9),
+                    ByteRange::new(usage_start, usage_start + 10),
                     "unknown call",
                 ))
                 .with_related(RelatedLocation::new(
@@ -575,10 +575,10 @@ mod tests {
         assert_eq!(fix["source"]["path"], "/tmp/Host 合同.nidl");
         assert_eq!(fix["byteRange"]["start"], contract_start);
         assert_eq!(fix["byteRange"]["end"], contract_end);
-        assert_eq!(fix["range"]["start"]["line"], 1);
-        assert_eq!(fix["range"]["start"]["character"], 12);
-        assert_eq!(fix["range"]["end"]["line"], 1);
-        assert_eq!(fix["range"]["end"]["character"], 16);
+        assert_eq!(fix["range"]["start"]["line"], 2);
+        assert_eq!(fix["range"]["start"]["character"], 11);
+        assert_eq!(fix["range"]["end"]["line"], 2);
+        assert_eq!(fix["range"]["end"]["character"], 15);
 
         let ndjson = DiagnosticRenderer::ndjson(&batch).unwrap();
         let ndjson_diagnostic: serde_json::Value =

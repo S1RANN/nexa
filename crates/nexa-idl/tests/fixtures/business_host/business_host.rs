@@ -26,10 +26,14 @@ impl GameHost for BusinessHostV1 {
         context: &mut nexa_runtime::ResourceContext<'_>,
         _entity: i32,
     ) -> Result<ActionLockToken, HostError> {
-        context
-            .create_token(nexa_runtime::RuntimeHostDomain::Render)
-            .map(ActionLockToken::from_raw)
-            .map_err(|error| HostError(error.to_string()))
+        let token = context
+            .create_token(
+                ActionLockToken::CONTENT_TYPE_ID,
+                nexa_runtime::RuntimeHostDomain::Render,
+            )
+            .map_err(|error| HostError(error.to_string()))?;
+        ActionLockToken::try_from_raw(token)
+            .map_err(|error| HostError(format!("{error:?}")))
     }
 
     fn view(

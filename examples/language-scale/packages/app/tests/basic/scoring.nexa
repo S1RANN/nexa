@@ -1,14 +1,12 @@
-module test.basic.scoring;
-
-import language_scale.rules as rules;
-import scale_common.math as math;
+use package::language_scale::rules as rules;
+use scale_common::math as math;
 
 @test
 fn library_is_linked() -> bool {
-    return math.twice(4) == 8;
+    return math::twice(4) == 8;
 }
 
 @test
 fn package_helper_uses_the_constant() -> bool {
-    return rules.score(5) == 20;
+    return rules::score(5) == 20;
 }

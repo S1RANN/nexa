@@ -5,6 +5,15 @@ use crate::{
     EngineHealth, PackageId, PackageStatus, PackageVersion, SourceId,
 };
 
+/// Exact typed signature of one implemented Optional entrypoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EntrypointSignature {
+    pub name: String,
+    pub stable_id: nexa::StableId,
+    pub signature: nexa::prelude::Signature,
+    pub effect: nexa::prelude::FunctionEffect,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct EngineTickReport {
     pub development_events: Vec<crate::DevelopmentEvent>,
@@ -68,6 +77,14 @@ pub struct PackageInspection {
     pub last_reload_duration: Option<Duration>,
     pub recent_diagnostic: Option<EngineDiagnosticSummary>,
     pub recent_metrics: Vec<PackageMetric>,
+    /// Contract entrypoints implemented by the active or Last-Known-Good package artifact.
+    pub implemented_entrypoints: Vec<String>,
+    /// Entrypoints selected through `NexaEngineBuilder::require_export`.
+    pub required_entrypoints: Vec<String>,
+    /// Required entrypoints not present in the inspected package artifact.
+    pub missing_required_entrypoints: Vec<String>,
+    /// Exact signatures of implemented entrypoints which are not globally required.
+    pub optional_entrypoint_signatures: Vec<EntrypointSignature>,
 }
 
 #[derive(Clone, Debug, Default)]

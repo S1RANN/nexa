@@ -43,17 +43,15 @@ impl Fixture {
         .expect("Application Manifest");
         fs::write(
             app.join("src/example/main.nexa"),
-            "module example.main;\n\
-             import helper.example.math as math;\n\
-             pub fn value() -> i32 { return math.identity(7); }\n",
+            "use helper::example::math as math;\n\
+             pub fn value() -> i32 { return math::identity(7); }\n",
         )
         .expect("Application source");
         fs::write(
             app.join("tests/basic/value.nexa"),
-            "module test.basic.value;\n\
-             import example.main as app;\n\
+            "use package::example::main as app;\n\
              @test\n\
-             fn value_is_linked() -> bool { return app.value() == 7; }\n",
+             fn value_is_linked() -> bool { return app::value() == 7; }\n",
         )
         .expect("Application test");
         fs::write(
@@ -68,18 +66,17 @@ impl Fixture {
         .expect("Library Manifest");
         fs::write(
             library.join("src/example/math.nexa"),
-            "module example.math;\n\
-             pub fn identity(value: i32) -> i32 { return value; }\n",
+            "pub fn identity(value: i32) -> i32 { return value; }\n",
         )
         .expect("Library source");
         let contract = root.join("app_api.nidl");
-        fs::write(&contract, "interface EmptyHost {}\n").expect("Host Contract");
+        fs::write(&contract, "contract EmptyHost {}\n").expect("Host Contract");
         let project = root.join("nexa.dev.toml");
         fs::write(
             &project,
             "schema = 2\n\
              contract = \"app_api.nidl\"\n\
-             required_exports = []\n\
+             required_entrypoints = []\n\
              [[sources]]\n\
              id = \"fixture\"\n\
              root = \"packages\"\n\
@@ -226,11 +223,13 @@ fn dev_reports_real_verifier_failures_after_the_freshness_gate() {
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
     fs::write(
         fixture.app.join("src/example/main.nexa"),
-        "module example.main;\n\
-         immediate fn expensive() -> i32 {\n\
-             for step in 0..1025 { continue; }\n\
-             return 7;\n\
-         }\n",
+        concat!(
+            "@immediate\n",
+            "fn expensive() -> i32 {\n\
+                 for step in 0..1025 { continue; }\n\
+                 return 7;\n\
+             }\n"
+        ),
     )
     .expect("write verifier-failing Application");
 
@@ -281,14 +280,14 @@ fn product_check_and_build_ignore_invalid_root_and_dependency_tests() {
 
     fs::write(
         fixture.app.join("tests/basic/value.nexa"),
-        "module test.wrong;\n@test fn root_test() -> bool { return true; }\n",
+        "@test fn malformed( -> bool { return true; }\n",
     )
-    .expect("write invalid root test module header");
+    .expect("write invalid root test syntax");
     let dependency_tests = fixture.root.join("packages/library/tests/broken");
     fs::create_dir_all(&dependency_tests).expect("dependency test directory");
     fs::write(
         dependency_tests.join("syntax.nexa"),
-        "module test.broken.syntax;\n@test fn malformed( -> bool { return true; }\n",
+        "@test fn malformed( -> bool { return true; }\n",
     )
     .expect("write malformed dependency test");
 
@@ -334,15 +333,20 @@ fn product_check_and_build_ignore_invalid_root_and_dependency_tests() {
         "json",
     ]);
     assert_exit(&invalid_root_test, 1);
+    let invalid_root_diagnostics = text(&invalid_root_test.stderr);
     assert!(
-        text(&invalid_root_test.stderr).contains("NX2701"),
+        invalid_root_diagnostics.contains("NX1002"),
         "{}",
-        text(&invalid_root_test.stderr)
+        invalid_root_diagnostics
+    );
+    assert!(
+        !invalid_root_diagnostics.contains("tests/broken"),
+        "dependency Test sources must not enter the root Test target: {invalid_root_diagnostics}"
     );
 
     fs::write(
         fixture.app.join("tests/basic/value.nexa"),
-        "module test.basic.value;\n@test fn root_test() -> bool { return true; }\n",
+        "@test fn root_test() -> bool { return true; }\n",
     )
     .expect("restore valid root test");
     let dependency_tests_are_not_part_of_root_test_target = fixture.run(&[
@@ -379,8 +383,7 @@ fn exits_and_machine_failures_are_typed_and_not_duplicated() {
 
     fs::write(
         fixture.app.join("tests/basic/value.nexa"),
-        "module test.basic.value;\n\
-         @test\n\
+        "@test\n\
          fn value_is_linked() -> bool { return false; }\n",
     )
     .expect("failing test");
@@ -411,8 +414,7 @@ fn package_test_cli_reports_real_pass_fail_and_trap_outcomes() {
 
     fs::write(
         &test_source,
-        r#"module test.basic.value;
-import std.debug as debug;
+        r#"use std::debug as debug;
 
 @test
 fn a_passes() -> bool {
@@ -426,7 +428,7 @@ fn b_fails() -> bool {
 
 @test
 fn c_traps() -> bool {
-    return debug.trap("cli package-test trap");
+    return debug::trap("cli package-test trap");
 }
 
 @test
@@ -494,9 +496,7 @@ fn package_test_cli_resets_the_budget_per_test() {
 
     fs::write(
         &test_source,
-        r"module test.basic.value;
-
-@test
+        r"@test
 fn a_exhausts_its_budget() -> bool {
     for step in 0..64 {
         step + 1;
@@ -545,28 +545,26 @@ fn package_test_cli_rejects_an_indirect_host_call_before_execution() {
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
     fs::write(
         &fixture.contract,
-        "interface TestHost {\n    sync fn clock() -> i32;\n}\n",
+        "contract TestHost {\n    host {\n        fn clock() -> i32;\n    }\n}\n",
     )
     .expect("Host contract");
     fs::write(
         fixture.app.join("src/example/main.nexa"),
-        r"module example.main;
-import host as host;
+        r"use host::test_host as host;
 
 pub(package) fn forbidden_clock() -> i32 {
-    return host.clock();
+    return host::clock();
 }
 ",
     )
     .expect("indirect Host wrapper");
     fs::write(
         fixture.app.join("tests/basic/value.nexa"),
-        r"module test.basic.value;
-import example.main as app;
+        r"use package::example::main as app;
 
 @test
 fn indirect_host() -> bool {
-    return app.forbidden_clock() == 0;
+    return app::forbidden_clock() == 0;
 }
 ",
     )
@@ -598,9 +596,10 @@ fn indirect_host() -> bool {
 }
 
 #[test]
-fn project_check_rejects_nidl_comments_at_the_exact_byte_span() {
+fn project_check_accepts_nidl_comments_and_documentation() {
     let fixture = Fixture::new();
-    let source = "interface EmptyHost {\n    // 界面\n}\n";
+    assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
+    let source = "/// 空 Host contract。\ncontract EmptyHost {\n    // 界面\n}\n";
     fs::write(&fixture.contract, source).expect("commented Host Contract");
     let output = fixture.run(&[
         "check",
@@ -609,16 +608,8 @@ fn project_check_rejects_nidl_comments_at_the_exact_byte_span() {
         "--diagnostic-format",
         "json",
     ]);
-    assert_exit(&output, 1);
-    let value: Value =
-        serde_json::from_slice(&output.stderr).expect("one NIDL diagnostic JSON object");
-    let message = value["message"].as_str().expect("NIDL diagnostic message");
-    let start = source.find("//").expect("comment start");
-    let end = source[start..]
-        .find('\n')
-        .map_or(source.len(), |offset| start + offset);
-    assert!(message.contains("comments are not part of the NIDL language"));
-    assert!(message.contains(&format!("bytes {start}..{end}")));
+    assert_exit(&output, 0);
+    assert!(output.stderr.is_empty(), "{}", text(&output.stderr));
 }
 
 #[test]
@@ -736,34 +727,24 @@ fn single_file_diagnostics_keep_original_bytes_path_crlf_and_utf16_positions() {
 }
 
 #[test]
-fn single_file_explicit_module_header_must_match_virtual_main() {
+fn single_file_rejects_legacy_module_headers() {
     let fixture = Fixture::new();
     let source = fixture.root.join("explicit-module.nexa");
     fs::write(&source, "module main;\nfn answer() -> i32 { return 42; }\n")
-        .expect("matching explicit module");
-    assert_exit(
-        &fixture.run(&["check", path(&source), "--diagnostic-format", "json"]),
-        0,
-    );
-
-    fs::write(
-        &source,
-        "module other;\nfn answer() -> i32 { return 42; }\n",
-    )
-    .expect("mismatching explicit module");
-    let mismatched = fixture.run(&["check", path(&source), "--diagnostic-format", "json"]);
-    assert_exit(&mismatched, 1);
-    let mismatch_json: Value =
-        serde_json::from_slice(&mismatched.stderr).expect("one module diagnostic JSON document");
+        .expect("legacy module source");
+    let rejected = fixture.run(&["check", path(&source), "--diagnostic-format", "json"]);
+    assert_exit(&rejected, 1);
+    let rejection_json: Value =
+        serde_json::from_slice(&rejected.stderr).expect("one legacy syntax diagnostic document");
     assert!(
-        mismatch_json["diagnostics"]
+        rejection_json["diagnostics"]
             .as_array()
             .expect("diagnostics array")
             .iter()
             .any(|diagnostic| diagnostic["message"]
                 .as_str()
-                .is_some_and(|message| message.contains("must be `main`"))),
-        "explicit non-main module must be rejected against nexa.snippet::main"
+                .is_some_and(|message| message.contains("module"))),
+        "legacy module headers must be rejected"
     );
 }
 
@@ -797,28 +778,32 @@ fn manifest_only_is_strictly_schema2() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
-fn project_required_exports_are_an_exact_subset_while_direct_contracts_require_all() {
+fn project_required_entrypoints_are_an_exact_subset_while_direct_contracts_require_all() {
     let fixture = Fixture::new();
     fs::write(
         &fixture.contract,
-        "interface Host {\n\
-             export Run() -> i32;\n\
-             export Reset() -> void;\n\
+        "contract Host {\n\
+             nexa {\n\
+                 fn run() -> i32;\n\
+                 fn reset();\n\
+             }\n\
          }\n",
     )
-    .expect("Host Contract with two exports");
+    .expect("Host Contract with two Nexa entrypoints");
     fs::write(
         fixture.app.join("src/example/main.nexa"),
-        "module example.main;\n\
-         import helper.example.math as math;\n\
-         pub fn value() -> i32 { return math.identity(7); }\n\
-         pub fn Run() -> i32 { return value(); }\n",
+        "use helper::example::math as math;\n\
+         pub fn value() -> i32 { return math::identity(7); }\n\
+         pub fn run() -> i32 { return value(); }\n",
     )
-    .expect("Application implements only the configured export");
+    .expect("Application implements only the configured entrypoint");
     let configured = fs::read_to_string(&fixture.project)
         .expect("project configuration")
-        .replace("required_exports = []", "required_exports = [\"Run\"]");
-    fs::write(&fixture.project, configured).expect("configured required-export subset");
+        .replace(
+            "required_entrypoints = []",
+            "required_entrypoints = [\"run\"]",
+        );
+    fs::write(&fixture.project, configured).expect("configured required-entrypoint subset");
     assert_exit(&fixture.run(&["lock", path(&fixture.app)]), 0);
 
     for arguments in [
@@ -865,22 +850,24 @@ fn project_required_exports_are_an_exact_subset_while_direct_contracts_require_a
     ]);
     assert_exit(&direct, 1);
     assert!(
-        text(&direct.stderr).contains("Reset"),
-        "direct --contract must require every declared export: {}",
+        text(&direct.stderr).contains("reset"),
+        "direct --contract must require every declared Nexa entrypoint: {}",
         text(&direct.stderr)
     );
 
     let explicitly_empty = fs::read_to_string(&fixture.project)
         .expect("configured project")
-        .replace("required_exports = [\"Run\"]", "required_exports = []");
-    fs::write(&fixture.project, explicitly_empty).expect("explicit empty export subset");
+        .replace(
+            "required_entrypoints = [\"run\"]",
+            "required_entrypoints = []",
+        );
+    fs::write(&fixture.project, explicitly_empty).expect("explicit empty entrypoint subset");
     fs::write(
         fixture.app.join("src/example/main.nexa"),
-        "module example.main;\n\
-         import helper.example.math as math;\n\
-         pub fn value() -> i32 { return math.identity(7); }\n",
+        "use helper::example::math as math;\n\
+         pub fn value() -> i32 { return math::identity(7); }\n",
     )
-    .expect("Application implements no Host export");
+    .expect("Application implements no Nexa entrypoint");
     assert_exit(
         &fixture.run(&[
             "check",
@@ -894,8 +881,8 @@ fn project_required_exports_are_an_exact_subset_while_direct_contracts_require_a
 
     let omitted = fs::read_to_string(&fixture.project)
         .expect("explicit-empty project")
-        .replace("required_exports = []\n", "");
-    fs::write(&fixture.project, omitted).expect("omitted required_exports setting");
+        .replace("required_entrypoints = []\n", "");
+    fs::write(&fixture.project, omitted).expect("omitted required_entrypoints setting");
     let default_all = fixture.run(&[
         "check",
         "--project",
@@ -905,8 +892,8 @@ fn project_required_exports_are_an_exact_subset_while_direct_contracts_require_a
     ]);
     assert_exit(&default_all, 1);
     assert!(
-        text(&default_all.stderr).contains("Run") || text(&default_all.stderr).contains("Reset"),
-        "omitting required_exports must restore the complete NIDL surface: {}",
+        text(&default_all.stderr).contains("run") || text(&default_all.stderr).contains("reset"),
+        "omitting required_entrypoints must restore the complete NIDL surface: {}",
         text(&default_all.stderr)
     );
 }

@@ -1,32 +1,50 @@
-# Nexa Internal Language IDL 1.0
+# Nexa NIDL
 
-The internal gameplay language uses an IDL-first, exact-build Rust host interface.
+Version: **2.0.0**
 
-Supported forms:
+Status: **COMPLETE**
 
-- scalars and strings
-- opaque host handles
-- fixed-layout structs
-- `Result`
-- copy buffers and immutable snapshots
-- asynchronous host requests
-- registered host-resource tokens
-- immediate-host whitelist metadata
+The internal gameplay language uses an NIDL-first, exact-build Rust Host
+Contract. The normative syntax and semantic rules are in
+[`NIDL_V2.md`](NIDL_V2.md); the binary identity rules are in
+[`CONTRACT_DESCRIPTOR_V2.md`](CONTRACT_DESCRIPTOR_V2.md); generated Rust rules
+are in [`BINDING_CODEGEN_V2.md`](BINDING_CODEGEN_V2.md).
 
-The normalized schema produces an exact interface hash. A hash mismatch rejects module loading and
-requires binding regeneration and rebuild. Compatible adapters and independent release windows are
-not part of the current internal-language contract.
+The only top-level form is:
 
-Asynchronous functions use:
+```nidl
+contract App {
+    handle Entity;
 
-```text
-request(return_error|cancel_task, return_error|trap) fn name(...)
-    -> request<Result<Success, Error>>;
+    host {
+        fn log(message: string);
+
+        @fuel(8)
+        @cancel(return_error)
+        @abandon(trap)
+        async fn load(id: string) -> Result<Profile, LoadError>;
+    }
+
+    nexa {
+        fn on_event(event: Event) -> Array<Command>;
+    }
+}
 ```
 
-Both terminal policies and both Result payload types participate in the exact hash. Generated Rust
-bindings include IDL enums and a typed completion-ticket wrapper.
+The `host` surface is implemented by Rust and callable from Nexa. The `nexa`
+surface lists legal typed entrypoints implemented by Nexa and callable from
+Rust. Whether an entrypoint is Required or Optional belongs to the Host usage
+site, not to NIDL.
 
-In Nexa source, an async IDL function evaluates to its declared `Result<Success, Error>`. Scripts
-may consume it with exhaustive `match` or propagate the exact error type with `?`; request handles
-are not exposed to source programs.
+Validated declarations lower to ABI Descriptor v2 through a typed semantic
+model. Type layout, Host function, and Nexa entrypoint fingerprints are
+independent. Comments, formatting, top-level declaration order, and
+`host`/`nexa` block order do not affect identity; ordered fields, Variants,
+parameters, and semantic attributes do.
+
+An async Host function evaluates in Nexa to its declared result after postfix
+`.await`. ABI lowering may use completion tickets and internal Host Request
+state, but no Request type is nameable in NIDL or Nexa source.
+
+NIDL v1 spellings, canonical formatted-string hashes, and compatibility
+adapters are not part of the active Contract.

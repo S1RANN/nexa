@@ -58,6 +58,18 @@ pub fn round_f64(value: f64) -> f64 {
     canonicalize_nan_f64(libm::round(value))
 }
 
+/// Deterministic `f32` remainder using Nexa's pinned math backend.
+#[must_use]
+pub fn rem_f32(left: f32, right: f32) -> f32 {
+    canonicalize_nan_f32(libm::fmodf(left, right))
+}
+
+/// Deterministic `f64` remainder using Nexa's pinned math backend.
+#[must_use]
+pub fn rem_f64(left: f64, right: f64) -> f64 {
+    canonicalize_nan_f64(libm::fmod(left, right))
+}
+
 /// Deterministic `f32` square root using Nexa's pinned math backend.
 #[must_use]
 pub fn sqrt_f32(value: f32) -> f32 {
@@ -115,8 +127,8 @@ pub fn cos_f64(value: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ceil_f32, ceil_f64, cos_f32, cos_f64, floor_f32, floor_f64, round_f32, round_f64, sin_f32,
-        sin_f64, sqrt_f32, sqrt_f64,
+        ceil_f32, ceil_f64, cos_f32, cos_f64, floor_f32, floor_f64, rem_f32, rem_f64, round_f32,
+        round_f64, sin_f32, sin_f64, sqrt_f32, sqrt_f64,
     };
     use crate::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS};
 
@@ -134,6 +146,11 @@ mod tests {
         assert_eq!(sin_f32(negative_zero).to_bits(), negative_zero.to_bits());
         assert_eq!(cos_f32(negative_zero).to_bits(), 1.0_f32.to_bits());
         assert_eq!(
+            rem_f32(negative_zero, 3.0).to_bits(),
+            negative_zero.to_bits()
+        );
+        assert_eq!(rem_f32(5.5, 2.0).to_bits(), libm::fmodf(5.5, 2.0).to_bits());
+        assert_eq!(
             sqrt_f32(subnormal).to_bits(),
             libm::sqrtf(subnormal).to_bits()
         );
@@ -145,7 +162,9 @@ mod tests {
             assert_eq!(sqrt_f32(value).to_bits(), CANONICAL_NAN_F32_BITS);
             assert_eq!(sin_f32(value).to_bits(), CANONICAL_NAN_F32_BITS);
             assert_eq!(cos_f32(value).to_bits(), CANONICAL_NAN_F32_BITS);
+            assert_eq!(rem_f32(value, 1.0).to_bits(), CANONICAL_NAN_F32_BITS);
         }
+        assert_eq!(rem_f32(1.0, 0.0).to_bits(), CANONICAL_NAN_F32_BITS);
         assert_eq!(sqrt_f32(-1.0).to_bits(), CANONICAL_NAN_F32_BITS);
         for value in [f32::NEG_INFINITY, f32::INFINITY] {
             assert_eq!(sin_f32(value).to_bits(), CANONICAL_NAN_F32_BITS);
@@ -168,6 +187,11 @@ mod tests {
         assert_eq!(sin_f64(negative_zero).to_bits(), negative_zero.to_bits());
         assert_eq!(cos_f64(negative_zero).to_bits(), 1.0_f64.to_bits());
         assert_eq!(
+            rem_f64(negative_zero, 3.0).to_bits(),
+            negative_zero.to_bits()
+        );
+        assert_eq!(rem_f64(5.5, 2.0).to_bits(), libm::fmod(5.5, 2.0).to_bits());
+        assert_eq!(
             sqrt_f64(subnormal).to_bits(),
             libm::sqrt(subnormal).to_bits()
         );
@@ -179,7 +203,9 @@ mod tests {
             assert_eq!(sqrt_f64(value).to_bits(), CANONICAL_NAN_F64_BITS);
             assert_eq!(sin_f64(value).to_bits(), CANONICAL_NAN_F64_BITS);
             assert_eq!(cos_f64(value).to_bits(), CANONICAL_NAN_F64_BITS);
+            assert_eq!(rem_f64(value, 1.0).to_bits(), CANONICAL_NAN_F64_BITS);
         }
+        assert_eq!(rem_f64(1.0, 0.0).to_bits(), CANONICAL_NAN_F64_BITS);
         assert_eq!(sqrt_f64(-1.0).to_bits(), CANONICAL_NAN_F64_BITS);
         for value in [f64::NEG_INFINITY, f64::INFINITY] {
             assert_eq!(sin_f64(value).to_bits(), CANONICAL_NAN_F64_BITS);

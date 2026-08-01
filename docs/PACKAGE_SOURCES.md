@@ -28,11 +28,12 @@ root/
 
 Discovery is sorted. Every package must contain a strict schema 2
 `package.toml` and exactly one `source_root = "src"`. Application Entry Module
-paths map uniquely to source paths and each file's `module` declaration must
-match. Every source path is UTF-8, normalized and package-relative. Source
-roots and files are canonicalized and must remain inside the configured
-package; symlinks and root escape are rejected. Package, module, file, import,
-edge, and source-byte ceilings are enforced.
+paths map uniquely to source paths. Every Source Module identity is derived
+only from its normalized package-relative path. Every source path is UTF-8,
+normalized and package-relative. Source roots and files are canonicalized and
+must remain inside the configured package; symlinks and root escape are
+rejected. Package, Module, file, use-edge, dependency-edge, and source-byte
+ceilings are enforced.
 
 Path dependencies are resolved only within the same Source root and Source ID.
 A dependency target must be a Library. Packages with dependencies require an

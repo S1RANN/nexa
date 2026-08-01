@@ -1,7 +1,5 @@
-module main;
-
-import hidden;
+use package::hidden;
 
 pub fn entry() -> i32 {
-    return hidden.private_value();
+    return hidden::private_value();
 }

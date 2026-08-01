@@ -45,12 +45,12 @@ fn handler_trap_evidence_preserves_source_and_script_stack() {
     assert!(trap.rendering.json_matches_diagnostic);
     assert!(trap.rendering.ndjson_matches_diagnostic);
     assert!(trap.observation.source_evidence_valid);
-    assert_eq!(trap.diagnostic.context.export.as_deref(), Some("Run"));
+    assert_eq!(trap.diagnostic.context.export.as_deref(), Some("run"));
     assert!(
         trap.diagnostic
             .related
             .iter()
-            .any(|related| related.message.contains("at Run"))
+            .any(|related| related.message.contains("at run"))
     );
 
     let primary = trap

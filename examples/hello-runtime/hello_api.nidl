@@ -1,4 +1,11 @@
-interface ConsoleHost {
-    sync fn log(message: string) -> i32;
-    export Main() -> i32;
+contract Console {
+    host {
+        fn log(
+            message: string,
+        ) -> i32;
+    }
+
+    nexa {
+        fn main() -> i32;
+    }
 }

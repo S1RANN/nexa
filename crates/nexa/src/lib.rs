@@ -2,13 +2,17 @@
 //!
 //! Stable facade over Nexa's model-checked runtime, compiler, bytecode and IDL APIs.
 
+mod build_profile;
 mod diagnostic_corpus;
 mod error;
 mod package_build;
 mod package_environment;
+mod package_inspection;
 mod package_test;
+mod repl_session;
 mod runtime_diagnostics;
 
+pub use build_profile::BuildProfile;
 pub use diagnostic_corpus::{
     AnalysisDiagnosticReport, BinaryDiagnosticReport, CaseFormatReport, CompilerDiagnosticReport,
     DiagnosticCorpusReport, EngineDiagnosticReport, ObservedDiagnosticCase, PipelineReport,
@@ -30,8 +34,8 @@ pub use nexa_analysis::{
 };
 pub use nexa_bytecode::{BYTECODE_VERSION, DecodeLimits, Module, SectionKind};
 pub use nexa_compiler::{
-    PackageDebugInfo, PackageFunctionDebugInfo, PackageHostImportDebugInfo, PackageModuleDebugInfo,
-    PackageTestCallGraphNode, PackageTestInfo,
+    PackageMainInfo, PackageReplCellInfo, PackageReplStateFieldInfo, STANDALONE_MAIN_STABLE_ID,
+    standalone_main_stable_id,
 };
 pub use nexa_core::{FileId, StableId};
 pub use nexa_diagnostics::{
@@ -43,14 +47,19 @@ pub use nexa_diagnostics::{
     SourceSnapshotRegistryError, TextEditSuggestion,
 };
 pub use nexa_idl::{
-    Idl, canonical, canonical as canonical_idl, exact_hash, exact_hash as exact_idl_hash,
-    export_signature, export_stable_id, parse, parse as parse_idl,
+    ABI_DESCRIPTOR_VERSION, AbiDescriptor, AbiFingerprint, BindingModel, CodegenError,
+    EffectiveContractDescriptor, EffectiveContractSelection, EffectiveDescriptorError,
+    NIDL_SYNTAX_VERSION, NidlAst, NidlError, NidlErrorKind, ValidatedContract, ValidatedFunction,
+    abi_descriptor, contract_fingerprint, contract_runtime_id, effective_contract_descriptor,
+    effective_contract_fingerprint, entrypoint_signature, entrypoint_stable_id,
+    generate_rust as generate_rust_bindings, host_function_signature, parse as parse_nidl,
+    parse_ast as parse_nidl_ast,
 };
 pub use nexa_runtime::{
-    CheckedInterpreter, HOST_CONTRACT_SCHEMA_VERSION, HostContract, MustCompletePolicy,
-    RuntimeHostArgs, RuntimeLimits, RuntimeMessage, ScriptArgumentRequirements, ScriptCallError,
-    ScriptCallStack, ScriptCallWriter, ScriptExport, ScriptFrame, ScriptFunction,
-    ScriptOutputReader, StateObject, Trap,
+    CheckedInterpreter, HOST_CONTRACT_SCHEMA_VERSION, HostContract, HostFunctionAuthority,
+    HostFunctionAuthorityField, MustCompletePolicy, RuntimeHostArgs, RuntimeLimits, RuntimeMessage,
+    ScriptArgumentRequirements, ScriptCallError, ScriptCallStack, ScriptCallWriter, ScriptExport,
+    ScriptFrame, ScriptOutputReader, StateObject, Trap,
 };
 pub use nexa_test_runner::{
     StackFrame, TestError, TestResult, TestRun, TestRunSummary, TestStatus,
@@ -58,62 +67,36 @@ pub use nexa_test_runner::{
 pub use nexa_verifier::{VerifiedModule, VerifierLimits};
 pub use package_build::{
     COMPILATION_OPTIONS_SCHEMA_VERSION, CompiledPackageArtifact, CompiledPackageTests,
-    CompiledSource, HostContractInput, HostContractSource, HostContractSourceError,
-    NEXA_COMPILER_VERSION, NEXA_LANGUAGE_VERSION, PackageArtifactIntegrityError,
-    PackageBuildDurations, PackageBuildError, PackageBuildObservation, PackageBuildSession,
-    PackageCheckReport, PackageCompilationEvidence, PackagePipelineStats, PackageSourceSnapshot,
-    canonical_compilation_options, canonical_host_contract_source_identity,
-    canonical_package_build_fingerprint_input,
-    canonical_package_build_fingerprint_input_with_contract, check_package,
-    check_package_with_contract, compile_package, compile_package_tests,
-    compile_package_tests_with_contract, compile_package_with_contract, linked_state_fingerprint,
-    verify_package_artifact_integrity,
+    CompiledReplCellArtifact, CompiledSource, CompiledStandaloneArtifact, HostContractInput,
+    HostContractSource, HostContractSourceError, NEXA_COMPILER_VERSION, NEXA_LANGUAGE_VERSION,
+    PackageArtifactIntegrityError, PackageBuildDurations, PackageBuildError,
+    PackageBuildObservation, PackageBuildSession, PackageCheckReport, PackageCompilationEvidence,
+    PackagePipelineStats, PackageSourceSnapshot, canonical_compilation_options,
+    canonical_compilation_options_for_profile, canonical_host_contract_source_identity,
+    canonical_package_build_fingerprint_input_with_contract,
+    canonical_package_build_fingerprint_input_with_contract_for_profile,
+    check_package_with_contract, compile_package_tests_with_contract,
+    compile_package_with_contract, compile_standalone_package_with_contract,
+    compile_standalone_with_contract,
+};
+pub use package_inspection::{
+    PackageDebugInspection, PackageFunctionInspection, PackageHostImportInspection,
+    PackageModuleInspection, PackageSymbolVisibility,
 };
 pub use package_test::{
     PackageTestBackendSetupError, PackageTestDeclarationError, PackageTestDeclarationErrorReason,
     PackageTestEligibilityReason, PackageTestEligibilityViolation, PackageTestFunctionLocation,
     PackageTestOptions, PackageTestRunError,
 };
+pub use repl_session::{
+    CONSOLE_HOST_NIDL, CONSOLE_HOST_SOURCE_IDENTITY, ReplCellOutcome, ReplConsoleEmission,
+    ReplConsoleHost, ReplConsoleHostError, ReplConsoleStream, ReplGcReport, ReplMemoryReport,
+    ReplResolvedCellInput, ReplSession, ReplSessionError, ReplSessionLimits,
+};
 pub use runtime_diagnostics::{
     MultiFileRuntimeDiagnosticEvidence, RuntimeDiagnosticCaseEvidence,
     RuntimeDiagnosticEndToEndReport, RuntimeDiagnosticHarness, run_runtime_diagnostic_end_to_end,
 };
-
-/// Compiles source through the stable facade error boundary.
-pub fn compile(source: &str) -> Result<VerifiedModule, NexaError> {
-    compile_file(source, FileId::default())
-}
-
-/// Compiles source and attaches `file` to diagnostics that have a source location.
-pub fn compile_file(source: &str, file: FileId) -> Result<VerifiedModule, NexaError> {
-    nexa_compiler::compile_file(source, file)
-        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
-}
-
-/// Compiles source against an exact IDL interface through the stable facade error boundary.
-pub fn compile_with_interface(source: &str, interface: &Idl) -> Result<VerifiedModule, NexaError> {
-    compile_with_interface_file(source, FileId::default(), interface)
-}
-
-/// Compiles source against an exact IDL interface while preserving its real file identity.
-pub fn compile_with_interface_file(
-    source: &str,
-    file: FileId,
-    interface: &Idl,
-) -> Result<VerifiedModule, NexaError> {
-    nexa_compiler::compile_with_interface_file(source, file, interface)
-        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
-}
-
-/// Compiles through lowering but deliberately leaves structural verification to the caller.
-pub fn compile_module_with_interface_file(
-    source: &str,
-    file: FileId,
-    interface: &Idl,
-) -> Result<Module, NexaError> {
-    nexa_compiler::compile_module_with_interface_file(source, file, interface)
-        .map_err(|error| NexaError::Diagnostic(Box::new(Diagnostic::new(&error, file))))
-}
 
 /// Decodes a bytecode module through the stable facade error boundary.
 pub fn decode_module(bytes: &[u8], limits: DecodeLimits) -> Result<Module, NexaError> {
@@ -134,88 +117,60 @@ pub mod prelude {
         StateHandleType, StateSchema, StateType, StructField, StructType, ValueType, option_type,
         result_type,
     };
-    pub use nexa_core::{FileId, FunctionId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
+    pub use nexa_core::{FileId, ModuleId, RawHandle, RealmId, SourceSpan, TypeId};
     pub use nexa_idl::generate_rust as generate_rust_bindings;
     pub use nexa_runtime::{
         CancelReason, CompletionAccounting, HostCallOutcome, HostCompletionResult,
-        HostCompletionTicket, HostErrorPayload, HostPayload, HostRegistry, HostRequestHandle,
-        HostTrap, MigrationCapacityReport, MigrationLimitError, MigrationLimits,
-        MigrationUsageReport, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
-        RealmRuntime, ResourceContext, ResourceTokenHandle, RestartReloadMetrics,
-        RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult, RuntimeFailureConfigError,
-        RuntimeFailureInjector, RuntimeFailureMode, RuntimeFailurePoint, RuntimeHost,
-        RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState,
-        RuntimeResourceLedger, RuntimeValue, ScopeHandle, ScopeSnapshot, ScriptFunction,
-        SnapshotHandle, StateHandle, StateHandleError, StateValue, StatefulDomainId, StepConfig,
-        TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget,
-        TickReport, YieldReason,
+        HostCompletionTicket, HostErrorPayload, HostFunctionAuthority, HostFunctionAuthorityField,
+        HostPayload, HostRegistry, HostRequestHandle, HostTrap, MigrationCapacityReport,
+        MigrationLimitError, MigrationLimits, MigrationUsageReport, ModuleHandle,
+        PendingHostRequest, RealmConfig, RealmError, RealmRuntime, ResourceContext,
+        ResourceTokenHandle, RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy,
+        RestartReloadResult, RuntimeFailureConfigError, RuntimeFailureInjector, RuntimeFailureMode,
+        RuntimeFailurePoint, RuntimeHost, RuntimeHostCloseError, RuntimeHostCloseStatus,
+        RuntimeHostDomain, RuntimeHostState, RuntimeResourceLedger, RuntimeValue, ScopeHandle,
+        ScopeSnapshot, SnapshotHandle, StateHandle, StateHandleError, StateValue, StatefulDomainId,
+        StepConfig, TaskHandle, TaskLimits, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
+        TickBudget, TickReport, YieldReason,
     };
     pub use nexa_verifier::VerifierLimits;
 
+    pub use crate::{
+        BuildProfile, CheckedInterpreter, ClassifiedError, CompiledPackageArtifact,
+        CompiledPackageTests, CompiledReplCellArtifact, CompiledSource, CompiledStandaloneArtifact,
+        Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
+        ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch,
+        HOST_CONTRACT_SCHEMA_VERSION, HostContract, HostContractInput, HostContractSource,
+        HostContractSourceError, HostError, Label, MigrationError, MustCompletePolicy, NexaError,
+        PackageArtifactIntegrityError, PackageBuildDurations, PackageBuildError,
+        PackageBuildObservation, PackageBuildSession, PackageDebugInspection,
+        PackageFunctionInspection, PackageHostImportInspection, PackageMainInfo,
+        PackageModuleInspection, PackageSourceSnapshot, PackageSymbolVisibility,
+        PackageTestEligibilityReason, PackageTestEligibilityViolation, PackageTestFunctionLocation,
+        PackageTestOptions, PackageTestRunError, QueryDatabase, QueryStats, ReplCellOutcome,
+        ReplConsoleEmission, ReplConsoleHost, ReplConsoleHostError, ReplConsoleStream,
+        ReplGcReport, ReplMemoryReport, ReplResolvedCellInput, ReplSession, ReplSessionError,
+        ReplSessionLimits, ResolvedBuildInput, ResolvedTestInput, RuntimeHostArgs, RuntimeLimits,
+        RuntimeMessage, ScriptArgumentRequirements, ScriptCallError, ScriptCallStack,
+        ScriptCallWriter, ScriptExport, ScriptFrame, ScriptOutputReader, Severity, StableId,
+        StackFrame, StateObject, TestError, TestResult, TestRun, TestRunSummary, TestStatus, Trap,
+        ValidatedContract, VerifiedModule, abi_descriptor, canonical_compilation_options,
+        canonical_package_build_fingerprint_input_with_contract, check_package_with_contract,
+        compile_package_tests_with_contract, compile_package_with_contract,
+        compile_standalone_package_with_contract, compile_standalone_with_contract,
+        contract_fingerprint, contract_runtime_id, decode_module, effective_contract_descriptor,
+        entrypoint_signature, entrypoint_stable_id, parse_nidl, parse_nidl_ast,
+        standalone_main_stable_id, verify_module,
+    };
     pub use crate::{
         ByteRange, DiagnosticBatch, DiagnosticBatchLimits, DiagnosticPhase, LeafDiagnostic,
         LeafDiagnosticRenderer, LeafLabel, LeafRelatedLocation, SourceIdentity, SourceSnapshot,
         SourceSnapshotRegistry, TextEditSuggestion,
     };
-    pub use crate::{
-        CheckedInterpreter, ClassifiedError, CompiledPackageArtifact, CompiledPackageTests,
-        CompiledSource, Diagnostic, DiagnosticCode, ERROR_CODE_TABLE, ErrorCategory, ErrorCode,
-        ErrorCodeDefinition, ErrorContext, ErrorMetadata, ErrorModuleEpoch,
-        HOST_CONTRACT_SCHEMA_VERSION, HostContract, HostContractInput, HostContractSource,
-        HostContractSourceError, HostError, Idl, Label, MigrationError, MustCompletePolicy,
-        NexaError, PackageArtifactIntegrityError, PackageBuildDurations, PackageBuildError,
-        PackageBuildObservation, PackageBuildSession, PackageDebugInfo, PackageFunctionDebugInfo,
-        PackageHostImportDebugInfo, PackageModuleDebugInfo, PackageSourceSnapshot,
-        PackageTestEligibilityReason, PackageTestEligibilityViolation, PackageTestFunctionLocation,
-        PackageTestOptions, PackageTestRunError, QueryDatabase, QueryStats, ResolvedBuildInput,
-        ResolvedTestInput, RuntimeHostArgs, RuntimeLimits, RuntimeMessage,
-        ScriptArgumentRequirements, ScriptCallError, ScriptCallStack, ScriptCallWriter,
-        ScriptExport, ScriptFrame, ScriptOutputReader, Severity, StableId, StackFrame, StateObject,
-        TestError, TestResult, TestRun, TestRunSummary, TestStatus, Trap, VerifiedModule,
-        canonical, canonical_compilation_options, canonical_idl,
-        canonical_package_build_fingerprint_input, check_package, check_package_with_contract,
-        compile, compile_file, compile_module_with_interface_file, compile_package,
-        compile_package_tests, compile_package_tests_with_contract, compile_package_with_contract,
-        compile_with_interface, compile_with_interface_file, decode_module, exact_hash,
-        exact_idl_hash, export_signature, export_stable_id, parse, parse_idl, verify_module,
-        verify_package_artifact_integrity,
-    };
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn compile_file_preserves_origin_for_non_lex_diagnostics() {
-        let file = crate::FileId(41);
-        let error = crate::compile_file("fn main() -> i32 { return missing; }", file).unwrap_err();
-        let crate::NexaError::Diagnostic(diagnostic) = error else {
-            panic!("unknown name must remain a source diagnostic");
-        };
-
-        assert_eq!(diagnostic.code, crate::ErrorCode::NX2001);
-        assert_eq!(diagnostic.phase(), Some(crate::DiagnosticPhase::Resolve));
-        assert_eq!(
-            diagnostic.primary.as_ref().map(|label| label.span.file),
-            Some(file)
-        );
-    }
-
-    #[test]
-    fn compile_file_preserves_lexical_class_and_origin() {
-        let file = crate::FileId(42);
-        let error = crate::compile_file("#", file).unwrap_err();
-        let crate::NexaError::Diagnostic(diagnostic) = error else {
-            panic!("unexpected character must remain a source diagnostic");
-        };
-
-        assert_eq!(diagnostic.code, crate::ErrorCode::NX1001);
-        assert_eq!(diagnostic.phase(), Some(crate::DiagnosticPhase::Lex));
-        assert_eq!(
-            diagnostic.primary.as_ref().map(|label| label.span),
-            Some(nexa_core::SourceSpan::new(file, 0, 1))
-        );
-    }
-
     #[test]
     fn compiler_diagnostic_corpus_uses_real_sources_and_exact_spans() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

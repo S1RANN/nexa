@@ -1,26 +1,22 @@
-module snake.neon_skin;
-import host as snake;
-import std.collections as collections;
+use host::snake;
 
-fn empty() -> Array<snake.SnakeCommand> {
-    return [];
+fn empty() -> Array<snake::SnakeCommand> {
+    return Array::new();
 }
 
-fn register() -> Array<snake.SnakeCommand> {
-    let commands: Array<snake.SnakeCommand> = [];
-    collections.array_push(commands, snake.RegisterSkin("neon"));
-    return commands;
+fn register() -> Array<snake::SnakeCommand> {
+    return [snake::SnakeCommand::RegisterSkin("neon")];
 }
 
-pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
     return match event {
-        snake.PackageEnabled(snapshot) => register(),
-        snake.GameStarted(snapshot) => empty(),
-        snake.GameTick(snapshot) => empty(),
-        snake.ScoreChanged(snapshot) => empty(),
-        snake.FoodSpawnRequested(snapshot) => empty(),
-        snake.FoodEaten(snapshot) => empty(),
-        snake.GameEnded(snapshot) => empty(),
-        snake.SettingsChanged(snapshot) => empty(),
+        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
+        snake::SnakeEvent::GameStarted(snapshot) => empty(),
+        snake::SnakeEvent::GameTick(snapshot) => empty(),
+        snake::SnakeEvent::ScoreChanged(snapshot) => empty(),
+        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
+        snake::SnakeEvent::GameEnded(snapshot) => empty(),
+        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

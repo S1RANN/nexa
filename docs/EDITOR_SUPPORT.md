@@ -1,11 +1,12 @@
 # Nexa editor support
 
-Status: M3R1 COMPLETE
+Status: M4 COMPLETE; M4R1 COMPLETE
 
 Nexa provides local syntax support for `.nexa` and `.nidl` files in VS Code
 and Zed. Version `0.1.2` provides syntax highlighting, bracket handling,
 indentation, outlines, and live compiler diagnostics through `nexa lsp`.
-It does not provide comments, semantic highlighting, completion, hover,
+It provides line/block comment configuration and documentation-comment
+highlighting. It does not provide semantic highlighting, completion, hover,
 definition, references, rename, formatting, snippets, code actions, DAP, or
 debugging.
 
@@ -108,23 +109,31 @@ and `?` characters.
 
 Nexa support follows the current compiler Lexer and Parser:
 
-- ASCII identifiers
-- module, import, type, function, field, parameter, and expression syntax
-- task, immediate, migration, and cleanup effects
-- stateful and activation attributes
-- strings, Unicode runes, integers, floats, generics, and operators
-- Option/Result constructors, collections, and Reload intrinsics
+- ASCII identifiers with `snake_case`, `PascalCase`, and
+  `SCREAMING_SNAKE_CASE` diagnostics
+- path-derived modules and `use` declarations rooted at `package::`, `self::`,
+  `super::`, `host::`, `std::`, or a dependency alias
+- `let`, `let mut`, module `const`, and field-level `mut`
+- Struct and Enum value declarations, Class reference declarations, and
+  `@state(version = N)` metadata
+- `async fn`, postfix `.await`, `yield`, `defer`, and attribute-based
+  migration, activation, cleanup, and immediate functions
+- strings, interpolation, Unicode runes, integers, floats, built-in generic
+  collections, `Option`, `Result`, and Reload intrinsics
+- namespace and associated-item `::`, member `.`, Range and update `..`
 
-Nexa IDL support follows the current IDL Parser:
+NIDL support follows the shared NIDL Syntax Tree and validated Contract model:
 
-- interface, opaque, struct, and enum declarations
-- sync and request Host functions
-- request policies and fuel clauses
-- typed request, token, snapshot, Option, Result, array, and buffer types
-- exports and `void`
+- `contract`, `struct`, `enum`, and `handle` declarations
+- `host {}` and `nexa {}` blocks
+- synchronous `fn` and Host `async fn`
+- `@fuel`, `@cancel`, `@abandon`, and `@capability` attributes
+- `Array`, `Buffer`, `Option`, `Result`, `Token`, and `Snapshot` types
+- line, block, and documentation comments
 
-Neither language has comment syntax. `/` is always highlighted and parsed as
-the division operator.
+Editor parsing remains structural. The compiler and NIDL validator own naming,
+type, attribute, object-mutability, await-context, and main-signature
+diagnostics.
 
 ## Updating the grammar
 

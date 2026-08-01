@@ -8,9 +8,9 @@ fuzz_target!(|bytes: &[u8]| {
     }
     let value = bytes.first().copied().unwrap_or_default();
     let source = format!(
-        "enum Failure {{ Rejected }}
+        "enum Failure {{ Rejected, }}
          fn propagate(value: Result<i32, Failure>) -> Result<i32, Failure> {{
-             return Ok(value? + {value});
+             return Result::Ok(value? + {value});
          }}"
     );
     let _ = nexa_compiler::compile(&source);

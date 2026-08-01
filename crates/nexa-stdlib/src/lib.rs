@@ -1,7 +1,7 @@
 //! Versioned, compiler-provided Nexa standard-library declarations.
 //!
 //! The standard library is a compile-time static library. Its descriptors do
-//! not contain host imports, capabilities, runtime realms, or ambient logging.
+//! not contain Host uses, capabilities, runtime realms, or ambient logging.
 //! Source-backed functions are linked with the application package; compiler
 //! intrinsics are resolved from the same canonical symbol records.
 

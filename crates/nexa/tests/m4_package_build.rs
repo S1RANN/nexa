@@ -8,8 +8,9 @@ use std::thread;
 
 use nexa::{
     CandidateIdentity, HostContractInput, LeafDiagnosticRenderer, PackageBuildError,
-    PackageBuildSession, PackagePipelineStats, canonical_host_contract_source_identity,
-    canonical_package_build_fingerprint_input,
+    PackageBuildSession, PackagePipelineStats, SourceIdentity,
+    canonical_host_contract_source_identity,
+    canonical_package_build_fingerprint_input_with_contract,
 };
 use nexa_analysis::{
     CompilationLimits, FingerprintBuilder, LockFile, NormalizedPackagePath, PackageCatalog,
@@ -24,8 +25,22 @@ const SYMBOLS_PER_MODULE: usize = 10;
 const PACKAGE_COUNT: usize = 20;
 const ROOT_PACKAGE: &str = "scale.application";
 const ROOT_DIRECTORY: &str = "packages/root";
+const SCALE_HOST_NIDL: &str = "contract ScaleHost {}\n";
+const SCALE_HOST_SOURCE_PATH: &str = "nidl://tests/m4-scale/host-contract.nidl";
 const WORKER_COUNT: usize = 4;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+
+fn scale_host_contract<'a>(
+    contract: &'a nexa::ValidatedContract,
+    source: &str,
+) -> HostContractInput<'a> {
+    HostContractInput::with_source(
+        contract,
+        SourceIdentity::standalone(SCALE_HOST_SOURCE_PATH),
+        source,
+    )
+    .expect("exact scale Host NIDL source")
+}
 
 const SCENARIOS: [&str; 10] = [
     "forward",
@@ -257,19 +272,19 @@ fn module_names() -> Vec<String> {
 
 fn module_source(module: &str, invalid: bool) -> String {
     if invalid && module == "scale.base0" {
-        return "module scale.base0;\npub fn broken( -> i32 { return 1; }\n".into();
+        return "pub fn broken( -> i32 { return 1; }\n".into();
     }
-    let mut source = format!("module {module};\n");
+    let mut source = String::new();
     if module.contains(".m") {
         for base in 0..BASE_MODULES {
-            writeln!(source, "import scale.base{base} as base{base};").unwrap();
+            writeln!(source, "use package::scale::base{base};").unwrap();
         }
     }
     for symbol in 0..SYMBOLS_PER_MODULE {
-        writeln!(source, "pub const symbol_{symbol}: i32 = {symbol};").unwrap();
+        writeln!(source, "pub const SYMBOL_{symbol}: i32 = {symbol};").unwrap();
     }
     if module == "scale.base0" {
-        writeln!(source, "pub fn boot() -> i32 {{ return symbol_0; }}").unwrap();
+        writeln!(source, "pub fn boot() -> i32 {{ return SYMBOL_0; }}").unwrap();
     }
     source
 }
@@ -337,7 +352,7 @@ fn scale_fixture(
     reverse_packages: bool,
     source_name: &str,
     invalid: bool,
-    contract: &nexa::Idl,
+    contract: &HostContractInput<'_>,
 ) -> ScaleFixture {
     let source_id = SourceId::new(source_name).unwrap();
     let root_manifest = root_manifest();
@@ -409,7 +424,7 @@ fn scale_fixture(
         .collect::<BTreeMap<_, _>>();
     let lock = Arc::new(LockFile::from_graph(&graph));
     let lock_bytes = lock.canonical_bytes();
-    let fingerprint_input = canonical_package_build_fingerprint_input(
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
         &root_manifest,
         &root_sources,
         &dependency_manifests,
@@ -424,9 +439,9 @@ fn scale_fixture(
         dependency_source_sets,
         graph,
         Some(lock),
-        Arc::<[u8]>::from(nexa::canonical_idl(contract).into_bytes()),
-        canonical_host_contract_source_identity(&HostContractInput::canonical(contract)),
-        fingerprint_input.host_required_exports.clone(),
+        Arc::<[u8]>::from(fingerprint_input.host_contract.clone()),
+        canonical_host_contract_source_identity(contract),
+        fingerprint_input.host_required_entrypoints.clone(),
         nexa_analysis::CompilationOptions::default(),
         fingerprint_input,
     )
@@ -499,7 +514,7 @@ fn write_scale_directory_tree(root: &Path) {
     .unwrap();
 }
 
-fn load_scale_directory_fixture(root: &Path, contract: &nexa::Idl) -> ScaleFixture {
+fn load_scale_directory_fixture(root: &Path, contract: &HostContractInput<'_>) -> ScaleFixture {
     let packages = root.join("packages");
     let root_directory = NormalizedPackagePath::new(ROOT_DIRECTORY).unwrap();
     let source_id = SourceId::new("scale-directory-source").unwrap();
@@ -568,7 +583,7 @@ fn load_scale_directory_fixture(root: &Path, contract: &nexa::Idl) -> ScaleFixtu
         .expect("directory scale root has generated nexa.lock");
     lock.verify(&graph).unwrap();
     let lock_bytes = lock.canonical_bytes();
-    let fingerprint_input = canonical_package_build_fingerprint_input(
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
         &root_loaded.manifest,
         &root_loaded.production_sources,
         &dependency_manifests,
@@ -583,9 +598,9 @@ fn load_scale_directory_fixture(root: &Path, contract: &nexa::Idl) -> ScaleFixtu
         dependency_source_sets,
         graph,
         Some(lock),
-        Arc::<[u8]>::from(nexa::canonical_idl(contract).into_bytes()),
-        canonical_host_contract_source_identity(&HostContractInput::canonical(contract)),
-        fingerprint_input.host_required_exports.clone(),
+        Arc::<[u8]>::from(fingerprint_input.host_contract.clone()),
+        canonical_host_contract_source_identity(contract),
+        fingerprint_input.host_required_entrypoints.clone(),
         nexa_analysis::CompilationOptions::default(),
         fingerprint_input,
     )
@@ -605,7 +620,7 @@ struct TempScenarioFixtures {
     loaded_package_ids: Vec<String>,
 }
 
-fn temp_scenario_fixtures(label: &str, contract: &nexa::Idl) -> TempScenarioFixtures {
+fn temp_scenario_fixtures(label: &str, contract: &HostContractInput<'_>) -> TempScenarioFixtures {
     let root = TempScaleRoot::new(label);
     write_scale_directory_tree(&root.path);
     let valid = load_scale_directory_fixture(&root.path, contract);
@@ -677,8 +692,8 @@ fn compiled_closure_ids(
         .source_files
         .files()
         .iter()
-        .filter(|source| !source.compiler_provided)
-        .filter_map(|source| source.key.as_ref())
+        .filter(|source| !source.compiler_provided())
+        .filter_map(|source| source.key())
         .map(|key| key.package_id.to_string())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -693,7 +708,7 @@ fn compiled_closure_ids(
     assert_eq!(package_ids, expected_package_ids);
 
     let module_ids = artifact
-        .debug_info
+        .debug_inspection()
         .modules
         .iter()
         .filter(|module| module.package_id != nexa_stdlib::PACKAGE_ID)
@@ -741,13 +756,15 @@ fn scale_counters(
 fn compile_scenario(
     session: &mut PackageBuildSession,
     fixture: &ScaleFixture,
-    contract: &nexa::Idl,
+    contract: &HostContractInput<'_>,
     diagnostic_digest: &str,
     diagnostic_records: usize,
     pipeline: &mut PipelineCounters,
 ) -> (ScenarioEvidence, ScaleCounters, QueryRunEvidence) {
     let check_pipeline_before = session.pipeline_stats();
-    let check = session.check_package(&fixture.input, contract).unwrap();
+    let check = session
+        .check_package_with_contract(&fixture.input, contract)
+        .unwrap();
     assert!(check.diagnostics.is_empty());
     pipeline.record_facade_stats(
         session
@@ -762,7 +779,8 @@ fn compile_scenario(
         fixture.input.build_fingerprint,
     )
     .unwrap();
-    let observation = session.compile_package_observed(&fixture.input, contract, identity);
+    let observation =
+        session.compile_package_with_contract_observed(&fixture.input, contract, identity);
     pipeline.record_facade_stats(observation.pipeline);
     let artifact = observation.result.unwrap();
     artifact.verify_integrity().unwrap();
@@ -807,12 +825,14 @@ fn compile_scenario(
 
 fn invalid_diagnostic_evidence(
     fixture: &ScaleFixture,
-    contract: &nexa::Idl,
+    contract: &HostContractInput<'_>,
     pipeline: &mut PipelineCounters,
 ) -> (String, usize) {
     let mut session = PackageBuildSession::new();
     let before = session.pipeline_stats();
-    let error = session.check_package(&fixture.input, contract).unwrap_err();
+    let error = session
+        .check_package_with_contract(&fixture.input, contract)
+        .unwrap_err();
     pipeline.record_facade_stats(
         session
             .pipeline_stats()
@@ -868,12 +888,14 @@ fn compile_worker_schedule(
         let rendezvous = Arc::clone(&rendezvous);
         let in_flight = Arc::clone(&in_flight);
         let max_in_flight = Arc::clone(&max_in_flight);
+        let parsed_contract = nexa::parse_nidl(contract_source).unwrap();
+        let contract = scale_host_contract(&parsed_contract, contract_source);
         let fixture = scale_fixture(
             &(0..count).collect::<Vec<_>>(),
             false,
             "scale-source",
             false,
-            &nexa::parse_idl(contract_source).unwrap(),
+            &contract,
         );
         let contract_source = contract_source.to_owned();
         let diagnostic_digest = diagnostic_digest.to_owned();
@@ -882,7 +904,8 @@ fn compile_worker_schedule(
             let active = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
             max_in_flight.fetch_max(active, Ordering::SeqCst);
             rendezvous.wait();
-            let contract = nexa::parse_idl(&contract_source).unwrap();
+            let parsed_contract = nexa::parse_nidl(&contract_source).unwrap();
+            let contract = scale_host_contract(&parsed_contract, &contract_source);
             let mut local_pipeline = PipelineCounters::default();
             let (evidence, scale, query) = compile_scenario(
                 &mut PackageBuildSession::new(),
@@ -953,7 +976,8 @@ fn compile_worker_schedule(
 #[ignore = "run by cargo xtask m4-scale-stress"]
 #[allow(clippy::too_many_lines)]
 fn facade_scale_determinism_report() {
-    let contract = nexa::parse_idl("interface ScaleHost {}\n").unwrap();
+    let parsed_contract = nexa::parse_nidl(SCALE_HOST_NIDL).unwrap();
+    let contract = scale_host_contract(&parsed_contract, SCALE_HOST_NIDL);
     let mut pipeline = PipelineCounters::default();
     let count = BASE_MODULES + WORK_MODULES;
     let mut scenarios = BTreeMap::new();
@@ -997,7 +1021,7 @@ fn facade_scale_determinism_report() {
                 };
                 let (evidence, scale, query) = compile_worker_schedule(
                     schedule,
-                    "interface ScaleHost {}\n",
+                    SCALE_HOST_NIDL,
                     &diagnostic_digest,
                     records,
                     &mut pipeline,

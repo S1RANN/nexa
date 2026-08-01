@@ -12,11 +12,11 @@ use std::fmt;
 /// version as independent identities.
 pub const NEXA_COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Current bytecode wire-format version included in every build fingerprint and module header.
-pub const BYTECODE_VERSION: u16 = 5;
+pub const BYTECODE_VERSION: u16 = 6;
 /// Version of observable VM execution semantics included in every build fingerprint.
 pub const RUNTIME_SEMANTICS_VERSION: u16 = 1;
 /// Version of the fixed instruction fuel schedule included in every build fingerprint.
-pub const OPCODE_COST_TABLE_VERSION: u32 = 5;
+pub const OPCODE_COST_TABLE_VERSION: u32 = 6;
 /// Exact `libm` release used by the deterministic scalar-math implementation.
 pub const RUNTIME_LIBM_VERSION: &str = "0.2.16";
 /// Canonical quiet-NaN encoding used for every observable `f32` NaN result.
@@ -534,6 +534,11 @@ pub fn canonical_snapshot_type_id(content_type: StableId) -> StableId {
 }
 
 #[must_use]
+pub fn canonical_resource_token_type_id(content_type: StableId) -> StableId {
+    canonical_parameterized_type_id("Token", &[CanonicalValueType::Named(content_type)])
+}
+
+#[must_use]
 pub fn canonical_state_handle_type_id(target: CanonicalValueType) -> StableId {
     canonical_parameterized_type_id("StateHandle", &[target])
 }
@@ -559,25 +564,24 @@ pub struct CanonicalStateSchema {
 impl CanonicalStateSchema {
     /// Computes the one normative state-layout content identity.
     ///
-    /// Type and field enumeration order is intentionally canonicalized. The
-    /// compact `StableId`s remain ABI identities; the complete framed BLAKE3
-    /// digest is the content identity used by build, verifier, and reload.
+    /// Type enumeration order is canonicalized, while field declaration order
+    /// remains semantic. The compact `StableId`s remain ABI identities; the
+    /// complete framed BLAKE3 digest is the content identity used by build,
+    /// verifier, and reload.
     #[must_use]
     pub fn fingerprint(&self) -> StateSchemaFingerprint {
         let mut types = self.types.iter().collect::<Vec<_>>();
         types.sort_by_key(|state_type| state_type.stable_id);
-        let mut builder = FingerprintBuilder::new(StateSchemaFingerprint::DOMAIN, 1);
+        let mut builder = FingerprintBuilder::new(StateSchemaFingerprint::DOMAIN, 2);
         builder.field_u64("type-count", u64::try_from(types.len()).unwrap_or(u64::MAX));
         for state_type in types {
             builder.field_u64("type-id", state_type.stable_id.0);
             builder.field_u32("type-version", state_type.version);
-            let mut fields = state_type.fields.iter().collect::<Vec<_>>();
-            fields.sort_by_key(|field| field.stable_id);
             builder.field_u64(
                 "field-count",
-                u64::try_from(fields.len()).unwrap_or(u64::MAX),
+                u64::try_from(state_type.fields.len()).unwrap_or(u64::MAX),
             );
-            for field in fields {
+            for field in &state_type.fields {
                 builder.field_u64("field-id", field.stable_id.0);
                 match field.ty {
                     CanonicalValueType::I32 => builder.field_u8("field-type", 0),
@@ -955,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn canonical_state_fingerprint_is_order_independent_and_type_sensitive() {
+    fn canonical_state_fingerprint_preserves_field_order_and_type() {
         let field_a = CanonicalStateField {
             stable_id: StableId::from_name("State::a"),
             ty: CanonicalValueType::I32,
@@ -974,7 +978,7 @@ mod tests {
             }
             .fingerprint()
         };
-        assert_eq!(build(vec![field_a, field_b]), build(vec![field_b, field_a]));
+        assert_ne!(build(vec![field_a, field_b]), build(vec![field_b, field_a]));
         assert_ne!(
             build(vec![field_a]),
             build(vec![CanonicalStateField {

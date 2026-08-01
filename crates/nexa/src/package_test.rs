@@ -8,21 +8,21 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
-use nexa_bytecode::{FunctionEffect, HostCallMode, Instruction, ValueType};
+use nexa_bytecode::{FunctionEffect, HostCallMode, HostImport, Instruction, ValueType};
 use nexa_compiler::{
     PackageDebugInfo, PackageTestCallGraphNode, PackageTestForbiddenEffect, PackageTestInfo,
     PackageTestRejection,
 };
 use nexa_core::{FileId, SourceSpan as CoreSourceSpan, StableId};
 use nexa_runtime::{
-    CancelReason, HostCallOutcome, HostRegistry, HostTrap, RealmConfig, RealmRuntime,
-    ResourceContext, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeValue, StepConfig,
-    TaskLimits, TaskPoll, TaskTerminalReason, Trap, TrapKind, YieldReason,
+    CancelReason, HostCallOutcome, HostFunctionAuthority, HostRegistry, HostTrap, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeValue,
+    StepConfig, TaskLimits, TaskPoll, TaskTerminalReason, Trap, TrapKind, YieldReason,
 };
 use nexa_test_runner::{
-    CallGraph, CallGraphBuildError, CallGraphNode, EligibilityViolationReason, ExecutionReport,
-    ExecutionTermination, ForbiddenEffect, HostCall, RejectingHost, SourceSpan, StackFrame,
-    TestBackend, TestBackendFactory, TestDescriptor, TestHost, TestRun, TestRunner,
+    CallGraph, CallGraphNode, EligibilityViolationReason, ExecutionReport, ExecutionTermination,
+    ForbiddenEffect, HostCall, RejectingHost, SourceSpan, StackFrame, TestBackend,
+    TestBackendFactory, TestDescriptor, TestHost, TestRun, TestRunner,
 };
 use nexa_verifier::VerifiedModule;
 
@@ -114,7 +114,7 @@ impl fmt::Display for PackageTestDeclarationErrorReason {
 /// Source-addressable function identity used by an eligibility call chain.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PackageTestFunctionLocation {
-    pub function_index: u32,
+    pub stable_id: Option<StableId>,
     pub package: String,
     pub module: String,
     pub name: String,
@@ -162,11 +162,11 @@ pub struct PackageTestEligibilityViolation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PackageTestRunError {
     InvalidOptions(&'static str),
-    MissingHostInterfaceHash,
+    MissingHostContractRuntimeId,
     InvalidDeclarations(Vec<PackageTestDeclarationError>),
-    ArtifactMetadataMismatch { function_index: u32 },
-    InvalidCallGraph(CallGraphBuildError<u32>),
-    CallGraphMetadataMismatch { function_index: Option<u32> },
+    ArtifactMetadataMismatch { function: Option<StableId> },
+    InvalidCallGraph { function: Option<StableId> },
+    CallGraphMetadataMismatch { function: Option<StableId> },
     Ineligible(Vec<PackageTestEligibilityViolation>),
 }
 
@@ -174,8 +174,8 @@ impl fmt::Display for PackageTestRunError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidOptions(message) => formatter.write_str(message),
-            Self::MissingHostInterfaceHash => {
-                formatter.write_str("package-test artifact is missing its Host contract hash")
+            Self::MissingHostContractRuntimeId => {
+                formatter.write_str("package-test artifact is missing its Host contract runtime ID")
             }
             Self::InvalidDeclarations(errors) => {
                 write!(
@@ -192,15 +192,19 @@ impl fmt::Display for PackageTestRunError {
                 }
                 Ok(())
             }
-            Self::ArtifactMetadataMismatch { function_index } => write!(
+            Self::ArtifactMetadataMismatch { function } => write!(
                 formatter,
-                "package-test debug/source metadata mismatch at function {function_index}"
+                "package-test debug/source metadata mismatch at stable function {function:?}"
             ),
-            Self::InvalidCallGraph(error) => error.fmt(formatter),
-            Self::CallGraphMetadataMismatch { function_index } => {
+            Self::InvalidCallGraph { function } => write!(
+                formatter,
+                "duplicate stable function in package-test call graph at {function:?}"
+            ),
+            Self::CallGraphMetadataMismatch { function } => {
                 write!(
                     formatter,
-                    "compiler package-test call-graph metadata mismatch at {function_index:?}"
+                    "compiler package-test call-graph metadata mismatch at stable function \
+                     {function:?}"
                 )
             }
             Self::Ineligible(violations) => {
@@ -284,8 +288,8 @@ fn validate_runtime_metadata(
     artifact
         .verified
         .module()
-        .host_interface_hash
-        .ok_or(PackageTestRunError::MissingHostInterfaceHash)
+        .host_contract_id
+        .ok_or(PackageTestRunError::MissingHostContractRuntimeId)
         .map(|_| ())
 }
 
@@ -301,7 +305,7 @@ fn validate_options(options: PackageTestOptions) -> Result<(), PackageTestRunErr
 #[allow(clippy::too_many_lines)]
 fn descriptors(
     artifact: PackageTestArtifactRef<'_>,
-) -> Result<Vec<TestDescriptor<u32>>, PackageTestRunError> {
+) -> Result<Vec<TestDescriptor<StableId>>, PackageTestRunError> {
     let module = artifact.verified.module();
     let mut declarations = Vec::new();
     let mut output = Vec::with_capacity(artifact.tests.len());
@@ -407,6 +411,17 @@ fn descriptors(
             .or_else(|| {
                 let function = function?;
                 let debug = debug?;
+                let export_matches = module
+                    .exports
+                    .iter()
+                    .filter(|export| {
+                        export.stable_id == test.stable_id.0
+                            && export.function == test.function_index
+                            && export.signature == function.signature
+                            && export.effect == function.effect
+                    })
+                    .count()
+                    == 1;
                 (test.effect != function.effect
                     || test.effect != debug.effect
                     || test.package_id != debug.package_id
@@ -414,7 +429,8 @@ fn descriptors(
                     || test.name != debug.name
                     || test.definition_span != debug.definition_span
                     || test.stable_id != debug.stable_id
-                    || test.canonical_identity != debug.canonical_identity)
+                    || test.canonical_identity != debug.canonical_identity
+                    || !export_matches)
                     .then_some(PackageTestDeclarationErrorReason::MetadataMismatch)
             })
             .or_else(|| {
@@ -438,7 +454,7 @@ fn descriptors(
             test.module_path.clone(),
             test.name.clone(),
             span,
-            test.function_index,
+            test.stable_id.0,
         ));
     }
 
@@ -482,7 +498,7 @@ const fn map_compiler_rejection(
 #[allow(clippy::too_many_lines)]
 fn validate_eligibility(
     artifact: PackageTestArtifactRef<'_>,
-    tests: &[TestDescriptor<u32>],
+    tests: &[TestDescriptor<StableId>],
 ) -> Result<(), PackageTestRunError> {
     let expected = bytecode_call_graph_nodes(artifact.verified.module());
     let test_functions = artifact
@@ -506,11 +522,14 @@ fn validate_eligibility(
                 )
         })
         .collect::<Vec<_>>();
-    let graph = CallGraph::new(compiler_nodes).map_err(PackageTestRunError::InvalidCallGraph)?;
+    let raw_graph = CallGraph::new(compiler_nodes).map_err(|error| {
+        let nexa_test_runner::CallGraphBuildError::DuplicateFunction(function) = error;
+        PackageTestRunError::InvalidCallGraph {
+            function: stable_function_id(function, artifact.debug_info),
+        }
+    })?;
     if artifact.call_graph.len() != expected.len() {
-        return Err(PackageTestRunError::CallGraphMetadataMismatch {
-            function_index: None,
-        });
+        return Err(PackageTestRunError::CallGraphMetadataMismatch { function: None });
     }
     for expected_node in &expected {
         let debug = artifact
@@ -525,7 +544,7 @@ fn validate_eligibility(
                 .contains_key(&debug[0].definition_span.file)
         {
             return Err(PackageTestRunError::ArtifactMetadataMismatch {
-                function_index: expected_node.function,
+                function: stable_function_id(expected_node.function, artifact.debug_info),
             });
         }
         let function = &artifact.verified.module().functions[expected_node.function as usize];
@@ -561,10 +580,10 @@ fn validate_eligibility(
                 .is_some_and(|prior| &prior != canonical)
         {
             return Err(PackageTestRunError::ArtifactMetadataMismatch {
-                function_index: expected_node.function,
+                function: stable_function_id(expected_node.function, artifact.debug_info),
             });
         }
-        let compiler_node = graph.node(&expected_node.function);
+        let compiler_node = raw_graph.node(&expected_node.function);
         if compiler_node.is_none_or(|compiler_node| {
             compiler_node.calls != expected_node.calls
                 || !compiler_node
@@ -572,12 +591,42 @@ fn validate_eligibility(
                     .is_superset(&expected_node.forbidden_effects)
         }) {
             return Err(PackageTestRunError::CallGraphMetadataMismatch {
-                function_index: Some(expected_node.function),
+                function: stable_function_id(expected_node.function, artifact.debug_info),
             });
         }
     }
 
-    let report = graph.validate_tests(tests.iter().map(|test| test.function));
+    let stable_nodes = artifact
+        .call_graph
+        .iter()
+        .map(|node| {
+            let function = stable_function_id(node.function_index, artifact.debug_info)
+                .ok_or(PackageTestRunError::ArtifactMetadataMismatch { function: None })?;
+            let calls = node
+                .calls
+                .iter()
+                .map(|call| {
+                    stable_function_id(*call, artifact.debug_info)
+                        .ok_or(PackageTestRunError::ArtifactMetadataMismatch { function: None })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(CallGraphNode::new(function)
+                .with_calls(calls)
+                .with_forbidden_effects(
+                    node.forbidden_effects
+                        .iter()
+                        .copied()
+                        .map(map_compiler_forbidden_effect),
+                ))
+        })
+        .collect::<Result<Vec<_>, PackageTestRunError>>()?;
+    let stable_graph = CallGraph::new(stable_nodes).map_err(|error| {
+        let nexa_test_runner::CallGraphBuildError::DuplicateFunction(function) = error;
+        PackageTestRunError::InvalidCallGraph {
+            function: Some(function),
+        }
+    })?;
+    let report = stable_graph.validate_tests(tests.iter().map(|test| test.function));
     if report.violations.is_empty() {
         return Ok(());
     }
@@ -693,16 +742,16 @@ const fn map_compiler_forbidden_effect(effect: PackageTestForbiddenEffect) -> Fo
 }
 
 fn function_location(
-    function_index: u32,
+    stable_id: StableId,
     debug_info: &PackageDebugInfo,
     source_paths: &PackageTestSourcePaths,
 ) -> PackageTestFunctionLocation {
     let function = debug_info
         .functions
         .iter()
-        .find(|function| function.function_index == function_index);
+        .find(|function| function.stable_id.0 == stable_id);
     PackageTestFunctionLocation {
-        function_index,
+        stable_id: Some(stable_id),
         package: function.map_or_else(
             || "<unknown-package>".into(),
             |function| function.package_id.clone(),
@@ -712,7 +761,7 @@ fn function_location(
             |function| function.module_path.clone(),
         ),
         name: function.map_or_else(
-            || format!("<function #{function_index}>"),
+            || "<unknown-function>".into(),
             |function| function.name.clone(),
         ),
         span: function.map_or_else(
@@ -720,6 +769,14 @@ fn function_location(
             |function| runner_span(function.definition_span, source_paths),
         ),
     }
+}
+
+fn stable_function_id(function_index: u32, debug_info: &PackageDebugInfo) -> Option<StableId> {
+    debug_info
+        .functions
+        .iter()
+        .find(|function| function.function_index == function_index)
+        .map(|function| function.stable_id.0)
 }
 
 const fn map_eligibility_reason(
@@ -792,11 +849,11 @@ struct RealmTestBackendFactory<'a> {
     next_realm_id: u32,
 }
 
-impl<'a> TestBackendFactory<u32> for RealmTestBackendFactory<'a> {
+impl<'a> TestBackendFactory<StableId> for RealmTestBackendFactory<'a> {
     type Backend = RealmTestBackend<'a>;
     type Error = PackageTestBackendSetupError;
 
-    fn create(&mut self, _test: &TestDescriptor<u32>) -> Result<Self::Backend, Self::Error> {
+    fn create(&mut self, _test: &TestDescriptor<StableId>) -> Result<Self::Backend, Self::Error> {
         let realm_id = self.next_realm_id;
         self.next_realm_id = self
             .next_realm_id
@@ -805,7 +862,7 @@ impl<'a> TestBackendFactory<u32> for RealmTestBackendFactory<'a> {
 
         let module = self.verified.module();
         let host_hash = module
-            .host_interface_hash
+            .host_contract_id
             .ok_or(PackageTestBackendSetupError::MissingHostHash)?;
         let state_schema_fingerprint = module.state_schema_fingerprint;
 
@@ -818,7 +875,7 @@ impl<'a> TestBackendFactory<u32> for RealmTestBackendFactory<'a> {
         let mut realm = match RealmRuntime::hosted(
             config,
             runtime_host.clone(),
-            Box::new(RejectingRuntimeHost(host_hash)),
+            Box::new(RejectingRuntimeHost::new(host_hash, &module.host_imports)),
         ) {
             Ok(realm) => realm,
             Err(error) => {
@@ -877,9 +934,9 @@ struct RealmTestBackend<'a> {
     source_paths: &'a PackageTestSourcePaths,
 }
 
-impl TestBackend<u32> for RealmTestBackend<'_> {
+impl TestBackend<StableId> for RealmTestBackend<'_> {
     #[allow(clippy::too_many_lines)]
-    fn execute(self, function: &u32, host: &mut RejectingHost) -> ExecutionReport {
+    fn execute(self, function: &StableId, host: &mut RejectingHost) -> ExecutionReport {
         let Self {
             mut realm,
             module_handle,
@@ -1123,17 +1180,37 @@ fn close_runtime_host(runtime_host: &RuntimeHost) {
     let _ = runtime_host.try_finish_close();
 }
 
-#[derive(Clone, Copy)]
-struct RejectingRuntimeHost(StableId);
+struct RejectingRuntimeHost {
+    contract_runtime_id: StableId,
+    authorities: Vec<HostFunctionAuthority>,
+}
+
+impl RejectingRuntimeHost {
+    fn new(contract_runtime_id: StableId, imports: &[HostImport]) -> Self {
+        Self {
+            contract_runtime_id,
+            authorities: imports
+                .iter()
+                .map(HostFunctionAuthority::from_import)
+                .collect(),
+        }
+    }
+}
 
 impl HostRegistry for RejectingRuntimeHost {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.0)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        self.authorities
+            .iter()
+            .find(|authority| authority.stable_id() == id)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         _context: &mut ResourceContext<'_>,
         _args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
@@ -1144,8 +1221,8 @@ impl HostRegistry for RejectingRuntimeHost {
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
-        Function, FunctionBuilder, HostImport, ModuleBuilder, Signature, SourceMapEntry,
-        StandardIntrinsic,
+        Function, FunctionBuilder, HostImport, ModuleBuilder, ScriptExport, Signature,
+        SourceMapEntry, StandardIntrinsic,
     };
     use nexa_compiler::{PackageFunctionDebugInfo, PackageVisibility};
     use nexa_core::{CanonicalSymbolIdentity, SymbolKind};
@@ -1292,12 +1369,29 @@ mod tests {
             .iter()
             .map(|test| test.function_index)
             .collect::<BTreeSet<_>>();
+        let test_exports = tests
+            .iter()
+            .filter(|test| test.rejection.is_none())
+            .map(|test| (test.function_index, test.stable_id.0))
+            .collect::<BTreeMap<_, _>>();
+        let mut emitted_export_ids = BTreeSet::new();
         for (index, (name, mut function, span)) in functions.into_iter().enumerate() {
             let index = u32::try_from(index).unwrap();
             let effect = FunctionEffect::Immediate;
             function.effect = effect;
+            let signature = function.signature.clone();
             let end = u32::try_from(function.code.len()).unwrap();
             builder.function(function);
+            if let Some(stable_id) = test_exports.get(&index)
+                && emitted_export_ids.insert(*stable_id)
+            {
+                builder.script_export(ScriptExport {
+                    stable_id: *stable_id,
+                    function: index,
+                    signature,
+                    effect,
+                });
+            }
             source_map.push(SourceMapEntry {
                 function: index,
                 pc_start: 0,
@@ -1499,7 +1593,12 @@ mod tests {
         assert_eq!(run.results[0].status, TestStatus::Error);
         assert_eq!(run.results[0].error, Some(TestError::FuelExhaustion));
         assert_eq!(run.results[0].instructions, 33);
-        assert_eq!(run.results[0].fuel, 2);
+        // Bytecode v6 charges the caller's `Call` base plus its one-register
+        // callee-frame initialization (2 fuel) before entering `helper`.
+        // The first `LoadBool` is then settled at the callee's entry
+        // safepoint, so the exact committed charge is 3 fuel; the remaining
+        // straight-line loads stay pending when `Return` exhausts the budget.
+        assert_eq!(run.results[0].fuel, 3);
         assert_eq!(
             run.results[0]
                 .stack
@@ -1542,6 +1641,8 @@ mod tests {
             |builder| {
                 builder.host_import(HostImport {
                     stable_id: StableId::from_name("Host::forbidden"),
+                    declaration_fingerprint: [0x74; 32],
+                    capabilities: Vec::new(),
                     parameters: Vec::new(),
                     result: Some(ValueType::Bool),
                     mode: HostCallMode::Immediate,
@@ -1569,9 +1670,9 @@ mod tests {
             violations[0]
                 .path
                 .iter()
-                .map(|location| location.function_index)
+                .map(|location| location.name.as_str())
                 .collect::<Vec<_>>(),
-            [1, 0]
+            ["indirect", "host_helper"]
         );
         assert_eq!(violations[0].reason, PackageTestEligibilityReason::Host);
 
@@ -1586,7 +1687,11 @@ mod tests {
                 source_paths: &paths,
             }),
             Err(PackageTestRunError::CallGraphMetadataMismatch {
-                function_index: Some(0),
+                function: debug
+                    .functions
+                    .iter()
+                    .find(|function| function.function_index == 0)
+                    .map(|function| function.stable_id.0),
             })
         );
     }
@@ -1703,6 +1808,7 @@ mod tests {
         );
         debug.functions[0].stable_id = malformed.runtime_id();
         debug.functions[0].canonical_identity = malformed;
+        let malformed_stable_id = debug.functions[0].stable_id.0;
         assert_eq!(
             validate_package_test_artifact(PackageTestArtifactRef {
                 verified: &verified,
@@ -1711,7 +1817,9 @@ mod tests {
                 debug_info: &debug,
                 source_paths: &paths,
             }),
-            Err(PackageTestRunError::ArtifactMetadataMismatch { function_index: 0 })
+            Err(PackageTestRunError::ArtifactMetadataMismatch {
+                function: Some(malformed_stable_id),
+            })
         );
     }
 
@@ -1770,7 +1878,7 @@ mod tests {
             |_| {},
         );
         let mut module = verified.module().clone();
-        module.host_interface_hash = None;
+        module.host_contract_id = None;
         let verified = verify(module, VerifierLimits::default()).unwrap();
 
         assert_eq!(
@@ -1781,7 +1889,7 @@ mod tests {
                 debug_info: &debug,
                 source_paths: &paths,
             }),
-            Err(PackageTestRunError::MissingHostInterfaceHash)
+            Err(PackageTestRunError::MissingHostContractRuntimeId)
         );
     }
 }

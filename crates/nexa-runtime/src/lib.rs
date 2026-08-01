@@ -36,7 +36,10 @@ pub use failure::{
 pub use kernel::{RuntimeError, RuntimeLimits, RuntimeTrap, StepConfig, TaskLimits, TaskRuntime};
 pub use ledger::RuntimeResourceLedger;
 pub use message::{DiagnosticCode, InlineMessage, RuntimeMessage};
-pub use nexa_bytecode::{Signature, ValueType};
+pub use nexa_bytecode::{
+    AbandonPolicy, AsyncResultType, CancelPolicy, FunctionEffect, HostCallMode, Signature,
+    ValueType,
+};
 pub use nexa_core::{
     CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, CANONICAL_NAN_POLICY_VERSION,
     OPCODE_COST_TABLE_VERSION, RUNTIME_LIBM_VERSION, RUNTIME_MATH_BACKEND_ID,
@@ -55,19 +58,19 @@ pub use heap::{
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,
-    HOST_CONTRACT_SCHEMA_VERSION, HostArrayRef, HostBufferRef, HostCallOutcome,
+    HOST_CONTRACT_SCHEMA_VERSION, HostArrayRef, HostBufferRef, HostCallOutcome, HostClassRef,
     HostCollectionBuilder, HostCompletionDelivery, HostCompletionProtocolError,
     HostCompletionResult, HostCompletionTicket, HostContract, HostEnumRef, HostErrorPayload,
-    HostOptionRef, HostPayload, HostRegistry, HostRequestError, HostRequestHandle,
-    HostRequestState, HostResultRef, HostReturnRequirements, HostReturnTransaction, HostStr,
-    HostStructRef, HostTrap, HostValueRef, MAX_HOST_RETURN_FIELDS, MustCompletePolicy,
-    PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue, ReleaseQueueError,
-    ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext, ResourceTokenHandle,
-    RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError, RuntimeHostCloseStatus, RuntimeHostDomain,
-    RuntimeHostState, RuntimeResourceSnapshot, RuntimeResources, ScriptArgumentRequirements,
-    ScriptCallError, ScriptCallWriter, ScriptExport, ScriptFunction, ScriptOutputReader,
-    SnapshotHandle, SnapshotLayout, TaskResourceSet, TypedSnapshotRef, invoke_host_boundary,
-    validate_host_completion,
+    HostFunctionAuthority, HostMapEntryRef, HostMapRef, HostOptionRef, HostPayload, HostRegistry,
+    HostRequestError, HostRequestHandle, HostRequestState, HostResultRef, HostReturnRequirements,
+    HostReturnTransaction, HostStr, HostStructRef, HostTrap, HostValueRef, MAX_HOST_RETURN_FIELDS,
+    MustCompletePolicy, PendingHostRequest, RELEASE_DOMAIN_COUNT, ReleaseKind, ReleaseQueue,
+    ReleaseQueueError, ReleaseQueueState, ReleaseRecord, RequestTerminalRecord, ResourceContext,
+    ResourceTokenHandle, RuntimeHost, RuntimeHostArgs, RuntimeHostCloseError,
+    RuntimeHostCloseStatus, RuntimeHostDomain, RuntimeHostState, RuntimeResourceSnapshot,
+    RuntimeResources, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter, ScriptExport,
+    ScriptOutputReader, SnapshotHandle, SnapshotLayout, TaskResourceSet, TypedSnapshotRef,
+    contract_runtime_id_from_fingerprint, invoke_host_boundary, validate_host_completion,
 };
 #[cfg(feature = "fuzzing")]
 pub use host::{fuzz_completion_ticket_terminal_race, fuzz_release_intrusive_list};
@@ -79,10 +82,13 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use realm::{
-    CancelReason, CompletionDisposition, HostResult, ModuleHandle, ModuleLifecycle, NexaValue,
-    RealmConfig, RealmError, RealmRuntime, ReloadAccounting, RestartReloadMetrics,
-    RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult, RuntimeCapacityReport,
-    TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport, YieldReason,
+    CancelReason, CompletionDisposition, HostFunctionAuthorityField, HostResult, ModuleHandle,
+    ModuleLifecycle, NexaValue, RealmConfig, RealmError, RealmRuntime, ReloadAccounting,
+    RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult,
+    RuntimeCapacityReport, StagedCellTransaction, TaskPoll, TaskTerminalReason, TaskTerminalRecord,
+    TickBudget, TickReport, TransactionalCellCommit, TransactionalCellEntrypoint,
+    TransactionalCellFailure, TransactionalCellFailureCause, TransactionalCellPoll,
+    TransactionalCellRollback, YieldReason,
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{

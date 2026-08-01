@@ -7,6 +7,48 @@
       "type": "SYMBOL",
       "name": "nidl_document"
     },
+    "doc_comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 2,
+        "content": {
+          "type": "PATTERN",
+          "value": "\\/\\/\\/[^\\n\\r]*"
+        }
+      }
+    },
+    "line_comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "\\/\\/[^\\n\\r]*"
+        }
+      }
+    },
+    "block_comment": {
+      "type": "TOKEN",
+      "content": {
+        "type": "SEQ",
+        "members": [
+          {
+            "type": "STRING",
+            "value": "/*"
+          },
+          {
+            "type": "PATTERN",
+            "value": "[^*]*\\*+([^/*][^*]*\\*+)*"
+          },
+          {
+            "type": "STRING",
+            "value": "/"
+          }
+        ]
+      }
+    },
     "nidl_document": {
       "type": "SEQ",
       "members": [
@@ -15,7 +57,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "interface_keyword"
+            "name": "contract_keyword"
           }
         },
         {
@@ -34,7 +76,7 @@
           "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_member"
+            "name": "contract_member"
           }
         },
         {
@@ -43,12 +85,12 @@
         }
       ]
     },
-    "nidl_member": {
+    "contract_member": {
       "type": "CHOICE",
       "members": [
         {
           "type": "SYMBOL",
-          "name": "opaque_declaration"
+          "name": "handle_declaration"
         },
         {
           "type": "SYMBOL",
@@ -60,15 +102,15 @@
         },
         {
           "type": "SYMBOL",
-          "name": "host_function_declaration"
+          "name": "host_block"
         },
         {
           "type": "SYMBOL",
-          "name": "export_declaration"
+          "name": "nexa_block"
         }
       ]
     },
-    "opaque_declaration": {
+    "handle_declaration": {
       "type": "SEQ",
       "members": [
         {
@@ -76,7 +118,7 @@
           "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "opaque_keyword"
+            "name": "handle_keyword"
           }
         },
         {
@@ -117,11 +159,49 @@
           "value": "{"
         },
         {
-          "type": "REPEAT",
-          "content": {
-            "type": "SYMBOL",
-            "name": "nidl_field_declaration"
-          }
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "nidl_field_declaration"
+                },
+                {
+                  "type": "REPEAT",
+                  "content": {
+                    "type": "SEQ",
+                    "members": [
+                      {
+                        "type": "STRING",
+                        "value": ","
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "nidl_field_declaration"
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ","
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -151,10 +231,6 @@
             "type": "SYMBOL",
             "name": "nidl_type"
           }
-        },
-        {
-          "type": "STRING",
-          "value": ";"
         }
       ]
     },
@@ -182,28 +258,49 @@
           "value": "{"
         },
         {
-          "type": "REPEAT",
-          "content": {
-            "type": "SEQ",
-            "members": [
-              {
-                "type": "SYMBOL",
-                "name": "nidl_enum_variant"
-              },
-              {
-                "type": "CHOICE",
-                "members": [
-                  {
-                    "type": "STRING",
-                    "value": ","
-                  },
-                  {
-                    "type": "BLANK"
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "SYMBOL",
+                  "name": "nidl_enum_variant"
+                },
+                {
+                  "type": "REPEAT",
+                  "content": {
+                    "type": "SEQ",
+                    "members": [
+                      {
+                        "type": "STRING",
+                        "value": ","
+                      },
+                      {
+                        "type": "SYMBOL",
+                        "name": "nidl_enum_variant"
+                      }
+                    ]
                   }
-                ]
-              }
-            ]
-          }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ","
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -219,30 +316,130 @@
           "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "nidl_identifier"
+            "name": "nidl_type_identifier"
           }
         },
         {
           "type": "CHOICE",
           "members": [
             {
-              "type": "SEQ",
+              "type": "CHOICE",
               "members": [
                 {
-                  "type": "STRING",
-                  "value": "("
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "("
+                    },
+                    {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "SEQ",
+                          "members": [
+                            {
+                              "type": "SYMBOL",
+                              "name": "nidl_type"
+                            },
+                            {
+                              "type": "REPEAT",
+                              "content": {
+                                "type": "SEQ",
+                                "members": [
+                                  {
+                                    "type": "STRING",
+                                    "value": ","
+                                  },
+                                  {
+                                    "type": "SYMBOL",
+                                    "name": "nidl_type"
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "BLANK"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "STRING",
+                          "value": ","
+                        },
+                        {
+                          "type": "BLANK"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "STRING",
+                      "value": ")"
+                    }
+                  ]
                 },
                 {
-                  "type": "FIELD",
-                  "name": "payload",
-                  "content": {
-                    "type": "SYMBOL",
-                    "name": "nidl_type"
-                  }
-                },
-                {
-                  "type": "STRING",
-                  "value": ")"
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "{"
+                    },
+                    {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "SEQ",
+                          "members": [
+                            {
+                              "type": "SYMBOL",
+                              "name": "nidl_field_declaration"
+                            },
+                            {
+                              "type": "REPEAT",
+                              "content": {
+                                "type": "SEQ",
+                                "members": [
+                                  {
+                                    "type": "STRING",
+                                    "value": ","
+                                  },
+                                  {
+                                    "type": "SYMBOL",
+                                    "name": "nidl_field_declaration"
+                                  }
+                                ]
+                              }
+                            }
+                          ]
+                        },
+                        {
+                          "type": "BLANK"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "CHOICE",
+                      "members": [
+                        {
+                          "type": "STRING",
+                          "value": ","
+                        },
+                        {
+                          "type": "BLANK"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "}"
+                    }
+                  ]
                 }
               ]
             },
@@ -253,35 +450,82 @@
         }
       ]
     },
-    "host_function_declaration": {
+    "host_block": {
       "type": "SEQ",
       "members": [
         {
           "type": "FIELD",
-          "name": "mode",
+          "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "host_mode_keyword"
+            "name": "host_keyword"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "host_function_declaration"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "nexa_block": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "keyword",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nexa_keyword"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "{"
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nexa_function_declaration"
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "}"
+        }
+      ]
+    },
+    "host_function_declaration": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_attribute"
           }
         },
         {
           "type": "CHOICE",
           "members": [
             {
-              "type": "SYMBOL",
-              "name": "request_policy"
-            },
-            {
-              "type": "BLANK"
-            }
-          ]
-        },
-        {
-          "type": "CHOICE",
-          "members": [
-            {
-              "type": "SYMBOL",
-              "name": "fuel_clause"
+              "type": "FIELD",
+              "name": "effect",
+              "content": {
+                "type": "SYMBOL",
+                "name": "async_keyword"
+              }
             },
             {
               "type": "BLANK"
@@ -313,20 +557,33 @@
           }
         },
         {
-          "type": "FIELD",
-          "name": "arrow",
-          "content": {
-            "type": "SYMBOL",
-            "name": "return_arrow_operator"
-          }
-        },
-        {
-          "type": "FIELD",
-          "name": "return_type",
-          "content": {
-            "type": "SYMBOL",
-            "name": "nidl_type"
-          }
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "FIELD",
+                  "name": "arrow",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "return_arrow_operator"
+                  }
+                },
+                {
+                  "type": "FIELD",
+                  "name": "return_type",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "nidl_type"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "STRING",
@@ -334,53 +591,230 @@
         }
       ]
     },
-    "request_policy": {
+    "nexa_function_declaration": {
       "type": "SEQ",
       "members": [
         {
-          "type": "STRING",
-          "value": "("
-        },
-        {
-          "type": "FIELD",
-          "name": "cancel",
+          "type": "REPEAT",
           "content": {
             "type": "SYMBOL",
-            "name": "cancel_policy_keyword"
+            "name": "nidl_attribute"
           }
         },
         {
-          "type": "STRING",
-          "value": ","
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "effect",
+              "content": {
+                "type": "SYMBOL",
+                "name": "async_keyword"
+              }
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
         },
         {
           "type": "FIELD",
-          "name": "abandon",
+          "name": "keyword",
           "content": {
             "type": "SYMBOL",
-            "name": "abandon_policy_keyword"
+            "name": "nidl_function_keyword"
           }
         },
         {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_identifier"
+          }
+        },
+        {
+          "type": "FIELD",
+          "name": "parameters",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_parameter_list"
+          }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "FIELD",
+                  "name": "arrow",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "return_arrow_operator"
+                  }
+                },
+                {
+                  "type": "FIELD",
+                  "name": "return_type",
+                  "content": {
+                    "type": "SYMBOL",
+                    "name": "nidl_type"
+                  }
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
-          "value": ")"
+          "value": ";"
         }
       ]
     },
-    "fuel_clause": {
+    "nidl_attribute": {
       "type": "SEQ",
       "members": [
         {
-          "type": "SYMBOL",
-          "name": "fuel_keyword"
+          "type": "STRING",
+          "value": "@"
         },
         {
           "type": "FIELD",
-          "name": "amount",
+          "name": "name",
           "content": {
             "type": "SYMBOL",
-            "name": "integer_literal"
+            "name": "nidl_attribute_name"
           }
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "SEQ",
+              "members": [
+                {
+                  "type": "STRING",
+                  "value": "("
+                },
+                {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "nidl_attribute_argument"
+                        },
+                        {
+                          "type": "REPEAT",
+                          "content": {
+                            "type": "SEQ",
+                            "members": [
+                              {
+                                "type": "STRING",
+                                "value": ","
+                              },
+                              {
+                                "type": "SYMBOL",
+                                "name": "nidl_attribute_argument"
+                              }
+                            ]
+                          }
+                        }
+                      ]
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
+                },
+                {
+                  "type": "CHOICE",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": ","
+                    },
+                    {
+                      "type": "BLANK"
+                    }
+                  ]
+                },
+                {
+                  "type": "STRING",
+                  "value": ")"
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "nidl_attribute_argument": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SEQ",
+          "members": [
+            {
+              "type": "FIELD",
+              "name": "name",
+              "content": {
+                "type": "SYMBOL",
+                "name": "nidl_identifier"
+              }
+            },
+            {
+              "type": "STRING",
+              "value": "="
+            },
+            {
+              "type": "FIELD",
+              "name": "value",
+              "content": {
+                "type": "SYMBOL",
+                "name": "nidl_attribute_value"
+              }
+            }
+          ]
+        },
+        {
+          "type": "FIELD",
+          "name": "value",
+          "content": {
+            "type": "SYMBOL",
+            "name": "nidl_attribute_value"
+          }
+        }
+      ]
+    },
+    "nidl_attribute_value": {
+      "type": "CHOICE",
+      "members": [
+        {
+          "type": "SYMBOL",
+          "name": "string_literal"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "integer_literal"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "policy_value"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_identifier"
         }
       ]
     },
@@ -425,6 +859,18 @@
           ]
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ","
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
           "value": ")"
         }
@@ -455,74 +901,16 @@
         }
       ]
     },
-    "export_declaration": {
-      "type": "SEQ",
-      "members": [
-        {
-          "type": "FIELD",
-          "name": "keyword",
-          "content": {
-            "type": "SYMBOL",
-            "name": "export_keyword"
-          }
-        },
-        {
-          "type": "FIELD",
-          "name": "name",
-          "content": {
-            "type": "SYMBOL",
-            "name": "nidl_identifier"
-          }
-        },
-        {
-          "type": "FIELD",
-          "name": "parameters",
-          "content": {
-            "type": "SYMBOL",
-            "name": "nidl_parameter_list"
-          }
-        },
-        {
-          "type": "FIELD",
-          "name": "arrow",
-          "content": {
-            "type": "SYMBOL",
-            "name": "return_arrow_operator"
-          }
-        },
-        {
-          "type": "FIELD",
-          "name": "return_type",
-          "content": {
-            "type": "CHOICE",
-            "members": [
-              {
-                "type": "SYMBOL",
-                "name": "nidl_type"
-              },
-              {
-                "type": "SYMBOL",
-                "name": "void_type"
-              }
-            ]
-          }
-        },
-        {
-          "type": "STRING",
-          "value": ";"
-        }
-      ]
-    },
     "nidl_type": {
       "type": "CHOICE",
       "members": [
         {
           "type": "SYMBOL",
-          "name": "nidl_builtin_type"
+          "name": "nidl_generic_type"
         },
         {
           "type": "SYMBOL",
-          "name": "nidl_generic_type"
+          "name": "nidl_builtin_type"
         },
         {
           "type": "SYMBOL",
@@ -593,6 +981,18 @@
           ]
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": ","
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
           "value": ">"
         }
@@ -604,15 +1004,15 @@
     },
     "nidl_identifier": {
       "type": "PATTERN",
-      "value": "[^/*{}(),:;<>\\s-]+"
+      "value": "[A-Za-z_][A-Za-z0-9_]*"
     },
-    "interface_keyword": {
+    "contract_keyword": {
       "type": "STRING",
-      "value": "interface"
+      "value": "contract"
     },
-    "opaque_keyword": {
+    "handle_keyword": {
       "type": "STRING",
-      "value": "opaque"
+      "value": "handle"
     },
     "nidl_struct_keyword": {
       "type": "STRING",
@@ -622,32 +1022,48 @@
       "type": "STRING",
       "value": "enum"
     },
+    "host_keyword": {
+      "type": "STRING",
+      "value": "host"
+    },
+    "nexa_keyword": {
+      "type": "STRING",
+      "value": "nexa"
+    },
+    "async_keyword": {
+      "type": "STRING",
+      "value": "async"
+    },
     "nidl_function_keyword": {
       "type": "STRING",
       "value": "fn"
     },
-    "export_keyword": {
-      "type": "STRING",
-      "value": "export"
-    },
-    "host_mode_keyword": {
+    "nidl_attribute_name": {
       "type": "CHOICE",
       "members": [
         {
           "type": "STRING",
-          "value": "sync"
+          "value": "fuel"
         },
         {
           "type": "STRING",
-          "value": "request"
+          "value": "cancel"
+        },
+        {
+          "type": "STRING",
+          "value": "abandon"
+        },
+        {
+          "type": "STRING",
+          "value": "capability"
+        },
+        {
+          "type": "SYMBOL",
+          "name": "nidl_identifier"
         }
       ]
     },
-    "fuel_keyword": {
-      "type": "STRING",
-      "value": "fuel"
-    },
-    "cancel_policy_keyword": {
+    "policy_value": {
       "type": "CHOICE",
       "members": [
         {
@@ -657,15 +1073,6 @@
         {
           "type": "STRING",
           "value": "cancel_task"
-        }
-      ]
-    },
-    "abandon_policy_keyword": {
-      "type": "CHOICE",
-      "members": [
-        {
-          "type": "STRING",
-          "value": "return_error"
         },
         {
           "type": "STRING",
@@ -706,31 +1113,11 @@
         },
         {
           "type": "STRING",
-          "value": "host_request"
+          "value": "Array"
         },
         {
           "type": "STRING",
-          "value": "request"
-        },
-        {
-          "type": "STRING",
-          "value": "resource_token"
-        },
-        {
-          "type": "STRING",
-          "value": "token"
-        },
-        {
-          "type": "STRING",
-          "value": "snapshot"
-        },
-        {
-          "type": "STRING",
-          "value": "array"
-        },
-        {
-          "type": "STRING",
-          "value": "buffer"
+          "value": "Buffer"
         },
         {
           "type": "STRING",
@@ -739,12 +1126,63 @@
         {
           "type": "STRING",
           "value": "Result"
+        },
+        {
+          "type": "STRING",
+          "value": "Token"
+        },
+        {
+          "type": "STRING",
+          "value": "Snapshot"
         }
       ]
     },
-    "void_type": {
-      "type": "STRING",
-      "value": "void"
+    "string_literal": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "STRING",
+          "value": "\""
+        },
+        {
+          "type": "REPEAT",
+          "content": {
+            "type": "CHOICE",
+            "members": [
+              {
+                "type": "SYMBOL",
+                "name": "string_content"
+              },
+              {
+                "type": "SYMBOL",
+                "name": "escape_sequence"
+              }
+            ]
+          }
+        },
+        {
+          "type": "STRING",
+          "value": "\""
+        }
+      ]
+    },
+    "string_content": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PREC",
+        "value": 1,
+        "content": {
+          "type": "PATTERN",
+          "value": "[^\"\\\\]+"
+        }
+      }
+    },
+    "escape_sequence": {
+      "type": "IMMEDIATE_TOKEN",
+      "content": {
+        "type": "PATTERN",
+        "value": "\\\\[nrt\\\\\"']"
+      }
     },
     "integer_literal": {
       "type": "PATTERN",
@@ -759,6 +1197,18 @@
     {
       "type": "PATTERN",
       "value": "\\s"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "doc_comment"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "line_comment"
+    },
+    {
+      "type": "SYMBOL",
+      "name": "block_comment"
     }
   ],
   "conflicts": [],
@@ -766,7 +1216,7 @@
   "externals": [],
   "inline": [],
   "supertypes": [
-    "nidl_member",
+    "contract_member",
     "nidl_type"
   ],
   "reserved": {}

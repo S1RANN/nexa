@@ -1,6 +1,6 @@
 # Package Source
 
-Status: M2 COMPLETE
+Status: M4 COMPLETE; M4R1 COMPLETE
 
 A `PackageSource` has one stable `SourceId`, one host-defined `PackagePolicy`,
 and a deterministic `discover` operation returning `PackageCandidate` values.
@@ -9,10 +9,16 @@ assume candidates came from a filesystem.
 
 `MemorySource` stores manifest/source pairs and is the canonical fixture and
 programmatic source. `DirectorySource` examines only direct child directories.
-Each child must contain `package.toml`; its declared entry is relative, cannot
-contain a parent traversal, and after canonicalization must remain inside the
-package directory. Package directories and entries may not escape through
+Each child must contain a strict schema 2 `package.toml` and exactly one
+`source_root = "src"`. The Application Entry Module maps uniquely to a source
+path, and every other Source Module identity is likewise derived from its
+normalized package-relative path. Canonical source roots and files must remain
+inside the package directory and cannot escape through parent traversal or
 symbolic links. Discovery order is stable.
+
+Local path dependencies resolve only inside the same Source root and
+`SourceId`. The target must be a Library, and a Package with dependencies must
+provide a current `nexa.lock`; discovery never rewrites it.
 
 Source IDs must be unique in one embed instance. Package IDs must be globally
 unique across all sources. If multiple candidates claim one package ID, every

@@ -1,6 +1,7 @@
-interface InvalidHost {
+contract EnumCommentFixture {
     enum State {
-        // NIDL comments must be rejected even where an identifier is valid.
-        Ready
+        // Comments are accepted between enum variants.
+        Ready,
+        Waiting,
     }
 }

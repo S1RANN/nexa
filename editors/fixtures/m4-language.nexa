@@ -1,9 +1,7 @@
 /// Public score rules used by the game package.
-module demo.score_rules;
-
-import demo.food;
-import snake_common.score as score;
-import host as snake;
+use package::demo::food;
+use snake_common::score as score;
+use host::snake;
 
 // Public constants participate in the package API fingerprint.
 pub const MAX_SCORE: i32 = 100;
@@ -12,13 +10,13 @@ pub const MAX_SCORE: i32 = 100;
 @stable("score-policy")
 pub(package) struct ScorePolicy {
     @stable("score-policy.multiplier")
-    multiplier: i32;
+    multiplier: i32,
 }
 
-@stateful(2)
+@state(version = 2)
 pub class PlayState {
     @stable("play-state.total-games")
-    total_games: i32;
+    mut total_games: i32,
 }
 
 @test
@@ -36,6 +34,6 @@ fn score_is_positive() -> bool {
 }
 
 @activation
-pub task fn activate(value: i32) -> i32 {
-    return snake.update(value, MAX_SCORE);
+pub async fn activate(value: i32) -> i32 {
+    return snake::update(value, MAX_SCORE);
 }

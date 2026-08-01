@@ -11,10 +11,20 @@ pub enum SyntaxLanguage {
     Nidl,
 }
 
+/// Whether a REPL submission is structurally complete enough to analyze.
+///
+/// This classification deliberately answers only the continuation question. A complete
+/// submission may still contain ordinary syntax errors, which the normal parser and analyzer
+/// report with their precise source ranges.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CellCompleteness {
+    Complete,
+    Incomplete,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SyntaxErrorKind {
     UnexpectedCharacter,
-    CommentsNotSupported,
     UnterminatedBlockComment,
     UnterminatedString,
     UnterminatedInterpolation,
@@ -25,8 +35,7 @@ pub enum SyntaxErrorKind {
     UnclosedDelimiter,
     ExpectedIdentifier,
     ExpectedSemicolon,
-    UnexpectedTopLevel,
-    MissingInterface,
+    MissingContract,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,15 +48,14 @@ pub struct SyntaxError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum NodeKind {
     Root,
-    ModuleDeclaration,
-    ImportDeclaration,
+    UseDeclaration,
     FunctionDeclaration,
     StructDeclaration,
     EnumDeclaration,
     ClassDeclaration,
     ConstDeclaration,
-    InterfaceDeclaration,
-    Error,
+    TopLevelStatement,
+    ContractDeclaration,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,6 +127,37 @@ pub fn parse_nexa(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
 pub fn parse_nidl(source: &str) -> Result<SyntaxTree, SourceTooLarge> {
     let lexed = lex_nidl(source)?;
     Ok(parse_lexed(lexed, SyntaxLanguage::Nidl))
+}
+
+/// Classifies one Nexa REPL submission using the canonical lexer and delimiter validator.
+///
+/// Unterminated lexical constructs and genuinely unclosed delimiters request another input line.
+/// An unmatched closing delimiter makes the cell complete-but-invalid so the analyzer can report
+/// it immediately instead of leaving the prompt stuck in continuation mode.
+pub fn classify_cell_completeness(source: &str) -> Result<CellCompleteness, SourceTooLarge> {
+    let tree = parse_nexa(source)?;
+    if tree
+        .errors
+        .iter()
+        .any(|error| error.kind == SyntaxErrorKind::UnmatchedDelimiter)
+    {
+        return Ok(CellCompleteness::Complete);
+    }
+    let incomplete = tree.errors.iter().any(|error| {
+        matches!(
+            error.kind,
+            SyntaxErrorKind::UnterminatedBlockComment
+                | SyntaxErrorKind::UnterminatedString
+                | SyntaxErrorKind::UnterminatedInterpolation
+                | SyntaxErrorKind::UnterminatedRune
+                | SyntaxErrorKind::UnclosedDelimiter
+        )
+    });
+    Ok(if incomplete {
+        CellCompleteness::Incomplete
+    } else {
+        CellCompleteness::Complete
+    })
 }
 
 fn parse_lexed(lexed: Lexed, language: SyntaxLanguage) -> SyntaxTree {
@@ -205,32 +244,21 @@ impl Parser<'_> {
                 break;
             };
             let kind = match self.tokens[token_index].kind {
-                TokenKind::Keyword(Keyword::Module) => NodeKind::ModuleDeclaration,
-                TokenKind::Keyword(Keyword::Import) => NodeKind::ImportDeclaration,
+                TokenKind::Keyword(Keyword::Use) => NodeKind::UseDeclaration,
                 TokenKind::Keyword(Keyword::Fn) => NodeKind::FunctionDeclaration,
                 TokenKind::Keyword(Keyword::Struct) => NodeKind::StructDeclaration,
                 TokenKind::Keyword(Keyword::Enum) => NodeKind::EnumDeclaration,
                 TokenKind::Keyword(Keyword::Class) => NodeKind::ClassDeclaration,
                 TokenKind::Keyword(Keyword::Const) => NodeKind::ConstDeclaration,
                 _ if declaration_keyword.is_some() => declaration_keyword.expect("checked"),
-                _ => NodeKind::Error,
+                _ => NodeKind::TopLevelStatement,
             };
             let end_cursor = self.item_end(cursor, kind);
             let end_cursor = end_cursor.max(cursor + 1).min(self.significant.len());
             let first = self.attached_doc_start(self.significant[start_cursor]);
             let last = self.significant[end_cursor - 1];
-            if kind == NodeKind::Error {
-                self.errors.push(SyntaxError {
-                    kind: SyntaxErrorKind::UnexpectedTopLevel,
-                    range: self.tokens[first].range,
-                    message: format!("unexpected top-level token `{}`", self.text(first)),
-                });
-            } else if matches!(
-                kind,
-                NodeKind::ModuleDeclaration
-                    | NodeKind::ImportDeclaration
-                    | NodeKind::ConstDeclaration
-            ) && self.tokens[last].kind != TokenKind::Semicolon
+            if matches!(kind, NodeKind::UseDeclaration | NodeKind::ConstDeclaration)
+                && self.tokens[last].kind != TokenKind::Semicolon
             {
                 self.errors.push(SyntaxError {
                     kind: SyntaxErrorKind::ExpectedSemicolon,
@@ -238,11 +266,8 @@ impl Parser<'_> {
                     message: "expected `;` after declaration".into(),
                 });
             }
-            if matches!(
-                kind,
-                NodeKind::ModuleDeclaration | NodeKind::ImportDeclaration
-            ) {
-                self.validate_path_declaration(cursor, end_cursor, kind);
+            if kind == NodeKind::UseDeclaration {
+                self.validate_use_declaration(cursor, end_cursor);
             }
             children.push(self.node(kind, first, last));
             cursor = end_cursor;
@@ -250,7 +275,7 @@ impl Parser<'_> {
         self.root(children)
     }
 
-    fn validate_path_declaration(&mut self, cursor: usize, end: usize, kind: NodeKind) {
+    fn validate_use_declaration(&mut self, cursor: usize, end: usize) {
         let mut current = cursor + 1;
         let mut expects_identifier = true;
         let mut saw_identifier = false;
@@ -259,23 +284,21 @@ impl Parser<'_> {
                 break;
             };
             match token_kind {
-                TokenKind::Identifier if expects_identifier => {
+                TokenKind::Identifier | TokenKind::Keyword(Keyword::Package)
+                    if expects_identifier =>
+                {
                     saw_identifier = true;
                     expects_identifier = false;
                 }
-                TokenKind::Dot if !expects_identifier => {
+                TokenKind::ColonColon if !expects_identifier => {
                     expects_identifier = true;
                 }
-                TokenKind::Keyword(Keyword::As)
-                    if kind == NodeKind::ImportDeclaration
-                        && saw_identifier
-                        && !expects_identifier =>
-                {
+                TokenKind::Keyword(Keyword::As) if saw_identifier && !expects_identifier => {
                     let alias = self.kind_at(current + 1);
                     if alias != Some(TokenKind::Identifier) {
-                        self.path_error(current, "expected an import alias after `as`");
+                        self.path_error(current, "expected a use alias after `as`");
                     } else if self.kind_at(current + 2) != Some(TokenKind::Semicolon) {
-                        self.path_error(current + 2, "expected `;` after import alias");
+                        self.path_error(current + 2, "expected `;` after use alias");
                     }
                     return;
                 }
@@ -284,9 +307,9 @@ impl Parser<'_> {
                     self.path_error(
                         current,
                         if expects_identifier {
-                            "expected an ASCII module path segment"
+                            "expected an ASCII use path segment"
                         } else {
-                            "expected `.` or `;` after module path segment"
+                            "expected `::`, `as`, or `;` after use path segment"
                         },
                     );
                     return;
@@ -297,7 +320,7 @@ impl Parser<'_> {
         let error_cursor = current
             .min(end.saturating_sub(1))
             .min(self.significant.len().saturating_sub(1));
-        self.path_error(error_cursor, "incomplete module path declaration");
+        self.path_error(error_cursor, "incomplete use declaration");
     }
 
     fn path_error(&mut self, cursor: usize, message: &str) {
@@ -312,22 +335,22 @@ impl Parser<'_> {
     }
 
     fn nidl_root(&mut self) -> SyntaxNode {
-        let Some(interface_cursor) = self
+        let Some(contract_cursor) = self
             .significant
             .iter()
-            .position(|index| self.tokens[*index].kind == TokenKind::Keyword(Keyword::Interface))
+            .position(|index| self.tokens[*index].kind == TokenKind::Keyword(Keyword::Contract))
         else {
             self.errors.push(SyntaxError {
-                kind: SyntaxErrorKind::MissingInterface,
+                kind: SyntaxErrorKind::MissingContract,
                 range: TextRange::new(TextSize::ZERO, TextSize::ZERO),
-                message: "expected an NIDL `interface` declaration".into(),
+                message: "expected an NIDL `contract` declaration".into(),
             });
             return self.root(Vec::new());
         };
-        let first = self.significant[interface_cursor];
-        let last_cursor = self.item_end(interface_cursor, NodeKind::InterfaceDeclaration);
-        let last = self.significant[last_cursor.saturating_sub(1).max(interface_cursor)];
-        self.root(vec![self.node(NodeKind::InterfaceDeclaration, first, last)])
+        let first = self.significant[contract_cursor];
+        let last_cursor = self.item_end(contract_cursor, NodeKind::ContractDeclaration);
+        let last = self.significant[last_cursor.saturating_sub(1).max(contract_cursor)];
+        self.root(vec![self.node(NodeKind::ContractDeclaration, first, last)])
     }
 
     fn declaration_prefix(&self, mut cursor: usize) -> (usize, Option<NodeKind>) {
@@ -346,18 +369,8 @@ impl Parser<'_> {
                         cursor += 3;
                     }
                 }
-                TokenKind::Keyword(
-                    Keyword::Task
-                    | Keyword::Immediate
-                    | Keyword::Migration
-                    | Keyword::Activation
-                    | Keyword::Cleanup,
-                ) => {
+                TokenKind::Keyword(Keyword::Async) => {
                     declaration_kind = Some(NodeKind::FunctionDeclaration);
-                    cursor += 1;
-                }
-                TokenKind::Keyword(Keyword::Stateful) => {
-                    declaration_kind = Some(NodeKind::ClassDeclaration);
                     cursor += 1;
                 }
                 _ => break,
@@ -428,7 +441,7 @@ impl Parser<'_> {
                 _ => {}
             }
             current += 1;
-            if kind == NodeKind::Error
+            if kind == NodeKind::TopLevelStatement
                 && current > cursor
                 && self.kind_at(current).is_some_and(is_top_level_start)
             {
@@ -510,19 +523,13 @@ fn is_top_level_start(kind: TokenKind) -> bool {
         kind,
         TokenKind::At
             | TokenKind::Keyword(
-                Keyword::Module
-                    | Keyword::Import
+                Keyword::Use
                     | Keyword::Pub
+                    | Keyword::Async
                     | Keyword::Fn
-                    | Keyword::Task
-                    | Keyword::Immediate
-                    | Keyword::Migration
-                    | Keyword::Activation
-                    | Keyword::Cleanup
                     | Keyword::Struct
                     | Keyword::Enum
                     | Keyword::Class
-                    | Keyword::Stateful
                     | Keyword::Const
             )
     )
@@ -534,26 +541,13 @@ pub struct AstRoot<'a> {
 }
 
 impl<'a> AstRoot<'a> {
-    #[must_use]
-    pub fn module(self) -> Option<ModuleDeclaration<'a>> {
+    pub fn uses(self) -> impl Iterator<Item = UseDeclaration<'a>> {
         self.tree
             .root
             .children
             .iter()
-            .find(|node| node.kind == NodeKind::ModuleDeclaration)
-            .map(|node| ModuleDeclaration {
-                tree: self.tree,
-                node,
-            })
-    }
-
-    pub fn imports(self) -> impl Iterator<Item = ImportDeclaration<'a>> {
-        self.tree
-            .root
-            .children
-            .iter()
-            .filter(|node| node.kind == NodeKind::ImportDeclaration)
-            .map(|node| ImportDeclaration {
+            .filter(|node| node.kind == NodeKind::UseDeclaration)
+            .map(|node| UseDeclaration {
                 tree: self.tree,
                 node,
             })
@@ -579,36 +573,26 @@ impl<'a> AstRoot<'a> {
                 node,
             })
     }
-}
 
-#[derive(Clone, Copy, Debug)]
-pub struct ModuleDeclaration<'a> {
-    tree: &'a SyntaxTree,
-    node: &'a SyntaxNode,
-}
-
-impl ModuleDeclaration<'_> {
-    #[must_use]
-    pub fn path(&self) -> Option<String> {
-        qualified_path_after(self.tree, self.node, Keyword::Module)
-    }
-
-    #[must_use]
-    pub const fn range(&self) -> TextRange {
-        self.node.range
+    pub fn top_level_statements(self) -> impl Iterator<Item = &'a SyntaxNode> {
+        self.tree
+            .root
+            .children
+            .iter()
+            .filter(|node| node.kind == NodeKind::TopLevelStatement)
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct ImportDeclaration<'a> {
+pub struct UseDeclaration<'a> {
     tree: &'a SyntaxTree,
     node: &'a SyntaxNode,
 }
 
-impl<'a> ImportDeclaration<'a> {
+impl<'a> UseDeclaration<'a> {
     #[must_use]
     pub fn path(&self) -> Option<String> {
-        qualified_path_after(self.tree, self.node, Keyword::Import)
+        qualified_path_after(self.tree, self.node, Keyword::Use)
     }
 
     #[must_use]
@@ -751,18 +735,18 @@ pub struct NidlRoot<'a> {
 
 impl<'a> NidlRoot<'a> {
     #[must_use]
-    pub fn interface_name(&self) -> Option<&'a str> {
+    pub fn contract_name(&self) -> Option<&'a str> {
         let node = self
             .tree
             .root
             .children
             .iter()
-            .find(|node| node.kind == NodeKind::InterfaceDeclaration)?;
+            .find(|node| node.kind == NodeKind::ContractDeclaration)?;
         let tokens = significant_node_tokens(self.tree, node);
-        let interface = tokens
+        let contract = tokens
             .iter()
-            .position(|token| token.kind == TokenKind::Keyword(Keyword::Interface))?;
-        let name = tokens.get(interface + 1)?;
+            .position(|token| token.kind == TokenKind::Keyword(Keyword::Contract))?;
+        let name = tokens.get(contract + 1)?;
         (name.kind == TokenKind::Identifier).then(|| self.tree.token_text(name))
     }
 }
@@ -785,12 +769,12 @@ fn qualified_path_after(tree: &SyntaxTree, node: &SyntaxNode, keyword: Keyword) 
     loop {
         let token = tokens.get(cursor)?;
         match token.kind {
-            TokenKind::Identifier if expects_identifier => {
+            TokenKind::Identifier | TokenKind::Keyword(Keyword::Package) if expects_identifier => {
                 result.push_str(tree.token_text(token));
                 expects_identifier = false;
             }
-            TokenKind::Dot if !expects_identifier => {
-                result.push('.');
+            TokenKind::ColonColon if !expects_identifier => {
+                result.push_str("::");
                 expects_identifier = true;
             }
             TokenKind::Keyword(Keyword::As) | TokenKind::Semicolon if !expects_identifier => {

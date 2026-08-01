@@ -779,6 +779,15 @@ fn run_editor_packaging(context: &mut GateContext, report_path: &Path) -> Result
     Ok(())
 }
 
+pub(super) fn validate_editor_report_for_m4r1(report_path: &Path) -> Result<(), DynError> {
+    let report = read_machine_report::<M4EditorPackageReport>(
+        report_path,
+        "M4R1 cached editor package gate",
+        "editor-package-report.json",
+    )?;
+    report.validate()
+}
+
 fn validate_language_scale_test_output(bytes: &[u8]) -> Result<(), DynError> {
     let document: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("language-scale test output is not JSON: {error}"))?;
@@ -944,6 +953,32 @@ fn scale_stress_gate(
     stress_report.validate()?;
     context.record_machine_report(&stress_report_path);
     Ok((analysis_report, facade_report, stress_report))
+}
+
+pub(super) fn validate_scale_reports_for_m4r1(
+    analysis_report_path: &Path,
+    facade_report_path: &Path,
+    stress_report_path: &Path,
+) -> Result<(), DynError> {
+    let analysis = read_machine_report::<M4AnalysisScaleReport>(
+        analysis_report_path,
+        "M4R1 cached analysis scale gate",
+        "NEXA_M4_SCALE_REPORT",
+    )?;
+    analysis.validate()?;
+    let facade = read_machine_report::<M4FacadeScaleReport>(
+        facade_report_path,
+        "M4R1 cached facade scale gate",
+        "NEXA_M4_FACADE_SCALE_REPORT",
+    )?;
+    facade.validate()?;
+    validate_facade_report_matches_analysis(&analysis, &facade)?;
+    let stress = read_machine_report::<M4ReloadStressReport>(
+        stress_report_path,
+        "M4R1 cached Reload stress gate",
+        "NEXA_M4_RELOAD_STRESS_REPORT",
+    )?;
+    stress.validate()
 }
 
 fn require_integration_test(

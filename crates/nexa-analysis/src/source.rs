@@ -517,13 +517,13 @@ mod tests {
         first
             .add(
                 NormalizedPackagePath::new("src/z.nexa").unwrap(),
-                "module z;",
+                "fn z() {}",
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("src/a.nexa").unwrap(),
-                "module a;",
+                "fn a() {}",
                 SourceRole::Production,
             )
             .unwrap();
@@ -542,13 +542,13 @@ mod tests {
         builder
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() {}",
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("tests/food/poison.nexa").unwrap(),
-                "module test.food.poison;",
+                "@test\nfn poison() {}",
                 SourceRole::Test,
             )
             .unwrap();
@@ -596,8 +596,8 @@ mod tests {
     }
 
     #[test]
-    fn virtual_snippet_keeps_an_explicit_header_for_semantic_validation() {
-        let source = "module declared.name;\r\nfn value() -> i32 { return 1; }\r\n";
+    fn virtual_snippet_preserves_v2_source_bytes_and_explicit_identity() {
+        let source = "const VALUE: i32 = 1;\r\nfn value() -> i32 { return VALUE; }\r\n";
         let virtual_module = ModulePath::new("main").unwrap();
         let mut builder = SourceSetBuilder::new(package(), CompilationLimits::default());
         builder
@@ -611,6 +611,7 @@ mod tests {
         let unit = set.production_units().next().unwrap();
 
         assert_eq!(unit.text.as_ref(), source);
+        assert_eq!(unit.text.as_bytes(), source.as_bytes());
         assert_eq!(unit.expected_module_path().unwrap(), virtual_module);
     }
 
@@ -644,7 +645,7 @@ mod tests {
             builder
                 .add(
                     NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                    "module main;",
+                    "fn main() {}",
                     SourceRole::Production,
                 )
                 .unwrap();
@@ -672,7 +673,7 @@ mod tests {
         assert!(matches!(
             bytes.add(
                 NormalizedPackagePath::new("tests/a.nexa").unwrap(),
-                "module",
+                "fn a() {}",
                 SourceRole::Test,
             ),
             Err(SourceSetError::TestSourceTooLarge)
@@ -686,13 +687,13 @@ mod tests {
         modules
             .add(
                 NormalizedPackagePath::new("tests/a.nexa").unwrap(),
-                "module test.a;",
+                "@test\nfn a() {}",
                 SourceRole::Test,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("tests/b.nexa").unwrap(),
-                "module test.b;",
+                "@test\nfn b() {}",
                 SourceRole::Test,
             )
             .unwrap();

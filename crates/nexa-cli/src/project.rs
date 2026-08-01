@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nexa_analysis::{
-    ActivationPolicy, BuildFingerprint, CandidateIdentity, CompilationLimits, CompilationOptions,
+    ActivationPolicy, BuildFingerprint, CandidateIdentity, CompilationLimits,
     LoadedPackageDirectory, LockFile, NormalizedPackagePath, PackageCandidate, PackageCatalog,
     PackageId, PackageLocation, PackageManifest, ResolvedBuildInput, ResolvedDependencyGraph,
     ResolvedPackage, ResolvedTestInput, SourceId, SourceKey, SourceRole, SourceSetBuilder,
@@ -20,7 +20,7 @@ pub struct ProjectConfig {
     pub schema: u32,
     pub contract: PathBuf,
     #[serde(default)]
-    pub required_exports: Option<Vec<String>>,
+    pub required_entrypoints: Option<Vec<String>>,
     pub sources: Vec<SourceConfig>,
 }
 
@@ -90,85 +90,88 @@ pub struct LoadedProject {
     pub sources: Vec<LoadedSource>,
     pub contract_path: PathBuf,
     pub contract_source: String,
-    pub idl: nexa::Idl,
-    /// Effective required-export subset. An omitted setting means every NIDL export; an explicit
-    /// empty list means no Package export is required.
-    pub required_exports: Vec<String>,
+    pub contract: nexa::ValidatedContract,
+    /// Effective required-entrypoint subset. An omitted setting means every NIDL `nexa`
+    /// function; an explicit empty list means no Package entrypoint is required.
+    pub required_entrypoints: Vec<String>,
 }
 
 /// An owned Host contract snapshot which can borrow its parsed IDL only for the duration of one
 /// facade call while retaining the exact reader-facing source identity and bytes.
 #[derive(Clone, Debug)]
 pub struct HostContractSnapshot {
-    pub idl: Arc<nexa::Idl>,
+    pub contract: Arc<nexa::ValidatedContract>,
     pub identity: nexa::SourceIdentity,
     pub source: Arc<str>,
-    pub required_exports: Arc<[String]>,
+    pub required_entrypoints: Arc<[String]>,
 }
 
 impl HostContractSnapshot {
     pub fn with_source(
-        idl: &nexa::Idl,
+        contract: &nexa::ValidatedContract,
         identity: nexa::SourceIdentity,
         source: impl Into<Arc<str>>,
     ) -> CliResult<Self> {
-        let required_exports = idl
-            .exports
+        let required_entrypoints = contract
+            .nexa_functions
             .iter()
-            .map(|export| export.name.clone())
+            .map(|entrypoint| entrypoint.name.clone())
             .collect::<Vec<_>>();
-        Self::with_required_exports(idl, identity, source, &required_exports)
+        Self::with_required_entrypoints(contract, identity, source, &required_entrypoints)
     }
 
-    pub fn with_required_exports(
-        idl: &nexa::Idl,
+    pub fn with_required_entrypoints(
+        contract: &nexa::ValidatedContract,
         identity: nexa::SourceIdentity,
         source: impl Into<Arc<str>>,
-        required_exports: &[String],
+        required_entrypoints: &[String],
     ) -> CliResult<Self> {
         let source = source.into();
-        nexa::HostContractInput::with_source(idl, identity.clone(), Arc::clone(&source))
-            .and_then(|contract| contract.requiring_exports(required_exports))
+        nexa::HostContractInput::with_source(contract, identity.clone(), Arc::clone(&source))
+            .and_then(|contract| contract.requiring_entrypoints(required_entrypoints))
             .map_err(|error| {
                 CliError::internal(format!("invalid owned Host contract snapshot: {error}"))
             })?;
         Ok(Self {
-            idl: Arc::new(idl.clone()),
+            contract: Arc::new(contract.clone()),
             identity,
             source,
-            required_exports: Arc::from(required_exports),
+            required_entrypoints: Arc::from(required_entrypoints),
         })
     }
 
     #[must_use]
-    pub fn canonical(idl: &nexa::Idl) -> Self {
-        let input = nexa::HostContractInput::canonical(idl);
+    pub fn canonical(contract: &nexa::ValidatedContract) -> Self {
+        let input = nexa::HostContractInput::canonical(contract);
         Self {
-            idl: Arc::new(idl.clone()),
+            contract: Arc::new(contract.clone()),
             identity: input.source().identity().clone(),
             source: Arc::clone(input.source().text()),
-            required_exports: idl
-                .exports
+            required_entrypoints: contract
+                .nexa_functions
                 .iter()
-                .map(|export| export.name.clone())
+                .map(|entrypoint| entrypoint.name.clone())
                 .collect::<Vec<_>>()
                 .into(),
         }
     }
 
-    fn input(&self) -> Result<nexa::HostContractInput<'_>, nexa::HostContractSourceError> {
+    pub(crate) fn input(
+        &self,
+    ) -> Result<nexa::HostContractInput<'_>, nexa::HostContractSourceError> {
         nexa::HostContractInput::with_source(
-            &self.idl,
+            &self.contract,
             self.identity.clone(),
             Arc::clone(&self.source),
         )
-        .and_then(|contract| contract.requiring_exports(&self.required_exports))
+        .and_then(|contract| contract.requiring_entrypoints(&self.required_entrypoints))
     }
 }
 
 /// One immutable, fully resolved build input shared by check, build, test, dev, and LSP.
 #[derive(Clone, Debug)]
 pub struct ResolvedBuild {
+    pub profile: nexa::BuildProfile,
     #[allow(dead_code)]
     pub source_id: SourceId,
     #[allow(dead_code)]
@@ -199,6 +202,11 @@ pub struct CompiledBuild {
     pub identity: CandidateIdentity,
     pub artifact: CompiledBuildArtifact,
     pub module_count: usize,
+}
+
+#[derive(Debug)]
+pub struct CompiledStandaloneBuild {
+    pub artifact: nexa::CompiledStandaloneArtifact,
 }
 
 #[derive(Debug)]
@@ -254,14 +262,14 @@ impl ResolvedBuild {
     pub fn compile(
         &self,
         generation: u64,
-        host_idl: Option<&nexa::Idl>,
-        required_exports: &[String],
+        host_contract_model: Option<&nexa::ValidatedContract>,
+        required_entrypoints: &[String],
         include_tests: bool,
     ) -> Result<CompiledBuild, BuildCompileError> {
         self.compile_with_limits(
             generation,
-            host_idl,
-            required_exports,
+            host_contract_model,
+            required_entrypoints,
             include_tests,
             nexa::VerifierLimits::default(),
         )
@@ -271,8 +279,8 @@ impl ResolvedBuild {
     pub fn compile_with_limits(
         &self,
         generation: u64,
-        host_idl: Option<&nexa::Idl>,
-        required_exports: &[String],
+        host_contract_model: Option<&nexa::ValidatedContract>,
+        required_entrypoints: &[String],
         include_tests: bool,
         verifier_limits: nexa::VerifierLimits,
     ) -> Result<CompiledBuild, BuildCompileError> {
@@ -280,8 +288,8 @@ impl ResolvedBuild {
         self.compile_with_session_and_limits(
             &mut session,
             generation,
-            host_idl,
-            required_exports,
+            host_contract_model,
+            required_entrypoints,
             include_tests,
             verifier_limits,
         )
@@ -292,15 +300,15 @@ impl ResolvedBuild {
         &self,
         session: &mut nexa::PackageBuildSession,
         generation: u64,
-        host_idl: Option<&nexa::Idl>,
-        required_exports: &[String],
+        host_contract_model: Option<&nexa::ValidatedContract>,
+        required_entrypoints: &[String],
         include_tests: bool,
     ) -> Result<CompiledBuild, BuildCompileError> {
         self.compile_with_session_and_limits(
             session,
             generation,
-            host_idl,
-            required_exports,
+            host_contract_model,
+            required_entrypoints,
             include_tests,
             nexa::VerifierLimits::default(),
         )
@@ -311,15 +319,15 @@ impl ResolvedBuild {
         &self,
         session: &mut nexa::PackageBuildSession,
         generation: u64,
-        host_idl: Option<&nexa::Idl>,
-        required_exports: &[String],
+        host_contract_model: Option<&nexa::ValidatedContract>,
+        required_entrypoints: &[String],
         include_tests: bool,
         verifier_limits: nexa::VerifierLimits,
     ) -> Result<CompiledBuild, BuildCompileError> {
         let canonical_contract;
         let retained_contract;
-        let contract = if let Some(host_idl) = host_idl {
-            canonical_contract = nexa::HostContractInput::canonical(host_idl);
+        let contract = if let Some(host_contract_model) = host_contract_model {
+            canonical_contract = nexa::HostContractInput::canonical(host_contract_model);
             &canonical_contract
         } else {
             retained_contract = self.host_contract.input().map_err(|error| {
@@ -333,7 +341,7 @@ impl ResolvedBuild {
             session,
             generation,
             contract,
-            required_exports,
+            required_entrypoints,
             include_tests,
             verifier_limits,
         )
@@ -345,14 +353,14 @@ impl ResolvedBuild {
         session: &mut nexa::PackageBuildSession,
         generation: u64,
         contract: &nexa::HostContractInput<'_>,
-        required_exports: &[String],
+        required_entrypoints: &[String],
         include_tests: bool,
     ) -> Result<CompiledBuild, BuildCompileError> {
         self.compile_with_contract_session_and_limits(
             session,
             generation,
             contract,
-            required_exports,
+            required_entrypoints,
             include_tests,
             nexa::VerifierLimits::default(),
         )
@@ -364,15 +372,15 @@ impl ResolvedBuild {
         session: &mut nexa::PackageBuildSession,
         generation: u64,
         contract: &nexa::HostContractInput<'_>,
-        required_exports: &[String],
+        required_entrypoints: &[String],
         include_tests: bool,
         verifier_limits: nexa::VerifierLimits,
     ) -> Result<CompiledBuild, BuildCompileError> {
         let contract = contract
-            .requiring_exports(required_exports)
+            .requiring_entrypoints(required_entrypoints)
             .map_err(|error| {
                 BuildCompileError::Cli(CliError::diagnostic(format!(
-                    "invalid required-export view: {error}"
+                    "invalid required-entrypoint view: {error}"
                 )))
             })?;
         let identity = self.identity(generation).map_err(BuildCompileError::Cli)?;
@@ -399,7 +407,7 @@ impl ResolvedBuild {
                     verifier_limits,
                 )
                 .map_err(BuildCompileError::Facade)?;
-            let module_count = artifact.debug_info.modules.len();
+            let module_count = artifact.module_count();
             (
                 CompiledBuildArtifact::Product(Box::new(artifact)),
                 module_count,
@@ -415,6 +423,30 @@ impl ResolvedBuild {
             artifact,
             module_count,
         })
+    }
+
+    #[allow(clippy::result_large_err)]
+    pub fn compile_standalone_with_session_and_limits(
+        &self,
+        session: &mut nexa::PackageBuildSession,
+        generation: u64,
+        verifier_limits: nexa::VerifierLimits,
+    ) -> Result<CompiledStandaloneBuild, BuildCompileError> {
+        let contract = self.host_contract.input().map_err(|error| {
+            BuildCompileError::Cli(CliError::internal(format!(
+                "retained standalone Host contract is invalid: {error}"
+            )))
+        })?;
+        let identity = self.identity(generation).map_err(BuildCompileError::Cli)?;
+        let artifact = session
+            .compile_standalone_with_contract_and_limits(
+                &self.input,
+                &contract,
+                identity.clone(),
+                verifier_limits,
+            )
+            .map_err(BuildCompileError::Facade)?;
+        Ok(CompiledStandaloneBuild { artifact })
     }
 
     /// Atomically rebuilds every source-derived identity after an editor overlay changes one or
@@ -449,9 +481,9 @@ impl ResolvedBuild {
         )
         .map_err(|error| CliError::diagnostic(error.to_string()))?;
         let selected_contract = host_contract
-            .requiring_exports(&self.host_contract.required_exports)
+            .requiring_entrypoints(&self.host_contract.required_entrypoints)
             .map_err(|error| {
-                CliError::diagnostic(format!("invalid required-export view: {error}"))
+                CliError::diagnostic(format!("invalid required-entrypoint view: {error}"))
             })?;
         let input = resolved_build_input(
             &root,
@@ -460,6 +492,7 @@ impl ResolvedBuild {
             Arc::clone(&self.dependency_graph),
             self.input.lock.clone(),
             &selected_contract,
+            self.profile,
         )?;
         let build_fingerprint = input.build_fingerprint;
         let candidate =
@@ -467,17 +500,18 @@ impl ResolvedBuild {
                 CliError::internal(format!("invalid overlay Candidate: {error}"))
             })?);
         Ok(Self {
+            profile: self.profile,
             source_id: self.source_id.clone(),
             source_root: self.source_root.clone(),
             root_directory: self.root_directory.clone(),
             root,
             packages,
             input,
-            host_contract: HostContractSnapshot::with_required_exports(
-                host_contract.idl(),
+            host_contract: HostContractSnapshot::with_required_entrypoints(
+                host_contract.contract(),
                 host_contract.source().identity().clone(),
                 Arc::clone(host_contract.source().text()),
-                &self.host_contract.required_exports,
+                &self.host_contract.required_entrypoints,
             )?,
             dependency_graph: Arc::clone(&self.dependency_graph),
             canonical_lock: self.canonical_lock.clone(),
@@ -527,8 +561,8 @@ impl LoadedProject {
     }
 
     /// Loads an editor snapshot without rejecting a syntactically valid NIDL that temporarily
-    /// omits a configured export. The LSP reports that semantic error against the NIDL URI after
-    /// project discovery, while normal CLI and development loads remain strict.
+    /// omits a configured Nexa entrypoint. The LSP reports that semantic error against the NIDL
+    /// URI after project discovery, while normal CLI and development loads remain strict.
     pub fn load_editor_snapshot(
         path: &Path,
         overlay_for_path: impl FnMut(&Path) -> Option<String>,
@@ -540,7 +574,7 @@ impl LoadedProject {
     fn load_snapshot(
         path: &Path,
         mut overlay_for_path: impl FnMut(&Path) -> Option<String>,
-        validate_exports: bool,
+        validate_entrypoints: bool,
     ) -> CliResult<Self> {
         let snapshot_config_path = snapshot_path(path);
         let config_overlay = overlay_for_path(path).or_else(|| {
@@ -593,8 +627,8 @@ impl LoadedProject {
                 "nexa.dev.toml must declare at least one [[sources]] entry",
             ));
         }
-        if let Some(required_exports) = &config.required_exports {
-            reject_duplicate_required_exports(required_exports)?;
+        if let Some(required_entrypoints) = &config.required_entrypoints {
+            reject_duplicate_required_entrypoints(required_entrypoints)?;
         }
 
         let mut source_ids = BTreeSet::new();
@@ -641,17 +675,18 @@ impl LoadedProject {
             },
             Ok,
         )?;
-        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+        let contract = nexa::parse_nidl(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract_path.display()))
         })?;
-        let required_exports = config.required_exports.clone().unwrap_or_else(|| {
-            idl.exports
+        let required_entrypoints = config.required_entrypoints.clone().unwrap_or_else(|| {
+            contract
+                .nexa_functions
                 .iter()
-                .map(|export| export.name.clone())
+                .map(|entrypoint| entrypoint.name.clone())
                 .collect()
         });
-        if validate_exports {
-            validate_required_exports(&idl, &required_exports, &contract_path)?;
+        if validate_entrypoints {
+            validate_required_entrypoints(&contract, &required_entrypoints, &contract_path)?;
         }
 
         Ok(Self {
@@ -660,8 +695,8 @@ impl LoadedProject {
             sources,
             contract_path,
             contract_source,
-            idl,
-            required_exports,
+            contract,
+            required_entrypoints,
         })
     }
 
@@ -717,11 +752,11 @@ impl LoadedProject {
     }
 
     pub fn host_contract_snapshot(&self) -> CliResult<HostContractSnapshot> {
-        HostContractSnapshot::with_required_exports(
-            &self.idl,
+        HostContractSnapshot::with_required_entrypoints(
+            &self.contract,
             nexa::SourceIdentity::standalone(self.contract_path.to_string_lossy().into_owned()),
             Arc::<str>::from(self.contract_source.as_str()),
-            &self.required_exports,
+            &self.required_entrypoints,
         )
     }
 
@@ -730,7 +765,27 @@ impl LoadedProject {
         package: &DiscoveredPackage,
         require_current_lock: bool,
     ) -> CliResult<ResolvedBuild> {
-        self.resolve_package_snapshot(package, require_current_lock, None)
+        Self::resolve_package_snapshot(
+            package,
+            require_current_lock,
+            None,
+            &self.host_contract_snapshot()?,
+            nexa::BuildProfile::Package,
+        )
+    }
+
+    /// Resolves one configured package as a standalone executable against the fixed Console Host.
+    pub fn resolve_standalone_package(
+        package: &DiscoveredPackage,
+        require_current_lock: bool,
+    ) -> CliResult<ResolvedBuild> {
+        Self::resolve_package_snapshot(
+            package,
+            require_current_lock,
+            None,
+            &standalone_host_contract_snapshot()?,
+            nexa::BuildProfile::StandalonePackage,
+        )
     }
 
     /// Resolves the complete package/dependency closure from one editor snapshot.
@@ -744,18 +799,21 @@ impl LoadedProject {
         require_current_lock: bool,
         overlays: &BTreeMap<PathBuf, String>,
     ) -> CliResult<ResolvedBuild> {
-        self.resolve_package_snapshot(
+        Self::resolve_package_snapshot(
             package,
             require_current_lock,
             (!overlays.is_empty()).then_some(overlays),
+            &self.host_contract_snapshot()?,
+            nexa::BuildProfile::Package,
         )
     }
 
     fn resolve_package_snapshot(
-        &self,
         package: &DiscoveredPackage,
         require_current_lock: bool,
         overlays: Option<&BTreeMap<PathBuf, String>>,
+        host_contract: &HostContractSnapshot,
+        profile: nexa::BuildProfile,
     ) -> CliResult<ResolvedBuild> {
         validate_package_belongs_to_source(package)?;
         let (resolver_root, allowed_root) = if package.directory == package.source_root {
@@ -774,10 +832,11 @@ impl LoadedProject {
             allowed_root,
             package.source_id.clone(),
             Some(&package.policy),
-            &self.host_contract_snapshot()?,
+            host_contract,
             require_current_lock,
             false,
             overlays,
+            profile,
         )
     }
 
@@ -806,6 +865,7 @@ impl LoadedProject {
             false,
             true,
             None,
+            nexa::BuildProfile::Package,
         )
     }
 
@@ -866,6 +926,46 @@ pub fn resolve_direct_package(
         require_current_lock,
         false,
         None,
+        nexa::BuildProfile::Package,
+    )
+}
+
+/// Resolves a direct package as a standalone executable against the fixed Console Host.
+pub fn resolve_direct_standalone_package(
+    directory: &Path,
+    source_id: SourceId,
+    policy: Option<&SourcePolicy>,
+    require_current_lock: bool,
+) -> CliResult<ResolvedBuild> {
+    let host_contract = standalone_host_contract_snapshot()?;
+    reject_symlink_path(directory)?;
+    let directory = directory.canonicalize().map_err(|error| {
+        CliError::environment(format!(
+            "could not resolve {}: {error}",
+            directory.display()
+        ))
+    })?;
+    if !directory.is_dir() {
+        return Err(CliError::environment(format!(
+            "package path is not a directory: {}",
+            directory.display()
+        )));
+    }
+    let source_root = directory
+        .parent()
+        .ok_or_else(|| CliError::environment("package directory has no parent"))?
+        .to_path_buf();
+    resolve_package_build(
+        &directory,
+        &source_root,
+        &source_root,
+        source_id,
+        policy,
+        &host_contract,
+        require_current_lock,
+        false,
+        None,
+        nexa::BuildProfile::StandalonePackage,
     )
 }
 
@@ -884,8 +984,8 @@ pub fn resolve_direct_package_for_lock(
         .parent()
         .ok_or_else(|| CliError::environment("package directory has no parent"))?
         .to_path_buf();
-    let host_idl = empty_host_idl()?;
-    let host_contract = HostContractSnapshot::canonical(&host_idl);
+    let host_contract_model = empty_host_contract()?;
+    let host_contract = HostContractSnapshot::canonical(&host_contract_model);
     resolve_package_build(
         &directory,
         &source_root,
@@ -896,20 +996,141 @@ pub fn resolve_direct_package_for_lock(
         false,
         true,
         None,
+        nexa::BuildProfile::Package,
     )
 }
 
-fn empty_host_idl() -> CliResult<nexa::Idl> {
-    nexa::parse_idl("interface NexaCliEmptyHost {}\n").map_err(|error| {
+fn empty_host_contract() -> CliResult<nexa::ValidatedContract> {
+    nexa::parse_nidl("contract NexaCliEmptyHost {}\n").map_err(|error| {
         CliError::internal(format!("invalid built-in empty Host contract: {error}"))
     })
+}
+
+pub fn standalone_host_contract_snapshot() -> CliResult<HostContractSnapshot> {
+    let contract = nexa::parse_nidl(nexa::CONSOLE_HOST_NIDL).map_err(|error| {
+        CliError::internal(format!(
+            "invalid built-in standalone Console contract: {error}"
+        ))
+    })?;
+    HostContractSnapshot::with_source(
+        &contract,
+        nexa::SourceIdentity::standalone(nexa::CONSOLE_HOST_SOURCE_IDENTITY),
+        Arc::<str>::from(nexa::CONSOLE_HOST_NIDL),
+    )
 }
 
 /// Adapts the single-file CLI surface to the same package identity and fingerprint model.
 #[allow(clippy::too_many_lines)]
 pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedBuild> {
-    let host_idl = empty_host_idl()?;
-    let host_contract = HostContractSnapshot::canonical(&host_idl);
+    let host_contract_model = empty_host_contract()?;
+    let host_contract = HostContractSnapshot::canonical(&host_contract_model);
+    virtual_source_build(
+        source,
+        display_path,
+        host_contract,
+        nexa::BuildProfile::Package,
+    )
+}
+
+/// Resolves a single-file script with the fixed Console Host and standalone-script semantics.
+pub fn virtual_standalone_script(source: &str, display_path: &Path) -> CliResult<ResolvedBuild> {
+    virtual_source_build(
+        source,
+        display_path,
+        standalone_host_contract_snapshot()?,
+        nexa::BuildProfile::StandaloneScript,
+    )
+}
+
+/// Resolves one immutable REPL cell as the reserved `nexa.repl::repl.session` module.
+///
+/// Cross-cell symbol/value staging remains owned by the REPL session. The candidate itself retains
+/// the exact reader-facing `repl::cell_N` source identity and never concatenates prior source text.
+#[cfg(test)]
+pub fn virtual_repl_cell(cell: u64, source: &str) -> CliResult<ResolvedBuild> {
+    virtual_repl_cell_with_identity(
+        cell,
+        source,
+        nexa::SourceIdentity::package("nexa.repl", format!("repl::cell_{cell}")),
+    )
+}
+
+/// Exact-source variant used by `:load`, which keeps the loaded file URI while retaining the
+/// reserved `nexa.repl` Package and `repl.session` semantic module.
+pub fn virtual_repl_cell_with_identity(
+    cell: u64,
+    source: &str,
+    display_identity: nexa::SourceIdentity,
+) -> CliResult<ResolvedBuild> {
+    if display_identity.package_id() != Some("nexa.repl") {
+        return Err(CliError::internal(
+            "REPL display identities must belong to Package `nexa.repl`",
+        ));
+    }
+    let package_id = PackageId::new("nexa.repl")
+        .map_err(|error| CliError::internal(format!("invalid REPL Package ID: {error}")))?;
+    let manifest_source = "schema = 2\n\
+                           kind = \"application\"\n\
+                           id = \"nexa.repl\"\n\
+                           name = \"Nexa REPL\"\n\
+                           version = \"0.0.0\"\n\
+                           source_root = \"src\"\n\
+                           entry = \"repl.session\"\n\
+                           activation = \"programmatic\"\n";
+    let manifest = Arc::new(
+        PackageManifest::parse(manifest_source)
+            .map_err(|error| CliError::internal(format!("invalid REPL manifest: {error}")))?,
+    );
+    let original_text = Arc::<str>::from(source);
+    let mut source_builder =
+        SourceSetBuilder::new(package_id.clone(), CompilationLimits::default());
+    source_builder
+        .add_virtual_snippet(
+            // Fixed-width ordinals keep the cumulative artifact source order identical to Cell
+            // commit order even across decimal boundaries (`...00009` sorts before `...00010`).
+            NormalizedPackagePath::new(format!("src/__repl/cell_{cell:020}.nexa"))
+                .map_err(|error| CliError::internal(error.to_string()))?,
+            Arc::clone(&original_text),
+            nexa_analysis::ModulePath::new("repl.session")
+                .map_err(|error| CliError::internal(error.to_string()))?,
+        )
+        .map_err(|error| CliError::diagnostic(error.to_string()))?;
+    let production_sources = Arc::new(
+        source_builder
+            .build()
+            .map_err(|error| CliError::diagnostic(error.to_string()))?,
+    );
+    let source_key = production_sources
+        .production_units()
+        .next()
+        .expect("a REPL Candidate has exactly one source")
+        .key
+        .clone();
+    finish_virtual_build(
+        package_id,
+        manifest_source,
+        &manifest,
+        &production_sources,
+        standalone_host_contract_snapshot()?,
+        nexa::BuildProfile::ReplCell,
+        "repl",
+        "repl",
+        Some(VirtualSourceOrigin {
+            source_key,
+            display_identity,
+            original_text,
+            source_text_is_original: true,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn virtual_source_build(
+    source: &str,
+    display_path: &Path,
+    host_contract: HostContractSnapshot,
+    profile: nexa::BuildProfile,
+) -> CliResult<ResolvedBuild> {
     let package_id = PackageId::new("nexa.snippet")
         .map_err(|error| CliError::internal(format!("invalid snippet Package ID: {error}")))?;
     let manifest_source = "schema = 2\n\
@@ -947,14 +1168,46 @@ pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedB
         .expect("virtual snippet has exactly one source")
         .key
         .clone();
+    finish_virtual_build(
+        package_id,
+        manifest_source,
+        &manifest,
+        &production_sources,
+        host_contract,
+        profile,
+        "cli",
+        "snippet",
+        Some(VirtualSourceOrigin {
+            source_key,
+            display_identity: nexa::SourceIdentity::standalone(
+                display_path.to_string_lossy().into_owned(),
+            ),
+            original_text,
+            source_text_is_original: true,
+        }),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_virtual_build(
+    package_id: PackageId,
+    manifest_source: &str,
+    manifest: &Arc<PackageManifest>,
+    production_sources: &Arc<nexa_analysis::PackageSourceSet>,
+    host_contract: HostContractSnapshot,
+    profile: nexa::BuildProfile,
+    source_id: &str,
+    directory: &str,
+    virtual_source_origin: Option<VirtualSourceOrigin>,
+) -> CliResult<ResolvedBuild> {
     let test_sources = Arc::new(
         SourceSetBuilder::new(package_id.clone(), CompilationLimits::default())
             .build()
             .map_err(|error| CliError::internal(error.to_string()))?,
     );
-    let source_id = SourceId::new("cli")
+    let source_id = SourceId::new(source_id)
         .map_err(|error| CliError::internal(format!("invalid CLI Source ID: {error}")))?;
-    let root_directory = NormalizedPackagePath::new("snippet")
+    let root_directory = NormalizedPackagePath::new(directory)
         .map_err(|error| CliError::internal(error.to_string()))?;
     let graph = Arc::new(ResolvedDependencyGraph {
         root: package_id.clone(),
@@ -971,10 +1224,10 @@ pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedB
         edges: BTreeSet::new(),
     });
     let root = Arc::new(LoadedPackageDirectory {
-        directory: PathBuf::from("nexa.snippet"),
+        directory: PathBuf::from(directory),
         manifest_source: Arc::from(manifest_source),
-        manifest: Arc::clone(&manifest),
-        production_sources: Arc::clone(&production_sources),
+        manifest: Arc::clone(manifest),
+        production_sources: Arc::clone(production_sources),
         test_sources,
         lock: None,
     });
@@ -990,6 +1243,7 @@ pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedB
         Arc::clone(&graph),
         None,
         &contract,
+        profile,
     )?;
     let build_fingerprint = input.build_fingerprint;
     let candidate = Arc::new(
@@ -998,8 +1252,9 @@ pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedB
             .map_err(|error| CliError::internal(format!("invalid snippet Candidate: {error}")))?,
     );
     Ok(ResolvedBuild {
+        profile,
         source_id,
-        source_root: PathBuf::from("nexa.snippet"),
+        source_root: PathBuf::from(directory),
         root_directory,
         root,
         packages,
@@ -1009,14 +1264,7 @@ pub fn virtual_snippet(source: &str, display_path: &Path) -> CliResult<ResolvedB
         canonical_lock,
         build_fingerprint,
         candidate,
-        virtual_source_origin: Some(VirtualSourceOrigin {
-            source_key,
-            display_identity: nexa::SourceIdentity::standalone(
-                display_path.to_string_lossy().into_owned(),
-            ),
-            original_text,
-            source_text_is_original: true,
-        }),
+        virtual_source_origin,
     })
 }
 
@@ -1280,6 +1528,7 @@ fn resolve_package_build(
     require_current_lock: bool,
     ignore_existing_lock: bool,
     overlays: Option<&BTreeMap<PathBuf, String>>,
+    profile: nexa::BuildProfile,
 ) -> CliResult<ResolvedBuild> {
     let limits = CompilationLimits::default();
     let resolver_root = resolver_root.canonicalize().map_err(|error| {
@@ -1424,6 +1673,7 @@ fn resolve_package_build(
         Arc::clone(&graph),
         resolved_lock,
         &contract,
+        profile,
     )?;
     let build_fingerprint = input.build_fingerprint;
     let candidate = Arc::new(
@@ -1433,6 +1683,7 @@ fn resolve_package_build(
     );
 
     Ok(ResolvedBuild {
+        profile,
         source_id,
         source_root: resolver_root,
         root_directory: root_relative,
@@ -1472,6 +1723,7 @@ fn resolved_build_input(
     graph: Arc<ResolvedDependencyGraph>,
     lock: Option<Arc<LockFile>>,
     host_contract: &nexa::HostContractInput<'_>,
+    profile: nexa::BuildProfile,
 ) -> CliResult<Arc<ResolvedBuildInput>> {
     let dependency_manifests = packages
         .iter()
@@ -1483,17 +1735,19 @@ fn resolved_build_input(
         .filter(|(package, _)| *package != &root.manifest.id)
         .map(|(package, loaded)| (package.clone(), Arc::clone(&loaded.production_sources)))
         .collect::<BTreeMap<_, _>>();
-    let fingerprint_input = nexa::canonical_package_build_fingerprint_input_with_contract(
-        &root.manifest,
-        &root_source_set,
-        &dependency_manifests,
-        &dependency_source_sets,
-        host_contract,
-        lock.as_deref(),
-    );
+    let fingerprint_input =
+        nexa::canonical_package_build_fingerprint_input_with_contract_for_profile(
+            &root.manifest,
+            &root_source_set,
+            &dependency_manifests,
+            &dependency_source_sets,
+            host_contract,
+            lock.as_deref(),
+            profile,
+        );
     let canonical_host_contract = fingerprint_input.host_contract.clone();
     let host_contract_source_identity = fingerprint_input.host_contract_source.clone();
-    let host_required_exports_identity = fingerprint_input.host_required_exports.clone();
+    let host_required_entrypoints_identity = fingerprint_input.host_required_entrypoints.clone();
     ResolvedBuildInput::new(
         Arc::clone(&root.manifest),
         root_source_set,
@@ -1503,8 +1757,8 @@ fn resolved_build_input(
         lock,
         Arc::<[u8]>::from(canonical_host_contract),
         Arc::<[u8]>::from(host_contract_source_identity),
-        Arc::<[u8]>::from(host_required_exports_identity),
-        CompilationOptions::default(),
+        Arc::<[u8]>::from(host_required_entrypoints_identity),
+        profile.compilation_options(),
         fingerprint_input,
     )
     .map(Arc::new)
@@ -1689,15 +1943,19 @@ fn valid_capability(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn validate_required_exports(
-    idl: &nexa::Idl,
+fn validate_required_entrypoints(
+    contract: &nexa::ValidatedContract,
     names: &[String],
     contract_path: &Path,
 ) -> CliResult<()> {
     for name in names {
-        if !idl.exports.iter().any(|export| export.name == *name) {
+        if !contract
+            .nexa_functions
+            .iter()
+            .any(|entrypoint| entrypoint.name == *name)
+        {
             return Err(CliError::environment(format!(
-                "required export `{name}` is not declared by {}",
+                "required Nexa entrypoint `{name}` is not declared by {}",
                 contract_path.display()
             )));
         }
@@ -1705,12 +1963,12 @@ fn validate_required_exports(
     Ok(())
 }
 
-fn reject_duplicate_required_exports(exports: &[String]) -> CliResult<()> {
+fn reject_duplicate_required_entrypoints(entrypoints: &[String]) -> CliResult<()> {
     let mut seen = BTreeSet::new();
-    for export in exports {
-        if !seen.insert(export) {
+    for entrypoint in entrypoints {
+        if !seen.insert(entrypoint) {
             return Err(CliError::environment(format!(
-                "duplicate required export `{export}`"
+                "duplicate required Nexa entrypoint `{entrypoint}`"
             )));
         }
     }
@@ -1968,8 +2226,74 @@ mod tests {
     }
 
     #[test]
+    fn virtual_build_profiles_are_bound_into_options_and_fingerprints() {
+        let contract = standalone_host_contract_snapshot().expect("Console contract");
+        let source = "fn main(args: Array<string>) -> i32 { return 0; }\n";
+        let package = virtual_source_build(
+            source,
+            Path::new("profile.nexa"),
+            contract.clone(),
+            nexa::BuildProfile::Package,
+        )
+        .expect("Package profile");
+        let script = virtual_source_build(
+            source,
+            Path::new("profile.nexa"),
+            contract,
+            nexa::BuildProfile::StandaloneScript,
+        )
+        .expect("Script profile");
+
+        assert_eq!(package.profile, nexa::BuildProfile::Package);
+        assert_eq!(script.profile, nexa::BuildProfile::StandaloneScript);
+        assert_eq!(
+            package.input.compilation_options.profile,
+            nexa_analysis::CompilationProfile::Package
+        );
+        assert_eq!(
+            script.input.compilation_options.profile,
+            nexa_analysis::CompilationProfile::Script
+        );
+        assert_ne!(package.build_fingerprint, script.build_fingerprint);
+    }
+
+    #[test]
+    fn repl_cell_uses_the_reserved_module_and_reader_facing_identity() {
+        let build = virtual_repl_cell(7, "let value = 1;").expect("REPL cell input");
+        let unit = build
+            .root
+            .production_sources
+            .production_units()
+            .next()
+            .expect("one REPL source");
+        assert_eq!(build.profile, nexa::BuildProfile::ReplCell);
+        assert_eq!(
+            unit.expected_module_path()
+                .expect("reserved REPL module")
+                .as_str(),
+            "repl.session"
+        );
+        let identity = &build
+            .virtual_source_origin
+            .as_ref()
+            .expect("REPL source origin")
+            .display_identity;
+        assert_eq!(identity.package_id(), Some("nexa.repl"));
+        assert_eq!(identity.path(), "repl::cell_7");
+    }
+
+    #[test]
+    fn project_config_rejects_the_removed_required_exports_key() {
+        let legacy = "schema = 2\n\
+                      contract = \"api.nidl\"\n\
+                      required_exports = []\n\
+                      sources = []\n";
+        assert!(toml::from_str::<ProjectConfig>(legacy).is_err());
+    }
+
+    #[test]
     fn lockless_package_has_identical_cli_and_memory_source_build_identity() {
-        const CONTRACT: &str = "interface LocklessHost {}\n";
+        const CONTRACT: &str = "contract LocklessHost {}\n";
         const MANIFEST: &str = "schema = 2\n\
 kind = \"application\"\n\
 id = \"example.lockless\"\n\
@@ -1980,8 +2304,7 @@ entry = \"example.lockless\"\n\
 activation = \"default-enabled\"\n\
 handler_fuel = 20000\n\
 capabilities = []\n";
-        const SOURCE: &str = "module example.lockless;\n\
-pub fn value() -> i32 {\n\
+        const SOURCE: &str = "pub fn value() -> i32 {\n\
     return 1;\n\
 }\n";
 
@@ -2067,7 +2390,7 @@ release_records = 2048\n",
     #[test]
     #[allow(clippy::too_many_lines)]
     fn host_contract_uri_changes_build_identity_and_artifact_source_registry() {
-        const CONTRACT: &str = "interface HostIdentity {}\n";
+        const CONTRACT: &str = "contract HostIdentity {}\n";
         const MANIFEST: &str = "schema = 2\n\
 kind = \"application\"\n\
 id = \"example.hostidentity\"\n\
@@ -2078,8 +2401,7 @@ entry = \"example.hostidentity\"\n\
 activation = \"default-enabled\"\n\
 handler_fuel = 20000\n\
 capabilities = []\n";
-        const SOURCE: &str = "module example.hostidentity;\n\
-pub fn value() -> i32 {\n\
+        const SOURCE: &str = "pub fn value() -> i32 {\n\
     return 1;\n\
 }\n";
         const CONFIG: &str = "schema = 2\n\
@@ -2122,7 +2444,7 @@ release_records = 2048\n";
             .pop()
             .expect("one first CLI build");
         let compiled_a = build_a
-            .compile(1, None, &project_a.required_exports, false)
+            .compile(1, None, &project_a.required_entrypoints, false)
             .expect("compile first exact Host source");
         let artifact_a = compiled_a.product().expect("first product artifact");
         let canonical_contract_a = contract_a_path
@@ -2154,7 +2476,7 @@ release_records = 2048\n";
         );
 
         let compiled_b = build_b
-            .compile(1, None, &project_b.required_exports, false)
+            .compile(1, None, &project_b.required_entrypoints, false)
             .expect("compile retargeted exact Host source");
         let artifact_b = compiled_b.product().expect("retargeted product artifact");
         assert_ne!(

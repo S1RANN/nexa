@@ -2,9 +2,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use nexa::prelude::{
-    HostCallOutcome, HostCompletionTicket, HostRegistry, HostTrap, ResourceContext,
-    RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements, ScriptCallError, ScriptCallWriter,
-    ScriptExport, ScriptOutputReader, Signature, StableId, ValueType,
+    FunctionEffect, HostCallOutcome, HostCompletionTicket, HostFunctionAuthority, HostRegistry,
+    HostTrap, ResourceContext, RuntimeHostArgs, RuntimeValue, ScriptArgumentRequirements,
+    ScriptCallError, ScriptCallWriter, ScriptExport, ScriptOutputReader, Signature, StableId,
+    ValueType,
 };
 use serde::Deserialize;
 
@@ -15,13 +16,37 @@ use crate::{
     TrustLevel,
 };
 
-const IDL_SOURCE: &str = "interface TestHost {
-    enum WaitError { Cancelled }
-    request(return_error, trap) fn wait(value: i32) -> request<Result<i32, WaitError>>;
-    export Run(value: i32) -> i32;
+const IDL_SOURCE: &str = "contract Test {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        fn run(value: i32) -> i32;
+        fn missing_run(value: i32) -> i32;
+    }
 }";
-const RUN_ID: StableId = StableId(0xf1c5_6273_0ddd_ab52);
+const TASK_IDL_SOURCE: &str = "contract Test {
+    enum WaitError { Cancelled, }
+    host {
+        @cancel(return_error)
+        @abandon(trap)
+        async fn wait(value: i32) -> Result<i32, WaitError>;
+    }
+    nexa {
+        async fn run(value: i32) -> i32;
+        fn missing_run(value: i32) -> i32;
+    }
+}";
+const RUN_ID: StableId = StableId(0x7b5d_1e73_ccb5_ad74);
+const MISSING_RUN_ID: StableId = StableId(0xd1ad_b999_51e8_0fcd);
+const EVIDENCE_ENTRY: &str = "evidence.valid";
 static EVIDENCE_RUN_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static EVIDENCE_CONTRACT: OnceLock<crate::HostContract> = OnceLock::new();
+static EVIDENCE_TASK_CONTRACT: OnceLock<crate::HostContract> = OnceLock::new();
+static EVIDENCE_HOST_AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct EngineDiagnosticEvidence {
@@ -99,22 +124,27 @@ struct RenderedRelated {
 }
 
 struct Registry {
-    interface_hash: StableId,
+    contract_runtime_id: StableId,
+    authority: HostFunctionAuthority,
     held_completion: Option<Arc<Mutex<Option<HostCompletionTicket>>>>,
 }
 
 impl HostRegistry for Registry {
-    fn interface_hash(&self) -> Option<StableId> {
-        Some(self.interface_hash)
+    fn contract_runtime_id(&self) -> Option<StableId> {
+        Some(self.contract_runtime_id)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        (id == self.authority.stable_id()).then_some(&self.authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 {
+        if id != self.authority.stable_id() {
             return Err(HostTrap::UnknownFunction(id));
         }
         let pending = context
@@ -135,13 +165,17 @@ impl ScriptExport for Run {
     type Output = i32;
 
     const STABLE_ID: StableId = RUN_ID;
-    const NAME: &'static str = "Run";
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
         Signature {
             parameters: vec![ValueType::I32],
             result: Some(ValueType::I32),
         }
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
     }
 
     fn argument_requirements(
@@ -168,43 +202,41 @@ impl ScriptExport for Run {
     }
 }
 
-struct RunWithWrongHostSignature;
+struct TaskRun;
 
-impl ScriptExport for RunWithWrongHostSignature {
-    type Args = i64;
+impl ScriptExport for TaskRun {
+    type Args = i32;
     type Output = i32;
 
     const STABLE_ID: StableId = RUN_ID;
-    const NAME: &'static str = "Run";
+    const NAME: &'static str = "run";
 
     fn signature() -> Signature {
-        Signature {
-            parameters: vec![ValueType::I64],
-            result: Some(ValueType::I32),
-        }
+        Run::signature()
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Task
     }
 
     fn argument_requirements(
-        _: &Self::Args,
+        args: &Self::Args,
     ) -> Result<ScriptArgumentRequirements, ScriptCallError> {
-        Ok(ScriptArgumentRequirements::ZERO)
+        Run::argument_requirements(args)
     }
 
     fn encode_args(
-        _: &mut ScriptCallWriter<'_>,
+        writer: &mut ScriptCallWriter<'_>,
         args: &Self::Args,
     ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
-        Ok(vec![RuntimeValue::I64(*args)])
+        Run::encode_args(writer, args)
     }
 
     fn decode_output(
         reader: &ScriptOutputReader<'_>,
         value: RuntimeValue,
     ) -> Result<Self::Output, ScriptCallError> {
-        reader
-            .value(value)
-            .i32()
-            .map_err(|_| ScriptCallError::OutputDecoding)
+        Run::decode_output(reader, value)
     }
 }
 
@@ -214,11 +246,15 @@ impl ScriptExport for MissingRun {
     type Args = i32;
     type Output = i32;
 
-    const STABLE_ID: StableId = StableId(0x8f7a_92c1_65d0_44e3);
-    const NAME: &'static str = "MissingRun";
+    const STABLE_ID: StableId = MISSING_RUN_ID;
+    const NAME: &'static str = "missing_run";
 
     fn signature() -> Signature {
         Run::signature()
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Ordinary
     }
 
     fn argument_requirements(
@@ -288,7 +324,7 @@ impl PackageSource for SharedSource {
         build: &CandidateBuildContext,
     ) -> Result<Vec<DiscoveredPackage>, PackageSourceError> {
         let script = self.script.read().expect("source evidence lock").clone();
-        let module = script_module(&script);
+        let module = EVIDENCE_ENTRY;
         let manifest = self.manifest.replace(
             "entry = \"evidence.valid\"",
             &format!("entry = \"{module}\""),
@@ -296,7 +332,7 @@ impl PackageSource for SharedSource {
         MemorySource::new(self.id.clone(), self.policy.clone())
             .package(
                 MemoryPackage::new(self.id.as_str(), manifest)
-                    .source(module_source_path(&module), script),
+                    .source(module_source_path(module), script),
             )
             .discover(build)
     }
@@ -506,10 +542,11 @@ fn signature_mismatch() -> Result<EngineDiagnosticEvidence, String> {
         package_id.as_str(),
         "user-controlled",
         "",
-        &valid_script(1),
+        "use host::test;\n\
+         pub fn run(value: i64) -> i32 { return 1; }",
     )?;
     let mut engine = builder(source, None)
-        .require_export::<RunWithWrongHostSignature>()
+        .require_export::<Run>()
         .build()
         .map_err(string_error)?;
     engine.discover().map_err(string_error)?;
@@ -520,31 +557,34 @@ fn signature_mismatch() -> Result<EngineDiagnosticEvidence, String> {
 }
 
 fn handler_yield() -> Result<EngineDiagnosticEvidence, String> {
-    handler_failure(
+    task_handler_failure(
         "evidence-yield",
         "evidence.handler-yield",
-        "pub task fn Run(value: i32) -> i32 { yield; return value; }",
+        "pub async fn run(value: i32) -> i32 { yield; return value; }",
         nexa::ErrorCode::NX7101,
     )
 }
 
 fn handler_wait() -> Result<EngineDiagnosticEvidence, String> {
-    handler_failure(
+    task_handler_failure(
         "evidence-wait",
         "evidence.handler-wait",
-        "pub task fn Run(value: i32) -> i32 {
-            let result: Result<i32, test.WaitError> = await test.wait(value);
-            return match result { Ok(found) => found, Err(error) => 0 };
+        "pub async fn run(value: i32) -> i32 {
+            let result: Result<i32, test::WaitError> = test::wait(value).await;
+            return match result {
+                Result::Ok(found) => found,
+                Result::Err(error) => 0,
+            };
         }",
         nexa::ErrorCode::NX7102,
     )
 }
 
 fn handler_trap() -> Result<EngineDiagnosticEvidence, String> {
-    handler_failure(
+    ordinary_handler_failure(
         "evidence-trap",
         "evidence.handler-trap",
-        "pub fn Run(value: i32) -> i32 {
+        "pub fn run(value: i32) -> i32 {
             let zero: i32 = 0;
             return value / zero;
         }",
@@ -552,7 +592,7 @@ fn handler_trap() -> Result<EngineDiagnosticEvidence, String> {
     )
 }
 
-fn handler_failure(
+fn task_handler_failure(
     source_name: &str,
     package_name: &str,
     body: &str,
@@ -564,7 +604,33 @@ fn handler_failure(
         package_name,
         "default-enabled",
         "",
-        &format!("module evidence.handler;\nimport host as test;\n{body}"),
+        &format!("use host::test;\n{body}"),
+    )?;
+    let mut engine = task_builder(source, None)
+        .require_export::<TaskRun>()
+        .build()
+        .map_err(string_error)?;
+    engine.discover().map_err(string_error)?;
+    engine.enable(&package_id).map_err(string_error)?;
+    engine
+        .call::<TaskRun>(&package_id, &7)
+        .expect_err("task handler evidence must fail");
+    capture(&engine, code, "NexaEngine::call")
+}
+
+fn ordinary_handler_failure(
+    source_name: &str,
+    package_name: &str,
+    body: &str,
+    code: nexa::ErrorCode,
+) -> Result<EngineDiagnosticEvidence, String> {
+    let package_id = package_id(package_name)?;
+    let source = memory_source(
+        source_name,
+        package_name,
+        "default-enabled",
+        "",
+        &format!("use host::test;\n{body}"),
     )?;
     let mut engine = builder(source, None)
         .require_export::<Run>()
@@ -669,7 +735,8 @@ fn persistence_failure() -> Result<EngineDiagnosticEvidence, String> {
 
 fn shutdown_failure() -> Result<EngineDiagnosticEvidence, String> {
     let runtime_host = nexa::prelude::RuntimeHost::new(32);
-    let interface_hash = contract().interface_hash;
+    let contract_runtime_id = contract().contract_runtime_id();
+    let authority = host_function_authority();
     let external_realm = nexa::prelude::RealmRuntime::hosted(
         nexa::prelude::RealmConfig {
             realm_id: 9_001,
@@ -677,7 +744,8 @@ fn shutdown_failure() -> Result<EngineDiagnosticEvidence, String> {
         },
         runtime_host.clone(),
         Box::new(Registry {
-            interface_hash,
+            contract_runtime_id,
+            authority,
             held_completion: None,
         }),
     )
@@ -757,26 +825,127 @@ fn builder(
     source: impl PackageSource + 'static,
     held_completion: Option<Arc<Mutex<Option<HostCompletionTicket>>>>,
 ) -> crate::NexaEngineBuilder {
-    let contract = contract();
-    let interface_hash = contract.interface_hash;
+    builder_with_contract(source, held_completion, contract())
+}
+
+fn task_builder(
+    source: impl PackageSource + 'static,
+    held_completion: Option<Arc<Mutex<Option<HostCompletionTicket>>>>,
+) -> crate::NexaEngineBuilder {
+    builder_with_contract(source, held_completion, task_contract())
+}
+
+fn builder_with_contract(
+    source: impl PackageSource + 'static,
+    held_completion: Option<Arc<Mutex<Option<HostCompletionTicket>>>>,
+    contract: crate::HostContract,
+) -> crate::NexaEngineBuilder {
+    let contract_runtime_id = contract.contract_runtime_id();
+    let authority = host_function_authority();
     NexaEngine::builder(contract)
         .host_factory(move |_: &crate::PackageContext| {
             Box::new(Registry {
-                interface_hash,
+                contract_runtime_id,
+                authority: authority.clone(),
                 held_completion: held_completion.clone(),
             }) as Box<dyn HostRegistry>
         })
         .package_source(source)
 }
 
+fn host_function_authority() -> HostFunctionAuthority {
+    EVIDENCE_HOST_AUTHORITY
+        .get_or_init(|| {
+            let contract = nexa::parse_nidl(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
+            let model = nexa::BindingModel::from_contract(&contract)
+                .expect("diagnostic evidence Contract runtime binding model");
+            let function = model
+                .host_functions
+                .iter()
+                .find(|function| function.identity.source_name == "wait")
+                .expect("diagnostic evidence Host wait function");
+            let runtime = function
+                .host_contract
+                .as_ref()
+                .expect("Host function has runtime metadata");
+            let parameters = Box::leak(runtime.parameters.clone().into_boxed_slice());
+            let capabilities: &'static [&'static str] = Box::leak(
+                function
+                    .capabilities
+                    .iter()
+                    .cloned()
+                    .map(|capability| {
+                        let capability: &'static str = Box::leak(capability.into_boxed_str());
+                        capability
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+            HostFunctionAuthority::new(
+                function.identity.stable_id,
+                function.declaration_fingerprint,
+                parameters,
+                runtime.result,
+                runtime.mode,
+                function.fuel_cost,
+                runtime.async_result,
+                capabilities,
+            )
+        })
+        .clone()
+}
+
 fn contract() -> crate::HostContract {
-    let idl = nexa::parse(IDL_SOURCE).expect("diagnostic evidence IDL is valid");
-    crate::HostContract {
-        interface_name: "TestHost",
-        canonical_idl: IDL_SOURCE,
-        interface_hash: nexa::exact_hash(&idl),
-        generator_schema_version: nexa::HOST_CONTRACT_SCHEMA_VERSION,
-    }
+    *EVIDENCE_CONTRACT.get_or_init(|| {
+        let idl = nexa::parse_nidl(IDL_SOURCE).expect("diagnostic evidence NIDL is valid");
+        for (name, expected) in [
+            (Run::NAME, Run::STABLE_ID),
+            (MissingRun::NAME, MissingRun::STABLE_ID),
+        ] {
+            let entrypoint = idl
+                .nexa_functions
+                .iter()
+                .find(|function| function.name == name)
+                .expect("diagnostic evidence entrypoint is declared");
+            assert_eq!(nexa::entrypoint_stable_id(entrypoint), expected);
+        }
+        let descriptor = nexa::abi_descriptor(&idl);
+        let fingerprint = descriptor.fingerprint.into_bytes();
+        let canonical_descriptor = Box::leak(descriptor.bytes.into_boxed_slice());
+        crate::HostContract::new(
+            "Test",
+            IDL_SOURCE,
+            canonical_descriptor,
+            fingerprint,
+            nexa::contract_runtime_id(&idl),
+            nexa::HOST_CONTRACT_SCHEMA_VERSION,
+        )
+    })
+}
+
+fn task_contract() -> crate::HostContract {
+    *EVIDENCE_TASK_CONTRACT.get_or_init(|| {
+        let idl =
+            nexa::parse_nidl(TASK_IDL_SOURCE).expect("diagnostic evidence task NIDL is valid");
+        let entrypoint = idl
+            .nexa_functions
+            .iter()
+            .find(|function| function.name == TaskRun::NAME)
+            .expect("diagnostic evidence task entrypoint is declared");
+        assert_eq!(nexa::entrypoint_stable_id(entrypoint), TaskRun::STABLE_ID);
+        assert!(entrypoint.is_async);
+        let descriptor = nexa::abi_descriptor(&idl);
+        let fingerprint = descriptor.fingerprint.into_bytes();
+        let canonical_descriptor = Box::leak(descriptor.bytes.into_boxed_slice());
+        crate::HostContract::new(
+            "Test",
+            TASK_IDL_SOURCE,
+            canonical_descriptor,
+            fingerprint,
+            nexa::contract_runtime_id(&idl),
+            nexa::HOST_CONTRACT_SCHEMA_VERSION,
+        )
+    })
 }
 
 fn policy(activation: impl IntoIterator<Item = ActivationPolicy>) -> PackagePolicy {
@@ -828,50 +997,36 @@ fn memory_source(
     )
     .package(
         MemoryPackage::new(package, {
-            let module = script_module(script);
+            let module = EVIDENCE_ENTRY;
             manifest(package, activation, entitlement).replace(
                 "entry = \"evidence.valid\"",
                 &format!("entry = \"{module}\""),
             )
         })
-        .source(module_source_path(&script_module(script)), script),
+        .source(module_source_path(EVIDENCE_ENTRY), script),
     ))
 }
 
 fn valid_script(increment: i32) -> String {
     format!(
-        "module evidence.valid;\n\
-         import host as test;\n\
-         pub fn Run(value: i32) -> i32 {{ return value + {increment}; }}"
+        "use host::test;\n\
+         pub fn run(value: i32) -> i32 {{ return value + {increment}; }}"
     )
 }
 
 fn stateful_script(schema: u32, increment: i32, activation_fault: bool) -> String {
     format!(
-        "module evidence.store;\n\
-         import host as test;\n\
-         @stateful({schema}) class Store {{ value: i32;{} }}\n\
-         pub fn Run(value: i32) -> i32 {{ return value + {increment}; }}\n\
+        "use host::test;\n\
+         @state(version = {schema}) class Store {{ mut value: i32,{} }}\n\
+         pub fn run(value: i32) -> i32 {{ return value + {increment}; }}\n\
          {}",
-        if schema == 1 { "" } else { " extra: i32;" },
+        if schema == 1 { "" } else { " mut extra: i32," },
         if activation_fault {
             "@activation pub fn activate() -> i32 { let zero: i32 = 0; return 1 / zero; }"
         } else {
             ""
         }
     )
-}
-
-fn script_module(script: &str) -> String {
-    script
-        .lines()
-        .find_map(|line| {
-            line.trim()
-                .strip_prefix("module ")
-                .and_then(|value| value.strip_suffix(';'))
-        })
-        .unwrap_or("evidence.valid")
-        .to_owned()
 }
 
 fn module_source_path(module: &str) -> String {

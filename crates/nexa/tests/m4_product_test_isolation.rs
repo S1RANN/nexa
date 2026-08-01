@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use nexa::{
-    CandidateIdentity, PackageBuildError, PackageBuildSession, PackageTestOptions, TestError,
-    TestStatus, canonical_package_build_fingerprint_input,
+    CandidateIdentity, HostContractInput, PackageBuildError, PackageBuildSession,
+    PackageTestOptions, SourceIdentity, TestError, TestStatus,
+    canonical_host_contract_source_identity,
+    canonical_package_build_fingerprint_input_with_contract,
 };
 use nexa_analysis::{
     CompilationLimits, NormalizedPackagePath, PackageManifest, QueryKey, ResolvedBuildInput,
@@ -11,20 +13,28 @@ use nexa_analysis::{
     SourceSetBuilder,
 };
 
+const EMPTY_HOST_NIDL: &str = "contract Empty {}";
+const EMPTY_HOST_URI: &str = "nidl://tests/m4-product-test-isolation/empty.nidl";
+
+fn host_contract<'a>(
+    contract: &'a nexa_idl::ValidatedContract,
+    uri: &str,
+    source: &str,
+) -> HostContractInput<'a> {
+    HostContractInput::with_source(contract, SourceIdentity::standalone(uri), source)
+        .expect("exact test NIDL source")
+}
+
 fn resolved_product(
     manifest: PackageManifest,
-    contract: &nexa_idl::Idl,
+    contract: &HostContractInput<'_>,
 ) -> Arc<ResolvedBuildInput> {
-    resolved_product_with_source(
-        manifest,
-        contract,
-        "module main;\npub fn value() -> i32 { return 7; }\n",
-    )
+    resolved_product_with_source(manifest, contract, "pub fn value() -> i32 { return 7; }\n")
 }
 
 fn resolved_product_with_source(
     manifest: PackageManifest,
-    contract: &nexa_idl::Idl,
+    contract: &HostContractInput<'_>,
     source: impl Into<Arc<str>>,
 ) -> Arc<ResolvedBuildInput> {
     resolved_product_with_sources(manifest, contract, [("src/main.nexa", source.into())])
@@ -32,7 +42,7 @@ fn resolved_product_with_source(
 
 fn resolved_product_with_sources(
     manifest: PackageManifest,
-    contract: &nexa_idl::Idl,
+    contract: &HostContractInput<'_>,
     units: impl IntoIterator<Item = (&'static str, Arc<str>)>,
 ) -> Arc<ResolvedBuildInput> {
     let mut sources = SourceSetBuilder::new(manifest.id.clone(), CompilationLimits::default());
@@ -60,7 +70,7 @@ fn resolved_product_with_sources(
         )]),
         edges: BTreeSet::new(),
     });
-    let fingerprint_input = canonical_package_build_fingerprint_input(
+    let fingerprint_input = canonical_package_build_fingerprint_input_with_contract(
         &manifest,
         &sources,
         &BTreeMap::new(),
@@ -68,7 +78,8 @@ fn resolved_product_with_sources(
         contract,
         None,
     );
-    let host_contract_source_identity = fingerprint_input.host_contract_source.clone();
+    let canonical_host_contract = fingerprint_input.host_contract.clone();
+    let host_contract_source_identity = canonical_host_contract_source_identity(contract);
     Arc::new(
         ResolvedBuildInput::new(
             Arc::new(manifest),
@@ -77,9 +88,9 @@ fn resolved_product_with_sources(
             BTreeMap::new(),
             graph,
             None,
-            Arc::<[u8]>::from(nexa_idl::canonical(contract).into_bytes()),
+            Arc::<[u8]>::from(canonical_host_contract),
             host_contract_source_identity,
-            fingerprint_input.host_required_exports.clone(),
+            fingerprint_input.host_required_entrypoints.clone(),
             nexa_analysis::CompilationOptions::default(),
             fingerprint_input,
         )
@@ -90,9 +101,7 @@ fn resolved_product_with_sources(
 fn test_input(product: &Arc<ResolvedBuildInput>, result: bool) -> ResolvedTestInput {
     test_input_with_source(
         product,
-        format!(
-            "module test.checks;\n@test fn product_is_valid() -> bool {{ return {result}; }}\n"
-        ),
+        format!("@test fn product_is_valid() -> bool {{ return {result}; }}\n"),
     )
 }
 
@@ -142,23 +151,24 @@ activation = "programmatic"
 #[test]
 fn test_only_changes_do_not_contaminate_the_product_build() {
     let manifest = application_manifest();
-    let contract = nexa_idl::parse("interface Empty {}").unwrap();
+    let parsed_contract = nexa_idl::parse(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(manifest, &contract);
     let tests_returning_true = test_input(&product, true);
     let tests_returning_false = test_input(&product, false);
 
     let mut session = PackageBuildSession::new();
     let product_before = session
-        .compile_package(&product, &contract, identity(&product))
+        .compile_package_with_contract(&product, &contract, identity(&product))
         .unwrap();
     let true_artifact = session
-        .compile_package_tests(&tests_returning_true, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests_returning_true, &contract, identity(&product))
         .unwrap();
     let false_artifact = session
-        .compile_package_tests(&tests_returning_false, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests_returning_false, &contract, identity(&product))
         .unwrap();
     let product_after = session
-        .compile_package(&product, &contract, identity(&product))
+        .compile_package_with_contract(&product, &contract, identity(&product))
         .unwrap();
 
     assert_eq!(
@@ -187,8 +197,7 @@ fn test_only_changes_do_not_contaminate_the_product_build() {
     );
     assert!(product_before.source_files.files().iter().all(|source| {
         source
-            .key
-            .as_ref()
+            .key()
             .is_none_or(|key| !key.path.as_str().starts_with("tests/"))
     }));
 
@@ -200,22 +209,23 @@ fn test_only_changes_do_not_contaminate_the_product_build() {
 
 #[test]
 fn product_check_discards_prior_test_modules_edges_and_invalidation_evidence() {
-    let contract = nexa_idl::parse("interface Empty {}").unwrap();
+    let parsed_contract = nexa_idl::parse(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
         &product,
-        "module test.checks;\nimport main as product;\n@test fn succeeds() -> bool { return true; }\n",
+        "use package::main as product;\n@test fn succeeds() -> bool { return true; }\n",
     );
     let mut session = PackageBuildSession::new();
     session
-        .compile_package_tests(&tests, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
         .expect("test analysis records a test module and its product import");
 
     let report = session
-        .check_package(&product, &contract)
+        .check_package_with_contract(&product, &contract)
         .expect("the same session returns to an exact product analysis");
     let cold = PackageBuildSession::new()
-        .check_package(&product, &contract)
+        .check_package_with_contract(&product, &contract)
         .expect("cold product check");
 
     assert_eq!(report.modules, cold.modules);
@@ -257,7 +267,8 @@ fn product_check_discards_prior_test_modules_edges_and_invalidation_evidence() {
 
 #[test]
 fn canonical_compiler_accepts_an_imported_namespace_value_field_method_chain() {
-    let contract = nexa_idl::parse("interface Empty {}").unwrap();
+    let parsed_contract = nexa_idl::parse(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product_with_sources(
         application_manifest(),
         &contract,
@@ -265,19 +276,19 @@ fn canonical_compiler_accepts_an_imported_namespace_value_field_method_chain() {
             (
                 "src/main.nexa",
                 Arc::from(
-                    "module main;\nimport util as u;\npub fn value() -> i32 { return u.value.text.len(); }\n",
+                    "use package::util as u;\npub fn value() -> i32 { return u::VALUE.text.len(); }\n",
                 ),
             ),
             (
                 "src/util.nexa",
                 Arc::from(
-                    "module util;\npub(package) struct Record { text: string; }\npub(package) const value: Record = Record { text: \"compiled\", };\n",
+                    "pub(package) struct Record { text: string, }\npub(package) const VALUE: Record = Record { text: \"compiled\", };\n",
                 ),
             ),
         ],
     );
     let artifact = PackageBuildSession::new()
-        .compile_package(&product, &contract, identity(&product))
+        .compile_package_with_contract(&product, &contract, identity(&product))
         .expect("analysis, typed codegen, and verifier accept the qualified receiver");
     assert!(!artifact.encode_module().is_empty());
 }
@@ -300,16 +311,16 @@ fn query_key_belongs_to_tests(key: &QueryKey) -> bool {
 
 #[test]
 fn canonical_test_build_traps_inside_a_fresh_realm_with_source_evidence() {
-    let contract = nexa_idl::parse("interface Empty {}").unwrap();
+    let parsed_contract = nexa_idl::parse(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
         &product,
-        r#"module test.checks;
-import std.debug as debug;
+        r#"use std::debug;
 
 @test
 fn a_explicit_trap() -> bool {
-    return debug.trap("canonical test trap");
+    return debug::trap("canonical test trap");
 }
 
 @test
@@ -320,13 +331,12 @@ fn b_still_runs_after_trap() -> bool {
     );
 
     let artifact = PackageBuildSession::new()
-        .compile_package_tests(&tests, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
         .expect("canonical analysis, typed compilation, and verification must succeed");
     assert_eq!(artifact.test_count(), 2);
     assert!(artifact.source_files().files().iter().any(|source| {
         source
-            .key
-            .as_ref()
+            .key()
             .is_some_and(|key| key.path.as_str() == "tests/checks.nexa")
     }));
 
@@ -359,13 +369,12 @@ fn b_still_runs_after_trap() -> bool {
 
 #[test]
 fn canonical_test_build_reports_realm_fuel_exhaustion_with_exact_stack() {
-    let contract = nexa_idl::parse("interface Empty {}").unwrap();
+    let parsed_contract = nexa_idl::parse(EMPTY_HOST_NIDL).unwrap();
+    let contract = host_contract(&parsed_contract, EMPTY_HOST_URI, EMPTY_HOST_NIDL);
     let product = resolved_product(application_manifest(), &contract);
     let tests = test_input_with_source(
         &product,
-        r"module test.checks;
-
-@test
+        r"@test
 fn exhausts_fuel() -> bool {
     for step in 0..64 {
         step + 1;
@@ -376,7 +385,7 @@ fn exhausts_fuel() -> bool {
     );
 
     let artifact = PackageBuildSession::new()
-        .compile_package_tests(&tests, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
         .expect("canonical analysis, typed compilation, and verification must succeed");
     let run = artifact
         .run(PackageTestOptions { fuel_limit: 1 })
@@ -397,39 +406,42 @@ fn exhausts_fuel() -> bool {
 
 #[test]
 fn canonical_analysis_rejects_an_indirect_host_call_before_test_codegen() {
-    let contract = nexa_idl::parse(
-        r"
-interface TestHost {
-    sync fn clock() -> i32;
+    let contract_source = r"
+contract TestHost {
+    host {
+        fn clock() -> i32;
+    }
 }
-",
-    )
-    .unwrap();
+";
+    let parsed_contract = nexa_idl::parse(contract_source).unwrap();
+    let contract = host_contract(
+        &parsed_contract,
+        "nidl://tests/m4-product-test-isolation/test-host.nidl",
+        contract_source,
+    );
     let product = resolved_product_with_source(
         application_manifest(),
         &contract,
-        r"module main;
-import host as host;
+        r"use host::test_host as host;
 
 pub(package) fn host_value() -> i32 {
-    return host.clock();
+    return host::clock();
 }
 ",
     );
     let tests = test_input_with_source(
         &product,
-        r"module test.checks;
-import main as app;
+        r"use package::main as app;
 
 @test
 fn indirect_host() -> bool {
-    return app.host_value() == 0;
+    return app::host_value() == 0;
 }
 ",
     );
 
     let error = PackageBuildSession::new()
-        .compile_package_tests(&tests, &contract, identity(&product))
+        .compile_package_tests_with_contract(&tests, &contract, identity(&product))
         .expect_err("analysis must reject indirect Host reachability");
     let PackageBuildError::AnalysisFailed(diagnostics) = error else {
         panic!("expected analysis failure, got {error}");

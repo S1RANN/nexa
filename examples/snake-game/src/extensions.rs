@@ -146,6 +146,7 @@ impl SnakeExtensions {
         root: impl Into<PathBuf>,
         data_root: impl Into<PathBuf>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        assert_eq!(generated::OnEvent::NAME, "on_event");
         let root = root.into();
         let data_root = data_root.into();
         let settings_path = data_root.join("settings.json");
@@ -238,6 +239,15 @@ impl SnakeExtensions {
                     Err(error) => self.toast = Some(error.to_string()),
                 }
             }
+            match event.kind {
+                GameEventKind::FoodSpawnRequested => {
+                    self.choose_food_spawn(&event, game)?;
+                }
+                GameEventKind::FoodEaten => {
+                    self.calculate_food_effect(&event, game)?;
+                }
+                _ => {}
+            }
             if event.kind == GameEventKind::FoodSpawnRequested && game.food().is_some() {
                 if let Some((food_id, _)) = self
                     .registries
@@ -251,6 +261,97 @@ impl SnakeExtensions {
             }
         }
         self.update_fallbacks();
+        Ok(())
+    }
+
+    fn choose_food_spawn(
+        &mut self,
+        event: &GameEvent,
+        game: &mut SnakeGame,
+    ) -> Result<(), nexa_embed::EngineError> {
+        let Some(policy_id) = self.selected_spawn_policy.as_deref() else {
+            return Ok(());
+        };
+        let Some(owner) = self.registries.spawn_policies.owner(policy_id).cloned() else {
+            return Ok(());
+        };
+        let args = generated::ChooseFoodSpawnArgs {
+            context: generated::FoodSpawnContext {
+                snapshot: to_generated_snapshot(&event.snapshot),
+            },
+        };
+        match self
+            .engine
+            .call_optional::<generated::ChooseFoodSpawn>(&owner, &args)
+        {
+            None => {}
+            Some(Ok(output)) => {
+                if let Some(cell) = output.value {
+                    self.apply_or_fault(
+                        &owner,
+                        GameEventKind::FoodSpawnRequested,
+                        vec![SnakeCommand::ProposeFoodSpawn(Cell {
+                            x: cell.x,
+                            y: cell.y,
+                        })],
+                        game,
+                    )?;
+                }
+            }
+            Some(Err(error)) => self.toast = Some(error.to_string()),
+        }
+        Ok(())
+    }
+
+    fn calculate_food_effect(
+        &mut self,
+        event: &GameEvent,
+        game: &mut SnakeGame,
+    ) -> Result<(), nexa_embed::EngineError> {
+        let Some(owner) = self
+            .registries
+            .foods
+            .owner(&event.snapshot.food_kind)
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let Some(cell) = event.snapshot.food else {
+            return Ok(());
+        };
+        let args = generated::CalculateFoodEffectArgs {
+            context: generated::FoodEatenContext {
+                snapshot: to_generated_snapshot(&event.snapshot),
+                food: generated::FoodInstance {
+                    kind: event.snapshot.food_kind.clone(),
+                    cell: generated::Cell {
+                        x: cell.x,
+                        y: cell.y,
+                    },
+                },
+            },
+        };
+        match self
+            .engine
+            .call_optional::<generated::CalculateFoodEffect>(&owner, &args)
+        {
+            None => {}
+            Some(Ok(output)) => {
+                let effect = output.value;
+                let mut commands = Vec::new();
+                if effect.length_delta != 0 {
+                    commands.push(SnakeCommand::ResizeSnake(effect.length_delta));
+                }
+                if effect.score_delta != 0 {
+                    commands.push(SnakeCommand::AddScore(effect.score_delta));
+                }
+                if effect.speed_delta != 0 {
+                    commands.push(SnakeCommand::SetSpeed(effect.speed_delta));
+                }
+                self.apply_or_fault(&owner, GameEventKind::FoodEaten, commands, game)?;
+            }
+            Some(Err(error)) => self.toast = Some(error.to_string()),
+        }
         Ok(())
     }
 
@@ -282,11 +383,12 @@ impl SnakeExtensions {
                 ExtensionAction::Enable(id) => {
                     let result = (|| {
                         self.engine.enable(&id)?;
-                        if id.as_str() == SCORE_OVERLAY_ID {
+                        let event = GameEvent::new(GameEventKind::PackageEnabled, game.snapshot());
+                        self.call_package(&id, &event, &mut Some(game))?;
+                        if id.as_str() == SCORE_OVERLAY_ID && self.overlay_foods().is_none() {
                             self.set_overlay_foods(0)?;
                         }
-                        let event = GameEvent::new(GameEventKind::PackageEnabled, game.snapshot());
-                        self.call_package(&id, &event, &mut Some(game))
+                        Ok(())
                     })();
                     (id, result, true)
                 }
@@ -301,11 +403,13 @@ impl SnakeExtensions {
                     (id, result, false)
                 }
                 ExtensionAction::Reload(id) => {
-                    let result = self
-                        .engine
-                        .reload(&id)
-                        .map_err(|error| Box::new(error) as Box<dyn std::error::Error>);
-                    (id, result, false)
+                    let result = (|| {
+                        self.engine.reload(&id)?;
+                        self.registries.remove_owner(&id);
+                        let event = GameEvent::new(GameEventKind::PackageEnabled, game.snapshot());
+                        self.call_package(&id, &event, &mut Some(game))
+                    })();
+                    (id, result, true)
                 }
             };
             if let Err(error) = result {
@@ -852,6 +956,21 @@ mod tests {
         assert_eq!(view.skin_entries, 2);
         assert_eq!(view.food_entries, 6);
         assert_eq!(view.spawn_entries, 2);
+        assert!(
+            extensions
+                .engine
+                .has_export::<generated::ChooseFoodSpawn>(&id("builtin.classic-spawn"))
+        );
+        assert!(
+            !extensions
+                .engine
+                .has_export::<generated::ChooseFoodSpawn>(&id("builtin.classic-rules"))
+        );
+        assert!(
+            extensions
+                .engine
+                .has_export::<generated::CalculateFoodEffect>(&id("official.food-chaos"))
+        );
 
         assert!(extensions.select_skin("community.neon-skin:neon"));
         assert!(extensions.select_spawn_policy("community.corner-spawn:corner"));
@@ -871,6 +990,23 @@ mod tests {
             view.selected_spawn_policy.as_deref(),
             Some("builtin.classic-spawn:classic")
         );
+    }
+
+    #[test]
+    fn selected_spawn_provider_uses_its_optional_entrypoint() {
+        let (mut game, mut extensions, _) = harness("spawn-entrypoint");
+        enable(&mut extensions, &mut game, "community.corner-spawn");
+        assert!(extensions.select_spawn_policy("community.corner-spawn:corner"));
+        extensions
+            .handle_events(
+                vec![GameEvent::new(
+                    GameEventKind::FoodSpawnRequested,
+                    game.snapshot(),
+                )],
+                &mut game,
+            )
+            .expect("call selected spawn provider");
+        assert_eq!(game.food(), Some(Cell { x: 0, y: 0 }));
     }
 
     #[test]

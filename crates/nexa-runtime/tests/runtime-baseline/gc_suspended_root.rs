@@ -25,7 +25,7 @@ fn gc_suspended_root() {
     let task = realm
         .spawn_task(
             module,
-            0,
+            super::support::BASELINE_ENTRY_EXPORT,
             &[nexa_runtime::RuntimeValue::Ref(reference)],
             super::support::task_config(scope),
         )

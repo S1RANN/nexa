@@ -116,6 +116,19 @@ struct MigrationFieldSlot {
     value: StateValue,
 }
 
+/// A schema field that exists only in a staged transactional Cell generation.
+///
+/// Pending fields deliberately have no `StateValue`: manufacturing a zero/null
+/// value would make reference, nominal, and enum bindings observable before
+/// their initializer succeeds.  The only path that creates these slots is the
+/// runtime-owned REPL schema-extension transaction below.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingStateField {
+    object_id: StableId,
+    field_id: StableId,
+    ty: ValueType,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ForwardingSlot {
     old_id: StableId,
@@ -127,6 +140,7 @@ pub struct StatefulRegistry {
     domain: StatefulDomainId,
     objects: Vec<MigrationObjectSlot>,
     fields: Vec<MigrationFieldSlot>,
+    pending_fields: Vec<PendingStateField>,
     payload: Vec<u8>,
     gc_roots: Vec<GcRef>,
     object_capacity: usize,
@@ -142,6 +156,10 @@ pub enum StatefulError {
         actual: StatefulDomainId,
     },
     Missing(StableId),
+    Uninitialized {
+        object: StableId,
+        field: StableId,
+    },
     StaleGeneration,
     GenerationExhausted,
     NestedObject,
@@ -294,6 +312,9 @@ impl MigrationLimits {
                     field_capacity.saturating_mul(std::mem::size_of::<MigrationFieldSlot>()),
                 )
                 .saturating_add(
+                    field_capacity.saturating_mul(std::mem::size_of::<PendingStateField>()),
+                )
+                .saturating_add(
                     forwarding_capacity.saturating_mul(std::mem::size_of::<ForwardingSlot>()),
                 ),
         }
@@ -346,6 +367,8 @@ impl Clone for StatefulRegistry {
         objects.extend_from_slice(&self.objects);
         let mut fields = Vec::with_capacity(self.field_capacity);
         fields.extend_from_slice(&self.fields);
+        let mut pending_fields = Vec::with_capacity(self.field_capacity);
+        pending_fields.extend_from_slice(&self.pending_fields);
         let mut payload = Vec::with_capacity(self.byte_capacity);
         payload.extend_from_slice(&self.payload);
         let mut gc_roots = Vec::with_capacity(self.gc_root_capacity);
@@ -354,6 +377,7 @@ impl Clone for StatefulRegistry {
             domain: self.domain,
             objects,
             fields,
+            pending_fields,
             payload,
             gc_roots,
             object_capacity: self.object_capacity,
@@ -380,6 +404,7 @@ impl StatefulRegistry {
             domain,
             objects: reserve(report.object_capacity, MigrationLimitError::Objects)?,
             fields: reserve(report.field_capacity, MigrationLimitError::Fields)?,
+            pending_fields: reserve(report.field_capacity, MigrationLimitError::Fields)?,
             payload: reserve(
                 report.payload_byte_capacity,
                 MigrationLimitError::StateBytes,
@@ -395,6 +420,89 @@ impl StatefulRegistry {
     #[must_use]
     pub(crate) fn object_count(&self) -> usize {
         self.objects.len()
+    }
+
+    /// Builds the state overlay for one transactional REPL Cell.
+    ///
+    /// This is intentionally narrower than general migration: both schemas
+    /// must describe the same sole environment object, all committed fields
+    /// must retain their exact identity and type, and the candidate may only
+    /// add fields. Added fields have no value until the Cell task writes them.
+    pub(crate) fn stage_transactional_schema_extension(
+        &mut self,
+        environment: StableId,
+        old_schema: &nexa_bytecode::StateSchema,
+        candidate_schema: &nexa_bytecode::StateSchema,
+    ) -> Result<(), StatefulError> {
+        if !self.pending_fields.is_empty() {
+            let pending = self.pending_fields[0];
+            return Err(StatefulError::Uninitialized {
+                object: pending.object_id,
+                field: pending.field_id,
+            });
+        }
+        self.validate_schema(old_schema)?;
+        self.validate_handles()?;
+        let [old_type] = old_schema.types.as_slice() else {
+            return Err(StatefulError::Missing(environment));
+        };
+        let [candidate_type] = candidate_schema.types.as_slice() else {
+            return Err(StatefulError::Missing(environment));
+        };
+        if old_type.stable_id != environment
+            || candidate_type.stable_id != environment
+            || candidate_type.version != old_type.version
+            || candidate_type.fields.len() <= old_type.fields.len()
+            || candidate_type.fields[..old_type.fields.len()] != old_type.fields[..]
+        {
+            return Err(StatefulError::Missing(environment));
+        }
+        let environment_slot = self.object(environment)?;
+        if environment_slot.scalar.is_some()
+            || environment_slot.type_id != environment
+            || environment_slot.version != old_type.version
+        {
+            return Err(StatefulError::Missing(environment));
+        }
+
+        let mut pending = Vec::new();
+        pending
+            .try_reserve_exact(
+                candidate_type
+                    .fields
+                    .len()
+                    .saturating_sub(old_type.fields.len()),
+            )
+            .map_err(|_| StatefulError::Capacity(MigrationLimitError::Fields))?;
+        for field in &candidate_type.fields[old_type.fields.len()..] {
+            pending.push(PendingStateField {
+                object_id: environment,
+                field_id: field.stable_id,
+                ty: field.ty,
+            });
+        }
+        pending.sort_by_key(|field| (field.object_id, field.field_id));
+        if self.fields.len().saturating_add(pending.len()) > self.field_capacity {
+            return Err(StatefulError::Capacity(MigrationLimitError::Fields));
+        }
+        self.pending_fields = pending;
+        Ok(())
+    }
+
+    /// Fail-closed validation used immediately before a staged Cell may become
+    /// ready or publish its candidate generation.
+    pub(crate) fn validate_transactional_state(
+        &self,
+        schema: &nexa_bytecode::StateSchema,
+    ) -> Result<(), StatefulError> {
+        if let Some(pending) = self.pending_fields.first() {
+            return Err(StatefulError::Uninitialized {
+                object: pending.object_id,
+                field: pending.field_id,
+            });
+        }
+        self.validate_schema(schema)?;
+        self.validate_handles()
     }
 
     pub fn insert(
@@ -500,6 +608,238 @@ impl StatefulRegistry {
         ))
     }
 
+    pub(crate) fn current_object_proxy(
+        &self,
+        stable_id: StableId,
+        type_id: StableId,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
+        let slot = self
+            .object(stable_id)
+            .map_err(|_| RuntimeMessage::Static("current state object does not exist"))?;
+        let actual = slot
+            .scalar
+            .as_ref()
+            .map_or(ValueType::Named(slot.type_id), state_value_type);
+        if actual != ValueType::Named(type_id) {
+            return Err(RuntimeMessage::Static("current state object type mismatch"));
+        }
+        Ok(slot.scalar.as_ref().map_or(
+            RuntimeValue::Opaque {
+                value: stable_id.0,
+                type_id,
+            },
+            |value| state_to_runtime_value(stable_id, value),
+        ))
+    }
+
+    pub(crate) fn current_object_field(
+        &self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
+        let slot = self
+            .object(stable_id)
+            .map_err(|_| RuntimeMessage::Static("current state object does not exist"))?;
+        if slot.scalar.is_some() || slot.type_id != type_id {
+            return Err(RuntimeMessage::Static("current state object type mismatch"));
+        }
+        let fields = self.object_fields(slot);
+        let field =
+            if let Ok(index) = fields.binary_search_by_key(&field_id, |field| field.field_id) {
+                &fields[index]
+            } else {
+                if self.pending_field(stable_id, field_id).is_some() {
+                    return Err(RuntimeMessage::Static(
+                        "current state field is uninitialized",
+                    ));
+                }
+                return Err(RuntimeMessage::Static("current state field does not exist"));
+            };
+        let handle_target = match &field.value {
+            StateValue::Handle(handle) if handle.domain == self.domain => self
+                .objects
+                .binary_search_by_key(&handle.stable_id, |target| target.stable_id)
+                .ok()
+                .filter(|index| self.objects[*index].generation == handle.generation)
+                .map(|index| ValueType::Named(self.objects[index].type_id)),
+            _ => None,
+        };
+        if !state_value_matches(&field.value, expected, handle_target) {
+            return Err(RuntimeMessage::Static("current state field type mismatch"));
+        }
+        state_field_to_runtime_value(field_id, &field.value, expected)
+    }
+
+    pub(crate) fn set_current_object_field(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), RuntimeMessage> {
+        if runtime_state_type(value) != expected {
+            return Err(RuntimeMessage::Static("current state field type mismatch"));
+        }
+        let object_index = self
+            .objects
+            .binary_search_by_key(&stable_id, |slot| slot.stable_id)
+            .map_err(|_| RuntimeMessage::Static("current state object does not exist"))?;
+        let slot = &self.objects[object_index];
+        if slot.scalar.is_some() || slot.type_id != type_id {
+            return Err(RuntimeMessage::Static("current state object type mismatch"));
+        }
+        let field_start = slot.field_start as usize;
+        let field_search = self.fields[field_start..field_start + slot.field_len as usize]
+            .binary_search_by_key(&field_id, |field| field.field_id);
+        let pending_index = if field_search.is_err() {
+            self.pending_fields
+                .binary_search_by_key(&(stable_id, field_id), |field| {
+                    (field.object_id, field.field_id)
+                })
+                .ok()
+        } else {
+            None
+        };
+        if let Some(index) = pending_index {
+            if self.pending_fields[index].ty != expected {
+                return Err(RuntimeMessage::Static("current state field type mismatch"));
+            }
+        } else if field_search.is_err() {
+            return Err(RuntimeMessage::Static("current state field does not exist"));
+        }
+        let value = self.runtime_to_current_state_value(value)?;
+        let handle_target = match &value {
+            StateValue::Handle(handle) if handle.domain == self.domain => self
+                .objects
+                .binary_search_by_key(&handle.stable_id, |target| target.stable_id)
+                .ok()
+                .filter(|index| self.objects[*index].generation == handle.generation)
+                .map(|index| ValueType::Named(self.objects[index].type_id)),
+            _ => None,
+        };
+        if !state_value_matches(&value, expected, handle_target) {
+            return Err(RuntimeMessage::Static("current state field type mismatch"));
+        }
+        let usage = registry_usage(&self.objects, &self.fields);
+        let previous = field_search
+            .ok()
+            .map(|offset| &self.fields[field_start + offset].value);
+        self.check_usage(MigrationUsage {
+            objects: usage.objects,
+            fields: usage.fields + usize::from(previous.is_none()),
+            payload_bytes: usage
+                .payload_bytes
+                .saturating_sub(previous.map_or(0, state_value_payload_bytes))
+                .saturating_add(state_value_payload_bytes(&value)),
+            gc_roots: usage
+                .gc_roots
+                .saturating_sub(previous.map_or(0, state_value_root_count))
+                .saturating_add(state_value_root_count(&value)),
+        })
+        .map_err(|_| RuntimeMessage::Static("current state capacity exceeded"))?;
+        if let Ok(offset) = field_search {
+            self.fields[field_start + offset].value = value;
+        } else {
+            let insert_offset = field_search.expect_err("pending field search is absent");
+            self.fields.insert(
+                field_start + insert_offset,
+                MigrationFieldSlot { field_id, value },
+            );
+            self.objects[object_index].field_len = self.objects[object_index]
+                .field_len
+                .checked_add(1)
+                .ok_or(RuntimeMessage::Static("current state field count exceeded"))?;
+            for slot in &mut self.objects[object_index + 1..] {
+                slot.field_start =
+                    slot.field_start
+                        .checked_add(1)
+                        .ok_or(RuntimeMessage::Static(
+                            "current state field offset exceeded",
+                        ))?;
+            }
+            self.pending_fields.remove(
+                pending_index.expect("pending field index exists for an inserted state field"),
+            );
+        }
+        self.rebuild_caches();
+        Ok(())
+    }
+
+    fn runtime_to_current_state_value(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<StateValue, RuntimeMessage> {
+        match value {
+            RuntimeValue::I32(value) => Ok(StateValue::I32(value)),
+            RuntimeValue::I64(value) => Ok(StateValue::I64(value)),
+            RuntimeValue::F32(bits) => Ok(StateValue::F32(bits)),
+            RuntimeValue::F64(bits) => Ok(StateValue::F64(bits)),
+            RuntimeValue::Bool(value) => Ok(StateValue::Bool(value)),
+            RuntimeValue::Rune(value) => Ok(StateValue::Rune(value)),
+            RuntimeValue::String { reference, hash } => Ok(StateValue::String { reference, hash }),
+            RuntimeValue::Struct {
+                reference,
+                type_id,
+                hash,
+            } => Ok(StateValue::Struct {
+                reference,
+                type_id,
+                hash,
+            }),
+            RuntimeValue::Ref(reference) => Ok(StateValue::Ref {
+                reference,
+                type_id: None,
+            }),
+            RuntimeValue::NamedRef { reference, type_id } => Ok(StateValue::Ref {
+                reference,
+                type_id: Some(type_id),
+            }),
+            RuntimeValue::Opaque { value, type_id } => {
+                let stable_id = StableId(value);
+                let target = self
+                    .object(stable_id)
+                    .map_err(|_| RuntimeMessage::Static("state handle target does not exist"))?;
+                if target.type_id != type_id {
+                    return Err(RuntimeMessage::Static("state handle target type mismatch"));
+                }
+                Ok(StateValue::Handle(StateHandle {
+                    domain: self.domain,
+                    stable_id,
+                    generation: target.generation,
+                }))
+            }
+            RuntimeValue::StateHandle {
+                domain,
+                stable_id,
+                generation,
+                ..
+            } => {
+                let handle = StateHandle {
+                    domain: StatefulDomainId::new(domain),
+                    stable_id,
+                    generation,
+                };
+                self.checked_handle_slot(handle)
+                    .map_err(|_| RuntimeMessage::Static("state handle target does not exist"))?;
+                Ok(StateValue::Handle(handle))
+            }
+            RuntimeValue::MigrationOldObject(_) | RuntimeValue::MigrationStagingObject(_) => {
+                Err(RuntimeMessage::Static(
+                    "migration object handles cannot be stored in current state",
+                ))
+            }
+            RuntimeValue::HostRequest(_)
+            | RuntimeValue::ResourceToken(_)
+            | RuntimeValue::Snapshot(_)
+            | RuntimeValue::Unit => Err(RuntimeMessage::Static(
+                "Host capabilities cannot be stored in current state",
+            )),
+        }
+    }
+
     pub(crate) fn is_handle_alive(&self, handle: StateHandle) -> bool {
         if handle.domain != self.domain {
             return false;
@@ -558,6 +898,15 @@ impl StatefulRegistry {
             .binary_search_by_key(&stable_id, |slot| slot.stable_id)
             .map(|index| &self.objects[index])
             .map_err(|_| StatefulError::Missing(stable_id))
+    }
+
+    fn pending_field(&self, object_id: StableId, field_id: StableId) -> Option<&PendingStateField> {
+        self.pending_fields
+            .binary_search_by_key(&(object_id, field_id), |field| {
+                (field.object_id, field.field_id)
+            })
+            .ok()
+            .map(|index| &self.pending_fields[index])
     }
 
     fn checked_handle_slot(
@@ -1141,6 +1490,7 @@ impl MigrationArena {
             domain,
             objects: self.objects,
             fields: self.fields,
+            pending_fields: Vec::new(),
             payload: self.payload,
             gc_roots: self.gc_roots,
             object_capacity: self.object_capacity,
@@ -1685,13 +2035,17 @@ impl InterpreterMigration for MigrationContext {
             gc_roots,
             ..usage
         })?;
-        match search {
-            Ok(offset) => self.arena.fields[start + offset].value = value,
-            Err(offset) => self.arena.insert_field(
+        if let Ok(offset) = search {
+            self.arena.fields[start + offset].value = value;
+        } else {
+            let Err(offset) = search else {
+                unreachable!("the successful field-search branch was handled above");
+            };
+            self.arena.insert_field(
                 object_index,
                 start + offset,
                 MigrationFieldSlot { field_id, value },
-            ),
+            );
         }
         self.arena.rebuild_caches();
         self.set_flag(TOUCHED);
@@ -2047,9 +2401,7 @@ fn runtime_state_type(value: RuntimeValue) -> nexa_bytecode::ValueType {
         RuntimeValue::HostRequest(_) => {
             nexa_bytecode::ValueType::Named(StableId::from_name("HostRequest"))
         }
-        RuntimeValue::ResourceToken(_) => {
-            nexa_bytecode::ValueType::Named(StableId::from_name("ResourceToken"))
-        }
+        RuntimeValue::ResourceToken(token) => nexa_bytecode::ValueType::Named(token.token_type()),
         RuntimeValue::Snapshot(snapshot) => nexa_bytecode::ValueType::Named(snapshot.type_id()),
         RuntimeValue::Unit => nexa_bytecode::ValueType::Named(StableId::from_name("Unit")),
     }
@@ -2764,7 +3116,7 @@ mod tests {
             },
             nexa_bytecode::RootMap {
                 pc: 6,
-                bitmap: vec![true, false, true],
+                bitmap: vec![false, false, false],
             },
         ];
         let mut module = ModuleBuilder::new();
@@ -3519,8 +3871,70 @@ mod tests {
             report.metadata_bytes,
             2 * std::mem::size_of::<MigrationObjectSlot>()
                 + 3 * std::mem::size_of::<MigrationFieldSlot>()
+                + 3 * std::mem::size_of::<PendingStateField>()
                 + 4 * std::mem::size_of::<ForwardingSlot>()
         );
+    }
+
+    #[test]
+    fn transactional_schema_extension_accepts_only_a_nonempty_exact_suffix() {
+        let environment = StableId::from_name("nexa.repl::__ReplEnvironment");
+        let first = StableId::from_name("cell_1::binding_0");
+        let second = StableId::from_name("cell_2::binding_0");
+        let old_schema = schema(environment, &[(first, ValueType::I32)]);
+        let mut registry = StatefulRegistry::new(StatefulDomainId::new(1));
+        registry
+            .insert(
+                environment,
+                StateValue::Object(StateObject {
+                    type_id: environment,
+                    version: 1,
+                    fields: BTreeMap::from([(first, StateValue::I32(1))]),
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .clone()
+                .stage_transactional_schema_extension(environment, &old_schema, &old_schema,)
+                .is_err()
+        );
+        assert!(
+            registry
+                .clone()
+                .stage_transactional_schema_extension(
+                    environment,
+                    &old_schema,
+                    &schema(
+                        environment,
+                        &[(second, ValueType::Bool), (first, ValueType::I32)],
+                    ),
+                )
+                .is_err()
+        );
+
+        let mut staged = registry.clone();
+        staged
+            .stage_transactional_schema_extension(
+                environment,
+                &old_schema,
+                &schema(
+                    environment,
+                    &[(first, ValueType::I32), (second, ValueType::Bool)],
+                ),
+            )
+            .unwrap();
+        assert!(matches!(
+            staged.validate_transactional_state(&schema(
+                environment,
+                &[(first, ValueType::I32), (second, ValueType::Bool)],
+            )),
+            Err(StatefulError::Uninitialized {
+                object,
+                field
+            }) if object == environment && field == second
+        ));
     }
 
     #[test]

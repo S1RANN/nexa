@@ -180,7 +180,7 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(
         NX2703,
         "nexa-analysis::resolver",
-        "UnknownImport",
+        "UnknownUsePath",
         ".analysis"
     ),
     emission!(
@@ -228,7 +228,7 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(
         NX2740,
         "nexa-analysis::lifecycle",
-        "InvalidLifecycleExportLocation",
+        "InvalidLifecycleEntrypointLocation",
         ".analysis"
     ),
     emission!(NX3001, "nexa-bytecode::decode", "InvalidMagic", ".bin"),
@@ -238,7 +238,7 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(
         NX4001,
         "nexa-runtime::realm",
-        "HostHashMismatch",
+        "HostContractIdMismatch",
         ".runtime"
     ),
     emission!(
@@ -280,8 +280,18 @@ pub static ERROR_EMISSION_TABLE: &[ErrorEmissionDefinition] = &[
     emission!(NX7002, "nexa-embed::manifest", "InvalidManifest", ".engine"),
     emission!(NX7003, "nexa-embed::policy", "PolicyRejected", ".engine"),
     emission!(NX7004, "nexa-embed::entitlement", "Unavailable", ".engine"),
-    emission!(NX7010, "nexa-embed::export", "MissingRequired", ".engine"),
-    emission!(NX7011, "nexa-embed::export", "SignatureMismatch", ".engine"),
+    emission!(
+        NX7010,
+        "nexa-embed::entrypoint",
+        "MissingRequired",
+        ".engine"
+    ),
+    emission!(
+        NX7011,
+        "nexa-embed::entrypoint",
+        "SignatureMismatch",
+        ".engine"
+    ),
     emission!(NX7101, "nexa-embed::handler", "Yielded", ".engine"),
     emission!(NX7102, "nexa-embed::handler", "Waited", ".engine"),
     emission!(NX7103, "nexa-embed::handler", "Trapped", ".engine"),
@@ -730,7 +740,17 @@ impl fmt::Display for HostError {
     }
 }
 
-impl std::error::Error for HostError {}
+impl std::error::Error for HostError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Trap(_) => None,
+            Self::Request(error) => Some(error),
+            Self::Lifecycle(error) => Some(error),
+            Self::Realm(error) => Some(error),
+            Self::Protocol(error) => Some(error),
+        }
+    }
+}
 
 impl ClassifiedError for HostError {
     fn metadata(&self) -> ErrorMetadata {
@@ -1092,7 +1112,7 @@ impl ClassifiedError for ReloadError {
             | Self::InvalidStateHandle
             | Self::Migration(_) => ErrorCode::NX6002,
             Self::Activation(_) => ErrorCode::NX6003,
-            Self::HostHashMismatch => ErrorCode::NX4001,
+            Self::HostContractIdMismatch => ErrorCode::NX4001,
             Self::InvalidState
             | Self::EpochNotNewer
             | Self::StagingCapacity
@@ -1185,7 +1205,11 @@ impl ClassifiedError for MigrationLimitError {
 fn compile_error_code(error: &CompileError) -> ErrorCode {
     match error {
         CompileError::AnalysisDiagnostic(diagnostic) => diagnostic.code,
-        CompileError::UnknownName { .. } | CompileError::DuplicateName { .. } => ErrorCode::NX2001,
+        CompileError::UnknownName { .. }
+        | CompileError::DuplicateName { .. }
+        | CompileError::MissingMain { .. } => ErrorCode::NX2001,
+        CompileError::MissingReplEntrypoint { .. } => ErrorCode::NX7010,
+        CompileError::InvalidReplEntrypoint { .. } => ErrorCode::NX7011,
         CompileError::UnknownType { .. }
         | CompileError::MissingReturn { .. }
         | CompileError::DeferCaptureLimit { .. }
@@ -1193,7 +1217,9 @@ fn compile_error_code(error: &CompileError) -> ErrorCode {
         | CompileError::TooManyRegisters { .. }
         | CompileError::Verify { .. } => ErrorCode::NX2002,
         CompileError::InvalidReloadMetadata { .. } => ErrorCode::NX6005,
-        CompileError::TypeMismatch { .. } => ErrorCode::NX2101,
+        CompileError::TypeMismatch { .. } | CompileError::InvalidMainSignature { .. } => {
+            ErrorCode::NX2101
+        }
     }
 }
 
@@ -1202,15 +1228,18 @@ fn compile_error_phase(error: &CompileError) -> DiagnosticPhase {
         CompileError::AnalysisDiagnostic(diagnostic) => analysis_diagnostic_phase(diagnostic.code),
         CompileError::UnknownName { .. }
         | CompileError::DuplicateName { .. }
-        | CompileError::UnknownType { .. } => DiagnosticPhase::Resolve,
-        CompileError::InvalidReloadMetadata { .. } | CompileError::TooManyRegisters { .. } => {
-            DiagnosticPhase::Lower
-        }
+        | CompileError::UnknownType { .. }
+        | CompileError::MissingMain { .. } => DiagnosticPhase::Resolve,
+        CompileError::InvalidReloadMetadata { .. }
+        | CompileError::TooManyRegisters { .. }
+        | CompileError::MissingReplEntrypoint { .. }
+        | CompileError::InvalidReplEntrypoint { .. } => DiagnosticPhase::Lower,
         CompileError::Verify { .. } => DiagnosticPhase::Verify,
         CompileError::TypeMismatch { .. }
         | CompileError::MissingReturn { .. }
         | CompileError::DeferCaptureLimit { .. }
-        | CompileError::InvalidEffect { .. } => DiagnosticPhase::TypeCheck,
+        | CompileError::InvalidEffect { .. }
+        | CompileError::InvalidMainSignature { .. } => DiagnosticPhase::TypeCheck,
     }
 }
 
@@ -1238,6 +1267,17 @@ fn write_compile_error(error: &CompileError, formatter: &mut fmt::Formatter<'_>)
             formatter.write_str("defer capture limit exceeded")
         }
         CompileError::InvalidEffect { .. } => formatter.write_str("invalid function effect"),
+        CompileError::MissingMain { entry_module, .. } => {
+            write!(
+                formatter,
+                "standalone entry module `{entry_module}` has no main"
+            )
+        }
+        CompileError::InvalidMainSignature { message, .. }
+        | CompileError::InvalidReplEntrypoint { message, .. } => formatter.write_str(message),
+        CompileError::MissingReplEntrypoint { .. } => {
+            formatter.write_str("compiled REPL cell is missing its transactional entrypoint")
+        }
         CompileError::InvalidReloadMetadata { message, .. } => {
             write!(formatter, "invalid reload metadata: {message}")
         }
@@ -1290,14 +1330,27 @@ fn host_request_code(error: &HostRequestError) -> ErrorCode {
 
 fn realm_error_code(error: &RealmError) -> ErrorCode {
     match error {
-        RealmError::HostHashMismatch | RealmError::MissingHostInterfaceHash => ErrorCode::NX4001,
-        RealmError::HostCapabilitiesUnavailable => ErrorCode::NX4002,
+        RealmError::HostContractIdMismatch
+        | RealmError::MissingHostContractRuntimeId
+        | RealmError::MissingHostFunctionAuthority(_)
+        | RealmError::HostFunctionAuthorityMismatch { .. }
+        | RealmError::MissingScriptExport(_)
+        | RealmError::ScriptExportMetadataMismatch(_) => ErrorCode::NX4001,
+        RealmError::HostCapabilitiesUnavailable | RealmError::ScriptExportNotCallable(_) => {
+            ErrorCode::NX4002
+        }
+        RealmError::MissingTransactionalCellExport(_) => ErrorCode::NX7010,
+        RealmError::TransactionalCellSignatureMismatch(_)
+        | RealmError::TransactionalCellEffectMismatch { .. } => ErrorCode::NX7011,
         RealmError::RuntimeHostClosing
         | RealmError::RuntimeHostClosed
         | RealmError::ModuleAllocation(_)
         | RealmError::EpochExhausted => ErrorCode::NX5004,
         RealmError::Reload(error) => error.metadata().code,
-        RealmError::State(_) | RealmError::SchemaHashMismatch => ErrorCode::NX6002,
+        RealmError::State(_)
+        | RealmError::SchemaHashMismatch
+        | RealmError::InvalidTransactionalStateExtension
+        | RealmError::InvalidTransactionalStateSeed => ErrorCode::NX6002,
         RealmError::Runtime(_)
         | RealmError::Interpreter(_)
         | RealmError::Host(_)
@@ -1309,6 +1362,8 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
         | RealmError::StaleTaskHandle
         | RealmError::CrossRealmTaskHandle
         | RealmError::TaskWaiting
+        | RealmError::TransactionalCellTerminalRecordMissing
+        | RealmError::TransactionalCellSetupRollbackFailed { .. }
         | RealmError::InjectedFailure(_) => ErrorCode::NX5001,
     }
 }
@@ -1359,17 +1414,17 @@ mod tests {
             ("NX2210", "Cannot infer constructor type"),
             ("NX2220", "? requires Result"),
             ("NX2221", "? error mismatch"),
-            ("NX2301", "Await outside Task"),
+            ("NX2301", "Await outside async function"),
             ("NX2302", "Missing await"),
             ("NX2401", "Invalid numeric conversion"),
             ("NX2501", "Invalid field access"),
-            ("NX2601", "Migration intrinsic outside Migration"),
+            ("NX2601", "Migration intrinsic outside @migration"),
             ("NX2602", "Missing finish_migration"),
             ("NX2603", "Missing forwarding"),
             ("NX2604", "Duplicate forwarding"),
             ("NX2701", "Module path mismatch"),
             ("NX2702", "Module cycle"),
-            ("NX2703", "Unknown import"),
+            ("NX2703", "Unknown use path"),
             ("NX2704", "Duplicate/ambiguous namespace"),
             ("NX2705", "Private access"),
             ("NX2706", "Invalid public API exposure"),
@@ -1377,12 +1432,12 @@ mod tests {
             ("NX2711", "Duplicate/colliding stable identity"),
             ("NX2720", "Invalid const expression"),
             ("NX2730", "Invalid package test"),
-            ("NX2740", "Invalid lifecycle/export location"),
+            ("NX2740", "Invalid lifecycle/entrypoint location"),
             ("NX3001", "Invalid bytecode section"),
             ("NX3002", "Invalid register range"),
             ("NX3003", "Invalid root map"),
             ("NX3004", "Invalid SourceMap"),
-            ("NX4001", "Host interface mismatch"),
+            ("NX4001", "Host contract mismatch"),
             ("NX4002", "Host capability unavailable"),
             ("NX4003", "Host argument mismatch"),
             ("NX5001", "Host result mismatch"),
@@ -1397,8 +1452,8 @@ mod tests {
             ("NX7002", "Invalid package manifest"),
             ("NX7003", "Package policy rejection"),
             ("NX7004", "Entitlement unavailable"),
-            ("NX7010", "Missing required export"),
-            ("NX7011", "Export signature mismatch"),
+            ("NX7010", "Missing required entrypoint"),
+            ("NX7011", "Entrypoint signature mismatch"),
             ("NX7101", "Handler yielded under MustComplete"),
             ("NX7102", "Handler waited under MustComplete"),
             ("NX7103", "Handler trapped"),

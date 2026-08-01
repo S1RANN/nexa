@@ -1,8 +1,7 @@
 {
   "nexa": {
     "declarationKeywords": [
-      "module",
-      "import",
+      "use",
       "as",
       "fn",
       "struct",
@@ -15,20 +14,16 @@
       "package"
     ],
     "effectKeywords": [
-      "task",
-      "immediate",
-      "migration",
-      "cleanup"
+      "async"
     ],
     "statementKeywords": [
       "return",
       "let",
-      "var",
+      "mut",
       "if",
       "else",
       "while",
       "match",
-      "with",
       "new",
       "await",
       "yield",
@@ -39,8 +34,12 @@
       "continue"
     ],
     "attributeKeywords": [
-      "stateful",
+      "state",
+      "fuel",
+      "migration",
       "activation",
+      "cleanup",
+      "immediate",
       "stable",
       "test"
     ],
@@ -61,13 +60,9 @@
       "Buffer",
       "Option",
       "Result",
-      "Task",
-      "HostRequest",
-      "ResourceToken",
+      "Token",
       "Snapshot",
-      "StateHandle",
-      "StableId",
-      "StateHandleError"
+      "StateHandle"
     ],
     "constructors": [
       "Some",
@@ -88,17 +83,22 @@
   },
   "nidl": {
     "declarationKeywords": [
-      "interface",
-      "opaque",
+      "contract",
       "struct",
       "enum",
-      "fn",
-      "export"
+      "handle"
     ],
     "modeKeywords": [
-      "sync",
-      "request",
-      "fuel"
+      "host",
+      "nexa",
+      "fn",
+      "async"
+    ],
+    "attributeKeywords": [
+      "fuel",
+      "cancel",
+      "abandon",
+      "capability"
     ],
     "policyKeywords": [
       "return_error",
@@ -113,16 +113,12 @@
       "bool",
       "rune",
       "string",
-      "host_request",
-      "request",
-      "resource_token",
-      "token",
-      "snapshot",
-      "array",
-      "buffer",
+      "Array",
+      "Buffer",
       "Option",
       "Result",
-      "void"
+      "Token",
+      "Snapshot"
     ]
   }
 }

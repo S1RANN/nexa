@@ -30,6 +30,13 @@ struct FixturePackage {
 }
 
 fn application_manifest(dependency: bool) -> Arc<PackageManifest> {
+    application_manifest_with_capabilities(dependency, &[])
+}
+
+fn application_manifest_with_capabilities(
+    dependency: bool,
+    capabilities: &[&str],
+) -> Arc<PackageManifest> {
     let dependency = dependency.then_some(
         r#"
 
@@ -37,6 +44,11 @@ fn application_manifest(dependency: bool) -> Arc<PackageManifest> {
 shared_api = { path = "../lib" }
 "#,
     );
+    let capabilities = capabilities
+        .iter()
+        .map(|capability| format!("\"{capability}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
     Arc::new(
         PackageManifest::parse(&format!(
             r#"
@@ -48,6 +60,7 @@ version = "1.0.0"
 source_root = "src"
 entry = "app.main"
 activation = "programmatic"
+capabilities = [{capabilities}]
 {}"#,
             dependency.unwrap_or_default()
         ))
@@ -194,8 +207,9 @@ fn resolved_input_with_contract_and_options(
             .collect(),
         host_contract: host_contract.to_vec(),
         host_contract_source: host_contract_source.clone(),
-        host_required_exports: Vec::new(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: Vec::new(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -215,7 +229,7 @@ fn resolved_input_with_contract_and_options(
         lock,
         host_contract,
         host_contract_source,
-        fingerprint_input.host_required_exports.clone(),
+        fingerprint_input.host_required_entrypoints.clone(),
         compilation_options,
         fingerprint_input,
     )
@@ -325,8 +339,8 @@ fn assert_primary(diagnostic: &Diagnostic, source: &SourceIdentity, range: ByteR
 fn host_environment() -> AnalysisEnvironment {
     AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "FixtureHost".into(),
-            interface_stable_id: StableId::from_name("FixtureHost"),
+            contract_name: "FixtureHost".into(),
+            contract_stable_id: StableId::from_name("FixtureHost"),
             types: Vec::new(),
             functions: vec![HostFunctionSurface {
                 name: "clock".into(),
@@ -334,13 +348,15 @@ fn host_environment() -> AnalysisEnvironment {
                 result: SurfaceType::I32,
                 mode: HostFunctionMode::Sync,
                 stable_id: StableId::from_name("FixtureHost.clock"),
+                declaration_fingerprint: [0x41; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result: None,
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: None,
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: None,
         }),
         ..AnalysisEnvironment::default()
@@ -365,8 +381,8 @@ fn host_environment_with_clock(result: SurfaceType, mode: HostFunctionMode) -> A
     });
     AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "FixtureHost".into(),
-            interface_stable_id: StableId::from_name("FixtureHost"),
+            contract_name: "FixtureHost".into(),
+            contract_stable_id: StableId::from_name("FixtureHost"),
             types: Vec::new(),
             functions: vec![HostFunctionSurface {
                 name: "clock".into(),
@@ -374,13 +390,15 @@ fn host_environment_with_clock(result: SurfaceType, mode: HostFunctionMode) -> A
                 result,
                 mode,
                 stable_id: StableId::from_name("FixtureHost.clock"),
+                declaration_fingerprint: [0x41; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result,
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: None,
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: None,
         }),
         ..AnalysisEnvironment::default()
@@ -478,7 +496,7 @@ source_root = "src"
             id,
             &[(
                 "src/math.nexa",
-                "module math;\npub fn value() -> i32 { return 1; }\n",
+                "pub fn value() -> i32 { return 1; }\n",
                 SourceRole::Production,
             )],
         ),
@@ -526,10 +544,9 @@ fn called_value_package(outcome: &AnalysisOutcome) -> String {
 fn mixed_import_fixture(
     compilation_options: CompilationOptions,
 ) -> (ResolvedBuildInput, AnalysisEnvironment, &'static str) {
-    const MAIN: &str = "module app.main;\nimport app.util as local;\nimport shared_api.math as dependency;\nimport std.core as standard;\nimport fixture.static as static_api;\nimport host as host_api;\npub fn run() -> i32 { return 0; }\n";
-    const UTIL: &str = "module app.util;\npub(package) fn value() -> i32 { return 1; }\n";
-    const LIBRARY: &str =
-        "module math;\npub fn twice(value: i32) -> i32 { return value + value; }\n";
+    const MAIN: &str = "use package::app::util as local;\nuse shared_api::math as dependency;\nuse std::core as standard;\nuse fixture::static as static_api;\nuse host::fixture_host as host_api;\npub fn run() -> i32 { return 0; }\n";
+    const UTIL: &str = "pub(package) fn value() -> i32 { return 1; }\n";
+    const LIBRARY: &str = "pub fn twice(value: i32) -> i32 { return value + value; }\n";
     let dependency = dependency_fixture(&[("src/math.nexa", LIBRARY, SourceRole::Production)]);
     let input = resolved_input_with_options(
         root_fixture(
@@ -575,7 +592,7 @@ fn imports_per_module_counts_every_resolved_namespace_kind() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(main, "import host as host_api;"),
+        range(main, "use host::fixture_host as host_api;"),
     );
 
     let edges = main_import_edges(&outcome);
@@ -638,15 +655,14 @@ fn module_edge_limit_counts_non_source_imports_across_the_closure() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(main, "import host as host_api;"),
+        range(main, "use host::fixture_host as host_api;"),
     );
     assert_eq!(main_import_edges(&outcome).len(), 5);
 }
 
 #[test]
 fn dynamic_while_limit_changes_both_build_identity_and_typed_ir() {
-    const SOURCE: &str =
-        "module app.main;\npub fn run() -> unit {\n    while false { break; }\n}\n";
+    const SOURCE: &str = "pub fn run() -> unit {\n    while false { break; }\n}\n";
     let build = |max_while_iterations| {
         let options = CompilationOptions {
             max_while_iterations,
@@ -696,7 +712,7 @@ fn dynamic_while_limit_changes_both_build_identity_and_typed_ir() {
 
 #[test]
 fn assignable_places_and_index_key_types_match_typed_codegen() {
-    const SOURCE: &str = "module app.main;\nstruct Record { value: i32; }\nclass Boxed { value: i32; }\npub fn run(buffer: Buffer<i32>) -> i32 {\n    let object: Boxed = new Boxed { value: 0 };\n    object.value = 1;\n    let record: Record = Record { value: 1 };\n    let changed: Record = record with { value: 2 };\n    let array: Array<i32> = [0];\n    array[0] = changed.value;\n    let table: Map<bool, i32> = Map.new<bool, i32>();\n    table[true] = object.value;\n    buffer[0] = table[true];\n    return buffer[0];\n}\n";
+    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { mut value: i32, }\npub fn run(buffer: Buffer<i32>) -> i32 {\n    let object: Boxed = new Boxed { value: 0 };\n    object.value = 1;\n    let record: Record = Record { value: 1 };\n    let changed: Record = Record { value: 2, ..record };\n    let array: Array<i32> = [0];\n    array[0] = changed.value;\n    let table: Map<bool, i32> = Map::new();\n    table[true] = object.value;\n    buffer[0] = table[true];\n    return buffer[0];\n}\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -714,8 +730,8 @@ fn assignable_places_and_index_key_types_match_typed_codegen() {
 }
 
 #[test]
-fn analyzer_rejects_places_updates_and_equality_codegen_cannot_lower() {
-    const SOURCE: &str = "module app.main;\nstruct Record { value: i32; }\nclass Boxed { value: i32; }\npub fn run() -> bool {\n    let record: Record = Record { value: 1 };\n    record.value = 2;\n    let object: Boxed = new Boxed { value: 1 };\n    let copied = object with { value: 2 };\n    let text: string = \"abc\";\n    text[0] = 'x';\n    let values: Array<i32> = [1];\n    return values == values;\n}\n";
+fn analyzer_rejects_immutable_places_and_noncomparable_values() {
+    const SOURCE: &str = "struct Record { value: i32, }\nclass Boxed { value: i32, }\npub fn run() -> bool {\n    let record: Record = Record { value: 1 };\n    record.value = 2;\n    let object: Boxed = new Boxed { value: 1 };\n    object.value = 2;\n    let text: string = \"abc\";\n    text[0] = 'x';\n    let values: Array<i32> = [1];\n    return values == values;\n}\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -724,18 +740,21 @@ fn analyzer_rejects_places_updates_and_equality_codegen_cannot_lower() {
         &[],
     );
     let outcome = analyze_deterministically(&input, &AnalysisEnvironment::default());
-    let diagnostics = diagnostics_with_code(&outcome, ErrorCode::NX2101);
+    let diagnostics = outcome.diagnostics.diagnostics();
     assert_eq!(diagnostics.len(), 4, "{diagnostics:#?}");
     assert_eq!(
         diagnostics
             .iter()
-            .map(|diagnostic| diagnostic.message.as_ref())
+            .map(|diagnostic| (diagnostic.code, diagnostic.message.as_ref()))
             .collect::<Vec<_>>(),
         [
-            "only class fields are assignable",
-            "`with` requires a struct value",
-            "assignment index requires Array, Map, or Buffer",
-            "invalid binary operand type",
+            (ErrorCode::NX2501, "binding `record` is immutable",),
+            (ErrorCode::NX2501, "class field `value` is immutable",),
+            (
+                ErrorCode::NX2101,
+                "assignment index requires Array, Map, or Buffer",
+            ),
+            (ErrorCode::NX2101, "invalid binary operand type"),
         ]
     );
     assert!(outcome.ir.is_none());
@@ -743,7 +762,7 @@ fn analyzer_rejects_places_updates_and_equality_codegen_cannot_lower() {
 
 #[test]
 fn type_mismatch_points_at_expression_and_carries_structured_types() {
-    const SOURCE: &str = "module app.main;\npub fn run() -> i32 { return true; }\n";
+    const SOURCE: &str = "pub fn run() -> i32 { return true; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -770,11 +789,11 @@ fn type_mismatch_points_at_expression_and_carries_structured_types() {
 
 #[test]
 fn return_statements_strictly_distinguish_unit_from_recovery_types() {
-    const MISSING_VALUE: &str = "module app.main;\nfn bad() -> i32 { return; }\n";
-    const UNEXPECTED_VALUE: &str = "module app.main;\nfn bad() -> unit { return 1; }\n";
-    const RECOVERY_VALUE: &str = "module app.main;\nfn bad() -> i32 { return missing; }\n";
+    const MISSING_VALUE: &str = "fn bad() -> i32 { return; }\n";
+    const UNEXPECTED_VALUE: &str = "fn bad() -> unit { return 1; }\n";
+    const RECOVERY_VALUE: &str = "fn bad() -> i32 { return missing; }\n";
     const UNIT_CALL_WITH_BAD_ARGUMENT: &str = concat!(
-        "module app.main;\n",
+        "",
         "fn sink(value: i32) -> unit {}\n",
         "fn bad() -> i32 { return sink(true); }\n",
     );
@@ -820,7 +839,7 @@ fn return_statements_strictly_distinguish_unit_from_recovery_types() {
 
 #[test]
 fn enum_match_reports_missing_variants_on_the_whole_match() {
-    const SOURCE: &str = "module app.main;\nenum Choice { A, B }\nfn run(value: Choice) -> i32 { return match value { A => 1 }; }\n";
+    const SOURCE: &str = "enum Choice { A, B }\nfn run(value: Choice) -> i32 { return match value { Choice::A => 1 }; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -833,7 +852,7 @@ fn enum_match_reports_missing_variants_on_the_whole_match() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(SOURCE, "match value { A => 1 }"),
+        range(SOURCE, "match value { Choice::A => 1 }"),
     );
     assert!(
         diagnostic
@@ -851,7 +870,7 @@ fn enum_match_reports_missing_variants_on_the_whole_match() {
 
 #[test]
 fn enum_match_reports_duplicate_arm_and_first_arm_exactly() {
-    const SOURCE: &str = "module app.main;\nenum Choice { A }\nfn run(value: Choice) -> i32 { return match value { A => 1, A => 2 }; }\n";
+    const SOURCE: &str = "enum Choice { A }\nfn run(value: Choice) -> i32 { return match value { Choice::A => 1, Choice::A => 2 }; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -864,7 +883,7 @@ fn enum_match_reports_duplicate_arm_and_first_arm_exactly() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(SOURCE, "A => 2"),
+        range(SOURCE, "Choice::A => 2"),
     );
     let secondary = diagnostic
         .labels
@@ -872,7 +891,7 @@ fn enum_match_reports_duplicate_arm_and_first_arm_exactly() {
         .filter(|label| label.style == LabelStyle::Secondary)
         .collect::<Vec<_>>();
     assert_eq!(secondary.len(), 1);
-    assert_eq!(secondary[0].range, range(SOURCE, "A => 1"));
+    assert_eq!(secondary[0].range, range(SOURCE, "Choice::A => 1"));
     assert!(
         diagnostic
             .notes
@@ -883,16 +902,16 @@ fn enum_match_reports_duplicate_arm_and_first_arm_exactly() {
 
 #[test]
 fn constructor_and_try_diagnostics_are_structured_and_source_exact() {
-    const CONSTRUCTOR: &str = "module app.main;\nfn run() -> i32 { let value = None; return 0; }\n";
-    const NON_RESULT: &str = "module app.main;\nfn run() -> i32 { return 1?; }\n";
-    const ERROR_MISMATCH: &str = "module app.main;\nfn run() -> Result<i32, bool> { let value: Result<i32, i32> = Err(1); return value?; }\n";
+    const CONSTRUCTOR: &str = "fn run() -> i32 { let value = Option::None; return 0; }\n";
+    const NON_RESULT: &str = "fn run() -> i32 { return 1?; }\n";
+    const ERROR_MISMATCH: &str = "fn run() -> Result<i32, bool> { let value: Result<i32, i32> = Result::Err(1); return value?; }\n";
 
     let constructor = analyze_main_source(CONSTRUCTOR);
     let diagnostic = one_diagnostic(&constructor, ErrorCode::NX2210);
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(CONSTRUCTOR, "None"),
+        range(CONSTRUCTOR, "Option::None"),
     );
 
     let non_result = analyze_main_source(NON_RESULT);
@@ -927,16 +946,18 @@ fn constructor_and_try_diagnostics_are_structured_and_source_exact() {
 }
 
 #[test]
-fn task_diagnostics_point_at_await_and_the_unawaited_call() {
-    const OUTSIDE_TASK: &str = "module app.main;\nfn work() -> i32 { return 1; }\nfn run() -> i32 { return await work(); }\n";
-    const MISSING_AWAIT: &str = "module app.main;\ntask fn work() -> i32 { return 1; }\ntask fn run() -> i32 { return work(); }\n";
+fn async_diagnostics_point_at_await_and_the_unawaited_call() {
+    const OUTSIDE_TASK: &str =
+        "fn work() -> i32 { return 1; }\nfn run() -> i32 { return work().await; }\n";
+    const MISSING_AWAIT: &str =
+        "async fn work() -> i32 { return 1; }\nasync fn run() -> i32 { return work(); }\n";
 
     let outside_task = analyze_main_source(OUTSIDE_TASK);
     let diagnostic = one_diagnostic(&outside_task, ErrorCode::NX2301);
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(OUTSIDE_TASK, "await"),
+        range(OUTSIDE_TASK, ".await"),
     );
 
     let missing_await = analyze_main_source(MISSING_AWAIT);
@@ -949,21 +970,22 @@ fn task_diagnostics_point_at_await_and_the_unawaited_call() {
 }
 
 #[test]
-fn task_await_rejects_literal_and_ordinary_function_operands() {
-    const LITERAL: &str = "module app.main;\ntask fn run() -> i32 { return await 1; }\n";
-    const ORDINARY: &str = "module app.main;\nfn ordinary() -> i32 { return 1; }\ntask fn run() -> i32 { return await ordinary(); }\n";
+fn async_await_rejects_literal_and_ordinary_function_operands() {
+    const LITERAL: &str = "async fn run() -> i32 { return 1.await; }\n";
+    const ORDINARY: &str =
+        "fn ordinary() -> i32 { return 1; }\nasync fn run() -> i32 { return ordinary().await; }\n";
 
-    for (source, operand) in [(LITERAL, "1"), (ORDINARY, "ordinary()")] {
+    for source in [LITERAL, ORDINARY] {
         let outcome = analyze_main_source(source);
         let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2301);
         assert_primary(
             diagnostic,
             &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-            last_range(source, operand),
+            last_range(source, ".await"),
         );
         assert_eq!(
             diagnostic.message.as_ref(),
-            "await requires a Task or Host Request operand"
+            "`.await` requires an asynchronous call result"
         );
         assert!(
             outcome.ir.is_none(),
@@ -974,9 +996,9 @@ fn task_await_rejects_literal_and_ordinary_function_operands() {
 
 #[test]
 fn conversion_and_field_diagnostics_point_at_the_complete_invalid_expression() {
-    const CONVERSION: &str =
-        "module app.main;\nfn run() -> i32 { let value: i64 = 1; return value; }\n";
-    const FIELD: &str = "module app.main;\nstruct Record { value: i32; }\nfn run(record: Record) -> i32 { return record.missing; }\n";
+    const CONVERSION: &str = "fn run() -> i32 { let value: i64 = 1; return value; }\n";
+    const FIELD: &str =
+        "struct Record { value: i32, }\nfn run(record: Record) -> i32 { return record.missing; }\n";
 
     let conversion = analyze_main_source(CONVERSION);
     let diagnostic = one_diagnostic(&conversion, ErrorCode::NX2401);
@@ -997,11 +1019,10 @@ fn conversion_and_field_diagnostics_point_at_the_complete_invalid_expression() {
 
 #[test]
 fn migration_diagnostics_enforce_context_finalization_and_exact_forwarding() {
-    const OUTSIDE: &str = "module app.main;\nfn run() -> i32 { return old.get<i32>(legacy); }\n";
-    const UNFINISHED: &str =
-        "module app.main;\npub migration fn migrate() -> bool { return true; }\n";
-    const MISSING_FORWARDING: &str = "module app.main;\npub migration fn migrate() -> bool { old.get<i32>(legacy); finish_migration(); return true; }\n";
-    const DUPLICATE_FORWARDING: &str = "module app.main;\npub migration fn migrate() -> bool { preserve(legacy); preserve(legacy); finish_migration(); return true; }\n";
+    const OUTSIDE: &str = "fn run() -> i32 { return old.get<i32>(legacy); }\n";
+    const UNFINISHED: &str = "@migration\npub fn migrate() -> bool { return true; }\n";
+    const MISSING_FORWARDING: &str = "@migration\npub fn migrate() -> bool { old.get<i32>(legacy); finish_migration(); return true; }\n";
+    const DUPLICATE_FORWARDING: &str = "@migration\npub fn migrate() -> bool { preserve(legacy); preserve(legacy); finish_migration(); return true; }\n";
 
     let outside = analyze_main_source(OUTSIDE);
     let diagnostic = one_diagnostic(&outside, ErrorCode::NX2601);
@@ -1047,11 +1068,12 @@ fn migration_diagnostics_enforce_context_finalization_and_exact_forwarding() {
 
 #[test]
 fn migration_cfg_tracks_mutually_exclusive_branches_and_every_normal_exit() {
-    const BRANCH_OK: &str = "module app.main;\npub migration fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    old.get<i32>(legacy);\n    if flag { preserve(legacy); } else { delete(legacy); }\n    finish_migration();\n    return true;\n}\n";
-    const EXIT_OK: &str = "module app.main;\npub migration fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { finish_migration(); return true; }\n    finish_migration();\n    return true;\n}\n";
-    const CROSS_BRANCH_MISSING: &str = "module app.main;\npub migration fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { old.get<i32>(legacy); } else { preserve(legacy); }\n    finish_migration();\n    return true;\n}\n";
-    const CONDITIONAL_FINISH: &str = "module app.main;\npub migration fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { finish_migration(); }\n    return true;\n}\n";
-    const UNREACHABLE_FINISH: &str = "module app.main;\npub migration fn migrate() -> bool {\n    return true;\n    finish_migration();\n}\n";
+    const BRANCH_OK: &str = "@migration\npub fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    old.get<i32>(legacy);\n    if flag { preserve(legacy); } else { delete(legacy); }\n    finish_migration();\n    return true;\n}\n";
+    const EXIT_OK: &str = "@migration\npub fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { finish_migration(); return true; }\n    finish_migration();\n    return true;\n}\n";
+    const CROSS_BRANCH_MISSING: &str = "@migration\npub fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { old.get<i32>(legacy); } else { preserve(legacy); }\n    finish_migration();\n    return true;\n}\n";
+    const CONDITIONAL_FINISH: &str = "@migration\npub fn migrate() -> bool {\n    let flag: bool = old.get<bool>(switch);\n    preserve(switch);\n    if flag { finish_migration(); }\n    return true;\n}\n";
+    const UNREACHABLE_FINISH: &str =
+        "@migration\npub fn migrate() -> bool {\n    return true;\n    finish_migration();\n}\n";
 
     for source in [BRANCH_OK, EXIT_OK] {
         let outcome = analyze_main_source(source);
@@ -1081,12 +1103,12 @@ fn migration_cfg_tracks_mutually_exclusive_branches_and_every_normal_exit() {
 
 #[test]
 fn migration_cfg_models_short_circuit_try_finalization_barrier_and_loops() {
-    const SHORT_CIRCUIT: &str = "module app.main;\npub migration fn migrate() -> bool {\n    false && finish_migration();\n    return true;\n}\n";
-    const TRY_EXIT: &str = "module app.main;\npub migration fn migrate() -> Result<bool, i32> {\n    let value: bool = old.get<Result<bool, i32>>(legacy)?;\n    preserve(legacy);\n    finish_migration();\n    return Ok(value);\n}\n";
-    const AFTER_FINISH: &str = "module app.main;\npub migration fn migrate() -> bool {\n    old.get<i32>(legacy);\n    finish_migration();\n    preserve(legacy);\n    return true;\n}\n";
-    const MULTIPLE_FINISH: &str = "module app.main;\npub migration fn migrate() -> bool {\n    finish_migration();\n    finish_migration();\n    return true;\n}\n";
-    const LOOP_DUPLICATE: &str = "module app.main;\npub migration fn migrate() -> bool {\n    for step in 0..2 { preserve(legacy); continue; }\n    finish_migration();\n    return true;\n}\n";
-    const LOOP_BREAK_OK: &str = "module app.main;\npub migration fn migrate() -> bool {\n    for step in 0..10 { preserve(legacy); break; }\n    finish_migration();\n    return true;\n}\n";
+    const SHORT_CIRCUIT: &str = "@migration\npub fn migrate() -> bool {\n    false && finish_migration();\n    return true;\n}\n";
+    const TRY_EXIT: &str = "@migration\npub fn migrate() -> Result<bool, i32> {\n    let value: bool = old.get<Result<bool, i32>>(legacy)?;\n    preserve(legacy);\n    finish_migration();\n    return Result::Ok(value);\n}\n";
+    const AFTER_FINISH: &str = "@migration\npub fn migrate() -> bool {\n    old.get<i32>(legacy);\n    finish_migration();\n    preserve(legacy);\n    return true;\n}\n";
+    const MULTIPLE_FINISH: &str = "@migration\npub fn migrate() -> bool {\n    finish_migration();\n    finish_migration();\n    return true;\n}\n";
+    const LOOP_DUPLICATE: &str = "@migration\npub fn migrate() -> bool {\n    for step in 0..2 { preserve(legacy); continue; }\n    finish_migration();\n    return true;\n}\n";
+    const LOOP_BREAK_OK: &str = "@migration\npub fn migrate() -> bool {\n    for step in 0..10 { preserve(legacy); break; }\n    finish_migration();\n    return true;\n}\n";
 
     for source in [SHORT_CIRCUIT, TRY_EXIT, AFTER_FINISH, MULTIPLE_FINISH] {
         let outcome = analyze_main_source(source);
@@ -1118,10 +1140,10 @@ fn migration_cfg_models_short_circuit_try_finalization_barrier_and_loops() {
 
 #[test]
 fn migration_static_ranges_propagate_each_binding_and_model_zero_break_continue() {
-    const ZERO_ITERATIONS: &str = "module app.main;\npub migration fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..0 { preserve(legacy); }\n    finish_migration();\n    return true;\n}\n";
-    const ONE_ITERATION: &str = "module app.main;\npub migration fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..1 { if step == 0 { preserve(legacy); } }\n    finish_migration();\n    return true;\n}\n";
-    const BINDING_DEPENDENT: &str = "module app.main;\npub migration fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..2 {\n        if step == 0 { preserve(legacy); continue; }\n        break;\n    }\n    finish_migration();\n    return true;\n}\n";
-    const DUPLICATE_ON_SECOND: &str = "module app.main;\npub migration fn migrate() -> bool {\n    for step in 0..2 {\n        if step < 2 { preserve(legacy); }\n    }\n    finish_migration();\n    return true;\n}\n";
+    const ZERO_ITERATIONS: &str = "@migration\npub fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..0 { preserve(legacy); }\n    finish_migration();\n    return true;\n}\n";
+    const ONE_ITERATION: &str = "@migration\npub fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..1 { if step == 0 { preserve(legacy); } }\n    finish_migration();\n    return true;\n}\n";
+    const BINDING_DEPENDENT: &str = "@migration\npub fn migrate() -> bool {\n    old.get<i32>(legacy);\n    for step in 0..2 {\n        if step == 0 { preserve(legacy); continue; }\n        break;\n    }\n    finish_migration();\n    return true;\n}\n";
+    const DUPLICATE_ON_SECOND: &str = "@migration\npub fn migrate() -> bool {\n    for step in 0..2 {\n        if step < 2 { preserve(legacy); }\n    }\n    finish_migration();\n    return true;\n}\n";
 
     let zero = analyze_main_source(ZERO_ITERATIONS);
     assert_eq!(
@@ -1149,7 +1171,8 @@ fn migration_static_ranges_propagate_each_binding_and_model_zero_break_continue(
 
 #[test]
 fn static_range_binding_is_read_only() {
-    const SOURCE: &str = "module app.main;\npub fn run() -> i32 {\n    for step in 0..2 { step = 0; }\n    return 0;\n}\n";
+    const SOURCE: &str =
+        "pub fn run() -> i32 {\n    for step in 0..2 { step = 0; }\n    return 0;\n}\n";
     let outcome = analyze_main_source(SOURCE);
 
     assert!(outcome.ir.is_none());
@@ -1166,10 +1189,10 @@ fn static_range_binding_is_read_only() {
 }
 
 #[test]
-fn migration_intrinsics_require_exact_stateful_owners_and_targets() {
-    const WRONG_OLD_OWNER: &str = "module app.main;\n@stateful(1) class Left { value: i32; }\n@stateful(1) class Right { value: i32; }\npub migration fn migrate() -> bool {\n    let object: Left = old.get<Left>(legacy);\n    old.field<i32>(object, Right.value);\n    preserve(legacy);\n    finish_migration();\n    return true;\n}\n";
-    const WRONG_NEW_OWNER: &str = "module app.main;\n@stateful(1) class Left { value: i32; }\n@stateful(1) class Right { value: i32; }\npub migration fn migrate() -> bool {\n    let object: Left = new.create<Left>(replacement);\n    new.set(object, Right.value, 1);\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
-    const WRONG_REPLACE_TARGET: &str = "module app.main;\nstruct Plain { value: i32; }\npub migration fn migrate() -> bool {\n    let object: Plain = Plain { value: 1 };\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
+fn migration_intrinsics_require_exact_state_class_owners_and_targets() {
+    const WRONG_OLD_OWNER: &str = "@state(version = 1) class Left { mut value: i32, }\n@state(version = 1) class Right { mut value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = old.get<Left>(legacy);\n    old.field<i32>(object, Right::value);\n    preserve(legacy);\n    finish_migration();\n    return true;\n}\n";
+    const WRONG_NEW_OWNER: &str = "@state(version = 1) class Left { mut value: i32, }\n@state(version = 1) class Right { mut value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Left = new.create<Left>(replacement);\n    new.set(object, Right::value, 1);\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
+    const WRONG_REPLACE_TARGET: &str = "struct Plain { value: i32, }\n@migration\npub fn migrate() -> bool {\n    let object: Plain = Plain { value: 1 };\n    replace(legacy, object);\n    finish_migration();\n    return true;\n}\n";
 
     for source in [WRONG_OLD_OWNER, WRONG_NEW_OWNER, WRONG_REPLACE_TARGET] {
         let outcome = analyze_main_source(source);
@@ -1183,36 +1206,37 @@ fn migration_intrinsics_require_exact_stateful_owners_and_targets() {
 }
 
 #[test]
-fn direct_stateful_construction_is_rejected_for_literal_and_new_syntax() {
-    const SOURCE: &str = r"module app.main;
-@stateful(1) class State { value: i32; }
+fn direct_state_class_construction_is_rejected_for_literal_and_new_syntax() {
+    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
 fn construct_literal() -> State { return State { value: 1 }; }
 fn construct_new() -> State { return new State { value: 2 }; }
 ";
     let outcome = analyze_main_source(SOURCE);
-    let diagnostics = diagnostics_with_code(&outcome, ErrorCode::NX2101)
-        .into_iter()
-        .filter(|diagnostic| {
-            diagnostic
-                .message
-                .contains("@stateful values cannot be constructed directly")
-        })
-        .collect::<Vec<_>>();
+    let diagnostics = diagnostics_with_code(&outcome, ErrorCode::NX2101);
     assert_eq!(diagnostics.len(), 2, "{:#?}", outcome.diagnostics);
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_ref())
+            .collect::<Vec<_>>(),
+        [
+            "Class construction requires `new`; a Struct constructor cannot name this type",
+            "@state Class values cannot be constructed directly",
+        ]
+    );
     assert!(outcome.ir.is_none());
 }
 
 #[test]
-fn direct_stateful_field_read_is_rejected() {
-    const SOURCE: &str = r"module app.main;
-@stateful(1) class State { value: i32; }
+fn direct_state_class_field_read_is_rejected() {
+    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
 fn read(state: State) -> i32 { return state.value; }
 ";
     let outcome = analyze_main_source(SOURCE);
     let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2101);
     assert_eq!(
         diagnostic.message.as_ref(),
-        "@stateful fields cannot be accessed directly"
+        "@state fields cannot be accessed directly"
     );
     assert_primary(
         diagnostic,
@@ -1223,9 +1247,8 @@ fn read(state: State) -> i32 { return state.value; }
 }
 
 #[test]
-fn direct_stateful_field_assignment_is_rejected() {
-    const SOURCE: &str = r"module app.main;
-@stateful(1) class State { value: i32; }
+fn direct_state_class_field_assignment_is_rejected() {
+    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
 fn write(state: State) -> i32 {
     state.value = 1;
     return 0;
@@ -1235,7 +1258,7 @@ fn write(state: State) -> i32 {
     let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2101);
     assert_eq!(
         diagnostic.message.as_ref(),
-        "@stateful fields cannot be accessed directly"
+        "@state fields cannot be accessed directly"
     );
     assert_primary(
         diagnostic,
@@ -1246,17 +1269,17 @@ fn write(state: State) -> i32 {
 }
 
 #[test]
-fn migration_intrinsics_and_state_handle_resolution_remain_the_stateful_value_paths() {
-    const SOURCE: &str = r"module app.main;
-@stateful(1) class State { value: i32; }
+fn migration_intrinsics_and_state_handle_resolution_remain_the_state_value_paths() {
+    const SOURCE: &str = r"@state(version = 1) class State { mut value: i32, }
 fn resolve(handle: StateHandle<State>) -> Result<State, StateHandleError> {
     return handle.resolve();
 }
-pub migration fn migrate() -> bool {
+@migration
+pub fn migrate() -> bool {
     let old_state: State = old.get<State>(legacy);
-    let value: i32 = old.field<i32>(old_state, State.value);
+    let value: i32 = old.field<i32>(old_state, State::value);
     let replacement: State = new.create<State>(replacement);
-    new.set(replacement, State.value, value);
+    new.set(replacement, State::value, value);
     replace(legacy, replacement);
     finish_migration();
     return true;
@@ -1279,7 +1302,8 @@ pub migration fn migrate() -> bool {
 
 #[test]
 fn generated_defer_cleanup_has_an_analysis_assigned_stable_symbol() {
-    const SOURCE: &str = "module app.main;\npub fn run() -> i32 {\n    let value: i32 = 1;\n    defer value;\n    return value;\n}\n";
+    const SOURCE: &str =
+        "pub fn run() -> i32 {\n    let value: i32 = 1;\n    defer value;\n    return value;\n}\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1316,8 +1340,9 @@ fn generated_defer_cleanup_has_an_analysis_assigned_stable_symbol() {
 
 #[test]
 fn cross_file_namespace_call_resolves_into_typed_package_ir() {
-    const MAIN: &str = "module app.main;\nimport app.util as util;\npub fn run() -> i32 { return util.value(); }\n";
-    const UTIL: &str = "module app.util;\npub(package) fn value() -> i32 { return 41 + 1; }\n";
+    const MAIN: &str =
+        "use package::app::util as util;\npub fn run() -> i32 { return util::value(); }\n";
+    const UTIL: &str = "pub(package) fn value() -> i32 { return 41 + 1; }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1355,7 +1380,7 @@ fn cross_file_namespace_call_resolves_into_typed_package_ir() {
         .find(|reference| reference.target == target.id)
         .expect("namespace call resolves to the utility definition");
     assert_eq!(reference.span.source.path.as_str(), "src/app/main.nexa");
-    let expected = range(MAIN, "util.value");
+    let expected = range(MAIN, "util::value");
     assert_eq!(
         (reference.span.start, reference.span.end),
         (expected.start, expected.end)
@@ -1364,8 +1389,9 @@ fn cross_file_namespace_call_resolves_into_typed_package_ir() {
 
 #[test]
 fn imported_namespace_value_fields_and_method_lower_from_the_nominal_receiver() {
-    const MAIN: &str = "module app.main;\nimport app.util as u;\npub fn run() -> i32 { return u.value.text.len(); }\n";
-    const UTIL: &str = "module app.util;\npub(package) struct Record { text: string; }\npub(package) const value: Record = Record { text: \"scale\", };\n";
+    const MAIN: &str =
+        "use package::app::util as u;\npub fn run() -> i32 { return u::VALUE.text.len(); }\n";
+    const UTIL: &str = "pub(package) struct Record { text: string, }\npub(package) const VALUE: Record = Record { text: \"scale\", };\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1387,8 +1413,9 @@ fn imported_namespace_value_fields_and_method_lower_from_the_nominal_receiver() 
 
 #[test]
 fn dependency_namespace_value_field_and_method_use_the_dependency_nominal_owner() {
-    const MAIN: &str = "module app.main;\nimport shared_api.math as u;\npub fn run() -> i32 { return u.value.text.len(); }\n";
-    const LIBRARY: &str = "module math;\npub struct Record { text: string; }\npub const value: Record = Record { text: \"dependency\", };\n";
+    const MAIN: &str =
+        "use shared_api::math as u;\npub fn run() -> i32 { return u::VALUE.text.len(); }\n";
+    const LIBRARY: &str = "pub struct Record { text: string, }\npub const VALUE: Record = Record { text: \"dependency\", };\n";
     let dependency = dependency_fixture(&[("src/math.nexa", LIBRARY, SourceRole::Production)]);
     let input = resolved_input(
         root_fixture(&[("src/app/main.nexa", MAIN, SourceRole::Production)], true),
@@ -1405,20 +1432,18 @@ fn dependency_namespace_value_field_and_method_use_the_dependency_nominal_owner(
 
 #[test]
 fn qualified_namespace_types_constructors_and_variants_remain_symbolic() {
-    const MAIN: &str = r#"module app.main;
-import app.model as model;
+    const MAIN: &str = r#"use package::app::model;
 pub fn run() -> i32 {
-    let record: model.Record = model.Record { text: "qualified", };
-    let choice: model.Choice = model.Choice.Some(record);
-    let empty: model.Choice = model.Choice.Empty;
+    let record: model::Record = model::Record { text: "qualified", };
+    let choice: model::Choice = model::Choice::Some(record);
+    let empty: model::Choice = model::Choice::Empty;
     return match choice {
-        model.Choice.Some(value) => value.text.len(),
-        model.Choice.Empty => 0,
+        model::Choice::Some(value) => value.text.len(),
+        model::Choice::Empty => 0,
     };
 }
 "#;
-    const MODEL: &str = r"module app.model;
-pub(package) struct Record { text: string; }
+    const MODEL: &str = r"pub(package) struct Record { text: string, }
 pub(package) enum Choice { Empty, Some(Record), }
 ";
     let input = resolved_input(
@@ -1461,13 +1486,11 @@ pub(package) enum Choice { Empty, Some(Record), }
 
 #[test]
 fn lexical_receiver_shadows_an_imported_namespace_for_fields_and_methods() {
-    const MAIN: &str = r"module app.main;
-import app.util as value;
-pub(package) struct Record { text: string; }
+    const MAIN: &str = r"use package::app::util as value;
+pub(package) struct Record { text: string, }
 fn run(value: Record) -> i32 { return value.text.len(); }
 ";
-    const UTIL: &str = r#"module app.util;
-pub(package) fn text() -> string { return "namespace"; }
+    const UTIL: &str = r#"pub(package) fn text() -> string { return "namespace"; }
 "#;
     let input = resolved_input(
         root_fixture(
@@ -1564,7 +1587,7 @@ fn assert_namespace_value_field_method_shape(
     let value = &ir.definitions()[value.0 as usize];
     assert_eq!(value.package_id.as_str(), receiver_package);
     assert_eq!(value.module.as_str(), receiver_module);
-    assert_eq!(value.name, "value");
+    assert_eq!(value.name, "VALUE");
     let field = &ir.definitions()[field.0 as usize];
     assert_eq!(field.package_id.as_str(), receiver_package);
     assert_eq!(field.module.as_str(), receiver_module);
@@ -1573,8 +1596,9 @@ fn assert_namespace_value_field_method_shape(
 
 #[test]
 fn private_cross_file_access_has_use_site_and_related_declaration() {
-    const MAIN: &str = "module app.main;\nimport app.util as util;\npub fn run() -> i32 { return util.secret(); }\n";
-    const UTIL: &str = "module app.util;\nfn secret() -> i32 { return 7; }\n";
+    const MAIN: &str =
+        "use package::app::util as util;\npub fn run() -> i32 { return util::secret(); }\n";
+    const UTIL: &str = "fn secret() -> i32 { return 7; }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1602,9 +1626,11 @@ fn private_cross_file_access_has_use_site_and_related_declaration() {
 
 #[test]
 fn dependency_alias_allows_public_call_and_rejects_private_call() {
-    const LIBRARY: &str = "module math;\npub fn twice(value: i32) -> i32 { return value + value; }\nfn hidden() -> i32 { return 9; }\n";
-    const PUBLIC_MAIN: &str = "module app.main;\nimport shared_api.math as math;\npub fn run() -> i32 { return math.twice(3); }\n";
-    const PRIVATE_MAIN: &str = "module app.main;\nimport shared_api.math as math;\npub fn run() -> i32 { return math.hidden(); }\n";
+    const LIBRARY: &str = "pub fn twice(value: i32) -> i32 { return value + value; }\nfn hidden() -> i32 { return 9; }\n";
+    const PUBLIC_MAIN: &str =
+        "use shared_api::math;\npub fn run() -> i32 { return math::twice(3); }\n";
+    const PRIVATE_MAIN: &str =
+        "use shared_api::math;\npub fn run() -> i32 { return math::hidden(); }\n";
     let dependency = dependency_fixture(&[("src/math.nexa", LIBRARY, SourceRole::Production)]);
     let public_input = resolved_input(
         root_fixture(
@@ -1643,8 +1669,8 @@ fn dependency_alias_allows_public_call_and_rejects_private_call() {
 }
 
 #[test]
-fn module_path_mismatch_is_source_exact() {
-    const SOURCE: &str = "module app.wrong;\npub fn run() -> i32 { return 0; }\n";
+fn source_path_is_the_only_module_identity() {
+    const SOURCE: &str = "pub fn run() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1653,18 +1679,21 @@ fn module_path_mismatch_is_source_exact() {
         &[],
     );
     let outcome = analyze_deterministically(&input, &AnalysisEnvironment::default());
-    let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2701);
-    assert_primary(
-        diagnostic,
-        &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(SOURCE, "app.wrong"),
+    assert!(
+        outcome.diagnostics.diagnostics().is_empty(),
+        "{:#?}",
+        outcome.diagnostics.diagnostics()
     );
+    assert!(outcome.ir.as_ref().is_some_and(|ir| {
+        ir.modules()
+            .iter()
+            .any(|module| module.module.as_str() == "app.main")
+    }));
 }
 
 #[test]
-fn unknown_import_points_at_the_qualified_path() {
-    const SOURCE: &str =
-        "module app.main;\nimport missing.target;\npub fn run() -> i32 { return 0; }\n";
+fn unknown_use_points_at_the_qualified_path() {
+    const SOURCE: &str = "use missing::target;\npub fn run() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1677,15 +1706,15 @@ fn unknown_import_points_at_the_qualified_path() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/main.nexa"),
-        range(SOURCE, "missing.target"),
+        range(SOURCE, "missing::target"),
     );
 }
 
 #[test]
 fn module_cycle_is_canonical_and_source_exact() {
-    const A: &str = "module app.a;\nimport app.b;\npub fn a() -> i32 { return 1; }\n";
-    const B: &str = "module app.b;\nimport app.a;\npub fn b() -> i32 { return 2; }\n";
-    const MAIN: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
+    const A: &str = "use package::app::b;\npub fn a() -> i32 { return 1; }\n";
+    const B: &str = "use package::app::a;\npub fn b() -> i32 { return 2; }\n";
+    const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1706,15 +1735,15 @@ fn module_cycle_is_canonical_and_source_exact() {
     assert_primary(
         diagnostic,
         &identity(ROOT_PACKAGE, "src/app/a.nexa"),
-        range(A, "app.b"),
+        range(A, "package::app::b"),
     );
 }
 
 #[test]
-fn duplicate_import_alias_points_at_the_second_import() {
-    const MAIN: &str = "module app.main;\nimport app.a as same;\nimport app.b as same;\npub fn run() -> i32 { return 0; }\n";
-    const A: &str = "module app.a;\npub(package) fn a() -> i32 { return 1; }\n";
-    const B: &str = "module app.b;\npub(package) fn b() -> i32 { return 2; }\n";
+fn duplicate_use_alias_points_at_the_second_use() {
+    const MAIN: &str = "use package::app::a as same;\nuse package::app::b as same;\npub fn run() -> i32 { return 0; }\n";
+    const A: &str = "pub(package) fn a() -> i32 { return 1; }\n";
+    const B: &str = "pub(package) fn b() -> i32 { return 2; }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1737,7 +1766,8 @@ fn duplicate_import_alias_points_at_the_second_import() {
 
 #[test]
 fn public_api_cannot_expose_a_private_type() {
-    const SOURCE: &str = "module app.main;\nstruct Hidden { value: i32; }\npub fn leak(value: Hidden) -> Hidden { return value; }\n";
+    const SOURCE: &str =
+        "struct Hidden { value: i32, }\npub fn leak(value: Hidden) -> Hidden { return value; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1765,8 +1795,9 @@ fn public_api_cannot_expose_a_private_type() {
 
 #[test]
 fn inaccessible_qualified_api_type_points_at_only_the_type_token() {
-    const MAIN: &str = "module app.main;\nimport app.types as types;\npub fn leak(value: types.Hidden) -> i32 { return 0; }\n";
-    const TYPES: &str = "module app.types;\nstruct Hidden { value: i32; }\n";
+    const MAIN: &str =
+        "use package::app::types;\npub fn leak(value: types::Hidden) -> i32 { return 0; }\n";
+    const TYPES: &str = "struct Hidden { value: i32, }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1794,7 +1825,7 @@ fn inaccessible_qualified_api_type_points_at_only_the_type_token() {
 
 #[test]
 fn stable_names_reject_invalid_and_duplicate_identities() {
-    const SOURCE: &str = "module app.main;\n@stable(\"1bad\") pub fn invalid() -> i32 { return 0; }\n@stable(\"same-name\") pub fn first() -> i32 { return 1; }\n@stable(\"same-name\") pub fn second() -> i32 { return 2; }\n";
+    const SOURCE: &str = "@stable(\"1bad\") pub fn invalid() -> i32 { return 0; }\n@stable(\"same-name\") pub fn first() -> i32 { return 1; }\n@stable(\"same-name\") pub fn second() -> i32 { return 2; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1823,8 +1854,7 @@ fn stable_names_reject_invalid_and_duplicate_identities() {
 
 #[test]
 fn const_expression_cannot_call_a_function() {
-    const SOURCE: &str =
-        "module app.main;\nfn make() -> i32 { return 1; }\npub const BAD: i32 = make();\n";
+    const SOURCE: &str = "fn make() -> i32 { return 1; }\npub const BAD: i32 = make();\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -1843,8 +1873,8 @@ fn const_expression_cannot_call_a_function() {
 
 #[test]
 fn tests_reject_bad_signatures_and_indirect_host_calls() {
-    const MAIN: &str = "module app.main;\nimport host as host;\npub(package) fn host_value() -> i32 { return host.clock(); }\n";
-    const TESTS: &str = "module test.checks;\nimport app.main as app;\n@test fn bad_signature(value: i32) -> i32 { return value; }\n@test fn indirect_host() -> bool { return app.host_value() == 0; }\n";
+    const MAIN: &str = "use host::fixture_host as host;\npub(package) fn host_value() -> i32 { return host::clock(); }\n";
+    const TESTS: &str = "use package::app::main as app;\n@test fn bad_signature(value: i32) -> i32 { return value; }\n@test fn indirect_host() -> bool { return app::host_value() == 0; }\n";
     let product = Arc::new(resolved_input(
         root_fixture(
             &[("src/app/main.nexa", MAIN, SourceRole::Production)],
@@ -1881,8 +1911,8 @@ fn tests_reject_bad_signatures_and_indirect_host_calls() {
 
 #[test]
 fn test_analysis_preserves_production_abi_state_and_product_query_authority() {
-    const MAIN: &str = "module app.main;\n@stateful(1) pub class ProductState { value: i32; }\npub fn value() -> i32 { return 7; }\n";
-    const TESTS: &str = "module test.checks;\n@stateful(99) pub class TestOnlyState { ignored: string; }\npub fn test_only_api() -> i32 { return 99; }\n@test fn succeeds() -> bool { return true; }\n";
+    const MAIN: &str = "@state(version = 1) pub class ProductState { mut value: i32, }\npub fn value() -> i32 { return 7; }\n";
+    const TESTS: &str = "@state(version = 99) pub class TestOnlyState { mut ignored: string, }\npub fn test_only_api() -> i32 { return 99; }\n@test fn succeeds() -> bool { return true; }\n";
     let product = Arc::new(resolved_input(
         root_fixture(
             &[("src/app/main.nexa", MAIN, SourceRole::Production)],
@@ -1975,8 +2005,8 @@ fn test_analysis_preserves_production_abi_state_and_product_query_authority() {
 
 #[test]
 fn lifecycle_function_outside_entry_module_is_rejected() {
-    const MAIN: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
-    const OTHER: &str = "module app.other;\npub activation fn activate() -> i32 { return 0; }\n";
+    const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
+    const OTHER: &str = "@activation\npub fn activate() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[
@@ -1998,7 +2028,7 @@ fn lifecycle_function_outside_entry_module_is_rejected() {
 
 #[test]
 fn unknown_external_nominal_type_is_a_fail_closed_analysis_error() {
-    const SOURCE: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
+    const SOURCE: &str = "pub fn run() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -2018,14 +2048,14 @@ fn unknown_external_nominal_type_is_a_fail_closed_analysis_error() {
     let diagnostic = one_diagnostic(&outcome, ErrorCode::NX2101);
     assert_eq!(
         diagnostic.message.as_ref(),
-        "unknown external nominal type `host.Missing`"
+        "unknown external nominal type `host::Missing`"
     );
 }
 
 #[test]
 fn external_nominal_type_can_resolve_to_the_dependency_definition() {
-    const MAIN: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
-    const LIBRARY: &str = "module math;\npub struct Record { value: i32; }\n";
+    const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
+    const LIBRARY: &str = "pub struct Record { value: i32, }\n";
     let dependency = dependency_fixture(&[("src/math.nexa", LIBRARY, SourceRole::Production)]);
     let input = resolved_input(
         root_fixture(&[("src/app/main.nexa", MAIN, SourceRole::Production)], true),
@@ -2060,8 +2090,50 @@ fn external_nominal_type_can_resolve_to_the_dependency_definition() {
 }
 
 #[test]
+fn host_call_requires_every_declared_function_capability() {
+    const SOURCE: &str =
+        "use host::fixture_host as host;\npub fn run() -> i32 { return host::clock(); }\n";
+    let environment = {
+        let mut environment = host_environment();
+        environment.host.as_mut().unwrap().functions[0].required_capabilities =
+            vec!["clock.read".into(), "clock.use".into()];
+        environment
+    };
+
+    let build = |capabilities: &[&str]| {
+        let mut root = root_fixture(
+            &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
+            false,
+        );
+        root.manifest = application_manifest_with_capabilities(false, capabilities);
+        resolved_input(root, &[])
+    };
+
+    let accepted = analyze_deterministically(&build(&["clock.read", "clock.use"]), &environment);
+    assert!(
+        accepted.diagnostics.diagnostics().is_empty(),
+        "{:#?}",
+        accepted.diagnostics.diagnostics()
+    );
+    let accepted_ir = accepted.ir.as_ref().expect("Host call analysis succeeds");
+    assert_eq!(
+        accepted_ir.metadata().host_bindings[0].functions[0].declaration_fingerprint,
+        [0x41; 32],
+        "the validated NIDL declaration fingerprint is propagated verbatim"
+    );
+
+    let rejected = analyze_deterministically(&build(&["clock.read"]), &environment);
+    assert!(rejected.ir.is_none());
+    let diagnostic = one_diagnostic(&rejected, ErrorCode::NX4002);
+    assert_eq!(
+        diagnostic.message.as_ref(),
+        "Host function requires capability `clock.use`"
+    );
+}
+
+#[test]
 fn async_host_result_preserves_both_nominal_arms() {
-    const SOURCE: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
+    const SOURCE: &str = "pub fn run() -> i32 { return 0; }\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -2071,8 +2143,8 @@ fn async_host_result_preserves_both_nominal_arms() {
     );
     let environment = AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "FixtureHost".into(),
-            interface_stable_id: StableId::from_name("FixtureHost"),
+            contract_name: "FixtureHost".into(),
+            contract_stable_id: StableId::from_name("FixtureHost"),
             types: vec![opaque_host_type("Failure"), opaque_host_type("Payload")],
             functions: vec![HostFunctionSurface {
                 name: "load".into(),
@@ -2080,6 +2152,7 @@ fn async_host_result_preserves_both_nominal_arms() {
                 result: SurfaceType::Unit,
                 mode: HostFunctionMode::Request,
                 stable_id: StableId::from_name("FixtureHost.load"),
+                declaration_fingerprint: [0x42; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result: Some(HostAsyncResultSurface {
@@ -2100,10 +2173,11 @@ fn async_host_result_preserves_both_nominal_arms() {
                     cancel_error: Some(0),
                     abandon_error: Some(1),
                 }),
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: None,
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: None,
         }),
         ..AnalysisEnvironment::default()
@@ -2133,7 +2207,7 @@ fn async_host_result_preserves_both_nominal_arms() {
 
 #[test]
 fn persistent_database_invalidates_typed_module_when_host_signature_changes() {
-    const SOURCE: &str = "module app.main;\nimport host as api;\nfn run() -> i32 { let ignored = api.clock(); return 0; }\n";
+    const SOURCE: &str = "use host::fixture_host as api;\nfn run() -> i32 { let ignored = api::clock(); return 0; }\n";
     let first_input = resolved_input_with_contract(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -2188,7 +2262,7 @@ fn persistent_database_invalidates_typed_module_when_host_signature_changes() {
 
 #[test]
 fn failed_host_mode_revision_cannot_pollute_next_successful_revision() {
-    const SOURCE: &str = "module app.main;\nimport host as api;\ntask fn run() -> Result<i32, bool> { return await api.clock(); }\n";
+    const SOURCE: &str = "use host::fixture_host as api;\nasync fn run() -> Result<i32, bool> { return api::clock().await; }\n";
     let sync_input = resolved_input_with_contract(
         root_fixture(
             &[("src/app/main.nexa", SOURCE, SourceRole::Production)],
@@ -2240,8 +2314,7 @@ fn failed_host_mode_revision_cannot_pollute_next_successful_revision() {
 
 #[test]
 fn manifest_and_lock_alias_retarget_invalidates_import_and_typed_ir() {
-    const SOURCE: &str =
-        "module app.main;\nimport chosen.math as api;\nfn run() -> i32 { return api.value(); }\n";
+    const SOURCE: &str = "use chosen::math as api;\nfn run() -> i32 { return api::value(); }\n";
     let first_input = dependency_alias_fixture(SOURCE, false);
     let second_input = dependency_alias_fixture(SOURCE, true);
     let root = nexa_analysis::PackageId::new(ROOT_PACKAGE).unwrap();
@@ -2272,11 +2345,11 @@ fn manifest_and_lock_alias_retarget_invalidates_import_and_typed_ir() {
 }
 
 #[test]
-fn source_import_retarget_invalidates_current_typed_ir_without_global_context_change() {
+fn source_use_retarget_invalidates_current_typed_ir_without_global_context_change() {
     const FIRST_SOURCE: &str =
-        "module app.main;\nimport chosen.math as api;\nfn run() -> i32 { return api.value(); }\n";
+        "use chosen::math as api;\nfn run() -> i32 { return api::value(); }\n";
     const SECOND_SOURCE: &str =
-        "module app.main;\nimport retained.math as api;\nfn run() -> i32 { return api.value(); }\n";
+        "use retained::math as api;\nfn run() -> i32 { return api::value(); }\n";
     let first_input = dependency_alias_fixture(FIRST_SOURCE, false);
     let second_input = dependency_alias_fixture(SECOND_SOURCE, false);
     let root = nexa_analysis::PackageId::new(ROOT_PACKAGE).unwrap();
@@ -2309,9 +2382,9 @@ fn source_import_retarget_invalidates_current_typed_ir_without_global_context_ch
 
 #[test]
 fn documentation_changes_source_identity_but_not_analyzed_public_api() {
-    const FIRST: &str =
-        "module app.main;\n/// first wording\npub fn value() -> i32 { return 1; }\n";
-    const SECOND: &str = "module app.main;\n/// completely different documentation\npub fn value() -> i32 { return 1; }\n";
+    const FIRST: &str = "/// first wording\npub fn value() -> i32 { return 1; }\n";
+    const SECOND: &str =
+        "/// completely different documentation\npub fn value() -> i32 { return 1; }\n";
     let input = |source| {
         resolved_input(
             root_fixture(
@@ -2362,11 +2435,11 @@ fn documentation_changes_source_identity_but_not_analyzed_public_api() {
 #[test]
 #[allow(clippy::too_many_lines)]
 fn diagnostic_registry_retains_every_host_and_static_module_origin() {
-    const MAIN: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
-    const HOST: &str = "interface FixtureHost { sync fn ping() -> i32; }\r\n";
-    const HOST_STRUCT: &str = "struct HostRecord { value: i32; }\r\n";
+    const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
+    const HOST: &str = "contract FixtureHost { host { fn ping() -> i32; } }\r\n";
+    const HOST_STRUCT: &str = "struct HostRecord { value: i32, }\r\n";
     const HOST_ENUM: &str = "enum HostChoice { Ready }\r\n";
-    const STATIC_STRUCT: &str = "struct StaticRecord { value: i32; }\n";
+    const STATIC_STRUCT: &str = "struct StaticRecord { value: i32, }\n";
     const STATIC_ENUM: &str = "enum StaticChoice { Ready }\n";
     let input = resolved_input(
         root_fixture(
@@ -2382,8 +2455,8 @@ fn diagnostic_registry_retains_every_host_and_static_module_origin() {
     };
     let environment = AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "FixtureHost".into(),
-            interface_stable_id: StableId::from_name("FixtureHost"),
+            contract_name: "FixtureHost".into(),
+            contract_stable_id: StableId::from_name("FixtureHost"),
             types: vec![
                 ExternalTypeSurface {
                     name: "HostRecord".into(),
@@ -2424,13 +2497,15 @@ fn diagnostic_registry_retains_every_host_and_static_module_origin() {
                 result: SurfaceType::I32,
                 mode: HostFunctionMode::Sync,
                 stable_id: StableId::from_name("FixtureHost.ping"),
+                declaration_fingerprint: [0x43; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result: None,
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: Some(origin("contracts/host.nidl", HOST, "ping")),
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: Some(origin("contracts/host.nidl", HOST, "FixtureHost")),
         }),
         static_modules: vec![StaticModuleSurface {
@@ -2534,9 +2609,9 @@ fn diagnostic_registry_retains_every_host_and_static_module_origin() {
 
 #[test]
 fn conflicting_external_source_identity_fails_closed_before_typed_ir() {
-    const MAIN: &str = "module app.main;\npub fn run() -> i32 { return 0; }\n";
-    const INTERFACE: &str = "interface FixtureHost {}\n";
-    const FUNCTION: &str = "sync fn ping() -> i32;\n";
+    const MAIN: &str = "pub fn run() -> i32 { return 0; }\n";
+    const CONTRACT: &str = "contract FixtureHost {}\n";
+    const FUNCTION: &str = "fn ping() -> i32;\n";
     let input = resolved_input(
         root_fixture(
             &[("src/app/main.nexa", MAIN, SourceRole::Production)],
@@ -2547,8 +2622,8 @@ fn conflicting_external_source_identity_fails_closed_before_typed_ir() {
     let identity = SourceIdentity::standalone("contracts/conflict.nidl");
     let environment = AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "FixtureHost".into(),
-            interface_stable_id: StableId::from_name("FixtureHost"),
+            contract_name: "FixtureHost".into(),
+            contract_stable_id: StableId::from_name("FixtureHost"),
             types: Vec::new(),
             functions: vec![HostFunctionSurface {
                 name: "ping".into(),
@@ -2556,21 +2631,23 @@ fn conflicting_external_source_identity_fails_closed_before_typed_ir() {
                 result: SurfaceType::I32,
                 mode: HostFunctionMode::Sync,
                 stable_id: StableId::from_name("FixtureHost.ping"),
+                declaration_fingerprint: [0x43; 32],
                 import_index: 0,
                 fuel_cost: 1,
                 async_result: None,
-                required_capability: None,
+                required_capabilities: Vec::new(),
                 source: Some(ExternalSourceOrigin {
                     identity: identity.clone(),
                     text: Arc::from(FUNCTION),
                     range: range(FUNCTION, "ping"),
                 }),
             }],
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: Some(ExternalSourceOrigin {
                 identity: identity.clone(),
-                text: Arc::from(INTERFACE),
-                range: range(INTERFACE, "FixtureHost"),
+                text: Arc::from(CONTRACT),
+                range: range(CONTRACT, "FixtureHost"),
             }),
         }),
         ..AnalysisEnvironment::default()
@@ -2593,7 +2670,125 @@ fn conflicting_external_source_identity_fails_closed_before_typed_ir() {
             .sources()
             .get(&identity)
             .map(|snapshot| snapshot.text()),
-        Some(INTERFACE),
+        Some(CONTRACT),
         "deduplication retains the deterministic first snapshot only for rendering the error batch"
     );
+}
+
+#[test]
+fn recursive_inline_value_layouts_are_rejected_without_implicit_boxing() {
+    const DIRECT: &str = "enum Expr { Add(Expr, Expr), }\n";
+    let direct = analyze_main_source(DIRECT);
+    let diagnostic = one_diagnostic(&direct, ErrorCode::NX2101);
+    assert_eq!(
+        diagnostic.message.as_ref(),
+        "recursive inline value layout: Expr -> Expr"
+    );
+    assert_primary(
+        diagnostic,
+        &identity(ROOT_PACKAGE, "src/app/main.nexa"),
+        range(DIRECT, "Add(Expr, Expr),"),
+    );
+    assert_eq!(
+        diagnostic
+            .notes
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<_>>(),
+        ["use a Class node to break the recursive inline value layout"]
+    );
+    assert!(direct.ir.is_none());
+
+    let through_wrappers = concat!(
+        "struct Left { right: Option<(Right, i32)>, }\n",
+        "enum Right { Again(Result<Left, i32>), }\n",
+    );
+    let through_wrappers_outcome = analyze_main_source(through_wrappers);
+    let diagnostic = one_diagnostic(&through_wrappers_outcome, ErrorCode::NX2101);
+    assert_eq!(
+        diagnostic.message.as_ref(),
+        "recursive inline value layout: Left -> Right -> Left"
+    );
+    assert_primary(
+        diagnostic,
+        &identity(ROOT_PACKAGE, "src/app/main.nexa"),
+        range(through_wrappers, "Again(Result<Left, i32>),"),
+    );
+    assert!(through_wrappers_outcome.ir.is_none());
+}
+
+#[test]
+fn reference_and_container_edges_break_recursive_inline_layouts() {
+    const SOURCE: &str = concat!(
+        "class Node { next: Option<Node>, }\n",
+        "struct Indirect {\n",
+        "    object: Node,\n",
+        "    children: Array<Indirect>,\n",
+        "    lookup: Map<string, Indirect>,\n",
+        "    scratch: Buffer<Indirect>,\n",
+        "}\n",
+    );
+    let outcome = analyze_main_source(SOURCE);
+    assert!(
+        outcome.diagnostics.diagnostics().is_empty(),
+        "{:#?}",
+        outcome.diagnostics.diagnostics()
+    );
+    assert!(outcome.ir.is_some());
+}
+
+#[test]
+fn equality_recurses_through_value_layouts_and_compares_classes_by_identity() {
+    const SOURCE: &str = concat!(
+        "struct Point { x: i32, label: string, }\n",
+        "enum Shape { Empty, One(Point), Named { point: Option<(Point, string)>, }, }\n",
+        "class Object { payload: Buffer<i32>, }\n",
+        "fn same_point(left: Point, right: Point) -> bool { return left == right; }\n",
+        "fn same_shape(left: Shape, right: Shape) -> bool { return left == right; }\n",
+        "fn same_wrapped(left: Option<(Point, string)>, right: Option<(Point, string)>) -> bool {\n",
+        "    return left == right;\n",
+        "}\n",
+        "fn same_object(left: Object, right: Object) -> bool { return left == right; }\n",
+    );
+    let outcome = analyze_main_source(SOURCE);
+    assert!(
+        outcome.diagnostics.diagnostics().is_empty(),
+        "{:#?}",
+        outcome.diagnostics.diagnostics()
+    );
+    assert!(outcome.ir.is_some());
+}
+
+#[test]
+fn equality_rejects_resources_nested_in_structs_and_enum_payloads() {
+    const SOURCE: &str = concat!(
+        "struct ResourceStruct { values: Array<i32>, }\n",
+        "enum ResourceEnum { Values(Option<(string, Map<string, i32>)>), }\n",
+        "fn same_struct(left: ResourceStruct, right: ResourceStruct) -> bool {\n",
+        "    return left == right;\n",
+        "}\n",
+        "fn same_enum(left: ResourceEnum, right: ResourceEnum) -> bool {\n",
+        "    return left == right;\n",
+        "}\n",
+    );
+    let outcome = analyze_main_source(SOURCE);
+    let diagnostics = diagnostics_with_code(&outcome, ErrorCode::NX2101);
+    assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    assert!(
+        diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.message.as_ref() == "invalid binary operand type"),
+        "{diagnostics:#?}"
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.primary_label().unwrap().range)
+            .collect::<Vec<_>>(),
+        [
+            range(SOURCE, "left == right"),
+            last_range(SOURCE, "left == right"),
+        ]
+    );
+    assert!(outcome.ir.is_none());
 }

@@ -1,1 +1,1 @@
-fn main() -> Result<i32, bool> { let value: Result<i32, i32> = Err(1); return value?; }
+fn main() -> Result<i32, bool> { let value: Result<i32, i32> = Result::Err(1); return value?; }

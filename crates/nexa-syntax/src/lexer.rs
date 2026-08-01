@@ -96,7 +96,7 @@ impl Lexer {
             return;
         }
 
-        if character == '"' && self.language == LexerLanguage::Nexa {
+        if character == '"' {
             self.lex_string();
             return;
         }
@@ -123,6 +123,7 @@ impl Lexer {
             Some(">=") => Some(TokenKind::GreaterEqual),
             Some("&&") => Some(TokenKind::AmpAmp),
             Some("||") => Some(TokenKind::PipePipe),
+            Some("::") => Some(TokenKind::ColonColon),
             Some("..") => Some(TokenKind::DotDot),
             _ => None,
         };
@@ -176,25 +177,15 @@ impl Lexer {
         {
             self.bump_char();
         }
-        if self.language == LexerLanguage::Nidl {
-            self.push(TokenKind::InvalidComment, start, self.cursor);
-            self.error(
-                SyntaxErrorKind::CommentsNotSupported,
-                start,
-                self.cursor,
-                "comments are not part of the NIDL language",
-            );
-        } else {
-            self.push(
-                if documentation {
-                    TokenKind::DocComment
-                } else {
-                    TokenKind::LineComment
-                },
-                start,
-                self.cursor,
-            );
-        }
+        self.push(
+            if documentation {
+                TokenKind::DocComment
+            } else {
+                TokenKind::LineComment
+            },
+            start,
+            self.cursor,
+        );
     }
 
     fn lex_block_comment(&mut self, start: usize) {
@@ -208,18 +199,7 @@ impl Lexer {
         } else {
             self.cursor = self.source.as_str().len();
         }
-        let kind = if self.language == LexerLanguage::Nidl {
-            self.error(
-                SyntaxErrorKind::CommentsNotSupported,
-                start,
-                self.cursor,
-                "comments are not part of the NIDL language",
-            );
-            TokenKind::InvalidComment
-        } else {
-            TokenKind::BlockComment
-        };
-        self.push(kind, start, self.cursor);
+        self.push(TokenKind::BlockComment, start, self.cursor);
         if end.is_none() {
             self.error(
                 SyntaxErrorKind::UnterminatedBlockComment,
@@ -489,19 +469,14 @@ fn keyword(text: &str, language: LexerLanguage) -> Option<Keyword> {
 fn nexa_keyword(text: &str) -> Option<Keyword> {
     Some(match text {
         "fn" => Keyword::Fn,
-        "task" => Keyword::Task,
-        "immediate" => Keyword::Immediate,
-        "migration" => Keyword::Migration,
-        "activation" => Keyword::Activation,
-        "cleanup" => Keyword::Cleanup,
+        "async" => Keyword::Async,
         "return" => Keyword::Return,
         "let" => Keyword::Let,
-        "var" => Keyword::Var,
+        "mut" => Keyword::Mut,
         "if" => Keyword::If,
         "else" => Keyword::Else,
         "while" => Keyword::While,
         "match" => Keyword::Match,
-        "with" => Keyword::With,
         "new" => Keyword::New,
         "await" => Keyword::Await,
         "yield" => Keyword::Yield,
@@ -510,9 +485,7 @@ fn nexa_keyword(text: &str) -> Option<Keyword> {
         "struct" => Keyword::Struct,
         "enum" => Keyword::Enum,
         "class" => Keyword::Class,
-        "stateful" => Keyword::Stateful,
-        "module" => Keyword::Module,
-        "import" => Keyword::Import,
+        "use" => Keyword::Use,
         "as" => Keyword::As,
         "in" => Keyword::In,
         "true" => Keyword::True,
@@ -528,16 +501,14 @@ fn nexa_keyword(text: &str) -> Option<Keyword> {
 
 fn nidl_keyword(text: &str) -> Option<Keyword> {
     Some(match text {
-        "interface" => Keyword::Interface,
-        "opaque" => Keyword::Opaque,
+        "contract" => Keyword::Contract,
+        "host" => Keyword::Host,
+        "nexa" => Keyword::Nexa,
+        "handle" => Keyword::Handle,
         "struct" => Keyword::Struct,
         "enum" => Keyword::Enum,
-        "sync" => Keyword::Sync,
-        "request" => Keyword::Request,
-        "fuel" => Keyword::Fuel,
-        "policy" => Keyword::Policy,
+        "async" => Keyword::Async,
         "fn" => Keyword::Fn,
-        "export" => Keyword::Export,
         _ => return None,
     })
 }

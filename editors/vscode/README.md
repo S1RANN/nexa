@@ -4,12 +4,14 @@ Provides syntax highlighting, bracket matching, automatic closing pairs,
 language identification, and real-time Problems diagnostics for:
 
 - Nexa source files (`.nexa`)
-- Nexa interface definition files (`.nidl`)
+- Nexa contract definition files (`.nidl`)
 
 The extension follows the syntax accepted by the Nexa compiler and IDL parser.
-Nexa supports `//`, `///`, and non-nested `/* ... */` comments. Nexa IDL
-deliberately has no comment syntax, so comment commands are registered only for
-`.nexa` files.
+Nexa v2 highlighting includes `use` and `package::`/`host::` paths, mutable
+bindings and fields, attributes, `async fn`, and postfix `.await`. NIDL v2
+highlights `contract`, `handle`, `host`/`nexa` blocks, attributes, generic
+types, and `//`, `///`, and non-nested `/* ... */` comments. Comment commands
+are registered for both languages.
 
 The extension starts `nexa lsp` from `PATH`. Set `nexa.server.path` when the
 CLI is installed elsewhere. The language server intentionally provides only

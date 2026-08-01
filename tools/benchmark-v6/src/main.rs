@@ -1,12 +1,12 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap,
-    Signature, ValueType,
+    ScriptExport, Signature, ValueType,
 };
 use nexa_core::StableId;
 use nexa_migrate::{
@@ -15,10 +15,10 @@ use nexa_migrate::{
 };
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, ExecutionCharge, FrameLimits, FuelState, Heap,
-    HostCallOutcome, HostPayload, HostRegistry, HostTrap, InterpreterOutcome, OpcodeCostTable,
-    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs,
-    RuntimeResourceLedger, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll,
-    TickBudget,
+    HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
+    InterpreterOutcome, OpcodeCostTable, PendingHostRequest, RealmConfig, RealmRuntime,
+    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue,
+    StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
@@ -27,6 +27,7 @@ const DEFAULT_SAMPLES: usize = 1_000;
 const SMOKE_SAMPLES: usize = 20;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
+const BENCH_TASK_EXPORT: StableId = StableId(0x4245_4e43_4854_4153);
 
 struct CountingAllocator;
 
@@ -466,15 +467,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 const LANGUAGE_SOURCE: &str = r#"
-enum BenchError { Failed }
-struct BenchStruct { value: i32; wide: i64; label: string; }
-class BenchClass { value: i32; next: Option<BenchClass>; }
-enum BenchEvent { Idle, Value(i32) }
+enum BenchError { Failed, }
+struct BenchStruct { value: i32, wide: i64, label: string, }
+class BenchClass { mut value: i32, next: Option<BenchClass>, }
+enum BenchEvent { Idle, Value(i32), }
 
-immediate fn immediate_call(value: i32) -> i32 { return value + 1; }
-fn result_ok(value: i32) -> Result<i32, BenchError> { return Ok(value); }
-fn result_err() -> Result<i32, BenchError> { return Err(BenchError.Failed); }
-task fn fuel_work(value: i32) -> i32 {
+@immediate
+fn immediate_call(value: i32) -> i32 { return value + 1; }
+fn result_ok(value: i32) -> Result<i32, BenchError> { return Result::Ok(value); }
+fn result_err() -> Result<i32, BenchError> { return Result::Err(BenchError::Failed); }
+async fn fuel_work(value: i32) -> i32 {
     let first: i32 = value + 1;
     let second: i32 = first + 1;
     let third: i32 = second + 1;
@@ -489,30 +491,30 @@ fn struct_construction() -> i32 {
     return value.value;
 }
 fn class_allocation() -> i32 {
-    let value: BenchClass = new BenchClass { value: 7, next: None };
+    let value: BenchClass = new BenchClass { value: 7, next: Option::None };
     value.value = value.value + 1;
     return value.value;
 }
 fn enum_match() -> i32 {
-    let event: BenchEvent = BenchEvent.Value(7);
+    let event: BenchEvent = BenchEvent::Value(7);
     return match event {
-        BenchEvent.Idle => 0,
-        BenchEvent.Value(value) => value,
+        BenchEvent::Idle => 0,
+        BenchEvent::Value(value) => value,
     };
 }
 fn array_operations() -> i32 {
-    let values: Array<i32> = Array.new<i32>();
+    let values: Array<i32> = Array::new();
     values.push(1);
     values.push(2);
     values.set(0, 3);
     return values.get(0) + values.len();
 }
 fn map_operations() -> i32 {
-    let values: Map<i32, string> = Map.new<i32, string>();
+    let values: Map<i32, string> = Map::new();
     values.set(1, "one");
     return match values.get(1) {
-        Some(value) => value.byte_len(),
-        None => 0,
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
     };
 }
 fn buffer_copy(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
@@ -612,48 +614,54 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
 }
 
 fn explicit_resume_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        1,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::Yield)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
-    module.function(function.finish().expect("explicit resume function"));
+    let function = module.function(function.finish().expect("explicit resume function"));
+    module.script_export(ScriptExport {
+        stable_id: BENCH_TASK_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("explicit resume module")
 }
 
 fn fast_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        1,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 1);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
     module.metadata(HOST, nexa_bytecode::StateSchema::default().fingerprint());
-    module.function(function.finish().expect("fast function"));
+    let function = module.function(function.finish().expect("fast function"));
+    module.script_export(ScriptExport {
+        stable_id: BENCH_TASK_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("fast module")
 }
 
 fn async_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        3,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 3);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -683,6 +691,8 @@ fn async_module() -> VerifiedModule {
     module.enum_type(async_enum);
     module.host_import(HostImport {
         stable_id: StableId::from_name("BenchHost::value"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: vec![ValueType::I32],
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
@@ -706,24 +716,30 @@ fn async_module() -> VerifiedModule {
             bitmap: vec![false, true, false],
         },
     ];
-    module.function(function);
+    let function = module.function(function);
+    module.script_export(ScriptExport {
+        stable_id: BENCH_TASK_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).expect("async module")
 }
 
 struct NullRegistry;
 
 impl HostRegistry for NullRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(HOST)
     }
 
     fn call_runtime(
         &mut self,
-        _: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        Err(HostTrap::UnknownFunction(u32::MAX))
+        Err(HostTrap::UnknownFunction(id))
     }
 }
 
@@ -732,18 +748,47 @@ struct AsyncRegistry {
 }
 
 impl HostRegistry for AsyncRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(HOST)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        let authority = AUTHORITY.get_or_init(|| {
+            let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+            HostFunctionAuthority::new(
+                StableId::from_name("BenchHost::value"),
+                [0; 32],
+                &[ValueType::I32],
+                Some(ValueType::Named(result.type_id)),
+                HostCallMode::Async,
+                1,
+                Some(nexa_bytecode::AsyncResultType {
+                    result_type: result.type_id,
+                    success: ValueType::I32,
+                    error: ValueType::I32,
+                    cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                    abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                    cancel_error: Some(u32::MAX - 1),
+                    abandon_error: None,
+                }),
+                &[],
+            )
+        });
+        (id == authority.stable_id()).then_some(authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 1 {
+        if id != StableId::from_name("BenchHost::value") {
             return Err(HostTrap::UnknownFunction(id));
+        }
+        if args.len() != 1 {
+            return Err(HostTrap::Arity);
         }
         let request = context
             .create_request()
@@ -766,7 +811,7 @@ fn call(
     realm
         .spawn_task(
             module,
-            0,
+            BENCH_TASK_EXPORT,
             &[RuntimeValue::I32(value)],
             StepConfig {
                 owner: scope,
@@ -795,8 +840,8 @@ struct MigrationInputs {
 }
 
 fn migration_inputs() -> Result<MigrationInputs, Box<dyn std::error::Error>> {
-    let old_module = nexa_compiler::compile_with_metadata(MIGRATION_V1, HOST)?;
-    let new_module = nexa_compiler::compile_with_metadata(MIGRATION_V2, HOST)?;
+    let old_module = nexa_compiler::compile_with_contract_id(MIGRATION_V1, HOST)?;
+    let new_module = nexa_compiler::compile_with_contract_id(MIGRATION_V2, HOST)?;
     let state_ids = bench_state_ids(&old_module, &new_module);
     let fixture = StateFixture {
         format_version: nexa_migrate::STATE_FIXTURE_FORMAT_VERSION,
@@ -827,24 +872,28 @@ fn migration_inputs() -> Result<MigrationInputs, Box<dyn std::error::Error>> {
 }
 
 const MIGRATION_V1: &str = r#"
-@stateful(1) class BenchState { value: i32; legacy: i32; }
-task fn update(value: i32) -> i32 { return value; }
+@state(version = 1)
+class BenchState { mut value: i32, mut legacy: i32, }
+async fn update(value: i32) -> i32 { return value; }
 "#;
 
 const MIGRATION_V2: &str = r#"
-@stateful(2) class BenchState { value: i32; total: i32; }
-pub migration fn migrate() -> bool {
+@state(version = 2)
+class BenchState { mut value: i32, mut total: i32, }
+@migration
+pub fn migrate() -> bool {
     let old_state: BenchState = old.get<BenchState>(bench);
-    let old_value: i32 = old.field<i32>(old_state, BenchState.value);
+    let old_value: i32 = old.field<i32>(old_state, BenchState::value);
     let state: BenchState = new.create<BenchState>(bench);
-    new.set(state, BenchState.value, old_value);
-    new.set(state, BenchState.total, 1);
+    new.set(state, BenchState::value, old_value);
+    new.set(state, BenchState::total, 1);
     replace(bench, state);
     finish_migration();
     return true;
 }
-task fn update(value: i32) -> i32 { return value + 1; }
-@activation pub fn activate() -> bool { return true; }
+async fn update(value: i32) -> i32 { return value + 1; }
+@activation
+pub fn activate() -> bool { return true; }
 "#;
 
 #[derive(Clone, Copy)]

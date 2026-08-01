@@ -1,7 +1,33 @@
-interface GameHost {
-    opaque Entity;
-    struct Vec3 { x: f32; y: f32; z: f32; }
-    sync fn entity_position(entity: Entity) -> Vec3;
-    request fn load_score(entity: Entity) -> host_request;
-    export Update(entity: Entity, dt: f32) -> void;
+contract Game {
+    handle Entity;
+
+    struct Vec3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    enum LoadScoreError {
+        MissingEntity,
+        Unavailable,
+        Cancelled,
+        Abandoned,
+    }
+
+    host {
+        fn entity_position(
+            entity: Entity,
+        ) -> Vec3;
+
+        async fn load_score(
+            entity: Entity,
+        ) -> Result<i32, LoadScoreError>;
+    }
+
+    nexa {
+        fn update(
+            entity: Entity,
+            dt: f32,
+        );
+    }
 }

@@ -25,13 +25,12 @@ pub enum DefinitionKind {
     Struct,
     Enum,
     Class,
-    Stateful,
     Const,
     Field,
     Variant,
     Parameter,
     Local,
-    HostInterface,
+    HostContract,
     HostFunction,
     StandardLibrary,
 }
@@ -68,6 +67,8 @@ pub enum IrAbandonPolicy {
 pub enum IrCompilationKind {
     Product,
     Test,
+    Script,
+    ReplCell,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -75,6 +76,11 @@ pub struct FieldLayoutIr {
     pub definition: DefinitionId,
     pub ty: IrType,
     pub order: u32,
+    /// Class fields are writable after construction only when this bit is set.
+    ///
+    /// Struct fields always carry `false`; their assignability is determined by the mutable
+    /// place which contains the struct value.
+    pub mutable: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,10 +94,23 @@ pub struct VariantLayoutIr {
 /// travel in Typed IR instead of being reconstructed from map iteration or Definition allocation.
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypedTypeLayoutIr {
-    Struct { fields: Vec<FieldLayoutIr> },
-    Class { fields: Vec<FieldLayoutIr> },
-    Stateful { fields: Vec<FieldLayoutIr> },
-    Enum { variants: Vec<VariantLayoutIr> },
+    Struct {
+        fields: Vec<FieldLayoutIr>,
+    },
+    Class {
+        fields: Vec<FieldLayoutIr>,
+        state: Option<StateMetadataIr>,
+    },
+    Enum {
+        variants: Vec<VariantLayoutIr>,
+    },
+}
+
+/// Persistent-state metadata attached to an otherwise ordinary sealed Class.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StateMetadataIr {
+    pub version: u32,
+    pub stable_id: StableSymbolId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,6 +218,7 @@ pub struct ResolvedReference {
 pub struct TypedModuleIr {
     pub package_id: PackageId,
     pub module: ModulePath,
+    pub virtual_module_path: Option<ModulePath>,
     pub source: SourceKey,
     pub file_id: ArtifactFileId,
     pub syntax: Arc<nexa_syntax::SyntaxTree>,
@@ -259,11 +279,17 @@ pub struct HostAsyncResultIr {
 pub struct HostFunctionBindingIr {
     pub definition: DefinitionId,
     pub stable_id: StableId,
+    /// Authoritative fingerprint of the validated NIDL declaration.
+    ///
+    /// It is copied verbatim from the NIDL model rather than recomputed from lowered fields.
+    pub declaration_fingerprint: [u8; 32],
     pub import_index: u32,
     pub mode: IrHostFunctionMode,
     pub parameters: Vec<IrType>,
     pub result: IrType,
     pub fuel_cost: u32,
+    /// Canonical sorted, duplicate-free capabilities required together by this import.
+    pub required_capabilities: Vec<String>,
     pub async_result: Option<HostAsyncResultIr>,
     pub source: Option<ExternalSourceRangeIr>,
 }
@@ -307,8 +333,8 @@ pub struct HostTypeBindingIr {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HostBindingIr {
-    pub interface: DefinitionId,
-    pub interface_stable_id: StableId,
+    pub contract: DefinitionId,
+    pub contract_stable_id: StableId,
     pub namespaces: Vec<HostNamespaceBindingIr>,
     pub types: Vec<HostTypeBindingIr>,
     pub functions: Vec<HostFunctionBindingIr>,
@@ -369,6 +395,19 @@ pub struct StandardFunctionBindingIr {
     pub result: IrType,
 }
 
+/// Authoritative entrypoint for one cumulative REPL cell.
+///
+/// The compiler uses this metadata instead of guessing a function by name. A synchronous source
+/// entry is wrapped as a Task at the bytecode boundary; an async source entry is already a Task.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ReplEntrypointIr {
+    pub cell_ordinal: u64,
+    pub function: DefinitionId,
+    pub stable_id: nexa_core::StableSymbolId,
+    pub result: IrType,
+    pub effect: IrEffect,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PackageSemanticMetadata {
     pub entry_module: Option<ModulePath>,
@@ -378,6 +417,7 @@ pub struct PackageSemanticMetadata {
     pub tests: Arc<[TestDefinitionIr]>,
     pub external_sources: Arc<[ExternalSourceSnapshotIr]>,
     pub lifecycle: LifecycleBindingsIr,
+    pub repl_entry: Option<ReplEntrypointIr>,
     pub standard_functions: Arc<[StandardFunctionBindingIr]>,
     pub public_api_fingerprint: PublicApiFingerprint,
     pub state_schema_fingerprint: StateSchemaFingerprint,
@@ -393,6 +433,7 @@ pub struct TypedBlockIr {
 pub enum TypedStatementIr {
     Let {
         definition: DefinitionId,
+        mutable: bool,
         value: Option<TypedExpressionIr>,
     },
     Assign {
@@ -428,14 +469,24 @@ pub enum TypedStatementIr {
         cleanup: DefinitionId,
         captures: Vec<TypedExpressionIr>,
     },
-    Yield,
+    Yield {
+        span: SourceRange,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum TypedPlaceIr {
     Definition(DefinitionId),
+    /// A value-typed Struct projection. The nested place preserves the writable root so lowering
+    /// can rebuild the Struct value and store it back without guessing from an expression tree.
     Field {
-        base: Box<TypedExpressionIr>,
+        base: Box<TypedPlaceIr>,
+        field: DefinitionId,
+    },
+    /// A mutable field on a GC Class object. The object need not itself be a writable binding;
+    /// field mutability is encoded by its owner layout and validated by analysis/IR validation.
+    ClassField {
+        object: Box<TypedExpressionIr>,
         field: DefinitionId,
     },
     Index {
@@ -499,6 +550,13 @@ pub enum MigrationIntrinsicIr {
 pub enum TypedExpressionKind {
     Literal(IrLiteral),
     Reference(DefinitionId),
+    /// Loads the current persisted instance of an analyzer-generated state class.
+    ///
+    /// This is an internal REPL/reload primitive and has no source-language spelling.
+    PersistentStateGet {
+        identity: StableId,
+        state_type: DefinitionId,
+    },
     Unary {
         operator: UnaryOperator,
         operand: Box<TypedExpressionIr>,
@@ -534,13 +592,20 @@ pub enum TypedExpressionKind {
         arguments: Vec<TypedExpressionIr>,
     },
     HostCall {
-        interface: DefinitionId,
+        contract: DefinitionId,
         function: DefinitionId,
         arguments: Vec<TypedExpressionIr>,
     },
     Construct {
         definition: DefinitionId,
         fields: Vec<(DefinitionId, TypedExpressionIr)>,
+    },
+    /// Allocates a fresh sealed GC Class object. `update`, when present, copies the source
+    /// object's fields before applying explicit initializers; it never aliases or mutates it.
+    ClassConstruct {
+        definition: DefinitionId,
+        fields: Vec<(DefinitionId, TypedExpressionIr)>,
+        update: Option<Box<TypedExpressionIr>>,
     },
     EnumConstruct {
         enum_definition: DefinitionId,
@@ -693,6 +758,40 @@ impl TypedPackageIr {
         )
     }
 
+    pub fn new_script(
+        package_id: PackageId,
+        analysis_revision: u64,
+        definitions: Vec<Definition>,
+        modules: Vec<TypedModuleIr>,
+        metadata: PackageSemanticMetadata,
+    ) -> Result<Self, TypedIrError> {
+        Self::construct(
+            package_id,
+            analysis_revision,
+            IrCompilationKind::Script,
+            definitions,
+            modules,
+            metadata,
+        )
+    }
+
+    pub fn new_repl_cell(
+        package_id: PackageId,
+        analysis_revision: u64,
+        definitions: Vec<Definition>,
+        modules: Vec<TypedModuleIr>,
+        metadata: PackageSemanticMetadata,
+    ) -> Result<Self, TypedIrError> {
+        Self::construct(
+            package_id,
+            analysis_revision,
+            IrCompilationKind::ReplCell,
+            definitions,
+            modules,
+            metadata,
+        )
+    }
+
     fn construct(
         package_id: PackageId,
         analysis_revision: u64,
@@ -719,6 +818,9 @@ impl TypedPackageIr {
                 validate_concrete_type(&definition.ty, limit)?;
             }
         }
+        for module in &modules {
+            validate_module_source_identity(module)?;
+        }
         if !modules.iter().any(|module| module.package_id == package_id) {
             return Err(TypedIrError::MissingRootPackageModule(package_id));
         }
@@ -742,7 +844,7 @@ impl TypedPackageIr {
             if !module_packages.contains(&definition.package_id)
                 && !matches!(
                     definition.kind,
-                    DefinitionKind::HostInterface
+                    DefinitionKind::HostContract
                         | DefinitionKind::HostFunction
                         | DefinitionKind::StandardLibrary
                 )
@@ -758,7 +860,7 @@ impl TypedPackageIr {
             }
             for declaration in module.declarations.iter() {
                 validate_id(declaration.definition, limit)?;
-                validate_declaration(declaration, limit, &constants)?;
+                validate_declaration(declaration, &definitions, &constants)?;
             }
         }
         let standard_functions = validate_metadata(&metadata, &definitions)?;
@@ -818,6 +920,42 @@ impl TypedPackageIr {
     }
 }
 
+fn validate_module_source_identity(module: &TypedModuleIr) -> Result<(), TypedIrError> {
+    if module.source.package_id != module.package_id {
+        return Err(TypedIrError::InvalidModuleSourceIdentity {
+            source: module.source.clone(),
+            module: module.module.clone(),
+        });
+    }
+    if let Some(virtual_module) = &module.virtual_module_path {
+        return if virtual_module == &module.module {
+            Ok(())
+        } else {
+            Err(TypedIrError::VirtualModuleIdentityMismatch {
+                source: module.source.clone(),
+                module: module.module.clone(),
+                virtual_module: virtual_module.clone(),
+            })
+        };
+    }
+
+    let expected = if module.package_id.as_str() == nexa_stdlib::PACKAGE_ID {
+        format!("stdlib/{}.nexa", module.module.as_str().replace('.', "/"))
+    } else if let Some(test_module) = module.module.as_str().strip_prefix("test.") {
+        format!("tests/{}.nexa", test_module.replace('.', "/"))
+    } else {
+        module.module.source_path().as_str().to_owned()
+    };
+    if module.source.path.as_str() == expected {
+        Ok(())
+    } else {
+        Err(TypedIrError::InvalidModuleSourceIdentity {
+            source: module.source.clone(),
+            module: module.module.clone(),
+        })
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn validate_metadata<'a>(
     metadata: &'a PackageSemanticMetadata,
@@ -840,7 +978,7 @@ fn validate_metadata<'a>(
         }
     }
     for host in metadata.host_bindings.iter() {
-        validate_id(host.interface, limit)?;
+        validate_id(host.contract, limit)?;
         for ty in &host.types {
             validate_id(ty.definition, limit)?;
             match &ty.layout {
@@ -874,6 +1012,15 @@ fn validate_metadata<'a>(
         }
         for function in &host.functions {
             validate_id(function.definition, limit)?;
+            if function
+                .required_capabilities
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(TypedIrError::NonCanonicalHostCapabilities(
+                    function.definition,
+                ));
+            }
             for parameter in &function.parameters {
                 validate_type(parameter, limit)?;
             }
@@ -905,6 +1052,13 @@ fn validate_metadata<'a>(
     .flatten()
     {
         validate_id(lifecycle, limit)?;
+    }
+    if let Some(entry) = &metadata.repl_entry {
+        validate_id(entry.function, limit)?;
+        validate_concrete_type(&entry.result, limit)?;
+        if !matches!(entry.effect, IrEffect::Ordinary | IrEffect::Task) {
+            return Err(TypedIrError::InvalidReplEntrypoint(entry.function));
+        }
     }
     let mut standard_functions = BTreeMap::new();
     for function in metadata.standard_functions.iter() {
@@ -999,8 +1153,16 @@ fn canonical_host_value_type(
                 .collect::<Result<Vec<_>, _>>()?;
             named(nexa_core::canonical_tuple_type_id(&items))
         }
-        IrType::HostRequest(_) => named(StableId::from_name("HostRequest")),
-        IrType::ResourceToken(_) => named(StableId::from_name("ResourceToken")),
+        IrType::HostRequest(_) => Err(TypedIrError::RuntimeRequestTypeEscaped),
+        IrType::ResourceToken(None) => Err(TypedIrError::UntypedResourceToken),
+        IrType::ResourceToken(Some(content)) => {
+            let CanonicalValueType::Named(content) =
+                canonical_host_value_type(content, host, definitions)?
+            else {
+                return Err(TypedIrError::InvalidResourceTokenContentType);
+            };
+            named(nexa_core::canonical_resource_token_type_id(content))
+        }
         IrType::Snapshot(content) => {
             let CanonicalValueType::Named(content) =
                 canonical_host_value_type(content, host, definitions)?
@@ -1136,7 +1298,9 @@ fn validate_standard_calls_in_block(
                     validate_standard_calls_in_expression(capture, bindings, migration_types)?;
                 }
             }
-            TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield => {}
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
         }
     }
     if let Some(tail) = &block.tail {
@@ -1152,7 +1316,10 @@ fn validate_standard_calls_in_place(
 ) -> Result<(), TypedIrError> {
     match place {
         TypedPlaceIr::Definition(_) => Ok(()),
-        TypedPlaceIr::Field { base, .. } | TypedPlaceIr::StateField { base, .. } => {
+        TypedPlaceIr::Field { base, .. } => {
+            validate_standard_calls_in_place(base, bindings, migration_types)
+        }
+        TypedPlaceIr::ClassField { object: base, .. } | TypedPlaceIr::StateField { base, .. } => {
             validate_standard_calls_in_expression(base, bindings, migration_types)
         }
         TypedPlaceIr::Index { base, index } => {
@@ -1162,6 +1329,7 @@ fn validate_standard_calls_in_place(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_standard_calls_in_expression(
     expression: &TypedExpressionIr,
     bindings: &BTreeMap<DefinitionId, &StandardFunctionBindingIr>,
@@ -1170,6 +1338,7 @@ fn validate_standard_calls_in_expression(
     match &expression.kind {
         TypedExpressionKind::Literal(_)
         | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
         | TypedExpressionKind::Yield => Ok(()),
         TypedExpressionKind::Unary { operand, .. }
         | TypedExpressionKind::Try(operand)
@@ -1237,11 +1406,23 @@ fn validate_standard_calls_in_expression(
         | TypedExpressionKind::StringInterpolation(arguments) => {
             validate_standard_call_arguments(arguments, bindings, migration_types)
         }
-        TypedExpressionKind::Construct { fields, .. }
-        | TypedExpressionKind::Update { fields, .. } => {
-            if let TypedExpressionKind::Update { base, .. } = &expression.kind {
-                validate_standard_calls_in_expression(base, bindings, migration_types)?;
+        TypedExpressionKind::Construct { fields, .. } => {
+            for (_, value) in fields {
+                validate_standard_calls_in_expression(value, bindings, migration_types)?;
             }
+            Ok(())
+        }
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            if let Some(update) = update {
+                validate_standard_calls_in_expression(update, bindings, migration_types)?;
+            }
+            for (_, value) in fields {
+                validate_standard_calls_in_expression(value, bindings, migration_types)?;
+            }
+            Ok(())
+        }
+        TypedExpressionKind::Update { base, fields } => {
+            validate_standard_calls_in_expression(base, bindings, migration_types)?;
             for (_, value) in fields {
                 validate_standard_calls_in_expression(value, bindings, migration_types)?;
             }
@@ -1315,19 +1496,24 @@ fn migration_type_context(
     modules: &[TypedModuleIr],
 ) -> Result<MigrationTypeContext, TypedIrError> {
     let mut layout_fields = BTreeMap::new();
-    let mut layout_state_types = BTreeSet::new();
+    let mut layout_state_types = BTreeMap::new();
     for declaration in modules.iter().flat_map(|module| module.declarations.iter()) {
-        let TypedDeclarationBody::TypeLayout(TypedTypeLayoutIr::Stateful { fields }) =
-            &declaration.body
+        let TypedDeclarationBody::TypeLayout(TypedTypeLayoutIr::Class {
+            fields,
+            state: Some(state),
+        }) = &declaration.body
         else {
             continue;
         };
-        if definitions[declaration.definition.0 as usize].kind != DefinitionKind::Stateful {
+        if definitions[declaration.definition.0 as usize].kind != DefinitionKind::Class {
             return Err(TypedIrError::InvalidMigrationStateType(
                 declaration.definition,
             ));
         }
-        if !layout_state_types.insert(declaration.definition) {
+        if layout_state_types
+            .insert(declaration.definition, state.clone())
+            .is_some()
+        {
             return Err(TypedIrError::InvalidMigrationStateType(
                 declaration.definition,
             ));
@@ -1344,8 +1530,12 @@ fn migration_type_context(
 
     let mut context = MigrationTypeContext::default();
     for state in metadata.state_types.iter() {
-        if definitions[state.definition.0 as usize].kind != DefinitionKind::Stateful
-            || !layout_state_types.contains(&state.definition)
+        if definitions[state.definition.0 as usize].kind != DefinitionKind::Class
+            || !layout_state_types
+                .get(&state.definition)
+                .is_some_and(|layout| {
+                    layout.version == state.version && layout.stable_id == state.stable_id
+                })
             || !context.state_types.insert(state.definition)
         {
             return Err(TypedIrError::InvalidMigrationStateType(state.definition));
@@ -1505,23 +1695,28 @@ fn validate_external_range(
 
 fn validate_declaration(
     declaration: &TypedDeclarationIr,
-    limit: usize,
+    definitions: &[Definition],
     constants: &BTreeMap<DefinitionId, &TypedExpressionIr>,
 ) -> Result<(), TypedIrError> {
+    let limit = definitions.len();
     match &declaration.body {
         TypedDeclarationBody::Function(function) => {
             for id in function.parameters.iter().chain(&function.locals) {
                 validate_id(*id, limit)?;
             }
             validate_type(&function.return_type, limit)?;
-            validate_block(&function.body, limit, constants)
+            validate_block(&function.body, limit, constants)?;
+            if function.effect == IrEffect::Cleanup
+                && !cleanup_block_is_synchronous(&function.body, definitions)
+            {
+                return Err(TypedIrError::InvalidCleanupBody(declaration.definition));
+            }
+            Ok(())
         }
         TypedDeclarationBody::Const(expression) => validate_expression(expression, limit),
         TypedDeclarationBody::TypeLayout(layout) => {
             match layout {
-                TypedTypeLayoutIr::Struct { fields }
-                | TypedTypeLayoutIr::Class { fields }
-                | TypedTypeLayoutIr::Stateful { fields } => {
+                TypedTypeLayoutIr::Struct { fields } | TypedTypeLayoutIr::Class { fields, .. } => {
                     let mut orders = std::collections::BTreeSet::new();
                     for field in fields {
                         validate_id(field.definition, limit)?;
@@ -1550,6 +1745,190 @@ fn validate_declaration(
     }
 }
 
+fn cleanup_block_is_synchronous(block: &TypedBlockIr, definitions: &[Definition]) -> bool {
+    let statements_are_sync = block.statements.iter().all(|statement| match statement {
+        TypedStatementIr::Let { value, .. } => value
+            .as_ref()
+            .is_none_or(|value| cleanup_expression_is_synchronous(value, definitions)),
+        TypedStatementIr::Assign { target, value } => {
+            cleanup_place_is_synchronous(target, definitions)
+                && cleanup_expression_is_synchronous(value, definitions)
+        }
+        TypedStatementIr::Expression(expression) => {
+            cleanup_expression_is_synchronous(expression, definitions)
+        }
+        TypedStatementIr::Return(expression) => expression
+            .as_ref()
+            .is_none_or(|expression| cleanup_expression_is_synchronous(expression, definitions)),
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            cleanup_expression_is_synchronous(condition, definitions)
+                && cleanup_block_is_synchronous(then_block, definitions)
+                && else_block
+                    .as_ref()
+                    .is_none_or(|block| cleanup_block_is_synchronous(block, definitions))
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => {
+            cleanup_expression_is_synchronous(condition, definitions)
+                && cleanup_block_is_synchronous(body, definitions)
+        }
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            cleanup_expression_is_synchronous(start, definitions)
+                && cleanup_expression_is_synchronous(end, definitions)
+                && cleanup_block_is_synchronous(body, definitions)
+        }
+        TypedStatementIr::Defer { cleanup, captures } => {
+            definitions
+                .get(cleanup.0 as usize)
+                .is_some_and(|definition| definition.effect == IrEffect::Cleanup)
+                && captures
+                    .iter()
+                    .all(|capture| cleanup_expression_is_synchronous(capture, definitions))
+        }
+        TypedStatementIr::Break | TypedStatementIr::Continue => true,
+        TypedStatementIr::Yield { .. } => false,
+    });
+    statements_are_sync
+        && block
+            .tail
+            .as_ref()
+            .is_none_or(|tail| cleanup_expression_is_synchronous(tail, definitions))
+}
+
+fn cleanup_place_is_synchronous(place: &TypedPlaceIr, definitions: &[Definition]) -> bool {
+    match place {
+        TypedPlaceIr::Definition(_) => true,
+        TypedPlaceIr::Field { base, .. } => cleanup_place_is_synchronous(base, definitions),
+        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
+            cleanup_expression_is_synchronous(object, definitions)
+        }
+        TypedPlaceIr::Index { base, index } => {
+            cleanup_expression_is_synchronous(base, definitions)
+                && cleanup_expression_is_synchronous(index, definitions)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn cleanup_expression_is_synchronous(
+    expression: &TypedExpressionIr,
+    definitions: &[Definition],
+) -> bool {
+    if expression.effect == IrEffect::Task {
+        return false;
+    }
+    let definition_is_sync = |definition: DefinitionId| {
+        definitions
+            .get(definition.0 as usize)
+            .is_some_and(|definition| definition.effect != IrEffect::Task)
+    };
+    match &expression.kind {
+        TypedExpressionKind::Await(_) | TypedExpressionKind::Yield => false,
+        TypedExpressionKind::Literal(_)
+        | TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. } => true,
+        TypedExpressionKind::Unary { operand, .. } | TypedExpressionKind::Try(operand) => {
+            cleanup_expression_is_synchronous(operand, definitions)
+        }
+        TypedExpressionKind::Binary { left, right, .. } => {
+            cleanup_expression_is_synchronous(left, definitions)
+                && cleanup_expression_is_synchronous(right, definitions)
+        }
+        TypedExpressionKind::Call { callee, arguments } => {
+            definition_is_sync(*callee)
+                && arguments
+                    .iter()
+                    .all(|argument| cleanup_expression_is_synchronous(argument, definitions))
+        }
+        TypedExpressionKind::StandardCall {
+            function,
+            arguments,
+            ..
+        } => {
+            definition_is_sync(*function)
+                && arguments
+                    .iter()
+                    .all(|argument| cleanup_expression_is_synchronous(argument, definitions))
+        }
+        TypedExpressionKind::BuiltinCall { arguments, .. } => arguments
+            .iter()
+            .all(|argument| cleanup_expression_is_synchronous(argument, definitions)),
+        TypedExpressionKind::HostCall {
+            function,
+            arguments,
+            ..
+        } => {
+            definition_is_sync(*function)
+                && arguments
+                    .iter()
+                    .all(|argument| cleanup_expression_is_synchronous(argument, definitions))
+        }
+        TypedExpressionKind::Construct { fields, .. } => fields
+            .iter()
+            .all(|(_, value)| cleanup_expression_is_synchronous(value, definitions)),
+        TypedExpressionKind::ClassConstruct { fields, update, .. } => {
+            update
+                .as_ref()
+                .is_none_or(|value| cleanup_expression_is_synchronous(value, definitions))
+                && fields
+                    .iter()
+                    .all(|(_, value)| cleanup_expression_is_synchronous(value, definitions))
+        }
+        TypedExpressionKind::EnumConstruct { payload, .. }
+        | TypedExpressionKind::BuiltinVariant { payload, .. } => payload
+            .as_ref()
+            .is_none_or(|payload| cleanup_expression_is_synchronous(payload, definitions)),
+        TypedExpressionKind::Field { base, .. } | TypedExpressionKind::StateField { base, .. } => {
+            cleanup_expression_is_synchronous(base, definitions)
+        }
+        TypedExpressionKind::Index { base, index } => {
+            cleanup_expression_is_synchronous(base, definitions)
+                && cleanup_expression_is_synchronous(index, definitions)
+        }
+        TypedExpressionKind::Array(values)
+        | TypedExpressionKind::Tuple(values)
+        | TypedExpressionKind::StringInterpolation(values) => values
+            .iter()
+            .all(|value| cleanup_expression_is_synchronous(value, definitions)),
+        TypedExpressionKind::Match { value, arms } => {
+            cleanup_expression_is_synchronous(value, definitions)
+                && arms
+                    .iter()
+                    .all(|arm| cleanup_expression_is_synchronous(&arm.value, definitions))
+        }
+        TypedExpressionKind::Update { base, fields } => {
+            cleanup_expression_is_synchronous(base, definitions)
+                && fields
+                    .iter()
+                    .all(|(_, value)| cleanup_expression_is_synchronous(value, definitions))
+        }
+        TypedExpressionKind::Migration(intrinsic) => match intrinsic {
+            MigrationIntrinsicIr::OldFieldGet { object, .. } => {
+                cleanup_expression_is_synchronous(object, definitions)
+            }
+            MigrationIntrinsicIr::NewSet { object, value, .. } => {
+                cleanup_expression_is_synchronous(object, definitions)
+                    && cleanup_expression_is_synchronous(value, definitions)
+            }
+            MigrationIntrinsicIr::Replace { target, .. } => {
+                cleanup_expression_is_synchronous(target, definitions)
+            }
+            MigrationIntrinsicIr::OldGet { .. }
+            | MigrationIntrinsicIr::NewCreate { .. }
+            | MigrationIntrinsicIr::Preserve { .. }
+            | MigrationIntrinsicIr::Delete { .. }
+            | MigrationIntrinsicIr::Finish => true,
+        },
+    }
+}
+
 fn validate_block(
     block: &TypedBlockIr,
     limit: usize,
@@ -1557,7 +1936,9 @@ fn validate_block(
 ) -> Result<(), TypedIrError> {
     for statement in &block.statements {
         match statement {
-            TypedStatementIr::Let { definition, value } => {
+            TypedStatementIr::Let {
+                definition, value, ..
+            } => {
                 validate_id(*definition, limit)?;
                 if let Some(value) = value {
                     validate_expression(value, limit)?;
@@ -1619,7 +2000,9 @@ fn validate_block(
                 validate_id(*cleanup, limit)?;
                 validate_expressions(captures, limit)?;
             }
-            TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield => {}
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
         }
     }
     if let Some(tail) = &block.tail {
@@ -1688,7 +2071,15 @@ fn constant_i32_expression(
 fn validate_place(place: &TypedPlaceIr, limit: usize) -> Result<(), TypedIrError> {
     match place {
         TypedPlaceIr::Definition(id) => validate_id(*id, limit),
-        TypedPlaceIr::Field { base, field } | TypedPlaceIr::StateField { base, field } => {
+        TypedPlaceIr::Field { base, field } => {
+            validate_place(base, limit)?;
+            validate_id(*field, limit)
+        }
+        TypedPlaceIr::ClassField {
+            object: base,
+            field,
+        }
+        | TypedPlaceIr::StateField { base, field } => {
             validate_expression(base, limit)?;
             validate_id(*field, limit)
         }
@@ -1713,6 +2104,14 @@ fn validate_expression(expression: &TypedExpressionIr, limit: usize) -> Result<(
             }
         }
         TypedExpressionKind::Reference(id) => validate_id(*id, limit),
+        TypedExpressionKind::PersistentStateGet { state_type, .. } => {
+            validate_id(*state_type, limit)?;
+            if expression.ty == IrType::Named(*state_type) {
+                Ok(())
+            } else {
+                Err(TypedIrError::InvalidReplEntrypoint(*state_type))
+            }
+        }
         TypedExpressionKind::Unary { operand, .. } => validate_expression(operand, limit),
         TypedExpressionKind::Binary { left, right, .. } => {
             validate_expression(left, limit)?;
@@ -1745,16 +2144,31 @@ fn validate_expression(expression: &TypedExpressionIr, limit: usize) -> Result<(
             validate_expressions(arguments, limit)
         }
         TypedExpressionKind::HostCall {
-            interface,
+            contract,
             function,
             arguments,
         } => {
-            validate_id(*interface, limit)?;
+            validate_id(*contract, limit)?;
             validate_id(*function, limit)?;
             validate_expressions(arguments, limit)
         }
         TypedExpressionKind::Construct { definition, fields } => {
             validate_id(*definition, limit)?;
+            for (field, value) in fields {
+                validate_id(*field, limit)?;
+                validate_expression(value, limit)?;
+            }
+            Ok(())
+        }
+        TypedExpressionKind::ClassConstruct {
+            definition,
+            fields,
+            update,
+        } => {
+            validate_id(*definition, limit)?;
+            if let Some(update) = update {
+                validate_expression(update, limit)?;
+            }
             for (field, value) in fields {
                 validate_id(*field, limit)?;
                 validate_expression(value, limit)?;
@@ -1839,6 +2253,7 @@ fn validate_unit_expression_shape(expression: &TypedExpressionIr) -> Result<(), 
     }
     match &expression.kind {
         TypedExpressionKind::Reference(_)
+        | TypedExpressionKind::PersistentStateGet { .. }
         | TypedExpressionKind::Call { .. }
         | TypedExpressionKind::StandardCall { .. }
         | TypedExpressionKind::BuiltinCall { .. }
@@ -1856,6 +2271,7 @@ fn validate_unit_expression_shape(expression: &TypedExpressionIr) -> Result<(), 
         | TypedExpressionKind::Binary { .. }
         | TypedExpressionKind::StringInterpolation(_)
         | TypedExpressionKind::Construct { .. }
+        | TypedExpressionKind::ClassConstruct { .. }
         | TypedExpressionKind::EnumConstruct { .. }
         | TypedExpressionKind::BuiltinVariant { .. }
         | TypedExpressionKind::Array(_)
@@ -1990,10 +2406,80 @@ fn validate_type(ty: &IrType, limit: usize) -> Result<(), TypedIrError> {
 
 fn validate_concrete_type(ty: &IrType, limit: usize) -> Result<(), TypedIrError> {
     validate_type(ty, limit)?;
-    if contains_type_parameter(ty) {
+    validate_resource_token_types(ty)?;
+    if contains_host_request(ty) {
+        Err(TypedIrError::RuntimeRequestTypeEscaped)
+    } else if contains_type_parameter(ty) {
         Err(TypedIrError::UnresolvedTypeParameter)
     } else {
         Ok(())
+    }
+}
+
+fn validate_resource_token_types(ty: &IrType) -> Result<(), TypedIrError> {
+    match ty {
+        IrType::ResourceToken(None) => Err(TypedIrError::UntypedResourceToken),
+        IrType::ResourceToken(Some(content)) => {
+            validate_resource_token_types(content)?;
+            if matches!(content.as_ref(), IrType::Named(_)) {
+                Ok(())
+            } else {
+                Err(TypedIrError::InvalidResourceTokenContentType)
+            }
+        }
+        IrType::Option(inner)
+        | IrType::Array(inner)
+        | IrType::HostRequest(Some(inner))
+        | IrType::Snapshot(inner)
+        | IrType::Buffer(inner)
+        | IrType::StateHandle(inner) => validate_resource_token_types(inner),
+        IrType::Result(ok, error) | IrType::Map(ok, error) => {
+            validate_resource_token_types(ok)?;
+            validate_resource_token_types(error)
+        }
+        IrType::Tuple(items) => {
+            for item in items {
+                validate_resource_token_types(item)?;
+            }
+            Ok(())
+        }
+        IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_)
+        | IrType::HostRequest(None)
+        | IrType::TypeParameter(_) => Ok(()),
+    }
+}
+
+fn contains_host_request(ty: &IrType) -> bool {
+    match ty {
+        IrType::HostRequest(_) => true,
+        IrType::Option(inner)
+        | IrType::Array(inner)
+        | IrType::Snapshot(inner)
+        | IrType::Buffer(inner)
+        | IrType::StateHandle(inner) => contains_host_request(inner),
+        IrType::ResourceToken(inner) => inner.as_deref().is_some_and(contains_host_request),
+        IrType::Result(ok, error) | IrType::Map(ok, error) => {
+            contains_host_request(ok) || contains_host_request(error)
+        }
+        IrType::Tuple(items) => items.iter().any(contains_host_request),
+        IrType::Unit
+        | IrType::Bool
+        | IrType::I32
+        | IrType::I64
+        | IrType::F32
+        | IrType::F64
+        | IrType::String
+        | IrType::Rune
+        | IrType::Named(_)
+        | IrType::TypeParameter(_) => false,
     }
 }
 
@@ -2056,6 +2542,7 @@ pub(crate) fn remap_typed_module(
     Ok(TypedModuleIr {
         package_id: module.package_id.clone(),
         module: module.module.clone(),
+        virtual_module_path: module.virtual_module_path.clone(),
         source: module.source.clone(),
         file_id: module.file_id,
         syntax: Arc::clone(&module.syntax),
@@ -2087,9 +2574,7 @@ fn remap_type_layout(
     mapping: &BTreeMap<DefinitionId, DefinitionId>,
 ) -> Result<(), TypedIrError> {
     match layout {
-        TypedTypeLayoutIr::Struct { fields }
-        | TypedTypeLayoutIr::Class { fields }
-        | TypedTypeLayoutIr::Stateful { fields } => {
+        TypedTypeLayoutIr::Struct { fields } | TypedTypeLayoutIr::Class { fields, .. } => {
             for field in fields {
                 field.definition = remapped_id(field.definition, mapping)?;
                 remap_type(&mut field.ty, mapping)?;
@@ -2113,7 +2598,9 @@ fn remap_block(
 ) -> Result<(), TypedIrError> {
     for statement in &mut block.statements {
         match statement {
-            TypedStatementIr::Let { definition, value } => {
+            TypedStatementIr::Let {
+                definition, value, ..
+            } => {
                 *definition = remapped_id(*definition, mapping)?;
                 if let Some(value) = value {
                     remap_expression(value, mapping)?;
@@ -2164,7 +2651,9 @@ fn remap_block(
                     remap_expression(capture, mapping)?;
                 }
             }
-            TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield => {}
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
         }
     }
     if let Some(tail) = &mut block.tail {
@@ -2181,7 +2670,15 @@ fn remap_place(
         TypedPlaceIr::Definition(definition) => {
             *definition = remapped_id(*definition, mapping)?;
         }
-        TypedPlaceIr::Field { base, field } | TypedPlaceIr::StateField { base, field } => {
+        TypedPlaceIr::Field { base, field } => {
+            remap_place(base, mapping)?;
+            *field = remapped_id(*field, mapping)?;
+        }
+        TypedPlaceIr::ClassField {
+            object: base,
+            field,
+        }
+        | TypedPlaceIr::StateField { base, field } => {
             remap_expression(base, mapping)?;
             *field = remapped_id(*field, mapping)?;
         }
@@ -2193,6 +2690,7 @@ fn remap_place(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn remap_expression(
     expression: &mut TypedExpressionIr,
     mapping: &BTreeMap<DefinitionId, DefinitionId>,
@@ -2202,6 +2700,9 @@ fn remap_expression(
         TypedExpressionKind::Literal(_) | TypedExpressionKind::Yield => {}
         TypedExpressionKind::Reference(definition) => {
             *definition = remapped_id(*definition, mapping)?;
+        }
+        TypedExpressionKind::PersistentStateGet { state_type, .. } => {
+            *state_type = remapped_id(*state_type, mapping)?;
         }
         TypedExpressionKind::Unary { operand, .. }
         | TypedExpressionKind::Try(operand)
@@ -2237,17 +2738,28 @@ fn remap_expression(
             remap_expressions(arguments, mapping)?;
         }
         TypedExpressionKind::HostCall {
-            interface,
+            contract,
             function,
             arguments,
         } => {
-            *interface = remapped_id(*interface, mapping)?;
+            *contract = remapped_id(*contract, mapping)?;
             *function = remapped_id(*function, mapping)?;
             remap_expressions(arguments, mapping)?;
         }
         TypedExpressionKind::Construct { definition, fields } => {
             *definition = remapped_id(*definition, mapping)?;
             remap_fields(fields, mapping)?;
+        }
+        TypedExpressionKind::ClassConstruct {
+            definition,
+            fields,
+            update,
+        } => {
+            *definition = remapped_id(*definition, mapping)?;
+            remap_fields(fields, mapping)?;
+            if let Some(update) = update {
+                remap_expression(update, mapping)?;
+            }
         }
         TypedExpressionKind::EnumConstruct {
             enum_definition,
@@ -2457,6 +2969,15 @@ pub enum TypedIrError {
     UnknownDefinition(DefinitionId),
     MissingRootPackageModule(PackageId),
     DefinitionPackageWithoutModule(PackageId),
+    InvalidModuleSourceIdentity {
+        source: SourceKey,
+        module: ModulePath,
+    },
+    VirtualModuleIdentityMismatch {
+        source: SourceKey,
+        module: ModulePath,
+        virtual_module: ModulePath,
+    },
     ZeroLoopBound,
     NonConstantStaticRange,
     InvalidStaticRangeBound {
@@ -2470,9 +2991,13 @@ pub enum TypedIrError {
     MissingStableSymbol(DefinitionId),
     MissingDefinitionRemap(DefinitionId),
     InvalidSnapshotContentType,
+    UntypedResourceToken,
+    InvalidResourceTokenContentType,
     NonRuntimeStateType,
     InvalidHostAsyncResult(DefinitionId),
+    NonCanonicalHostCapabilities(DefinitionId),
     InvalidAwaitOperand,
+    InvalidCleanupBody(DefinitionId),
     InvalidUnitExpression,
     InvalidMigrationEffect,
     InvalidMigrationResultType,
@@ -2481,6 +3006,8 @@ pub enum TypedIrError {
     InvalidMigrationFieldOwner(DefinitionId),
     InvalidMigrationFieldType(DefinitionId),
     InvalidMigrationTargetType,
+    InvalidReplEntrypoint(DefinitionId),
+    RuntimeRequestTypeEscaped,
     UnresolvedTypeParameter,
     InvalidTypeParameter(u16),
     InvalidStandardFunction(DefinitionId),
@@ -2543,11 +3070,13 @@ mod tests {
         let function = HostFunctionBindingIr {
             definition: DefinitionId(0),
             stable_id: StableId::from_name("Host::request"),
+            declaration_fingerprint: [1; 32],
             import_index: 0,
             mode: IrHostFunctionMode::Request,
             parameters: Vec::new(),
             result: IrType::Result(Box::new(IrType::I32), Box::new(IrType::String)),
             fuel_cost: 1,
+            required_capabilities: Vec::new(),
             async_result: Some(HostAsyncResultIr {
                 result_type: StableId::from_name("forged-result"),
                 success: IrType::I32,
@@ -2560,8 +3089,8 @@ mod tests {
             source: None,
         };
         let host = HostBindingIr {
-            interface: DefinitionId(0),
-            interface_stable_id: StableId::from_name("Host"),
+            contract: DefinitionId(0),
+            contract_stable_id: StableId::from_name("Host"),
             namespaces: Vec::new(),
             types: Vec::new(),
             functions: vec![function.clone()],

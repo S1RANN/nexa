@@ -8,9 +8,9 @@ pub use nexa_core::{
 use crate::{Definition, IrType, PackageId, PackageSourceSet, StateTypeIr, TypedIrError};
 
 const SOURCE_SET_SCHEMA: u16 = 2;
-const PUBLIC_API_SCHEMA: u16 = 1;
-const STATE_SCHEMA_SCHEMA: u16 = 1;
-const BUILD_SCHEMA: u16 = 1;
+const PUBLIC_API_SCHEMA: u16 = 2;
+const STATE_SCHEMA_SCHEMA: u16 = 2;
+const BUILD_SCHEMA: u16 = 2;
 
 /// One canonical, already type-checked semantic record.
 ///
@@ -132,8 +132,16 @@ pub fn canonical_value_type(
                 .collect::<Result<Vec<_>, _>>()?;
             named(nexa_core::canonical_tuple_type_id(&items))
         }
-        IrType::HostRequest(_) => named(nexa_core::StableId::from_name("HostRequest")),
-        IrType::ResourceToken(_) => named(nexa_core::StableId::from_name("ResourceToken")),
+        IrType::HostRequest(_) => Err(TypedIrError::RuntimeRequestTypeEscaped),
+        IrType::ResourceToken(None) => Err(TypedIrError::UntypedResourceToken),
+        IrType::ResourceToken(Some(content)) => {
+            let nexa_core::CanonicalValueType::Named(content) =
+                canonical_value_type(content, definitions)?
+            else {
+                return Err(TypedIrError::InvalidResourceTokenContentType);
+            };
+            named(nexa_core::canonical_resource_token_type_id(content))
+        }
         IrType::Snapshot(content) => {
             let CanonicalValueType::Named(content) = canonical_value_type(content, definitions)?
             else {
@@ -201,8 +209,10 @@ pub struct BuildFingerprintInput {
     ///
     /// The complete Host ABI remains in `host_contract`; this field changes only the effective
     /// export-requirement view selected by the build owner.
-    pub host_required_exports: Vec<u8>,
-    pub language_version: String,
+    pub host_required_entrypoints: Vec<u8>,
+    /// Canonical cumulative REPL session context. Empty for non-REPL builds.
+    pub repl_session_context: Vec<u8>,
+    pub language_version: u16,
     pub standard_library_version: String,
     /// Canonical descriptor bytes for every compiler-provided static module and intrinsic.
     ///
@@ -247,8 +257,9 @@ impl BuildFingerprintInput {
         }
         builder.field_bytes("host-contract", &self.host_contract);
         builder.field_bytes("host-contract-source", &self.host_contract_source);
-        builder.field_bytes("host-required-exports", &self.host_required_exports);
-        builder.field_str("language-version", &self.language_version);
+        builder.field_bytes("host-required-entrypoints", &self.host_required_entrypoints);
+        builder.field_bytes("repl-session-context", &self.repl_session_context);
+        builder.field_bytes("language-version", &self.language_version.to_le_bytes());
         builder.field_str("standard-library-version", &self.standard_library_version);
         builder.field_bytes(
             "standard-library-descriptor",
@@ -287,7 +298,7 @@ mod tests {
                 builder
                     .add(
                         NormalizedPackagePath::new(path).unwrap(),
-                        format!("module {};", path.as_bytes()[4] as char),
+                        format!("fn {}() {{}}", path.as_bytes()[4] as char),
                         SourceRole::Production,
                     )
                     .unwrap();
@@ -303,7 +314,7 @@ mod tests {
         let mut base = SourceSetBuilder::new(package.clone(), CompilationLimits::default());
         base.add(
             NormalizedPackagePath::new("src/main.nexa").unwrap(),
-            "module main;",
+            "fn main() {}",
             SourceRole::Production,
         )
         .unwrap();
@@ -313,13 +324,13 @@ mod tests {
         with_test
             .add(
                 NormalizedPackagePath::new("src/main.nexa").unwrap(),
-                "module main;",
+                "fn main() {}",
                 SourceRole::Production,
             )
             .unwrap()
             .add(
                 NormalizedPackagePath::new("tests/check.nexa").unwrap(),
-                "module test.check;",
+                "@test\nfn check() {}",
                 SourceRole::Test,
             )
             .unwrap();

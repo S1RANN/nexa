@@ -1,5 +1,5 @@
 use nexa_bytecode::{
-    FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, Signature, ValueType,
+    FunctionBuilder, FunctionEffect, Instruction, ModuleBuilder, ScriptExport, Signature, ValueType,
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
@@ -10,6 +10,7 @@ use nexa_runtime::{
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 pub const HOST_NAME: &str = "baseline-host";
+pub const BASELINE_ENTRY_EXPORT: StableId = StableId(0x5254_4241_5345_454e);
 #[must_use]
 pub fn hashes() -> (StableId, StateSchemaFingerprint) {
     (
@@ -23,8 +24,18 @@ pub fn verified(functions: Vec<nexa_bytecode::Function>) -> VerifiedModule {
     let (host, schema) = hashes();
     let mut module = ModuleBuilder::new();
     module.metadata(host, schema);
-    for function in functions {
-        module.function(function);
+    for (position, function) in functions.into_iter().enumerate() {
+        let signature = function.signature.clone();
+        let effect = function.effect;
+        let function = module.function(function);
+        if position == 0 {
+            module.script_export(ScriptExport {
+                stable_id: BASELINE_ENTRY_EXPORT,
+                function,
+                signature,
+                effect,
+            });
+        }
     }
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
@@ -63,13 +74,13 @@ pub fn realm_with(
 struct NoHost(StableId);
 
 impl HostRegistry for NoHost {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(self.0)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         _: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
@@ -94,7 +105,12 @@ pub fn spawn_test_task(
 ) -> (ScopeHandle, TaskHandle) {
     let scope = realm.create_scope(None).unwrap();
     let task = realm
-        .spawn_task(module, 0, &[RuntimeValue::I32(7)], task_config(scope))
+        .spawn_task(
+            module,
+            BASELINE_ENTRY_EXPORT,
+            &[RuntimeValue::I32(7)],
+            task_config(scope),
+        )
         .unwrap();
     (scope, task)
 }

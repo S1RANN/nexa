@@ -24,12 +24,20 @@ const PACKAGE_COUNT: usize = 20;
 const ROOT_PACKAGE: &str = "scale.application";
 const SOURCE_ID: &str = "scale-source";
 const ROOT_DIRECTORY: &str = "packages/root";
-/// `nexa_idl::canonical(parse("interface ScaleHost {}"))`.
-const SCALE_HOST_CONTRACT: &[u8] = b"interface:ScaleHost;";
-const SCALE_HOST_SOURCE_PATH: &str = "host-contract.nidl";
-const SCALE_HOST_SOURCE: &str = "interface ScaleHost {\n}\n";
+const SCALE_HOST_SOURCE_PATH: &str = "nidl://tests/m4-scale/host-contract.nidl";
+const SCALE_HOST_SOURCE: &str = "contract ScaleHost {}\n";
 const WORKER_COUNT: usize = 4;
 static NEXT_TEMP_ROOT: AtomicU64 = AtomicU64::new(0);
+
+fn scale_host_contract() -> Vec<u8> {
+    let contract = nexa_idl::parse(SCALE_HOST_SOURCE).expect("scale Host NIDL");
+    nexa_idl::effective_contract_descriptor(
+        &contract,
+        &nexa_idl::EffectiveContractSelection::default(),
+    )
+    .expect("empty scale Host effective Contract")
+    .bytes
+}
 
 fn scale_host_source_identity() -> Vec<u8> {
     let mut bytes = b"nexa.host-contract-source\0\x01\0\0\0".to_vec();
@@ -48,11 +56,8 @@ fn scale_host_source_identity() -> Vec<u8> {
     bytes
 }
 
-fn scale_host_required_exports_identity() -> Vec<u8> {
-    let mut bytes = b"nexa.host-required-exports\0".to_vec();
-    bytes.extend_from_slice(&1_u32.to_le_bytes());
-    bytes.extend_from_slice(&0_u64.to_le_bytes());
-    bytes
+fn scale_host_required_entrypoints_identity() -> Vec<u8> {
+    nexa_idl::required_entrypoints_descriptor(std::iter::empty::<&str>())
 }
 
 #[derive(Serialize)]
@@ -170,17 +175,17 @@ fn root_module_names() -> Vec<String> {
 }
 
 fn root_module_source(module: &str) -> String {
-    let mut source = format!("module {module};\n");
+    let mut source = String::new();
     if module.contains(".m") {
         for base in 0..BASE_MODULES {
-            writeln!(source, "import scale.base{base} as base{base};").unwrap();
+            writeln!(source, "use package::scale::base{base};").unwrap();
         }
     }
     for symbol in 0..SYMBOLS_PER_MODULE {
-        writeln!(source, "pub const symbol_{symbol}: i32 = {symbol};").unwrap();
+        writeln!(source, "pub const SYMBOL_{symbol}: i32 = {symbol};").unwrap();
     }
     if module == "scale.base0" {
-        writeln!(source, "pub fn boot() -> i32 {{ return symbol_0; }}").unwrap();
+        writeln!(source, "pub fn boot() -> i32 {{ return SYMBOL_0; }}").unwrap();
     }
     source
 }
@@ -318,6 +323,7 @@ fn scale_fixture(module_order: &[usize], reverse_packages: bool) -> ScaleFixture
     let lock = Arc::new(LockFile::from_graph(&graph));
     let lock_bytes = lock.canonical_bytes();
     let compilation_options = CompilationOptions::default();
+    let host_contract = scale_host_contract();
     let fingerprint_input = BuildFingerprintInput {
         root_package: root_manifest.id.clone(),
         root_manifest: root_manifest.canonical_bytes(),
@@ -330,10 +336,11 @@ fn scale_fixture(module_order: &[usize], reverse_packages: bool) -> ScaleFixture
             .iter()
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
-        host_contract: SCALE_HOST_CONTRACT.to_vec(),
+        host_contract: host_contract.clone(),
         host_contract_source: scale_host_source_identity(),
-        host_required_exports: scale_host_required_exports_identity(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: scale_host_required_entrypoints_identity(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -351,9 +358,9 @@ fn scale_fixture(module_order: &[usize], reverse_packages: bool) -> ScaleFixture
         dependency_source_sets,
         graph,
         Some(lock),
-        SCALE_HOST_CONTRACT,
+        host_contract,
         scale_host_source_identity(),
-        fingerprint_input.host_required_exports.clone(),
+        fingerprint_input.host_required_entrypoints.clone(),
         compilation_options,
         fingerprint_input,
     )
@@ -424,11 +431,12 @@ fn analyze_fixture(fixture: &ScaleFixture) -> AnalysisRun {
 fn scale_environment() -> AnalysisEnvironment {
     AnalysisEnvironment {
         host: Some(HostContractSurface {
-            interface_name: "ScaleHost".into(),
-            interface_stable_id: StableId::from_name("ScaleHost"),
+            contract_name: "ScaleHost".into(),
+            contract_stable_id: StableId::from_name("ScaleHost"),
             types: Vec::new(),
             functions: Vec::new(),
-            required_exports: Vec::new(),
+            nexa_entrypoints: Vec::new(),
+            required_entrypoints: Vec::new(),
             source: None,
         }),
         ..AnalysisEnvironment::default()
@@ -575,6 +583,7 @@ fn write_scale_directory_tree(root: &Path) {
     .unwrap();
 }
 
+#[allow(clippy::too_many_lines)]
 fn load_scale_directory_fixture(root: &Path) -> ScaleFixture {
     let packages = root.join("packages");
     let source_id = SourceId::new("scale-directory-source").unwrap();
@@ -636,6 +645,7 @@ fn load_scale_directory_fixture(root: &Path) -> ScaleFixture {
     lock.verify(&graph).unwrap();
     let lock_bytes = lock.canonical_bytes();
     let compilation_options = CompilationOptions::default();
+    let host_contract = scale_host_contract();
     let fingerprint_input = BuildFingerprintInput {
         root_package: root_loaded.manifest.id.clone(),
         root_manifest: root_loaded.manifest.canonical_bytes(),
@@ -648,10 +658,11 @@ fn load_scale_directory_fixture(root: &Path) -> ScaleFixture {
             .iter()
             .map(|(package, sources)| (package.clone(), source_set_fingerprint(sources)))
             .collect(),
-        host_contract: SCALE_HOST_CONTRACT.to_vec(),
+        host_contract: host_contract.clone(),
         host_contract_source: scale_host_source_identity(),
-        host_required_exports: scale_host_required_exports_identity(),
-        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION.into(),
+        host_required_entrypoints: scale_host_required_entrypoints_identity(),
+        repl_session_context: Vec::new(),
+        language_version: nexa_analysis::NEXA_LANGUAGE_VERSION,
         standard_library_version: nexa_stdlib::standard_library().version.to_string(),
         standard_library_descriptor: nexa_stdlib::canonical_descriptor_identity(),
         compiler_version: nexa_core::NEXA_COMPILER_VERSION.into(),
@@ -669,9 +680,9 @@ fn load_scale_directory_fixture(root: &Path) -> ScaleFixture {
         dependency_source_sets,
         graph,
         Some(lock),
-        SCALE_HOST_CONTRACT,
+        host_contract,
         scale_host_source_identity(),
-        fingerprint_input.host_required_exports.clone(),
+        fingerprint_input.host_required_entrypoints.clone(),
         compilation_options,
         fingerprint_input,
     )
@@ -784,14 +795,14 @@ fn assert_build_authorities(input: &ResolvedBuildInput) {
     let fingerprint = input.fingerprint_input.as_ref();
     let options = CompilationOptions::default();
     assert_eq!(input.compilation_options, options);
-    assert_eq!(fingerprint.host_contract, SCALE_HOST_CONTRACT);
+    assert_eq!(fingerprint.host_contract, scale_host_contract());
     assert_eq!(
         fingerprint.host_contract_source,
         scale_host_source_identity()
     );
     assert_eq!(
-        fingerprint.host_required_exports,
-        scale_host_required_exports_identity()
+        fingerprint.host_required_entrypoints,
+        scale_host_required_entrypoints_identity()
     );
     assert_eq!(
         fingerprint.language_version,

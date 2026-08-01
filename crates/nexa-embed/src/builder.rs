@@ -87,7 +87,14 @@ impl NexaEngineBuilder {
 
     #[must_use]
     pub fn require_export<E: nexa::ScriptExport>(mut self) -> Self {
-        self.required_exports.push(ExportRequirement::of::<E>());
+        let requirement = ExportRequirement::of::<E>();
+        if !self
+            .required_exports
+            .iter()
+            .any(|existing| existing == &requirement)
+        {
+            self.required_exports.push(requirement);
+        }
         self
     }
 

@@ -1,47 +1,58 @@
-module snake.food_chaos;
-import host as snake;
-import std.collections as collections;
+use host::snake;
 
-fn empty() -> Array<snake.SnakeCommand> {
-    return [];
+fn empty() -> Array<snake::SnakeCommand> {
+    return Array::new();
 }
 
-fn register() -> Array<snake.SnakeCommand> {
-    let commands: Array<snake.SnakeCommand> = [];
-    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "golden", length_delta: 2, score_delta: 20, speed_delta: 0 }));
-    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "poison", length_delta: 0 - 1, score_delta: 0, speed_delta: 0 }));
-    collections.array_push(commands, snake.RegisterFood(snake.FoodDefinition { local_id: "speed", length_delta: 0, score_delta: 0, speed_delta: 0 - 20 }));
-    return commands;
+fn register() -> Array<snake::SnakeCommand> {
+    return [
+        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "golden", length_delta: 2, score_delta: 20, speed_delta: 0 }),
+        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "poison", length_delta: 0 - 1, score_delta: 0, speed_delta: 0 }),
+        snake::SnakeCommand::RegisterFood(snake::FoodDefinition { local_id: "speed", length_delta: 0, score_delta: 0, speed_delta: 0 - 20 }),
+    ];
 }
 
-fn effect(snapshot: snake.GameSnapshot) -> Array<snake.SnakeCommand> {
-    let commands: Array<snake.SnakeCommand> = [];
-    let kind: string = match snapshot.food {
-        Some(food) => food.kind,
-        None => "classic",
-    };
+pub fn calculate_food_effect(
+    context: snake::FoodEatenContext,
+) -> snake::FoodEffect {
+    let kind: string = context.food.kind;
     if kind == "official.food-chaos:golden" {
-        collections.array_push(commands, snake.ResizeSnake(2));
-        collections.array_push(commands, snake.AddScore(20));
+        return snake::FoodEffect {
+            length_delta: 2,
+            score_delta: 20,
+            speed_delta: 0,
+        };
     }
     if kind == "official.food-chaos:poison" {
-        collections.array_push(commands, snake.ResizeSnake(0 - 1));
+        return snake::FoodEffect {
+            length_delta: 0 - 1,
+            score_delta: 0,
+            speed_delta: 0,
+        };
     }
     if kind == "official.food-chaos:speed" {
-        collections.array_push(commands, snake.SetSpeed(0 - 20));
+        return snake::FoodEffect {
+            length_delta: 0,
+            score_delta: 0,
+            speed_delta: 0 - 20,
+        };
     }
-    return commands;
+    return snake::FoodEffect {
+        length_delta: 0,
+        score_delta: 0,
+        speed_delta: 0,
+    };
 }
 
-pub fn OnEvent(event: snake.SnakeEvent) -> Array<snake.SnakeCommand> {
+pub fn on_event(event: snake::SnakeEvent) -> Array<snake::SnakeCommand> {
     return match event {
-        snake.PackageEnabled(snapshot) => register(),
-        snake.GameStarted(snapshot) => empty(),
-        snake.GameTick(snapshot) => empty(),
-        snake.ScoreChanged(snapshot) => empty(),
-        snake.FoodSpawnRequested(snapshot) => empty(),
-        snake.FoodEaten(snapshot) => effect(snapshot),
-        snake.GameEnded(snapshot) => empty(),
-        snake.SettingsChanged(snapshot) => empty(),
+        snake::SnakeEvent::PackageEnabled(snapshot) => register(),
+        snake::SnakeEvent::GameStarted(snapshot) => empty(),
+        snake::SnakeEvent::GameTick(snapshot) => empty(),
+        snake::SnakeEvent::ScoreChanged(snapshot) => empty(),
+        snake::SnakeEvent::FoodSpawnRequested(snapshot) => empty(),
+        snake::SnakeEvent::FoodEaten(snapshot) => empty(),
+        snake::SnakeEvent::GameEnded(snapshot) => empty(),
+        snake::SnakeEvent::SettingsChanged(snapshot) => empty(),
     };
 }

@@ -1,22 +1,25 @@
 use std::hint::black_box;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use nexa_bytecode::{
     FunctionBuilder, FunctionEffect, HostCallMode, HostImport, Instruction, ModuleBuilder, RootMap,
-    Signature, ValueType,
+    ScriptExport, Signature, ValueType,
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    HostCallOutcome, HostPayload, HostRegistry, HostTrap, PendingHostRequest, RealmConfig,
-    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeValue,
-    StepConfig, TaskLimits, TaskPoll, TickBudget,
+    HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
+    PendingHostRequest, RealmConfig, RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs,
+    RuntimeHostDomain, RuntimeValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 
 const DEFAULT_SAMPLES: usize = 1_000;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(11);
+const UNARY_TASK_EXPORT: StableId = StableId(0x4641_5354_554e_4152);
+const BINARY_TASK_EXPORT: StableId = StableId(0x4641_5354_4249_4e41);
+const BINARY_IMMEDIATE_EXPORT: StableId = StableId(0x4641_5354_494d_4d45);
 
 fn schema() -> StateSchemaFingerprint {
     nexa_bytecode::StateSchema::default().fingerprint()
@@ -48,6 +51,7 @@ fn main() {
     }));
 
     let immediate = build_module(
+        BINARY_IMMEDIATE_EXPORT,
         FunctionEffect::Immediate,
         vec![
             Instruction::Add {
@@ -73,6 +77,7 @@ fn main() {
     }));
 
     let fast = build_module(
+        UNARY_TASK_EXPORT,
         FunctionEffect::Task,
         vec![Instruction::Return { source: 0 }],
         1,
@@ -91,6 +96,7 @@ fn main() {
     }));
 
     let yielded = build_module(
+        UNARY_TASK_EXPORT,
         FunctionEffect::Task,
         vec![Instruction::Yield, Instruction::Return { source: 0 }],
         1,
@@ -120,7 +126,7 @@ fn main() {
         let outcome = realm
             .with_resource_context(task, |context| {
                 registry.call_runtime(
-                    0,
+                    StableId::from_name("BenchHost::add"),
                     context,
                     RuntimeHostArgs::new(&[RuntimeValue::I32(20), RuntimeValue::I32(22)], None)
                         .unwrap(),
@@ -149,7 +155,7 @@ fn main() {
         let task = host_realm
             .spawn_task(
                 host_module,
-                0,
+                BINARY_TASK_EXPORT,
                 &[RuntimeValue::I32(20), RuntimeValue::I32(22)],
                 StepConfig {
                     owner: host_scope,
@@ -208,7 +214,11 @@ fn main() {
         let task = call(&mut realm, module, scope, 1);
         black_box(
             realm
-                .create_resource_token(task, RuntimeHostDomain::Render)
+                .create_resource_token(
+                    task,
+                    StableId::from_name("FastTaskBenchToken"),
+                    RuntimeHostDomain::Render,
+                )
                 .unwrap(),
         );
         black_box(realm.poll_task(task, 64).unwrap());
@@ -311,13 +321,11 @@ fn main() {
 }
 
 fn host_call_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32, ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        3,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32, ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 3);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -331,24 +339,30 @@ fn host_call_module() -> VerifiedModule {
     module.metadata(HOST, schema());
     module.host_import(HostImport {
         stable_id: StableId::from_name("BenchHost::add"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: vec![ValueType::I32, ValueType::I32],
         result: Some(ValueType::I32),
         mode: HostCallMode::Immediate,
         fuel_cost: 1,
         async_result: None,
     });
-    module.function(function.finish().unwrap());
+    let function = module.function(function.finish().unwrap());
+    module.script_export(ScriptExport {
+        stable_id: BINARY_TASK_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
 fn async_host_call_module() -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        3,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), 3);
     function
         .effect(FunctionEffect::Task)
         .emit(Instruction::HostCall {
@@ -378,6 +392,8 @@ fn async_host_call_module() -> VerifiedModule {
     module.enum_type(async_enum);
     module.host_import(HostImport {
         stable_id: StableId::from_name("BenchHost::async"),
+        declaration_fingerprint: [0; 32],
+        capabilities: Vec::new(),
         parameters: vec![ValueType::I32],
         result: Some(ValueType::Named(async_result.result_type)),
         mode: HostCallMode::Async,
@@ -401,42 +417,50 @@ fn async_host_call_module() -> VerifiedModule {
             bitmap: vec![false, true, false],
         },
     ];
-    module.function(function);
+    let function = module.function(function);
+    module.script_export(ScriptExport {
+        stable_id: UNARY_TASK_EXPORT,
+        function,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
 fn build_module(
+    export_id: StableId,
     effect: FunctionEffect,
     code: Vec<Instruction>,
     registers: u16,
     parameters: usize,
 ) -> VerifiedModule {
-    let mut function = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32; parameters],
-            result: Some(ValueType::I32),
-        },
-        registers,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32; parameters],
+        result: Some(ValueType::I32),
+    };
+    let mut function = FunctionBuilder::new(signature.clone(), registers);
     function.effect(effect);
     for instruction in code {
         function.emit(instruction);
     }
     let mut module = ModuleBuilder::new();
-    module
-        .metadata(HOST, schema())
-        .function(function.finish().unwrap());
+    module.metadata(HOST, schema());
+    let function = module.function(function.finish().unwrap());
+    module.script_export(ScriptExport {
+        stable_id: export_id,
+        function,
+        signature,
+        effect,
+    });
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
 
 fn nested_module() -> VerifiedModule {
-    let mut caller = FunctionBuilder::new(
-        Signature {
-            parameters: vec![ValueType::I32],
-            result: Some(ValueType::I32),
-        },
-        2,
-    );
+    let signature = Signature {
+        parameters: vec![ValueType::I32],
+        result: Some(ValueType::I32),
+    };
+    let mut caller = FunctionBuilder::new(signature.clone(), 2);
     caller
         .effect(FunctionEffect::Task)
         .emit(Instruction::Call {
@@ -455,9 +479,14 @@ fn nested_module() -> VerifiedModule {
     );
     identity_function.emit(Instruction::Return { source: 0 });
     let mut module = ModuleBuilder::new();
-    module
-        .metadata(HOST, schema())
-        .function(caller.finish().unwrap());
+    module.metadata(HOST, schema());
+    let caller = module.function(caller.finish().unwrap());
+    module.script_export(ScriptExport {
+        stable_id: UNARY_TASK_EXPORT,
+        function: caller,
+        signature,
+        effect: FunctionEffect::Task,
+    });
     module.function(identity_function.finish().unwrap());
     verify(module.finish(), VerifierLimits::default()).unwrap()
 }
@@ -540,7 +569,7 @@ fn call(
     realm
         .spawn_task(
             module,
-            0,
+            UNARY_TASK_EXPORT,
             &[RuntimeValue::I32(value)],
             StepConfig {
                 owner: scope,
@@ -556,18 +585,38 @@ fn call(
 struct AddRegistry;
 
 impl HostRegistry for AddRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(HOST)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        let authority = AUTHORITY.get_or_init(|| {
+            HostFunctionAuthority::new(
+                StableId::from_name("BenchHost::add"),
+                [0; 32],
+                &[ValueType::I32, ValueType::I32],
+                Some(ValueType::I32),
+                HostCallMode::Immediate,
+                1,
+                None,
+                &[],
+            )
+        });
+        (id == authority.stable_id()).then_some(authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         _: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 2 {
+        if id != StableId::from_name("BenchHost::add") {
             return Err(HostTrap::UnknownFunction(id));
+        }
+        if args.len() != 2 {
+            return Err(HostTrap::Arity);
         }
         let (lhs, rhs) = (args.i32(0)?, args.i32(1)?);
         Ok(HostCallOutcome::RuntimeImmediate(RuntimeValue::I32(
@@ -581,18 +630,47 @@ struct AsyncRegistry {
 }
 
 impl HostRegistry for AsyncRegistry {
-    fn interface_hash(&self) -> Option<StableId> {
+    fn contract_runtime_id(&self) -> Option<StableId> {
         Some(HOST)
+    }
+
+    fn function_authority(&self, id: StableId) -> Option<&HostFunctionAuthority> {
+        static AUTHORITY: OnceLock<HostFunctionAuthority> = OnceLock::new();
+        let authority = AUTHORITY.get_or_init(|| {
+            let result = nexa_bytecode::result_type(ValueType::I32, ValueType::I32);
+            HostFunctionAuthority::new(
+                StableId::from_name("BenchHost::async"),
+                [0; 32],
+                &[ValueType::I32],
+                Some(ValueType::Named(result.type_id)),
+                HostCallMode::Async,
+                1,
+                Some(nexa_bytecode::AsyncResultType {
+                    result_type: result.type_id,
+                    success: ValueType::I32,
+                    error: ValueType::I32,
+                    cancel_policy: nexa_bytecode::CancelPolicy::ReturnError,
+                    abandon_policy: nexa_bytecode::AbandonPolicy::Trap,
+                    cancel_error: Some(u32::MAX - 1),
+                    abandon_error: None,
+                }),
+                &[],
+            )
+        });
+        (id == authority.stable_id()).then_some(authority)
     }
 
     fn call_runtime(
         &mut self,
-        id: u32,
+        id: StableId,
         context: &mut ResourceContext<'_>,
         args: RuntimeHostArgs<'_>,
     ) -> Result<HostCallOutcome, HostTrap> {
-        if id != 0 || args.len() != 1 {
+        if id != StableId::from_name("BenchHost::async") {
             return Err(HostTrap::UnknownFunction(id));
+        }
+        if args.len() != 1 {
+            return Err(HostTrap::Arity);
         }
         let pending = context
             .create_request()

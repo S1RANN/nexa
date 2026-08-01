@@ -1,4 +1,13 @@
-interface LanguageScaleHost {
-    sync fn log(message: string) -> i32;
-    export OnEvent(value: i32) -> string;
+contract LanguageScale {
+    host {
+        fn log(
+            message: string,
+        ) -> i32;
+    }
+
+    nexa {
+        fn on_event(
+            value: i32,
+        ) -> string;
+    }
 }

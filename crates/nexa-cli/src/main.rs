@@ -17,6 +17,8 @@ use serde_json::{Value, json};
 mod dev;
 mod lsp;
 mod project;
+mod repl;
+mod standalone;
 
 const REQUIRED_BASELINE: &[&str] = &[
     "baseline/BASELINE_INDEX.md",
@@ -49,6 +51,7 @@ pub(crate) enum CliErrorKind {
     DiagnosticOrTestFailure,
     UsageOrEnvironment,
     WorkerIoOrInternal,
+    RuntimeTrap,
 }
 
 impl CliErrorKind {
@@ -57,6 +60,7 @@ impl CliErrorKind {
             Self::DiagnosticOrTestFailure => 1,
             Self::UsageOrEnvironment => 2,
             Self::WorkerIoOrInternal => 3,
+            Self::RuntimeTrap => standalone::TRAP_EXIT_CODE,
         }
     }
 }
@@ -105,6 +109,14 @@ impl CliError {
         }
     }
 
+    pub(crate) fn runtime_trap(message: impl Into<String>) -> Self {
+        Self {
+            kind: CliErrorKind::RuntimeTrap,
+            message: message.into(),
+            already_rendered: false,
+        }
+    }
+
     const fn exit_code(&self) -> i32 {
         self.kind.exit_code()
     }
@@ -146,6 +158,7 @@ impl CommandOutcome {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let raw_arguments = std::env::args().skip(1).collect::<Vec<_>>();
     let (diagnostic_format, arguments) = match extract_diagnostic_format(&raw_arguments) {
@@ -156,6 +169,7 @@ fn main() {
             std::process::exit(outcome.exit_code());
         }
     };
+    let mut program_exit_code = None;
     let result: CliResult<()> = match arguments.as_slice() {
         [command, arguments @ ..] if command == "check" => {
             check_command(arguments, diagnostic_format)
@@ -166,11 +180,18 @@ fn main() {
         [command, arguments @ ..] if command == "verify" => {
             legacy_result(verify_command(arguments, diagnostic_format))
         }
-        [command, arguments @ ..] if command == "run" => {
-            run_command(arguments, diagnostic_format, false)
+        [command, arguments @ ..] if command == "run" => run_command(arguments, diagnostic_format)
+            .map(|exit_code| {
+                program_exit_code = Some(exit_code);
+            }),
+        [command, arguments @ ..] if command == "exec" => {
+            exec_command(arguments, diagnostic_format, false)
         }
         [command, arguments @ ..] if command == "trace" => {
-            run_command(arguments, diagnostic_format, true)
+            exec_command(arguments, diagnostic_format, true)
+        }
+        [command, arguments @ ..] if command == "repl" => {
+            repl_command(arguments, diagnostic_format)
         }
         [command, arguments @ ..] if command == "dev" => {
             dev::dev_command(arguments, diagnostic_format)
@@ -209,14 +230,14 @@ fn main() {
         }
         [command, arguments @ ..] if command == "dump" => legacy_result(dump_module(arguments)),
         [command, path] if command == "compile" => compile_file(Path::new(path), diagnostic_format),
-        [area, command, path] if area == "idl" && command == "check" => {
-            legacy_result(check_idl(Path::new(path)))
+        [area, command, path] if area == "nidl" && command == "check" => {
+            legacy_result(check_nidl(Path::new(path)))
         }
-        [area, command, path] if area == "idl" && command == "generate" => {
-            legacy_result(generate_idl(Path::new(path)))
+        [area, command, path] if area == "nidl" && command == "generate" => {
+            legacy_result(generate_nidl(Path::new(path)))
         }
         _ => Err(CliError::usage(
-            "usage: nexa check|build|test|lock|verify|dump|run|trace ... | \
+            "usage: nexa check|build|test|lock|verify|dump|run|exec|trace|repl ... | \
              nexa check <package-directory> --manifest-only | \
              nexa check <package-directory> --contract <app_api.nidl> [--policy <policy.toml>] | \
              nexa check|test|lock --project <nexa.dev.toml> | \
@@ -225,7 +246,7 @@ fn main() {
              nexa lsp | \
              nexa model-check | nexa diagnostic-corpus-check | nexa model-replay <artifact.json> | \
              nexa migrate-check ... | nexa fixture-check <fixture-or-directory> | \
-             nexa baseline check | nexa machine check | nexa idl check|generate <file> | \
+             nexa baseline check | nexa machine check | nexa nidl check|generate <file> | \
              nexa migrate-check --old-module OLD --new-module NEW --state STATE \
              [--format human|json] [--output PATH] [--dump-state] [--diff-state] \
              [MigrationLimits] [--diagnostic-format human|json|ndjson]"
@@ -236,6 +257,11 @@ fn main() {
     render_cli_outcome(&outcome, diagnostic_format);
     if outcome.exit_code() != 0 {
         std::process::exit(outcome.exit_code());
+    }
+    if let Some(exit_code) = program_exit_code
+        && exit_code != 0
+    {
+        std::process::exit(exit_code);
     }
 }
 
@@ -364,7 +390,7 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
                 build,
                 1,
                 None,
-                &project.required_exports,
+                &project.required_entrypoints,
                 false,
                 format,
             )?;
@@ -419,11 +445,11 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
         let contract_source = std::fs::read_to_string(contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
-            &idl,
+            &contract_model,
             nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
             Arc::<str>::from(contract_source),
         )?;
@@ -449,7 +475,7 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
             &build,
             1,
             None,
-            build.host_contract.required_exports.as_ref(),
+            build.host_contract.required_entrypoints.as_ref(),
             false,
             format,
         )?;
@@ -496,7 +522,7 @@ fn check_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
         &build,
         1,
         None,
-        build.host_contract.required_exports.as_ref(),
+        build.host_contract.required_entrypoints.as_ref(),
         false,
         limits,
         format,
@@ -611,12 +637,41 @@ fn diagnostics_for_build(
         return Ok(batch.clone());
     };
     if !origin.source_text_is_original {
-        return Ok(batch.clone());
+        return Err(CliError::internal(
+            "virtual diagnostic origin does not preserve the original source text",
+        ));
+    }
+    let unit = build
+        .input
+        .root_source_set
+        .get(&origin.source_key)
+        .ok_or_else(|| {
+            CliError::internal(
+                "virtual diagnostic origin is absent from the resolved source snapshot",
+            )
+        })?;
+    if unit.role != nexa_analysis::SourceRole::Production
+        || unit.virtual_module_path().is_none()
+        || unit.text.as_ref() != origin.original_text.as_ref()
+    {
+        return Err(CliError::internal(
+            "virtual diagnostic origin disagrees with the resolved source authority",
+        ));
     }
     let internal = nexa::SourceIdentity::package(
         origin.source_key.package_id.as_str(),
         origin.source_key.path.as_str(),
     );
+    let internal_snapshot = batch.sources().get(&internal).ok_or_else(|| {
+        CliError::internal(
+            "virtual diagnostic source is absent from the diagnostic source registry",
+        )
+    })?;
+    if internal_snapshot.text() != unit.text.as_ref() {
+        return Err(CliError::internal(
+            "virtual diagnostic source bytes disagree with the resolved source authority",
+        ));
+    }
     let mut sources = nexa::SourceSnapshotRegistry::builder();
     for (identity, snapshot) in batch.sources().iter() {
         if identity == &internal {
@@ -660,8 +715,8 @@ fn classify_facade_build_error(error: nexa::PackageBuildError) -> CliError {
         error @ (nexa::PackageBuildError::Compile(_)
         | nexa::PackageBuildError::Environment(_)
         | nexa::PackageBuildError::Verify(_)
-        | nexa::PackageBuildError::MissingRequiredExport(_)
-        | nexa::PackageBuildError::ExportSignatureMismatch { .. }) => {
+        | nexa::PackageBuildError::MissingRequiredEntrypoint(_)
+        | nexa::PackageBuildError::EntrypointSignatureMismatch { .. }) => {
             CliError::diagnostic(error.to_string())
         }
         error => CliError::internal(error.to_string()),
@@ -671,14 +726,14 @@ fn classify_facade_build_error(error: nexa::PackageBuildError) -> CliError {
 fn compile_resolved_build(
     build: &project::ResolvedBuild,
     generation: u64,
-    idl: Option<&nexa::Idl>,
-    required_exports: &[String],
+    contract: Option<&nexa::ValidatedContract>,
+    required_entrypoints: &[String],
     include_tests: bool,
     format: DiagnosticFormat,
 ) -> CliResult<project::CompiledBuild> {
     finish_resolved_build(
         build,
-        build.compile(generation, idl, required_exports, include_tests),
+        build.compile(generation, contract, required_entrypoints, include_tests),
         format,
     )
 }
@@ -687,8 +742,8 @@ fn compile_resolved_build(
 fn compile_resolved_build_with_limits(
     build: &project::ResolvedBuild,
     generation: u64,
-    idl: Option<&nexa::Idl>,
-    required_exports: &[String],
+    contract: Option<&nexa::ValidatedContract>,
+    required_entrypoints: &[String],
     include_tests: bool,
     verifier_limits: nexa::VerifierLimits,
     format: DiagnosticFormat,
@@ -697,8 +752,8 @@ fn compile_resolved_build_with_limits(
         build,
         build.compile_with_limits(
             generation,
-            idl,
-            required_exports,
+            contract,
+            required_entrypoints,
             include_tests,
             verifier_limits,
         ),
@@ -710,14 +765,20 @@ fn compile_resolved_build_with_session(
     session: &mut nexa::PackageBuildSession,
     build: &project::ResolvedBuild,
     generation: u64,
-    idl: Option<&nexa::Idl>,
-    required_exports: &[String],
+    contract: Option<&nexa::ValidatedContract>,
+    required_entrypoints: &[String],
     include_tests: bool,
     format: DiagnosticFormat,
 ) -> CliResult<project::CompiledBuild> {
     finish_resolved_build(
         build,
-        build.compile_with_session(session, generation, idl, required_exports, include_tests),
+        build.compile_with_session(
+            session,
+            generation,
+            contract,
+            required_entrypoints,
+            include_tests,
+        ),
         format,
     )
 }
@@ -727,8 +788,8 @@ fn compile_resolved_build_with_session_and_limits(
     session: &mut nexa::PackageBuildSession,
     build: &project::ResolvedBuild,
     generation: u64,
-    idl: Option<&nexa::Idl>,
-    required_exports: &[String],
+    contract: Option<&nexa::ValidatedContract>,
+    required_entrypoints: &[String],
     include_tests: bool,
     verifier_limits: nexa::VerifierLimits,
     format: DiagnosticFormat,
@@ -738,8 +799,8 @@ fn compile_resolved_build_with_session_and_limits(
         build.compile_with_session_and_limits(
             session,
             generation,
-            idl,
-            required_exports,
+            contract,
+            required_entrypoints,
             include_tests,
             verifier_limits,
         ),
@@ -877,7 +938,7 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
                 build,
                 1,
                 None,
-                &project.required_exports,
+                &project.required_entrypoints,
                 false,
                 limits,
                 format,
@@ -917,11 +978,11 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
-            &idl,
+            &contract_model,
             nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
             Arc::<str>::from(contract_source),
         )?;
@@ -938,7 +999,7 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
             &build,
             1,
             None,
-            build.host_contract.required_exports.as_ref(),
+            build.host_contract.required_entrypoints.as_ref(),
             false,
             limits,
             format,
@@ -987,7 +1048,7 @@ fn build_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()
         &build,
         1,
         None,
-        build.host_contract.required_exports.as_ref(),
+        build.host_contract.required_entrypoints.as_ref(),
         false,
         limits,
         format,
@@ -1157,7 +1218,7 @@ fn test_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()>
                 &build,
                 1,
                 None,
-                &project.required_exports,
+                &project.required_entrypoints,
                 true,
                 format,
             )?;
@@ -1170,11 +1231,11 @@ fn test_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()>
         let contract_source = std::fs::read_to_string(&contract).map_err(|error| {
             CliError::internal(format!("could not read {}: {error}", contract.display()))
         })?;
-        let idl = nexa::parse_idl(&contract_source).map_err(|error| {
+        let contract_model = nexa::parse_nidl(&contract_source).map_err(|error| {
             CliError::diagnostic(format!("invalid {}: {error}", contract.display()))
         })?;
         let host_contract = project::HostContractSnapshot::with_source(
-            &idl,
+            &contract_model,
             nexa::SourceIdentity::standalone(contract.to_string_lossy().into_owned()),
             Arc::<str>::from(contract_source),
         )?;
@@ -1186,7 +1247,7 @@ fn test_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()>
             &build,
             1,
             None,
-            build.host_contract.required_exports.as_ref(),
+            build.host_contract.required_entrypoints.as_ref(),
             true,
             format,
         )?;
@@ -1424,68 +1485,129 @@ fn verify_command(arguments: &[String], format: DiagnosticFormat) -> Result<(), 
     Ok(())
 }
 
-fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> CliResult<()> {
-    let mut input = None;
-    let mut limits_file = None;
-    let mut trace_output = None;
-    let mut fuel = 1_000_000_u64;
-    let mut function = 0_u32;
-    let mut runtime_arguments = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let option = arguments[index].as_str();
-        match option {
-            "--limits-file" | "--trace-output" | "--fuel" | "--function" | "--arg-i32" => {
-                let value = arguments
-                    .get(index + 1)
-                    .ok_or_else(|| CliError::usage(format!("missing value for `{option}`")))?;
-                match option {
-                    "--limits-file" => limits_file = Some(PathBuf::from(value)),
-                    "--trace-output" => trace_output = Some(PathBuf::from(value)),
-                    "--fuel" => {
-                        fuel = parse_limit(option, value).map_err(CliError::usage)?;
-                    }
-                    "--function" => {
-                        function = parse_limit(option, value).map_err(CliError::usage)?;
-                    }
-                    "--arg-i32" => {
-                        runtime_arguments.push(nexa::prelude::RuntimeValue::I32(
-                            parse_limit(option, value).map_err(CliError::usage)?,
-                        ));
-                    }
-                    _ => unreachable!(),
-                }
-                index += 2;
+fn run_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<i32> {
+    let options = standalone::parse_run_options(arguments)?;
+    let verifier_limits =
+        load_verifier_limits(options.limits_file.as_deref()).map_err(classify_legacy_error)?;
+    let build = match &options.input {
+        standalone::RunInput::Path(path) if path.is_file() => {
+            if path.extension().is_none_or(|extension| extension != "nexa") {
+                return Err(CliError::usage(
+                    "`nexa run` accepts a `.nexa` source file or Package directory",
+                ));
             }
-            option if option.starts_with('-') => {
-                return Err(CliError::usage(format!("unknown run option `{option}`")));
-            }
-            path if input.is_none() => {
-                input = Some(PathBuf::from(path));
-                index += 1;
-            }
-            path => {
-                return Err(CliError::usage(format!("unexpected run argument `{path}`")));
-            }
+            let source = std::fs::read_to_string(path).map_err(|error| {
+                CliError::internal(format!("could not read {}: {error}", path.display()))
+            })?;
+            project::virtual_standalone_script(&source, path)?
         }
+        standalone::RunInput::Path(path) if path.is_dir() => {
+            let source_id = nexa_analysis::SourceId::new("standalone-cli")
+                .map_err(|error| CliError::internal(error.to_string()))?;
+            project::resolve_direct_standalone_package(path, source_id, None, true)?
+        }
+        standalone::RunInput::Path(path) => {
+            return Err(CliError::environment(format!(
+                "standalone input does not exist: {}",
+                path.display()
+            )));
+        }
+        standalone::RunInput::Project {
+            configuration,
+            package_id,
+        } => {
+            let project = project::LoadedProject::load(configuration)?;
+            let packages = project.package_directories()?;
+            let mut selected = None;
+            for package in packages {
+                let candidate = project::LoadedProject::resolve_standalone_package(&package, true)?;
+                if candidate.package_id().as_str() == package_id {
+                    selected = Some(candidate);
+                    break;
+                }
+            }
+            selected.ok_or_else(|| {
+                CliError::diagnostic(format!(
+                    "project {} does not contain Package `{package_id}`",
+                    configuration.display()
+                ))
+            })?
+        }
+    };
+    let mut session = nexa::PackageBuildSession::new();
+    let compiled = finish_standalone_build(
+        &build,
+        build.compile_standalone_with_session_and_limits(&mut session, 1, verifier_limits),
+        format,
+    )?;
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    standalone::run_compiled(
+        &compiled.artifact,
+        &options.program_arguments,
+        options.fuel,
+        4_096,
+        &cancelled,
+    )
+    .map_err(|error| match error {
+        standalone::StandaloneRuntimeError::Trap(message) => CliError::runtime_trap(message),
+        standalone::StandaloneRuntimeError::Internal(message) => CliError::internal(message),
+    })
+}
+
+fn finish_standalone_build(
+    build: &project::ResolvedBuild,
+    result: Result<project::CompiledStandaloneBuild, project::BuildCompileError>,
+    format: DiagnosticFormat,
+) -> CliResult<project::CompiledStandaloneBuild> {
+    match result {
+        Ok(compiled) => Ok(compiled),
+        Err(project::BuildCompileError::Cli(error)) => Err(error),
+        Err(project::BuildCompileError::Facade(nexa::PackageBuildError::AnalysisFailed(batch))) => {
+            let batch = diagnostics_for_build(build, &batch)?;
+            render_diagnostic_batch(&batch, format)?;
+            Err(CliError::rendered_diagnostic("Package analysis failed"))
+        }
+        Err(project::BuildCompileError::Facade(error)) => Err(classify_facade_build_error(error)),
     }
-    let input =
-        input.ok_or_else(|| CliError::usage("usage: nexa run|trace <source.nexa|module.nxb>"))?;
-    let limits = load_verifier_limits(limits_file.as_deref()).map_err(classify_legacy_error)?;
-    let verified = load_verified(&input, limits, format)?;
-    let outcome = nexa::CheckedInterpreter::run(&verified, function, &runtime_arguments, fuel)
-        .map_err(|error| CliError::diagnostic(format!("execution failed: {error}")))?;
+}
+
+fn repl_command(arguments: &[String], format: DiagnosticFormat) -> CliResult<()> {
+    let options = repl::parse_repl_options(arguments)?;
+    let cancelled = repl::install_cancel_handler()?;
+    let backend =
+        repl::CanonicalReplBackend::new(options.limits, format).map_err(CliError::internal)?;
+    repl::run(backend, options, cancelled.as_ref())
+}
+
+fn exec_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> CliResult<()> {
+    let options = standalone::parse_exec_options(arguments)?;
+    let limits =
+        load_verifier_limits(options.limits_file.as_deref()).map_err(classify_legacy_error)?;
+    let verified = load_verified(&options.module, limits, format)?;
+    let runtime_arguments = options
+        .runtime_arguments
+        .iter()
+        .copied()
+        .map(nexa::prelude::RuntimeValue::I32)
+        .collect::<Vec<_>>();
+    let outcome = nexa::CheckedInterpreter::run(
+        &verified,
+        options.function,
+        &runtime_arguments,
+        options.fuel,
+    )
+    .map_err(|error| CliError::diagnostic(format!("execution failed: {error}")))?;
     let record = json!({
-        "input": input,
-        "function": function,
+        "input": options.module,
+        "function": options.function,
         "arguments": runtime_arguments.len(),
-        "fuel_limit": fuel,
+        "fuel_limit": options.fuel,
         "outcome": format!("{outcome:?}"),
     });
     if trace {
         let rendered = serde_json::to_string_pretty(&record)
             .map_err(|error| CliError::internal(format!("could not serialize trace: {error}")))?;
-        if let Some(path) = trace_output {
+        if let Some(path) = options.trace_output {
             std::fs::write(&path, rendered).map_err(|error| {
                 CliError::internal(format!("could not write {}: {error}", path.display()))
             })?;
@@ -1495,9 +1617,9 @@ fn run_command(arguments: &[String], format: DiagnosticFormat, trace: bool) -> C
     } else {
         print_success(
             format,
-            "run",
+            "exec",
             &record,
-            &format!("run completed: {outcome:?}"),
+            &format!("exec completed: {outcome:?}"),
         );
     }
     Ok(())
@@ -1647,7 +1769,7 @@ fn load_verified(
             &build,
             1,
             None,
-            build.host_contract.required_exports.as_ref(),
+            build.host_contract.required_entrypoints.as_ref(),
             false,
             limits,
             format,
@@ -1897,7 +2019,7 @@ fn render_module_dump(
         for state_type in state_types {
             writeln!(
                 output,
-                "stateful-class {:016x} version={}",
+                "state-class {:016x} version={}",
                 state_type.stable_id.0, state_type.version
             )
             .expect("String writes do not fail");
@@ -2146,7 +2268,7 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
         &build,
         1,
         None,
-        build.host_contract.required_exports.as_ref(),
+        build.host_contract.required_entrypoints.as_ref(),
         false,
         format,
     )?;
@@ -2170,23 +2292,25 @@ fn compile_file(path: &Path, format: DiagnosticFormat) -> CliResult<()> {
     Ok(())
 }
 
-fn check_idl(path: &Path) -> Result<(), String> {
+fn check_nidl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let idl = nexa::parse_idl(&source).map_err(|error| error.to_string())?;
+    let contract = nexa::parse_nidl(&source).map_err(|error| error.to_string())?;
     println!(
-        "IDL {} is valid; exact hash {}",
+        "NIDL {} is valid; contract fingerprint {}",
         path.display(),
-        nexa::exact_idl_hash(&idl)
+        nexa::contract_fingerprint(&contract)
     );
     Ok(())
 }
 
-fn generate_idl(path: &Path) -> Result<(), String> {
+fn generate_nidl(path: &Path) -> Result<(), String> {
     let source = std::fs::read_to_string(path)
         .map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let idl = nexa::parse_idl(&source).map_err(|error| error.to_string())?;
-    print!("{}", nexa::prelude::generate_rust_bindings(&idl));
+    let contract = nexa::parse_nidl(&source).map_err(|error| error.to_string())?;
+    let generated =
+        nexa::prelude::generate_rust_bindings(&contract).map_err(|error| error.to_string())?;
+    print!("{generated}");
     Ok(())
 }
 
@@ -2710,8 +2834,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        DiagnosticFormat, build_command, check_command, extract_diagnostic_format, fixture_check,
-        model_replay, render_module_dump, run_command, verify_command,
+        DiagnosticFormat, build_command, check_command, exec_command, extract_diagnostic_format,
+        fixture_check, model_replay, render_module_dump, verify_command,
     };
 
     #[test]
@@ -2768,7 +2892,7 @@ mod tests {
             DiagnosticFormat::Human,
         )
         .unwrap();
-        run_command(
+        exec_command(
             &[
                 module.display().to_string(),
                 "--trace-output".into(),
@@ -2918,7 +3042,7 @@ mod tests {
             full,
             render_module_dump(&bytes, &module, None, false).unwrap()
         );
-        assert!(full.contains("header magic=NXBC version=5 sections=16"));
+        assert!(full.contains("header magic=NXBC version=6 sections=16"));
         assert!(full.contains("000000 LoadI32"));
         assert!(full.contains("string 0 \"Nexa界\\n\""));
         assert!(full.contains("struct "));
@@ -2934,7 +3058,7 @@ mod tests {
         assert!(full.contains("element=I64 ownership=vm-copy"));
         assert!(full.contains("snapshot "));
         assert!(full.contains("ownership=host immutable=true"));
-        assert!(full.contains("stateful-class "));
+        assert!(full.contains("state-class "));
         assert!(full.contains("persistent=true"));
         assert!(
             full.find("pc=0..1")

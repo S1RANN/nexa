@@ -80,5 +80,6 @@ Shutdown stops admission, terminates pending work, accounts for in-flight work,
 drains terminals, joins the Worker, closes Package runtimes, drains releases,
 and closes `RuntimeHost`.
 
-The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 has not
-started.
+The immutable M3, M3R1, and M3R2 completion tags remain unchanged. M4 is
+complete at `language-scale-m4-complete`; completed M4R1 Language v2 and NIDL
+v2 do not change the Worker freshness contract.

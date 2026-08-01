@@ -17,6 +17,11 @@ use crate::policy::PackagePolicy;
 pub struct CandidateBuildContext {
     pub host_contract_source_identity: nexa::SourceIdentity,
     pub host_contract: Vec<u8>,
+    /// Host-selected entrypoints which every enabled application must implement.
+    ///
+    /// The complete contract remains in `host_contract`; this list only selects the required
+    /// subset for analysis and the canonical build fingerprint.
+    pub required_entrypoints: Vec<String>,
 }
 
 impl CandidateBuildContext {
@@ -24,17 +29,19 @@ impl CandidateBuildContext {
     pub fn new(host_contract: impl Into<Vec<u8>>) -> Self {
         let host_contract = host_contract.into();
         if let Ok(source) = std::str::from_utf8(&host_contract)
-            && let Ok(idl) = nexa::parse(source)
+            && let Ok(idl) = nexa::parse_nidl(source)
         {
             let contract = nexa::HostContractInput::canonical(&idl);
             return Self {
                 host_contract_source_identity: contract.source().identity().clone(),
                 host_contract: contract.source().text().as_bytes().to_vec(),
+                required_entrypoints: Vec::new(),
             };
         }
         Self {
             host_contract_source_identity: nexa::SourceIdentity::standalone("host-contract.nidl"),
             host_contract,
+            required_entrypoints: Vec::new(),
         }
     }
 
@@ -47,7 +54,18 @@ impl CandidateBuildContext {
         Self {
             host_contract_source_identity,
             host_contract: host_contract.into(),
+            required_entrypoints: Vec::new(),
         }
+    }
+
+    /// Selects the Host entrypoints which are required for this build.
+    #[must_use]
+    pub fn requiring_entrypoints(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.required_entrypoints = names.into_iter().map(Into::into).collect();
+        self
     }
 }
 
@@ -154,13 +172,15 @@ pub(crate) fn resolve_application_candidates(
 
         let host_source = std::str::from_utf8(&build.host_contract)
             .map_err(|error| PackageSourceError::HostContract(error.to_string()))?;
-        let host_contract = nexa::parse(host_source)
+        let host_contract = nexa::parse_nidl(host_source)
             .map_err(|error| PackageSourceError::HostContract(error.to_string()))?;
         let host_contract_input = nexa::HostContractInput::with_source(
             &host_contract,
             build.host_contract_source_identity.clone(),
             Arc::<str>::from(host_source),
         )
+        .map_err(|error| PackageSourceError::HostContract(error.to_string()))?
+        .requiring_entrypoints(&build.required_entrypoints)
         .map_err(|error| PackageSourceError::HostContract(error.to_string()))?;
         let fingerprint_input = nexa::canonical_package_build_fingerprint_input_with_contract(
             &root.manifest,
@@ -181,7 +201,7 @@ pub(crate) fn resolve_application_candidates(
             root.lock.clone(),
             canonical_host_contract,
             host_contract_source_identity,
-            fingerprint_input.host_required_exports.clone(),
+            fingerprint_input.host_required_entrypoints.clone(),
             CompilationOptions::default(),
             fingerprint_input,
         )?);

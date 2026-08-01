@@ -1,1 +1,1 @@
-{"version":1,"code":"NX2730","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2730","expected":{"primary_text":"bad_test","primary_occurrence":2,"secondary_count":0,"message_contains":"@test must be","notes":[]}}
+{"version":1,"code":"NX2730","category":"diagnostic","pipeline":"analysis","input":"../analysis/NX2730","expected":{"primary_text":"bad_test","primary_occurrence":1,"secondary_count":0,"message_contains":"@test must be","notes":[]}}
