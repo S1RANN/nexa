@@ -11,7 +11,7 @@ use nexa_bytecode::{
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    CancelReason, CopyBuffer, Heap, HeapError, HostCallOutcome, HostErrorPayload,
+    CancelReason, CopyBuffer, EncodeHostReturn, Heap, HeapError, HostCallOutcome, HostErrorPayload,
     HostFunctionAuthority, HostPayload, HostRegistry, HostReturnRequirements, HostTrap,
     MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
     RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RestartReloadOutcome,
@@ -152,16 +152,60 @@ fn host_owned<T>(operation: impl FnOnce() -> T) -> T {
     result
 }
 
+fn encode_host_return<T: EncodeHostReturn>(heap: &mut Heap, value: T) -> RuntimeValue {
+    let requirements = value.requirements().unwrap();
+    let arguments = RuntimeHostArgs::new(&[], Some(heap)).unwrap();
+    let mut transaction = arguments.return_transaction(requirements).unwrap();
+    let value = value.encode_into(&mut transaction).unwrap();
+    transaction.commit(value).unwrap()
+}
+
 #[allow(
     dead_code,
     clippy::extra_unused_lifetimes,
     clippy::identity_op,
     clippy::needless_borrow,
     clippy::needless_question_mark,
+    clippy::redundant_closure,
     clippy::too_many_arguments
 )]
 mod host_matrix {
     include!(concat!(env!("OUT_DIR"), "/host_matrix.rs"));
+}
+
+#[derive(Clone, Copy)]
+#[repr(usize)]
+enum MatrixFunction {
+    Baseline8,
+    Inspect,
+    InspectScalarCollections,
+    PanicHost,
+    ReturnArray,
+    ReturnArrayStruct,
+    ReturnBuffer,
+    ReturnBufferStruct,
+    ReturnEnum,
+    ReturnLargeArray,
+    ReturnLargeBuffer,
+    ReturnNested,
+    ReturnNestedEnum,
+    ReturnOption,
+    ReturnOptionArray,
+    ReturnResult,
+    ReturnResultBuffer,
+    ReturnScalar,
+    ReturnString,
+    ReturnStruct,
+}
+
+impl MatrixFunction {
+    fn authority(self) -> &'static HostFunctionAuthority {
+        &host_matrix::HOST_FUNCTION_AUTHORITIES[self as usize]
+    }
+
+    fn stable_id(self) -> StableId {
+        self.authority().stable_id()
+    }
 }
 
 fn release_buffer<const N: usize>() -> [ReleaseRecord; N] {
@@ -403,8 +447,8 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
         event: host_matrix::EventRef<'a>,
         option: Option<host_matrix::RecordRef<'a>>,
         result: Result<host_matrix::RecordRef<'a>, host_matrix::EventRef<'a>>,
-        array: nexa_runtime::HostArrayRef<'a>,
-        buffer: nexa_runtime::HostBufferRef<'a>,
+        array: host_matrix::__NexaArrayRef<'a, host_matrix::RecordRef<'a>>,
+        buffer: host_matrix::__NexaBufferRef<'a, host_matrix::RecordRef<'a>>,
         nested: host_matrix::EventRef<'a>,
     ) -> Result<i32, host_matrix::HostError> {
         Ok(host_owned(|| {
@@ -416,14 +460,12 @@ impl host_matrix::AllocationMatrixHost for MatrixHost {
     fn inspect_scalar_collections<'a>(
         &mut self,
         _: &mut ResourceContext<'_>,
-        array: nexa_runtime::HostArrayRef<'a>,
-        buffer: nexa_runtime::HostBufferRef<'a>,
+        array: host_matrix::__NexaArrayRef<'a, i32>,
+        buffer: host_matrix::__NexaBufferRef<'a, i32>,
     ) -> Result<i32, host_matrix::HostError> {
         let mut total = 0;
         for value in array.iter().chain(buffer.iter()) {
-            total += value
-                .i32()
-                .map_err(|_| host_matrix::HostError(String::new()))?;
+            total += value.map_err(|_| host_matrix::HostError(String::new()))?;
         }
         Ok(total)
     }
@@ -771,20 +813,29 @@ fn complex_host_allocation_matrix() {
         reference: string_reference,
         hash: heap.string_hash(string_reference).unwrap(),
     };
-    let record_type = StableId::from_name("Record");
+    let inspect_authority = MatrixFunction::Inspect.authority();
+    let ValueType::Named(record_type) = inspect_authority.parameters()[1] else {
+        panic!("generated inspect record parameter must be named")
+    };
+    let ValueType::Named(event_type) = inspect_authority.parameters()[2] else {
+        panic!("generated inspect event parameter must be named")
+    };
     let record = heap
         .allocate_struct(record_type, &[string, RuntimeValue::I32(5)])
         .unwrap();
-    let event_type = StableId::from_name("Event");
-    let event = heap
-        .allocate_enum(
-            event_type,
-            StableId::from_parts(&["Event", "::", "Record"]),
-            1,
-            Some(record),
-        )
-        .unwrap();
+    let event = encode_host_return(
+        &mut heap,
+        host_matrix::Event::Record(host_matrix::Record {
+            label: "nested".to_owned(),
+            value: 5,
+        }),
+    );
+    let (_, event_record_variant, _, _) = heap.enum_parts(event).unwrap();
     let option = nexa_bytecode::option_type(ValueType::Named(record_type));
+    assert_eq!(
+        inspect_authority.parameters()[3],
+        ValueType::Named(option.type_id)
+    );
     let option_value = heap
         .allocate_enum(
             option.type_id,
@@ -795,6 +846,10 @@ fn complex_host_allocation_matrix() {
         .unwrap();
     let result =
         nexa_bytecode::result_type(ValueType::Named(record_type), ValueType::Named(event_type));
+    assert_eq!(
+        inspect_authority.parameters()[4],
+        ValueType::Named(result.type_id)
+    );
     let result_value = heap
         .allocate_enum(
             result.type_id,
@@ -803,12 +858,24 @@ fn complex_host_allocation_matrix() {
             Some(record),
         )
         .unwrap();
-    let array_type = nexa_bytecode::array_type(ValueType::Named(record_type));
+    let ValueType::Named(array_type) = inspect_authority.parameters()[5] else {
+        panic!("generated inspect array parameter must be named")
+    };
+    assert_eq!(
+        array_type,
+        nexa_bytecode::array_type(ValueType::Named(record_type))
+    );
     let array = heap
         .allocate_array(array_type, ValueType::Named(record_type))
         .unwrap();
     heap.array_push(array, record).unwrap();
-    let buffer_type = nexa_bytecode::buffer_type(ValueType::Named(record_type));
+    let ValueType::Named(buffer_type) = inspect_authority.parameters()[6] else {
+        panic!("generated inspect buffer parameter must be named")
+    };
+    assert_eq!(
+        buffer_type,
+        nexa_bytecode::buffer_type(ValueType::Named(record_type))
+    );
     let buffer = heap
         .allocate_buffer(buffer_type, ValueType::Named(record_type), &[record])
         .unwrap();
@@ -890,14 +957,14 @@ fn complex_host_allocation_matrix() {
     }
     registry
         .call_runtime(
-            host_matrix::THUNK_RETURN_SCALAR,
+            MatrixFunction::ReturnScalar.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (_, scalar_counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_RETURN_SCALAR,
+            MatrixFunction::ReturnScalar.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
@@ -915,14 +982,14 @@ fn complex_host_allocation_matrix() {
     ];
     registry
         .call_runtime(
-            host_matrix::THUNK_BASELINE8,
+            MatrixFunction::Baseline8.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (_, eight_argument_counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_BASELINE8,
+            MatrixFunction::Baseline8.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&scalar_arguments, Some(&mut heap)).unwrap(),
         )
@@ -930,14 +997,14 @@ fn complex_host_allocation_matrix() {
     assert_eq!(eight_argument_counts, AllocationCounts::default());
     registry
         .call_runtime(
-            host_matrix::THUNK_INSPECT,
+            MatrixFunction::Inspect.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_INSPECT,
+            MatrixFunction::Inspect.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&arguments, Some(&mut heap)).unwrap(),
         )
@@ -970,14 +1037,14 @@ fn complex_host_allocation_matrix() {
     let scalar_collections = [scalar_array, scalar_buffer];
     registry
         .call_runtime(
-            host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
+            MatrixFunction::InspectScalarCollections.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
         )
         .unwrap();
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_INSPECT_SCALAR_COLLECTIONS,
+            MatrixFunction::InspectScalarCollections.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&scalar_collections, Some(&mut heap)).unwrap(),
         )
@@ -993,40 +1060,26 @@ fn complex_host_allocation_matrix() {
     });
 
     let return_cases = [
-        ("return_string", host_matrix::THUNK_RETURN_STRING),
-        ("return_struct", host_matrix::THUNK_RETURN_STRUCT),
-        ("return_enum", host_matrix::THUNK_RETURN_ENUM),
-        ("return_option", host_matrix::THUNK_RETURN_OPTION),
-        ("return_result", host_matrix::THUNK_RETURN_RESULT),
-        ("return_array", host_matrix::THUNK_RETURN_ARRAY),
-        ("return_buffer", host_matrix::THUNK_RETURN_BUFFER),
-        (
-            "return_array_struct",
-            host_matrix::THUNK_RETURN_ARRAY_STRUCT,
-        ),
-        (
-            "return_buffer_struct",
-            host_matrix::THUNK_RETURN_BUFFER_STRUCT,
-        ),
-        ("return_nested_enum", host_matrix::THUNK_RETURN_NESTED_ENUM),
-        (
-            "return_option_array",
-            host_matrix::THUNK_RETURN_OPTION_ARRAY,
-        ),
-        (
-            "return_result_buffer",
-            host_matrix::THUNK_RETURN_RESULT_BUFFER,
-        ),
-        ("return_large_array", host_matrix::THUNK_RETURN_LARGE_ARRAY),
-        (
-            "return_large_buffer",
-            host_matrix::THUNK_RETURN_LARGE_BUFFER,
-        ),
-        ("return_nested", host_matrix::THUNK_RETURN_NESTED),
+        ("return_string", MatrixFunction::ReturnString),
+        ("return_struct", MatrixFunction::ReturnStruct),
+        ("return_enum", MatrixFunction::ReturnEnum),
+        ("return_option", MatrixFunction::ReturnOption),
+        ("return_result", MatrixFunction::ReturnResult),
+        ("return_array", MatrixFunction::ReturnArray),
+        ("return_buffer", MatrixFunction::ReturnBuffer),
+        ("return_array_struct", MatrixFunction::ReturnArrayStruct),
+        ("return_buffer_struct", MatrixFunction::ReturnBufferStruct),
+        ("return_nested_enum", MatrixFunction::ReturnNestedEnum),
+        ("return_option_array", MatrixFunction::ReturnOptionArray),
+        ("return_result_buffer", MatrixFunction::ReturnResultBuffer),
+        ("return_large_array", MatrixFunction::ReturnLargeArray),
+        ("return_large_buffer", MatrixFunction::ReturnLargeBuffer),
+        ("return_nested", MatrixFunction::ReturnNested),
     ];
     let mut separated_host_allocations = 0;
     let mut generated_non_empty_lengths = BTreeMap::new();
-    for (name, id) in return_cases {
+    for (name, function) in return_cases {
+        let id = function.stable_id();
         registry
             .call_runtime(
                 id,
@@ -1069,7 +1122,7 @@ fn complex_host_allocation_matrix() {
     wrong_arguments[1] = wrong_record;
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_INSPECT,
+            MatrixFunction::Inspect.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
         )
@@ -1082,18 +1135,13 @@ fn complex_host_allocation_matrix() {
     });
 
     let wrong_event = heap
-        .allocate_enum(
-            event_type,
-            StableId::from_parts(&["Event", "::", "Record"]),
-            99,
-            Some(record),
-        )
+        .allocate_enum(event_type, event_record_variant, 99, Some(record))
         .unwrap();
     wrong_arguments = arguments;
     wrong_arguments[2] = wrong_event;
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_INSPECT,
+            MatrixFunction::Inspect.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&wrong_arguments, Some(&mut heap)).unwrap(),
         )
@@ -1189,7 +1237,7 @@ fn complex_host_allocation_matrix() {
     std::panic::set_hook(Box::new(|_| {}));
     let (outcome, counts) = observed_host_split(|| {
         registry.call_runtime(
-            host_matrix::THUNK_PANIC_HOST,
+            MatrixFunction::PanicHost.stable_id(),
             &mut context,
             RuntimeHostArgs::new(&[], Some(&mut heap)).unwrap(),
         )
@@ -1205,30 +1253,31 @@ fn complex_host_allocation_matrix() {
     let injected_cases = [
         (
             RuntimeFailurePoint::HostReturnObjectReservation,
-            host_matrix::THUNK_RETURN_ARRAY,
+            MatrixFunction::ReturnArray,
         ),
         (
             RuntimeFailurePoint::HostReturnCollectionReservation,
-            host_matrix::THUNK_RETURN_ARRAY,
+            MatrixFunction::ReturnArray,
         ),
         (
             RuntimeFailurePoint::HostReturnStringReservation,
-            host_matrix::THUNK_RETURN_STRUCT,
+            MatrixFunction::ReturnStruct,
         ),
         (
             RuntimeFailurePoint::HostReturnStructWrite,
-            host_matrix::THUNK_RETURN_STRUCT,
+            MatrixFunction::ReturnStruct,
         ),
         (
             RuntimeFailurePoint::HostReturnCollectionWrite,
-            host_matrix::THUNK_RETURN_ARRAY,
+            MatrixFunction::ReturnArray,
         ),
         (
             RuntimeFailurePoint::HostReturnCommit,
-            host_matrix::THUNK_RETURN_ARRAY,
+            MatrixFunction::ReturnArray,
         ),
     ];
-    for (point, id) in injected_cases {
+    for (point, function) in injected_cases {
+        let id = function.stable_id();
         let mut injected_heap = Heap::new_with_arena_limits(32, 256, 16, 64, 33);
         let before = injected_heap.collection_inspection();
         let _probe = injected_heap.failure_injector().arm_once(point);
@@ -2265,7 +2314,7 @@ fn make_migration_realm() -> (RealmRuntime, ModuleHandle, nexa_verifier::Verifie
         },
         RootMap {
             pc: 7,
-            bitmap: vec![false, true],
+            bitmap: vec![false, false],
         },
     ];
     let new_schema = StateSchema {
