@@ -368,7 +368,12 @@ fn m4r1_nidl_mutation_stress() {
     let mut failures = Vec::new();
     let mut categories = std::collections::BTreeMap::<&str, u32>::new();
     let mut mutations = 0_u32;
-    for cycle in 0..10 {
+    for (cycle, suffix) in [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine",
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let valid_changes = [
             (
                 "contract",
@@ -382,8 +387,8 @@ fn m4r1_nidl_mutation_stress() {
                 "host_nexa",
                 format!(
                     "contract Stress {{ struct Value {{ item: i32, }} \
-                     host {{ fn work_{cycle}(value: Value) -> i32; }} \
-                     nexa {{ fn run_{cycle}(value: i32) -> i32; }} }}"
+                     host {{ fn work_{suffix}(value: Value) -> i32; }} \
+                     nexa {{ fn run_{suffix}(value: i32) -> i32; }} }}"
                 ),
             ),
             (
@@ -500,7 +505,7 @@ fn m4r1_nidl_mutation_stress() {
         let async_entrypoint = format!(
             "contract Stress {{ struct Value {{ item: i32, }} \
              host {{ fn work(value: Value) -> i32; }} \
-             nexa {{ async fn run_{cycle}(value: i32) -> i32; }} }}"
+             nexa {{ async fn run_{suffix}(value: i32) -> i32; }} }}"
         );
         mutations += 1;
         *categories.entry("illegal_async").or_default() += 1;
