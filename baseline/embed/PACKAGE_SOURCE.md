@@ -1,5 +1,7 @@
 # Package Source
 
+Version: **1.0.0**
+
 Status: M4 COMPLETE; M4R1 COMPLETE
 
 A `PackageSource` has one stable `SourceId`, one host-defined `PackagePolicy`,

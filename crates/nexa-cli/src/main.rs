@@ -2363,17 +2363,20 @@ fn check_decision_index(index: &str) -> Result<(), String> {
         if !decision_ids.insert(id.clone()) {
             return Err(format!("decision `{id}` appears more than once"));
         }
-        let location = row[3].trim_matches('`');
-        let normative_path = if location == "this file" {
-            PathBuf::from(REQUIRED_BASELINE[0])
-        } else {
-            Path::new("baseline").join(location)
-        };
-        if !normative_path.is_file() {
-            return Err(format!(
-                "active decision `{id}` refers to missing normative path `{}`",
-                normative_path.display()
-            ));
+        // A normative location lists one or more comma-separated paths.
+        for location in row[3].split(',') {
+            let location = location.trim().trim_matches('`');
+            let normative_path = if location == "this file" {
+                PathBuf::from(REQUIRED_BASELINE[0])
+            } else {
+                Path::new("baseline").join(location)
+            };
+            if !normative_path.is_file() {
+                return Err(format!(
+                    "active decision `{id}` refers to missing normative path `{}`",
+                    normative_path.display()
+                ));
+            }
         }
     }
 

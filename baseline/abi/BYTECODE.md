@@ -1,5 +1,7 @@
 # Nexa Internal Language Bytecode 6
 
+Version: **6.0.0**
+
 The bytecode is a fixed-endian, sectioned, versioned typed-register format. Runtime execution
 accepts only a `VerifiedModule`.
 

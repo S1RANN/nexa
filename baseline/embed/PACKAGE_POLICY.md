@@ -1,5 +1,7 @@
 # Package Policy
 
+Version: **1.0.0**
+
 Status: M2 COMPLETE
 
 Source policy is host-owned and cannot be declared by a package. It fixes

@@ -1,5 +1,7 @@
 # Package Lifecycle
 
+Version: **1.0.0**
+
 Status: M2 COMPLETE
 
 The only package states are `Discovered`, `Locked`, `Disabled`, `Enabling`,

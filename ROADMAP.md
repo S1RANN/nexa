@@ -26,6 +26,7 @@ Restart Reload v1 = COMPLETE
 Combat Dogfood Loop = COMPLETE
 Nexa M4 Language Scale Foundation = COMPLETE
 Nexa M4R1 Language Surface Reset = COMPLETE
+Nexa M5 Deep Performance Optimization = IN PROGRESS
 Nexa Language v2 = COMPLETE
 NIDL v2 = COMPLETE
 Structured Codegen v2 = COMPLETE
@@ -207,11 +208,18 @@ tagged commit.
 ## After M4R1
 
 ```text
-M5 Deep Performance Optimization = NOT STARTED
+M5 Deep Performance Optimization = IN PROGRESS
 M6 LLVM JIT = NOT STARTED
 M7 Full Semantic LSP = NOT STARTED
 M8 DAP = NOT STARTED
 ```
+
+M5 optimizes value representation, the interpreter, collections, GC, and
+Task/Host boundaries behind frozen observable semantics, in two gated
+stages (M5a representation and interpreter, M5b GC and product corpus).
+Its normative scope, protocol, targets, and JIT decision rules live under
+`baseline/performance/`. M5 ends with a data-backed `GO`/`DEFER` decision
+for M6 LLVM JIT.
 
 M4R1 does not include user generics, traits or interfaces, closures,
 inheritance, dynamic dispatch, operator overloading, macros, reflection,

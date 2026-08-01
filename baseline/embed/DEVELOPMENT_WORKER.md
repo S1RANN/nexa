@@ -1,5 +1,7 @@
 # Development Worker
 
+Version: **1.0.0**
+
 Status: M3R3 COMPLETE
 
 The development Worker compiles immutable Package Candidate snapshots outside

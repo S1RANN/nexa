@@ -1,5 +1,7 @@
 # Host Request Machine Specification 1.1
 
+Version: **1.0.0**
+
 ```text
 Created → Submitted → InFlight → CompletionQueued
                          │              ├→ Completed → Released

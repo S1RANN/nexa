@@ -1,5 +1,7 @@
 # Engine Diagnostics
 
+Version: **1.0.0**
+
 Status: M3R1 COMPLETE
 
 An Engine diagnostic code is valid evidence only when all of the following

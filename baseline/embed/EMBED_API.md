@@ -1,5 +1,7 @@
 # Nexa Embed API
 
+Version: **1.0.0**
+
 Status: M4 COMPLETE; M4R1 COMPLETE
 
 `nexa-embed` is the generic, package-oriented boundary between a Rust

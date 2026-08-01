@@ -1,5 +1,7 @@
 # Snake Pilot
 
+Version: **1.0.0**
+
 Status: M2 COMPLETE
 
 The Snake pilot is a playable Macroquad application with a pure Rust,

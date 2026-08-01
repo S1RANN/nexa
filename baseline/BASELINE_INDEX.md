@@ -1,6 +1,6 @@
 # Nexa Baseline Index
 
-Version: **4.1.0**
+Version: **4.2.0**
 
 ```text
 Nexa Internal Pivot M1 = COMPLETE
@@ -34,6 +34,13 @@ Structured Codegen v2 = COMPLETE
 Standalone Profile v1 = COMPLETE
 REPL v1 = COMPLETE
 Multiple Entrypoint Model = COMPLETE
+Nexa M5 Deep Performance Optimization = IN PROGRESS
+Performance Measurement Authority v1 = IN PROGRESS
+Value Layout v1 = IN PROGRESS
+ExecutableModule v1 = IN PROGRESS
+Incremental GC v1 = IN PROGRESS
+Runtime Fast Paths v1 = IN PROGRESS
+M6 LLVM JIT = NOT STARTED
 ```
 
 This is the only normative entry point for the active Internal Language Pivot.
@@ -121,6 +128,14 @@ of selecting a compatibility parser or decoder.
 - [`../docs/REPL.md`](../docs/REPL.md)
 - [`abi/IDL.md`](abi/IDL.md)
 - [`abi/BYTECODE.md`](abi/BYTECODE.md)
+- [`performance/M5_SCOPE.md`](performance/M5_SCOPE.md)
+- [`performance/BENCHMARK_PROTOCOL_V1.md`](performance/BENCHMARK_PROTOCOL_V1.md)
+- [`performance/PERFORMANCE_COUNTERS_V1.md`](performance/PERFORMANCE_COUNTERS_V1.md)
+- [`performance/VALUE_LAYOUT_V1.md`](performance/VALUE_LAYOUT_V1.md)
+- [`performance/EXECUTABLE_MODULE_V1.md`](performance/EXECUTABLE_MODULE_V1.md)
+- [`performance/GC_V1.md`](performance/GC_V1.md)
+- [`performance/PERFORMANCE_TARGETS_V1.md`](performance/PERFORMANCE_TARGETS_V1.md)
+- [`performance/JIT_DECISION_V1.md`](performance/JIT_DECISION_V1.md)
 - [`runtime/HANDLES.md`](runtime/HANDLES.md)
 - [`runtime/RESOURCE_MACHINE.md`](runtime/RESOURCE_MACHINE.md)
 - [`runtime/SCOPE_MACHINE.md`](runtime/SCOPE_MACHINE.md)
@@ -137,6 +152,7 @@ of selecting a compatibility parser or decoder.
 | D67 | Active | Language and object model v2 | `language/LANGUAGE_V2.md`, `language/OBJECT_MODEL_V2.md` | M4 source surface |
 | D68 | Active | NIDL and generated bindings v2 | `abi/NIDL_V2.md`, `abi/CONTRACT_DESCRIPTOR_V2.md`, `abi/BINDING_CODEGEN_V2.md` | NIDL v1 surface and legacy index generation |
 | D69 | Active | Standalone and REPL | `language/STANDALONE_V2.md`, `language/REPL_V1.md` | low-level function-index-only execution |
+| D70 | Active | M5 performance authority | `performance/M5_SCOPE.md` | benchmark-v6-only performance evidence |
 
 ## Historical boundary
 

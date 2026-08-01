@@ -1,5 +1,7 @@
 # Module Machine Specification 1.0
 
+Version: **1.0.0**
+
 ```text
 Prepared → Quiescing → Staged → Activating → Active
                                       └────→ ActivationFaulted
