@@ -13,7 +13,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::{EnumType, Module, StructType, ValueType};
+use crate::{EnumType, Module, Signature, StructType, ValueType};
 use nexa_core::StableId;
 
 /// The only value categories a physical slot may carry (WP22).
@@ -134,17 +134,33 @@ pub struct LayoutTable {
 }
 
 impl LayoutTable {
-    /// Derives the complete table for every named type in the module.
+    /// Derives the table for every layoutable named type in the module.
+    ///
+    /// Recursive value types and slot overflows are hard errors. Aggregates
+    /// referencing types outside the module's type sections (bytecode v6
+    /// legally omits host nominal definitions) are skipped rather than
+    /// guessed: a wrong GC bitmap would be worse than an absent layout.
+    /// Full-closure enforcement arrives with bytecode v7 (WP34).
     pub fn for_module(module: &Module) -> Result<Self, LayoutError> {
         let mut table = Self::default();
         let context = LayoutContext { module };
         for struct_type in &module.struct_types {
-            let layout = context.struct_layout(struct_type, &mut Vec::new())?;
-            table.named.insert(struct_type.type_id.0, layout);
+            match context.struct_layout(struct_type, &mut Vec::new()) {
+                Ok(layout) => {
+                    table.named.insert(struct_type.type_id.0, layout);
+                }
+                Err(LayoutError::UnknownType(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         for enum_type in &module.enum_types {
-            let layout = context.enum_value_layout(enum_type, &mut Vec::new())?;
-            table.named.insert(enum_type.type_id.0, layout);
+            match context.enum_value_layout(enum_type, &mut Vec::new()) {
+                Ok(layout) => {
+                    table.named.insert(enum_type.type_id.0, layout);
+                }
+                Err(LayoutError::UnknownType(_)) => {}
+                Err(error) => return Err(error),
+            }
         }
         for class_type in &module.class_types {
             table.named.insert(
@@ -202,11 +218,12 @@ impl LayoutTable {
     /// Layout of any logical type against this table.
     pub fn layout_of(&self, ty: ValueType) -> Result<ValueLayout, LayoutError> {
         match ty {
-            ValueType::Named(id) => self
-                .named
-                .get(&id.0)
-                .cloned()
-                .ok_or(LayoutError::UnknownType(id)),
+            ValueType::Named(id) => {
+                if let Some(layout) = self.named.get(&id.0) {
+                    return Ok(layout.clone());
+                }
+                builtin_named_layout(id).ok_or(LayoutError::UnknownType(id))
+            }
             other => Ok(scalar_or_reference_layout(other)),
         }
     }
@@ -287,6 +304,9 @@ impl LayoutContext<'_> {
         }
         if self.is_handle_type(id) {
             return Ok(vec![PhysicalSlotKind::HostHandle]);
+        }
+        if let Some(layout) = builtin_named_layout(id) {
+            return Ok(layout.slot_kinds);
         }
         Err(LayoutError::UnknownType(id))
     }
@@ -539,5 +559,124 @@ fn handle_layout(ty: ValueType) -> ValueLayout {
         copy_strategy: CopyStrategy::ReferenceShare,
         equality_strategy: EqualityStrategy::Bits,
         hash_strategy: HashStrategy::Bits,
+    }
+}
+
+/// Well-known runtime-builtin type names that never appear in module type
+/// sections; the runtime's own value taxonomy treats them the same way.
+fn builtin_named_layout(id: StableId) -> Option<ValueLayout> {
+    if id == StableId::from_name("HostRequest") || id == StableId::from_name("HostError") {
+        return Some(handle_layout(ValueType::Named(id)));
+    }
+    if id == StableId::from_name("Buffer") {
+        return Some(reference_layout(ValueType::Named(id)));
+    }
+    None
+}
+
+/// Physical placement of one parameter inside the callee's argument range
+/// (WP23).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterAbi {
+    pub logical_type: ValueType,
+    pub slot_offset: u16,
+    pub slot_count: u16,
+    pub gc_bitmap: Vec<bool>,
+}
+
+/// Caller-allocated result range of one function (WP24).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResultAbi {
+    pub logical_type: ValueType,
+    pub slot_count: u16,
+    pub gc_bitmap: Vec<bool>,
+}
+
+/// Derived calling convention of one function: logical signature in,
+/// contiguous physical slot ranges out. Calls copy arguments directly into
+/// the target range and never construct temporary heap aggregates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionAbi {
+    pub parameters: Vec<ParameterAbi>,
+    pub parameter_slots: u16,
+    pub parameter_gc_bitmap: Vec<bool>,
+    pub result: Option<ResultAbi>,
+}
+
+impl FunctionAbi {
+    /// Derives the physical ABI for one logical signature.
+    pub fn for_signature(table: &LayoutTable, signature: &Signature) -> Result<Self, LayoutError> {
+        let mut parameters = Vec::with_capacity(signature.parameters.len());
+        let mut parameter_gc_bitmap = Vec::new();
+        let mut cursor: usize = 0;
+        for parameter in &signature.parameters {
+            let layout = table.layout_of(*parameter)?;
+            let slot_offset = u16::try_from(cursor).map_err(|_| overflow_owner(*parameter))?;
+            parameters.push(ParameterAbi {
+                logical_type: *parameter,
+                slot_offset,
+                slot_count: layout.physical_slots,
+                gc_bitmap: layout.gc_bitmap.clone(),
+            });
+            parameter_gc_bitmap.extend_from_slice(&layout.gc_bitmap);
+            cursor += usize::from(layout.physical_slots);
+        }
+        let parameter_slots = u16::try_from(cursor).map_err(|_| overflow_owner(ValueType::I32))?;
+        let result = match signature.result {
+            Some(result_type) => {
+                let layout = table.layout_of(result_type)?;
+                Some(ResultAbi {
+                    logical_type: result_type,
+                    slot_count: layout.physical_slots,
+                    gc_bitmap: layout.gc_bitmap,
+                })
+            }
+            None => None,
+        };
+        Ok(Self {
+            parameters,
+            parameter_slots,
+            parameter_gc_bitmap,
+            result,
+        })
+    }
+}
+
+const fn overflow_owner(ty: ValueType) -> LayoutError {
+    match ty {
+        ValueType::Named(id) => LayoutError::SlotOverflow(id),
+        _ => LayoutError::SlotOverflow(StableId(0)),
+    }
+}
+
+/// Deterministic per-module ABI table indexed by function position (WP23).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModuleAbi {
+    functions: Vec<FunctionAbi>,
+}
+
+impl ModuleAbi {
+    /// Derives every function ABI against the module's layout table.
+    pub fn for_module(module: &Module, table: &LayoutTable) -> Result<Self, LayoutError> {
+        let mut functions = Vec::with_capacity(module.functions.len());
+        for function in &module.functions {
+            functions.push(FunctionAbi::for_signature(table, &function.signature)?);
+        }
+        Ok(Self { functions })
+    }
+
+    #[must_use]
+    pub fn function(&self, index: usize) -> Option<&FunctionAbi> {
+        self.functions.get(index)
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.functions.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
     }
 }

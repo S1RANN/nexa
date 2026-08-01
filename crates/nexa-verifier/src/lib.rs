@@ -69,6 +69,10 @@ pub enum VerifyErrorKind {
     InvalidSnapshotMetadata,
     InvalidResourceTokenMetadata,
     InvalidSourceMap,
+    /// M5 WP35: every verified module must yield a deterministic layout
+    /// table and function ABI; recursion, dangling types, and slot
+    /// overflows are rejected before execution.
+    InvalidValueLayout(nexa_bytecode::layout::LayoutError),
     EnumTypeOutOfRange(u64),
     EnumVariantOutOfRange(u64),
     StructTypeOutOfRange(u64),
@@ -309,6 +313,7 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     verify_source_map(&module)?;
     verify_named_type_metadata(&module)?;
     verify_host_import_metadata(&module)?;
+    verify_value_layouts(&module)?;
     let mut export_ids = BTreeSet::new();
     for export in &module.exports {
         if !export_ids.insert(export.stable_id) {
@@ -790,6 +795,20 @@ fn has_state_handle_type(module: &Module, target: ValueType) -> bool {
         .state_handle_types
         .iter()
         .any(|handle_type| handle_type.type_id == type_id && handle_type.target == target)
+}
+
+/// M5 WP35 first stage: the layout table must derive for every verified
+/// module, rejecting recursive value types, dangling aggregate fields, and
+/// slot overflows. Signature-level ABI enforcement needs the full type
+/// closure in the module and therefore lands with the bytecode v7 upgrade
+/// (WP34); host nominal types legally stay outside v6 type sections.
+fn verify_value_layouts(module: &Module) -> Result<(), VerifyError> {
+    nexa_bytecode::layout::LayoutTable::for_module(module).map_err(|error| VerifyError {
+        function: 0,
+        instruction: None,
+        kind: VerifyErrorKind::InvalidValueLayout(error),
+    })?;
+    Ok(())
 }
 
 fn verify_host_import_metadata(module: &Module) -> Result<(), VerifyError> {

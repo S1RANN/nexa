@@ -2,11 +2,12 @@
 //! GC bitmaps, enum tag+payload ranges, and recursion rejection.
 
 use nexa_bytecode::layout::{
-    CopyStrategy, EqualityStrategy, LayoutError, LayoutTable, PhysicalSlotKind,
+    CopyStrategy, EqualityStrategy, FunctionAbi, LayoutError, LayoutTable, ModuleAbi,
+    PhysicalSlotKind,
 };
 use nexa_bytecode::{
-    ArrayType, ClassType, EnumType, EnumVariant, ModuleBuilder, StructField, StructType, ValueType,
-    option_type,
+    ArrayType, ClassType, EnumType, EnumVariant, ModuleBuilder, Signature, StructField, StructType,
+    ValueType, option_type,
 };
 use nexa_core::StableId;
 
@@ -158,7 +159,7 @@ fn recursive_struct_nesting_is_rejected() {
 }
 
 #[test]
-fn unknown_named_types_are_rejected_not_defaulted() {
+fn unknown_field_types_defer_layout_instead_of_guessing_bitmaps() {
     let dangling = StableId::from_name("Dangling");
     let holder = StableId::from_name("Holder");
     let mut builder = ModuleBuilder::new();
@@ -171,9 +172,13 @@ fn unknown_named_types_are_rejected_not_defaulted() {
         fields: vec![field("Holder::value", ValueType::Named(dangling))],
     });
     let module = builder.finish();
+    // Bytecode v6 legally references host nominals outside the type
+    // sections: the aggregate is skipped, never given a guessed bitmap,
+    // and stays unavailable through layout_of until the v7 closure.
+    let table = LayoutTable::for_module(&module).expect("derivation succeeds");
     assert_eq!(
-        LayoutTable::for_module(&module),
-        Err(LayoutError::UnknownType(dangling))
+        table.layout_of(ValueType::Named(holder)),
+        Err(LayoutError::UnknownType(holder))
     );
 }
 
@@ -191,6 +196,55 @@ fn scalar_layouts_carry_float_aware_equality_and_no_gc_slots() {
         EqualityStrategy::StringContent
     );
     assert!(string_layout.gc_bitmap[0]);
+}
+
+#[test]
+fn function_abi_flattens_parameters_into_contiguous_slot_ranges() {
+    let module = module_with_nested_types();
+    let table = LayoutTable::for_module(&module).expect("layout derivation");
+    let outer = StableId::from_name("Outer");
+    let signature = Signature {
+        parameters: vec![ValueType::I32, ValueType::Named(outer), ValueType::String],
+        result: Some(ValueType::Named(outer)),
+    };
+    let abi = FunctionAbi::for_signature(&table, &signature).expect("function abi");
+    assert_eq!(abi.parameters.len(), 3);
+    assert_eq!(
+        (abi.parameters[0].slot_offset, abi.parameters[0].slot_count),
+        (0, 1)
+    );
+    // Outer flattens to six slots directly inside the argument range.
+    assert_eq!(
+        (abi.parameters[1].slot_offset, abi.parameters[1].slot_count),
+        (1, 6)
+    );
+    assert_eq!(
+        (abi.parameters[2].slot_offset, abi.parameters[2].slot_count),
+        (7, 1)
+    );
+    assert_eq!(abi.parameter_slots, 8);
+    assert_eq!(
+        abi.parameter_gc_bitmap,
+        vec![false, false, false, true, true, false, true, true]
+    );
+    let result = abi.result.expect("caller-allocated result range");
+    assert_eq!(result.slot_count, 6);
+
+    // Builtin runtime handle names never appear in module type tables but
+    // still lay out as single handle slots.
+    let request = FunctionAbi::for_signature(
+        &table,
+        &Signature {
+            parameters: vec![ValueType::Named(StableId::from_name("HostRequest"))],
+            result: None,
+        },
+    )
+    .expect("builtin handle abi");
+    assert_eq!(request.parameter_slots, 1);
+    assert_eq!(request.parameter_gc_bitmap, vec![false]);
+
+    let module_abi = ModuleAbi::for_module(&module, &table).expect("module abi");
+    assert_eq!(module_abi.len(), module.functions.len());
 }
 
 #[test]
