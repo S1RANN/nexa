@@ -691,10 +691,19 @@ fn activation_fault() -> Result<EngineDiagnosticEvidence, String> {
     let activation_error = engine
         .reload(&package_id)
         .expect_err("invalid activation entry must fault after commit");
-    if engine.status(&package_id) != Some(crate::PackageStatus::Faulted) {
+    if engine.status(&package_id) != Some(crate::PackageStatus::Enabled) {
         return Err(format!(
-            "activation failure did not fault the Package: status={:?}, error={activation_error}",
+            "activation failure did not retain the active Package: status={:?}, error={activation_error}",
             engine.status(&package_id)
+        ));
+    }
+    let active_value = engine
+        .call::<Run>(&package_id, &7)
+        .map_err(|error| format!("last-known-good Package was not callable: {error}"))?
+        .value;
+    if active_value != 8 {
+        return Err(format!(
+            "activation failure changed last-known-good behavior: value={active_value}, error={activation_error}"
         ));
     }
     capture(&engine, nexa::ErrorCode::NX7202, "NexaEngine::reload")
