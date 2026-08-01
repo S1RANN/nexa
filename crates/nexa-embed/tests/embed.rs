@@ -1108,11 +1108,22 @@ fn change_scan_migration_rollback_and_activation_fault_follow_contract() {
         engine.reload(&id),
         Err(EngineError::Activation(_, _))
     ));
-    assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
-    assert_eq!(engine.health().enabled_packages, 0);
+    assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
+    assert_eq!(engine.health().enabled_packages, 1);
+    assert_eq!(
+        engine.call::<Run>(&id, &1).expect("activation LKG").value,
+        3
+    );
+    assert_eq!(
+        engine
+            .state_i32(&id, "store", "Store", "value")
+            .expect("activation LKG state"),
+        Some(9)
+    );
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     let script = Arc::new(RwLock::new(
         "use host::test_host as test;\n\
@@ -1182,6 +1193,10 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
     }
 
     for generation in 1..=10 {
+        let before = engine
+            .call::<Run>(&id, &1)
+            .expect("call LKG before activation fault")
+            .value;
         *script.write().expect("source lock") = "use host::test_host as test;\n\
              @state(version = 1) class Store { mut value: i32, }\n\
              pub fn run(value: i32) -> i32 { return value; }\n\
@@ -1191,7 +1206,20 @@ fn stress_reload_keeps_last_known_good_and_recovers_activation_faults() {
             engine.reload(&id),
             Err(EngineError::Activation(_, _))
         ));
-        assert_eq!(engine.status(&id), Some(PackageStatus::Faulted));
+        assert_eq!(engine.status(&id), Some(PackageStatus::Enabled));
+        assert_eq!(
+            engine
+                .call::<Run>(&id, &1)
+                .expect("activation fault LKG")
+                .value,
+            before
+        );
+        assert_eq!(
+            engine
+                .state_i32(&id, "store", "Store", "value")
+                .expect("activation fault state LKG"),
+            Some(7)
+        );
 
         *script.write().expect("source lock") = format!(
             "use host::test_host as test;\n\

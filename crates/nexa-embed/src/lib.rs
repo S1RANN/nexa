@@ -1287,10 +1287,9 @@ impl NexaEngine {
                 ))
             }
             Ok(nexa_runtime::RestartReloadOutcome::ActivationFaulted { error, .. }) => {
-                self.packages[index].runtime = None;
                 let _ = self.packages[index]
                     .lifecycle
-                    .transition(PackageStatus::Faulted);
+                    .transition(PackageStatus::Enabled);
                 let error = EngineError::Activation(id.clone(), error.to_string());
                 let summary = self.record_error(index, &error);
                 self.packages[index].last_diagnostic = Some(summary);

@@ -21,8 +21,10 @@ stable source snapshot
 Before commit, admission stops, old Tasks are cancelled, Requests are
 detached, and migration runs on staging. Failure rolls back without replacing
 the active package or Last Known Good. Commit publishes the new epoch and
-artifact. Activation then runs; its failure is explicitly post-commit and
-faults the package.
+artifact provisionally while retaining the old epoch until activation
+finishes. Activation failure is reported as `ActivationFaulted`, restores the
+old root, heap, and Last Known Good, and leaves the package enabled; a
+successful activation retires the old epoch.
 
 `ReloadReport` records package and generation identity, old/new epochs, source
 hash, cancelled Tasks, detached Requests, and independently measured timing:

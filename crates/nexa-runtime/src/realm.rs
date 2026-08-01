@@ -1759,6 +1759,7 @@ impl RealmRuntime {
         }
         metrics.migration_duration = migration_started.elapsed();
 
+        let activation_heap_checkpoint = self.heap.checkpoint();
         let commit = self.commit_reload_measured(&activation_arguments, activation_fuel);
         metrics.commit_duration = commit.commit_duration;
         metrics.activation_duration = commit.activation_duration;
@@ -1774,6 +1775,8 @@ impl RealmRuntime {
                         .is_ok_and(|state| state == ModuleLifecycle::ActivationFaulted) =>
             {
                 let error = restart_reload_error(error);
+                self.rollback_activation_fault(candidate, activation_heap_checkpoint)
+                    .map_err(restart_reload_error)?;
                 self.flush_releases();
                 RestartReloadOutcome::ActivationFaulted { candidate, error }
             }
@@ -2187,6 +2190,7 @@ impl RealmRuntime {
             .lifecycle = ModuleLifecycle::Active;
         let transaction = self.reload.finish()?;
         debug_assert_eq!(transaction.candidate, candidate);
+        self.retire_published_old_root(&transaction)?;
         Ok(candidate)
     }
 
@@ -2244,7 +2248,6 @@ impl RealmRuntime {
                     .resolve_mut(candidate.raw())
                     .map_err(RealmError::ModuleHandle)?
                     .lifecycle = ModuleLifecycle::ActivationFaulted;
-                self.reload.finish()?;
                 return Err(RealmError::InjectedFailure(
                     crate::RuntimeFailurePoint::ActivationTrap,
                 ));
@@ -2288,6 +2291,7 @@ impl RealmRuntime {
                         .map_err(RealmError::ModuleHandle)?
                         .lifecycle = ModuleLifecycle::Active;
                     let transaction = self.reload.finish()?;
+                    self.retire_published_old_root(&transaction)?;
                     Ok(transaction.candidate)
                 }
                 Err(ReloadError::Activation(error)) => {
@@ -2296,7 +2300,6 @@ impl RealmRuntime {
                         .resolve_mut(candidate.raw())
                         .map_err(RealmError::ModuleHandle)?
                         .lifecycle = ModuleLifecycle::ActivationFaulted;
-                    self.reload.finish()?;
                     Err(ReloadError::Activation(error).into())
                 }
                 Err(error) => Err(error.into()),
@@ -2392,9 +2395,25 @@ impl RealmRuntime {
             .resolve_mut(old.raw())
             .map_err(RealmError::ModuleHandle)?
             .lifecycle = ModuleLifecycle::Retired;
+        Ok(())
+    }
+
+    fn retire_published_old_root(
+        &mut self,
+        transaction: &ReloadTransaction,
+    ) -> Result<(), RealmError> {
+        let publication_id = self
+            .root_publications
+            .back()
+            .filter(|publication| {
+                publication.old_root == transaction.old_module
+                    && publication.candidate_root == transaction.candidate
+            })
+            .map(|publication| publication.publication_id)
+            .ok_or(ReloadError::InvalidState)?;
         let old_root = self
             .modules
-            .release(old.raw())
+            .release(transaction.old_module.raw())
             .map_err(RealmError::ModuleHandle)?;
         self.retired_modules.push(RetiredModuleRecord {
             module_id: old_root.module_id,
@@ -2402,6 +2421,44 @@ impl RealmRuntime {
             committed_at_publication: publication_id,
             released: true,
         });
+        Ok(())
+    }
+
+    fn rollback_activation_fault(
+        &mut self,
+        candidate: ModuleHandle,
+        heap_checkpoint: crate::heap::HeapCheckpoint,
+    ) -> Result<(), RealmError> {
+        let transaction = self.reload.finish()?;
+        if transaction.candidate != candidate || self.active_root != Some(candidate) {
+            return Err(ReloadError::InvalidState.into());
+        }
+        let publication_id = self
+            .root_publications
+            .back()
+            .filter(|publication| {
+                publication.old_root == transaction.old_module
+                    && publication.candidate_root == transaction.candidate
+            })
+            .map(|publication| publication.publication_id)
+            .ok_or(ReloadError::InvalidState)?;
+        self.set_active_root(transaction.old_module);
+        self.modules
+            .resolve_mut(transaction.old_module.raw())
+            .map_err(RealmError::ModuleHandle)?
+            .lifecycle = ModuleLifecycle::Active;
+        let candidate_root = self
+            .modules
+            .release(candidate.raw())
+            .map_err(RealmError::ModuleHandle)?;
+        self.retired_modules.push(RetiredModuleRecord {
+            module_id: candidate_root.module_id,
+            epoch: candidate_root.epoch,
+            committed_at_publication: publication_id,
+            released: true,
+        });
+        self.heap.restore_checkpoint(heap_checkpoint);
+        self.collect_garbage()?;
         Ok(())
     }
 

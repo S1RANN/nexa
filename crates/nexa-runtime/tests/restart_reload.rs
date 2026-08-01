@@ -559,7 +559,7 @@ fn late_completion_from_old_epoch_is_discarded() {
 }
 
 #[test]
-fn activation_fault_is_observable_after_commit() {
+fn activation_fault_restores_the_previous_active_root() {
     let old_module = simple_yielding();
     let (mut realm, old) = realm(old_module);
     let candidate = compile(
@@ -576,11 +576,12 @@ fn activation_fault_is_observable_after_commit() {
         panic!("activation must fault after commit");
     };
     probe.require_consumed().expect("activation reached");
-    assert_eq!(realm.active_root(), Some(candidate));
-    assert_eq!(
-        realm.module_lifecycle(candidate).expect("lifecycle"),
-        nexa_runtime::ModuleLifecycle::ActivationFaulted
+    assert_eq!(realm.active_root(), Some(old));
+    assert!(
+        realm.module_lifecycle(candidate).is_err(),
+        "the released activation-fault Candidate remained addressable"
     );
+    assert_eq!(realm.resource_ledger().retired_modules, 0);
 }
 
 #[test]

@@ -31,9 +31,11 @@ const IDL: &str = "contract TestHost {
     }
     nexa {
         fn run(value: i32) -> i32;
+        async fn resource_probe(value: i32) -> i32;
     }
 }";
 const RUN_ID: StableId = StableId(0x8143_9374_8b64_00a6);
+const RESOURCE_PROBE_ID: StableId = StableId(0xfac0_ded9_4371_1d6f);
 const ITERATIONS_PER_CLASS: u64 = 100;
 const ACTIVATION_RECOVERIES: u64 = 10;
 const WORKER_TIMEOUT: Duration = Duration::from_secs(10);
@@ -344,6 +346,44 @@ impl ScriptExport for Run {
             .value(value)
             .i32()
             .map_err(|_| ScriptCallError::OutputDecoding)
+    }
+}
+
+struct ResourceProbe;
+
+impl ScriptExport for ResourceProbe {
+    type Args = i32;
+    type Output = i32;
+
+    const STABLE_ID: StableId = RESOURCE_PROBE_ID;
+    const NAME: &'static str = "resource_probe";
+
+    fn signature() -> Signature {
+        Run::signature()
+    }
+
+    fn effect() -> FunctionEffect {
+        FunctionEffect::Task
+    }
+
+    fn argument_requirements(
+        args: &Self::Args,
+    ) -> Result<ScriptArgumentRequirements, ScriptCallError> {
+        Run::argument_requirements(args)
+    }
+
+    fn encode_args(
+        writer: &mut ScriptCallWriter<'_>,
+        args: &Self::Args,
+    ) -> Result<Vec<RuntimeValue>, ScriptCallError> {
+        Run::encode_args(writer, args)
+    }
+
+    fn decode_output(
+        reader: &ScriptOutputReader<'_>,
+        value: RuntimeValue,
+    ) -> Result<Self::Output, ScriptCallError> {
+        Run::decode_output(reader, value)
     }
 }
 
@@ -780,6 +820,16 @@ fn m4_reload_stress() {
         .find(|function| function.name == Run::NAME)
         .expect("stress Host Contract declares run");
     assert_eq!(nexa::entrypoint_stable_id(run), RUN_ID);
+    let resource_probe = idl
+        .nexa_functions
+        .iter()
+        .find(|function| function.name == ResourceProbe::NAME)
+        .expect("stress Host Contract declares resource_probe");
+    assert_eq!(
+        nexa::entrypoint_stable_id(resource_probe),
+        RESOURCE_PROBE_ID
+    );
+    assert!(resource_probe.is_async);
     let descriptor = nexa::abi_descriptor(&idl);
     let fingerprint = descriptor.fingerprint.into_bytes();
     let descriptor: &'static [u8] = Box::leak(descriptor.bytes.into_boxed_slice());
@@ -857,7 +907,8 @@ fn m4_reload_stress() {
         .root_override = Some(
         "use support::library as support;\nuse host::test_host as stress;\n\
          @state(version = 1) class Store { mut value: i32, }\n\
-         pub async fn run(value: i32) -> i32 {\n\
+         pub fn run(value: i32) -> i32 { return support::revision() + value; }\n\
+         pub async fn resource_probe(value: i32) -> i32 {\n\
              let result: Result<i32, stress::WaitError> = stress::wait(value).await;\n\
              return match result { Result::Ok(found) => found, Result::Err(error) => 0 };\n\
          }\n"
@@ -866,9 +917,18 @@ fn m4_reload_stress() {
     engine
         .reload(&package_id)
         .expect("load the Host request resource probe");
-    assert!(
-        engine.call::<Run>(&package_id, &7).is_err(),
-        "a must-complete call unexpectedly retained an unresolved Host request"
+    let probe_result = engine
+        .call_optional::<ResourceProbe>(&package_id, &7)
+        .expect("the probe Candidate implements its optional entrypoint");
+    assert!(matches!(probe_result, Err(EngineError::Handler(_, _))));
+    assert_eq!(
+        engine
+            .diagnostics()
+            .last()
+            .expect("Host wait diagnostic")
+            .diagnostic
+            .code,
+        nexa::ErrorCode::NX7102
     );
     assert_eq!(
         requests_created.load(Ordering::Relaxed),
@@ -1643,7 +1703,11 @@ path = \"library\"
             .all(|count| *count >= ITERATIONS_PER_CLASS)
     );
     assert!(report.activation_fault_recovery >= ACTIVATION_RECOVERIES);
-    assert!(report.safety.values().all(|count| *count == 0));
+    assert!(
+        report.safety.values().all(|count| *count == 0),
+        "non-zero safety counters: {:#?}",
+        report.safety
+    );
 
     let json = serde_json::to_string_pretty(&report).expect("serialize M4 Reload stress report");
     if let Some(path) = std::env::var_os("NEXA_M4_RELOAD_STRESS_REPORT") {
@@ -1912,7 +1976,9 @@ fn active_matches_source(
         state: Arc::clone(state),
     };
     let desired = source
-        .discover(&CandidateBuildContext::new(IDL.as_bytes().to_vec()))
+        .discover(
+            &CandidateBuildContext::new(IDL.as_bytes().to_vec()).requiring_entrypoints([Run::NAME]),
+        )
         .expect("rediscover current stress Candidate")
         .into_iter()
         .find(|candidate| candidate.manifest.id == *package_id)
