@@ -2819,24 +2819,41 @@ fn instruction_attempt_fuel(
             nominal_index_lookup_fuel(nominal_shape.class_fields)?
         }
         Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
-        Instruction::ArrayPush { source, .. } | Instruction::ArrayInsert { source, .. } => {
+        Instruction::ArrayPush { source, .. } => {
             let heap = heap_required()?;
             let array = register(arena, source)?;
-            let old_length = heap.array_len(array)?;
-            let new_length = old_length
-                .checked_add(1)
-                .ok_or(InterpreterError::FuelCostOverflow)?;
-            array_replace_attempt_fuel(heap, old_length, new_length)?
+            let (live, capacity) = heap.array_fuel_shape(array)?;
+            // Amortized push (WP49): spare capacity is a constant-cost
+            // in-place write; growth relocates exactly the live prefix.
+            let moved = if live < capacity { 1 } else { live.max(1) };
+            let element_work =
+                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            fuel_add(
+                element_work,
+                collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+            )?
         }
-        Instruction::ArrayPop { source, .. } | Instruction::ArrayRemove { source, .. } => {
+        Instruction::ArrayInsert { source, .. } => {
+            let heap = heap_required()?;
+            let array = register(arena, source)?;
+            let (live, capacity) = heap.array_fuel_shape(array)?;
+            let moved = live.max(1);
+            let element_work =
+                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            fuel_add(
+                element_work,
+                collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+            )?
+        }
+        Instruction::ArrayPop { source, .. }
+        | Instruction::ArrayRemove { source, .. }
+        | Instruction::ArrayClear { source } => {
             let heap = heap_required()?;
             let old_length = heap.array_len(register(arena, source)?)?;
-            array_replace_attempt_fuel(heap, old_length, old_length.saturating_sub(1))?
-        }
-        Instruction::ArrayClear { source } => {
-            let heap = heap_required()?;
-            let old_length = heap.array_len(register(arena, source)?)?;
-            array_replace_attempt_fuel(heap, old_length, 0)?
+            fuel_blocks(
+                fuel_usize(old_length.max(1))?,
+                STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+            )?
         }
         Instruction::MapGet { source, key, .. }
         | Instruction::MapRemove { source, key, .. }
@@ -3041,22 +3058,6 @@ fn value_visit_fuel(values: u64, passes: u64) -> Result<u64, InterpreterError> {
     fuel_blocks(work, 8)
 }
 
-fn array_replace_attempt_fuel(
-    heap: &Heap,
-    old_length: usize,
-    new_length: usize,
-) -> Result<u64, InterpreterError> {
-    // Replacing an arena range copies the new values and clears the released
-    // old values. Both passes are visible work even though the arena storage
-    // itself was reserved at Realm admission.
-    let elements = fuel_usize(old_length)?
-        .checked_add(fuel_usize(new_length)?)
-        .ok_or(InterpreterError::FuelCostOverflow)?;
-    let element_work = fuel_blocks(elements, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
-    let metadata_work = collection_arena_metadata_fuel(heap, new_length != 0, old_length != 0)?;
-    fuel_add(element_work, metadata_work)
-}
-
 fn collection_arena_metadata_fuel(
     heap: &Heap,
     claim: bool,
@@ -3162,15 +3163,22 @@ fn standard_intrinsic_attempt_fuel(
         }
         StandardIntrinsicFuelModel::ArrayCopy => {
             let heap = heap_required()?;
-            let old_length = heap.array_len(arguments[0])?;
-            let new_length = if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
-                old_length
-                    .checked_add(1)
-                    .ok_or(InterpreterError::FuelCostOverflow)?
+            let (live, capacity) = heap.array_fuel_shape(arguments[0])?;
+            if matches!(intrinsic, StandardIntrinsic::ArrayPush { .. }) {
+                // Amortized push (WP49): in-place unless the extent is full.
+                let moved = if live < capacity { 1 } else { live.max(1) };
+                let element_work =
+                    fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+                fuel_add(
+                    element_work,
+                    collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+                )?
             } else {
-                old_length.saturating_sub(1)
-            };
-            array_replace_attempt_fuel(heap, old_length, new_length)?
+                fuel_blocks(
+                    fuel_usize(live.max(1))?,
+                    STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+                )?
+            }
         }
         StandardIntrinsicFuelModel::MapLookup => {
             map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?

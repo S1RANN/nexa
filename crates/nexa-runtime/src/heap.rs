@@ -330,7 +330,10 @@ pub enum Object {
     Array {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
+        /// Capacity extent inside the collection arena (WP48); `length`
+        /// tracks the live prefix so pushes grow amortized (WP49).
         range: CollectionRange,
+        length: usize,
     },
     Buffer {
         type_id: StableId,
@@ -385,6 +388,21 @@ impl Object {
                 Vec::new()
             }
         }
+    }
+}
+
+/// Bounded geometric growth for the array capacity extent (WP49): at least
+/// four slots, at most double, never past the collection length ceiling.
+const fn grown_array_capacity(current: usize, needed: usize, ceiling: usize) -> usize {
+    let doubled = current.saturating_mul(2);
+    let mut capacity = if doubled < 4 { 4 } else { doubled };
+    if capacity < needed {
+        capacity = needed;
+    }
+    if capacity > ceiling {
+        ceiling
+    } else {
+        capacity
     }
 }
 
@@ -1130,12 +1148,14 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         self.validate_collection_length(range.length)?;
+        let length = range.length;
         let reference = self.commit(
             reservation,
             Object::Array {
                 type_id,
                 element_type,
                 range,
+                length,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -1566,6 +1586,7 @@ impl Heap {
             type_id,
             element_type,
             range: CollectionRange::default(),
+            length: 0,
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
@@ -1591,13 +1612,12 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let (_, range) = self.array_range(value)?;
+        let (_, range, length) = self.array_range(value)?;
+        if index >= length {
+            return Err(HeapError::IndexOutOfBounds { index, length });
+        }
         let values = self.collections.values_mut(range)?;
-        let length = values.len();
-        let slot = values
-            .get_mut(index)
-            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
-        *slot = replacement;
+        values[index] = replacement;
         Ok(())
     }
 
@@ -1606,7 +1626,7 @@ impl Heap {
         value: RuntimeValue,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let current = self.array_values(value)?.len();
+        let (reference, range, current) = self.array_range(value)?;
         let length = current
             .checked_add(1)
             .ok_or(HeapError::CollectionTooLarge {
@@ -1614,22 +1634,30 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
-        self.replace_array_range(value, length, |destination, source| {
-            destination[..current].copy_from_slice(source);
-            destination[current] = element;
-        })
+        if current < range.length {
+            // WP49 amortized fast path: spare capacity, write in place.
+            self.collections.values_mut(range)?[current] = element;
+            self.set_array_length(reference, length)?;
+            return Ok(());
+        }
+        let capacity = grown_array_capacity(range.length, length, self.max_collection_length);
+        self.regrow_array(reference, range, current, capacity, |values| {
+            values[current] = element;
+        })?;
+        self.set_array_length(reference, length)
     }
 
     pub fn array_pop(&mut self, value: RuntimeValue) -> Result<RuntimeValue, HeapError> {
-        let length = self.array_values(value)?.len();
-        let result = self
-            .array_values(value)?
-            .last()
-            .copied()
-            .ok_or(HeapError::IndexOutOfBounds { index: 0, length })?;
-        self.replace_array_range(value, length - 1, |destination, source| {
-            destination.copy_from_slice(&source[..length - 1]);
-        })?;
+        let (reference, range, length) = self.array_range(value)?;
+        if length == 0 {
+            return Err(HeapError::IndexOutOfBounds { index: 0, length });
+        }
+        let values = self.collections.values_mut(range)?;
+        let result = values[length - 1];
+        // Clear the vacated tail slot so no stale reference lingers in the
+        // retained capacity extent.
+        values[length - 1] = RuntimeValue::Unit;
+        self.set_array_length(reference, length - 1)?;
         Ok(result)
     }
 
@@ -1639,7 +1667,7 @@ impl Heap {
         index: usize,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let current = self.array_values(value)?.len();
+        let (reference, range, current) = self.array_range(value)?;
         if index > current {
             return Err(HeapError::IndexOutOfBounds {
                 index,
@@ -1653,11 +1681,23 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
-        self.replace_array_range(value, length, |destination, source| {
-            destination[..index].copy_from_slice(&source[..index]);
-            destination[index] = element;
-            destination[index + 1..].copy_from_slice(&source[index..]);
-        })
+        if current < range.length {
+            let values = self.collections.values_mut(range)?;
+            values.copy_within(index..current, index + 1);
+            values[index] = element;
+            self.counters.collection_relocation_bytes = self
+                .counters
+                .collection_relocation_bytes
+                .saturating_add(((current - index) * std::mem::size_of::<RuntimeValue>()) as u64);
+            self.set_array_length(reference, length)?;
+            return Ok(());
+        }
+        let capacity = grown_array_capacity(range.length, length, self.max_collection_length);
+        self.regrow_array(reference, range, current, capacity, |values| {
+            values.copy_within(index..current, index + 1);
+            values[index] = element;
+        })?;
+        self.set_array_length(reference, length)
     }
 
     pub fn array_remove(
@@ -1665,20 +1705,92 @@ impl Heap {
         value: RuntimeValue,
         index: usize,
     ) -> Result<RuntimeValue, HeapError> {
-        let length = self.array_values(value)?.len();
+        let (reference, range, length) = self.array_range(value)?;
         if index >= length {
             return Err(HeapError::IndexOutOfBounds { index, length });
         }
-        let removed = self.array_values(value)?[index];
-        self.replace_array_range(value, length - 1, |destination, source| {
-            destination[..index].copy_from_slice(&source[..index]);
-            destination[index..].copy_from_slice(&source[index + 1..]);
-        })?;
+        let values = self.collections.values_mut(range)?;
+        let removed = values[index];
+        values.copy_within(index + 1..length, index);
+        values[length - 1] = RuntimeValue::Unit;
+        self.counters.collection_relocation_bytes = self
+            .counters
+            .collection_relocation_bytes
+            .saturating_add(((length - 1 - index) * std::mem::size_of::<RuntimeValue>()) as u64);
+        self.set_array_length(reference, length - 1)?;
         Ok(removed)
     }
 
     pub fn array_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
-        self.replace_array_range(value, 0, |_, _| {})
+        // WP50: clear retains capacity; live slots reset so no stale
+        // references survive in the extent.
+        let (reference, range, length) = self.array_range(value)?;
+        let values = self.collections.values_mut(range)?;
+        values[..length].fill(RuntimeValue::Unit);
+        self.set_array_length(reference, 0)
+    }
+
+    fn set_array_length(&mut self, reference: GcRef, new_length: usize) -> Result<(), HeapError> {
+        match self.resolve_mut(reference)? {
+            Object::Array { length, .. } => {
+                *length = new_length;
+                Ok(())
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    /// Deterministic (live, capacity) shape used by fuel settlement before
+    /// an array mutation runs (WP49).
+    pub fn array_fuel_shape(&self, value: RuntimeValue) -> Result<(usize, usize), HeapError> {
+        let (_, range, length) = self.array_range(value)?;
+        Ok((length, range.length))
+    }
+
+    /// Moves the live prefix into a larger extent, applies `write`, and
+    /// releases the old extent. Relocation copies exactly `live` elements.
+    fn regrow_array(
+        &mut self,
+        reference: GcRef,
+        old_range: CollectionRange,
+        live: usize,
+        capacity: usize,
+        write: impl FnOnce(&mut [RuntimeValue]),
+    ) -> Result<(), HeapError> {
+        let mut reservation = self.preflight_collection(capacity)?;
+        let new_range = reservation.range;
+        self.counters.collection_relocation_bytes = self
+            .counters
+            .collection_relocation_bytes
+            .saturating_add((live * std::mem::size_of::<RuntimeValue>()) as u64);
+        let old_start = old_range.start;
+        let old_end = old_range.end();
+        let new_start = new_range.start;
+        let new_end = new_range.end();
+        if old_range.length == 0 {
+            write(&mut self.collections.values[new_start..new_end]);
+        } else if new_end <= old_start || old_end <= new_start {
+            let (destination, source) = if new_end <= old_start {
+                let (left, right) = self.collections.values.split_at_mut(old_start);
+                (&mut left[new_start..new_end], &right[..old_range.length])
+            } else {
+                let (left, right) = self.collections.values.split_at_mut(new_start);
+                (&mut right[..capacity], &left[old_start..old_end])
+            };
+            destination[..live].copy_from_slice(&source[..live]);
+            write(destination);
+        } else {
+            self.release_collection_reservation(&mut reservation);
+            return Err(HeapError::CapacityExhausted);
+        }
+        reservation.written = capacity;
+        Self::complete_collection_reservation(&mut reservation)?;
+        match self.resolve_mut(reference)? {
+            Object::Array { range, .. } => *range = new_range,
+            _ => return Err(HeapError::InvalidReference(reference)),
+        }
+        self.collections.release(old_range);
+        Ok(())
     }
 
     pub fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
@@ -1690,14 +1802,22 @@ impl Heap {
                 type_id: actual,
                 element_type,
                 range,
+                length,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                self.collections.values(*range)
+                let values = self.collections.values(*range)?;
+                values.get(..*length).ok_or(HeapError::IndexOutOfBounds {
+                    index: *length,
+                    length: values.len(),
+                })
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
 
-    fn array_range(&self, value: RuntimeValue) -> Result<(GcRef, CollectionRange), HeapError> {
+    fn array_range(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<(GcRef, CollectionRange, usize), HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
@@ -1706,57 +1826,12 @@ impl Heap {
                 type_id: actual,
                 element_type,
                 range,
+                length,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                Ok((reference, *range))
+                Ok((reference, *range, *length))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
-    }
-
-    fn replace_array_range(
-        &mut self,
-        value: RuntimeValue,
-        new_length: usize,
-        copy: impl FnOnce(&mut [RuntimeValue], &[RuntimeValue]),
-    ) -> Result<(), HeapError> {
-        let (reference, old_range) = self.array_range(value)?;
-        let mut reservation = self.preflight_collection(new_length)?;
-        let new_range = reservation.range;
-        // Every surviving element is copied out of the old range exactly once
-        // per replacement; this is the WP49 relocation-copy accounting input.
-        self.counters.collection_relocation_bytes =
-            self.counters.collection_relocation_bytes.saturating_add(
-                (old_range.length.min(new_length) * std::mem::size_of::<RuntimeValue>()) as u64,
-            );
-        let old_start = old_range.start;
-        let old_end = old_range.end();
-        let new_start = new_range.start;
-        let new_end = new_range.end();
-        if new_length != 0 {
-            if old_range.length == 0 {
-                copy(&mut self.collections.values[new_start..new_end], &[]);
-            } else if new_end <= old_start || old_end <= new_start {
-                let (destination, source) = if new_end <= old_start {
-                    let (left, right) = self.collections.values.split_at_mut(old_start);
-                    (&mut left[new_start..new_end], &right[..old_range.length])
-                } else {
-                    let (left, right) = self.collections.values.split_at_mut(new_start);
-                    (&mut right[..new_length], &left[old_start..old_end])
-                };
-                copy(destination, source);
-            } else {
-                self.release_collection_reservation(&mut reservation);
-                return Err(HeapError::CapacityExhausted);
-            }
-        }
-        reservation.written = new_length;
-        Self::complete_collection_reservation(&mut reservation)?;
-        match self.resolve_mut(reference)? {
-            Object::Array { range, .. } => *range = new_range,
-            _ => return Err(HeapError::InvalidReference(reference)),
-        }
-        self.collections.release(old_range);
-        Ok(())
     }
 
     pub fn allocate_buffer(
@@ -2434,7 +2509,18 @@ impl Heap {
             marked += 1;
             let object = slot.object.as_ref().expect("validated live object");
             let references = match object {
-                Object::Array { range, .. } | Object::Buffer { range, .. } => self
+                // Only the live prefix of an array participates in marking;
+                // vacated capacity slots are cleared to Unit on shrink.
+                Object::Array { range, length, .. } => {
+                    let live = *length;
+                    self.collections
+                        .values(*range)?
+                        .iter()
+                        .take(live)
+                        .filter_map(|value| value_reference(*value))
+                        .collect()
+                }
+                Object::Buffer { range, .. } => self
                     .collections
                     .values(*range)?
                     .iter()
@@ -2780,11 +2866,10 @@ mod tests {
         assert_eq!(counters.string_copy_bytes, 5);
         assert_eq!(counters.collection_storage_allocations, 1);
         assert_eq!(counters.object_allocations, 2);
-        // The first push copies zero surviving elements, the second copies one.
-        assert_eq!(
-            counters.collection_relocation_bytes,
-            std::mem::size_of::<RuntimeValue>() as u64
-        );
+        // WP49 amortized growth: the first push grows an empty extent
+        // (zero live elements copied) and the second lands in spare
+        // capacity, so no relocation bytes accrue at all.
+        assert_eq!(counters.collection_relocation_bytes, 0);
 
         // Counters are monotonic work totals: rollback keeps them.
         heap.restore_checkpoint(checkpoint);
