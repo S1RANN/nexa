@@ -398,6 +398,7 @@ module.exports = grammar({
       choice(
         $.new_expression,
         $.struct_literal,
+        $.array_literal,
         $.tuple_expression,
         $.parenthesized_expression,
         $.path_expression,
@@ -407,6 +408,9 @@ module.exports = grammar({
         $.rune_literal,
         $.string_literal,
       ),
+
+    array_literal: ($) =>
+      seq("[", optional(commaSep1($.expression)), optional(","), "]"),
 
     new_expression: ($) =>
       prec(
