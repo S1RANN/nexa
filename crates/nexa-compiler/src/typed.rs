@@ -34,7 +34,9 @@ use nexa_diagnostics::SourceIdentity;
 #[derive(Clone, Debug)]
 struct TypedFunctionPlan<'a> {
     definition: &'a Definition,
-    function: &'a TypedFunctionIr,
+    /// Borrowed straight from the analyzer snapshot when no Typed IR pass
+    /// rewrote the body, owned otherwise (M5 WP37).
+    function: std::borrow::Cow<'a, TypedFunctionIr>,
     index: u32,
 }
 
@@ -710,6 +712,17 @@ fn compile_typed_package_with_profile(
                     let definition = package
                         .definition(declaration.definition)
                         .expect("TypedPackageIr validates declaration IDs");
+                    // M5 WP37/WP38: optimization passes run on an owned copy
+                    // immediately before lowering; analyzer snapshots and
+                    // their fingerprints stay untouched.
+                    let mut optimized = function.clone();
+                    let reports = nexa_analysis::passes::PassManager::standard()
+                        .optimize_function(&mut optimized);
+                    let function = if reports.iter().all(|report| report.rewrites == 0) {
+                        std::borrow::Cow::Borrowed(function)
+                    } else {
+                        std::borrow::Cow::Owned(optimized)
+                    };
                     function_plans.push(TypedFunctionPlan {
                         definition,
                         function,
@@ -767,7 +780,7 @@ fn compile_typed_package_with_profile(
     };
     for plan in &function_plans {
         collect_block_codegen_inputs(&plan.function.body, &mut codegen_inputs);
-        collect_type_strings(package, plan.function, &mut codegen_inputs.strings);
+        collect_type_strings(package, plan.function.as_ref(), &mut codegen_inputs.strings);
     }
     for expression in constants.values() {
         collect_expression_codegen_inputs(expression, &mut codegen_inputs);
@@ -794,7 +807,7 @@ fn compile_typed_package_with_profile(
     let mut activation_entry = None;
     for plan in &function_plans {
         let function_span = source_span(&plan.definition.span, &files)?;
-        let signature = typed_signature(package, plan.function, function_span)?;
+        let signature = typed_signature(package, plan.function.as_ref(), function_span)?;
         let mut emitter = FunctionEmitter::new(
             package,
             &function_indices,
@@ -804,7 +817,7 @@ fn compile_typed_package_with_profile(
             &constants,
             &files,
             &string_indices,
-            plan.function,
+            plan.function.as_ref(),
             function_span,
         )?;
         emitter.emit_block(&plan.function.body)?;
@@ -2113,7 +2126,7 @@ fn valid_standalone_main_plan<'a>(
         plan.definition.package_id == *package.package_id()
             && plan.definition.module.as_str() == entry_module
             && plan.definition.name == "main"
-            && invalid_standalone_main_signature(package, plan.function).is_none()
+            && invalid_standalone_main_signature(package, plan.function.as_ref()).is_none()
     })
 }
 
@@ -7199,7 +7212,7 @@ fn emit_typed_exports(
                 .then(|| lower_type(package, &export.result, span))
                 .transpose()?,
         };
-        if analyzed_signature != typed_signature(package, plan.function, span)?
+        if analyzed_signature != typed_signature(package, plan.function.as_ref(), span)?
             || export.effect != plan.function.effect
         {
             return Err(CompileError::type_mismatch(None, None, span));

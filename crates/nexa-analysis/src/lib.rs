@@ -17,6 +17,7 @@ mod loader;
 mod lockfile;
 mod manifest;
 mod options;
+pub mod passes;
 mod query;
 mod repl;
 mod snippet;
