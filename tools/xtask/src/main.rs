@@ -2417,7 +2417,7 @@ fn test_binding() -> Result<(), DynError> {
         "-p",
         "nexa-cli",
         "--",
-        "idl",
+        "nidl",
         "check",
         "examples/combat-runtime/combat_api.nidl",
     ])?;
