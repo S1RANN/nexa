@@ -232,6 +232,9 @@ pub struct RealmConfig {
     pub runtime_limits: RuntimeLimits,
     pub max_modules: u32,
     pub max_heap_objects: u32,
+    /// G6: ceiling over live out-of-slot payload bytes (`GC_V1` heap
+    /// accounting); `u64::MAX` disables the byte limit.
+    pub max_heap_bytes: u64,
     pub max_string_bytes: usize,
     pub max_collection_elements: usize,
     pub max_collection_ranges: usize,
@@ -249,6 +252,7 @@ impl Default for RealmConfig {
             runtime_limits: RuntimeLimits::default(),
             max_modules: 16,
             max_heap_objects: 4_096,
+            max_heap_bytes: u64::MAX,
             max_string_bytes: 1024 * 1024,
             max_collection_elements: 65_536,
             max_collection_ranges: 4_097,
@@ -1185,6 +1189,7 @@ impl RealmRuntime {
             config.max_collection_ranges,
         );
         heap.set_failure_injector(failure_injector.clone());
+        heap.set_max_heap_bytes(config.max_heap_bytes);
         Self {
             realm_id: config.realm_id,
             modules: SlotPool::with_capacity_limit(config.realm_id, config.max_modules),

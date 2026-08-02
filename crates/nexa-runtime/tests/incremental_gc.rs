@@ -497,3 +497,110 @@ fn zero_object_budget_is_a_no_op() {
     assert_eq!(report, nexa_runtime::IncrementalGcReport::default());
     assert_eq!(heap.gc_phase(), GcPhase::Idle);
 }
+
+/// G6 gate: the live payload gauge tracks the byte inspection through
+/// allocation and collection. (The debug drift assertion inside every
+/// full collection additionally pins the gauge across the whole suite.)
+#[test]
+fn live_payload_gauge_matches_the_inspection_across_the_lifecycle() {
+    let mut heap = Heap::new(64);
+    assert_eq!(heap.live_payload_bytes(), 0);
+    build_byte_graph(&mut heap);
+    let inspection = heap.byte_inspection();
+    assert_eq!(
+        heap.live_payload_bytes(),
+        inspection.string_bytes
+            + inspection.array_bytes
+            + inspection.buffer_bytes
+            + inspection.map_bytes,
+        "the gauge equals the inspected out-of-slot payload"
+    );
+    heap.collect(&GcRoots::default()).expect("full collection");
+    assert_eq!(
+        heap.live_payload_bytes(),
+        0,
+        "reclaiming every object empties the gauge"
+    );
+}
+
+/// G6 gate: `max_heap_bytes` refuses growth past the ceiling at the
+/// allocation boundary with `CapacityExhausted`, and collection restores
+/// headroom.
+#[test]
+fn heap_byte_ceiling_refuses_growth_until_collection_frees_it() {
+    let mut heap = Heap::new(16);
+    heap.set_max_heap_bytes(32);
+    heap.allocate_string("0123456789abcdef")
+        .expect("a 16-byte string fits under the 32-byte ceiling");
+    let refused = heap.allocate_string("0123456789abcdef0123456789abcdef");
+    assert_eq!(
+        refused.unwrap_err(),
+        nexa_runtime::HeapError::CapacityExhausted,
+        "16 + 32 bytes exceeds the ceiling"
+    );
+    heap.collect(&GcRoots::default()).expect("full collection");
+    heap.allocate_string("0123456789abcdef0123456789abcdef")
+        .expect("the reclaimed heap has headroom again");
+}
+
+/// G6 gate: amortized array growth respects the byte ceiling - the
+/// conservative regrow admission (old extent still held) refuses the
+/// relocation, existing contents stay intact, and the push reports
+/// `CapacityExhausted`.
+#[test]
+fn array_growth_stops_at_the_byte_ceiling_without_corruption() {
+    let mut heap = Heap::new(64);
+    heap.set_max_heap_bytes(1_024);
+    let element = nexa_bytecode::ValueType::I32;
+    let array = heap
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("empty array");
+    let mut accepted = 0_i32;
+    let mut refused = None;
+    for index in 0..100 {
+        match heap.array_push(array, RuntimeValue::I32(index)) {
+            Ok(()) => accepted += 1,
+            Err(error) => {
+                refused = Some(error);
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        refused,
+        Some(nexa_runtime::HeapError::CapacityExhausted),
+        "growth must hit the byte ceiling before 100 pushes"
+    );
+    let length = heap.array_len(array).expect("array stays valid");
+    assert_eq!(
+        i32::try_from(length).expect("bounded"),
+        accepted,
+        "every accepted push is visible, the refused one changed nothing"
+    );
+    let values = heap.array_values(array).expect("contents stay readable");
+    assert_eq!(values[0], RuntimeValue::I32(0));
+    assert_eq!(
+        values[usize::try_from(accepted - 1).expect("bounded")],
+        RuntimeValue::I32(accepted - 1)
+    );
+}
+
+/// G6 gate: the realm forwards `RealmConfig::max_heap_bytes` to the heap.
+#[test]
+fn realm_config_wires_the_heap_byte_ceiling() {
+    use nexa_runtime::{Object, RealmConfig, RealmRuntime};
+    let config = RealmConfig {
+        max_heap_bytes: 8,
+        ..RealmConfig::default()
+    };
+    let mut realm = RealmRuntime::isolated(config);
+    let refused = realm.allocate(Object::String(String::from("longer-than-eight-bytes")));
+    assert!(
+        refused.is_err(),
+        "a realm-configured byte ceiling refuses oversized payloads"
+    );
+    let mut unlimited = RealmRuntime::isolated(RealmConfig::default());
+    unlimited
+        .allocate(Object::String(String::from("longer-than-eight-bytes")))
+        .expect("the default configuration stays unlimited");
+}
