@@ -557,11 +557,85 @@ pub enum GcPhase {
     Sweep,
 }
 
-/// Per-step work budget for one incremental collection step (G1 counts
-/// slot-shaped work units; byte and duration budgets are later G work).
+/// Per-step work budget for one incremental collection step, in the
+/// `GC_V1` shape: object-shaped work units, payload bytes processed, and a
+/// wall-clock ceiling. Each step performs at least one work unit so a
+/// degenerate budget can never stall the cycle; the overshoot is the
+/// "budget overrun" the spec allows the runtime to report.
+///
+/// `max_duration` is deliberately outside the deterministic fuel domain:
+/// GC pauses are host-side scheduling, never program-observable cost.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GcBudget {
-    pub max_steps: usize,
+    /// Slot-shaped work units: gray-queue pops during Mark plus slots
+    /// visited during Sweep. Zero returns an empty report unchanged.
+    pub max_objects: usize,
+    /// Payload bytes processed: traced payload during Mark, reclaimed
+    /// payload during Sweep. Inline-only objects cost zero bytes, so this
+    /// axis binds only when byte-carrying objects flow through the step.
+    pub max_bytes: u64,
+    /// Wall-clock ceiling for the step; `Duration::MAX` disables the
+    /// clock entirely (no time syscalls on the deterministic test path).
+    pub max_duration: std::time::Duration,
+}
+
+impl GcBudget {
+    /// Object-count-only budget: bytes and duration unlimited.
+    #[must_use]
+    pub const fn objects(max_objects: usize) -> Self {
+        Self {
+            max_objects,
+            max_bytes: u64::MAX,
+            max_duration: std::time::Duration::MAX,
+        }
+    }
+}
+
+/// Live tracker for one incremental step (G5). The object axis is a strict
+/// pre-check (G1 semantics); bytes and deadline are charged after each
+/// completed unit with a first-unit guarantee, so a degenerate budget
+/// overruns by at most one unit instead of stalling the cycle.
+struct StepBudget {
+    objects: usize,
+    bytes: u64,
+    deadline: Option<std::time::Instant>,
+    spent: bool,
+}
+
+impl StepBudget {
+    fn new(budget: GcBudget) -> Self {
+        Self {
+            objects: budget.max_objects,
+            bytes: budget.max_bytes,
+            // `Duration::MAX` disables the clock; adding it to `now` would
+            // overflow, and the deterministic path must not read time.
+            deadline: (budget.max_duration != std::time::Duration::MAX)
+                .then(|| std::time::Instant::now() + budget.max_duration),
+            spent: false,
+        }
+    }
+
+    /// Whether another work unit may start.
+    fn available(&self) -> bool {
+        if self.objects == 0 {
+            return false;
+        }
+        if !self.spent {
+            return true;
+        }
+        if self.bytes == 0 {
+            return false;
+        }
+        self.deadline
+            .is_none_or(|deadline| std::time::Instant::now() < deadline)
+    }
+
+    /// Charges one completed work unit and its payload bytes.
+    fn charge(&mut self, payload_bytes: u64) {
+        self.objects = self.objects.saturating_sub(1);
+        self.bytes = self.bytes.saturating_sub(payload_bytes);
+        self.spent = true;
+    }
 }
 
 /// Telemetry for one incremental step: work actually performed, the phase
@@ -2687,8 +2761,8 @@ impl Heap {
                 marked += 1;
             }
         }
-        let mut steps = usize::MAX;
-        marked += self.mark_step(queue, &mut steps)?;
+        let mut budget = StepBudget::new(GcBudget::objects(usize::MAX));
+        marked += self.mark_step(queue, &mut budget)?;
         Ok(marked)
     }
 
@@ -2825,10 +2899,10 @@ impl Heap {
         budget: GcBudget,
     ) -> Result<IncrementalGcReport, HeapError> {
         let mut report = IncrementalGcReport::default();
-        let mut steps = budget.max_steps;
-        if steps == 0 {
+        if budget.max_objects == 0 {
             return Ok(report);
         }
+        let mut budget = StepBudget::new(budget);
         // G3 bound: marks land at enqueue time, so every object enters the
         // gray queue at most once per cycle and the preallocated capacity
         // is never outgrown - Mark performs zero system allocations.
@@ -2851,28 +2925,30 @@ impl Heap {
                     report.roots_seeded += 1;
                 }
             }
-            let grayed = self.mark_step(&mut queue, &mut steps);
+            let grayed = self.mark_step(&mut queue, &mut budget);
             self.mark_scratch = queue;
             let grayed = grayed?;
             self.gc_marked += grayed + report.roots_seeded;
             report.objects_marked = grayed + report.roots_seeded;
-            if self.mark_scratch.is_empty() && steps > 0 {
+            // Conservative transition: only a step with leftover budget can
+            // prove the freshly seeded queue truly drained.
+            if self.mark_scratch.is_empty() && budget.available() {
                 self.gc_phase = GcPhase::Sweep;
                 self.gc_sweep_cursor = 0;
             }
         }
         if self.gc_phase == GcPhase::Sweep {
-            while steps > 0 && self.gc_sweep_cursor < self.slots.len() {
+            while budget.available() && self.gc_sweep_cursor < self.slots.len() {
                 let index = self.gc_sweep_cursor;
                 self.gc_sweep_cursor += 1;
-                steps -= 1;
                 report.slots_swept += 1;
                 let slot = &mut self.slots[index];
+                let mut payload = 0;
                 if slot.object.is_some() && !slot.marked {
                     if let Some(object) = slot.object.take() {
                         // G4: measured before the drop, mirroring the full
                         // collection path byte for byte.
-                        let payload = object.payload_bytes();
+                        payload = object.payload_bytes();
                         report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
                         self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
                         if let Object::Array { range, .. } | Object::Buffer { range, .. } = object {
@@ -2886,6 +2962,7 @@ impl Heap {
                     }
                     self.gc_reclaimed += 1;
                 }
+                budget.charge(payload);
             }
             if self.gc_sweep_cursor >= self.slots.len() {
                 report.completed = Some(CollectionStats {
@@ -2908,22 +2985,22 @@ impl Heap {
         Ok(report)
     }
 
-    /// Drains up to `steps` gray references; every pop was already marked
-    /// at enqueue time, so this only scans children, streaming them back
-    /// through [`Self::enqueue_gray`] with no temporary allocation (WP73)
-    /// and no queue growth past its preallocated bound (G3). Returns the
-    /// number of newly grayed children.
+    /// Drains gray references within the step budget; every pop was already
+    /// marked at enqueue time, so this only scans children, streaming them
+    /// back through [`Self::enqueue_gray`] with no temporary allocation
+    /// (WP73) and no queue growth past its preallocated bound (G3). Each
+    /// pop charges one work unit plus the popped object's payload bytes
+    /// (G5). Returns the number of newly grayed children.
     fn mark_step(
         &mut self,
         queue: &mut VecDeque<GcRef>,
-        steps: &mut usize,
+        budget: &mut StepBudget,
     ) -> Result<usize, HeapError> {
         let mut grayed = 0;
-        while *steps > 0 {
+        while budget.available() {
             let Some(reference) = queue.pop_front() else {
                 break;
             };
-            *steps -= 1;
             let slot = self
                 .slots
                 .get(reference.index as usize)
@@ -2934,6 +3011,7 @@ impl Heap {
                 self.slots[reference.index as usize].marked,
                 "gray queue entries are marked at enqueue time"
             );
+            let payload = slot.payload_bytes();
             match slot {
                 Object::Array { range, length, .. } => {
                     let range = *range;
@@ -2978,6 +3056,7 @@ impl Heap {
                     self.slots[index].object = Some(taken);
                 }
             }
+            budget.charge(payload);
         }
         Ok(grayed)
     }

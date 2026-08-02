@@ -22,7 +22,7 @@ fn reference_of(value: RuntimeValue) -> nexa_runtime::GcRef {
 fn run_cycle(heap: &mut Heap, roots: &GcRoots, budget: usize) -> nexa_runtime::CollectionStats {
     for _ in 0..10_000 {
         let report = heap
-            .collect_incremental(roots, GcBudget { max_steps: budget })
+            .collect_incremental(roots, GcBudget::objects(budget))
             .expect("incremental step");
         if let Some(stats) = report.completed {
             assert_eq!(heap.gc_phase(), GcPhase::Idle);
@@ -113,7 +113,7 @@ fn insertion_barrier_keeps_a_hidden_pointer_alive_during_mark() {
     // Step once with the smallest budget: the cycle enters Mark and only
     // the root is processed; `hidden` is still white.
     let report = heap
-        .collect_incremental(&roots, GcBudget { max_steps: 1 })
+        .collect_incremental(&roots, GcBudget::objects(1))
         .expect("first mark step");
     assert_eq!(heap.gc_phase(), GcPhase::Mark);
     assert!(report.completed.is_none());
@@ -143,7 +143,7 @@ fn objects_born_during_mark_and_sweep_survive_the_active_cycle() {
         running_frames: vec![root_reference],
         ..GcRoots::default()
     };
-    heap.collect_incremental(&roots, GcBudget { max_steps: 1 })
+    heap.collect_incremental(&roots, GcBudget::objects(1))
         .expect("enter mark");
     assert_eq!(heap.gc_phase(), GcPhase::Mark);
     // Born during Mark, referencing a pre-existing white child: the
@@ -158,7 +158,7 @@ fn objects_born_during_mark_and_sweep_survive_the_active_cycle() {
     let mut born_sweep_reference = None;
     for _ in 0..10_000 {
         let report = heap
-            .collect_incremental(&roots, GcBudget { max_steps: 1 })
+            .collect_incremental(&roots, GcBudget::objects(1))
             .expect("step");
         if heap.gc_phase() == GcPhase::Sweep && born_sweep_reference.is_none() {
             let born_sweep = heap
@@ -199,7 +199,7 @@ fn full_collection_cancels_an_active_incremental_cycle() {
         running_frames: vec![root_reference],
         ..GcRoots::default()
     };
-    heap.collect_incremental(&roots, GcBudget { max_steps: 1 })
+    heap.collect_incremental(&roots, GcBudget::objects(1))
         .expect("enter mark");
     assert_eq!(heap.gc_phase(), GcPhase::Mark);
     let stats = heap.collect(&roots).expect("full collection mid-cycle");
@@ -262,7 +262,7 @@ fn water_mark_trigger_sustains_one_hundred_thousand_short_lived_objects() {
     };
     let mut realm = RealmRuntime::isolated(config);
     let node = class_type();
-    let budget = GcBudget { max_steps: 32 };
+    let budget = GcBudget::objects(32);
     let mut triggered_steps = 0_u64;
     let mut completed_cycles = 0_u64;
     for index in 0..100_000_u32 {
@@ -368,7 +368,7 @@ fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
     let mut completed = false;
     for _ in 0..10_000 {
         let report = incremental
-            .collect_incremental(&roots, GcBudget { max_steps: 1 })
+            .collect_incremental(&roots, GcBudget::objects(1))
             .expect("incremental step");
         step_bytes += report.bytes_reclaimed;
         if report.completed.is_some() {
@@ -386,4 +386,114 @@ fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
         step_bytes, expected,
         "per-step reports sum to the cycle total"
     );
+}
+
+/// G5 gate: the byte axis slices sweeps at object-payload granularity -
+/// with `max_bytes: 1` no step reclaims more than one byte-carrying
+/// object - while the cycle still reclaims exactly what the unbudgeted
+/// collector reclaims.
+#[test]
+fn byte_budget_slices_the_sweep_without_changing_the_outcome() {
+    let roots = GcRoots::default();
+    let mut reference = Heap::new(64);
+    build_byte_graph(&mut reference);
+    let expected_bytes = {
+        let inspection = reference.byte_inspection();
+        inspection.string_bytes
+            + inspection.array_bytes
+            + inspection.buffer_bytes
+            + inspection.map_bytes
+    };
+    let expected_stats = reference.collect(&roots).expect("reference collection");
+
+    let mut budgeted = Heap::new(64);
+    build_byte_graph(&mut budgeted);
+    let budget = GcBudget {
+        max_objects: usize::MAX,
+        max_bytes: 1,
+        max_duration: std::time::Duration::MAX,
+    };
+    let mut total_bytes = 0_u64;
+    let mut byte_carrying_steps = 0_u32;
+    let mut completed = None;
+    for _ in 0..10_000 {
+        let report = budgeted
+            .collect_incremental(&roots, budget)
+            .expect("byte-budgeted step");
+        total_bytes += report.bytes_reclaimed;
+        if report.bytes_reclaimed > 0 {
+            byte_carrying_steps += 1;
+            assert!(
+                report.bytes_reclaimed < expected_bytes,
+                "a one-byte budget must split the byte-carrying reclamations"
+            );
+        }
+        if let Some(stats) = report.completed {
+            completed = Some(stats);
+            break;
+        }
+    }
+    let stats = completed.expect("byte-budgeted cycle converges");
+    assert_eq!(stats.reclaimed, expected_stats.reclaimed);
+    assert_eq!(total_bytes, expected_bytes);
+    assert!(
+        byte_carrying_steps >= 3,
+        "string, array extent, and map storage land in separate steps"
+    );
+}
+
+/// G5 gate: a zero wall-clock budget still makes progress - the
+/// first-unit guarantee turns it into single-unit steps - and the cycle
+/// converges to the reference outcome. `Instant::now() < now` is false on
+/// any clock, so this is deterministic despite reading time.
+#[test]
+fn zero_duration_budget_degrades_to_single_unit_steps() {
+    let roots = GcRoots::default();
+    let mut reference = Heap::new(64);
+    build_byte_graph(&mut reference);
+    let expected_stats = reference.collect(&roots).expect("reference collection");
+    let expected_bytes = reference.last_cycle_bytes_reclaimed();
+
+    let mut budgeted = Heap::new(64);
+    build_byte_graph(&mut budgeted);
+    let budget = GcBudget {
+        max_objects: usize::MAX,
+        max_bytes: u64::MAX,
+        max_duration: std::time::Duration::ZERO,
+    };
+    let mut completed = None;
+    let mut steps_taken = 0_u32;
+    for _ in 0..10_000 {
+        let report = budgeted
+            .collect_incremental(&roots, budget)
+            .expect("zero-duration step");
+        steps_taken += 1;
+        assert!(
+            report.objects_marked + report.slots_swept <= 1,
+            "an expired deadline admits exactly the guaranteed unit"
+        );
+        if let Some(stats) = report.completed {
+            completed = Some(stats);
+            break;
+        }
+    }
+    let stats = completed.expect("zero-duration cycle converges");
+    assert_eq!(stats.reclaimed, expected_stats.reclaimed);
+    assert_eq!(budgeted.last_cycle_bytes_reclaimed(), expected_bytes);
+    assert!(
+        steps_taken >= u32::try_from(stats.reclaimed).expect("bounded"),
+        "single-unit steps need at least one call per swept slot"
+    );
+}
+
+/// A zero object budget performs no work and leaves the phase untouched.
+#[test]
+fn zero_object_budget_is_a_no_op() {
+    let mut heap = Heap::new(16);
+    build_byte_graph(&mut heap);
+    let report = heap
+        .collect_incremental(&GcRoots::default(), GcBudget::objects(0))
+        .expect("no-op step");
+    assert_eq!(report, nexa_runtime::IncrementalGcReport::default());
+    assert_eq!(heap.gc_phase(), GcPhase::Idle);
 }

@@ -852,7 +852,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |()| {
             let mut realm = gc_realm.borrow_mut();
             let report = realm
-                .collect_garbage_incremental(GcBudget { max_steps: 128 })
+                .collect_garbage_incremental(GcBudget::objects(128))
                 .expect("budgeted incremental step");
             let reclaimed = report.completed.map_or(0, |stats| {
                 u64::try_from(stats.reclaimed).unwrap_or(u64::MAX)
