@@ -684,6 +684,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
+    // J corpus: eight combat rounds over 128 units - array-heavy reads,
+    // in-place writes, and branchy damage clamping per tick.
+    cases.push(bench(
+        "product_combat_tick",
+        "product",
+        samples,
+        || Heap::new_with_limits(1_024, 65_536, 512),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                12,
+                &[],
+                &mut heap,
+                4_000_000,
+                &mut continuation_pool,
+            )
+        },
+    ));
+    // J corpus: 64x64 pure-computation grid scoring - no heap objects at
+    // all, the closest shape to a JIT-favorable inner loop.
+    cases.push(bench(
+        "product_grid_score",
+        "product",
+        samples,
+        || Heap::new_with_limits(1_024, 65_536, 512),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                13,
+                &[],
+                &mut heap,
+                4_000_000,
+                &mut continuation_pool,
+            )
+        },
+    ));
     cases.push(bench(
         "product_standalone_pipeline",
         "product",
@@ -1225,6 +1263,57 @@ fn product_data_sweep() -> i32 {
         cursor = cursor + 1;
     }
     return total;
+}
+fn product_combat_tick() -> i32 {
+    let attack: Array<i32> = Array::new();
+    let defense: Array<i32> = Array::new();
+    let health: Array<i32> = Array::new();
+    let mut index: i32 = 0;
+    while index < 128 {
+        attack.push(10 + index);
+        defense.push(3 + index / 2);
+        health.push(100);
+        index = index + 1;
+    }
+    let mut round: i32 = 0;
+    let mut defeated: i32 = 0;
+    while round < 8 {
+        let mut cursor: i32 = 0;
+        while cursor < 128 {
+            let raw: i32 = attack.get(cursor) - defense.get(127 - cursor);
+            let mut damage: i32 = raw;
+            if raw < 1 {
+                damage = 1;
+            }
+            let remaining: i32 = health.get(cursor) - damage;
+            health.set(cursor, remaining);
+            if remaining < 1 {
+                defeated = defeated + 1;
+            }
+            cursor = cursor + 1;
+        }
+        round = round + 1;
+    }
+    return defeated + health.get(0);
+}
+fn product_grid_score() -> i32 {
+    let mut score: i32 = 0;
+    let mut y: i32 = 0;
+    while y < 64 {
+        let mut x: i32 = 0;
+        while x < 64 {
+            let dx: i32 = x - 32;
+            let dy: i32 = y - 32;
+            let mut cell: i32 = dx * dx + dy * dy;
+            if cell > 1024 {
+                cell = 1024;
+            }
+            score = score + cell / 16;
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+    return score;
 }
 "#;
 
