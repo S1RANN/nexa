@@ -670,6 +670,30 @@ impl CheckedInterpreter {
         )
     }
 
+    /// F3: heap poll through predecoded rows. The rows must originate from
+    /// `ExecutableModule::build` over the same verified module and cost
+    /// table; fuel accounting is bit-identical to [`Self::poll_with_heap`].
+    pub fn poll_with_heap_and_executable(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            None,
+            Some(heap),
+            Some(executable),
+        )
+    }
+
     pub fn poll_with_host_and_heap(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,
@@ -780,6 +804,34 @@ impl CheckedInterpreter {
             FuelState::new(fuel, 0, u64::MAX),
             &OpcodeCostTable::default(),
             heap,
+        )
+    }
+
+    /// F3: one-shot run through predecoded rows (see
+    /// [`Self::poll_with_heap_and_executable`] for the parity contract).
+    pub fn run_with_heap_and_executable(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: u64,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        let limits = FrameLimits::default();
+        let continuation = Self::start(
+            module,
+            function,
+            arguments,
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )?;
+        Self::poll_with_heap_and_executable(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            &OpcodeCostTable::default(),
+            heap,
+            executable,
         )
     }
 

@@ -14,8 +14,8 @@ use nexa_migrate::{
     run_migrate_check,
 };
 use nexa_runtime::{
-    CheckedInterpreter, ContinuationReservation, ExecutionCharge, FrameLimits, FuelState, Heap,
-    HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
+    CheckedInterpreter, ContinuationReservation, ExecutableModule, ExecutionCharge, FrameLimits,
+    FuelState, Heap, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
     InterpreterOutcome, OpcodeCostTable, PendingHostRequest, RealmConfig, RealmRuntime,
     ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue,
     StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
@@ -441,6 +441,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
 
     let language = nexa_compiler::compile(LANGUAGE_SOURCE)?;
+    // Stage F: rows are built once at load, exactly like realm admission.
+    let language_rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
     let bytecode_hash = blake3::hash(&language.module().encode())
         .to_hex()
         .to_string();
@@ -451,7 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 0, &[RuntimeValue::I32(41)], &mut heap, 256),
+        |mut heap| run_returned(&language, &language_rows, 0, &[RuntimeValue::I32(41)], &mut heap, 256),
     ));
     cases.push(bench(
         "result_ok_err",
@@ -459,8 +461,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            let first = run_returned(&language, 1, &[RuntimeValue::I32(7)], &mut heap, 256);
-            let second = run_returned(&language, 2, &[], &mut heap, 256);
+            let first = run_returned(&language, &language_rows, 1, &[RuntimeValue::I32(7)], &mut heap, 256);
+            let second = run_returned(&language, &language_rows, 2, &[], &mut heap, 256);
             combine(first, second, heap.live_len())
         },
     ));
@@ -484,42 +486,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 4, &[], &mut heap, 256),
+        |mut heap| run_returned(&language, &language_rows, 4, &[], &mut heap, 256),
     ));
     cases.push(bench(
         "struct_construction",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 5, &[], &mut heap, 256),
+        |mut heap| run_returned(&language, &language_rows, 5, &[], &mut heap, 256),
     ));
     cases.push(bench(
         "class_allocation",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 6, &[], &mut heap, 256),
+        |mut heap| run_returned(&language, &language_rows, 6, &[], &mut heap, 256),
     ));
     cases.push(bench(
         "enum_construction_match",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 7, &[], &mut heap, 256),
+        |mut heap| run_returned(&language, &language_rows, 7, &[], &mut heap, 256),
     ));
     cases.push(bench(
         "array_operations",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 8, &[], &mut heap, 512),
+        |mut heap| run_returned(&language, &language_rows, 8, &[], &mut heap, 512),
     ));
     cases.push(bench(
         "map_operations",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, 9, &[], &mut heap, 512),
+        |mut heap| run_returned(&language, &language_rows, 9, &[], &mut heap, 512),
     ));
     let buffer_type = language.module().buffer_types[0];
     cases.push(bench(
@@ -553,7 +555,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (heap, destination, source)
         },
         |(mut heap, destination, source)| {
-            run_returned(&language, 10, &[destination, source], &mut heap, 512)
+            run_returned(&language, &language_rows, 10, &[destination, source], &mut heap, 512)
         },
     ));
     cases.push(bench(
@@ -561,7 +563,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "product",
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
-        |mut heap| run_returned(&language, 11, &[], &mut heap, 2_000_000),
+        |mut heap| run_returned(&language, &language_rows, 11, &[], &mut heap, 2_000_000),
     ));
     cases.push(bench(
         "product_standalone_pipeline",
@@ -569,12 +571,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || (),
         |()| {
-            // Full frontend + verifier + execution per sample: the cost shape
-            // of a standalone script or REPL cell.
+            // Full frontend + verifier + predecode + execution per sample:
+            // the cost shape of a standalone script or REPL cell.
             let verified =
                 nexa_compiler::compile(LANGUAGE_SOURCE).expect("benchmark language compiles");
+            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+                .expect("benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
-            run_returned(&verified, 0, &[RuntimeValue::I32(41)], &mut heap, 256)
+            run_returned(&verified, &rows, 0, &[RuntimeValue::I32(41)], &mut heap, 256)
         },
     ));
 
@@ -1004,13 +1008,19 @@ fn product_data_sweep() -> i32 {
 
 fn run_returned(
     module: &VerifiedModule,
+    executable: &ExecutableModule,
     function: u32,
     arguments: &[RuntimeValue],
     heap: &mut Heap,
     fuel: u64,
 ) -> Observation {
-    let outcome = CheckedInterpreter::run_with_heap(module, function, arguments, fuel, heap)
-        .expect("verified benchmark function");
+    // Stage F: the measurement authority executes the predecoded-row form,
+    // which is what product realms run; fuel parity with the portable
+    // interpreter is enforced by the executable_parity gate.
+    let outcome = CheckedInterpreter::run_with_heap_and_executable(
+        module, function, arguments, fuel, heap, executable,
+    )
+    .expect("verified benchmark function");
     let InterpreterOutcome::Returned { charge, value, .. } = outcome else {
         panic!("benchmark function did not return");
     };

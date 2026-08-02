@@ -410,6 +410,7 @@ fn main() -> Result<(), DynError> {
         "test-value-layout" => test_value_layout(),
         "test-ir-optimizations" => test_ir_optimizations(),
         "test-optimization-differential" => test_optimization_differential(),
+        "test-executable-parity" => test_executable_parity(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -518,6 +519,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_value_layout()?;
     test_ir_optimizations()?;
     test_optimization_differential()?;
+    test_executable_parity()?;
     cargo(&[
         "run",
         "--release",
@@ -1449,6 +1451,13 @@ fn test_optimization_differential() -> Result<(), DynError> {
         "--test",
         "optimization_differential",
     ])
+}
+
+/// M5 stage-F gate: portable versus predecoded-row interpreter over one
+/// artifact and cost table - results, traps, per-slice charges, suspend
+/// points, and fuel totals must match item by item.
+fn test_executable_parity() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-runtime", "--test", "executable_parity"])
 }
 
 #[allow(clippy::too_many_lines)]
