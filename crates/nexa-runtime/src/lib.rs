@@ -59,7 +59,8 @@ pub use frame::{
 };
 pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
-    CollectionStats, GcRef, GcRoots, Heap, HeapError, MapSetOutcome, Object, VmAllocationCounters,
+    CollectionStats, GcBudget, GcPhase, GcRef, GcRoots, Heap, HeapError, IncrementalGcReport,
+    MapSetOutcome, Object, VmAllocationCounters,
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,

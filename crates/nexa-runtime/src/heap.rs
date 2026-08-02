@@ -480,6 +480,32 @@ pub struct CollectionStats {
     pub live: usize,
 }
 
+/// Incremental cycle phase (G1): `Idle -> Mark -> Sweep -> Idle`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GcPhase {
+    Idle,
+    Mark,
+    Sweep,
+}
+
+/// Per-step work budget for one incremental collection step (G1 counts
+/// slot-shaped work units; byte and duration budgets are later G work).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcBudget {
+    pub max_steps: usize,
+}
+
+/// Telemetry for one incremental step: work actually performed, the phase
+/// after the step, and the whole-cycle stats when the cycle completed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IncrementalGcReport {
+    pub roots_seeded: usize,
+    pub objects_marked: usize,
+    pub slots_swept: usize,
+    pub barrier_shades: u64,
+    pub completed: Option<CollectionStats>,
+}
+
 /// Cumulative VM allocation and copy counters (M5 WP13).
 ///
 /// Counters are monotonic work totals, not live-state gauges: checkpoint
@@ -588,8 +614,17 @@ pub struct Heap {
     string_literal_cache: BTreeMap<String, GcRef>,
     /// WP74: reusable mark-phase work queue. Capacity converges to the
     /// high-water mark of prior collections instead of reallocating on
-    /// every `collect` call. Pure scratch space, never heap state.
+    /// every `collect` call. Pure scratch space, never heap state. During
+    /// an incremental cycle (G1) it holds the persistent gray set.
     mark_scratch: VecDeque<GcRef>,
+    /// G1 incremental cycle state: current phase, the sweep resume
+    /// cursor, objects marked so far this cycle, and insertion-barrier
+    /// shade count for telemetry.
+    gc_phase: GcPhase,
+    gc_sweep_cursor: usize,
+    gc_marked: usize,
+    gc_reclaimed: usize,
+    gc_barrier_shades: u64,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -659,6 +694,9 @@ impl Heap {
     }
 
     pub(crate) fn restore_checkpoint(&mut self, checkpoint: HeapCheckpoint) {
+        // The snapshot predates any in-flight incremental cycle state; the
+        // gray queue and sweep cursor would reference rolled-back slots.
+        self.reset_incremental_cycle();
         self.slots = checkpoint.slots;
         self.free = checkpoint.free;
         self.collections = checkpoint.collections;
@@ -690,6 +728,11 @@ impl Heap {
             counters: VmAllocationCounters::default(),
             string_literal_cache: BTreeMap::new(),
             mark_scratch: VecDeque::with_capacity(max_objects as usize),
+            gc_phase: GcPhase::Idle,
+            gc_sweep_cursor: 0,
+            gc_marked: 0,
+            gc_reclaimed: 0,
+            gc_barrier_shades: 0,
         }
     }
 
@@ -991,10 +1034,24 @@ impl Heap {
                     self.counters.enum_materializations.saturating_add(1);
             }
         }
+        // G1: objects allocated while a cycle is active are born marked so
+        // an in-flight sweep never reclaims them; during Mark their inline
+        // children are shaded because the newborn is already black. During
+        // Sweep every nameable child is necessarily marked, so no shading
+        // is needed. Array/Buffer extents shade through
+        // `commit_collection_value`.
+        let born_marked = self.gc_phase != GcPhase::Idle;
+        if self.gc_phase == GcPhase::Mark {
+            object.trace_references(&mut |child| {
+                self.mark_scratch.push_back(child);
+                self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+            });
+        }
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.object.is_none());
             slot.object = Some(object);
+            slot.marked = born_marked;
             let reference = GcRef {
                 index,
                 generation: slot.generation,
@@ -1008,7 +1065,7 @@ impl Heap {
         debug_assert!(index < self.max_objects);
         self.slots.push(ObjectSlot {
             generation: 0,
-            marked: false,
+            marked: born_marked,
             object: Some(object),
         });
         let reference = GcRef {
@@ -1071,6 +1128,9 @@ impl Heap {
             });
         }
         let index = reservation.range.start + reservation.written;
+        // G1 barrier: initial collection elements are published into an
+        // extent owned by a born-black object while marking runs.
+        self.shade_on_write(value);
         self.collections.values[index] = value;
         reservation.written += 1;
         Ok(())
@@ -1557,16 +1617,16 @@ impl Heap {
 
     /// Publishes a value into an already allocated GC object.
     ///
-    /// Collection is currently stop-the-world, so the barrier does not need a
-    /// remembered set. It still validates both sides before mutation: a
-    /// forged or stale child reference must never become reachable through a
-    /// live object, and future collector strategies have one publication
-    /// point to extend.
-    fn write_barrier(&self, owner: GcRef, replacement: RuntimeValue) -> Result<(), HeapError> {
+    /// Validates both sides before mutation: a forged or stale child
+    /// reference must never become reachable through a live object. While
+    /// an incremental mark phase is active (G1), the published child is
+    /// also shaded gray to preserve the tri-color invariant.
+    fn write_barrier(&mut self, owner: GcRef, replacement: RuntimeValue) -> Result<(), HeapError> {
         self.validate_reference(owner)?;
         if let Some(child) = value_reference(replacement) {
             self.validate_reference(child)?;
         }
+        self.shade_on_write(replacement);
         Ok(())
     }
 
@@ -1641,6 +1701,7 @@ impl Heap {
         if index >= length {
             return Err(HeapError::IndexOutOfBounds { index, length });
         }
+        self.shade_on_write(replacement);
         let values = self.collections.values_mut(range)?;
         values[index] = replacement;
         Ok(())
@@ -1652,6 +1713,7 @@ impl Heap {
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
         let (reference, range, current) = self.array_range(value)?;
+        self.shade_on_write(element);
         let length = current
             .checked_add(1)
             .ok_or(HeapError::CollectionTooLarge {
@@ -1693,6 +1755,7 @@ impl Heap {
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
         let (reference, range, current) = self.array_range(value)?;
+        self.shade_on_write(element);
         if index > current {
             return Err(HeapError::IndexOutOfBounds {
                 index,
@@ -1921,6 +1984,7 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
+        self.shade_on_write(replacement);
         let values = self.buffer_values_mut(value)?;
         let length = values.len();
         let slot = values
@@ -1983,6 +2047,14 @@ impl Heap {
             source_absolute..source_absolute + (source_end - source_start),
             destination_absolute,
         );
+        // G1 barrier: every reference just published into the destination
+        // extent is shaded; the gray queue tolerates duplicates.
+        if self.gc_phase == GcPhase::Mark {
+            for offset in 0..(source_end - source_start) {
+                let value = self.collections.values[destination_absolute + offset];
+                self.shade_on_write(value);
+            }
+        }
         debug_assert_eq!(destination_end - destination_start, length);
         Ok(())
     }
@@ -2174,6 +2246,10 @@ impl Heap {
         key: RuntimeValue,
         replacement: RuntimeValue,
     ) -> Result<MapSetOutcome, HeapError> {
+        // G1 barrier: shading before the outcome branches is conservative
+        // (a pending rehash publishes nothing yet) but always safe.
+        self.shade_on_write(key);
+        self.shade_on_write(replacement);
         // A retry resumes only the bounded rehash chunk. Looking up the key
         // again here would repeat an entire map scan on every retry and make
         // deterministic attempt-based fuel either free or overcharged.
@@ -2516,11 +2592,9 @@ impl Heap {
     }
 
     /// Mark phase (WP73/WP74): seeds the reusable queue with the validated
-    /// roots and drains it breadth-first. Child references stream straight
-    /// into the queue via `trace_references`, so no per-object temporary
-    /// `Vec` is materialized; each queued reference is validated when it is
-    /// popped, before its slot is touched, preserving the corruption
-    /// detection contract of the previous push-time validation.
+    /// roots and drains it breadth-first via [`Self::mark_step`]; child
+    /// references stream straight into the queue, so no per-object
+    /// temporary `Vec` is materialized.
     fn mark_reachable(
         &mut self,
         roots: &GcRoots,
@@ -2530,53 +2604,14 @@ impl Heap {
             self.validate_reference(root)?;
             queue.push_back(root);
         }
-        let mut marked = 0;
-        while let Some(reference) = queue.pop_front() {
-            let slot = self
-                .slots
-                .get_mut(reference.index as usize)
-                .filter(|slot| slot.generation == reference.generation && slot.object.is_some())
-                .ok_or(HeapError::InvalidReference(reference))?;
-            if slot.marked {
-                continue;
-            }
-            slot.marked = true;
-            marked += 1;
-            let object = slot.object.as_ref().expect("presence checked above");
-            match object {
-                // Only the live prefix of an array participates in marking;
-                // vacated capacity slots are cleared to Unit on shrink.
-                Object::Array { range, length, .. } => {
-                    let live = *length;
-                    for child in self
-                        .collections
-                        .values(*range)?
-                        .iter()
-                        .take(live)
-                        .copied()
-                        .filter_map(value_reference)
-                    {
-                        queue.push_back(child);
-                    }
-                }
-                Object::Buffer { range, .. } => {
-                    for child in self
-                        .collections
-                        .values(*range)?
-                        .iter()
-                        .copied()
-                        .filter_map(value_reference)
-                    {
-                        queue.push_back(child);
-                    }
-                }
-                _ => object.trace_references(&mut |child| queue.push_back(child)),
-            }
-        }
-        Ok(marked)
+        let mut steps = usize::MAX;
+        self.mark_step(queue, &mut steps)
     }
 
     pub fn collect(&mut self, roots: &GcRoots) -> Result<CollectionStats, HeapError> {
+        // Explicit full collection cancels any in-flight incremental cycle:
+        // the mark bits and gray queue are rebuilt from scratch below.
+        self.reset_incremental_cycle();
         for slot in &mut self.slots {
             slot.marked = false;
         }
@@ -2614,6 +2649,180 @@ impl Heap {
 
     pub fn failure_injector(&mut self) -> &mut RuntimeFailureInjector {
         &mut self.failure_injector
+    }
+
+    fn reset_incremental_cycle(&mut self) {
+        self.gc_phase = GcPhase::Idle;
+        self.gc_sweep_cursor = 0;
+        self.gc_marked = 0;
+        self.gc_reclaimed = 0;
+        self.mark_scratch.clear();
+    }
+
+    /// Current incremental phase (G1); `Idle` outside an active cycle.
+    #[must_use]
+    pub const fn gc_phase(&self) -> GcPhase {
+        self.gc_phase
+    }
+
+    /// G1 insertion barrier: while a mark phase is active, a reference
+    /// value being published into a live object is shaded gray so the
+    /// tri-color invariant holds under mutation. Duplicate shades are
+    /// tolerated; the mark loop skips already-marked pops.
+    fn shade_on_write(&mut self, value: RuntimeValue) {
+        if self.gc_phase != GcPhase::Mark {
+            return;
+        }
+        if let Some(child) = value_reference(value) {
+            let already_marked = self
+                .slots
+                .get(child.index as usize)
+                .is_some_and(|slot| slot.marked);
+            if !already_marked {
+                self.mark_scratch.push_back(child);
+                self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+            }
+        }
+    }
+
+    /// One budgeted step of the incremental cycle (G1):
+    /// `Idle -> Mark -> Sweep -> Idle`, spanning as many calls as the
+    /// budget requires.
+    ///
+    /// Every mark step re-seeds the current precise roots before draining
+    /// the gray queue, so the root set may change between steps (task
+    /// suspend points move); Sweep begins only after a step whose freshly
+    /// seeded queue drains completely, which together with the insertion
+    /// barrier keeps every reachable object marked. Objects allocated
+    /// while a cycle is active are born marked and survive to the next
+    /// cycle.
+    pub fn collect_incremental(
+        &mut self,
+        roots: &GcRoots,
+        budget: GcBudget,
+    ) -> Result<IncrementalGcReport, HeapError> {
+        let mut report = IncrementalGcReport::default();
+        let mut steps = budget.max_steps;
+        if steps == 0 {
+            return Ok(report);
+        }
+        if self.gc_phase == GcPhase::Idle {
+            for slot in &mut self.slots {
+                slot.marked = false;
+            }
+            self.gc_marked = 0;
+            self.gc_reclaimed = 0;
+            self.gc_sweep_cursor = 0;
+            self.mark_scratch.clear();
+            self.gc_phase = GcPhase::Mark;
+        }
+        if self.gc_phase == GcPhase::Mark {
+            for root in roots.iter() {
+                self.validate_reference(root)?;
+                let already_marked = self.slots[root.index as usize].marked;
+                if !already_marked {
+                    self.mark_scratch.push_back(root);
+                    report.roots_seeded += 1;
+                }
+            }
+            let mut queue = std::mem::take(&mut self.mark_scratch);
+            let marked = self.mark_step(&mut queue, &mut steps);
+            self.mark_scratch = queue;
+            let marked = marked?;
+            self.gc_marked += marked;
+            report.objects_marked = marked;
+            if self.mark_scratch.is_empty() && steps > 0 {
+                self.gc_phase = GcPhase::Sweep;
+                self.gc_sweep_cursor = 0;
+            }
+        }
+        if self.gc_phase == GcPhase::Sweep {
+            while steps > 0 && self.gc_sweep_cursor < self.slots.len() {
+                let index = self.gc_sweep_cursor;
+                self.gc_sweep_cursor += 1;
+                steps -= 1;
+                report.slots_swept += 1;
+                let slot = &mut self.slots[index];
+                if slot.object.is_some() && !slot.marked {
+                    if let Some(Object::Array { range, .. } | Object::Buffer { range, .. }) =
+                        slot.object.take()
+                    {
+                        self.collections.release(range);
+                    }
+                    if let Some(generation) = slot.generation.checked_add(1) {
+                        slot.generation = generation;
+                        self.free
+                            .push(u32::try_from(index).expect("slot indices originate as u32"));
+                    }
+                    self.gc_reclaimed += 1;
+                }
+            }
+            if self.gc_sweep_cursor >= self.slots.len() {
+                report.completed = Some(CollectionStats {
+                    marked: self.gc_marked,
+                    reclaimed: self.gc_reclaimed,
+                    live: self.live_len(),
+                });
+                self.reset_incremental_cycle();
+            }
+        }
+        report.barrier_shades = self.gc_barrier_shades;
+        Ok(report)
+    }
+
+    /// Drains up to `steps` gray references; children stream straight
+    /// back into the queue with no temporary allocation (WP73).
+    fn mark_step(
+        &mut self,
+        queue: &mut VecDeque<GcRef>,
+        steps: &mut usize,
+    ) -> Result<usize, HeapError> {
+        let mut marked = 0;
+        while *steps > 0 {
+            let Some(reference) = queue.pop_front() else {
+                break;
+            };
+            *steps -= 1;
+            let slot = self
+                .slots
+                .get_mut(reference.index as usize)
+                .filter(|slot| slot.generation == reference.generation && slot.object.is_some())
+                .ok_or(HeapError::InvalidReference(reference))?;
+            if slot.marked {
+                continue;
+            }
+            slot.marked = true;
+            marked += 1;
+            let object = slot.object.as_ref().expect("presence checked above");
+            match object {
+                Object::Array { range, length, .. } => {
+                    let live = *length;
+                    for child in self
+                        .collections
+                        .values(*range)?
+                        .iter()
+                        .take(live)
+                        .copied()
+                        .filter_map(value_reference)
+                    {
+                        queue.push_back(child);
+                    }
+                }
+                Object::Buffer { range, .. } => {
+                    for child in self
+                        .collections
+                        .values(*range)?
+                        .iter()
+                        .copied()
+                        .filter_map(value_reference)
+                    {
+                        queue.push_back(child);
+                    }
+                }
+                _ => object.trace_references(&mut |child| queue.push_back(child)),
+            }
+        }
+        Ok(marked)
     }
 
     #[must_use]

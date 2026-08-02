@@ -411,6 +411,7 @@ fn main() -> Result<(), DynError> {
         "test-ir-optimizations" => test_ir_optimizations(),
         "test-optimization-differential" => test_optimization_differential(),
         "test-executable-parity" => test_executable_parity(),
+        "test-incremental-gc" => test_incremental_gc(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -520,6 +521,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_ir_optimizations()?;
     test_optimization_differential()?;
     test_executable_parity()?;
+    test_incremental_gc()?;
     cargo(&[
         "run",
         "--release",
@@ -1458,6 +1460,12 @@ fn test_optimization_differential() -> Result<(), DynError> {
 /// points, and fuel totals must match item by item.
 fn test_executable_parity() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "executable_parity"])
+}
+
+/// M5 stage-G gate (G1): budgeted incremental Mark/Sweep equivalence,
+/// insertion-barrier safety under mutation, and born-black allocation.
+fn test_incremental_gc() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-runtime", "--test", "incremental_gc"])
 }
 
 #[allow(clippy::too_many_lines)]
