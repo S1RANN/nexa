@@ -482,7 +482,7 @@ impl OpcodeCostTable {
         Ok(())
     }
 
-    fn cost(&self, instruction: Instruction) -> u64 {
+    pub(crate) fn cost(&self, instruction: Instruction) -> u64 {
         if let Instruction::StandardIntrinsic { intrinsic, .. } = instruction {
             u64::from(intrinsic.base_fuel_cost())
         } else {
@@ -2720,7 +2720,103 @@ enum StandardIntrinsicOutcome {
 }
 
 #[allow(clippy::too_many_lines)]
+/// F1: attempt fuel for instructions whose whole cost is determined by the
+/// module, nominal index shape, and cost table alone. Returns `None` for
+/// operand-dependent instructions (their surcharge needs the frame arena or
+/// the heap). `ExecutableModule` rows precompute exactly these values, and
+/// `instruction_attempt_fuel` consumes this function first, so the portable
+/// interpreter and predecoded rows cannot diverge by construction.
+pub(crate) fn static_instruction_fuel(
+    module: &nexa_bytecode::Module,
+    nominal_shape: nexa_verifier::NominalIndexShape,
+    instruction: Instruction,
+    costs: &OpcodeCostTable,
+) -> Result<Option<u64>, InterpreterError> {
+    let work = match instruction {
+        // Operand-dependent surcharges: dynamic by definition.
+        Instruction::StandardIntrinsic { .. }
+        | Instruction::StringLen { .. }
+        | Instruction::StringRuneAt { .. }
+        | Instruction::StringEqual { .. }
+        | Instruction::StringConcat { .. }
+        | Instruction::StructNew { .. }
+        | Instruction::StructWith { .. }
+        | Instruction::EnumEqual { .. }
+        | Instruction::StructEqual { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArrayInsert { .. }
+        | Instruction::ArrayPop { .. }
+        | Instruction::ArrayRemove { .. }
+        | Instruction::ArrayClear { .. }
+        | Instruction::MapGet { .. }
+        | Instruction::MapRemove { .. }
+        | Instruction::MapContains { .. }
+        | Instruction::MapSet { .. }
+        | Instruction::MapClear { .. }
+        | Instruction::BufferSlice { .. }
+        | Instruction::BufferCopy { .. }
+        | Instruction::Return { .. }
+        | Instruction::ReturnVoid
+        | Instruction::CleanupReturn => return Ok(None),
+        Instruction::LoadString { string, .. } => {
+            let bytes = module
+                .strings
+                .get(string as usize)
+                .ok_or(InterpreterError::TypeMismatch)?
+                .len();
+            fuel_blocks(fuel_usize(bytes)?, STANDARD_STRING_FUEL_BLOCK_BYTES)?
+                .checked_mul(2)
+                .ok_or(InterpreterError::FuelCostOverflow)?
+        }
+        Instruction::I32ToString { .. }
+        | Instruction::I64ToString { .. }
+        | Instruction::F32ToString { .. }
+        | Instruction::F64ToString { .. }
+        | Instruction::BoolToString { .. }
+        | Instruction::RuneToString { .. } => {
+            fuel_blocks(SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES)?
+                .checked_mul(SCALAR_TO_STRING_FUEL_PASSES)
+                .ok_or(InterpreterError::FuelCostOverflow)?
+        }
+        Instruction::Call {
+            function,
+            args_count,
+            ..
+        } => call_frame_attempt_fuel(module, function, args_count)?,
+        Instruction::EnumNew { .. } => nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
+        Instruction::StructGet { .. } => nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
+        Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
+        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
+            nominal_index_lookup_fuel(nominal_shape.class_fields)?
+        }
+        Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
+        Instruction::MapNew { .. } => nominal_index_lookup_fuel(nominal_shape.map_types)?,
+        _ => 0,
+    };
+    Ok(Some(fuel_add(costs.cost(instruction), work)?))
+}
+
 fn instruction_attempt_fuel(
+    module: &nexa_bytecode::Module,
+    nominal_shape: nexa_verifier::NominalIndexShape,
+    instruction: Instruction,
+    arena: &FrameArena,
+    heap: Option<&Heap>,
+    costs: &OpcodeCostTable,
+) -> Result<u64, InterpreterError> {
+    // F1 single source of truth: instructions whose whole attempt fuel is
+    // known at module load time settle here; only operand-dependent
+    // surcharges fall through to the dynamic arms below.
+    if let Some(static_fuel) = static_instruction_fuel(module, nominal_shape, instruction, costs)? {
+        return Ok(static_fuel);
+    }
+    dynamic_instruction_fuel(module, nominal_shape, instruction, arena, heap, costs)
+}
+
+/// Operand-dependent attempt-fuel surcharges (frame arena or heap inputs).
+/// Reached only for instructions [`static_instruction_fuel`] declines.
+#[allow(clippy::too_many_lines)]
+pub(crate) fn dynamic_instruction_fuel(
     module: &nexa_bytecode::Module,
     nominal_shape: nexa_verifier::NominalIndexShape,
     instruction: Instruction,
@@ -2738,16 +2834,6 @@ fn instruction_attempt_fuel(
             ..
         } => {
             return standard_intrinsic_attempt_fuel(intrinsic, args_base, args_count, arena, heap);
-        }
-        Instruction::LoadString { string, .. } => {
-            let bytes = module
-                .strings
-                .get(string as usize)
-                .ok_or(InterpreterError::TypeMismatch)?
-                .len();
-            fuel_blocks(fuel_usize(bytes)?, STANDARD_STRING_FUEL_BLOCK_BYTES)?
-                .checked_mul(2)
-                .ok_or(InterpreterError::FuelCostOverflow)?
         }
         Instruction::StringLen { source, .. } | Instruction::StringRuneAt { source, .. } => {
             fuel_blocks(
@@ -2770,31 +2856,14 @@ fn instruction_attempt_fuel(
                 .checked_mul(2)
                 .ok_or(InterpreterError::FuelCostOverflow)?
         }
-        Instruction::I32ToString { .. }
-        | Instruction::I64ToString { .. }
-        | Instruction::F32ToString { .. }
-        | Instruction::F64ToString { .. }
-        | Instruction::BoolToString { .. }
-        | Instruction::RuneToString { .. } => {
-            fuel_blocks(SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES)?
-                .checked_mul(SCALAR_TO_STRING_FUEL_PASSES)
-                .ok_or(InterpreterError::FuelCostOverflow)?
-        }
-        Instruction::Call {
-            function,
-            args_count,
-            ..
-        } => call_frame_attempt_fuel(module, function, args_count)?,
         Instruction::Return { .. } | Instruction::ReturnVoid | Instruction::CleanupReturn => {
             return_defer_attempt_fuel(module, instruction, arena)?
         }
-        Instruction::EnumNew { .. } => nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
         Instruction::StructNew {
             fields_base,
             fields_count,
             ..
         } => register_structural_hash_fuel(arena, heap_required()?, fields_base, fields_count)?,
-        Instruction::StructGet { .. } => nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
         Instruction::StructWith { source, value, .. } => {
             let heap = heap_required()?;
             let source = register(arena, source)?;
@@ -2814,11 +2883,6 @@ fn instruction_attempt_fuel(
         Instruction::EnumEqual { lhs, .. } | Instruction::StructEqual { lhs, .. } => {
             runtime_value_comparison_fuel(heap_required()?, register(arena, lhs)?)?
         }
-        Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
-        Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => {
-            nominal_index_lookup_fuel(nominal_shape.class_fields)?
-        }
-        Instruction::ArrayNew { .. } => nominal_index_lookup_fuel(nominal_shape.array_types)?,
         Instruction::ArrayPush { source, .. } => {
             let heap = heap_required()?;
             let array = register(arena, source)?;
@@ -2867,7 +2931,6 @@ fn instruction_attempt_fuel(
             register(arena, source)?,
             register(arena, key)?,
         )?,
-        Instruction::MapNew { .. } => nominal_index_lookup_fuel(nominal_shape.map_types)?,
         Instruction::MapClear { source } => {
             let shape = heap_required()?.map_fuel_shape(register(arena, source)?)?;
             let slots = fuel_usize(shape.current_slots)?
@@ -3789,7 +3852,7 @@ fn checked_target(code_len: usize, target: u32) -> Result<u32, InterpreterError>
     }
 }
 
-fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
+pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
     match instruction {
         Instruction::Safepoint
         | Instruction::Yield

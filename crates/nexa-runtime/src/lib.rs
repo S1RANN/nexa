@@ -1,6 +1,7 @@
 //! Model-driven Nexa runtime primitives.
 
 mod allocation;
+mod executable;
 mod failure;
 mod frame;
 mod heap;
@@ -29,6 +30,9 @@ mod machines;
 pub use allocation::{
     AllocationBoundary, AllocationSnapshot, MigrationAllocationPhase, allocation_snapshot,
     set_migration_allocation_observer,
+};
+pub use executable::{
+    ExecutableBuildError, ExecutableFunction, ExecutableInstruction, ExecutableModule,
 };
 pub use failure::{
     FailureObservation, FailurePointStats, FailureProbe, FailureProbeState,
