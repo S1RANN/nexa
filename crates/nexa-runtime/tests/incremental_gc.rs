@@ -299,3 +299,91 @@ fn water_mark_trigger_sustains_one_hundred_thousand_short_lived_objects() {
     let final_stats = realm.collect_garbage().expect("final full collection");
     assert_eq!(final_stats.live, 0, "no short-lived object leaks");
 }
+
+/// Builds one condemned object of every byte-carrying kind (string, array
+/// with a live extent, map with entries, class) plus a class whose payload
+/// is inline and therefore reports zero out-of-slot bytes.
+fn build_byte_graph(heap: &mut Heap) {
+    let node = class_type();
+    heap.allocate_string("byte-accounting-corpus")
+        .expect("condemned string");
+    let element = nexa_bytecode::ValueType::I32;
+    let array = heap
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("condemned array");
+    for index in 0..9 {
+        heap.array_push(array, RuntimeValue::I32(index))
+            .expect("array element");
+    }
+    let map = heap
+        .allocate_map(nexa_bytecode::map_type(element, element), element, element)
+        .expect("condemned map");
+    for index in 0..5 {
+        heap.map_set(map, RuntimeValue::I32(index), RuntimeValue::I32(index * 2))
+            .expect("map entry");
+    }
+    heap.allocate_class(node, &[RuntimeValue::I32(7)])
+        .expect("condemned class");
+}
+
+/// G4 gate: the byte-accounting symmetry contract. The categorized
+/// inspection taken before collection predicts exactly the payload bytes
+/// the sweep reports as reclaimed - for the full collector, for the
+/// incremental cycle latch, and for the per-step report sum.
+#[test]
+fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
+    let roots = GcRoots::default();
+
+    let mut full = Heap::new(64);
+    build_byte_graph(&mut full);
+    let before = full.byte_inspection();
+    let expected =
+        before.string_bytes + before.array_bytes + before.buffer_bytes + before.map_bytes;
+    assert!(expected > 0, "the corpus owns out-of-slot bytes");
+    assert!(
+        before.class_payload_bytes > 0,
+        "inline class payload is visible as the informational sub-view"
+    );
+    let stats = full.collect(&roots).expect("full collection");
+    assert_eq!(stats.live, 0);
+    assert_eq!(
+        full.last_cycle_bytes_reclaimed(),
+        expected,
+        "full sweep reclaims exactly the inspected payload bytes"
+    );
+    let after = full.byte_inspection();
+    assert_eq!(
+        after.string_bytes + after.array_bytes + after.buffer_bytes + after.map_bytes,
+        0,
+        "no payload bytes survive an empty-root collection"
+    );
+    assert!(
+        after.allocator_slack_bytes > before.allocator_slack_bytes,
+        "reclaimed arena extents and vacated slots return to slack"
+    );
+
+    let mut incremental = Heap::new(64);
+    build_byte_graph(&mut incremental);
+    let mut step_bytes = 0_u64;
+    let mut completed = false;
+    for _ in 0..10_000 {
+        let report = incremental
+            .collect_incremental(&roots, GcBudget { max_steps: 1 })
+            .expect("incremental step");
+        step_bytes += report.bytes_reclaimed;
+        if report.completed.is_some() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "incremental cycle converges");
+    assert_eq!(
+        incremental.last_cycle_bytes_reclaimed(),
+        expected,
+        "incremental cycle latch matches the full collector byte for byte"
+    );
+    assert_eq!(
+        step_bytes, expected,
+        "per-step reports sum to the cycle total"
+    );
+}

@@ -114,6 +114,18 @@ pub(crate) fn enabled() -> bool {
     PROFILER_ENABLED.load(Ordering::Relaxed)
 }
 
+/// G4 byte accounting: bytes held by this thread's profile storage, zero
+/// until the lazily boxed table exists. The table is fixed-size, so this
+/// is a constant once profiling has recorded on the thread.
+#[must_use]
+pub(crate) fn thread_storage_bytes() -> u64 {
+    PROFILE.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map_or(0, |_| size_of::<ProfileStorage>() as u64)
+    })
+}
+
 /// Drains this thread's profile into a report, resetting the storage.
 #[must_use]
 pub fn take_thread_report() -> Option<ProfilerReport> {

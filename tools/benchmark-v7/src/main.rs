@@ -171,6 +171,7 @@ struct Observation {
 struct GcObservation {
     completed_cycles: u64,
     objects_reclaimed: u64,
+    bytes_reclaimed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -305,9 +306,10 @@ impl VmCounters {
 struct GcCounters {
     cycles: Option<u64>,
     pause_ns_max: Option<u64>,
-    /// Object-count reclamation; precise byte accounting is later stage-G
-    /// work and stays null until it lands.
+    /// Object-count reclamation next to the exact payload-byte figure
+    /// reported by the G4 sweep accounting.
     objects_reclaimed: Option<u64>,
+    bytes_reclaimed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -829,9 +831,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || {
             // Untimed churn: 32 short-lived objects per sample keeps the
             // in-flight garbage well below the 1024-slot ceiling across a
-            // full mark+sweep cycle (~9 steps at this budget).
+            // full mark+sweep cycle (~9 steps at this budget). One string
+            // per sample gives the sweep real out-of-slot payload bytes to
+            // account (G4); class payloads are inline and report zero.
             let mut realm = gc_realm.borrow_mut();
-            for index in 0..32_u32 {
+            realm
+                .allocate(Object::String(String::from("gc-churn-payload-bytes")))
+                .expect("churn string stays below the heap ceiling");
+            for index in 0..31_u32 {
                 realm
                     .allocate(Object::Class {
                         type_id: churn_type,
@@ -855,6 +862,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gc: Some(GcObservation {
                     completed_cycles: u64::from(report.completed.is_some()),
                     objects_reclaimed: reclaimed,
+                    bytes_reclaimed: report.bytes_reclaimed,
                 }),
                 ..Observation::default()
             }
@@ -1598,6 +1606,7 @@ fn bench<T>(
             let totals = gc_totals.get_or_insert_default();
             totals.completed_cycles += sample_gc.completed_cycles;
             totals.objects_reclaimed += sample_gc.objects_reclaimed;
+            totals.bytes_reclaimed += sample_gc.bytes_reclaimed;
         }
         resources.merge(observation.resources);
     }
@@ -1644,6 +1653,7 @@ fn bench<T>(
                 u64::try_from(durations.last().map_or(0, Duration::as_nanos)).unwrap_or(u64::MAX),
             ),
             objects_reclaimed: Some(totals.objects_reclaimed),
+            bytes_reclaimed: Some(totals.bytes_reclaimed),
         }),
         fuel_total: fuel,
         fuel_per_operation: fuel / sample_count,

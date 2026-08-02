@@ -50,6 +50,22 @@ impl VmMap {
             visit(reference);
         }
     }
+
+    /// G4 byte accounting: system bytes held by the slot vectors,
+    /// including both sides of an in-flight incremental rehash.
+    fn storage_bytes(&self) -> usize {
+        let slot_bytes = size_of::<Option<MapEntry>>();
+        let rehash_slots = self.rehash.as_ref().map_or(0, |rehash| {
+            rehash
+                .old_slots
+                .capacity()
+                .saturating_add(rehash.new_slots.capacity())
+        });
+        self.slots
+            .capacity()
+            .saturating_add(rehash_slots)
+            .saturating_mul(slot_bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -175,6 +191,41 @@ pub struct CollectionArenaInspection {
     pub capacity: usize,
     pub free_elements: usize,
     pub free_ranges: usize,
+}
+
+/// `GC_V1` byte accounting by category (G4).
+///
+/// `object_header_bytes` counts occupied slots at their physical pool size,
+/// which under the current inline representation already contains
+/// Class/Struct/Enum payload storage; `class_payload_bytes` reports the
+/// *live* inline field bytes as an informational sub-view and is therefore
+/// excluded from [`Self::total`]. Compact out-of-slot class storage is a
+/// later stage-G representation change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeapByteInspection {
+    pub object_header_bytes: u64,
+    pub class_payload_bytes: u64,
+    pub string_bytes: u64,
+    pub array_bytes: u64,
+    pub buffer_bytes: u64,
+    pub map_bytes: u64,
+    pub allocator_slack_bytes: u64,
+    pub profiler_bytes: u64,
+}
+
+impl HeapByteInspection {
+    /// Exclusive-category sum: headers, out-of-slot payloads, slack, and
+    /// profiler storage. `class_payload_bytes` is subsumed by headers.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.object_header_bytes
+            .saturating_add(self.string_bytes)
+            .saturating_add(self.array_bytes)
+            .saturating_add(self.buffer_bytes)
+            .saturating_add(self.map_bytes)
+            .saturating_add(self.allocator_slack_bytes)
+            .saturating_add(self.profiler_bytes)
+    }
 }
 
 impl CollectionArena {
@@ -381,6 +432,24 @@ impl Object {
             Self::Array { .. } | Self::Buffer { .. } | Self::String(_) | Self::I32Array(_) => {}
         }
     }
+
+    /// G4 byte accounting: bytes this object owns *outside* its slot -
+    /// system allocations (String storage, i32 backing, map slot vectors)
+    /// plus exclusively held collection-arena extents. Class/Struct/Enum
+    /// payloads are inline in the slot and report zero here; the slot
+    /// header itself is pool-owned and accounted separately.
+    fn payload_bytes(&self) -> u64 {
+        let bytes = match self {
+            Self::String(text) => text.capacity(),
+            Self::I32Array(values) => values.capacity().saturating_mul(size_of::<i32>()),
+            Self::Map(map) => map.storage_bytes(),
+            Self::Array { range, .. } | Self::Buffer { range, .. } => {
+                range.length.saturating_mul(size_of::<RuntimeValue>())
+            }
+            Self::Enum { .. } | Self::Struct { .. } | Self::Class { .. } => 0,
+        };
+        u64::try_from(bytes).unwrap_or(u64::MAX)
+    }
 }
 
 /// Bounded geometric growth for the array capacity extent (WP49): at least
@@ -503,6 +572,9 @@ pub struct IncrementalGcReport {
     pub objects_marked: usize,
     pub slots_swept: usize,
     pub barrier_shades: u64,
+    /// G4: payload bytes released by this step's sweep slice (String
+    /// storage, i32 backing, map slot vectors, collection-arena extents).
+    pub bytes_reclaimed: u64,
     pub completed: Option<CollectionStats>,
 }
 
@@ -625,6 +697,10 @@ pub struct Heap {
     gc_marked: usize,
     gc_reclaimed: usize,
     gc_barrier_shades: u64,
+    /// G4: payload bytes released by the current cycle's sweep slices;
+    /// latched into `last_cycle_bytes_reclaimed` when the cycle completes.
+    gc_bytes_reclaimed: u64,
+    last_cycle_bytes_reclaimed: u64,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -733,6 +809,8 @@ impl Heap {
             gc_marked: 0,
             gc_reclaimed: 0,
             gc_barrier_shades: 0,
+            gc_bytes_reclaimed: 0,
+            last_cycle_bytes_reclaimed: 0,
         }
     }
 
@@ -2631,12 +2709,16 @@ impl Heap {
         self.mark_scratch = queue;
         let marked = marked?;
         let mut reclaimed = 0;
+        let mut bytes_reclaimed = 0_u64;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.object.is_some() && !slot.marked {
-                if let Some(Object::Array { range, .. } | Object::Buffer { range, .. }) =
-                    slot.object.take()
-                {
-                    self.collections.release(range);
+                if let Some(object) = slot.object.take() {
+                    // G4: payload bytes are measured before the drop; the
+                    // slot header stays pool-owned and is not "released".
+                    bytes_reclaimed = bytes_reclaimed.saturating_add(object.payload_bytes());
+                    if let Object::Array { range, .. } | Object::Buffer { range, .. } = object {
+                        self.collections.release(range);
+                    }
                 }
                 if let Some(generation) = slot.generation.checked_add(1) {
                     slot.generation = generation;
@@ -2646,6 +2728,7 @@ impl Heap {
                 reclaimed += 1;
             }
         }
+        self.last_cycle_bytes_reclaimed = bytes_reclaimed;
         Ok(CollectionStats {
             marked,
             reclaimed,
@@ -2662,7 +2745,16 @@ impl Heap {
         self.gc_sweep_cursor = 0;
         self.gc_marked = 0;
         self.gc_reclaimed = 0;
+        self.gc_bytes_reclaimed = 0;
         self.mark_scratch.clear();
+    }
+
+    /// G4: payload bytes released by the most recently *completed*
+    /// collection (full or incremental). Cycle-boundary telemetry; the
+    /// per-step figure lives on [`IncrementalGcReport::bytes_reclaimed`].
+    #[must_use]
+    pub const fn last_cycle_bytes_reclaimed(&self) -> u64 {
+        self.last_cycle_bytes_reclaimed
     }
 
     /// Current incremental phase (G1); `Idle` outside an active cycle.
@@ -2777,10 +2869,15 @@ impl Heap {
                 report.slots_swept += 1;
                 let slot = &mut self.slots[index];
                 if slot.object.is_some() && !slot.marked {
-                    if let Some(Object::Array { range, .. } | Object::Buffer { range, .. }) =
-                        slot.object.take()
-                    {
-                        self.collections.release(range);
+                    if let Some(object) = slot.object.take() {
+                        // G4: measured before the drop, mirroring the full
+                        // collection path byte for byte.
+                        let payload = object.payload_bytes();
+                        report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
+                        self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
+                        if let Object::Array { range, .. } | Object::Buffer { range, .. } = object {
+                            self.collections.release(range);
+                        }
                     }
                     if let Some(generation) = slot.generation.checked_add(1) {
                         slot.generation = generation;
@@ -2796,6 +2893,9 @@ impl Heap {
                     reclaimed: self.gc_reclaimed,
                     live: self.live_len(),
                 });
+                // Latch the cycle total before the reset clears the
+                // accumulator; full collection sets the same latch.
+                self.last_cycle_bytes_reclaimed = self.gc_bytes_reclaimed;
                 self.reset_incremental_cycle();
             }
         }
@@ -2894,6 +2994,69 @@ impl Heap {
                 .sum(),
             free_ranges: self.collections.free_ranges.len(),
         }
+    }
+
+    /// `GC_V1` heap byte accounting by category (G4). One full walk over the
+    /// slot pool plus O(1) arena metadata - inspection-grade, never called
+    /// from the hot path or from inside a bounded GC step.
+    #[must_use]
+    pub fn byte_inspection(&self) -> HeapByteInspection {
+        let slot_bytes = size_of::<ObjectSlot>() as u64;
+        let value_bytes = size_of::<RuntimeValue>() as u64;
+        let mut inspection = HeapByteInspection::default();
+        let mut occupied = 0_u64;
+        for slot in &self.slots {
+            let Some(object) = slot.object.as_ref() else {
+                continue;
+            };
+            occupied += 1;
+            match object {
+                Object::String(_) => {
+                    inspection.string_bytes = inspection
+                        .string_bytes
+                        .saturating_add(object.payload_bytes());
+                }
+                Object::Array { .. } | Object::I32Array(_) => {
+                    inspection.array_bytes = inspection
+                        .array_bytes
+                        .saturating_add(object.payload_bytes());
+                }
+                Object::Buffer { .. } => {
+                    inspection.buffer_bytes = inspection
+                        .buffer_bytes
+                        .saturating_add(object.payload_bytes());
+                }
+                Object::Map(_) => {
+                    inspection.map_bytes =
+                        inspection.map_bytes.saturating_add(object.payload_bytes());
+                }
+                Object::Class { field_count, .. } | Object::Struct { field_count, .. } => {
+                    inspection.class_payload_bytes = inspection
+                        .class_payload_bytes
+                        .saturating_add(u64::from(*field_count).saturating_mul(value_bytes));
+                }
+                Object::Enum { payload, .. } => {
+                    inspection.class_payload_bytes = inspection
+                        .class_payload_bytes
+                        .saturating_add(u64::from(payload.is_some()).saturating_mul(value_bytes));
+                }
+            }
+        }
+        inspection.object_header_bytes = occupied.saturating_mul(slot_bytes);
+        let pool_slots = self.slots.capacity().max(self.slots.len()) as u64;
+        let vacant_pool_bytes = pool_slots
+            .saturating_sub(occupied)
+            .saturating_mul(slot_bytes);
+        let arena_free_bytes = (self
+            .collections
+            .free_ranges
+            .iter()
+            .map(|range| range.length)
+            .sum::<usize>() as u64)
+            .saturating_mul(value_bytes);
+        inspection.allocator_slack_bytes = vacant_pool_bytes.saturating_add(arena_free_bytes);
+        inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
+        inspection
     }
 
     pub(crate) fn failure_trigger(&self, point: RuntimeFailurePoint) -> bool {
