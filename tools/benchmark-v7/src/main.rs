@@ -475,7 +475,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|duration| duration.as_millis())
         .unwrap_or_default();
 
-    let language = nexa_compiler::compile(LANGUAGE_SOURCE)?;
+    let language = nexa_compiler::compile(&full_language_source())?;
     // Stage F: rows are built once at load, exactly like realm admission.
     let language_rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
     // Stage H: one pooled continuation arena serves every steady-state case;
@@ -752,9 +752,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || (),
         |()| {
             // Full frontend + verifier + predecode + execution per sample:
-            // the cost shape of a standalone script or REPL cell.
+            // the cost shape of a standalone script or REPL cell. The
+            // compiled source is the frozen baseline-era module so this
+            // case stays comparable across the whole M5 window.
             let verified =
-                nexa_compiler::compile(LANGUAGE_SOURCE).expect("benchmark language compiles");
+                nexa_compiler::compile(LANGUAGE_SOURCE_BASE).expect("benchmark language compiles");
             let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
                 .expect("benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
@@ -783,7 +785,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         || (),
         |()| {
             let verified = source_cache
-                .compile(LANGUAGE_SOURCE)
+                .compile(LANGUAGE_SOURCE_BASE)
                 .expect("cached benchmark language compiles");
             let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
                 .expect("cached benchmark language predecodes");
@@ -1216,7 +1218,12 @@ fn cpu_model() -> String {
     }
 }
 
-const LANGUAGE_SOURCE: &str = r#"
+/// The baseline-era corpus module (12 functions). The cold and cached
+/// pipeline cases compile exactly this source: their workload identity is
+/// frozen at the `performance-m5-baseline` tag so the live baseline
+/// comparison measures the pipeline, never corpus growth. New corpus
+/// functions land in `LANGUAGE_SOURCE_J_EXTENSION` instead.
+const LANGUAGE_SOURCE_BASE: &str = r#"
 enum BenchError { Failed, }
 struct BenchStruct { value: i32, wide: i64, label: string, }
 class BenchClass { mut value: i32, next: Option<BenchClass>, }
@@ -1287,6 +1294,11 @@ fn product_data_sweep() -> i32 {
     }
     return total;
 }
+"#;
+
+/// Corpus functions added after the baseline tag (stage J). Appended after
+/// the base source so existing function indices never move.
+const LANGUAGE_SOURCE_J_EXTENSION: &str = r#"
 fn product_combat_tick() -> i32 {
     let attack: Array<i32> = Array::new();
     let defense: Array<i32> = Array::new();
@@ -1340,11 +1352,17 @@ fn product_grid_score() -> i32 {
 }
 "#;
 
+/// The full row-corpus module: base functions at their baseline indices
+/// plus the stage-J extension appended at the end.
+fn full_language_source() -> String {
+    [LANGUAGE_SOURCE_BASE, LANGUAGE_SOURCE_J_EXTENSION].concat()
+}
+
 /// J3: prints the product-workload results for the V8 comparison
 /// result-parity handshake. Nothing is timed; each function runs once
 /// through the same predecoded-row path the benchmark cases execute.
 fn verify_products() -> Result<(), Box<dyn std::error::Error>> {
-    let language = nexa_compiler::compile(LANGUAGE_SOURCE)?;
+    let language = nexa_compiler::compile(&full_language_source())?;
     let rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
     let report = serde_json::json!({
         "product_data_sweep": returned_i32(

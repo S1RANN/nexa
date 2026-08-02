@@ -415,6 +415,7 @@ fn main() -> Result<(), DynError> {
         "test-source-cache" => test_source_cache(),
         "m5-final-report" => m5_final_report(),
         "m5-v8-comparison" => m5_v8_comparison(),
+        "m5-performance-regression" => m5_performance_regression(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -1860,6 +1861,284 @@ fn m5_v8_comparison() -> Result<(), DynError> {
     )?;
     println!("{}", serde_json::to_string_pretty(&comparison)?);
     Ok(())
+}
+
+/// The frozen target buckets from `PERFORMANCE_TARGETS_V1.md`, mapped to
+/// benchmark v7 case names. Cases added after the baseline tag have no
+/// baseline side and are reported separately, never averaged.
+const VALUE_COLLECTION_CASES: &[&str] = &[
+    "struct_construction",
+    "enum_construction_match",
+    "array_operations",
+    "map_operations",
+    "buffer_copy",
+    "string_concat",
+    "class_allocation",
+];
+const PRODUCT_CPU_CASES: &[&str] = &[
+    "product_data_sweep",
+    "product_combat_tick",
+    "product_grid_score",
+];
+const HOST_TASK_ENGINE_CASES: &[&str] = &[
+    "immediate_call",
+    "result_ok_err",
+    "fuel_resume",
+    "explicit_resume",
+    "snapshot_access",
+    "async_admission",
+    "migration",
+    "reload_commit",
+    "realm_drop",
+];
+const COLD_START_CASES: &[&str] = &["product_standalone_pipeline"];
+
+/// Regressions acknowledged with a written explanation, per the
+/// `PERFORMANCE_TARGETS_V1.md` latency discipline. Empty until a regression
+/// is investigated and justified in the final report.
+const EXPLAINED_REGRESSIONS: &[(&str, &str)] = &[];
+
+/// Differences below this floor are timer-resolution noise on the
+/// qualification machine (the mach timebase quantum is ~42ns); the 10%
+/// regression rule applies above it.
+const REGRESSION_NOISE_FLOOR_NS: u128 = 100;
+
+/// M5 stage-J: the live baseline comparison demanded by
+/// `PERFORMANCE_TARGETS_V1.md` - HEAD versus the immutable
+/// `performance-m5-baseline` tag, both measured on this machine under the
+/// formal 7x1000 protocol. The baseline side runs its own frozen harness
+/// inside a temporary worktree (never a saved report from another
+/// session); its live artifact is reused only while pinned to the
+/// immutable tag commit. The command fails on unexplained shared-case
+/// p95/p99 regressions beyond 10%; throughput-target achievement is
+/// recorded for finalize-m5 to enforce.
+#[allow(
+    clippy::too_many_lines,
+    // Ratio reporting only; the f64 mantissa bound is irrelevant here.
+    clippy::cast_precision_loss
+)]
+fn m5_performance_regression() -> Result<(), DynError> {
+    let root = workspace_root();
+    let regression_dir = root.join("target/nexa-artifacts/m5/regression");
+    fs::create_dir_all(&regression_dir)?;
+    if git_output(&["cat-file", "-t", "performance-m5-baseline"])? != "tag" {
+        return Err("performance-m5-baseline must be an annotated tag".into());
+    }
+    let baseline_commit = git_output(&["rev-parse", "performance-m5-baseline^{}"])?;
+    let head_commit = git_output(&["rev-parse", "HEAD"])?;
+
+    // Baseline side: reuse this machine's live artifact only while it is
+    // pinned to the immutable tag commit under the formal protocol.
+    let baseline_path = regression_dir.join("baseline-live-7x1000.json");
+    let existing: Option<Value> = fs::read(&baseline_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let baseline = match existing {
+        Some(report)
+            if report["implementation_commit"].as_str() == Some(baseline_commit.as_str())
+                && report["process_count"].as_u64() == Some(7)
+                && report["samples_per_process"].as_u64() == Some(1_000) =>
+        {
+            eprintln!("baseline: reusing the live run pinned to {baseline_commit}");
+            report
+        }
+        _ => generate_baseline_live(&root, &baseline_path)?,
+    };
+
+    // HEAD side: always fresh under the same protocol.
+    let head_path = regression_dir.join("head-7x1000.json");
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--samples",
+        "1000",
+        "--processes",
+        "7",
+        "--output",
+        head_path.to_str().ok_or("non-UTF-8 artifact path")?,
+    ])?;
+    let head: Value = serde_json::from_slice(&fs::read(&head_path)?)?;
+
+    let case_map = |report: &Value| -> BTreeMap<String, (u128, u128, u128)> {
+        report["cases"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|case| {
+                Some((
+                    case["case"].as_str()?.to_owned(),
+                    (
+                        case["median_p50_ns"].as_u64()?.into(),
+                        case["median_p95_ns"].as_u64()?.into(),
+                        case["median_p99_ns"].as_u64()?.into(),
+                    ),
+                ))
+            })
+            .collect()
+    };
+    let baseline_cases = case_map(&baseline);
+    let head_cases = case_map(&head);
+
+    let mut speedups = BTreeMap::new();
+    let mut regressions = Vec::new();
+    let mut explained = Vec::new();
+    for (name, (base_p50, base_p95, base_p99)) in &baseline_cases {
+        let Some((head_p50, head_p95, head_p99)) = head_cases.get(name).copied() else {
+            return Err(format!("HEAD report dropped the mandatory case {name}").into());
+        };
+        speedups.insert(name.clone(), *base_p50 as f64 / head_p50.max(1) as f64);
+        for (metric, base, now) in [("p95", *base_p95, head_p95), ("p99", *base_p99, head_p99)] {
+            let limit = base.saturating_mul(110) / 100;
+            if now > limit && now.saturating_sub(base) > REGRESSION_NOISE_FLOOR_NS {
+                let entry = serde_json::json!({
+                    "case": name,
+                    "metric": metric,
+                    "baseline_ns": u64::try_from(base).unwrap_or(u64::MAX),
+                    "head_ns": u64::try_from(now).unwrap_or(u64::MAX),
+                    "ratio": (now as f64 / base.max(1) as f64 * 100.0).round() / 100.0,
+                });
+                if let Some((_, note)) = EXPLAINED_REGRESSIONS.iter().find(|(case, _)| case == name)
+                {
+                    let mut entry = entry;
+                    entry["explanation"] = Value::from(*note);
+                    explained.push(entry);
+                } else {
+                    regressions.push(entry);
+                }
+            }
+        }
+    }
+    let new_cases = head_cases
+        .keys()
+        .filter(|name| !baseline_cases.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let bucket = |cases: &[&str], target: f64| -> Value {
+        let shared = cases
+            .iter()
+            .filter_map(|name| {
+                speedups
+                    .get(*name)
+                    .map(|speedup| ((*name).to_owned(), *speedup))
+            })
+            .collect::<BTreeMap<_, _>>();
+        let geomean = if shared.is_empty() {
+            0.0
+        } else {
+            (shared.values().map(|speedup| speedup.ln()).sum::<f64>() / shared.len() as f64).exp()
+        };
+        serde_json::json!({
+            "target": target,
+            "geomean": (geomean * 1000.0).round() / 1000.0,
+            "met": geomean >= target,
+            "cases": shared,
+            "without_baseline": cases
+                .iter()
+                .filter(|name| head_cases.contains_key(**name) && !baseline_cases.contains_key(**name))
+                .collect::<Vec<_>>(),
+        })
+    };
+    let comparison = serde_json::json!({
+        "schema": 1,
+        "protocol": "live baseline worktree vs HEAD; 7 processes x 1000 samples each side; median across process medians",
+        "baseline_tag": "performance-m5-baseline",
+        "baseline_commit": baseline_commit,
+        "head_commit": head_commit,
+        "buckets": {
+            "product_cpu": bucket(PRODUCT_CPU_CASES, 1.50),
+            "value_collection": bucket(VALUE_COLLECTION_CASES, 2.00),
+            "host_task_engine": bucket(HOST_TASK_ENGINE_CASES, 1.30),
+            "cold_start": bucket(COLD_START_CASES, 1.20),
+        },
+        "cases_without_baseline": new_cases,
+        "regressions": regressions,
+        "explained_regressions": explained,
+        "noise_floor_ns": u64::try_from(REGRESSION_NOISE_FLOOR_NS).unwrap_or(u64::MAX),
+    });
+    fs::write(
+        regression_dir.join("comparison.json"),
+        format!("{}\n", serde_json::to_string_pretty(&comparison)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&comparison)?);
+    if comparison["regressions"]
+        .as_array()
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        return Err("unexplained p95/p99 regressions beyond 10% on shared mandatory cases".into());
+    }
+    Ok(())
+}
+
+/// Regenerates the baseline side live: the immutable tag is checked out
+/// into a temporary worktree and its own frozen harness runs the formal
+/// protocol there. The worktree is removed afterwards; only the report
+/// survives.
+fn generate_baseline_live(root: &Path, baseline_path: &Path) -> Result<Value, DynError> {
+    let worktree = root.join("target/nexa-worktrees/m5-baseline");
+    let worktree_str = worktree.to_str().ok_or("non-UTF-8 worktree path")?;
+    // Pre-clean any stale worktree from an interrupted run.
+    let _ = Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_str])
+        .current_dir(root)
+        .output();
+    let added = Command::new("git")
+        .args([
+            "worktree",
+            "add",
+            "--detach",
+            worktree_str,
+            "performance-m5-baseline",
+        ])
+        .current_dir(root)
+        .output()?;
+    if !added.status.success() {
+        return Err(format!(
+            "git worktree add failed:\n{}",
+            String::from_utf8_lossy(&added.stderr)
+        )
+        .into());
+    }
+    eprintln!("baseline: measuring the tag live in {worktree_str}");
+    let output_path = baseline_path.to_str().ok_or("non-UTF-8 artifact path")?;
+    let run = Command::new("cargo")
+        .args([
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "nexa-benchmark-v7",
+            "--",
+            "--samples",
+            "1000",
+            "--processes",
+            "7",
+            "--output",
+            output_path,
+        ])
+        .current_dir(&worktree)
+        .status();
+    let removed = Command::new("git")
+        .args(["worktree", "remove", "--force", worktree_str])
+        .current_dir(root)
+        .output();
+    let run = run?;
+    if !run.success() {
+        return Err("baseline benchmark run failed inside the worktree".into());
+    }
+    if let Ok(removed) = removed
+        && !removed.status.success()
+    {
+        eprintln!(
+            "warning: could not remove the baseline worktree: {}",
+            String::from_utf8_lossy(&removed.stderr)
+        );
+    }
+    Ok(serde_json::from_slice(&fs::read(baseline_path)?)?)
 }
 
 #[allow(clippy::too_many_lines)]
