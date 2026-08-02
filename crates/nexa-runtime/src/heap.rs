@@ -484,6 +484,25 @@ struct ObjectSlot {
     object: Option<Object>,
 }
 
+/// Deterministic FNV-1a content hash shared by string values and the
+/// WP56 literal cache; computed once per interned literal (WP69).
+fn fnv_content_hash(value: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in value.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// One WP56 literal-cache entry: the shared live copy plus its content
+/// hash, computed once at interning time (WP69 hot-path discipline).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CachedStringLiteral {
+    reference: GcRef,
+    hash: u64,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HeapError {
     CapacityExhausted,
@@ -753,11 +772,14 @@ pub struct Heap {
     failure_injector: RuntimeFailureInjector,
     counters: VmAllocationCounters,
     /// WP56 literal memoization: content-keyed cache of previously loaded
-    /// string constants. Entries are NOT roots; a hit revalidates the
-    /// generation-protected reference and its content, and a collected or
-    /// repurposed slot simply falls back to a fresh allocation. No root
-    /// management, no unload bookkeeping, no leak.
-    string_literal_cache: BTreeMap<String, GcRef>,
+    /// string constants, each carrying its content hash so hot literal
+    /// loads are O(1) instead of rehashing per load (WP69). Entries are
+    /// NOT roots; a hit revalidates the generation-protected reference,
+    /// and a collected slot simply falls back to a fresh allocation. The
+    /// two paths that recycle a slot *without* bumping its generation -
+    /// host-transaction rollback and checkpoint restore - clear the cache
+    /// instead, so a generation match always implies content identity.
+    string_literal_cache: BTreeMap<String, CachedStringLiteral>,
     /// WP74: reusable mark-phase work queue. Capacity converges to the
     /// high-water mark of prior collections instead of reallocating on
     /// every `collect` call. Pure scratch space, never heap state. During
@@ -855,6 +877,9 @@ impl Heap {
         // The snapshot predates any in-flight incremental cycle state; the
         // gray queue and sweep cursor would reference rolled-back slots.
         self.reset_incremental_cycle();
+        // The restored slots may pair a cached literal's generation with
+        // different content; the cache trades that ambiguity for a rebuild.
+        self.string_literal_cache.clear();
         self.slots = checkpoint.slots;
         self.free = checkpoint.free;
         self.collections = checkpoint.collections;
@@ -917,24 +942,45 @@ impl Heap {
     }
 
     /// WP56 literal load: returns the cached live copy of a string constant
-    /// when its content still matches, otherwise allocates and re-caches.
-    /// Hot literal loads therefore create no new String objects.
+    /// when its slot generation still matches, otherwise allocates and
+    /// re-caches. Hot literal loads therefore create no new String objects.
     pub fn load_string_literal(&mut self, value: &str) -> Result<GcRef, HeapError> {
-        if let Some(reference) = self.string_literal_cache.get(value).copied()
-            && matches!(
-                self.slots
-                    .get(reference.index as usize)
-                    .filter(|slot| slot.generation == reference.generation)
-                    .and_then(|slot| slot.object.as_ref()),
-                Some(Object::String(cached)) if cached == value
-            )
-        {
-            return Ok(reference);
+        self.load_string_literal_with_hash(value)
+            .map(|(reference, _)| reference)
+    }
+
+    /// WP56/WP69 hot path: the cached reference *and* its content hash in
+    /// one O(1) lookup - no per-load content rehash, no content compare.
+    /// A generation match implies content identity because every path
+    /// that recycles a slot without bumping its generation (host
+    /// rollback, checkpoint restore) clears this cache instead.
+    pub fn load_string_literal_with_hash(
+        &mut self,
+        value: &str,
+    ) -> Result<(GcRef, u64), HeapError> {
+        if let Some(cached) = self.string_literal_cache.get(value).copied() {
+            let slot = self
+                .slots
+                .get(cached.reference.index as usize)
+                .filter(|slot| slot.generation == cached.reference.generation);
+            if let Some(slot) = slot
+                && matches!(slot.object.as_ref(), Some(Object::String(_)))
+            {
+                debug_assert!(
+                    matches!(
+                        slot.object.as_ref(),
+                        Some(Object::String(cached_value)) if cached_value == value
+                    ),
+                    "a generation-valid literal cache entry must keep its content"
+                );
+                return Ok((cached.reference, cached.hash));
+            }
         }
         let reference = self.allocate_string(value)?;
+        let hash = fnv_content_hash(value);
         self.string_literal_cache
-            .insert(value.to_owned(), reference);
-        Ok(reference)
+            .insert(value.to_owned(), CachedStringLiteral { reference, hash });
+        Ok((reference, hash))
     }
 
     pub fn concat_strings(&mut self, lhs: GcRef, rhs: GcRef) -> Result<GcRef, HeapError> {
@@ -1009,12 +1055,7 @@ impl Heap {
     }
 
     pub fn string_hash(&self, reference: GcRef) -> Result<u64, HeapError> {
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in self.string(reference)?.bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-        Ok(hash)
+        Ok(fnv_content_hash(self.string(reference)?))
     }
 
     pub(crate) fn split_string(
@@ -1398,6 +1439,7 @@ impl Heap {
     pub(crate) fn rollback_host_transaction(&mut self) {
         self.host_transaction_active = false;
         let mut released = 0_u64;
+        let mut recycled = false;
         while let Some(reference) = self.host_staging.pop() {
             if let Some(slot) = self.slots.get_mut(reference.index as usize)
                 && slot.generation == reference.generation
@@ -1409,7 +1451,14 @@ impl Heap {
                 // collection reservation and releases it itself.
                 released = released.saturating_add(object.payload_bytes());
                 self.free.push(reference.index);
+                recycled = true;
             }
+        }
+        if recycled {
+            // Rollback frees slots without bumping their generation, so a
+            // literal cached at the same (index, generation) could later
+            // alias different content; drop the cache instead.
+            self.string_literal_cache.clear();
         }
         self.release_live_payload(released);
     }
@@ -3543,10 +3592,13 @@ mod tests {
     #[test]
     fn string_literal_cache_shares_live_copies_and_survives_collection() {
         let mut heap = Heap::new(8);
-        let first = heap.load_string_literal("pooled").unwrap();
-        let second = heap.load_string_literal("pooled").unwrap();
+        let (first, first_hash) = heap.load_string_literal_with_hash("pooled").unwrap();
+        let (second, second_hash) = heap.load_string_literal_with_hash("pooled").unwrap();
         assert_eq!(first, second, "hot literal loads share one object");
         assert_eq!(heap.vm_allocation_counters().string_allocations, 1);
+        // WP69: the cached hash is the interning-time content hash.
+        assert_eq!(first_hash, heap.string_hash(first).unwrap());
+        assert_eq!(first_hash, second_hash);
 
         // Cache entries are not roots: an unrooted literal is collected,
         // and the next load safely re-allocates instead of resurrecting.
@@ -3555,6 +3607,53 @@ mod tests {
         let third = heap.load_string_literal("pooled").unwrap();
         assert_ne!(first, third, "collected entries fall back to allocation");
         assert_eq!(heap.string(third), Ok("pooled"));
+    }
+
+    #[test]
+    fn string_literal_cache_survives_generation_reuse_after_host_rollback() {
+        // Host rollback frees slots without bumping their generation; a
+        // literal interned inside the transaction must not alias whatever
+        // is committed into the recycled slot afterwards.
+        let mut heap = Heap::new(8);
+        heap.begin_host_transaction().unwrap();
+        let staged = heap.load_string_literal("staged-literal").unwrap();
+        heap.rollback_host_transaction();
+        let replacement = heap.allocate_string("different-content").unwrap();
+        assert_eq!(
+            (staged.index, staged.generation),
+            (replacement.index, replacement.generation),
+            "the rollback recycles the staged slot at the same generation"
+        );
+        let reloaded = heap.load_string_literal("staged-literal").unwrap();
+        assert_ne!(
+            reloaded, replacement,
+            "a stale cache entry must not alias the recycled slot"
+        );
+        assert_eq!(heap.string(reloaded), Ok("staged-literal"));
+        assert_eq!(heap.string(replacement), Ok("different-content"));
+    }
+
+    #[test]
+    fn string_literal_cache_survives_checkpoint_restore() {
+        // Restore replaces the slot population wholesale; entries cached
+        // after the checkpoint may match a restored generation with
+        // different content and must be dropped with it.
+        let mut heap = Heap::new(8);
+        let checkpoint = heap.checkpoint();
+        let cached = heap.load_string_literal("transient").unwrap();
+        heap.restore_checkpoint(checkpoint);
+        let replacement = heap.allocate_string("occupies-the-slot").unwrap();
+        assert_eq!(
+            (cached.index, cached.generation),
+            (replacement.index, replacement.generation),
+            "the restored heap hands out the same slot and generation"
+        );
+        let reloaded = heap.load_string_literal("transient").unwrap();
+        assert_ne!(
+            reloaded, replacement,
+            "a post-checkpoint cache entry must not survive the restore"
+        );
+        assert_eq!(heap.string(reloaded), Ok("transient"));
     }
 
     #[test]

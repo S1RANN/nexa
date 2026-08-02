@@ -1333,8 +1333,9 @@ impl CheckedInterpreter {
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
-                    let reference = heap.load_string_literal(value)?;
-                    let hash = heap.string_hash(reference)?;
+                    // WP56/WP69: one cache lookup returns the shared copy
+                    // and its interning-time hash; hot loads rehash nothing.
+                    let (reference, hash) = heap.load_string_literal_with_hash(value)?;
                     set_register(
                         &mut continuation.arena,
                         dst,
