@@ -124,7 +124,9 @@ fn replay(
                 &mut heap,
                 rows,
             ),
-            None => CheckedInterpreter::poll_with_heap(module, continuation, fuel, &costs, &mut heap),
+            None => {
+                CheckedInterpreter::poll_with_heap(module, continuation, fuel, &costs, &mut heap)
+            }
         }
         .expect("parity slice executes");
         match outcome {

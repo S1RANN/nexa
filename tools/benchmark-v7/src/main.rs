@@ -15,10 +15,10 @@ use nexa_migrate::{
 };
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, ExecutableModule, ExecutionCharge, FrameLimits,
-    FuelState, Heap, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry, HostTrap,
-    InterpreterOutcome, OpcodeCostTable, PendingHostRequest, RealmConfig, RealmRuntime,
-    ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger, RuntimeValue,
-    StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
+    FuelState, GcBudget, Heap, HostCallOutcome, HostFunctionAuthority, HostPayload, HostRegistry,
+    HostTrap, InterpreterOutcome, Object, OpcodeCostTable, PendingHostRequest, RealmConfig,
+    RealmRuntime, ResourceContext, RuntimeHost, RuntimeHostArgs, RuntimeResourceLedger,
+    RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits, TaskPoll, TickBudget,
 };
 use nexa_verifier::{VerifiedModule, VerifierLimits, verify};
 use serde::Serialize;
@@ -162,7 +162,15 @@ struct Observation {
     instructions: u64,
     heap_slots: u64,
     vm: Option<nexa_runtime::VmAllocationCounters>,
+    gc: Option<GcObservation>,
     resources: PeakResources,
+}
+
+/// Per-sample incremental GC evidence (stage G).
+#[derive(Clone, Copy, Debug, Default)]
+struct GcObservation {
+    completed_cycles: u64,
+    objects_reclaimed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize)]
@@ -297,7 +305,9 @@ impl VmCounters {
 struct GcCounters {
     cycles: Option<u64>,
     pause_ns_max: Option<u64>,
-    bytes_reclaimed: Option<u64>,
+    /// Object-count reclamation; precise byte accounting is later stage-G
+    /// work and stays null until it lands.
+    objects_reclaimed: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -453,7 +463,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 0, &[RuntimeValue::I32(41)], &mut heap, 256),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                0,
+                &[RuntimeValue::I32(41)],
+                &mut heap,
+                256,
+            )
+        },
     ));
     cases.push(bench(
         "result_ok_err",
@@ -461,7 +480,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            let first = run_returned(&language, &language_rows, 1, &[RuntimeValue::I32(7)], &mut heap, 256);
+            let first = run_returned(
+                &language,
+                &language_rows,
+                1,
+                &[RuntimeValue::I32(7)],
+                &mut heap,
+                256,
+            );
             let second = run_returned(&language, &language_rows, 2, &[], &mut heap, 256);
             combine(first, second, heap.live_len())
         },
@@ -555,7 +581,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (heap, destination, source)
         },
         |(mut heap, destination, source)| {
-            run_returned(&language, &language_rows, 10, &[destination, source], &mut heap, 512)
+            run_returned(
+                &language,
+                &language_rows,
+                10,
+                &[destination, source],
+                &mut heap,
+                512,
+            )
         },
     ));
     cases.push(bench(
@@ -578,7 +611,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
                 .expect("benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
-            run_returned(&verified, &rows, 0, &[RuntimeValue::I32(41)], &mut heap, 256)
+            run_returned(
+                &verified,
+                &rows,
+                0,
+                &[RuntimeValue::I32(41)],
+                &mut heap,
+                256,
+            )
         },
     ));
 
@@ -673,6 +713,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 instructions: async_instructions,
                 heap_slots: async_realm.resource_ledger().heap_objects,
                 vm: Some(async_realm.vm_allocation_counters().delta_since(vm_before)),
+                gc: None,
                 resources: peak,
             }
         },
@@ -700,6 +741,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 instructions: result.usage.fuel_used,
                 heap_slots: result.usage.object_peak as u64,
                 vm: None,
+                gc: None,
                 resources: PeakResources {
                     state_objects: result.usage.object_peak as u64,
                     total: result.usage.object_peak as u64,
@@ -738,6 +780,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 instructions: 1,
                 heap_slots: after.heap_objects,
                 vm: Some(prepared.realm.vm_allocation_counters()),
+                gc: None,
                 resources,
             }
         },
@@ -766,6 +809,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     ));
+
+    // Stage G: bounded-pause evidence. Each sample times exactly one
+    // budgeted incremental step against a realm heap under sustained
+    // short-lived churn; the allocator pressure lives in `prepare`, which
+    // the sampler never times. The case duration percentiles therefore ARE
+    // the single-step pause distribution, and the case-level
+    // system_allocations counter doubles as the "GC steps never allocate"
+    // witness (G3 bound).
+    let churn_type = StableId::from_name("benchmark-v7::GcChurn");
+    let gc_realm = std::cell::RefCell::new(RealmRuntime::isolated(RealmConfig {
+        max_heap_objects: 1_024,
+        ..RealmConfig::default()
+    }));
+    cases.push(bench(
+        "gc_incremental_step",
+        "micro",
+        samples,
+        || {
+            // Untimed churn: 32 short-lived objects per sample keeps the
+            // in-flight garbage well below the 1024-slot ceiling across a
+            // full mark+sweep cycle (~9 steps at this budget).
+            let mut realm = gc_realm.borrow_mut();
+            for index in 0..32_u32 {
+                realm
+                    .allocate(Object::Class {
+                        type_id: churn_type,
+                        fields: [RuntimeValue::I32(i32::try_from(index).expect("bounded"));
+                            nexa_bytecode::MAX_CLASS_FIELDS],
+                        field_count: 1,
+                    })
+                    .expect("churn stays below the heap ceiling");
+            }
+        },
+        |()| {
+            let mut realm = gc_realm.borrow_mut();
+            let report = realm
+                .collect_garbage_incremental(GcBudget { max_steps: 128 })
+                .expect("budgeted incremental step");
+            let reclaimed = report.completed.map_or(0, |stats| {
+                u64::try_from(stats.reclaimed).unwrap_or(u64::MAX)
+            });
+            Observation {
+                heap_slots: realm.resource_ledger().heap_objects,
+                gc: Some(GcObservation {
+                    completed_cycles: u64::from(report.completed.is_some()),
+                    objects_reclaimed: reclaimed,
+                }),
+                ..Observation::default()
+            }
+        },
+    ));
+    drop(gc_realm);
 
     let report = BenchmarkReport {
         schema: 1,
@@ -1102,6 +1197,7 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
         // Counters are cumulative per heap; the later observation subsumes
         // the earlier one taken from the same heap.
         vm: second.vm.or(first.vm),
+        gc: second.gc.or(first.gc),
         resources,
     }
 }
@@ -1482,6 +1578,7 @@ fn bench<T>(
     let mut instructions = 0_u64;
     let mut heap_slots = 0_u64;
     let mut vm_totals: Option<nexa_runtime::VmAllocationCounters> = None;
+    let mut gc_totals: Option<GcObservation> = None;
     let mut resources = PeakResources::default();
     for _ in 0..samples {
         let input = prepare();
@@ -1496,6 +1593,11 @@ fn bench<T>(
         heap_slots = heap_slots.max(observation.heap_slots);
         if let Some(sample_vm) = observation.vm {
             vm_totals.get_or_insert_default().accumulate(sample_vm);
+        }
+        if let Some(sample_gc) = observation.gc {
+            let totals = gc_totals.get_or_insert_default();
+            totals.completed_cycles += sample_gc.completed_cycles;
+            totals.objects_reclaimed += sample_gc.objects_reclaimed;
         }
         resources.merge(observation.resources);
     }
@@ -1536,7 +1638,13 @@ fn bench<T>(
         system_reallocated_bytes: allocation_totals.reallocated_bytes,
         system_peak_outstanding_bytes: allocation_totals.peak_outstanding_bytes,
         vm: VmCounters::from_totals(heap_slots, vm_totals),
-        gc: GcCounters::default(),
+        gc: gc_totals.map_or_else(GcCounters::default, |totals| GcCounters {
+            cycles: Some(totals.completed_cycles),
+            pause_ns_max: Some(
+                u64::try_from(durations.last().map_or(0, Duration::as_nanos)).unwrap_or(u64::MAX),
+            ),
+            objects_reclaimed: Some(totals.objects_reclaimed),
+        }),
         fuel_total: fuel,
         fuel_per_operation: fuel / sample_count,
         instructions_total: instructions,
