@@ -24,6 +24,12 @@ pub trait TypedIrPass {
     fn run_function(&self, function: &mut TypedFunctionIr, context: &mut PassContext);
 }
 
+/// Upper bound for one folded string concatenation. Far below the module
+/// decode limits (65,536 strings / 4 MiB total), it keeps repeated folds
+/// from inflating the constant table while covering every realistic
+/// literal concatenation.
+const MAX_FOLDED_STRING_BYTES: usize = 4_096;
+
 /// Mutable bookkeeping shared with a running pass.
 #[derive(Debug, Default)]
 pub struct PassContext {
@@ -90,12 +96,14 @@ impl TypedIrPass for ConstantFolding {
     }
 }
 
-/// WP39: substitutes references to immutable scalar-literal bindings.
+/// WP39: substitutes references to immutable scalar- and string-literal
+/// bindings.
 ///
-/// String literals are intentionally not propagated: duplicating them would
-/// multiply `LoadString` allocations until the module constant pool lands
-/// (WP56). The binding itself stays in place for WP41 to remove once it is
-/// provably unused.
+/// String literals propagate since the WP56 constant pool landed: every
+/// `LoadString` of the same content shares one interned heap entry, so
+/// duplicating a literal into its use sites no longer multiplies runtime
+/// allocations. The binding itself stays in place for WP41 to remove once
+/// it is provably unused.
 pub struct ConstantPropagation;
 
 impl TypedIrPass for ConstantPropagation {
@@ -244,9 +252,7 @@ fn propagate_statement(
                 scopes.immutable.insert(*definition);
                 if let Some(value) = value {
                     match (mode, &value.kind) {
-                        (PropagationMode::Constants, TypedExpressionKind::Literal(literal))
-                            if propagatable_literal(literal) =>
-                        {
+                        (PropagationMode::Constants, TypedExpressionKind::Literal(literal)) => {
                             scopes.bind(*definition, BoundValue::Literal(literal.clone()));
                         }
                         (PropagationMode::Copies, TypedExpressionKind::Reference(source))
@@ -366,10 +372,6 @@ fn substitute_expression(
     for_each_child_expression(expression, &mut |child| {
         substitute_expression(child, scopes, mode, context);
     });
-}
-
-const fn propagatable_literal(literal: &IrLiteral) -> bool {
-    !matches!(literal, IrLiteral::String(_))
 }
 
 fn fold_block(block: &mut TypedBlockIr, context: &mut PassContext) {
@@ -1000,9 +1002,27 @@ fn fold_binary(operator: BinaryOperator, left: &IrLiteral, right: &IrLiteral) ->
             Op::NotEqual => Lit::Bool(lhs != rhs),
             _ => return None,
         },
-        // String concatenation allocates on the VM heap and string equality
-        // is runtime content comparison; both stay observable runtime work
-        // until the string constant pool lands (WP56).
+        // Folded concatenations become module constants: with the WP56
+        // interned pool a `LoadString` of the combined content allocates
+        // nothing new, exactly as if the source had written the combined
+        // literal. Oversized results stay runtime work so the pass cannot
+        // bloat the constant table, and string ordering comparisons stay
+        // runtime work because the interpreter never defines them.
+        (Lit::String(lhs), Lit::String(rhs)) => match operator {
+            Op::Add => {
+                let length = lhs.len().checked_add(rhs.len())?;
+                if length > MAX_FOLDED_STRING_BYTES {
+                    return None;
+                }
+                let mut value = String::with_capacity(length);
+                value.push_str(lhs);
+                value.push_str(rhs);
+                Lit::String(value)
+            }
+            Op::Equal => Lit::Bool(lhs == rhs),
+            Op::NotEqual => Lit::Bool(lhs != rhs),
+            _ => return None,
+        },
         _ => return None,
     })
 }
@@ -1260,11 +1280,11 @@ mod tests {
     }
 
     #[test]
-    fn mutable_bindings_and_strings_are_never_propagated() {
-        // let mut m = 1; m = 2; let s = "x"; return m; (s unused but string)
+    fn mutable_bindings_are_never_propagated() {
+        // let mut m = 1; m = 2; return m;
         let mut function = TypedFunctionIr {
             parameters: Vec::new(),
-            locals: vec![DefinitionId(4), DefinitionId(5)],
+            locals: vec![DefinitionId(4)],
             return_type: IrType::I32,
             effect: IrEffect::Ordinary,
             body: TypedBlockIr {
@@ -1277,11 +1297,6 @@ mod tests {
                     TypedStatementIr::Assign {
                         target: TypedPlaceIr::Definition(DefinitionId(4)),
                         value: *literal(IrLiteral::I32(2), IrType::I32),
-                    },
-                    TypedStatementIr::Let {
-                        definition: DefinitionId(5),
-                        mutable: false,
-                        value: Some(*literal(IrLiteral::String("x".into()), IrType::String)),
                     },
                     TypedStatementIr::Return(Some(expr(
                         TypedExpressionKind::Reference(DefinitionId(4)),
@@ -1306,6 +1321,98 @@ mod tests {
             TypedExpressionKind::Reference(DefinitionId(4)),
             "mutable binding reads must stay runtime reads"
         );
+    }
+
+    #[test]
+    fn string_concat_and_equality_fold_to_module_constants() {
+        // "nexa" + "-benchmark" folds into one interned module constant.
+        let concat = binary(
+            BinaryOperator::Add,
+            literal(IrLiteral::String("nexa".into()), IrType::String),
+            literal(IrLiteral::String("-benchmark".into()), IrType::String),
+            IrType::String,
+        );
+        let mut function = function_returning(concat);
+        let reports = PassManager::standard().optimize_function(&mut function);
+        assert_eq!(reports[0].rewrites, 1);
+        assert_eq!(
+            folded_return(&function),
+            &TypedExpressionKind::Literal(IrLiteral::String("nexa-benchmark".into()))
+        );
+
+        let comparison = binary(
+            BinaryOperator::Equal,
+            literal(IrLiteral::String("left".into()), IrType::String),
+            literal(IrLiteral::String("left".into()), IrType::String),
+            IrType::Bool,
+        );
+        let mut function = function_returning(comparison);
+        PassManager::standard().optimize_function(&mut function);
+        assert_eq!(
+            folded_return(&function),
+            &TypedExpressionKind::Literal(IrLiteral::Bool(true))
+        );
+    }
+
+    #[test]
+    fn string_bindings_propagate_into_folds() {
+        // let s = "x"; return s + "y"; -> return "xy";
+        let mut function = TypedFunctionIr {
+            parameters: Vec::new(),
+            locals: vec![DefinitionId(6)],
+            return_type: IrType::String,
+            effect: IrEffect::Ordinary,
+            body: TypedBlockIr {
+                statements: vec![
+                    TypedStatementIr::Let {
+                        definition: DefinitionId(6),
+                        mutable: false,
+                        value: Some(*literal(IrLiteral::String("x".into()), IrType::String)),
+                    },
+                    TypedStatementIr::Return(Some(binary(
+                        BinaryOperator::Add,
+                        Box::new(expr(
+                            TypedExpressionKind::Reference(DefinitionId(6)),
+                            IrType::String,
+                        )),
+                        literal(IrLiteral::String("y".into()), IrType::String),
+                        IrType::String,
+                    ))),
+                ],
+                tail: None,
+            },
+        };
+        PassManager::standard().optimize_function(&mut function);
+        let TypedStatementIr::Return(Some(value)) = function
+            .body
+            .statements
+            .iter()
+            .find(|statement| matches!(statement, TypedStatementIr::Return(_)))
+            .expect("return survives")
+        else {
+            panic!("return has a value");
+        };
+        assert_eq!(
+            value.kind,
+            TypedExpressionKind::Literal(IrLiteral::String("xy".into()))
+        );
+    }
+
+    #[test]
+    fn oversized_string_concat_stays_runtime_work() {
+        let left = "a".repeat(MAX_FOLDED_STRING_BYTES / 2 + 1);
+        let right = "b".repeat(MAX_FOLDED_STRING_BYTES / 2 + 1);
+        let concat = binary(
+            BinaryOperator::Add,
+            literal(IrLiteral::String(left), IrType::String),
+            literal(IrLiteral::String(right), IrType::String),
+            IrType::String,
+        );
+        let original_kind = concat.kind.clone();
+        let mut function = function_returning(concat);
+        let reports = PassManager::standard().optimize_function(&mut function);
+        assert_eq!(reports[0].rewrites, 0);
+        assert_eq!(folded_return(&function), &original_kind);
     }
 
     #[test]
