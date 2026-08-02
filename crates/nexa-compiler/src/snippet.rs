@@ -40,8 +40,9 @@ pub(super) fn compile_verified(
     file: FileId,
     contract: Option<&ValidatedContract>,
     host_contract_id_override: Option<StableId>,
+    optimize: bool,
 ) -> Result<VerifiedModule, CompileError> {
-    let mut module = compile_module(source, file, contract)?;
+    let mut module = compile_module(source, file, contract, optimize)?;
     if let Some(host_contract_id) = host_contract_id_override {
         module.host_contract_id = Some(host_contract_id);
     }
@@ -57,6 +58,7 @@ pub(super) fn compile_module(
     source: &str,
     file: FileId,
     contract: Option<&ValidatedContract>,
+    optimize: bool,
 ) -> Result<Module, CompileError> {
     let compilation_options = CompilationOptions::default();
     let module = infer_snippet_module(source, compilation_options.limits.source_file_bytes)
@@ -82,7 +84,12 @@ pub(super) fn compile_module(
             &environment,
         )
     })?;
-    let compiled = compile_typed_package(&ir).map_err(|error| remap_compile_error(error, file))?;
+    let compiled = if optimize {
+        compile_typed_package(&ir)
+    } else {
+        crate::typed::compile_typed_package_reference(&ir)
+    }
+    .map_err(|error| remap_compile_error(error, file))?;
     let mut module = compiled.module;
 
     let root_functions = compiled

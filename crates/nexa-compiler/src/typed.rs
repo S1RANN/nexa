@@ -555,13 +555,25 @@ struct FunctionEmitter<'a> {
 pub fn compile_typed_package(
     package: &TypedPackageIr,
 ) -> Result<PackageCompileOutput, CompileError> {
-    compile_typed_package_with_profile(package, false)
+    compile_typed_package_with_profile(package, false, true)
+}
+
+/// M5 WP36 reference pipeline: identical front end and lowering, with every
+/// M5 emission optimization disabled (Typed IR passes and physical struct
+/// inlining). The differential gate compares this side against the
+/// optimized pipeline for identical results, traps, and task lifecycles;
+/// fuel totals are exempt per `BENCHMARK_PROTOCOL_V1.md`.
+pub fn compile_typed_package_reference(
+    package: &TypedPackageIr,
+) -> Result<PackageCompileOutput, CompileError> {
+    compile_typed_package_with_profile(package, false, false)
 }
 
 #[allow(clippy::too_many_lines)]
 fn compile_typed_package_with_profile(
     package: &TypedPackageIr,
     emit_standalone_main: bool,
+    optimize: bool,
 ) -> Result<PackageCompileOutput, CompileError> {
     let mut modules = package.modules().iter().collect::<Vec<_>>();
     modules.sort_by(|left, right| {
@@ -719,14 +731,19 @@ fn compile_typed_package_with_profile(
                         .expect("TypedPackageIr validates declaration IDs");
                     // M5 WP37/WP38: optimization passes run on an owned copy
                     // immediately before lowering; analyzer snapshots and
-                    // their fingerprints stay untouched.
-                    let mut optimized = function.clone();
-                    let reports = nexa_analysis::passes::PassManager::standard()
-                        .optimize_function(&mut optimized);
-                    let function = if reports.iter().all(|report| report.rewrites == 0) {
-                        std::borrow::Cow::Borrowed(function)
+                    // their fingerprints stay untouched. The WP36 reference
+                    // pipeline lowers the analyzer snapshot verbatim.
+                    let function = if optimize {
+                        let mut optimized = function.clone();
+                        let reports = nexa_analysis::passes::PassManager::standard()
+                            .optimize_function(&mut optimized);
+                        if reports.iter().all(|report| report.rewrites == 0) {
+                            std::borrow::Cow::Borrowed(function)
+                        } else {
+                            std::borrow::Cow::Owned(optimized)
+                        }
                     } else {
-                        std::borrow::Cow::Owned(optimized)
+                        std::borrow::Cow::Borrowed(function)
                     };
                     function_plans.push(TypedFunctionPlan {
                         definition,
@@ -824,6 +841,7 @@ fn compile_typed_package_with_profile(
             &string_indices,
             plan.function.as_ref(),
             function_span,
+            optimize,
         )?;
         emitter.emit_block(&plan.function.body)?;
         let effect = lower_effect(plan.function.effect);
@@ -962,7 +980,7 @@ pub fn compile_typed_standalone_package(
             SourceSpan::default(),
         ));
     }
-    let mut compiled = compile_typed_package_with_profile(package, true)?;
+    let mut compiled = compile_typed_package_with_profile(package, true, true)?;
     let main = standalone_main_info(package, &compiled)?;
     retain_standalone_generated_source_provenance(&mut compiled, main.definition_span)?;
     Ok(StandaloneCompileOutput {
@@ -2473,6 +2491,7 @@ impl<'a> FunctionEmitter<'a> {
         string_indices: &'a BTreeMap<String, u32>,
         function: &'a TypedFunctionIr,
         function_span: SourceSpan,
+        optimize: bool,
     ) -> Result<Self, CompileError> {
         let mut locals = BTreeMap::new();
         let mut register_types = Vec::new();
@@ -2489,21 +2508,24 @@ impl<'a> FunctionEmitter<'a> {
         // M5 WP27/WP45 slice: immutable struct locals used exclusively
         // through direct field reads get one register per field and skip
         // heap materialization entirely. Their primary register is never
-        // written, so the exact dataflow root maps ignore it.
+        // written, so the exact dataflow root maps ignore it. The WP36
+        // reference pipeline materializes every struct on the heap.
         let mut inline_structs = BTreeMap::new();
-        for (definition, owner) in inline_struct_candidates(function) {
-            let Some(layout) = layouts.aggregates.get(&owner) else {
-                continue;
-            };
-            if layout.kind != TypedAggregateKind::Struct {
-                continue;
+        if optimize {
+            for (definition, owner) in inline_struct_candidates(function) {
+                let Some(layout) = layouts.aggregates.get(&owner) else {
+                    continue;
+                };
+                if layout.kind != TypedAggregateKind::Struct {
+                    continue;
+                }
+                let fields_base = u16::try_from(register_types.len())
+                    .map_err(|_| CompileError::too_many_registers(function_span))?;
+                for field in &layout.fields {
+                    register_types.push(Some(field.ty));
+                }
+                inline_structs.insert(definition, (owner, fields_base));
             }
-            let fields_base = u16::try_from(register_types.len())
-                .map_err(|_| CompileError::too_many_registers(function_span))?;
-            for field in &layout.fields {
-                register_types.push(Some(field.ty));
-            }
-            inline_structs.insert(definition, (owner, fields_base));
         }
         Ok(Self {
             package,

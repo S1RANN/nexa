@@ -409,6 +409,7 @@ fn main() -> Result<(), DynError> {
         "test-performance-counters" => test_performance_counters(),
         "test-value-layout" => test_value_layout(),
         "test-ir-optimizations" => test_ir_optimizations(),
+        "test-optimization-differential" => test_optimization_differential(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -516,6 +517,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_performance_counters()?;
     test_value_layout()?;
     test_ir_optimizations()?;
+    test_optimization_differential()?;
     cargo(&[
         "run",
         "--release",
@@ -1434,6 +1436,19 @@ fn test_value_layout() -> Result<(), DynError> {
 /// M5 WP37/WP38 gate: Typed IR pass manager and constant folding.
 fn test_ir_optimizations() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-analysis", "--lib", "passes"])
+}
+
+/// M5 WP36 gate: optimized versus reference pipeline over the differential
+/// corpus. Identical results, traps, and task lifecycles are required; fuel
+/// totals are exempt per the cross-pipeline ruling.
+fn test_optimization_differential() -> Result<(), DynError> {
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "optimization_differential",
+    ])
 }
 
 #[allow(clippy::too_many_lines)]

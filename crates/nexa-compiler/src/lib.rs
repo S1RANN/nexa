@@ -237,7 +237,7 @@ pub fn compile(source: &str) -> Result<VerifiedModule, CompileError> {
 
 /// Compiles one source string while preserving the caller's source identity.
 pub fn compile_file(source: &str, file: FileId) -> Result<VerifiedModule, CompileError> {
-    snippet::compile_verified(source, file, None, None)
+    snippet::compile_verified(source, file, None, None, true)
 }
 
 /// Compiles one source string and pins its compact Host Contract runtime identity.
@@ -245,7 +245,13 @@ pub fn compile_with_contract_id(
     source: &str,
     host_contract_id: StableId,
 ) -> Result<VerifiedModule, CompileError> {
-    snippet::compile_verified(source, FileId::default(), None, Some(host_contract_id))
+    snippet::compile_verified(
+        source,
+        FileId::default(),
+        None,
+        Some(host_contract_id),
+        true,
+    )
 }
 
 /// Compiles one source string against a concrete NIDL v2 Contract.
@@ -262,7 +268,26 @@ pub fn compile_with_contract_file(
     file: FileId,
     contract: &ValidatedContract,
 ) -> Result<VerifiedModule, CompileError> {
-    snippet::compile_verified(source, file, Some(contract), None)
+    snippet::compile_verified(source, file, Some(contract), None, true)
+}
+
+/// Compiles one source string through the M5 WP36 reference pipeline: the
+/// identical front end, analyzer, and lowering with every emission
+/// optimization disabled (Typed IR passes, physical struct inlining).
+///
+/// The differential gate runs the same program through both pipelines and
+/// requires identical results, traps, and task lifecycles; fuel totals are
+/// exempt per the cross-pipeline ruling in `BENCHMARK_PROTOCOL_V1.md`.
+pub fn compile_reference(source: &str) -> Result<VerifiedModule, CompileError> {
+    snippet::compile_verified(source, FileId::default(), None, None, false)
+}
+
+/// Reference-pipeline variant of [`compile_with_contract`] (M5 WP36).
+pub fn compile_reference_with_contract(
+    source: &str,
+    contract: &ValidatedContract,
+) -> Result<VerifiedModule, CompileError> {
+    snippet::compile_verified(source, FileId::default(), Some(contract), None, false)
 }
 
 /// Lowers one source string against a host contract without running the verifier.
@@ -271,5 +296,5 @@ pub fn compile_module_with_contract_file(
     file: FileId,
     contract: &ValidatedContract,
 ) -> Result<Module, CompileError> {
-    snippet::compile_module(source, file, Some(contract))
+    snippet::compile_module(source, file, Some(contract), true)
 }
