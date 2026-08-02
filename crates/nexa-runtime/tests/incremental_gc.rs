@@ -211,6 +211,44 @@ fn full_collection_cancels_an_active_incremental_cycle() {
     assert_eq!(stats.reclaimed, 0);
 }
 
+/// G3 bound gate: an adversarial graph where one object is referenced
+/// hundreds of times (fan-in) plus a self-referential cycle must never
+/// grow the preallocated gray queue - marks land at enqueue time, so
+/// each object enters the queue at most once per cycle. The capacity
+/// invariant is a debug assertion inside every incremental step.
+#[test]
+fn duplicate_heavy_graphs_never_outgrow_the_gray_queue() {
+    let node = class_type();
+    let mut heap = Heap::new_with_limits(64, usize::MAX, 1_024);
+    let shared = heap
+        .allocate_class(node, &[RuntimeValue::I32(1)])
+        .expect("shared target");
+    let shared_reference = reference_of(shared);
+    let element = nexa_bytecode::ValueType::Named(node);
+    let fan_in = heap
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("fan-in array");
+    for _ in 0..512 {
+        heap.array_push(fan_in, shared).expect("push duplicate");
+    }
+    let looper = heap
+        .allocate_class(node, &[RuntimeValue::Unit, fan_in])
+        .expect("self loop");
+    heap.set_class_field(looper, 0, looper)
+        .expect("close the self reference");
+    let roots = GcRoots {
+        running_frames: vec![reference_of(looper)],
+        ..GcRoots::default()
+    };
+    let stats = run_cycle(&mut heap, &roots, 1);
+    assert_eq!(stats.reclaimed, 0);
+    assert_eq!(stats.marked, 3, "shared, fan-in array, and looper");
+    assert!(heap.resolve(shared_reference).is_ok());
+    // A second cycle over the same graph behaves identically.
+    let stats = run_cycle(&mut heap, &roots, 1);
+    assert_eq!(stats.marked, 3);
+}
+
 /// G2 stress gate (`GC_V1.md`): 100,000 short-lived Class objects flow
 /// through a small realm heap driven only by the water-mark trigger and
 /// budgeted steps - ordinary gameplay never falls back to an explicit

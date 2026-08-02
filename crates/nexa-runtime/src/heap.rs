@@ -1043,8 +1043,10 @@ impl Heap {
         let born_marked = self.gc_phase != GcPhase::Idle;
         if self.gc_phase == GcPhase::Mark {
             object.trace_references(&mut |child| {
-                self.mark_scratch.push_back(child);
-                self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+                if Self::enqueue_gray(&mut self.slots, &mut self.mark_scratch, child) {
+                    self.gc_marked += 1;
+                    self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+                }
             });
         }
         if let Some(index) = self.free.pop() {
@@ -2600,12 +2602,16 @@ impl Heap {
         roots: &GcRoots,
         queue: &mut VecDeque<GcRef>,
     ) -> Result<usize, HeapError> {
+        let mut marked = 0;
         for root in roots.iter() {
             self.validate_reference(root)?;
-            queue.push_back(root);
+            if Self::enqueue_gray(&mut self.slots, queue, root) {
+                marked += 1;
+            }
         }
         let mut steps = usize::MAX;
-        self.mark_step(queue, &mut steps)
+        marked += self.mark_step(queue, &mut steps)?;
+        Ok(marked)
     }
 
     pub fn collect(&mut self, roots: &GcRoots) -> Result<CollectionStats, HeapError> {
@@ -2671,23 +2677,42 @@ impl Heap {
         self.max_objects
     }
 
+    /// G3 gray-enqueue: marks on push (classic BFS deduplication), so every
+    /// object enters the queue at most once per cycle and the preallocated
+    /// queue capacity is a hard bound - Mark never allocates. Stale or
+    /// vacant references are ignored here; the mutator-facing write paths
+    /// validate references before they ever reach the collector.
+    fn enqueue_gray(
+        slots: &mut [ObjectSlot],
+        queue: &mut VecDeque<GcRef>,
+        reference: GcRef,
+    ) -> bool {
+        let Some(slot) = slots
+            .get_mut(reference.index as usize)
+            .filter(|slot| slot.generation == reference.generation && slot.object.is_some())
+        else {
+            return false;
+        };
+        if slot.marked {
+            return false;
+        }
+        slot.marked = true;
+        queue.push_back(reference);
+        true
+    }
+
     /// G1 insertion barrier: while a mark phase is active, a reference
     /// value being published into a live object is shaded gray so the
-    /// tri-color invariant holds under mutation. Duplicate shades are
-    /// tolerated; the mark loop skips already-marked pops.
+    /// tri-color invariant holds under mutation.
     fn shade_on_write(&mut self, value: RuntimeValue) {
         if self.gc_phase != GcPhase::Mark {
             return;
         }
-        if let Some(child) = value_reference(value) {
-            let already_marked = self
-                .slots
-                .get(child.index as usize)
-                .is_some_and(|slot| slot.marked);
-            if !already_marked {
-                self.mark_scratch.push_back(child);
-                self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
-            }
+        if let Some(child) = value_reference(value)
+            && Self::enqueue_gray(&mut self.slots, &mut self.mark_scratch, child)
+        {
+            self.gc_marked += 1;
+            self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
         }
     }
 
@@ -2712,6 +2737,10 @@ impl Heap {
         if steps == 0 {
             return Ok(report);
         }
+        // G3 bound: marks land at enqueue time, so every object enters the
+        // gray queue at most once per cycle and the preallocated capacity
+        // is never outgrown - Mark performs zero system allocations.
+        let queue_capacity_before = self.mark_scratch.capacity();
         if self.gc_phase == GcPhase::Idle {
             for slot in &mut self.slots {
                 slot.marked = false;
@@ -2723,20 +2752,18 @@ impl Heap {
             self.gc_phase = GcPhase::Mark;
         }
         if self.gc_phase == GcPhase::Mark {
+            let mut queue = std::mem::take(&mut self.mark_scratch);
             for root in roots.iter() {
                 self.validate_reference(root)?;
-                let already_marked = self.slots[root.index as usize].marked;
-                if !already_marked {
-                    self.mark_scratch.push_back(root);
+                if Self::enqueue_gray(&mut self.slots, &mut queue, root) {
                     report.roots_seeded += 1;
                 }
             }
-            let mut queue = std::mem::take(&mut self.mark_scratch);
-            let marked = self.mark_step(&mut queue, &mut steps);
+            let grayed = self.mark_step(&mut queue, &mut steps);
             self.mark_scratch = queue;
-            let marked = marked?;
-            self.gc_marked += marked;
-            report.objects_marked = marked;
+            let grayed = grayed?;
+            self.gc_marked += grayed + report.roots_seeded;
+            report.objects_marked = grayed + report.roots_seeded;
             if self.mark_scratch.is_empty() && steps > 0 {
                 self.gc_phase = GcPhase::Sweep;
                 self.gc_sweep_cursor = 0;
@@ -2773,17 +2800,25 @@ impl Heap {
             }
         }
         report.barrier_shades = self.gc_barrier_shades;
+        debug_assert_eq!(
+            self.mark_scratch.capacity(),
+            queue_capacity_before,
+            "the bounded gray queue must never reallocate"
+        );
         Ok(report)
     }
 
-    /// Drains up to `steps` gray references; children stream straight
-    /// back into the queue with no temporary allocation (WP73).
+    /// Drains up to `steps` gray references; every pop was already marked
+    /// at enqueue time, so this only scans children, streaming them back
+    /// through [`Self::enqueue_gray`] with no temporary allocation (WP73)
+    /// and no queue growth past its preallocated bound (G3). Returns the
+    /// number of newly grayed children.
     fn mark_step(
         &mut self,
         queue: &mut VecDeque<GcRef>,
         steps: &mut usize,
     ) -> Result<usize, HeapError> {
-        let mut marked = 0;
+        let mut grayed = 0;
         while *steps > 0 {
             let Some(reference) = queue.pop_front() else {
                 break;
@@ -2791,44 +2826,60 @@ impl Heap {
             *steps -= 1;
             let slot = self
                 .slots
-                .get_mut(reference.index as usize)
-                .filter(|slot| slot.generation == reference.generation && slot.object.is_some())
+                .get(reference.index as usize)
+                .filter(|slot| slot.generation == reference.generation)
+                .and_then(|slot| slot.object.as_ref())
                 .ok_or(HeapError::InvalidReference(reference))?;
-            if slot.marked {
-                continue;
-            }
-            slot.marked = true;
-            marked += 1;
-            let object = slot.object.as_ref().expect("presence checked above");
-            match object {
+            debug_assert!(
+                self.slots[reference.index as usize].marked,
+                "gray queue entries are marked at enqueue time"
+            );
+            match slot {
                 Object::Array { range, length, .. } => {
+                    let range = *range;
                     let live = *length;
-                    for child in self
-                        .collections
-                        .values(*range)?
-                        .iter()
-                        .take(live)
-                        .copied()
-                        .filter_map(value_reference)
-                    {
-                        queue.push_back(child);
+                    for index in 0..live.min(range.length) {
+                        let value = self.collections.values(range)?[index];
+                        if let Some(child) = value_reference(value)
+                            && Self::enqueue_gray(&mut self.slots, queue, child)
+                        {
+                            grayed += 1;
+                        }
                     }
                 }
                 Object::Buffer { range, .. } => {
-                    for child in self
-                        .collections
-                        .values(*range)?
-                        .iter()
-                        .copied()
-                        .filter_map(value_reference)
-                    {
-                        queue.push_back(child);
+                    let range = *range;
+                    for index in 0..range.length {
+                        let value = self.collections.values(range)?[index];
+                        if let Some(child) = value_reference(value)
+                            && Self::enqueue_gray(&mut self.slots, queue, child)
+                        {
+                            grayed += 1;
+                        }
                     }
                 }
-                _ => object.trace_references(&mut |child| queue.push_back(child)),
+                _ => {
+                    // The object is briefly taken out of its slot so the
+                    // visitor can enqueue children against `self.slots`
+                    // without aliasing; a self-reference is already marked
+                    // (marks land at enqueue time), so the momentarily
+                    // vacant slot cannot lose edges. No allocation occurs:
+                    // the object moves by value, and the queue is bounded.
+                    let index = reference.index as usize;
+                    let taken = self.slots[index]
+                        .object
+                        .take()
+                        .expect("presence checked above");
+                    taken.trace_references(&mut |child| {
+                        if Self::enqueue_gray(&mut self.slots, queue, child) {
+                            grayed += 1;
+                        }
+                    });
+                    self.slots[index].object = Some(taken);
+                }
             }
         }
-        Ok(marked)
+        Ok(grayed)
     }
 
     #[must_use]
