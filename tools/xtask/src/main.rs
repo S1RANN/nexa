@@ -413,6 +413,7 @@ fn main() -> Result<(), DynError> {
         "test-executable-parity" => test_executable_parity(),
         "test-incremental-gc" => test_incremental_gc(),
         "test-source-cache" => test_source_cache(),
+        "m5-final-report" => m5_final_report(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -1474,6 +1475,163 @@ fn test_incremental_gc() -> Result<(), DynError> {
 /// artifacts, keys on contract identity, and respects its bound.
 fn test_source_cache() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-compiler", "--test", "source_cache"])
+}
+
+/// M5 stage-J: produces the decision artifacts named by
+/// `JIT_DECISION_V1.md` - the formal 7x1000 performance report plus the
+/// JIT decision state. The decision stays `PENDING` until every GO
+/// condition has an input: the V8 comparison requires a qualified V8
+/// environment, and the frozen-surface condition requires M5a finalize.
+#[allow(
+    clippy::too_many_lines,
+    // Percent displays only; the mantissa bound is irrelevant here.
+    clippy::cast_precision_loss
+)]
+fn m5_final_report() -> Result<(), DynError> {
+    use std::fmt::Write as _;
+    let root = workspace_root();
+    let final_dir = root.join("target/nexa-artifacts/m5/final");
+    fs::create_dir_all(&final_dir)?;
+    let aggregate_path = final_dir.join("aggregate-7x1000.json");
+    let profile_path = final_dir.join("profile-1x200.json");
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--samples",
+        "1000",
+        "--processes",
+        "7",
+        "--output",
+        aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
+    ])?;
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--samples",
+        "200",
+        "--profile",
+        "--output",
+        profile_path.to_str().ok_or("non-UTF-8 artifact path")?,
+    ])?;
+    let aggregate: Value = serde_json::from_slice(&fs::read(&aggregate_path)?)?;
+    let profile: Value = serde_json::from_slice(&fs::read(&profile_path)?)?;
+    let profiler = &profile["profiler"];
+    let total_opcodes = profiler["total_opcode_executions"].as_u64().unwrap_or(0);
+    let top_share = profiler["top_opcodes"].as_array().map_or(0, |entries| {
+        entries
+            .iter()
+            .filter_map(|entry| entry[1].as_u64())
+            .sum::<u64>()
+    });
+    let function_count = profiler["function_count"].as_u64().unwrap_or(0);
+    let dropped_functions = profiler["dropped_functions"].as_u64().unwrap_or(0);
+    let case = |name: &str| -> Option<&Value> {
+        aggregate["cases"]
+            .as_array()?
+            .iter()
+            .find(|case| case["case"] == name)
+    };
+    let product_cases = [
+        "product_data_sweep",
+        "product_combat_tick",
+        "product_grid_score",
+    ];
+    let gc_step_p50 = case("gc_incremental_step")
+        .and_then(|case| case["median_p50_ns"].as_u64())
+        .unwrap_or(0);
+    let conditions = serde_json::json!({
+        "c1_interpreter_dominance": {
+            "status": "evidence-supported",
+            "note": "opcode dispatch dominates the product corpus; OS-level CPU sampling confirmation remains open",
+            "top5_opcode_share_percent": if total_opcodes == 0 { 0.0 } else { 100.0 * top_share as f64 / total_opcodes as f64 },
+            "total_opcode_executions": total_opcodes,
+            "product_workloads": product_cases,
+        },
+        "c2_gc_host_not_first_bottleneck": {
+            "status": "satisfied",
+            "note": "GC steps allocate zero system memory and pause ~1us; host boundary allocations are contract-pinned constants",
+            "gc_incremental_step_p50_ns": gc_step_p50,
+        },
+        "c3_hot_spot_concentration": {
+            "status": "satisfied",
+            "recorded_functions": function_count,
+            "dropped_functions": dropped_functions,
+        },
+        "c4_v8_gap": {
+            "status": "pending-environment",
+            "note": "requires a qualified V8/Node environment; its absence blocks only this report per JIT_DECISION_V1.md",
+        },
+        "c5_llvm_amortization": {
+            "status": "pending",
+            "note": "depends on the c4 workload mapping and an LLVM cost prototype",
+        },
+        "c6_frozen_surfaces": {
+            "status": "pending",
+            "note": "ExecutableModule schema and ValueLayout may still change until M5a finalize",
+        },
+    });
+    let decision = serde_json::json!({
+        "schema": 1,
+        "decision": "PENDING",
+        "blockers": ["v8-comparison-environment", "m5a-finalize-freeze"],
+        "conditions": conditions,
+        "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
+        "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
+        "implementation_commit": aggregate["implementation_commit"],
+    });
+    fs::write(
+        final_dir.join("jit-decision.json"),
+        serde_json::to_vec_pretty(&decision)?,
+    )?;
+    let report = serde_json::json!({
+        "schema": 1,
+        "aggregate": aggregate,
+        "profiler": profile["profiler"],
+        "decision": decision,
+    });
+    fs::write(
+        final_dir.join("performance-report.json"),
+        serde_json::to_vec_pretty(&report)?,
+    )?;
+    let mut markdown = String::from("# M5 Performance Report (generated)\n\n");
+    markdown.push_str(
+        "Decision state: **PENDING** (blockers: V8 environment, M5a finalize freeze).\n\n",
+    );
+    markdown
+        .push_str("| case | tier | p50 (ns) | p99 (ns) | max allocs |\n|---|---|---|---|---|\n");
+    if let Some(cases) = aggregate["cases"].as_array() {
+        for case in cases {
+            writeln!(
+                markdown,
+                "| {} | {} | {} | {} | {} |",
+                case["case"].as_str().unwrap_or("?"),
+                case["tier"].as_str().unwrap_or("?"),
+                case["median_p50_ns"],
+                case["median_p99_ns"],
+                case["max_system_allocations"],
+            )?;
+        }
+    }
+    writeln!(
+        markdown,
+        "\nProfile: {total_opcodes} opcode executions recorded, top-5 share {:.1}%, {function_count} functions, {dropped_functions} dropped.",
+        if total_opcodes == 0 {
+            0.0
+        } else {
+            100.0 * top_share as f64 / total_opcodes as f64
+        },
+    )?;
+    fs::write(final_dir.join("performance-report.md"), markdown)?;
+    println!("m5-final-report: PENDING decision written to target/nexa-artifacts/m5/final/");
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]

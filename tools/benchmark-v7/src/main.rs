@@ -343,6 +343,9 @@ struct ProfilerSummary {
     allocation_site_count: usize,
     dropped_functions: u64,
     dropped_sites: u64,
+    /// J2: whole-table total so downstream reports can compute the share
+    /// of the truncated top list without the full opcode table.
+    total_opcode_executions: u64,
     top_opcodes: Vec<(String, u64)>,
     top_allocation_sites: Vec<AllocationSiteSummary>,
 }
@@ -362,6 +365,11 @@ fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
     }
     nexa_runtime::profiler::disable();
     let report = nexa_runtime::profiler::take_thread_report()?;
+    let total_opcode_executions = report
+        .opcodes
+        .iter()
+        .map(|entry| entry.executions)
+        .fold(0_u64, u64::saturating_add);
     let mut opcodes = report
         .opcodes
         .iter()
@@ -378,6 +386,7 @@ fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
         allocation_site_count: report.allocation_sites.len(),
         dropped_functions: report.dropped_functions,
         dropped_sites: report.dropped_sites,
+        total_opcode_executions,
         top_opcodes: opcodes,
         top_allocation_sites: sites
             .into_iter()
