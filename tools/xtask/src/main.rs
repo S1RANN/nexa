@@ -506,7 +506,27 @@ fn finalize_m1() -> Result<(), DynError> {
 fn check() -> Result<(), DynError> {
     check_through_m3()?;
     m4::run_m4_gates().ensure_passed()?;
-    m4r1::record_regression_pass()
+    m4r1::record_regression_pass()?;
+    check_m5_gates()
+}
+
+/// M5 stage-A/B/C/D gates landed so far; the finalize-m5 protocol adds the
+/// multi-process benchmark comparison on top of these.
+fn check_m5_gates() -> Result<(), DynError> {
+    test_performance_counters()?;
+    test_value_layout()?;
+    test_ir_optimizations()?;
+    cargo(&[
+        "run",
+        "--release",
+        "--quiet",
+        "-p",
+        "nexa-benchmark-v7",
+        "--",
+        "--smoke",
+        "--output",
+        "target/nexa-artifacts/m5/check-smoke.json",
+    ])
 }
 
 fn check_through_m3() -> Result<(), DynError> {
