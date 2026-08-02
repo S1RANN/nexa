@@ -1760,7 +1760,7 @@ fn validate_frozen_versions(
         ),
         (
             "crates/nexa-core/src/lib.rs",
-            "pub const BYTECODE_VERSION: u16 = 6;",
+            "pub const BYTECODE_VERSION: u16 = 7;",
         ),
     ] {
         let source = fs::read_to_string(root.join(path)).unwrap_or_default();

@@ -124,6 +124,28 @@ fn index_trap(n: i32) -> i32 {
     values.push(1);
     return values.get(n);
 }
+fn row_projection(n: i32) -> i32 {
+    let cells: Array<Pair> = Array::new();
+    let mut index: i32 = 0;
+    while index < n {
+        cells.push(Pair { first: index, second: index * 2 });
+        index = index + 1;
+    }
+    let mut total: i32 = 0;
+    let mut cursor: i32 = 0;
+    while cursor < cells.len() {
+        let cell: Pair = cells.get(cursor);
+        total = total + cell.first + cell.second;
+        cursor = cursor + 1;
+    }
+    return total;
+}
+fn row_projection_trap(n: i32) -> i32 {
+    let cells: Array<Pair> = Array::new();
+    cells.push(Pair { first: 1, second: 2 });
+    let cell: Pair = cells.get(n);
+    return cell.first;
+}
 "#;
 
 const FOLD_CHAIN: u32 = 0;
@@ -140,6 +162,8 @@ const ENUM_STATIC_QUIET: u32 = 11;
 const ENUM_ESCAPE: u32 = 12;
 const DIV_TRAP: u32 = 13;
 const INDEX_TRAP: u32 = 14;
+const ROW_PROJECTION: u32 = 15;
+const ROW_PROJECTION_TRAP: u32 = 16;
 
 const FUEL: u64 = 1_000_000;
 
@@ -243,6 +267,16 @@ fn optimized_and_reference_pipelines_agree_on_results_and_traps() {
             vec![RuntimeValue::I32(5)],
             Observed::Trapped(TrapKind::ArrayIndexOutOfBounds),
         ),
+        // WP52: flattened rows behind fused field projection agree with
+        // the materializing reference pipeline on results and traps.
+        (ROW_PROJECTION, vec![RuntimeValue::I32(16)], returns(360)),
+        (ROW_PROJECTION, vec![RuntimeValue::I32(0)], returns(0)),
+        (ROW_PROJECTION_TRAP, vec![RuntimeValue::I32(0)], returns(1)),
+        (
+            ROW_PROJECTION_TRAP,
+            vec![RuntimeValue::I32(3)],
+            Observed::Trapped(TrapKind::ArrayIndexOutOfBounds),
+        ),
     ];
     for (function, arguments, expected) in cases {
         assert_case(&modules, *function, arguments, expected);
@@ -297,6 +331,24 @@ fn reference_pipeline_actually_disables_the_optimizations() {
     assert!(
         enum_materializations(&optimized, ENUM_ESCAPE) > 0,
         "a top-level binding pattern disqualifies the enum local on both sides"
+    );
+    // WP52: the struct-element read fuses into ArrayFieldGet only in the
+    // optimized pipeline; the reference side keeps the materializing get.
+    let field_gets = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::ArrayFieldGet { .. }))
+            .count()
+    };
+    assert!(
+        field_gets(&optimized, ROW_PROJECTION) > 0,
+        "optimized pipeline projects struct array fields without materializing"
+    );
+    assert_eq!(
+        field_gets(&reference, ROW_PROJECTION),
+        0,
+        "reference pipeline keeps the materializing array get"
     );
     // WP37/WP38: constant folding shortens the arithmetic chain, so the
     // optimized body must be strictly smaller. If this ever fails the

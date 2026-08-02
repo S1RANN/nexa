@@ -14,7 +14,7 @@
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub(crate) const OPCODE_TABLE_SIZE: usize = 107;
+pub(crate) const OPCODE_TABLE_SIZE: usize = 108;
 pub const PROFILER_FUNCTION_CAPACITY: usize = 256;
 pub const PROFILER_SITE_CAPACITY: usize = 512;
 

@@ -1109,6 +1109,7 @@ const fn collection_instruction_requires_heap(instruction: Instruction) -> bool 
         Instruction::ArrayNew { .. }
             | Instruction::ArrayLen { .. }
             | Instruction::ArrayGet { .. }
+            | Instruction::ArrayFieldGet { .. }
             | Instruction::ArraySet { .. }
             | Instruction::ArrayPush { .. }
             | Instruction::ArrayPop { .. }
@@ -1239,6 +1240,7 @@ fn verify_function(
             Instruction::ArrayNew { .. }
                 | Instruction::ArrayLen { .. }
                 | Instruction::ArrayGet { .. }
+                | Instruction::ArrayFieldGet { .. }
                 | Instruction::ArraySet { .. }
                 | Instruction::ArrayPush { .. }
                 | Instruction::ArrayPop { .. }
@@ -2027,6 +2029,34 @@ fn verify_function(
                 require(&state, index, ValueType::I32)?;
                 state[register(dst)?] = Some(element);
             }
+            Instruction::ArrayFieldGet {
+                source,
+                index,
+                field,
+                dst,
+            } => {
+                // WP52: one struct-element field projected without
+                // materializing the element; the field operand is the
+                // positional index inside the declared field order.
+                let element = array_element(&state, source)?;
+                require(&state, index, ValueType::I32)?;
+                let ValueType::Named(type_id) = element else {
+                    return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                };
+                let field_type = module
+                    .struct_types
+                    .iter()
+                    .find(|struct_type| struct_type.type_id == type_id)
+                    .and_then(|struct_type| struct_type.fields.get(usize::from(field)))
+                    .map(|field| field.ty)
+                    .ok_or_else(|| {
+                        error(
+                            Some(pc),
+                            VerifyErrorKind::StructFieldOutOfRange(u64::from(field)),
+                        )
+                    })?;
+                state[register(dst)?] = Some(field_type);
+            }
             Instruction::ArraySet {
                 source,
                 index,
@@ -2519,6 +2549,7 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::StateHandleEqual { lhs, rhs, .. } => vec![lhs, rhs],
         Instruction::StringRuneAt { source, index, .. }
         | Instruction::ArrayGet { source, index, .. }
+        | Instruction::ArrayFieldGet { source, index, .. }
         | Instruction::ArrayRemove { source, index, .. }
         | Instruction::BufferGet { source, index, .. } => vec![source, index],
         Instruction::StandardIntrinsic {
@@ -2696,6 +2727,7 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::ArrayNew { dst, .. }
         | Instruction::ArrayLen { dst, .. }
         | Instruction::ArrayGet { dst, .. }
+        | Instruction::ArrayFieldGet { dst, .. }
         | Instruction::ArrayPop { dst, .. }
         | Instruction::ArrayRemove { dst, .. }
         | Instruction::MapNew { dst, .. }
@@ -2779,6 +2811,7 @@ fn instruction_requires_safepoint(
                 | Instruction::ArrayNew { .. }
                 | Instruction::ArrayLen { .. }
                 | Instruction::ArrayGet { .. }
+                | Instruction::ArrayFieldGet { .. }
                 | Instruction::ArraySet { .. }
                 | Instruction::ArrayPush { .. }
                 | Instruction::ArrayPop { .. }

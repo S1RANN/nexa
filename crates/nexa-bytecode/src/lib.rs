@@ -1288,6 +1288,15 @@ pub enum Instruction {
         index: u16,
         dst: u16,
     },
+    /// WP52: reads one field of a struct array element without
+    /// materializing the element - flattened rows read their arena cell
+    /// directly, cell layouts project the stored struct's field.
+    ArrayFieldGet {
+        source: u16,
+        index: u16,
+        field: u16,
+        dst: u16,
+    },
     ArraySet {
         source: u16,
         index: u16,
@@ -3469,6 +3478,18 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, index);
             put_u16(output, dst);
         }
+        Instruction::ArrayFieldGet {
+            source,
+            index,
+            field,
+            dst,
+        } => {
+            output.push(107);
+            put_u16(output, source);
+            put_u16(output, index);
+            put_u16(output, field);
+            put_u16(output, dst);
+        }
         Instruction::ArraySet {
             source,
             index,
@@ -4123,6 +4144,12 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
             index: reader.u16()?,
             dst: reader.u16()?,
         },
+        107 => Instruction::ArrayFieldGet {
+            source: reader.u16()?,
+            index: reader.u16()?,
+            field: reader.u16()?,
+            dst: reader.u16()?,
+        },
         71 => Instruction::ArraySet {
             source: reader.u16()?,
             index: reader.u16()?,
@@ -4638,6 +4665,7 @@ impl FunctionBuilder {
                         | Instruction::ArrayNew { .. }
                         | Instruction::ArrayLen { .. }
                         | Instruction::ArrayGet { .. }
+                        | Instruction::ArrayFieldGet { .. }
                         | Instruction::ArraySet { .. }
                         | Instruction::ArrayPush { .. }
                         | Instruction::ArrayPop { .. }

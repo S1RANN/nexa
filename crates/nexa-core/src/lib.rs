@@ -12,11 +12,11 @@ use std::fmt;
 /// version as independent identities.
 pub const NEXA_COMPILER_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Current bytecode wire-format version included in every build fingerprint and module header.
-pub const BYTECODE_VERSION: u16 = 6;
+pub const BYTECODE_VERSION: u16 = 7;
 /// Version of observable VM execution semantics included in every build fingerprint.
 pub const RUNTIME_SEMANTICS_VERSION: u16 = 1;
 /// Version of the fixed instruction fuel schedule included in every build fingerprint.
-pub const OPCODE_COST_TABLE_VERSION: u32 = 6;
+pub const OPCODE_COST_TABLE_VERSION: u32 = 7;
 /// Exact `libm` release used by the deterministic scalar-math implementation.
 pub const RUNTIME_LIBM_VERSION: &str = "0.2.16";
 /// Canonical quiet-NaN encoding used for every observable `f32` NaN result.

@@ -491,7 +491,7 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 107],
+    costs: [u16; 108],
 }
 
 impl Default for OpcodeCostTable {
@@ -2422,6 +2422,27 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::ArrayFieldGet {
+                    source,
+                    index,
+                    field,
+                    dst,
+                } => {
+                    // WP52 fused projection: the element is never
+                    // materialized; both layouts read the field directly.
+                    let array = register(&continuation.arena, source)?;
+                    let RuntimeValue::I32(index) = register(&continuation.arena, index)? else {
+                        return Err(InterpreterError::TypeMismatch);
+                    };
+                    let index = array_index!(index);
+                    let value = array_operation!(
+                        heap.as_deref()
+                            .ok_or(InterpreterError::HeapUnavailable)?
+                            .array_field_get(array, index, usize::from(field))
+                    );
+                    set_register(&mut continuation.arena, dst, value)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::ArraySet {
                     source,
                     index,
@@ -4071,6 +4092,7 @@ pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::ArrayNew { .. }
         | Instruction::ArrayLen { .. }
         | Instruction::ArrayGet { .. }
+        | Instruction::ArrayFieldGet { .. }
         | Instruction::ArraySet { .. }
         | Instruction::ArrayPush { .. }
         | Instruction::ArrayPop { .. }
@@ -4144,13 +4166,13 @@ macro_rules! define_opcode_cost_schedule {
             }
         ),+ $(,)?
     ) => {
-        const DEFAULT_OPCODE_COSTS: [u16; 107] = [$($base_cost),+];
+        const DEFAULT_OPCODE_COSTS: [u16; 108] = [$($base_cost),+];
 
         /// Stable opcode display names indexed by `opcode_index` (WP15).
-        pub(crate) const OPCODE_NAMES: [&str; 107] = [$($name),+];
+        pub(crate) const OPCODE_NAMES: [&str; 108] = [$($name),+];
 
         #[cfg(test)]
-        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 107] = [
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 108] = [
             $(
                 OpcodeCostScheduleEntry {
                     index: $index,
@@ -4475,6 +4497,7 @@ define_opcode_cost_schedule! {
         base_cost: 1,
         dynamic_work: "lhs_recursive_enum_comparison_shape"
     },
+    Instruction::ArrayFieldGet { .. } => { index: 107, name: "ArrayFieldGet", base_cost: 1 },
 }
 
 #[cfg(test)]
@@ -4598,9 +4621,9 @@ fn work(x: i32) -> i32 {
     }
 
     #[test]
-    fn bytecode_v6_opcode_cost_schedule_matches_the_frozen_fixture() {
-        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 6);
-        assert_eq!(OPCODE_COST_SCHEDULE.len(), 107);
+    fn bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture() {
+        assert_eq!(nexa_bytecode::BYTECODE_VERSION, 7);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 108);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
         assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);
@@ -4644,7 +4667,7 @@ fn work(x: i32) -> i32 {
         .unwrap();
         assert_eq!(
             rendered,
-            include_str!("../fixtures/opcode-cost-table-v6.txt")
+            include_str!("../fixtures/opcode-cost-table-v7.txt")
         );
 
         let mut mismatched = table;

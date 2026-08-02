@@ -1,6 +1,6 @@
-bytecode_version=6
-opcode_cost_table_version=6
-entries=107
+bytecode_version=7
+opcode_cost_table_version=7
+entries=108
 index	name	table_base	effective_base	dynamic_work
 000	LoadI32	1	fixed	fixed
 001	LoadBool	1	fixed	fixed
@@ -109,5 +109,6 @@ index	name	table_base	effective_base	dynamic_work
 104	RemF64	1	fixed	fixed
 105	StateCurrentGet	1	fixed	fixed
 106	EnumEqual	1	fixed	lhs_recursive_enum_comparison_shape
+107	ArrayFieldGet	1	fixed	fixed
 runtime_transitions=1
 run_cleanup_initial_defer	sum_until_call(call:ceil((cleanup_registers+args_count)/8),other:1)

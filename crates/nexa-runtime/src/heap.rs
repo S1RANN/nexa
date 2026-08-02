@@ -2392,6 +2392,24 @@ impl Heap {
         self.struct_fields(element)
     }
 
+    /// WP52 fused projection: one field of one struct element, zero
+    /// allocation on both layouts. Backs the `ArrayFieldGet` instruction.
+    pub fn array_field_get(
+        &self,
+        value: RuntimeValue,
+        index: usize,
+        field: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let fields = self.array_element_fields(value, index)?;
+        fields
+            .get(field)
+            .copied()
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: field,
+                length: fields.len(),
+            })
+    }
+
     /// Copies `element`'s fields into a stack row after checking that it is
     /// a struct value of the array's element type with exactly `stride`
     /// fields (WP52).

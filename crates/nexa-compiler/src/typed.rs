@@ -2449,6 +2449,16 @@ fn collect_inline_candidates(
                 } = &value.kind
                 {
                     candidates.insert(*definition, *owner);
+                } else if let TypedExpressionKind::BuiltinCall {
+                    operation: BuiltinOperationIr::ArrayGet,
+                    ..
+                } = &value.kind
+                    && let IrType::Named(owner) = &value.ty
+                {
+                    // WP52 fused projection: a struct binding read out of
+                    // an array fills its field registers directly through
+                    // ArrayFieldGet; the element is never materialized.
+                    candidates.insert(*definition, *owner);
                 }
             }
             TypedStatementIr::If {
@@ -2816,14 +2826,31 @@ impl<'a> FunctionEmitter<'a> {
                         // WP27 slice: evaluate initializers straight into the
                         // per-field registers; no StructNew is emitted and no
                         // heap object ever exists for this binding.
-                        let TypedExpressionKind::Construct { fields, .. } = &value.kind else {
-                            return Err(CompileError::type_mismatch(
-                                None,
-                                None,
-                                self.span(&value.span)?,
-                            ));
-                        };
-                        self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
+                        match &value.kind {
+                            TypedExpressionKind::Construct { fields, .. } => {
+                                self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
+                            }
+                            TypedExpressionKind::BuiltinCall {
+                                operation: BuiltinOperationIr::ArrayGet,
+                                arguments,
+                                ..
+                            } if arguments.len() == 2 => {
+                                self.emit_inline_struct_from_array(
+                                    owner,
+                                    fields_base,
+                                    &arguments[0],
+                                    &arguments[1],
+                                    value,
+                                )?;
+                            }
+                            _ => {
+                                return Err(CompileError::type_mismatch(
+                                    None,
+                                    None,
+                                    self.span(&value.span)?,
+                                ));
+                            }
+                        }
                         return Ok(());
                     }
                     if let Some((variant_definition, payload_register)) =
@@ -5630,6 +5657,51 @@ impl<'a> FunctionEmitter<'a> {
         Ok(base)
     }
 
+    /// WP52 fused projection: a struct binding initialized from an array
+    /// element loads every field straight into its per-field registers via
+    /// `ArrayFieldGet`; the element itself is never materialized. Fields
+    /// copy eagerly at the Let site, so later writes to the array cannot
+    /// leak into the binding (value snapshot semantics), and the first
+    /// field load carries the same span the reference pipeline's
+    /// `ArrayGet` traps with on an out-of-bounds index.
+    fn emit_inline_struct_from_array(
+        &mut self,
+        owner: DefinitionId,
+        fields_base: u16,
+        array: &TypedExpressionIr,
+        index: &TypedExpressionIr,
+        value: &TypedExpressionIr,
+    ) -> Result<(), CompileError> {
+        let span = self.span(&value.span)?;
+        let layout = self
+            .layouts
+            .aggregates
+            .get(&owner)
+            .cloned()
+            .ok_or_else(|| CompileError::unknown_type(self.definition_name(owner), span))?;
+        let source = self.allocate_expression(array)?;
+        self.emit_expression(array, source)?;
+        let index_register = self.allocate_expression(index)?;
+        self.emit_expression(index, index_register)?;
+        for offset in 0..layout.fields.len() {
+            let offset =
+                u16::try_from(offset).map_err(|_| CompileError::too_many_registers(span))?;
+            let register = fields_base
+                .checked_add(offset)
+                .ok_or_else(|| CompileError::too_many_registers(span))?;
+            self.push(
+                Instruction::ArrayFieldGet {
+                    source,
+                    index: index_register,
+                    field: offset,
+                    dst: register,
+                },
+                span,
+            );
+        }
+        Ok(())
+    }
+
     /// Evaluates construct initializers directly into the inline field
     /// register range, in declared field order (WP27 slice).
     fn emit_inline_struct_fields(
@@ -6388,6 +6460,7 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
         | Instruction::StateHandleEqual { lhs, rhs, .. } => vec![lhs, rhs],
         Instruction::StringRuneAt { source, index, .. }
         | Instruction::ArrayGet { source, index, .. }
+        | Instruction::ArrayFieldGet { source, index, .. }
         | Instruction::ArrayRemove { source, index, .. }
         | Instruction::BufferGet { source, index, .. } => vec![source, index],
         Instruction::StandardIntrinsic {
@@ -6558,6 +6631,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::ArrayNew { dst, .. }
         | Instruction::ArrayLen { dst, .. }
         | Instruction::ArrayGet { dst, .. }
+        | Instruction::ArrayFieldGet { dst, .. }
         | Instruction::ArrayPop { dst, .. }
         | Instruction::ArrayRemove { dst, .. }
         | Instruction::MapNew { dst, .. }
@@ -9469,6 +9543,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::ArrayNew { .. }
                     | Instruction::ArrayLen { .. }
                     | Instruction::ArrayGet { .. }
+                    | Instruction::ArrayFieldGet { .. }
                     | Instruction::ArraySet { .. }
                     | Instruction::ArrayPush { .. }
                     | Instruction::ArrayPop { .. }
