@@ -210,3 +210,54 @@ fn full_collection_cancels_an_active_incremental_cycle() {
     let stats = run_cycle(&mut heap, &roots, 3);
     assert_eq!(stats.reclaimed, 0);
 }
+
+/// G2 stress gate (`GC_V1.md`): 100,000 short-lived Class objects flow
+/// through a small realm heap driven only by the water-mark trigger and
+/// budgeted steps - ordinary gameplay never falls back to an explicit
+/// full collection, and the heap never reaches capacity exhaustion.
+#[test]
+fn water_mark_trigger_sustains_one_hundred_thousand_short_lived_objects() {
+    use nexa_runtime::{RealmConfig, RealmRuntime};
+    let config = RealmConfig {
+        max_heap_objects: 256,
+        ..RealmConfig::default()
+    };
+    let mut realm = RealmRuntime::isolated(config);
+    let node = class_type();
+    let budget = GcBudget { max_steps: 32 };
+    let mut triggered_steps = 0_u64;
+    let mut completed_cycles = 0_u64;
+    for index in 0..100_000_u32 {
+        // Short-lived: the reference is dropped immediately; nothing roots
+        // the object, so the next completed cycle reclaims it.
+        let _ = realm
+            .allocate(nexa_runtime::Object::Class {
+                type_id: node,
+                fields: [RuntimeValue::I32(i32::try_from(index % 1_000).expect("bounded"));
+                    nexa_bytecode::MAX_CLASS_FIELDS],
+                field_count: 1,
+            })
+            .expect("allocation never hits capacity under the trigger");
+        if let Some(report) = realm
+            .maybe_collect_garbage_incremental(budget)
+            .expect("triggered step")
+        {
+            triggered_steps += 1;
+            if report.completed.is_some() {
+                completed_cycles += 1;
+            }
+        }
+    }
+    assert!(
+        completed_cycles >= 2,
+        "sustained allocation drives repeated cycles ({completed_cycles})"
+    );
+    assert!(
+        triggered_steps > completed_cycles,
+        "cycles span multiple budgeted steps"
+    );
+    // Shutdown-style full collection confirms nothing leaked beyond the
+    // short-lived garbage still in flight.
+    let final_stats = realm.collect_garbage().expect("final full collection");
+    assert_eq!(final_stats.live, 0, "no short-lived object leaks");
+}

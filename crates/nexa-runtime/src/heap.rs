@@ -2665,6 +2665,12 @@ impl Heap {
         self.gc_phase
     }
 
+    /// Configured object-slot ceiling (G2 trigger input).
+    #[must_use]
+    pub const fn max_objects(&self) -> u32 {
+        self.max_objects
+    }
+
     /// G1 insertion barrier: while a mark phase is active, a reference
     /// value being published into a live object is shaded gray so the
     /// tri-color invariant holds under mutation. Duplicate shades are

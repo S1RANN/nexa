@@ -17,14 +17,15 @@ use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, St
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
-    FuelState, GcRef, GcRoots, Heap, HeapError, HostCallOutcome, HostCompletionDelivery,
-    HostCompletionResult, HostErrorPayload, HostPayload, HostRegistry, HostRequestError,
-    HostRequestHandle, HostTrap, InterpreterError, InterpreterHost, InterpreterHostOutcome,
-    InterpreterOutcome, InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
-    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue,
-    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
-    TaskRuntime, TaskState, Trap, TrapKind,
+    FuelState, GcBudget, GcPhase, GcRef, GcRoots, Heap, HeapError, HostCallOutcome,
+    HostCompletionDelivery, HostCompletionResult, HostErrorPayload, HostPayload, HostRegistry,
+    HostRequestError, HostRequestHandle, HostTrap, IncrementalGcReport, InterpreterError,
+    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object,
+    OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
+    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeHostState, RuntimeLimits,
+    RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError,
+    SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
+    TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1160,6 +1161,9 @@ pub struct RealmRuntime {
     host_registry_contract_id: Option<StableId>,
     runtime_host: Option<RuntimeHost>,
     failure_injector: crate::RuntimeFailureInjector,
+    /// G2 trigger baseline: cumulative object allocations at the moment
+    /// the last incremental cycle completed.
+    gc_cycle_baseline: u64,
 }
 
 impl RealmRuntime {
@@ -1211,6 +1215,7 @@ impl RealmRuntime {
             host_registry_contract_id: None,
             runtime_host: None,
             failure_injector,
+            gc_cycle_baseline: 0,
         }
     }
 
@@ -3159,6 +3164,14 @@ impl RealmRuntime {
     }
 
     pub fn collect_garbage(&mut self) -> Result<CollectionStats, RealmError> {
+        let roots = self.gc_roots()?;
+        Ok(self.heap.collect(&roots)?)
+    }
+
+    /// Precise root snapshot shared by full and incremental collection:
+    /// suspended task continuations, retained terminal values, module
+    /// globals, stateful registries, and host staging roots.
+    fn gc_roots(&mut self) -> Result<GcRoots, RealmError> {
         let mut roots = GcRoots::default();
         for task in self.tasks.task_handles() {
             let snapshot = self.tasks.task_snapshot(task)?;
@@ -3185,7 +3198,46 @@ impl RealmRuntime {
             roots.stateful_registry.extend(module.state.gc_roots());
             roots.staging_heap.extend_from_slice(&module.staging_roots);
         }
-        Ok(self.heap.collect(&roots)?)
+        Ok(roots)
+    }
+
+    /// One budgeted incremental collection step over the realm's precise
+    /// roots (G2). Ordinary gameplay drives cycles through this entry;
+    /// explicit full collection stays available for tests, inspection,
+    /// and shutdown.
+    pub fn collect_garbage_incremental(
+        &mut self,
+        budget: GcBudget,
+    ) -> Result<IncrementalGcReport, RealmError> {
+        let roots = self.gc_roots()?;
+        let report = self.heap.collect_incremental(&roots, budget)?;
+        if report.completed.is_some() {
+            self.gc_cycle_baseline = self.heap.vm_allocation_counters().object_allocations;
+        }
+        Ok(report)
+    }
+
+    /// Water-mark trigger (G2): advances an active cycle, or starts one
+    /// when live slots pass 3/4 of the ceiling or allocations since the
+    /// last completed cycle exceed half the ceiling. Returns `None` when
+    /// the heap is idle and no trigger fires.
+    pub fn maybe_collect_garbage_incremental(
+        &mut self,
+        budget: GcBudget,
+    ) -> Result<Option<IncrementalGcReport>, RealmError> {
+        let ceiling = self.heap.max_objects() as usize;
+        let cycle_active = self.heap.gc_phase() != GcPhase::Idle;
+        let live_pressure = self.heap.live_len().saturating_mul(4) >= ceiling.saturating_mul(3);
+        let allocated_since = self
+            .heap
+            .vm_allocation_counters()
+            .object_allocations
+            .saturating_sub(self.gc_cycle_baseline);
+        let allocation_pressure = allocated_since >= (ceiling as u64).div_ceil(2);
+        if !(cycle_active || live_pressure || allocation_pressure) {
+            return Ok(None);
+        }
+        self.collect_garbage_incremental(budget).map(Some)
     }
 
     pub fn allocate(&mut self, object: Object) -> Result<GcRef, RealmError> {
