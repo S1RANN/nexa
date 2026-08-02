@@ -3,6 +3,7 @@
 //! Parsing, name resolution, and type checking live in `nexa-syntax` and
 //! `nexa-analysis`. This crate only lowers typed package IR to verified bytecode.
 
+pub mod cache;
 mod package;
 mod snippet;
 mod typed;

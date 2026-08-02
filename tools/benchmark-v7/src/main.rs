@@ -711,6 +711,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ));
 
+    // Stage I: the same pipeline behind the source cache. The steady-state
+    // sample is one key hash + one shared-module hit + predecode + run -
+    // the warm REPL/reload cost shape the cache exists for.
+    let source_cache = nexa_compiler::cache::SourceCache::new(8);
+    cases.push(bench(
+        "product_cached_pipeline",
+        "product",
+        samples,
+        || (),
+        |()| {
+            let verified = source_cache
+                .compile(LANGUAGE_SOURCE)
+                .expect("cached benchmark language compiles");
+            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+                .expect("cached benchmark language predecodes");
+            let mut heap = Heap::new_with_limits(64, 4_096, 64);
+            run_returned(
+                &verified,
+                &rows,
+                0,
+                &[RuntimeValue::I32(41)],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            )
+        },
+    ));
+    assert!(
+        source_cache.stats().hits > 0,
+        "the cached pipeline case must exercise the hit path"
+    );
+
     let fast = fast_module();
     let snapshot_host = RuntimeHost::new(4_096);
     let mut snapshot_realm = RealmRuntime::hosted(

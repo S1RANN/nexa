@@ -412,6 +412,7 @@ fn main() -> Result<(), DynError> {
         "test-optimization-differential" => test_optimization_differential(),
         "test-executable-parity" => test_executable_parity(),
         "test-incremental-gc" => test_incremental_gc(),
+        "test-source-cache" => test_source_cache(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -522,6 +523,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_optimization_differential()?;
     test_executable_parity()?;
     test_incremental_gc()?;
+    test_source_cache()?;
     cargo(&[
         "run",
         "--release",
@@ -1466,6 +1468,12 @@ fn test_executable_parity() -> Result<(), DynError> {
 /// insertion-barrier safety under mutation, and born-black allocation.
 fn test_incremental_gc() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "incremental_gc"])
+}
+
+/// M5 stage-I gate: the source compilation cache serves byte-identical
+/// artifacts, keys on contract identity, and respects its bound.
+fn test_source_cache() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-compiler", "--test", "source_cache"])
 }
 
 #[allow(clippy::too_many_lines)]
