@@ -28,6 +28,14 @@ const SMOKE_SAMPLES: usize = 20;
 const WARMUP: usize = 100;
 const HOST: StableId = StableId(0x4245_4e43_4848_4f53);
 const BENCH_TASK_EXPORT: StableId = StableId(0x4245_4e43_4854_4153);
+// J3: the three comparable pure-computation product workloads shared with
+// the V8 comparison harness (tools/benchmark-v7/v8/harness.js).
+const PRODUCT_DATA_SWEEP_FUNCTION: u32 = 11;
+const PRODUCT_COMBAT_TICK_FUNCTION: u32 = 12;
+const PRODUCT_GRID_SCORE_FUNCTION: u32 = 13;
+const PRODUCT_DATA_SWEEP_FUEL: u64 = 2_000_000;
+const PRODUCT_COMBAT_TICK_FUEL: u64 = 4_000_000;
+const PRODUCT_GRID_SCORE_FUEL: u64 = 4_000_000;
 
 struct CountingAllocator;
 
@@ -429,6 +437,12 @@ struct AggregateCase {
 #[allow(clippy::too_many_lines)]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    if arguments
+        .iter()
+        .any(|argument| argument == "--verify-products")
+    {
+        return verify_products();
+    }
     let smoke = arguments.iter().any(|argument| argument == "--smoke");
     let samples = argument_value(&arguments, "--samples")
         .map(str::parse)
@@ -685,10 +699,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_returned(
                 &language,
                 &language_rows,
-                11,
+                PRODUCT_DATA_SWEEP_FUNCTION,
                 &[],
                 &mut heap,
-                2_000_000,
+                PRODUCT_DATA_SWEEP_FUEL,
                 &mut continuation_pool,
             )
         },
@@ -704,10 +718,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_returned(
                 &language,
                 &language_rows,
-                12,
+                PRODUCT_COMBAT_TICK_FUNCTION,
                 &[],
                 &mut heap,
-                4_000_000,
+                PRODUCT_COMBAT_TICK_FUEL,
                 &mut continuation_pool,
             )
         },
@@ -723,10 +737,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             run_returned(
                 &language,
                 &language_rows,
-                13,
+                PRODUCT_GRID_SCORE_FUNCTION,
                 &[],
                 &mut heap,
-                4_000_000,
+                PRODUCT_GRID_SCORE_FUEL,
                 &mut continuation_pool,
             )
         },
@@ -1325,6 +1339,75 @@ fn product_grid_score() -> i32 {
     return score;
 }
 "#;
+
+/// J3: prints the product-workload results for the V8 comparison
+/// result-parity handshake. Nothing is timed; each function runs once
+/// through the same predecoded-row path the benchmark cases execute.
+fn verify_products() -> Result<(), Box<dyn std::error::Error>> {
+    let language = nexa_compiler::compile(LANGUAGE_SOURCE)?;
+    let rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
+    let report = serde_json::json!({
+        "product_data_sweep": returned_i32(
+            &language,
+            &rows,
+            PRODUCT_DATA_SWEEP_FUNCTION,
+            PRODUCT_DATA_SWEEP_FUEL,
+        ),
+        "product_combat_tick": returned_i32(
+            &language,
+            &rows,
+            PRODUCT_COMBAT_TICK_FUNCTION,
+            PRODUCT_COMBAT_TICK_FUEL,
+        ),
+        "product_grid_score": returned_i32(
+            &language,
+            &rows,
+            PRODUCT_GRID_SCORE_FUNCTION,
+            PRODUCT_GRID_SCORE_FUEL,
+        ),
+    });
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+/// Runs one argument-less product function to completion and returns its
+/// i32 result.
+fn returned_i32(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    fuel: u64,
+) -> i32 {
+    let limits = FrameLimits::default();
+    let continuation = nexa_runtime::InterpreterContinuation::new_with_storage(
+        module,
+        function,
+        &[],
+        limits,
+        ContinuationReservation::for_limits(limits),
+        None,
+    )
+    .expect("verified product function starts");
+    let mut heap = Heap::new_with_limits(1_024, 65_536, 512);
+    let mut pool = None;
+    let outcome = CheckedInterpreter::poll_recycling(
+        module,
+        continuation,
+        FuelState::new(fuel, 0, u64::MAX),
+        &OpcodeCostTable::default(),
+        Some(&mut heap),
+        Some(executable),
+        &mut pool,
+    )
+    .expect("verified product function");
+    let InterpreterOutcome::Returned { value, .. } = outcome else {
+        panic!("product function did not return");
+    };
+    match value {
+        Some(RuntimeValue::I32(result)) => result,
+        other => panic!("product function returned a non-i32 value: {other:?}"),
+    }
+}
 
 fn run_returned(
     module: &VerifiedModule,

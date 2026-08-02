@@ -414,6 +414,7 @@ fn main() -> Result<(), DynError> {
         "test-incremental-gc" => test_incremental_gc(),
         "test-source-cache" => test_source_cache(),
         "m5-final-report" => m5_final_report(),
+        "m5-v8-comparison" => m5_v8_comparison(),
         "test-m4-source" => m4::test_m4_source(),
         "test-m4-semantics" => m4::test_m4_semantics(),
         "test-m4-incremental" => m4::test_m4_incremental(),
@@ -1565,10 +1566,7 @@ fn m5_final_report() -> Result<(), DynError> {
             "recorded_functions": function_count,
             "dropped_functions": dropped_functions,
         },
-        "c4_v8_gap": {
-            "status": "pending-environment",
-            "note": "requires a qualified V8/Node environment; its absence blocks only this report per JIT_DECISION_V1.md",
-        },
+        "c4_v8_gap": v8_gap_condition(&final_dir, &aggregate),
         "c5_llvm_amortization": {
             "status": "pending",
             "note": "depends on the c4 workload mapping and an LLVM cost prototype",
@@ -1578,10 +1576,19 @@ fn m5_final_report() -> Result<(), DynError> {
             "note": "ExecutableModule schema and ValueLayout may still change until M5a finalize",
         },
     });
+    let mut blockers = Vec::new();
+    if !matches!(
+        conditions["c4_v8_gap"]["status"].as_str(),
+        Some("satisfied" | "not-satisfied")
+    ) {
+        blockers.push("v8-comparison-environment");
+    }
+    blockers.push("m5a-finalize-freeze");
+    let rendered_blockers = blockers.join(", ");
     let decision = serde_json::json!({
         "schema": 1,
         "decision": "PENDING",
-        "blockers": ["v8-comparison-environment", "m5a-finalize-freeze"],
+        "blockers": blockers,
         "conditions": conditions,
         "aggregate_artifact": "target/nexa-artifacts/m5/final/aggregate-7x1000.json",
         "profile_artifact": "target/nexa-artifacts/m5/final/profile-1x200.json",
@@ -1602,9 +1609,10 @@ fn m5_final_report() -> Result<(), DynError> {
         serde_json::to_vec_pretty(&report)?,
     )?;
     let mut markdown = String::from("# M5 Performance Report (generated)\n\n");
-    markdown.push_str(
-        "Decision state: **PENDING** (blockers: V8 environment, M5a finalize freeze).\n\n",
-    );
+    writeln!(
+        markdown,
+        "Decision state: **PENDING** (blockers: {rendered_blockers}).\n",
+    )?;
     markdown
         .push_str("| case | tier | p50 (ns) | p99 (ns) | max allocs |\n|---|---|---|---|---|\n");
     if let Some(cases) = aggregate["cases"].as_array() {
@@ -1631,6 +1639,226 @@ fn m5_final_report() -> Result<(), DynError> {
     )?;
     fs::write(final_dir.join("performance-report.md"), markdown)?;
     println!("m5-final-report: PENDING decision written to target/nexa-artifacts/m5/final/");
+    Ok(())
+}
+
+/// Renders GO condition c4 from the stage-J V8 comparison artifact. A
+/// missing or stale artifact keeps the condition pending without blocking
+/// the rest of the report (`JIT_DECISION_V1.md`).
+fn v8_gap_condition(final_dir: &Path, aggregate: &Value) -> Value {
+    let comparison: Option<Value> = fs::read(final_dir.join("v8-comparison.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let Some(comparison) = comparison else {
+        return serde_json::json!({
+            "status": "pending-environment",
+            "note": "run cargo xtask m5-v8-comparison on a machine with a qualified Node/V8 toolchain; its absence blocks only this report per JIT_DECISION_V1.md",
+        });
+    };
+    if comparison["nexa_implementation_commit"] != aggregate["implementation_commit"] {
+        return serde_json::json!({
+            "status": "stale",
+            "note": "v8-comparison.json was produced at a different commit; rerun cargo xtask m5-v8-comparison",
+        });
+    }
+    let satisfied = comparison["c4_v8_gap_satisfied"].as_bool() == Some(true);
+    serde_json::json!({
+        "status": if satisfied { "satisfied" } else { "not-satisfied" },
+        "note": "warm V8 versus the Nexa interpreter over the comparable pure-computation product workloads",
+        "node_version": comparison["node_version"],
+        "v8_version": comparison["v8_version"],
+        "workloads": comparison["workloads"],
+        "workloads_with_v8_lead_at_least_1_5x": comparison["workloads_with_v8_lead_at_least_1_5x"],
+    })
+}
+
+/// The formal V8-side process count; mirrors the WP11 protocol used for
+/// the Nexa aggregate.
+const V8_COMPARISON_PROCESSES: usize = 7;
+const V8_COMPARISON_SAMPLES: usize = 1_000;
+
+/// M5 stage-J: the warm-V8 comparison input for GO condition c4
+/// (`JIT_DECISION_V1.md`). Pins the Node/V8 versions, proves result parity
+/// between the Nexa product workloads and their JavaScript mirrors, then
+/// compares median-of-process p50 latencies under the formal 7x1000
+/// protocol. A missing Node environment fails only this command, never
+/// the rest of M5.
+#[allow(
+    clippy::too_many_lines,
+    // Ratio displays only; the mantissa bound is irrelevant here.
+    clippy::cast_precision_loss
+)]
+fn m5_v8_comparison() -> Result<(), DynError> {
+    let root = workspace_root();
+    let final_dir = root.join("target/nexa-artifacts/m5/final");
+    fs::create_dir_all(&final_dir)?;
+    let node_version = captured_stdout(
+        Command::new("node").arg("--version").current_dir(&root),
+        "node --version",
+    )
+    .map_err(|error| -> DynError {
+        format!(
+            "no qualified V8 environment: {error}; per JIT_DECISION_V1.md this blocks only \
+             the comparison report, not the rest of M5"
+        )
+        .into()
+    })?
+    .trim()
+    .to_owned();
+
+    // Result-parity handshake: the JavaScript mirrors must return exactly
+    // what the Nexa interpreter returns before any timing is comparable.
+    let nexa_results: Value = serde_json::from_str(&captured_stdout(
+        Command::new("cargo")
+            .args([
+                "run",
+                "--release",
+                "--quiet",
+                "-p",
+                "nexa-benchmark-v7",
+                "--",
+                "--verify-products",
+            ])
+            .current_dir(&root),
+        "nexa-benchmark-v7 --verify-products",
+    )?)?;
+
+    // Warm V8 side: independent processes, each with its own warmup,
+    // mirroring the WP11 multi-process protocol.
+    let harness = root.join("tools/benchmark-v7/v8/harness.js");
+    let samples = V8_COMPARISON_SAMPLES.to_string();
+    let mut v8_reports = Vec::with_capacity(V8_COMPARISON_PROCESSES);
+    for process_index in 0..V8_COMPARISON_PROCESSES {
+        let report: Value = serde_json::from_str(&captured_stdout(
+            Command::new("node")
+                .arg(&harness)
+                .args([
+                    "--samples",
+                    &samples,
+                    "--process-index",
+                    &process_index.to_string(),
+                ])
+                .current_dir(&root),
+            "v8 comparison harness",
+        )?)?;
+        eprintln!(
+            "v8 process {}/{V8_COMPARISON_PROCESSES} complete",
+            process_index + 1
+        );
+        v8_reports.push(report);
+    }
+    let v8_version = v8_reports[0]["v8_version"]
+        .as_str()
+        .ok_or("v8 harness report omitted its V8 version")?
+        .to_owned();
+
+    // Nexa side: reuse the formal aggregate when it was produced at this
+    // commit; otherwise regenerate it through the measurement authority.
+    let head = git_output(&["rev-parse", "HEAD"])?;
+    let aggregate_path = final_dir.join("aggregate-7x1000.json");
+    let existing: Option<Value> = fs::read(&aggregate_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let (aggregate, aggregate_provenance) = match existing {
+        Some(aggregate) if aggregate["implementation_commit"].as_str() == Some(head.as_str()) => {
+            (aggregate, "reused: produced at this commit")
+        }
+        _ => {
+            cargo(&[
+                "run",
+                "--release",
+                "--quiet",
+                "-p",
+                "nexa-benchmark-v7",
+                "--",
+                "--samples",
+                &samples,
+                "--processes",
+                &V8_COMPARISON_PROCESSES.to_string(),
+                "--output",
+                aggregate_path.to_str().ok_or("non-UTF-8 artifact path")?,
+            ])?;
+            (
+                serde_json::from_slice(&fs::read(&aggregate_path)?)?,
+                "generated by this run",
+            )
+        }
+    };
+
+    let mut workloads = Vec::new();
+    let mut leads = 0_usize;
+    let mut parity_failures = Vec::new();
+    for workload in [
+        "product_data_sweep",
+        "product_combat_tick",
+        "product_grid_score",
+    ] {
+        let expected = nexa_results[workload]
+            .as_i64()
+            .ok_or_else(|| format!("--verify-products omitted {workload}"))?;
+        let mut v8_p50s = Vec::with_capacity(v8_reports.len());
+        for report in &v8_reports {
+            let case = report["cases"]
+                .as_array()
+                .and_then(|cases| cases.iter().find(|case| case["case"] == workload))
+                .ok_or_else(|| format!("v8 report omitted {workload}"))?;
+            if case["result"].as_i64() != Some(expected) {
+                parity_failures.push(format!(
+                    "{workload}: v8 returned {} but Nexa returned {expected}",
+                    case["result"]
+                ));
+            }
+            v8_p50s.push(
+                case["p50_ns"]
+                    .as_u64()
+                    .ok_or_else(|| format!("v8 report omitted p50 for {workload}"))?,
+            );
+        }
+        v8_p50s.sort_unstable();
+        let v8_p50 = v8_p50s[v8_p50s.len() / 2];
+        let nexa_p50 = aggregate["cases"]
+            .as_array()
+            .and_then(|cases| cases.iter().find(|case| case["case"] == workload))
+            .and_then(|case| case["median_p50_ns"].as_u64())
+            .ok_or_else(|| format!("nexa aggregate omitted {workload}"))?;
+        let lead = nexa_p50 as f64 / v8_p50.max(1) as f64;
+        if lead >= 1.5 {
+            leads += 1;
+        }
+        workloads.push(serde_json::json!({
+            "case": workload,
+            "result": expected,
+            "nexa_median_p50_ns": nexa_p50,
+            "v8_median_p50_ns": v8_p50,
+            "v8_lead_ratio": (lead * 100.0).round() / 100.0,
+        }));
+    }
+    if !parity_failures.is_empty() {
+        return Err(format!(
+            "V8/Nexa result parity failed:\n{}",
+            parity_failures.join("\n")
+        )
+        .into());
+    }
+
+    let comparison = serde_json::json!({
+        "schema": 1,
+        "protocol": "7 processes x 1000 samples per side; median across process medians; per-process warmup",
+        "discipline": "warm V8 JIT-compiled code measured against the Nexa interpreter (JIT_DECISION_V1.md)",
+        "node_version": node_version,
+        "v8_version": v8_version,
+        "nexa_implementation_commit": aggregate["implementation_commit"],
+        "nexa_aggregate": aggregate_provenance,
+        "result_parity": "all workloads returned identical results in both runtimes",
+        "workloads": workloads,
+        "workloads_with_v8_lead_at_least_1_5x": leads,
+        "c4_v8_gap_satisfied": leads >= 3,
+    });
+    fs::write(
+        final_dir.join("v8-comparison.json"),
+        format!("{}\n", serde_json::to_string_pretty(&comparison)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&comparison)?);
     Ok(())
 }
 
@@ -3199,6 +3427,22 @@ fn repo_audit() -> Result<(), DynError> {
 
 fn cargo(arguments: &[&str]) -> Result<(), DynError> {
     cargo_with_environment(arguments, &[])
+}
+
+/// Runs one command to completion and returns its stdout, failing with
+/// the captured stderr when the command does not succeed.
+fn captured_stdout(command: &mut Command, label: &str) -> Result<String, DynError> {
+    let output = command
+        .output()
+        .map_err(|error| format!("{label}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "{label} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn cargo_with_environment(
