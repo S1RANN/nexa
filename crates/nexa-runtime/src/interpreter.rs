@@ -730,6 +730,37 @@ impl CheckedInterpreter {
         )
     }
 
+    /// H2: the engine fast path for embedders driving many short task
+    /// lifecycles through one call site. Terminal exits hand the frame
+    /// arena's storage back through `recycle`; feeding it into the next
+    /// [`InterpreterContinuation::new_with_storage`] makes steady-state
+    /// churn allocation-free, exactly like realm task admission (H1).
+    /// Suspensions leave the slot untouched. Outcomes and fuel accounting
+    /// are identical to the non-recycling entry points.
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_recycling(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: Option<&mut Heap>,
+        executable: Option<&crate::executable::ExecutableModule>,
+        recycle: &mut Option<FrameArena>,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            None,
+            heap,
+            executable,
+            Some(recycle),
+        )
+    }
+
     pub fn poll_with_host_and_heap(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,

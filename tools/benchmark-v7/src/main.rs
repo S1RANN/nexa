@@ -455,6 +455,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let language = nexa_compiler::compile(LANGUAGE_SOURCE)?;
     // Stage F: rows are built once at load, exactly like realm admission.
     let language_rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
+    // Stage H: one pooled continuation arena serves every steady-state case;
+    // cold-start cases pass a fresh empty pool on purpose.
+    let mut continuation_pool: Option<nexa_runtime::FrameArena> = None;
     let bytecode_hash = blake3::hash(&language.module().encode())
         .to_hex()
         .to_string();
@@ -473,6 +476,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &[RuntimeValue::I32(41)],
                 &mut heap,
                 256,
+                &mut continuation_pool,
             )
         },
     ));
@@ -489,8 +493,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &[RuntimeValue::I32(7)],
                 &mut heap,
                 256,
+                &mut continuation_pool,
             );
-            let second = run_returned(&language, &language_rows, 2, &[], &mut heap, 256);
+            let second = run_returned(
+                &language,
+                &language_rows,
+                2,
+                &[],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            );
             combine(first, second, heap.live_len())
         },
     ));
@@ -499,7 +512,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "micro",
         samples,
         || (),
-        |()| run_two_slices(&language, 3, false),
+        |()| run_two_slices(&language, 3, false, &mut continuation_pool),
     ));
     let explicit = explicit_resume_module();
     cases.push(bench(
@@ -507,49 +520,109 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "micro",
         samples,
         || (),
-        |()| run_two_slices(&explicit, 0, true),
+        |()| run_two_slices(&explicit, 0, true, &mut continuation_pool),
     ));
     cases.push(bench(
         "string_concat",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 4, &[], &mut heap, 256),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                4,
+                &[],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "struct_construction",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 5, &[], &mut heap, 256),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                5,
+                &[],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "class_allocation",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 6, &[], &mut heap, 256),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                6,
+                &[],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "enum_construction_match",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 7, &[], &mut heap, 256),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                7,
+                &[],
+                &mut heap,
+                256,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "array_operations",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 8, &[], &mut heap, 512),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                8,
+                &[],
+                &mut heap,
+                512,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "map_operations",
         "micro",
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
-        |mut heap| run_returned(&language, &language_rows, 9, &[], &mut heap, 512),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                9,
+                &[],
+                &mut heap,
+                512,
+                &mut continuation_pool,
+            )
+        },
     ));
     let buffer_type = language.module().buffer_types[0];
     cases.push(bench(
@@ -590,6 +663,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &[destination, source],
                 &mut heap,
                 512,
+                &mut continuation_pool,
             )
         },
     ));
@@ -598,7 +672,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "product",
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
-        |mut heap| run_returned(&language, &language_rows, 11, &[], &mut heap, 2_000_000),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                11,
+                &[],
+                &mut heap,
+                2_000_000,
+                &mut continuation_pool,
+            )
+        },
     ));
     cases.push(bench(
         "product_standalone_pipeline",
@@ -613,6 +697,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
                 .expect("benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
+            // Cold start on purpose: the arena reservation is part of the
+            // standalone-pipeline cost shape, so no pooled storage here.
             run_returned(
                 &verified,
                 &rows,
@@ -620,6 +706,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &[RuntimeValue::I32(41)],
                 &mut heap,
                 256,
+                &mut None,
             )
         },
     ));
@@ -1116,12 +1203,32 @@ fn run_returned(
     arguments: &[RuntimeValue],
     heap: &mut Heap,
     fuel: u64,
+    pool: &mut Option<nexa_runtime::FrameArena>,
 ) -> Observation {
     // Stage F: the measurement authority executes the predecoded-row form,
     // which is what product realms run; fuel parity with the portable
-    // interpreter is enforced by the executable_parity gate.
-    let outcome = CheckedInterpreter::run_with_heap_and_executable(
-        module, function, arguments, fuel, heap, executable,
+    // interpreter is enforced by the executable_parity gate. Stage H: the
+    // continuation storage cycles through `pool` exactly like realm task
+    // admission, so steady-state samples measure execution, not arena
+    // reservation; cold-start cases pass a fresh empty pool on purpose.
+    let limits = FrameLimits::default();
+    let continuation = nexa_runtime::InterpreterContinuation::new_with_storage(
+        module,
+        function,
+        arguments,
+        limits,
+        ContinuationReservation::for_limits(limits),
+        pool.take(),
+    )
+    .expect("verified benchmark function starts");
+    let outcome = CheckedInterpreter::poll_recycling(
+        module,
+        continuation,
+        FuelState::new(fuel, 0, u64::MAX),
+        &OpcodeCostTable::default(),
+        Some(heap),
+        Some(executable),
+        pool,
     )
     .expect("verified benchmark function");
     let InterpreterOutcome::Returned { charge, value, .. } = outcome else {
@@ -1131,22 +1238,31 @@ fn run_returned(
     observation(charge, heap)
 }
 
-fn run_two_slices(module: &VerifiedModule, function: u32, explicit: bool) -> Observation {
+fn run_two_slices(
+    module: &VerifiedModule,
+    function: u32,
+    explicit: bool,
+    pool: &mut Option<nexa_runtime::FrameArena>,
+) -> Observation {
     let limits = FrameLimits::default();
-    let continuation = CheckedInterpreter::start(
+    let continuation = nexa_runtime::InterpreterContinuation::new_with_storage(
         module,
         function,
         &[RuntimeValue::I32(7)],
         limits,
         ContinuationReservation::for_limits(limits),
+        pool.take(),
     )
     .expect("benchmark continuation");
     let first_fuel = if explicit { 64 } else { 1 };
-    let first = CheckedInterpreter::poll(
+    let first = CheckedInterpreter::poll_recycling(
         module,
         continuation,
         FuelState::new(first_fuel, 0, 1_024),
         &OpcodeCostTable::default(),
+        None,
+        None,
+        pool,
     )
     .expect("first benchmark slice");
     let InterpreterOutcome::Suspended {
@@ -1158,11 +1274,14 @@ fn run_two_slices(module: &VerifiedModule, function: u32, explicit: bool) -> Obs
     else {
         panic!("benchmark function did not suspend");
     };
-    let second = CheckedInterpreter::poll(
+    let second = CheckedInterpreter::poll_recycling(
         module,
         continuation,
         FuelState::new(64, fuel.cumulative_used, 1_024),
         &OpcodeCostTable::default(),
+        None,
+        None,
+        pool,
     )
     .expect("second benchmark slice");
     let InterpreterOutcome::Returned {
