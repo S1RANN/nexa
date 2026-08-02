@@ -1356,6 +1356,9 @@ fn realm_error_code(error: &RealmError) -> ErrorCode {
         | RealmError::Host(_)
         | RealmError::Heap(_)
         | RealmError::ModuleHandle(_)
+        // A verified module that fails predecoding is an internal
+        // inconsistency, not a user-facing admission class.
+        | RealmError::ExecutableBuild(_)
         | RealmError::MissingModule(_)
         | RealmError::ModuleNotCallable
         | RealmError::TerminalTask

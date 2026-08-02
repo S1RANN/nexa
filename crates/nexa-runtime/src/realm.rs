@@ -52,6 +52,9 @@ pub struct ModuleEpochRoot {
     pub stateful_domain: StatefulDomainId,
     pub epoch: u64,
     pub verified: Arc<VerifiedModule>,
+    /// F2: predecoded execution rows built once at load; the step path
+    /// consumes them instead of recomputing static fuel and safepoints.
+    pub executable: Arc<crate::executable::ExecutableModule>,
     pub host_contract_id: StableId,
     pub lifecycle: ModuleLifecycle,
     globals: Vec<GcRef>,
@@ -1014,6 +1017,7 @@ pub enum RealmError {
     Heap(HeapError),
     ModuleAllocation(SlotAllocError),
     ModuleHandle(crate::HandleError),
+    ExecutableBuild(crate::executable::ExecutableBuildError),
     MissingModule(u32),
     HostCapabilitiesUnavailable,
     MissingHostContractRuntimeId,
@@ -1569,6 +1573,10 @@ impl RealmRuntime {
             .next_stateful_domain
             .checked_add(1)
             .ok_or(RealmError::EpochExhausted)?;
+        // F2: the predecoded rows are part of module admission; a module
+        // that cannot build them never becomes executable.
+        let executable = crate::executable::ExecutableModule::build(&verified, &self.cost_table)
+            .map_err(RealmError::ExecutableBuild)?;
         let raw = self
             .modules
             .try_allocate(ModuleEpochRoot {
@@ -1576,6 +1584,7 @@ impl RealmRuntime {
                 stateful_domain,
                 epoch,
                 verified: Arc::new(verified),
+                executable: Arc::new(executable),
                 host_contract_id,
                 lifecycle: ModuleLifecycle::Active,
                 globals: Vec::new(),
@@ -2866,6 +2875,7 @@ impl RealmRuntime {
             return Err(RealmError::MissingModule(snapshot.module_id));
         }
         let verified = Arc::clone(&module.verified);
+        let executable = Arc::clone(&module.executable);
         let mut state_bridge = RealmStateBridge {
             registry: Arc::make_mut(&mut module.state),
         };
@@ -2886,6 +2896,7 @@ impl RealmRuntime {
                 &mut bridge,
                 &mut state_bridge,
                 &mut self.heap,
+                Some(&executable),
             )?
         } else {
             CheckedInterpreter::poll_with_heap_and_state(
@@ -2895,6 +2906,7 @@ impl RealmRuntime {
                 &self.cost_table,
                 &mut state_bridge,
                 &mut self.heap,
+                Some(&executable),
             )?
         };
         match outcome {

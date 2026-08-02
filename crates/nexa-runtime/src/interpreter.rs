@@ -617,7 +617,17 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute(module, continuation, fuel, costs, None, None, None, None)
+        Self::execute(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
     }
 
     pub fn poll_with_host(
@@ -633,6 +643,7 @@ impl CheckedInterpreter {
             fuel,
             costs,
             Some(host),
+            None,
             None,
             None,
             None,
@@ -655,6 +666,7 @@ impl CheckedInterpreter {
             None,
             None,
             Some(heap),
+            None,
         )
     }
 
@@ -675,6 +687,7 @@ impl CheckedInterpreter {
             None,
             None,
             Some(heap),
+            None,
         )
     }
 
@@ -685,6 +698,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         state: &mut dyn InterpreterState,
         heap: &mut Heap,
+        executable: Option<&crate::executable::ExecutableModule>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         Self::execute(
             module,
@@ -695,9 +709,11 @@ impl CheckedInterpreter {
             None,
             Some(state),
             Some(heap),
+            executable,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn poll_with_host_heap_and_state(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,
@@ -706,6 +722,7 @@ impl CheckedInterpreter {
         host: &mut dyn InterpreterHost,
         state: &mut dyn InterpreterState,
         heap: &mut Heap,
+        executable: Option<&crate::executable::ExecutableModule>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         Self::execute(
             module,
@@ -716,6 +733,7 @@ impl CheckedInterpreter {
             None,
             Some(state),
             Some(heap),
+            executable,
         )
     }
 
@@ -789,6 +807,7 @@ impl CheckedInterpreter {
             Some(migration),
             None,
             None,
+            None,
         )
     }
 
@@ -817,6 +836,7 @@ impl CheckedInterpreter {
             Some(migration),
             None,
             Some(heap),
+            None,
         )
     }
 
@@ -924,6 +944,7 @@ impl CheckedInterpreter {
         mut migration: Option<&mut dyn InterpreterMigration>,
         mut state_registry: Option<&mut dyn InterpreterState>,
         mut heap: Option<&mut Heap>,
+        executable: Option<&crate::executable::ExecutableModule>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         costs.validate_version()?;
         continuation.suspend_reason = None;
@@ -1046,31 +1067,65 @@ impl CheckedInterpreter {
                 .functions
                 .get(frame.function as usize)
                 .ok_or(InterpreterError::MissingFunction(frame.function))?;
-            let instruction = *function
-                .code
-                .get(frame.pc as usize)
-                .ok_or(InterpreterError::FellOffFunction)?;
-            let instruction_cost = instruction_attempt_fuel(
-                module.module(),
-                module.nominal_index_shape(),
-                instruction,
-                &continuation.arena,
-                heap.as_deref(),
-                costs,
-            )?
-            .checked_add(if let Instruction::HostCall { import, .. } = instruction {
-                u64::from(
-                    module
-                        .module()
-                        .host_imports
-                        .get(import as usize)
-                        .ok_or(InterpreterError::HostUnavailable)?
-                        .fuel_cost,
-                )
+            let instruction;
+            let instruction_cost;
+            let safepoint;
+            if let Some(rows) = executable {
+                // F2: the predecoded row carries the full static charge
+                // (HostCall import surcharge folded at build time) and the
+                // load-time safepoint flag; only operand-dependent
+                // surcharges still consult the arena and heap.
+                let row = rows
+                    .functions()
+                    .get(frame.function as usize)
+                    .and_then(|function| function.rows().get(frame.pc as usize))
+                    .ok_or(InterpreterError::FellOffFunction)?;
+                debug_assert_eq!(
+                    Some(&row.instruction),
+                    function.code.get(frame.pc as usize),
+                    "predecoded row diverges from verified bytecode"
+                );
+                instruction = row.instruction;
+                instruction_cost = match row.static_fuel {
+                    Some(static_fuel) => static_fuel,
+                    None => dynamic_instruction_fuel(
+                        module.module(),
+                        module.nominal_index_shape(),
+                        row.instruction,
+                        &continuation.arena,
+                        heap.as_deref(),
+                        costs,
+                    )?,
+                };
+                safepoint = row.safepoint;
             } else {
-                0
-            })
-            .ok_or(InterpreterError::FuelCostOverflow)?;
+                instruction = *function
+                    .code
+                    .get(frame.pc as usize)
+                    .ok_or(InterpreterError::FellOffFunction)?;
+                instruction_cost = instruction_attempt_fuel(
+                    module.module(),
+                    module.nominal_index_shape(),
+                    instruction,
+                    &continuation.arena,
+                    heap.as_deref(),
+                    costs,
+                )?
+                .checked_add(if let Instruction::HostCall { import, .. } = instruction {
+                    u64::from(
+                        module
+                            .module()
+                            .host_imports
+                            .get(import as usize)
+                            .ok_or(InterpreterError::HostUnavailable)?
+                            .fuel_cost,
+                    )
+                } else {
+                    0
+                })
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+                safepoint = is_safepoint(instruction, frame.pc);
+            }
             let settlement = pending_cost
                 .checked_add(instruction_cost)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
@@ -1079,7 +1134,7 @@ impl CheckedInterpreter {
                     function.code.get(frame.pc as usize - 1),
                     Some(Instruction::HostCall { .. })
                 );
-            if frame.pc == 0 || host_resume || is_safepoint(instruction, frame.pc) {
+            if frame.pc == 0 || host_resume || safepoint {
                 let cumulative_after = fuel
                     .cumulative_used
                     .checked_add(settlement)
@@ -4310,6 +4365,102 @@ mod tests {
         ContinuationReservation, FrameError, FrameLimits, GcRoots, Heap, HeapError, MapSetOutcome,
         Object, OpcodeCostTable, RuntimeValue,
     };
+
+    /// F2: the predecoded-row path and the recompute path must charge
+    /// bit-identical fuel and suspend at identical points across a
+    /// slice-by-slice replay of a mixed program.
+    #[test]
+    fn predecoded_rows_charge_identical_fuel_and_suspend_points() {
+        let source = r#"
+struct Pair { first: i32, second: i32, }
+enum Signal { Quiet, Loud(i32), }
+
+fn work(x: i32) -> i32 {
+    let text: string = "row-parity";
+    let cell: Pair = Pair { first: x, second: text.byte_len() };
+    let values: Array<i32> = Array::new();
+    let mut index: i32 = 0;
+    while index < 24 {
+        values.push(cell.first + index);
+        index = index + 1;
+    }
+    let table: Map<i32, i32> = Map::new();
+    table.set(1, cell.second);
+    let signal: Signal = Signal::Loud(x);
+    return match signal {
+        Signal::Quiet => 0,
+        Signal::Loud(value) => value + values.len() + table.len(),
+    };
+}
+"#;
+        let module = nexa_compiler::compile(source).expect("row parity corpus compiles");
+        let costs = OpcodeCostTable::default();
+        let executable =
+            crate::executable::ExecutableModule::build(&module, &costs).expect("build rows");
+        let run = |rows: Option<&crate::executable::ExecutableModule>| {
+            let limits = FrameLimits::default();
+            let mut heap = Heap::new_with_limits(256, 16_384, 256);
+            let mut continuation = CheckedInterpreter::start(
+                &module,
+                0,
+                &[RuntimeValue::I32(9)],
+                limits,
+                ContinuationReservation::for_limits(limits),
+            )
+            .expect("start row parity continuation");
+            let mut cumulative = 0;
+            let mut trace = Vec::new();
+            loop {
+                let outcome = CheckedInterpreter::execute(
+                    &module,
+                    continuation,
+                    FuelState::new(64, cumulative, u64::MAX),
+                    &costs,
+                    None,
+                    None,
+                    None,
+                    Some(&mut heap),
+                    rows,
+                )
+                .expect("row parity slice");
+                match outcome {
+                    InterpreterOutcome::Suspended {
+                        continuation: next,
+                        reason,
+                        charge,
+                        fuel,
+                    } => {
+                        assert_eq!(reason, SuspendReason::Fuel);
+                        trace.push((charge.fuel_used, charge.instructions));
+                        cumulative = fuel.cumulative_used;
+                        continuation = next;
+                    }
+                    InterpreterOutcome::Returned {
+                        value,
+                        charge,
+                        fuel,
+                    } => {
+                        trace.push((charge.fuel_used, charge.instructions));
+                        return (value, fuel.cumulative_used, trace);
+                    }
+                    other => panic!("row parity run ended unexpectedly: {other:?}"),
+                }
+            }
+        };
+        let (reference_value, reference_fuel, reference_trace) = run(None);
+        let (row_value, row_fuel, row_trace) = run(Some(&executable));
+        assert_eq!(row_value, reference_value, "identical results");
+        assert_eq!(row_fuel, reference_fuel, "identical cumulative fuel");
+        assert_eq!(
+            row_trace, reference_trace,
+            "identical per-slice charges and suspend points"
+        );
+        let (static_rows, total) = executable.static_fuel_coverage();
+        assert!(
+            static_rows * 2 > total,
+            "parity corpus keeps majority static coverage ({static_rows}/{total})"
+        );
+    }
 
     #[test]
     fn bytecode_v6_opcode_cost_schedule_matches_the_frozen_fixture() {
