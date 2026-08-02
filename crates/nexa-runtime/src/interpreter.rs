@@ -2369,10 +2369,26 @@ impl CheckedInterpreter {
                         .array_type(type_id.0)
                         .map(|array_type| array_type.element)
                         .ok_or(InterpreterError::TypeMismatch)?;
-                    let value = heap
+                    let heap = heap
                         .as_deref_mut()
-                        .ok_or(InterpreterError::HeapUnavailable)?
-                        .allocate_array(type_id, element_type)?;
+                        .ok_or(InterpreterError::HeapUnavailable)?;
+                    // WP52: struct elements flatten into arena rows - one
+                    // field cell per struct field, zero objects per element.
+                    // Named element types that are not structs (classes,
+                    // enums) and fieldless structs keep the cell layout.
+                    let row_fields = match element_type {
+                        nexa_bytecode::ValueType::Named(element_id) => module
+                            .struct_type(element_id.0)
+                            .and_then(|layout| u8::try_from(layout.fields.len()).ok())
+                            .and_then(std::num::NonZeroU8::new),
+                        _ => None,
+                    };
+                    let value = match row_fields {
+                        Some(field_count) => {
+                            heap.allocate_struct_row_array(type_id, element_type, field_count)?
+                        }
+                        None => heap.allocate_array(type_id, element_type)?,
+                    };
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -2399,7 +2415,7 @@ impl CheckedInterpreter {
                     };
                     let index = array_index!(index);
                     let value = array_operation!(
-                        heap.as_deref()
+                        heap.as_deref_mut()
                             .ok_or(InterpreterError::HeapUnavailable)?
                             .array_get(array, index)
                     );
@@ -3695,7 +3711,7 @@ fn run_standard_intrinsic(
             };
             let value = if let Some(index) = index {
                 match heap
-                    .as_deref()
+                    .as_deref_mut()
                     .ok_or(InterpreterError::HeapUnavailable)?
                     .array_get(arguments[0], index)
                 {

@@ -673,7 +673,12 @@ fn runtime_string(heap: &Heap, value: RuntimeValue) -> &str {
 }
 
 fn validate_record(heap: &Heap, value: RuntimeValue, label: &str, number: i32) {
-    let fields = heap.struct_fields(value).unwrap();
+    validate_record_fields(heap, heap.struct_fields(value).unwrap(), label, number);
+}
+
+// WP52: struct-element arrays store flattened rows, so array elements are
+// validated through their borrowed field view instead of a struct value.
+fn validate_record_fields(heap: &Heap, fields: &[RuntimeValue], label: &str, number: i32) {
     assert_eq!(runtime_string(heap, fields[0]), label);
     assert_eq!(fields[1], RuntimeValue::I32(number));
 }
@@ -738,10 +743,21 @@ fn validate_return(
             Some(values.len())
         }
         "return_array_struct" => {
-            let values = heap.array_values(*value).unwrap();
-            validate_record(heap, values[0], "array-a", 21);
-            validate_record(heap, values[1], "array-b", 22);
-            Some(values.len())
+            let length = heap.array_len(*value).unwrap();
+            assert_eq!(length, 2);
+            validate_record_fields(
+                heap,
+                heap.array_element_fields(*value, 0).unwrap(),
+                "array-a",
+                21,
+            );
+            validate_record_fields(
+                heap,
+                heap.array_element_fields(*value, 1).unwrap(),
+                "array-b",
+                22,
+            );
+            Some(length)
         }
         "return_buffer_struct" => {
             let values = heap.buffer_values(*value).unwrap();
@@ -756,9 +772,15 @@ fn validate_return(
         }
         "return_option_array" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
-            let records = heap.array_values(payload.unwrap()).unwrap();
-            validate_record(heap, records[0], "option-array", 51);
-            Some(records.len())
+            let records = payload.unwrap();
+            let length = heap.array_len(records).unwrap();
+            validate_record_fields(
+                heap,
+                heap.array_element_fields(records, 0).unwrap(),
+                "option-array",
+                51,
+            );
+            Some(length)
         }
         "return_result_buffer" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
@@ -780,9 +802,18 @@ fn validate_return(
         }
         "return_nested" => {
             let fields = heap.struct_fields(*value).unwrap();
-            let records = heap.array_values(fields[0]).unwrap();
-            validate_record(heap, records[0], "nested-a", 71);
-            validate_record(heap, records[1], "nested-b", 72);
+            validate_record_fields(
+                heap,
+                heap.array_element_fields(fields[0], 0).unwrap(),
+                "nested-a",
+                71,
+            );
+            validate_record_fields(
+                heap,
+                heap.array_element_fields(fields[0], 1).unwrap(),
+                "nested-b",
+                72,
+            );
             assert_eq!(
                 heap.buffer_values(fields[1]).unwrap(),
                 [

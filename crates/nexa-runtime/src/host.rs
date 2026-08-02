@@ -1080,6 +1080,17 @@ impl std::ops::Deref for HostStr<'_> {
 pub struct HostValueRef<'a> {
     value: crate::RuntimeValue,
     heap: Option<&'a crate::Heap>,
+    /// WP52: set when this logical value is a flattened struct row inside
+    /// an array extent; `struct_ref` serves it as a borrowed view without
+    /// any materialization.
+    row: Option<HostStructRow<'a>>,
+}
+
+/// One flattened struct row borrowed straight from the collection arena.
+#[derive(Clone, Copy, Debug)]
+struct HostStructRow<'a> {
+    type_id: StableId,
+    fields: &'a [crate::RuntimeValue],
 }
 
 impl<'a> HostValueRef<'a> {
@@ -1087,6 +1098,7 @@ impl<'a> HostValueRef<'a> {
         Self {
             value,
             heap: Some(heap),
+            row: None,
         }
     }
 
@@ -1148,6 +1160,18 @@ impl<'a> HostValueRef<'a> {
     }
 
     pub fn struct_ref(self, type_id: StableId) -> Result<HostStructRef<'a>, HostTrap> {
+        // WP52: flattened array elements are served as borrowed views over
+        // their arena row; nothing is materialized at the host boundary.
+        if let Some(row) = self.row {
+            if row.type_id != type_id {
+                return Err(HostTrap::Type);
+            }
+            return Ok(HostStructRef {
+                type_id,
+                fields: row.fields,
+                heap: self.heap()?,
+            });
+        }
         let crate::RuntimeValue::Struct {
             type_id: actual, ..
         } = self.value
@@ -1212,10 +1236,21 @@ impl<'a> HostValueRef<'a> {
             return Err(HostTrap::Type);
         }
         let heap = self.heap()?;
+        // WP52: flattened struct-element arrays expose their arena rows as
+        // borrowed views; plain arrays keep the one-cell-per-element view.
+        if let Some(rows) = heap.array_rows(self.value).map_err(|_| HostTrap::Type)? {
+            return Ok(HostArrayRef {
+                type_id,
+                values: rows.cells,
+                rows: Some((rows.stride, rows.struct_type)),
+                heap,
+            });
+        }
         let values = heap.array_values(self.value).map_err(|_| HostTrap::Type)?;
         Ok(HostArrayRef {
             type_id,
             values,
+            rows: None,
             heap,
         })
     }
@@ -1235,6 +1270,7 @@ impl<'a> HostValueRef<'a> {
         Ok(HostBufferRef {
             type_id,
             values,
+            rows: None,
             heap,
         })
     }
@@ -1295,6 +1331,7 @@ impl<'a> HostStructRef<'a> {
             .map(|value| HostValueRef {
                 value,
                 heap: Some(self.heap),
+                row: None,
             })
             .ok_or(HostTrap::Type)
     }
@@ -1331,6 +1368,7 @@ impl<'a> HostClassRef<'a> {
             .map(|value| HostValueRef {
                 value,
                 heap: Some(self.heap),
+                row: None,
             })
             .ok_or(HostTrap::Type)
     }
@@ -1340,6 +1378,7 @@ impl<'a> HostClassRef<'a> {
         self.fields.iter().copied().map(|value| HostValueRef {
             value,
             heap: Some(self.heap),
+            row: None,
         })
     }
 }
@@ -1375,6 +1414,7 @@ impl<'a> HostEnumRef<'a> {
         self.payload.map(|value| HostValueRef {
             value,
             heap: Some(self.heap),
+            row: None,
         })
     }
 }
@@ -1384,7 +1424,12 @@ macro_rules! host_collection_ref {
         #[derive(Clone, Copy, Debug)]
         pub struct $name<'a> {
             type_id: StableId,
+            /// Live arena cells: one per element, or `stride` per element
+            /// for flattened struct rows (WP52).
             values: &'a [crate::RuntimeValue],
+            /// `Some((stride, struct_type))` when elements are flattened
+            /// struct rows served as borrowed views.
+            rows: Option<(usize, StableId)>,
             heap: &'a crate::Heap,
         }
 
@@ -1396,7 +1441,13 @@ macro_rules! host_collection_ref {
 
             #[must_use]
             pub const fn len(self) -> usize {
-                self.values.len()
+                match self.rows {
+                    Some((stride, _)) => {
+                        let divisor = if stride == 0 { 1 } else { stride };
+                        self.values.len() / divisor
+                    }
+                    None => self.values.len(),
+                }
             }
 
             #[must_use]
@@ -1405,20 +1456,35 @@ macro_rules! host_collection_ref {
             }
 
             pub fn get(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
+                if let Some((stride, struct_type)) = self.rows {
+                    let fields = self
+                        .values
+                        .get(index * stride..(index + 1) * stride)
+                        .ok_or(HostTrap::Type)?;
+                    return Ok(HostValueRef {
+                        value: crate::RuntimeValue::Unit,
+                        heap: Some(self.heap),
+                        row: Some(HostStructRow {
+                            type_id: struct_type,
+                            fields,
+                        }),
+                    });
+                }
                 self.values
                     .get(index)
                     .copied()
                     .map(|value| HostValueRef {
                         value,
                         heap: Some(self.heap),
+                        row: None,
                     })
                     .ok_or(HostTrap::Type)
             }
 
             pub fn iter(self) -> impl ExactSizeIterator<Item = HostValueRef<'a>> + 'a {
-                self.values.iter().copied().map(|value| HostValueRef {
-                    value,
-                    heap: Some(self.heap),
+                (0..self.len()).map(move |index| {
+                    self.get(index)
+                        .expect("iterated index stays within the borrowed view")
                 })
             }
         }
@@ -1442,6 +1508,7 @@ impl<'a> HostMapEntryRef<'a> {
         HostValueRef {
             value: self.key,
             heap: Some(self.heap),
+            row: None,
         }
     }
 
@@ -1450,6 +1517,7 @@ impl<'a> HostMapEntryRef<'a> {
         HostValueRef {
             value: self.value,
             heap: Some(self.heap),
+            row: None,
         }
     }
 }
@@ -1597,6 +1665,7 @@ impl<'a> RuntimeHostArgs<'a> {
         Ok(HostValueRef {
             value: self.value(index)?,
             heap: self.heap.as_deref(),
+            row: None,
         })
     }
 

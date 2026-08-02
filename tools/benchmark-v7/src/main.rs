@@ -745,6 +745,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
         },
     ));
+    // WP52 corpus: 128 struct pushes into flattened rows plus a field
+    // reduction sweep - the Array<Struct> shape the structural gate pins.
+    cases.push(bench(
+        "product_struct_rows",
+        "product",
+        samples,
+        || Heap::new_with_limits(1_024, 65_536, 512),
+        |mut heap| {
+            run_returned(
+                &language,
+                &language_rows,
+                14,
+                &[],
+                &mut heap,
+                4_000_000,
+                &mut continuation_pool,
+            )
+        },
+    ));
     cases.push(bench(
         "product_standalone_pipeline",
         "product",
@@ -1349,6 +1368,22 @@ fn product_grid_score() -> i32 {
         y = y + 1;
     }
     return score;
+}
+fn product_struct_rows() -> i32 {
+    let cells: Array<BenchStruct> = Array::new();
+    let mut index: i32 = 0;
+    while index < 128 {
+        cells.push(BenchStruct { value: index, wide: 9, label: "row" });
+        index = index + 1;
+    }
+    let mut total: i32 = 0;
+    let mut cursor: i32 = 0;
+    while cursor < 128 {
+        let cell: BenchStruct = cells.get(cursor);
+        total = total + cell.value;
+        cursor = cursor + 1;
+    }
+    return total;
 }
 "#;
 

@@ -386,9 +386,16 @@ pub enum Object {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
         /// Capacity extent inside the collection arena (WP48); `length`
-        /// tracks the live prefix so pushes grow amortized (WP49).
+        /// tracks the live prefix so pushes grow amortized (WP49). The
+        /// extent is measured in arena cells: `row_stride` cells per
+        /// logical element for flattened struct rows, one otherwise.
         range: CollectionRange,
+        /// Logical element count, independent of the row stride.
         length: usize,
+        /// WP52: `Some(fields)` flattens struct elements into `fields`
+        /// arena cells per element instead of one heap object each;
+        /// `None` keeps the plain one-cell-per-element layout.
+        row_stride: Option<std::num::NonZeroU8>,
     },
     Buffer {
         type_id: StableId,
@@ -501,6 +508,46 @@ fn fnv_content_hash(value: &str) -> u64 {
 struct CachedStringLiteral {
     reference: GcRef,
     hash: u64,
+}
+
+/// Borrowed WP52 row view over a struct-element array: the live flattened
+/// cells, the per-element stride, and the element struct type.
+#[derive(Clone, Copy, Debug)]
+pub struct ArrayRowsView<'a> {
+    pub cells: &'a [RuntimeValue],
+    pub stride: usize,
+    pub struct_type: StableId,
+}
+
+/// Resolved array header shared by every logical array operation (WP52).
+#[derive(Clone, Copy)]
+struct ArrayParts {
+    reference: GcRef,
+    range: CollectionRange,
+    /// Logical element count.
+    length: usize,
+    row_stride: Option<std::num::NonZeroU8>,
+    element_type: nexa_bytecode::ValueType,
+}
+
+impl ArrayParts {
+    /// Arena cells per logical element.
+    fn stride(self) -> usize {
+        self.row_stride
+            .map_or(1, |stride| usize::from(stride.get()))
+    }
+
+    /// `Some(stride)` when elements are flattened struct rows.
+    fn rows(self) -> Option<usize> {
+        self.row_stride.map(|stride| usize::from(stride.get()))
+    }
+
+    fn element_struct_type(self) -> Result<StableId, HeapError> {
+        match self.element_type {
+            nexa_bytecode::ValueType::Named(id) => Ok(id),
+            _ => Err(invalid_value_reference()),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1482,6 +1529,7 @@ impl Heap {
                 element_type,
                 range,
                 length,
+                row_stride: None,
             },
         );
         Ok(RuntimeValue::NamedRef { reference, type_id })
@@ -1913,23 +1961,64 @@ impl Heap {
             element_type,
             range: CollectionRange::default(),
             length: 0,
+            row_stride: None,
+        })?;
+        Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    /// WP52: allocates an array whose struct elements live flattened in
+    /// the collection arena - `field_count` cells per element, zero heap
+    /// objects per element. `element_type` must name the struct type.
+    pub fn allocate_struct_row_array(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        field_count: std::num::NonZeroU8,
+    ) -> Result<RuntimeValue, HeapError> {
+        if type_id != nexa_bytecode::array_type(element_type)
+            || !matches!(element_type, nexa_bytecode::ValueType::Named(_))
+            || usize::from(field_count.get()) > nexa_bytecode::MAX_STRUCT_FIELDS
+        {
+            return Err(invalid_value_reference());
+        }
+        let reference = self.allocate(Object::Array {
+            type_id,
+            element_type,
+            range: CollectionRange::default(),
+            length: 0,
+            row_stride: Some(field_count),
         })?;
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
 
     pub fn array_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
-        Ok(self.array_values(value)?.len())
+        Ok(self.array_parts(value)?.length)
     }
 
-    pub fn array_get(&self, value: RuntimeValue, index: usize) -> Result<RuntimeValue, HeapError> {
-        let values = self.array_values(value)?;
-        values
-            .get(index)
-            .copied()
-            .ok_or(HeapError::IndexOutOfBounds {
+    pub fn array_get(
+        &mut self,
+        value: RuntimeValue,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let parts = self.array_parts(value)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
                 index,
-                length: values.len(),
-            })
+                length: parts.length,
+            });
+        }
+        let Some(stride) = parts.rows() else {
+            return Ok(self.collections.values(parts.range)?[index]);
+        };
+        // WP52 rows: reading a logical element materializes one transient
+        // struct value from the flattened cells; the storage itself never
+        // holds a per-element object.
+        let struct_type = parts.element_struct_type()?;
+        let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+        let cells = self.collections.values(parts.range)?;
+        fields[..stride].copy_from_slice(&cells[index * stride..(index + 1) * stride]);
+        let mut reservation = self.preflight(1)?;
+        self.commit_struct(&mut reservation, struct_type, &fields[..stride])
     }
 
     pub fn array_set(
@@ -1938,13 +2027,24 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let (_, range, length) = self.array_range(value)?;
-        if index >= length {
-            return Err(HeapError::IndexOutOfBounds { index, length });
+        let parts = self.array_parts(value)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            });
         }
-        self.shade_on_write(replacement);
-        let values = self.collections.values_mut(range)?;
-        values[index] = replacement;
+        let Some(stride) = parts.rows() else {
+            self.shade_on_write(replacement);
+            self.collections.values_mut(parts.range)?[index] = replacement;
+            return Ok(());
+        };
+        let row = self.struct_row(parts.element_struct_type()?, stride, replacement)?;
+        for field in &row[..stride] {
+            self.shade_on_write(*field);
+        }
+        self.collections.values_mut(parts.range)?[index * stride..(index + 1) * stride]
+            .copy_from_slice(&row[..stride]);
         Ok(())
     }
 
@@ -1953,8 +2053,8 @@ impl Heap {
         value: RuntimeValue,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let (reference, range, current) = self.array_range(value)?;
-        self.shade_on_write(element);
+        let parts = self.array_parts(value)?;
+        let current = parts.length;
         let length = current
             .checked_add(1)
             .ok_or(HeapError::CollectionTooLarge {
@@ -1962,30 +2062,76 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
-        if current < range.length {
-            // WP49 amortized fast path: spare capacity, write in place.
-            self.collections.values_mut(range)?[current] = element;
-            self.set_array_length(reference, length)?;
+        let Some(stride) = parts.rows() else {
+            self.shade_on_write(element);
+            if current < parts.range.length {
+                // WP49 amortized fast path: spare capacity, write in place.
+                self.collections.values_mut(parts.range)?[current] = element;
+                self.set_array_length(parts.reference, length)?;
+                return Ok(());
+            }
+            let capacity =
+                grown_array_capacity(parts.range.length, length, self.max_collection_length);
+            self.regrow_array(parts.reference, parts.range, current, capacity, |values| {
+                values[current] = element;
+            })?;
+            return self.set_array_length(parts.reference, length);
+        };
+        let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
+        for field in &row[..stride] {
+            self.shade_on_write(*field);
+        }
+        let needed_cells = length
+            .checked_mul(stride)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if needed_cells <= parts.range.length {
+            // WP49 amortized fast path: spare row capacity, write in place.
+            self.collections.values_mut(parts.range)?[current * stride..needed_cells]
+                .copy_from_slice(&row[..stride]);
+            self.set_array_length(parts.reference, length)?;
             return Ok(());
         }
-        let capacity = grown_array_capacity(range.length, length, self.max_collection_length);
-        self.regrow_array(reference, range, current, capacity, |values| {
-            values[current] = element;
-        })?;
-        self.set_array_length(reference, length)
+        // Growth is computed in logical elements so the new extent stays
+        // row-aligned; the arena works in cells.
+        let capacity_cells = grown_array_capacity(
+            parts.range.length / stride,
+            length,
+            self.max_collection_length,
+        )
+        .saturating_mul(stride);
+        self.regrow_array(
+            parts.reference,
+            parts.range,
+            current * stride,
+            capacity_cells,
+            |values| {
+                values[current * stride..(current + 1) * stride].copy_from_slice(&row[..stride]);
+            },
+        )?;
+        self.set_array_length(parts.reference, length)
     }
 
     pub fn array_pop(&mut self, value: RuntimeValue) -> Result<RuntimeValue, HeapError> {
-        let (reference, range, length) = self.array_range(value)?;
+        let parts = self.array_parts(value)?;
+        let length = parts.length;
         if length == 0 {
             return Err(HeapError::IndexOutOfBounds { index: 0, length });
         }
-        let values = self.collections.values_mut(range)?;
-        let result = values[length - 1];
-        // Clear the vacated tail slot so no stale reference lingers in the
-        // retained capacity extent.
-        values[length - 1] = RuntimeValue::Unit;
-        self.set_array_length(reference, length - 1)?;
+        let Some(stride) = parts.rows() else {
+            let values = self.collections.values_mut(parts.range)?;
+            let result = values[length - 1];
+            // Clear the vacated tail slot so no stale reference lingers in
+            // the retained capacity extent.
+            values[length - 1] = RuntimeValue::Unit;
+            self.set_array_length(parts.reference, length - 1)?;
+            return Ok(result);
+        };
+        // Materialize the row before mutating anything: a failed struct
+        // allocation must leave the array untouched (failure atomicity).
+        let result = self.array_get(value, length - 1)?;
+        let values = self.collections.values_mut(parts.range)?;
+        values[(length - 1) * stride..length * stride].fill(RuntimeValue::Unit);
+        self.set_array_length(parts.reference, length - 1)?;
         Ok(result)
     }
 
@@ -1995,8 +2141,8 @@ impl Heap {
         index: usize,
         element: RuntimeValue,
     ) -> Result<(), HeapError> {
-        let (reference, range, current) = self.array_range(value)?;
-        self.shade_on_write(element);
+        let parts = self.array_parts(value)?;
+        let current = parts.length;
         if index > current {
             return Err(HeapError::IndexOutOfBounds {
                 index,
@@ -2010,23 +2156,62 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
-        if current < range.length {
-            let values = self.collections.values_mut(range)?;
-            values.copy_within(index..current, index + 1);
-            values[index] = element;
-            self.counters.collection_relocation_bytes = self
-                .counters
-                .collection_relocation_bytes
-                .saturating_add(((current - index) * std::mem::size_of::<RuntimeValue>()) as u64);
-            self.set_array_length(reference, length)?;
+        let Some(stride) = parts.rows() else {
+            self.shade_on_write(element);
+            if current < parts.range.length {
+                let values = self.collections.values_mut(parts.range)?;
+                values.copy_within(index..current, index + 1);
+                values[index] = element;
+                self.counters.collection_relocation_bytes =
+                    self.counters.collection_relocation_bytes.saturating_add(
+                        ((current - index) * std::mem::size_of::<RuntimeValue>()) as u64,
+                    );
+                self.set_array_length(parts.reference, length)?;
+                return Ok(());
+            }
+            let capacity =
+                grown_array_capacity(parts.range.length, length, self.max_collection_length);
+            self.regrow_array(parts.reference, parts.range, current, capacity, |values| {
+                values.copy_within(index..current, index + 1);
+                values[index] = element;
+            })?;
+            return self.set_array_length(parts.reference, length);
+        };
+        let row = self.struct_row(parts.element_struct_type()?, stride, element)?;
+        for field in &row[..stride] {
+            self.shade_on_write(*field);
+        }
+        let needed_cells = length
+            .checked_mul(stride)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if needed_cells <= parts.range.length {
+            let values = self.collections.values_mut(parts.range)?;
+            values.copy_within(index * stride..current * stride, (index + 1) * stride);
+            values[index * stride..(index + 1) * stride].copy_from_slice(&row[..stride]);
+            self.counters.collection_relocation_bytes =
+                self.counters.collection_relocation_bytes.saturating_add(
+                    ((current - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
+                );
+            self.set_array_length(parts.reference, length)?;
             return Ok(());
         }
-        let capacity = grown_array_capacity(range.length, length, self.max_collection_length);
-        self.regrow_array(reference, range, current, capacity, |values| {
-            values.copy_within(index..current, index + 1);
-            values[index] = element;
-        })?;
-        self.set_array_length(reference, length)
+        let capacity_cells = grown_array_capacity(
+            parts.range.length / stride,
+            length,
+            self.max_collection_length,
+        )
+        .saturating_mul(stride);
+        self.regrow_array(
+            parts.reference,
+            parts.range,
+            current * stride,
+            capacity_cells,
+            |values| {
+                values.copy_within(index * stride..current * stride, (index + 1) * stride);
+                values[index * stride..(index + 1) * stride].copy_from_slice(&row[..stride]);
+            },
+        )?;
+        self.set_array_length(parts.reference, length)
     }
 
     pub fn array_remove(
@@ -2034,29 +2219,45 @@ impl Heap {
         value: RuntimeValue,
         index: usize,
     ) -> Result<RuntimeValue, HeapError> {
-        let (reference, range, length) = self.array_range(value)?;
+        let parts = self.array_parts(value)?;
+        let length = parts.length;
         if index >= length {
             return Err(HeapError::IndexOutOfBounds { index, length });
         }
-        let values = self.collections.values_mut(range)?;
-        let removed = values[index];
-        values.copy_within(index + 1..length, index);
-        values[length - 1] = RuntimeValue::Unit;
-        self.counters.collection_relocation_bytes = self
-            .counters
-            .collection_relocation_bytes
-            .saturating_add(((length - 1 - index) * std::mem::size_of::<RuntimeValue>()) as u64);
-        self.set_array_length(reference, length - 1)?;
+        let Some(stride) = parts.rows() else {
+            let values = self.collections.values_mut(parts.range)?;
+            let removed = values[index];
+            values.copy_within(index + 1..length, index);
+            values[length - 1] = RuntimeValue::Unit;
+            self.counters.collection_relocation_bytes =
+                self.counters.collection_relocation_bytes.saturating_add(
+                    ((length - 1 - index) * std::mem::size_of::<RuntimeValue>()) as u64,
+                );
+            self.set_array_length(parts.reference, length - 1)?;
+            return Ok(removed);
+        };
+        // Materialize the row before mutating anything: a failed struct
+        // allocation must leave the array untouched (failure atomicity).
+        let removed = self.array_get(value, index)?;
+        let values = self.collections.values_mut(parts.range)?;
+        values.copy_within((index + 1) * stride..length * stride, index * stride);
+        values[(length - 1) * stride..length * stride].fill(RuntimeValue::Unit);
+        self.counters.collection_relocation_bytes =
+            self.counters.collection_relocation_bytes.saturating_add(
+                ((length - 1 - index) * stride * std::mem::size_of::<RuntimeValue>()) as u64,
+            );
+        self.set_array_length(parts.reference, length - 1)?;
         Ok(removed)
     }
 
     pub fn array_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
-        // WP50: clear retains capacity; live slots reset so no stale
+        // WP50: clear retains capacity; live cells reset so no stale
         // references survive in the extent.
-        let (reference, range, length) = self.array_range(value)?;
-        let values = self.collections.values_mut(range)?;
-        values[..length].fill(RuntimeValue::Unit);
-        self.set_array_length(reference, 0)
+        let parts = self.array_parts(value)?;
+        let live_cells = parts.length * parts.stride();
+        let values = self.collections.values_mut(parts.range)?;
+        values[..live_cells].fill(RuntimeValue::Unit);
+        self.set_array_length(parts.reference, 0)
     }
 
     fn set_array_length(&mut self, reference: GcRef, new_length: usize) -> Result<(), HeapError> {
@@ -2070,10 +2271,12 @@ impl Heap {
     }
 
     /// Deterministic (live, capacity) shape used by fuel settlement before
-    /// an array mutation runs (WP49).
+    /// an array mutation runs (WP49). Both sides are logical elements on
+    /// purpose: fuel inputs stay identical across the WP52 row-layout
+    /// change until the frozen v7 cost-table boundary.
     pub fn array_fuel_shape(&self, value: RuntimeValue) -> Result<(usize, usize), HeapError> {
-        let (_, range, length) = self.array_range(value)?;
-        Ok((length, range.length))
+        let parts = self.array_parts(value)?;
+        Ok((parts.length, parts.range.length / parts.stride()))
     }
 
     /// Moves the live prefix into a larger extent, applies `write`, and
@@ -2127,31 +2330,93 @@ impl Heap {
         Ok(())
     }
 
+    /// One-cell-per-element live view. Flattened struct-row arrays have no
+    /// such view and are read through [`Self::array_rows`] instead (WP52).
     pub fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
-        let RuntimeValue::NamedRef { reference, type_id } = value else {
-            return Err(invalid_value_reference());
-        };
-        match self.resolve(reference)? {
-            Object::Array {
-                type_id: actual,
-                element_type,
-                range,
-                length,
-            } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                let values = self.collections.values(*range)?;
-                values.get(..*length).ok_or(HeapError::IndexOutOfBounds {
-                    index: *length,
-                    length: values.len(),
-                })
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
+        let parts = self.array_parts(value)?;
+        if parts.rows().is_some() {
+            return Err(HeapError::InvalidReference(parts.reference));
         }
+        let values = self.collections.values(parts.range)?;
+        values
+            .get(..parts.length)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: parts.length,
+                length: values.len(),
+            })
     }
 
-    fn array_range(
+    /// WP52 borrowed row view: `Some((cells, stride, struct_type))` exposes
+    /// the live flattened rows of a struct-element array without
+    /// materializing anything; `None` means the plain cell layout.
+    pub fn array_rows(&self, value: RuntimeValue) -> Result<Option<ArrayRowsView<'_>>, HeapError> {
+        let parts = self.array_parts(value)?;
+        let Some(stride) = parts.rows() else {
+            return Ok(None);
+        };
+        let struct_type = parts.element_struct_type()?;
+        let live = parts.length.saturating_mul(stride);
+        let values = self.collections.values(parts.range)?;
+        let cells = values.get(..live).ok_or(HeapError::IndexOutOfBounds {
+            index: live,
+            length: values.len(),
+        })?;
+        Ok(Some(ArrayRowsView {
+            cells,
+            stride,
+            struct_type,
+        }))
+    }
+
+    /// Borrowed field view of one struct element, independent of the array
+    /// layout (WP52): flattened rows come straight from the arena, cell
+    /// layouts resolve the stored struct value. Read-only tooling and
+    /// validation paths use this instead of materializing elements.
+    pub fn array_element_fields(
         &self,
         value: RuntimeValue,
-    ) -> Result<(GcRef, CollectionRange, usize), HeapError> {
+        index: usize,
+    ) -> Result<&[RuntimeValue], HeapError> {
+        let parts = self.array_parts(value)?;
+        if index >= parts.length {
+            return Err(HeapError::IndexOutOfBounds {
+                index,
+                length: parts.length,
+            });
+        }
+        if let Some(stride) = parts.rows() {
+            let cells = self.collections.values(parts.range)?;
+            return Ok(&cells[index * stride..(index + 1) * stride]);
+        }
+        let element = self.collections.values(parts.range)?[index];
+        self.struct_fields(element)
+    }
+
+    /// Copies `element`'s fields into a stack row after checking that it is
+    /// a struct value of the array's element type with exactly `stride`
+    /// fields (WP52).
+    fn struct_row(
+        &self,
+        expected: StableId,
+        stride: usize,
+        element: RuntimeValue,
+    ) -> Result<[RuntimeValue; nexa_bytecode::MAX_STRUCT_FIELDS], HeapError> {
+        let RuntimeValue::Struct { type_id, .. } = element else {
+            return Err(invalid_value_reference());
+        };
+        if type_id != expected {
+            return Err(invalid_value_reference());
+        }
+        let fields = self.struct_fields(element)?;
+        if fields.len() != stride {
+            return Err(invalid_value_reference());
+        }
+        let mut row = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
+        row[..stride].copy_from_slice(fields);
+        Ok(row)
+    }
+
+    fn array_parts(&self, value: RuntimeValue) -> Result<ArrayParts, HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
@@ -2161,8 +2426,15 @@ impl Heap {
                 element_type,
                 range,
                 length,
+                row_stride,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
-                Ok((reference, *range, *length))
+                Ok(ArrayParts {
+                    reference,
+                    range: *range,
+                    length: *length,
+                    row_stride: *row_stride,
+                    element_type: *element_type,
+                })
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -3183,9 +3455,17 @@ impl Heap {
             );
             let payload = slot.payload_bytes();
             match slot {
-                Object::Array { range, length, .. } => {
+                Object::Array {
+                    range,
+                    length,
+                    row_stride,
+                    ..
+                } => {
                     let range = *range;
-                    let live = *length;
+                    // Live cells cover the row stride (WP52); dead capacity
+                    // beyond the live prefix never enters the mark queue.
+                    let live =
+                        length.saturating_mul(row_stride.map_or(1, |s| usize::from(s.get())));
                     for index in 0..live.min(range.length) {
                         let value = self.collections.values(range)?[index];
                         if let Some(child) = value_reference(value)
@@ -3681,6 +3961,140 @@ mod tests {
         // Counters are monotonic work totals: rollback keeps them.
         heap.restore_checkpoint(checkpoint);
         assert_eq!(heap.vm_allocation_counters(), counters);
+    }
+
+    #[test]
+    fn struct_row_arrays_store_zero_objects_per_element() {
+        // WP52 structural gate: N pushed elements leave exactly one heap
+        // object (the array itself) after the transient sources die.
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 64);
+        let record = StableId::from_name("heap-test::RowRecord");
+        let element = nexa_bytecode::ValueType::Named(record);
+        let array_type = nexa_bytecode::array_type(element);
+        let array = heap
+            .allocate_struct_row_array(
+                array_type,
+                element,
+                std::num::NonZeroU8::new(2).expect("non-zero"),
+            )
+            .unwrap();
+        for index in 0..8_i32 {
+            let label = heap.allocate_string("row-label").unwrap();
+            let hash = heap.string_hash(label).unwrap();
+            let source = heap
+                .allocate_struct(
+                    record,
+                    &[
+                        RuntimeValue::I32(index),
+                        RuntimeValue::String {
+                            reference: label,
+                            hash,
+                        },
+                    ],
+                )
+                .unwrap();
+            heap.array_push(array, source).unwrap();
+        }
+        assert_eq!(heap.array_len(array), Ok(8));
+
+        // Only the array is rooted: every pushed struct source dies, the
+        // row storage and its string field references survive.
+        let RuntimeValue::NamedRef { reference, .. } = array else {
+            panic!("arrays are named references");
+        };
+        let mut roots = GcRoots::default();
+        roots.running_frames.push(reference);
+        heap.collect(&roots).unwrap();
+        assert_eq!(
+            heap.live_len(),
+            1 + 8,
+            "one array object plus eight row label strings"
+        );
+
+        // Reads materialize equal transient values from the rows.
+        let first = heap.array_get(array, 0).unwrap();
+        let fields = heap.struct_fields(first).unwrap();
+        assert_eq!(fields[0], RuntimeValue::I32(0));
+        let RuntimeValue::String {
+            reference: label, ..
+        } = fields[1]
+        else {
+            panic!("label field stays a string reference");
+        };
+        assert_eq!(heap.string(label), Ok("row-label"));
+
+        // The borrowed views agree with the materialized read.
+        assert_eq!(
+            heap.array_element_fields(array, 0).unwrap()[0],
+            RuntimeValue::I32(0)
+        );
+        let view = heap.array_rows(array).unwrap().expect("row layout");
+        assert_eq!(
+            (view.cells.len(), view.stride, view.struct_type),
+            (16, 2, record)
+        );
+        assert!(
+            heap.array_values(array).is_err(),
+            "row arrays have no one-cell-per-element view"
+        );
+    }
+
+    #[test]
+    fn struct_row_arrays_keep_logical_semantics_across_mutations() {
+        fn make(heap: &mut Heap, record: StableId, value: i32) -> RuntimeValue {
+            heap.allocate_struct(record, &[RuntimeValue::I32(value)])
+                .unwrap()
+        }
+        let mut heap = Heap::new_with_limits(64, usize::MAX, 16);
+        let record = StableId::from_name("heap-test::RowMutation");
+        let element = nexa_bytecode::ValueType::Named(record);
+        let array_type = nexa_bytecode::array_type(element);
+        let array = heap
+            .allocate_struct_row_array(
+                array_type,
+                element,
+                std::num::NonZeroU8::new(1).expect("non-zero"),
+            )
+            .unwrap();
+        let first = make(&mut heap, record, 10);
+        heap.array_push(array, first).unwrap();
+        let second = make(&mut heap, record, 20);
+        heap.array_push(array, second).unwrap();
+        let inserted = make(&mut heap, record, 5);
+        heap.array_insert(array, 0, inserted).unwrap();
+        // [5, 10, 20]
+        let replacement = make(&mut heap, record, 11);
+        heap.array_set(array, 1, replacement).unwrap();
+        // [5, 11, 20]
+        let removed = heap.array_remove(array, 0).unwrap();
+        assert_eq!(
+            heap.struct_fields(removed).unwrap()[0],
+            RuntimeValue::I32(5)
+        );
+        let popped = heap.array_pop(array).unwrap();
+        assert_eq!(
+            heap.struct_fields(popped).unwrap()[0],
+            RuntimeValue::I32(20)
+        );
+        assert_eq!(heap.array_len(array), Ok(1));
+        assert_eq!(
+            heap.array_element_fields(array, 0).unwrap()[0],
+            RuntimeValue::I32(11)
+        );
+        // Type confusion is rejected: a struct of another type cannot
+        // enter the rows.
+        let alien_type = StableId::from_name("heap-test::OtherRecord");
+        let alien = heap
+            .allocate_struct(alien_type, &[RuntimeValue::I32(1)])
+            .unwrap();
+        assert!(heap.array_push(array, alien).is_err());
+        // A materialized element equals what an identical construction
+        // produces (structural equality).
+        let expected = make(&mut heap, record, 11);
+        let read = heap.array_get(array, 0).unwrap();
+        assert_eq!(heap.struct_equal(read, expected), Ok(true));
+        heap.array_clear(array).unwrap();
+        assert_eq!(heap.array_len(array), Ok(0));
     }
 
     #[test]

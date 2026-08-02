@@ -6,7 +6,7 @@ use std::fmt;
 use nexa_bytecode::{
     ArrayType, EnumVariant, Function, FunctionEffect, HostCallMode, Instruction, MapType, Module,
     SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES,
-    StandardIntrinsic, StructField, ValueType, minimum_migration_limits,
+    StandardIntrinsic, StructField, StructType, ValueType, minimum_migration_limits,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -267,6 +267,23 @@ impl VerifiedModule {
             .fields
             .get(*field_index)
             .map(|field| (*field_index, field))
+    }
+
+    /// WP52: the full struct layout behind one stable type ID, resolved
+    /// through the sorted nominal index (no linear module scan). Structs
+    /// without fields have no index entries and resolve to `None`, which
+    /// callers treat as "keep the plain layout".
+    #[must_use]
+    pub fn struct_type(&self, type_id: u64) -> Option<&StructType> {
+        let index = self
+            .nominal_indexes
+            .struct_fields
+            .partition_point(|(key, _)| *key < (type_id, 0));
+        let ((candidate, _), (type_index, _)) = self.nominal_indexes.struct_fields.get(index)?;
+        if *candidate != type_id {
+            return None;
+        }
+        self.module.struct_types.get(*type_index)
     }
 
     #[must_use]
