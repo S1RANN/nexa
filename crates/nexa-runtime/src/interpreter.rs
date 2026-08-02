@@ -76,6 +76,22 @@ impl InterpreterContinuation {
         limits: FrameLimits,
         reservation: ContinuationReservation,
     ) -> Result<Self, InterpreterError> {
+        Self::new_with_storage(module, function, arguments, limits, reservation, None)
+    }
+
+    /// H1: builds a continuation, reusing `storage` when its retained
+    /// capacities satisfy the reservation; otherwise the storage is
+    /// dropped and a fresh reservation is made. Reuse changes only where
+    /// the backing vectors come from, never any admission check.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_storage(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        limits: FrameLimits,
+        reservation: ContinuationReservation,
+        storage: Option<FrameArena>,
+    ) -> Result<Self, InterpreterError> {
         if limits.max_call_depth as usize > MAX_SCRIPT_CALL_STACK_DEPTH {
             return Err(InterpreterError::ContinuationLimit(
                 FrameError::ReservationExceedsLimit,
@@ -87,7 +103,16 @@ impl InterpreterContinuation {
             .get(function as usize)
             .ok_or(InterpreterError::MissingFunction(function))?;
         validate_arguments(arguments, &function_meta.signature.parameters)?;
-        let mut arena = FrameArena::with_reserved_capacity(limits, reservation)?;
+        let mut arena = match storage {
+            Some(mut arena) => {
+                if arena.reset_for(limits, reservation).is_ok() {
+                    arena
+                } else {
+                    FrameArena::with_reserved_capacity(limits, reservation)?
+                }
+            }
+            None => FrameArena::with_reserved_capacity(limits, reservation)?,
+        };
         arena.push_call(function, function_meta.registers, None)?;
         for (index, argument) in arguments.iter().copied().enumerate() {
             arena.set_register(index, argument)?;
@@ -116,6 +141,13 @@ impl InterpreterContinuation {
     #[must_use]
     pub fn arena(&self) -> &FrameArena {
         &self.arena
+    }
+
+    /// H1: extracts the arena storage for pooling, leaving an empty shell
+    /// behind. Called only on terminal exits where the continuation is
+    /// dropped immediately afterwards; the swap performs no allocation.
+    pub(crate) fn recycle_storage(&mut self) -> FrameArena {
+        std::mem::replace(&mut self.arena, FrameArena::empty_shell())
     }
 
     #[must_use]
@@ -627,6 +659,7 @@ impl CheckedInterpreter {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -643,6 +676,7 @@ impl CheckedInterpreter {
             fuel,
             costs,
             Some(host),
+            None,
             None,
             None,
             None,
@@ -666,6 +700,7 @@ impl CheckedInterpreter {
             None,
             None,
             Some(heap),
+            None,
             None,
         )
     }
@@ -691,6 +726,7 @@ impl CheckedInterpreter {
             None,
             Some(heap),
             Some(executable),
+            None,
         )
     }
 
@@ -712,9 +748,11 @@ impl CheckedInterpreter {
             None,
             Some(heap),
             None,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn poll_with_heap_and_state(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,
@@ -723,6 +761,7 @@ impl CheckedInterpreter {
         state: &mut dyn InterpreterState,
         heap: &mut Heap,
         executable: Option<&crate::executable::ExecutableModule>,
+        recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         Self::execute(
             module,
@@ -734,6 +773,7 @@ impl CheckedInterpreter {
             Some(state),
             Some(heap),
             executable,
+            recycle,
         )
     }
 
@@ -747,6 +787,7 @@ impl CheckedInterpreter {
         state: &mut dyn InterpreterState,
         heap: &mut Heap,
         executable: Option<&crate::executable::ExecutableModule>,
+        recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         Self::execute(
             module,
@@ -758,6 +799,7 @@ impl CheckedInterpreter {
             Some(state),
             Some(heap),
             executable,
+            recycle,
         )
     }
 
@@ -860,6 +902,7 @@ impl CheckedInterpreter {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -888,6 +931,7 @@ impl CheckedInterpreter {
             Some(migration),
             None,
             Some(heap),
+            None,
             None,
         )
     }
@@ -997,8 +1041,18 @@ impl CheckedInterpreter {
         mut state_registry: Option<&mut dyn InterpreterState>,
         mut heap: Option<&mut Heap>,
         executable: Option<&crate::executable::ExecutableModule>,
+        mut recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         costs.validate_version()?;
+        // H1: on terminal exits the caller may reclaim the continuation's
+        // arena storage through this slot; suspension paths never touch it.
+        macro_rules! reclaim_storage {
+            () => {
+                if let Some(slot) = recycle.as_deref_mut() {
+                    *slot = Some(continuation.recycle_storage());
+                }
+            };
+        }
         continuation.suspend_reason = None;
         continuation.cumulative_exhausted = false;
         let mut charge = ExecutionCharge::default();
@@ -1009,16 +1063,14 @@ impl CheckedInterpreter {
                     Ok(value) => value,
                     Err(HeapError::IndexOutOfBounds { .. }) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::ArrayIndexOutOfBounds,
-                                "array index out of bounds",
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::ArrayIndexOutOfBounds,
+                            "array index out of bounds",
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     }
                     Err(error) => return Err(InterpreterError::Heap(error)),
                 }
@@ -1030,16 +1082,14 @@ impl CheckedInterpreter {
                     Ok(index) => index,
                     Err(_) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::ArrayIndexOutOfBounds,
-                                "array index out of bounds",
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::ArrayIndexOutOfBounds,
+                            "array index out of bounds",
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     }
                 }
             };
@@ -1050,16 +1100,14 @@ impl CheckedInterpreter {
                     Ok(value) => value,
                     Err(HeapError::IndexOutOfBounds { .. }) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::BufferIndexOutOfBounds,
-                                "buffer index out of bounds",
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::BufferIndexOutOfBounds,
+                            "buffer index out of bounds",
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     }
                     Err(error) => return Err(InterpreterError::Heap(error)),
                 }
@@ -1071,16 +1119,14 @@ impl CheckedInterpreter {
                     Ok(index) => index,
                     Err(_) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::BufferIndexOutOfBounds,
-                                "buffer index out of bounds",
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::BufferIndexOutOfBounds,
+                            "buffer index out of bounds",
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     }
                 }
             };
@@ -1091,16 +1137,14 @@ impl CheckedInterpreter {
                     Ok(value) => value,
                     Err(message) => {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::BytecodeTrap,
-                                message,
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::BytecodeTrap,
+                            message,
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     }
                 }
             };
@@ -1291,16 +1335,14 @@ impl CheckedInterpreter {
                         Instruction::RemI32 { .. } if rhs != 0 => lhs.wrapping_rem(rhs),
                         Instruction::Div { .. } | Instruction::RemI32 { .. } => {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                            return Ok(InterpreterOutcome::Trapped {
-                                trap: Trap::from_continuation(
-                                    module,
-                                    &continuation,
-                                    TrapKind::DivideByZero,
-                                    "integer division or remainder by zero",
-                                ),
-                                charge,
-                                fuel,
-                            });
+                            let trap = Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::DivideByZero,
+                                "integer division or remainder by zero",
+                            );
+                            reclaim_storage!();
+                            return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                         }
                         _ => unreachable!(),
                     };
@@ -1326,16 +1368,14 @@ impl CheckedInterpreter {
                         Instruction::RemI64 { .. } if rhs != 0 => lhs.wrapping_rem(rhs),
                         Instruction::DivI64 { .. } | Instruction::RemI64 { .. } => {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                            return Ok(InterpreterOutcome::Trapped {
-                                trap: Trap::from_continuation(
-                                    module,
-                                    &continuation,
-                                    TrapKind::DivideByZero,
-                                    "integer division or remainder by zero",
-                                ),
-                                charge,
-                                fuel,
-                            });
+                            let trap = Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::DivideByZero,
+                                "integer division or remainder by zero",
+                            );
+                            reclaim_storage!();
+                            return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                         }
                         _ => unreachable!(),
                     };
@@ -1528,16 +1568,14 @@ impl CheckedInterpreter {
                         StandardIntrinsicOutcome::Retry => {}
                         StandardIntrinsicOutcome::Trapped(message) => {
                             settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                            return Ok(InterpreterOutcome::Trapped {
-                                trap: Trap::from_continuation(
-                                    module,
-                                    &continuation,
-                                    TrapKind::StandardLibrary,
-                                    message,
-                                ),
-                                charge,
-                                fuel,
-                            });
+                            let trap = Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::StandardLibrary,
+                                message,
+                            );
+                            reclaim_storage!();
+                            return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                         }
                     }
                 }
@@ -1602,16 +1640,14 @@ impl CheckedInterpreter {
                     };
                     let Some(value) = value else {
                         settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                        return Ok(InterpreterOutcome::Trapped {
-                            trap: Trap::from_continuation(
-                                module,
-                                &continuation,
-                                TrapKind::StringIndexOutOfBounds,
-                                "string rune index out of bounds",
-                            ),
-                            charge,
-                            fuel,
-                        });
+                        let trap = Trap::from_continuation(
+                            module,
+                            &continuation,
+                            TrapKind::StringIndexOutOfBounds,
+                            "string rune index out of bounds",
+                        );
+                        reclaim_storage!();
+                        return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                     };
                     set_register(
                         &mut continuation.arena,
@@ -1753,38 +1789,34 @@ impl CheckedInterpreter {
                                 crate::HostTrap::Panicked => ("NX5001", 0),
                                 crate::HostTrap::Host(_) => ("NX5001", 1),
                             };
-                            return Ok(InterpreterOutcome::Trapped {
-                                trap: Trap::from_continuation(
-                                    module,
-                                    &continuation,
-                                    TrapKind::Host,
-                                    crate::RuntimeMessage::Code {
-                                        code: crate::DiagnosticCode::new(code),
-                                        argument,
-                                    },
-                                ),
-                                charge,
-                                fuel,
-                            });
+                            let trap = Trap::from_continuation(
+                                module,
+                                &continuation,
+                                TrapKind::Host,
+                                crate::RuntimeMessage::Code {
+                                    code: crate::DiagnosticCode::new(code),
+                                    argument,
+                                },
+                            );
+                            reclaim_storage!();
+                            return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                         }
                     };
                     match outcome {
                         InterpreterHostOutcome::Immediate(value) => {
                             if metadata.result != runtime_value_type(value) {
                                 settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                                return Ok(InterpreterOutcome::Trapped {
-                                    trap: Trap::from_continuation(
-                                        module,
-                                        &continuation,
-                                        TrapKind::Host,
-                                        crate::RuntimeMessage::Code {
-                                            code: crate::DiagnosticCode::new("NX5001"),
-                                            argument: 2,
-                                        },
-                                    ),
-                                    charge,
-                                    fuel,
-                                });
+                                let trap = Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::Host,
+                                    crate::RuntimeMessage::Code {
+                                        code: crate::DiagnosticCode::new("NX5001"),
+                                        argument: 2,
+                                    },
+                                );
+                                reclaim_storage!();
+                                return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                             }
                             if metadata.result.is_some() {
                                 set_register(&mut continuation.arena, dst, value)?;
@@ -1795,19 +1827,17 @@ impl CheckedInterpreter {
                         InterpreterHostOutcome::Pending(request) => {
                             if metadata.mode != HostCallMode::Async {
                                 settle_terminal_cost(&mut fuel, &mut charge, pending_cost)?;
-                                return Ok(InterpreterOutcome::Trapped {
-                                    trap: Trap::from_continuation(
-                                        module,
-                                        &continuation,
-                                        TrapKind::Host,
-                                        crate::RuntimeMessage::Code {
-                                            code: crate::DiagnosticCode::new("NX5001"),
-                                            argument: 3,
-                                        },
-                                    ),
-                                    charge,
-                                    fuel,
-                                });
+                                let trap = Trap::from_continuation(
+                                    module,
+                                    &continuation,
+                                    TrapKind::Host,
+                                    crate::RuntimeMessage::Code {
+                                        code: crate::DiagnosticCode::new("NX5001"),
+                                        argument: 3,
+                                    },
+                                );
+                                reclaim_storage!();
+                                return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                             }
                             continuation.suspend_reason = Some(SuspendReason::HostRequest);
                             continuation.pending_fuel = pending_cost;
@@ -2648,6 +2678,7 @@ impl CheckedInterpreter {
                         if continuation.cleanup_mode
                             && !start_next_defer(module, &mut continuation.arena)?
                         {
+                            reclaim_storage!();
                             return Ok(InterpreterOutcome::Returned {
                                 value: None,
                                 charge,
@@ -2665,6 +2696,7 @@ impl CheckedInterpreter {
                             result,
                         )?;
                     } else {
+                        reclaim_storage!();
                         return Ok(InterpreterOutcome::Returned {
                             value: Some(result),
                             charge,
@@ -2692,6 +2724,7 @@ impl CheckedInterpreter {
                         if continuation.cleanup_mode
                             && !start_next_defer(module, &mut continuation.arena)?
                         {
+                            reclaim_storage!();
                             return Ok(InterpreterOutcome::Returned {
                                 value: None,
                                 charge,
@@ -2701,6 +2734,7 @@ impl CheckedInterpreter {
                         pending_cost = 0;
                         continue;
                     } else if continuation.arena.depth() == 0 {
+                        reclaim_storage!();
                         return Ok(InterpreterOutcome::Returned {
                             value: None,
                             charge,
@@ -2726,16 +2760,14 @@ impl CheckedInterpreter {
                     if let Some(migration) = migration.as_deref_mut() {
                         migration.observe_fuel_used(charge.fuel_used);
                     }
-                    return Ok(InterpreterOutcome::Trapped {
-                        trap: Trap::from_continuation(
-                            module,
-                            &continuation,
-                            TrapKind::BytecodeTrap,
-                            "bytecode trap",
-                        ),
-                        charge,
-                        fuel,
-                    });
+                    let trap = Trap::from_continuation(
+                        module,
+                        &continuation,
+                        TrapKind::BytecodeTrap,
+                        "bytecode trap",
+                    );
+                    reclaim_storage!();
+                    return Ok(InterpreterOutcome::Trapped { trap, charge, fuel });
                 }
                 Instruction::DeferPush {
                     function,
@@ -2771,6 +2803,7 @@ impl CheckedInterpreter {
                         && continuation.arena.depth() > 0
                         && !start_next_defer(module, &mut continuation.arena)?
                     {
+                        reclaim_storage!();
                         return Ok(InterpreterOutcome::Returned {
                             value: None,
                             charge,
@@ -2778,6 +2811,7 @@ impl CheckedInterpreter {
                         });
                     }
                     if continuation.arena.depth() == 0 {
+                        reclaim_storage!();
                         return Ok(InterpreterOutcome::Returned {
                             value: None,
                             charge,
@@ -4473,6 +4507,7 @@ fn work(x: i32) -> i32 {
                     None,
                     Some(&mut heap),
                     rows,
+                    None,
                 )
                 .expect("row parity slice");
                 match outcome {

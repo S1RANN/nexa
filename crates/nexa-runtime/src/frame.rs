@@ -251,6 +251,49 @@ impl FrameArena {
         })
     }
 
+    /// H1: an allocation-free arena shell for storage swaps; unusable for
+    /// execution until [`Self::reset_for`] succeeds on it.
+    #[must_use]
+    pub(crate) fn empty_shell() -> Self {
+        Self {
+            frames: Vec::new(),
+            registers: Vec::new(),
+            defer_records: Vec::new(),
+            limits: FrameLimits::default(),
+        }
+    }
+
+    /// H1: reuses this arena's storage for a fresh continuation. Succeeds
+    /// only when the retained capacities already satisfy the reservation
+    /// (and the reservation satisfies the limits), so a reused arena is
+    /// indistinguishable from a freshly reserved one - including the
+    /// admission byte ceiling checks - and performs zero allocations.
+    pub(crate) fn reset_for(
+        &mut self,
+        limits: FrameLimits,
+        reservation: ContinuationReservation,
+    ) -> Result<(), FrameError> {
+        let max_registers = limits.max_frame_bytes / size_of::<RuntimeValue>().max(1);
+        if reservation.frame_capacity > limits.max_call_depth
+            || reservation.register_capacity as usize > max_registers
+            || reservation.defer_capacity > limits.max_defer_records
+        {
+            return Err(FrameError::ReservationExceedsLimit);
+        }
+        if self.frames.capacity() < reservation.frame_capacity as usize
+            || self.registers.capacity() < reservation.register_capacity as usize
+            || self.defer_records.capacity() < reservation.defer_capacity as usize
+        {
+            return Err(FrameError::ReservationExceedsLimit);
+        }
+        self.frames.clear();
+        self.registers.clear();
+        self.defer_records.clear();
+        self.limits = limits;
+        crate::allocation::record(crate::allocation::AllocationPhase::Admission, 0);
+        Ok(())
+    }
+
     pub fn push(&mut self, program_id: u32, register_count: usize) -> Result<(), FrameError> {
         self.push_call(
             program_id,

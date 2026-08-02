@@ -1168,6 +1168,11 @@ pub struct RealmRuntime {
     /// G2 trigger baseline: cumulative object allocations at the moment
     /// the last incremental cycle completed.
     gc_cycle_baseline: u64,
+    /// H1: bounded pool of retired continuation arenas. Admission pops one
+    /// and reuses its storage when the capacities satisfy the module's
+    /// reservation; terminal polls push the storage back. Bounded so idle
+    /// realms never retain more than a few task stacks worth of memory.
+    continuation_pool: Vec<crate::FrameArena>,
 }
 
 impl RealmRuntime {
@@ -1221,6 +1226,9 @@ impl RealmRuntime {
             runtime_host: None,
             failure_injector,
             gc_cycle_baseline: 0,
+            // H1: preallocated so terminal-path pushes never allocate; the
+            // allocation-observer gates pin task terminals at zero.
+            continuation_pool: Vec::with_capacity(Self::CONTINUATION_POOL_LIMIT),
         }
     }
 
@@ -2485,6 +2493,21 @@ impl RealmRuntime {
         self.active_root = Some(root);
     }
 
+    /// H1: bounded retention so the pool never outlives its usefulness.
+    const CONTINUATION_POOL_LIMIT: usize = 16;
+
+    fn recycle_continuation_storage(&mut self, storage: crate::FrameArena) {
+        if self.continuation_pool.len() < Self::CONTINUATION_POOL_LIMIT {
+            self.continuation_pool.push(storage);
+        }
+    }
+
+    /// H1 observability: retired continuation arenas currently pooled.
+    #[must_use]
+    pub fn continuation_pool_depth(&self) -> usize {
+        self.continuation_pool.len()
+    }
+
     fn spawn_task_inner(
         &mut self,
         module: ModuleHandle,
@@ -2602,12 +2625,16 @@ impl RealmRuntime {
         let verified = Arc::clone(&loaded.verified);
         let epoch = loaded.epoch;
         let reservation = reservation_for_module(&verified, config.limits.frames);
-        let continuation = CheckedInterpreter::start(
+        // H1: reuse pooled continuation storage when its retained
+        // capacities satisfy this module's reservation; the constructor
+        // falls back to a fresh reservation otherwise.
+        let continuation = crate::InterpreterContinuation::new_with_storage(
             &verified,
             function,
             arguments,
             config.limits.frames,
             reservation,
+            self.continuation_pool.pop(),
         )?;
         let task = self.tasks.admit_task(config.owner, epoch, true)?;
         if let Err(error) = self.tasks.attach_continuation(
@@ -2889,6 +2916,7 @@ impl RealmRuntime {
         let mut state_bridge = RealmStateBridge {
             registry: Arc::make_mut(&mut module.state),
         };
+        let mut recycled_storage: Option<crate::FrameArena> = None;
         let outcome = if let Some(registry) = self.host_registry.as_deref_mut() {
             let mut bridge = RealmHostBridge {
                 registry,
@@ -2907,6 +2935,7 @@ impl RealmRuntime {
                 &mut state_bridge,
                 &mut self.heap,
                 Some(&executable),
+                Some(&mut recycled_storage),
             )?
         } else {
             CheckedInterpreter::poll_with_heap_and_state(
@@ -2917,8 +2946,14 @@ impl RealmRuntime {
                 &mut state_bridge,
                 &mut self.heap,
                 Some(&executable),
+                Some(&mut recycled_storage),
             )?
         };
+        // H1: terminal polls hand the arena storage back; suspensions never
+        // set the slot. Pooled storage feeds the next task admission.
+        if let Some(storage) = recycled_storage {
+            self.recycle_continuation_storage(storage);
+        }
         match outcome {
             InterpreterOutcome::Returned {
                 value,
