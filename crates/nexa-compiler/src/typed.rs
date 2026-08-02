@@ -534,6 +534,9 @@ struct FunctionEmitter<'a> {
     /// a heap object. Maps the binding to its owner struct and the base of
     /// its contiguous field register range.
     inline_structs: BTreeMap<DefinitionId, (DefinitionId, u16)>,
+    /// Inlined enum locals: statically known variant plus the optional
+    /// payload register (M5 stage-C enum slice).
+    inline_enums: BTreeMap<DefinitionId, (DefinitionId, Option<u16>)>,
     register_types: Vec<Option<ValueType>>,
     parameter_count: usize,
     function_effect: IrEffect,
@@ -2240,6 +2243,196 @@ fn inline_struct_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId
     candidates
 }
 
+/// M5 stage-C enum slice: locals initialized by a direct user-enum variant
+/// construction whose every later use is a statically selectable match
+/// scrutinee. The constructed variant is a compile-time constant, so the
+/// match collapses to the matching arm and the binding needs at most one
+/// payload register; no `EnumNew`, `EnumTag`, or `EnumPayload` is emitted.
+///
+/// Any bare reference, any write, a top-level binding pattern, or a
+/// multi-payload pattern disqualifies the binding to the heap path.
+fn inline_enum_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, DefinitionId> {
+    let mut candidates = BTreeMap::new();
+    collect_inline_enum_candidates(&function.body, &mut candidates);
+    if candidates.is_empty() {
+        return candidates;
+    }
+    let mut disqualified = BTreeSet::new();
+    scan_enum_block_escapes(&function.body, &candidates, &mut disqualified);
+    candidates.retain(|definition, _| !disqualified.contains(definition));
+    candidates
+}
+
+fn collect_inline_enum_candidates(
+    block: &TypedBlockIr,
+    candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
+) {
+    for statement in &block.statements {
+        match statement {
+            TypedStatementIr::Let {
+                definition,
+                mutable: _,
+                value: Some(value),
+            } => {
+                if let TypedExpressionKind::EnumConstruct {
+                    variant_definition, ..
+                } = &value.kind
+                {
+                    candidates.insert(*definition, *variant_definition);
+                }
+            }
+            TypedStatementIr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_inline_enum_candidates(then_block, candidates);
+                if let Some(else_block) = else_block {
+                    collect_inline_enum_candidates(else_block, candidates);
+                }
+            }
+            TypedStatementIr::While { body, .. }
+            | TypedStatementIr::StaticRangeFor { body, .. } => {
+                collect_inline_enum_candidates(body, candidates);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Static arm selection needs every top-level pattern to name a variant (at
+/// most one payload sub-pattern) or be a wildcard; a top-level binding
+/// would need the materialized enum value.
+fn enum_match_is_static(arms: &[nexa_analysis::TypedMatchArmIr]) -> bool {
+    arms.iter().all(|arm| match &arm.pattern.kind {
+        TypedPatternKind::Variant { payload, .. } => payload.len() <= 1,
+        TypedPatternKind::Wildcard => true,
+        _ => false,
+    })
+}
+
+fn scan_enum_block_escapes(
+    block: &TypedBlockIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    for statement in &block.statements {
+        scan_enum_statement_escapes(statement, candidates, disqualified);
+    }
+    if let Some(tail) = &block.tail {
+        scan_enum_expression_escapes(tail, candidates, disqualified);
+    }
+}
+
+fn scan_enum_statement_escapes(
+    statement: &TypedStatementIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match statement {
+        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
+            if let Some(value) = value {
+                scan_enum_expression_escapes(value, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::Assign { target, value } => {
+            // No sanctioned mutation in this slice: the statically known
+            // variant is what makes the match collapse legal.
+            scan_enum_place_escapes(target, candidates, disqualified);
+            scan_enum_expression_escapes(value, candidates, disqualified);
+        }
+        TypedStatementIr::Expression(expression) => {
+            scan_enum_expression_escapes(expression, candidates, disqualified);
+        }
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            scan_enum_expression_escapes(condition, candidates, disqualified);
+            scan_enum_block_escapes(then_block, candidates, disqualified);
+            if let Some(else_block) = else_block {
+                scan_enum_block_escapes(else_block, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => {
+            scan_enum_expression_escapes(condition, candidates, disqualified);
+            scan_enum_block_escapes(body, candidates, disqualified);
+        }
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            scan_enum_expression_escapes(start, candidates, disqualified);
+            scan_enum_expression_escapes(end, candidates, disqualified);
+            scan_enum_block_escapes(body, candidates, disqualified);
+        }
+        TypedStatementIr::Defer { captures, .. } => {
+            for capture in captures {
+                scan_enum_expression_escapes(capture, candidates, disqualified);
+            }
+        }
+        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {}
+    }
+}
+
+fn scan_enum_place_escapes(
+    place: &TypedPlaceIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match place {
+        TypedPlaceIr::Definition(definition) => {
+            if candidates.contains_key(definition) {
+                disqualified.insert(*definition);
+            }
+        }
+        TypedPlaceIr::Field { base, .. } => scan_enum_place_escapes(base, candidates, disqualified),
+        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
+            scan_enum_expression_escapes(object, candidates, disqualified);
+        }
+        TypedPlaceIr::Index { base, index } => {
+            scan_enum_expression_escapes(base, candidates, disqualified);
+            scan_enum_expression_escapes(index, candidates, disqualified);
+        }
+    }
+}
+
+fn scan_enum_expression_escapes(
+    expression: &TypedExpressionIr,
+    candidates: &BTreeMap<DefinitionId, DefinitionId>,
+    disqualified: &mut BTreeSet<DefinitionId>,
+) {
+    match &expression.kind {
+        // A bare reference needs the materialized enum value.
+        TypedExpressionKind::Reference(definition) => {
+            if candidates.contains_key(definition) {
+                disqualified.insert(*definition);
+            }
+        }
+        // A statically selectable match over the binding is the one
+        // sanctioned use; arm values are still scanned.
+        TypedExpressionKind::Match { value, arms } => {
+            if !matches!(&value.kind, TypedExpressionKind::Reference(definition)
+                if candidates.contains_key(definition) && enum_match_is_static(arms))
+            {
+                scan_enum_expression_escapes(value, candidates, disqualified);
+            }
+            for arm in arms {
+                scan_enum_expression_escapes(&arm.value, candidates, disqualified);
+            }
+        }
+        _ => {
+            let mut children = Vec::new();
+            collect_expression_children(expression, &mut children);
+            for child in children {
+                scan_enum_expression_escapes(child, candidates, disqualified);
+            }
+        }
+    }
+}
+
 fn collect_inline_candidates(
     block: &TypedBlockIr,
     candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
@@ -2511,6 +2704,7 @@ impl<'a> FunctionEmitter<'a> {
         // written, so the exact dataflow root maps ignore it. The WP36
         // reference pipeline materializes every struct on the heap.
         let mut inline_structs = BTreeMap::new();
+        let mut inline_enums = BTreeMap::new();
         if optimize {
             for (definition, owner) in inline_struct_candidates(function) {
                 let Some(layout) = layouts.aggregates.get(&owner) else {
@@ -2526,6 +2720,23 @@ impl<'a> FunctionEmitter<'a> {
                 }
                 inline_structs.insert(definition, (owner, fields_base));
             }
+            // Enum slice: the variant is fixed at the Let site, so the
+            // binding collapses to one optional payload register.
+            for (definition, variant_definition) in inline_enum_candidates(function) {
+                let Some((_, variant)) = layouts.variants.get(&variant_definition) else {
+                    continue;
+                };
+                let payload_register = match variant.payload {
+                    Some(payload_type) => {
+                        let register = u16::try_from(register_types.len())
+                            .map_err(|_| CompileError::too_many_registers(function_span))?;
+                        register_types.push(Some(payload_type));
+                        Some(register)
+                    }
+                    None => None,
+                };
+                inline_enums.insert(definition, (variant_definition, payload_register));
+            }
         }
         Ok(Self {
             package,
@@ -2538,6 +2749,7 @@ impl<'a> FunctionEmitter<'a> {
             string_indices,
             locals,
             inline_structs,
+            inline_enums,
             register_types,
             parameter_count: function.parameters.len(),
             function_effect: function.effect,
@@ -2612,6 +2824,41 @@ impl<'a> FunctionEmitter<'a> {
                             ));
                         };
                         self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
+                        return Ok(());
+                    }
+                    if let Some((variant_definition, payload_register)) =
+                        self.inline_enums.get(definition).copied()
+                    {
+                        // Enum slice: the variant is statically known, so
+                        // only the payload (if any) is evaluated - into its
+                        // dedicated register. No EnumNew is emitted and no
+                        // heap object ever exists for this binding.
+                        let TypedExpressionKind::EnumConstruct {
+                            variant_definition: constructed,
+                            payload,
+                            ..
+                        } = &value.kind
+                        else {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        };
+                        if *constructed != variant_definition
+                            || payload.is_some() != payload_register.is_some()
+                        {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        }
+                        if let (Some(payload), Some(register)) =
+                            (payload.as_deref(), payload_register)
+                        {
+                            self.emit_expression(payload, register)?;
+                        }
                         return Ok(());
                     }
                     let destination = self.local(*definition)?;
@@ -4766,6 +5013,20 @@ impl<'a> FunctionEmitter<'a> {
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
+        // Enum slice: a match over an inlined binding selects its arm at
+        // compile time; no scrutinee register and no tag comparison exist.
+        if let TypedExpressionKind::Reference(definition) = &value.kind
+            && let Some((variant_definition, payload_register)) =
+                self.inline_enums.get(definition).copied()
+        {
+            return self.emit_inline_enum_match(
+                variant_definition,
+                payload_register,
+                arms,
+                destination,
+                span,
+            );
+        }
         let source = self.allocate_expression(value)?;
         self.emit_expression(value, source)?;
         let mut ends = Vec::new();
@@ -4777,6 +5038,67 @@ impl<'a> FunctionEmitter<'a> {
             let next = self.position();
             for failure in failures {
                 self.patch_target(failure, next)?;
+            }
+        }
+        self.push(Instruction::Trap, span);
+        let end = self.position();
+        for patch in ends {
+            self.patch_target(patch, end)?;
+        }
+        Ok(())
+    }
+
+    /// Match emission for an inlined enum binding (M5 stage-C enum slice):
+    /// arms naming other variants vanish, the matching variant's payload
+    /// sub-pattern guards run against the payload register, and the first
+    /// unconditional arm ends the chain. The trailing `Trap` is kept so a
+    /// failing literal payload guard traps exactly like the heap path.
+    fn emit_inline_enum_match(
+        &mut self,
+        variant_definition: DefinitionId,
+        payload_register: Option<u16>,
+        arms: &[nexa_analysis::TypedMatchArmIr],
+        destination: u16,
+        span: SourceSpan,
+    ) -> Result<(), CompileError> {
+        let mut ends = Vec::new();
+        for arm in arms {
+            let mut failures = Vec::new();
+            match &arm.pattern.kind {
+                TypedPatternKind::Variant {
+                    definition,
+                    payload,
+                } if *definition == variant_definition => {
+                    match (payload.as_slice(), payload_register) {
+                        ([], None) => {}
+                        ([single], Some(register)) => {
+                            self.emit_pattern_guard(register, single, &mut failures, span)?;
+                        }
+                        _ => {
+                            return Err(CompileError::type_mismatch(None, None, span));
+                        }
+                    }
+                }
+                TypedPatternKind::Variant { .. } => {
+                    // Statically unreachable arm: no code.
+                    continue;
+                }
+                TypedPatternKind::Wildcard => {}
+                _ => {
+                    // The escape scan only admits statically selectable
+                    // matches; anything else is a compiler bug.
+                    return Err(CompileError::type_mismatch(None, None, span));
+                }
+            }
+            let unconditional = failures.is_empty();
+            self.emit_expression(&arm.value, destination)?;
+            ends.push(self.push(Instruction::Jump { target: 0 }, span));
+            let next = self.position();
+            for failure in failures {
+                self.patch_target(failure, next)?;
+            }
+            if unconditional {
+                break;
             }
         }
         self.push(Instruction::Trap, span);

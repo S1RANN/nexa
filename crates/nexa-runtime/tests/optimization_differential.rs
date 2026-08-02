@@ -100,6 +100,22 @@ fn enum_round(x: i32) -> i32 {
         Signal::Loud(value) => value + 1,
     };
 }
+fn enum_static_quiet(x: i32) -> i32 {
+    let signal: Signal = Signal::Quiet;
+    return match signal {
+        Signal::Loud(value) => value,
+        Signal::Quiet => x + 2,
+    };
+}
+fn enum_escape(x: i32) -> i32 {
+    let signal: Signal = Signal::Loud(x);
+    return match signal {
+        other => match other {
+            Signal::Quiet => 0,
+            Signal::Loud(value) => value + 3,
+        },
+    };
+}
 fn div_trap(a: i32, b: i32) -> i32 {
     return a / b;
 }
@@ -120,8 +136,10 @@ const ARRAY_SWEEP: u32 = 7;
 const STRING_WALK: u32 = 8;
 const MAP_ROUND: u32 = 9;
 const ENUM_ROUND: u32 = 10;
-const DIV_TRAP: u32 = 11;
-const INDEX_TRAP: u32 = 12;
+const ENUM_STATIC_QUIET: u32 = 11;
+const ENUM_ESCAPE: u32 = 12;
+const DIV_TRAP: u32 = 13;
+const INDEX_TRAP: u32 = 14;
 
 const FUEL: u64 = 1_000_000;
 
@@ -208,6 +226,8 @@ fn optimized_and_reference_pipelines_agree_on_results_and_traps() {
         (STRING_WALK, vec![RuntimeValue::I32(32)], returns(512)),
         (MAP_ROUND, vec![RuntimeValue::I32(16)], returns(360)),
         (ENUM_ROUND, vec![RuntimeValue::I32(41)], returns(42)),
+        (ENUM_STATIC_QUIET, vec![RuntimeValue::I32(9)], returns(11)),
+        (ENUM_ESCAPE, vec![RuntimeValue::I32(20)], returns(23)),
         (
             DIV_TRAP,
             vec![RuntimeValue::I32(7), RuntimeValue::I32(2)],
@@ -249,6 +269,34 @@ fn reference_pipeline_actually_disables_the_optimizations() {
     assert!(
         materializations(&reference, STRUCT_READ) > 0,
         "reference pipeline materializes the struct on the heap"
+    );
+    // Stage-C enum slice: the statically selectable match binding loses its
+    // EnumNew in the optimized pipeline only, while the escaping binding
+    // (top-level binding pattern) keeps the heap path on both sides.
+    let enum_materializations = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::EnumNew { .. }))
+            .count()
+    };
+    assert_eq!(
+        enum_materializations(&optimized, ENUM_ROUND),
+        0,
+        "optimized pipeline inlines the match-only enum local"
+    );
+    assert!(
+        enum_materializations(&reference, ENUM_ROUND) > 0,
+        "reference pipeline materializes the enum on the heap"
+    );
+    assert_eq!(
+        enum_materializations(&optimized, ENUM_STATIC_QUIET),
+        0,
+        "optimized pipeline inlines the payload-less enum local"
+    );
+    assert!(
+        enum_materializations(&optimized, ENUM_ESCAPE) > 0,
+        "a top-level binding pattern disqualifies the enum local on both sides"
     );
     // WP37/WP38: constant folding shortens the arithmetic chain, so the
     // optimized body must be strictly smaller. If this ever fails the
