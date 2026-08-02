@@ -30,7 +30,9 @@ pub struct VmMap {
 }
 
 impl VmMap {
-    fn references(&self) -> Vec<GcRef> {
+    // WP73: stream child references into the mark queue instead of
+    // materializing a temporary Vec per object during GC.
+    fn trace_references(&self, visit: &mut impl FnMut(GcRef)) {
         let current = self
             .slots
             .iter()
@@ -44,7 +46,9 @@ impl VmMap {
                 .filter_map(Option::as_ref)
                 .flat_map(|entry| [entry.key, entry.value])
         });
-        current.chain(rehash).filter_map(value_reference).collect()
+        for reference in current.chain(rehash).filter_map(value_reference) {
+            visit(reference);
+        }
     }
 }
 
@@ -343,50 +347,38 @@ pub enum Object {
 }
 
 impl Object {
-    fn references(&self) -> Vec<GcRef> {
+    // WP73: allocation-free reference traversal for the GC mark phase.
+    // Array/Buffer extents live in the collection arena and are traced
+    // directly inside `collect`, which owns the arena borrow.
+    fn trace_references(&self, visit: &mut impl FnMut(GcRef)) {
         match self {
+            // MAX_CLASS_FIELDS == MAX_STRUCT_FIELDS, so both inline field
+            // arrays share one arm.
             Self::Class {
                 fields,
                 field_count,
                 ..
-            } => fields[..usize::from(*field_count)]
-                .iter()
-                .filter_map(|field| match field {
-                    RuntimeValue::String { reference, .. }
-                    | RuntimeValue::Struct { reference, .. }
-                    | RuntimeValue::Ref(reference)
-                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
-                    _ => None,
-                })
-                .collect(),
-            Self::Map(map) => map.references(),
-            Self::Enum { payload, .. } => payload
-                .iter()
-                .filter_map(|payload| match payload {
-                    RuntimeValue::String { reference, .. }
-                    | RuntimeValue::Struct { reference, .. }
-                    | RuntimeValue::Ref(reference)
-                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
-                    _ => None,
-                })
-                .collect(),
-            Self::Struct {
+            }
+            | Self::Struct {
                 fields,
                 field_count,
                 ..
-            } => fields[..usize::from(*field_count)]
-                .iter()
-                .filter_map(|field| match field {
-                    RuntimeValue::String { reference, .. }
-                    | RuntimeValue::Struct { reference, .. }
-                    | RuntimeValue::Ref(reference)
-                    | RuntimeValue::NamedRef { reference, .. } => Some(*reference),
-                    _ => None,
-                })
-                .collect(),
-            Self::Array { .. } | Self::Buffer { .. } | Self::String(_) | Self::I32Array(_) => {
-                Vec::new()
+            } => {
+                for reference in fields[..usize::from(*field_count)]
+                    .iter()
+                    .copied()
+                    .filter_map(value_reference)
+                {
+                    visit(reference);
+                }
             }
+            Self::Map(map) => map.trace_references(visit),
+            Self::Enum { payload, .. } => {
+                for reference in payload.iter().copied().filter_map(value_reference) {
+                    visit(reference);
+                }
+            }
+            Self::Array { .. } | Self::Buffer { .. } | Self::String(_) | Self::I32Array(_) => {}
         }
     }
 }
@@ -594,6 +586,10 @@ pub struct Heap {
     /// repurposed slot simply falls back to a fresh allocation. No root
     /// management, no unload bookkeeping, no leak.
     string_literal_cache: BTreeMap<String, GcRef>,
+    /// WP74: reusable mark-phase work queue. Capacity converges to the
+    /// high-water mark of prior collections instead of reallocating on
+    /// every `collect` call. Pure scratch space, never heap state.
+    mark_scratch: VecDeque<GcRef>,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -693,6 +689,7 @@ impl Heap {
             failure_injector: RuntimeFailureInjector::default(),
             counters: VmAllocationCounters::default(),
             string_literal_cache: BTreeMap::new(),
+            mark_scratch: VecDeque::with_capacity(max_objects as usize),
         }
     }
 
@@ -2518,49 +2515,80 @@ impl Heap {
             .ok_or(HeapError::InvalidReference(reference))
     }
 
-    pub fn collect(&mut self, roots: &GcRoots) -> Result<CollectionStats, HeapError> {
-        for slot in &mut self.slots {
-            slot.marked = false;
-        }
-        let mut queue = VecDeque::new();
+    /// Mark phase (WP73/WP74): seeds the reusable queue with the validated
+    /// roots and drains it breadth-first. Child references stream straight
+    /// into the queue via `trace_references`, so no per-object temporary
+    /// `Vec` is materialized; each queued reference is validated when it is
+    /// popped, before its slot is touched, preserving the corruption
+    /// detection contract of the previous push-time validation.
+    fn mark_reachable(
+        &mut self,
+        roots: &GcRoots,
+        queue: &mut VecDeque<GcRef>,
+    ) -> Result<usize, HeapError> {
         for root in roots.iter() {
             self.validate_reference(root)?;
             queue.push_back(root);
         }
         let mut marked = 0;
         while let Some(reference) = queue.pop_front() {
-            let slot = &mut self.slots[reference.index as usize];
+            let slot = self
+                .slots
+                .get_mut(reference.index as usize)
+                .filter(|slot| slot.generation == reference.generation && slot.object.is_some())
+                .ok_or(HeapError::InvalidReference(reference))?;
             if slot.marked {
                 continue;
             }
             slot.marked = true;
             marked += 1;
-            let object = slot.object.as_ref().expect("validated live object");
-            let references = match object {
+            let object = slot.object.as_ref().expect("presence checked above");
+            match object {
                 // Only the live prefix of an array participates in marking;
                 // vacated capacity slots are cleared to Unit on shrink.
                 Object::Array { range, length, .. } => {
                     let live = *length;
-                    self.collections
+                    for child in self
+                        .collections
                         .values(*range)?
                         .iter()
                         .take(live)
-                        .filter_map(|value| value_reference(*value))
-                        .collect()
+                        .copied()
+                        .filter_map(value_reference)
+                    {
+                        queue.push_back(child);
+                    }
                 }
-                Object::Buffer { range, .. } => self
-                    .collections
-                    .values(*range)?
-                    .iter()
-                    .filter_map(|value| value_reference(*value))
-                    .collect(),
-                _ => object.references(),
-            };
-            for child in references {
-                self.validate_reference(child)?;
-                queue.push_back(child);
+                Object::Buffer { range, .. } => {
+                    for child in self
+                        .collections
+                        .values(*range)?
+                        .iter()
+                        .copied()
+                        .filter_map(value_reference)
+                    {
+                        queue.push_back(child);
+                    }
+                }
+                _ => object.trace_references(&mut |child| queue.push_back(child)),
             }
         }
+        Ok(marked)
+    }
+
+    pub fn collect(&mut self, roots: &GcRoots) -> Result<CollectionStats, HeapError> {
+        for slot in &mut self.slots {
+            slot.marked = false;
+        }
+        // WP74: the scratch queue is taken for the duration of the mark
+        // phase and returned on every path, so its capacity converges to
+        // the reachable-set high-water mark instead of reallocating per
+        // collection.
+        let mut queue = std::mem::take(&mut self.mark_scratch);
+        queue.clear();
+        let marked = self.mark_reachable(roots, &mut queue);
+        self.mark_scratch = queue;
+        let marked = marked?;
         let mut reclaimed = 0;
         for (index, slot) in self.slots.iter_mut().enumerate() {
             if slot.object.is_some() && !slot.marked {
