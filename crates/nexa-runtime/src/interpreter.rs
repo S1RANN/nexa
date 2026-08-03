@@ -568,17 +568,45 @@ impl OpcodeCostTable {
     }
 }
 
-/// Type identity for allocating instructions profiled as WP14 sites; `None`
-/// marks non-allocating instructions.
-const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
+const fn profile_builtin_type(name: &[u8]) -> StableId {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    let mut index = 0;
+    while index < name.len() {
+        hash ^= name[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += 1;
+    }
+    StableId(hash)
+}
+
+const PROFILE_STRING_TYPE: StableId = profile_builtin_type(b"String");
+const PROFILE_BUFFER_TYPE: StableId = profile_builtin_type(b"Buffer");
+
+/// Stable WP14 allocation kind and type identity; `None` marks a
+/// non-allocating instruction. Verifier-resolved nominal metadata supplies
+/// the source type for copy-style Struct materialization.
+pub(crate) const fn allocation_profile(
+    instruction: Instruction,
+    resolved: nexa_verifier::ResolvedNominalOperand,
+) -> Option<(crate::profiler::AllocationKind, StableId)> {
+    use crate::profiler::AllocationKind;
     match instruction {
-        Instruction::StructNew { type_id, .. }
-        | Instruction::ClassNew { type_id, .. }
-        | Instruction::EnumNew { type_id, .. }
-        | Instruction::ArrayNew { type_id, .. }
-        | Instruction::MapNew { type_id, .. } => Some(type_id.0),
-        Instruction::StructWith { .. }
-        | Instruction::LoadString { .. }
+        Instruction::StructNew { type_id, .. } => {
+            Some((AllocationKind::StructMaterialization, type_id))
+        }
+        Instruction::ClassNew { type_id, .. } => Some((AllocationKind::Class, type_id)),
+        Instruction::EnumNew { type_id, .. } => {
+            Some((AllocationKind::EnumMaterialization, type_id))
+        }
+        Instruction::ArrayNew { type_id, .. } => Some((AllocationKind::ArrayStorage, type_id)),
+        Instruction::MapNew { type_id, .. } => Some((AllocationKind::MapSlots, type_id)),
+        Instruction::StructWith { .. } => match resolved {
+            nexa_verifier::ResolvedNominalOperand::StructField { type_id, .. } => {
+                Some((AllocationKind::StructMaterialization, type_id))
+            }
+            _ => Some((AllocationKind::StructMaterialization, StableId(0))),
+        },
+        Instruction::LoadString { .. }
         | Instruction::StringConcat { .. }
         | Instruction::StringToString { .. }
         | Instruction::I32ToString { .. }
@@ -586,13 +614,44 @@ const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
         | Instruction::F32ToString { .. }
         | Instruction::F64ToString { .. }
         | Instruction::BoolToString { .. }
-        | Instruction::RuneToString { .. }
-        | Instruction::BufferSlice { .. } => Some(0),
+        | Instruction::RuneToString { .. } => Some((AllocationKind::String, PROFILE_STRING_TYPE)),
+        Instruction::BufferSlice { .. } => {
+            Some((AllocationKind::BufferStorage, PROFILE_BUFFER_TYPE))
+        }
         _ => None,
     }
 }
 
+fn record_executable_profile_instruction(
+    profile_module: crate::profiler::ProfileModuleSlot,
+    function: u32,
+    pc: u32,
+    instruction: Instruction,
+    row: crate::executable::ExecutableProfileRow,
+) {
+    crate::profiler::record_instruction(
+        profile_module,
+        opcode_index(instruction),
+        function,
+        row.allocation
+            .map(|(kind, type_id)| crate::profiler::AllocationEvent {
+                pc,
+                source_span: row.source_span,
+                kind,
+                type_id,
+            }),
+        row.host_call,
+    );
+}
+
 pub struct CheckedInterpreter;
+
+type CachedFunctionMetadata<'a> = (
+    u32,
+    &'a nexa_bytecode::Function,
+    Option<&'a [crate::executable::ExecutableInstruction]>,
+    Option<&'a [crate::executable::ExecutableProfileRow]>,
+);
 
 #[derive(Clone, Copy)]
 enum StaticLeafStep {
@@ -1362,6 +1421,7 @@ impl CheckedInterpreter {
     /// insufficient budgets return `None` before any heap mutation so the
     /// caller can preserve ordinary suspension semantics through the full
     /// interpreter.
+    #[allow(clippy::too_many_lines)]
     pub fn try_run_static_leaf(
         module: &VerifiedModule,
         function: u32,
@@ -1419,7 +1479,32 @@ impl CheckedInterpreter {
         if upper_fuel > fuel.slice_remaining || cumulative_after_upper > fuel.cumulative_limit {
             return Ok(None);
         }
-        if certificate.buffer_kernel_instructions.is_some() {
+        let profile_module = crate::profiler::enabled()
+            .then(|| crate::profiler::begin_module(module))
+            .flatten();
+        let record_prefix = |count: usize| {
+            let Some(profile_module) = profile_module else {
+                return;
+            };
+            for (pc, (instruction, row)) in function_meta
+                .code
+                .iter()
+                .copied()
+                .zip(executable_function.profile_rows())
+                .take(count)
+                .enumerate()
+            {
+                record_executable_profile_instruction(
+                    profile_module,
+                    function,
+                    u32::try_from(pc).unwrap_or(u32::MAX),
+                    instruction,
+                    *row,
+                );
+            }
+        };
+        if let Some(instructions) = certificate.buffer_kernel_instructions {
+            record_prefix(usize::from(instructions));
             return execute_prepared_buffer_kernel(
                 certificate,
                 &prepared_buffers,
@@ -1430,6 +1515,7 @@ impl CheckedInterpreter {
             .map(Some);
         }
         if let Some(kernel) = executable_function.static_leaf_constant_kernel() {
+            record_prefix(usize::from(kernel.instructions));
             return execute_static_leaf_constant_kernel(
                 kernel, module, executable, fuel, upper_fuel, heap,
             )
@@ -1452,6 +1538,20 @@ impl CheckedInterpreter {
                 .fuel_used
                 .checked_add(attempt_fuel)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
+            if let Some(profile_module) = profile_module {
+                let profile_row = executable_function
+                    .profile_rows()
+                    .get(pc)
+                    .copied()
+                    .ok_or(InterpreterError::FellOffFunction)?;
+                record_executable_profile_instruction(
+                    profile_module,
+                    function,
+                    u32::try_from(pc).unwrap_or(u32::MAX),
+                    instruction,
+                    profile_row,
+                );
+            }
             let step = execute_static_leaf_instruction(
                 instruction,
                 *row,
@@ -2039,21 +2139,20 @@ impl CheckedInterpreter {
         // WP15/WP16: the enabled flag is read once per poll; the disabled
         // hot path costs one predictable branch per instruction.
         let profiling = crate::profiler::enabled();
+        let profile_module = profiling
+            .then(|| crate::profiler::begin_module(module))
+            .flatten();
         // K2: the verified function metadata and its predecoded rows are
         // immutable for the whole poll, so they are re-resolved only when
         // the executing function changes (Call/Return/defer boundaries)
         // instead of once per instruction.
-        let mut cached_function: Option<(
-            u32,
-            &nexa_bytecode::Function,
-            Option<&[crate::executable::ExecutableInstruction]>,
-        )> = None;
+        let mut cached_function: Option<CachedFunctionMetadata<'_>> = None;
         loop {
             let frame = *continuation.arena.current()?;
             continuation.current_function = frame.function;
-            let (function, function_rows) = match cached_function {
-                Some((cached_id, function, rows)) if cached_id == frame.function => {
-                    (function, rows)
+            let (function, function_rows, function_profile_rows) = match cached_function {
+                Some((cached_id, function, rows, profile_rows)) if cached_id == frame.function => {
+                    (function, rows, profile_rows)
                 }
                 _ => {
                     let function = module
@@ -2061,24 +2160,29 @@ impl CheckedInterpreter {
                         .functions
                         .get(frame.function as usize)
                         .ok_or(InterpreterError::MissingFunction(frame.function))?;
-                    let rows = if PREDECODED {
-                        Some(
-                            executable
-                                .expect("predecoded execution requires an executable module")
-                                .functions()
-                                .get(frame.function as usize)
-                                .ok_or(InterpreterError::FellOffFunction)?
-                                .rows(),
+                    let (rows, profile_rows) = if PREDECODED {
+                        let executable_function = executable
+                            .expect("predecoded execution requires an executable module")
+                            .functions()
+                            .get(frame.function as usize)
+                            .ok_or(InterpreterError::FellOffFunction)?;
+                        (
+                            Some(executable_function.rows()),
+                            profile_module.map(|_| executable_function.profile_rows()),
                         )
                     } else {
-                        executable.and_then(|rows| {
-                            rows.functions()
-                                .get(frame.function as usize)
-                                .map(crate::executable::ExecutableFunction::rows)
-                        })
+                        let executable_function = executable
+                            .and_then(|rows| rows.functions().get(frame.function as usize));
+                        (
+                            executable_function.map(crate::executable::ExecutableFunction::rows),
+                            profile_module.and_then(|_| {
+                                executable_function
+                                    .map(crate::executable::ExecutableFunction::profile_rows)
+                            }),
+                        )
                     };
-                    cached_function = Some((frame.function, function, rows));
-                    (function, rows)
+                    cached_function = Some((frame.function, function, rows, profile_rows));
+                    (function, rows, profile_rows)
                 }
             };
             let instruction_cost;
@@ -2133,7 +2237,8 @@ impl CheckedInterpreter {
                 };
                 fuel_boundary = row.fuel_boundary;
             } else {
-                resolved_nominal = nexa_verifier::ResolvedNominalOperand::None;
+                resolved_nominal =
+                    module.resolved_operand(frame.function as usize, frame.pc as usize);
                 instruction_cost = instruction_attempt_fuel(
                     module.module(),
                     module.nominal_index_shape(),
@@ -2196,12 +2301,47 @@ impl CheckedInterpreter {
                 pending_cost = settlement;
             }
             charge.instructions = charge.instructions.saturating_add(1);
-            if profiling {
+            if let Some(profile_module) = profile_module {
+                let (allocation, host_call) = if let Some(row) =
+                    function_profile_rows.and_then(|rows| rows.get(frame.pc as usize))
+                {
+                    (
+                        row.allocation
+                            .map(|(kind, type_id)| crate::profiler::AllocationEvent {
+                                pc: frame.pc,
+                                source_span: row.source_span,
+                                kind,
+                                type_id,
+                            }),
+                        row.host_call,
+                    )
+                } else {
+                    (
+                        allocation_profile(instruction, resolved_nominal).map(|(kind, type_id)| {
+                            crate::profiler::AllocationEvent {
+                                pc: frame.pc,
+                                source_span: module.module().source_span(frame.function, frame.pc),
+                                kind,
+                                type_id,
+                            }
+                        }),
+                        if let Instruction::HostCall { import, .. } = instruction {
+                            module
+                                .module()
+                                .host_imports
+                                .get(import as usize)
+                                .map(|host| (host.stable_id, host.mode))
+                        } else {
+                            None
+                        },
+                    )
+                };
                 crate::profiler::record_instruction(
+                    profile_module,
                     opcode_index(instruction),
                     frame.function,
-                    allocation_type_identity(instruction).map(|type_id| (frame.pc, type_id)),
-                    matches!(instruction, Instruction::HostCall { .. }),
+                    allocation,
+                    host_call,
                 );
             }
             match instruction {
@@ -3093,7 +3233,7 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::StructField { index } => {
+                        nexa_verifier::ResolvedNominalOperand::StructField { index, .. } => {
                             usize::from(index)
                         }
                         _ => module
@@ -3121,7 +3261,7 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::StructField { index } => {
+                        nexa_verifier::ResolvedNominalOperand::StructField { index, .. } => {
                             usize::from(index)
                         }
                         _ => module

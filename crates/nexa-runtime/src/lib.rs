@@ -91,8 +91,10 @@ pub use interpreter::{
 };
 pub use metrics::ExecutionMetrics;
 pub use profiler::{
-    AllocationSiteProfile, FunctionProfile, OpcodeProfile, PROFILER_FUNCTION_CAPACITY,
-    PROFILER_SITE_CAPACITY, ProfilerReport,
+    AllocationKind, AllocationProfile, AllocationSiteId, DroppedProfile, FunctionIdentity,
+    FunctionProfile, GcProfile, HostCallProfile, OpcodeProfile, PROFILER_FUNCTION_CAPACITY,
+    PROFILER_HOST_CALL_CAPACITY, PROFILER_MODULE_CAPACITY, PROFILER_SCHEMA_VERSION,
+    PROFILER_SITE_CAPACITY, PerformanceProfile, TaskProfile,
 };
 pub use realm::{
     CancelReason, CompletionDisposition, ExecutionImageCacheInspection, HostFunctionAuthorityField,

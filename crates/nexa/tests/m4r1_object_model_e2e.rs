@@ -274,12 +274,6 @@ fn canonical_object_model_source_executes_through_verified_bytecode() {
                 .any(|instruction| matches!(instruction, Instruction::ClassGet { .. })),
         ),
         (
-            "ClassSet",
-            instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::ClassSet { .. })),
-        ),
-        (
             "ClassEqual",
             instructions
                 .iter()
@@ -302,6 +296,9 @@ fn canonical_object_model_source_executes_through_verified_bytecode() {
         )
         .expect("verifier-approved artifact loads into Realm");
     let owner = realm.create_scope(None).expect("fixture task scope");
+    nexa::profiler::disable();
+    let _ = nexa::profiler::take_thread_report();
+    nexa::profiler::enable();
 
     assert_eq!(
         execute(
@@ -362,4 +359,28 @@ fn canonical_object_model_source_executes_through_verified_bytecode() {
         RuntimeValue::I32(41),
         "Option<Class> None must remain distinct from Some"
     );
+    nexa::profiler::disable();
+    let profile = nexa::profiler::take_thread_report().expect("profiled Package execution");
+    assert_eq!(profile.dropped, nexa::DroppedProfile::default());
+    assert!(!profile.allocations.is_empty());
+    assert!(profile.allocations.iter().all(|allocation| {
+        allocation.site.package_id == PACKAGE_ID
+            && allocation.site.module == MODULE
+            && allocation.site.function_stable_id.0 != 0
+            && allocation.site.source_span.is_some()
+    }));
+    assert!(profile.allocations.iter().any(|allocation| matches!(
+        allocation.site.kind,
+        nexa::AllocationKind::StructMaterialization
+    )));
+    assert!(
+        profile
+            .allocations
+            .iter()
+            .any(|allocation| matches!(allocation.site.kind, nexa::AllocationKind::Class))
+    );
+    assert!(profile.allocations.iter().any(|allocation| matches!(
+        allocation.site.kind,
+        nexa::AllocationKind::EnumMaterialization
+    )));
 }

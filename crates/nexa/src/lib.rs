@@ -55,11 +55,14 @@ pub use nexa_idl::{
     generate_rust as generate_rust_bindings, host_function_signature, parse as parse_nidl,
     parse_ast as parse_nidl_ast,
 };
+pub use nexa_runtime::profiler;
 pub use nexa_runtime::{
-    CheckedInterpreter, HOST_CONTRACT_SCHEMA_VERSION, HostContract, HostFunctionAuthority,
-    HostFunctionAuthorityField, MustCompletePolicy, RuntimeHostArgs, RuntimeLimits, RuntimeMessage,
+    AllocationKind, AllocationProfile, AllocationSiteId, CheckedInterpreter, DroppedProfile,
+    FunctionIdentity, FunctionProfile, GcProfile, HOST_CONTRACT_SCHEMA_VERSION, HostCallProfile,
+    HostContract, HostFunctionAuthority, HostFunctionAuthorityField, MustCompletePolicy,
+    OpcodeProfile, PerformanceProfile, RuntimeHostArgs, RuntimeLimits, RuntimeMessage,
     ScriptArgumentRequirements, ScriptCallError, ScriptCallStack, ScriptCallWriter, ScriptExport,
-    ScriptFrame, ScriptOutputReader, StateObject, Trap,
+    ScriptFrame, ScriptOutputReader, StateObject, TaskProfile, Trap,
 };
 pub use nexa_test_runner::{
     StackFrame, TestError, TestResult, TestRun, TestRunSummary, TestStatus,

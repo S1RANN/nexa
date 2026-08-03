@@ -14,8 +14,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nexa_bytecode::{Function, Instruction};
-use nexa_core::StableId;
+use nexa_bytecode::{Function, HostCallMode, Instruction};
+use nexa_core::{SourceSpan, StableId};
 use nexa_verifier::{NominalIndexShape, ResolvedNominalOperand, VerifiedModule};
 
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
@@ -51,9 +51,23 @@ pub struct ExecutableInstruction {
     pub fuel_boundary: bool,
 }
 
+/// Cold profiler metadata parallel to one executable instruction row.
+///
+/// Keeping this out of [`ExecutableInstruction`] preserves dispatch-row cache
+/// density when profiling is disabled. Enabled runs resolve allocation
+/// provenance and Host identity with one indexed cold-row read, without
+/// source-map scans or `StableId` work in the instruction loop.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ExecutableProfileRow {
+    pub allocation: Option<(crate::profiler::AllocationKind, StableId)>,
+    pub source_span: Option<SourceSpan>,
+    pub host_call: Option<(StableId, HostCallMode)>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ExecutableFunction {
     rows: Vec<ExecutableInstruction>,
+    profile_rows: Vec<ExecutableProfileRow>,
     /// Process-local identity of the verifier-owned instruction backing used
     /// to build these rows. It prevents a direct caller from pairing a valid
     /// certificate with a different same-shaped module.
@@ -119,11 +133,13 @@ impl ExecutableFunction {
     fn new(
         function: &nexa_bytecode::Function,
         rows: Vec<ExecutableInstruction>,
+        profile_rows: Vec<ExecutableProfileRow>,
         static_leaf: Option<StaticLeafCertificate>,
         constant_leaf: Option<StaticLeafConstantKernel>,
     ) -> Self {
         Self {
             rows,
+            profile_rows,
             code_identity: function.code.as_ptr() as usize,
             static_leaf,
             constant_leaf,
@@ -133,6 +149,10 @@ impl ExecutableFunction {
     #[must_use]
     pub fn rows(&self) -> &[ExecutableInstruction] {
         &self.rows
+    }
+
+    pub(crate) fn profile_rows(&self) -> &[ExecutableProfileRow] {
+        &self.profile_rows
     }
 
     #[must_use]
@@ -307,16 +327,32 @@ fn build_executable_function(
         }
     }
     let mut rows = Vec::with_capacity(function.code.len());
+    let mut profile_rows = Vec::with_capacity(function.code.len());
     for (pc, instruction) in function.code.iter().copied().enumerate() {
+        let pc = u32::try_from(pc).unwrap_or(u32::MAX);
+        let resolved = module.resolved_operand(function_id as usize, pc as usize);
         rows.push(build_executable_row(
             module,
             nominal_shape,
             function,
             function_id,
-            u32::try_from(pc).unwrap_or(u32::MAX),
+            pc,
             instruction,
             costs,
         )?);
+        let allocation = crate::interpreter::allocation_profile(instruction, resolved);
+        profile_rows.push(ExecutableProfileRow {
+            allocation,
+            source_span: allocation.and_then(|_| bytecode.source_span(function_id, pc)),
+            host_call: if let Instruction::HostCall { import, .. } = instruction {
+                bytecode
+                    .host_imports
+                    .get(import as usize)
+                    .map(|host| (host.stable_id, host.mode))
+            } else {
+                None
+            },
+        });
     }
     let static_leaf = certify_static_leaf(function, &rows);
     let constant_leaf =
@@ -324,6 +360,7 @@ fn build_executable_function(
     Ok(ExecutableFunction::new(
         function,
         rows,
+        profile_rows,
         static_leaf,
         constant_leaf,
     ))

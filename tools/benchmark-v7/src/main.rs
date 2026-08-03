@@ -356,10 +356,15 @@ struct BenchmarkReport {
 #[derive(Debug, Serialize)]
 struct ProfilerSummary {
     host_calls: u64,
+    host_function_count: usize,
     function_count: usize,
     allocation_site_count: usize,
+    dropped_modules: u64,
     dropped_functions: u64,
     dropped_sites: u64,
+    dropped_host_calls: u64,
+    gc: ProfilerGcSummary,
+    tasks: ProfilerTaskSummary,
     /// J2: whole-table total so downstream reports can compute the share
     /// of the truncated top list without the full opcode table.
     total_opcode_executions: u64,
@@ -369,11 +374,52 @@ struct ProfilerSummary {
 
 #[derive(Debug, Serialize)]
 struct AllocationSiteSummary {
-    function: u32,
-    pc: u32,
-    opcode: u16,
+    package_id: String,
+    module: String,
+    function_stable_id: u64,
+    source_file: Option<u32>,
+    source_start: Option<u32>,
+    source_end: Option<u32>,
+    allocation_kind: &'static str,
     type_id: u64,
     count: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfilerGcSummary {
+    full_collections: u64,
+    incremental_steps: u64,
+    completed_cycles: u64,
+    roots_seeded: u64,
+    objects_marked: u64,
+    slots_swept: u64,
+    objects_reclaimed: u64,
+    bytes_reclaimed: u64,
+    barrier_shades: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ProfilerTaskSummary {
+    polls: u64,
+    completed: u64,
+    yielded_fuel: u64,
+    yielded_explicit: u64,
+    waiting_host: u64,
+    cancelled: u64,
+    trapped: u64,
+}
+
+const fn allocation_kind_name(kind: nexa_runtime::AllocationKind) -> &'static str {
+    match kind {
+        nexa_runtime::AllocationKind::Object => "object",
+        nexa_runtime::AllocationKind::String => "string",
+        nexa_runtime::AllocationKind::Class => "class",
+        nexa_runtime::AllocationKind::ArrayStorage => "array-storage",
+        nexa_runtime::AllocationKind::BufferStorage => "buffer-storage",
+        nexa_runtime::AllocationKind::MapSlots => "map-slots",
+        nexa_runtime::AllocationKind::StructMaterialization => "struct-materialization",
+        nexa_runtime::AllocationKind::EnumMaterialization => "enum-materialization",
+    }
 }
 
 fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
@@ -394,25 +440,58 @@ fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
         .collect::<Vec<_>>();
     opcodes.sort_by_key(|(_, executions)| std::cmp::Reverse(*executions));
     opcodes.truncate(5);
-    let mut sites = report.allocation_sites.clone();
+    let mut sites = report.allocations.clone();
     sites.sort_by_key(|site| std::cmp::Reverse(site.count));
     sites.truncate(5);
+    let gc = report.gc;
+    let tasks = report.tasks;
     Some(ProfilerSummary {
-        host_calls: report.host_calls,
+        host_calls: report
+            .host_calls
+            .iter()
+            .map(|entry| entry.calls)
+            .fold(0_u64, u64::saturating_add),
+        host_function_count: report.host_calls.len(),
         function_count: report.functions.len(),
-        allocation_site_count: report.allocation_sites.len(),
-        dropped_functions: report.dropped_functions,
-        dropped_sites: report.dropped_sites,
+        allocation_site_count: report.allocations.len(),
+        dropped_modules: report.dropped.modules,
+        dropped_functions: report.dropped.functions,
+        dropped_sites: report.dropped.allocations,
+        dropped_host_calls: report.dropped.host_calls,
+        gc: ProfilerGcSummary {
+            full_collections: gc.full_collections,
+            incremental_steps: gc.incremental_steps,
+            completed_cycles: gc.completed_cycles,
+            roots_seeded: gc.roots_seeded,
+            objects_marked: gc.objects_marked,
+            slots_swept: gc.slots_swept,
+            objects_reclaimed: gc.objects_reclaimed,
+            bytes_reclaimed: gc.bytes_reclaimed,
+            barrier_shades: gc.barrier_shades,
+        },
+        tasks: ProfilerTaskSummary {
+            polls: tasks.polls,
+            completed: tasks.completed,
+            yielded_fuel: tasks.yielded_fuel,
+            yielded_explicit: tasks.yielded_explicit,
+            waiting_host: tasks.waiting_host,
+            cancelled: tasks.cancelled,
+            trapped: tasks.trapped,
+        },
         total_opcode_executions,
         top_opcodes: opcodes,
         top_allocation_sites: sites
             .into_iter()
-            .map(|site| AllocationSiteSummary {
-                function: site.function,
-                pc: site.pc,
-                opcode: site.opcode,
-                type_id: site.type_id,
-                count: site.count,
+            .map(|allocation| AllocationSiteSummary {
+                package_id: allocation.site.package_id,
+                module: allocation.site.module,
+                function_stable_id: allocation.site.function_stable_id.0,
+                source_file: allocation.site.source_span.map(|span| span.file.0),
+                source_start: allocation.site.source_span.map(|span| span.start),
+                source_end: allocation.site.source_span.map(|span| span.end),
+                allocation_kind: allocation_kind_name(allocation.site.kind),
+                type_id: allocation.site.type_id.0,
+                count: allocation.count,
             })
             .collect(),
     })

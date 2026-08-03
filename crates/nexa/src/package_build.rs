@@ -27,7 +27,7 @@ use nexa_diagnostics::{
     DiagnosticBatch, SourceIdentity, SourceSnapshot, SourceSnapshotRegistry,
     SourceSnapshotRegistryError,
 };
-use nexa_verifier::VerifiedModule;
+use nexa_verifier::{FunctionProfileMetadata, ModuleProfileMetadata, VerifiedModule};
 
 pub const NEXA_LANGUAGE_VERSION: u16 = nexa_analysis::NEXA_LANGUAGE_VERSION;
 pub const NEXA_COMPILER_VERSION: &str = nexa_core::NEXA_COMPILER_VERSION;
@@ -1211,7 +1211,7 @@ impl PackageBuildSession {
             self.pipeline.start_verifier();
             let verification = nexa_verifier::verify(compiled.module, verifier_limits);
             verify_duration = verify_started.elapsed();
-            let verified = verification?;
+            let mut verified = verification?;
             validate_host_entrypoints(verified.module(), contract)?;
             let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
             validate_compiled_host_source(&source_files, contract)?;
@@ -1241,6 +1241,7 @@ impl PackageBuildSession {
                 &input.dependency_graph,
                 &dependency_source_fingerprints,
             );
+            attach_runtime_profile_metadata(&mut verified, &compiled.debug_info)?;
             let artifact = CompiledPackageArtifact {
                 identity,
                 verified,
@@ -1365,7 +1366,7 @@ impl PackageBuildSession {
         let compiled = standalone.package;
         validate_product_compiler_output(&compiled, &outcome)?;
         self.pipeline.start_verifier();
-        let verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
+        let mut verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
         validate_host_entrypoints(verified.module(), contract)?;
         let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
         validate_compiled_host_source(&source_files, contract)?;
@@ -1395,6 +1396,7 @@ impl PackageBuildSession {
             &input.dependency_graph,
             &dependency_source_fingerprints,
         );
+        attach_runtime_profile_metadata(&mut verified, &compiled.debug_info)?;
         let artifact = CompiledPackageArtifact {
             identity,
             verified,
@@ -1510,7 +1512,7 @@ impl PackageBuildSession {
         validate_product_compiler_output(&compiled, &analysis)?;
 
         self.pipeline.start_verifier();
-        let verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
+        let mut verified = nexa_verifier::verify(compiled.module, verifier_limits)?;
         validate_host_entrypoints(verified.module(), contract)?;
         let source_files = PackageSourceSnapshot::from_compiler_sources(compiled.sources)?;
         validate_compiled_host_source(&source_files, contract)?;
@@ -1548,6 +1550,7 @@ impl PackageBuildSession {
             &input.dependency_graph,
             &dependency_source_fingerprints,
         );
+        attach_runtime_profile_metadata(&mut verified, &compiled.debug_info)?;
         let artifact = CompiledPackageArtifact {
             identity,
             verified,
@@ -2208,6 +2211,24 @@ fn package_compilation_evidence(
         import_edges,
         packages,
     }
+}
+
+fn attach_runtime_profile_metadata(
+    verified: &mut VerifiedModule,
+    debug_info: &PackageDebugInfo,
+) -> Result<(), nexa_verifier::ProfileMetadataError> {
+    let functions = debug_info
+        .functions
+        .iter()
+        .map(|function| FunctionProfileMetadata {
+            function: function.function_index,
+            package_id: function.package_id.clone(),
+            module: function.module_path.clone(),
+            stable_id: function.stable_id.0,
+            definition_span: function.definition_span,
+        })
+        .collect();
+    verified.attach_profile_metadata(ModuleProfileMetadata::new(functions))
 }
 
 fn validate_repl_cell_source(
@@ -2918,6 +2939,7 @@ pub enum PackageBuildError {
     MissingTypedPackageIr,
     Compile(nexa_compiler::CompileError),
     Verify(nexa_verifier::VerifyError),
+    ProfileMetadata(nexa_verifier::ProfileMetadataError),
     InvalidProductCompilerOutput(&'static str),
     InvalidTestCompilerOutput(&'static str),
     CompilerSourceClosureMismatch,
@@ -2996,6 +3018,7 @@ impl fmt::Display for PackageBuildError {
             }
             Self::Compile(error) => error.fmt(formatter),
             Self::Verify(error) => error.fmt(formatter),
+            Self::ProfileMetadata(error) => error.fmt(formatter),
             Self::InvalidProductCompilerOutput(message)
             | Self::InvalidTestCompilerOutput(message) => formatter.write_str(message),
             Self::CompilerSourceClosureMismatch => {
@@ -3043,6 +3066,7 @@ impl std::error::Error for PackageBuildError {
             Self::Environment(error) => Some(error),
             Self::Compile(error) => Some(error),
             Self::Verify(error) => Some(error),
+            Self::ProfileMetadata(error) => Some(error),
             Self::InvalidTestArtifact(error) => Some(error),
             Self::Integrity(error) => Some(error.as_ref()),
             _ => None,
@@ -3071,6 +3095,12 @@ impl From<nexa_compiler::CompileError> for PackageBuildError {
 impl From<nexa_verifier::VerifyError> for PackageBuildError {
     fn from(value: nexa_verifier::VerifyError) -> Self {
         Self::Verify(value)
+    }
+}
+
+impl From<nexa_verifier::ProfileMetadataError> for PackageBuildError {
+    fn from(value: nexa_verifier::ProfileMetadataError) -> Self {
+        Self::ProfileMetadata(value)
     }
 }
 
@@ -3109,7 +3139,7 @@ impl fmt::Debug for CompiledPackageTests {
 impl CompiledPackageTests {
     pub(crate) fn new(
         package_id: PackageId,
-        verified: VerifiedModule,
+        mut verified: VerifiedModule,
         source_files: PackageSourceSnapshot,
         debug_info: PackageDebugInfo,
         tests: Vec<PackageTestInfo>,
@@ -3123,6 +3153,7 @@ impl CompiledPackageTests {
             .into());
         }
         verify_package_artifact_integrity(verified.module(), &source_files, &debug_info)?;
+        attach_runtime_profile_metadata(&mut verified, &debug_info)?;
         if !tests.is_empty()
             && !source_files.files().iter().any(|source| {
                 source
@@ -5018,6 +5049,19 @@ activation = "programmatic"
         );
         assert_eq!(host_source.text.as_ref(), contract.source);
         assert!(!host_source.compiler_provided);
+        let profile = artifact
+            .verified
+            .profile_metadata()
+            .expect("Package artifacts attach stable Runtime profile metadata");
+        for function in &artifact.debug_info.functions {
+            let runtime = profile
+                .function(function.function_index)
+                .expect("every debug function has a Runtime profile identity");
+            assert_eq!(runtime.package_id, function.package_id);
+            assert_eq!(runtime.module, function.module_path);
+            assert_eq!(runtime.stable_id, function.stable_id.0);
+            assert_eq!(runtime.definition_span, function.definition_span);
+        }
     }
 
     #[test]

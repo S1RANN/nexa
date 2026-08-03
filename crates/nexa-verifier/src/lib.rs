@@ -2,13 +2,14 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use nexa_bytecode::{
     ArrayType, EnumVariant, Function, FunctionEffect, HostCallMode, Instruction, MapType, Module,
     SCALAR_TO_STRING_FUEL_PASSES, SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES,
     StandardIntrinsic, StructField, StructType, ValueType, minimum_migration_limits,
 };
-use nexa_core::FingerprintBuilder;
+use nexa_core::{FingerprintBuilder, SourceSpan, StableId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifierLimits {
@@ -106,6 +107,100 @@ pub struct VerifiedModule {
     nominal_indexes: NominalIndexes,
     resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
     portable_fingerprint: [u8; 32],
+    profile_fingerprint: [u8; 32],
+    profile_metadata: Option<Arc<ModuleProfileMetadata>>,
+}
+
+/// Cold semantic identity catalog used by the bounded Runtime profiler.
+///
+/// Dense function indices remain the execution representation. This catalog
+/// is attached by the Package façade after verification and lets enabled
+/// profiling resolve those slots to stable Package/source identities without
+/// putting strings, hashing, or allocation on the interpreter hot path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModuleProfileMetadata {
+    functions: Arc<[FunctionProfileMetadata]>,
+    fingerprint: [u8; 32],
+}
+
+/// Stable source identity for one verified dense function slot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunctionProfileMetadata {
+    pub function: u32,
+    pub package_id: String,
+    pub module: String,
+    pub stable_id: StableId,
+    pub definition_span: SourceSpan,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileMetadataError {
+    FunctionOutOfRange(u32),
+    DuplicateFunction(u32),
+}
+
+impl fmt::Display for ProfileMetadataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::FunctionOutOfRange(function) => {
+                write!(
+                    formatter,
+                    "profile metadata function {function} is out of range"
+                )
+            }
+            Self::DuplicateFunction(function) => {
+                write!(
+                    formatter,
+                    "profile metadata function {function} is duplicated"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ProfileMetadataError {}
+
+impl ModuleProfileMetadata {
+    #[must_use]
+    pub fn new(mut functions: Vec<FunctionProfileMetadata>) -> Self {
+        functions.sort_by_key(|function| function.function);
+        let mut fingerprint = FingerprintBuilder::new("nexa.profiler.module-metadata", 1);
+        fingerprint.field_u64(
+            "functions",
+            u64::try_from(functions.len()).unwrap_or(u64::MAX),
+        );
+        for function in &functions {
+            fingerprint.field_u32("function", function.function);
+            fingerprint.field_str("package", &function.package_id);
+            fingerprint.field_str("module", &function.module);
+            fingerprint.field_u64("stable-id", function.stable_id.0);
+            fingerprint.field_u32("file", function.definition_span.file.0);
+            fingerprint.field_u32("span-start", function.definition_span.start);
+            fingerprint.field_u32("span-end", function.definition_span.end);
+        }
+        Self {
+            functions: functions.into(),
+            fingerprint: fingerprint.finish_bytes(),
+        }
+    }
+
+    #[must_use]
+    pub fn function(&self, function: u32) -> Option<&FunctionProfileMetadata> {
+        self.functions
+            .binary_search_by_key(&function, |metadata| metadata.function)
+            .ok()
+            .map(|index| &self.functions[index])
+    }
+
+    #[must_use]
+    pub const fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint
+    }
+
+    #[must_use]
+    pub fn functions(&self) -> &[FunctionProfileMetadata] {
+        &self.functions
+    }
 }
 
 /// Dense nominal metadata proven by the verifier for one instruction.
@@ -118,6 +213,7 @@ pub enum ResolvedNominalOperand {
     #[default]
     None,
     StructField {
+        type_id: StableId,
         index: u16,
     },
     ClassField {
@@ -234,11 +330,14 @@ impl VerifiedModule {
         let nominal_indexes = NominalIndexes::new(&module);
         let mut fingerprint = FingerprintBuilder::new("nexa.bytecode.portable-module", 1);
         fingerprint.field_bytes("module", &module.encode());
+        let portable_fingerprint = fingerprint.finish_bytes();
         Self {
             module,
             nominal_indexes,
             resolved_operands,
-            portable_fingerprint: fingerprint.finish_bytes(),
+            portable_fingerprint,
+            profile_fingerprint: portable_fingerprint,
+            profile_metadata: None,
         }
     }
 
@@ -254,6 +353,47 @@ impl VerifiedModule {
     #[must_use]
     pub const fn portable_fingerprint(&self) -> [u8; 32] {
         self.portable_fingerprint
+    }
+
+    /// Attaches Package/source identities after structural verification.
+    ///
+    /// Profile metadata is deliberately not part of portable bytecode or its
+    /// execution-image cache key. It is validated against the dense function
+    /// table and contributes to a separate profiler key so identical code
+    /// linked under different Package identities cannot be conflated.
+    pub fn attach_profile_metadata(
+        &mut self,
+        metadata: ModuleProfileMetadata,
+    ) -> Result<(), ProfileMetadataError> {
+        let mut previous = None;
+        for function in metadata.functions() {
+            if usize::try_from(function.function)
+                .ok()
+                .is_none_or(|index| index >= self.module.functions.len())
+            {
+                return Err(ProfileMetadataError::FunctionOutOfRange(function.function));
+            }
+            if previous == Some(function.function) {
+                return Err(ProfileMetadataError::DuplicateFunction(function.function));
+            }
+            previous = Some(function.function);
+        }
+        let mut fingerprint = FingerprintBuilder::new("nexa.profiler.verified-module", 1);
+        fingerprint.field_bytes("portable-module", &self.portable_fingerprint);
+        fingerprint.field_bytes("semantic-metadata", &metadata.fingerprint());
+        self.profile_fingerprint = fingerprint.finish_bytes();
+        self.profile_metadata = Some(Arc::new(metadata));
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn profile_fingerprint(&self) -> [u8; 32] {
+        self.profile_fingerprint
+    }
+
+    #[must_use]
+    pub fn profile_metadata(&self) -> Option<&Arc<ModuleProfileMetadata>> {
+        self.profile_metadata.as_ref()
     }
 
     #[must_use]
@@ -1916,6 +2056,7 @@ fn verify_function(
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
                 resolved_operands[pc] = ResolvedNominalOperand::StructField {
+                    type_id,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                 };
@@ -1947,6 +2088,7 @@ fn verify_function(
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
                 resolved_operands[pc] = ResolvedNominalOperand::StructField {
+                    type_id,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                 };

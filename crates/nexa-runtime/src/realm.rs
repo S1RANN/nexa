@@ -3075,8 +3075,34 @@ impl RealmRuntime {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn poll_task_raw(
+        &mut self,
+        task: TaskHandle,
+        fuel_slice: u64,
+    ) -> Result<PollResult<Option<RuntimeValue>>, RealmError> {
+        let result = self.poll_task_raw_inner(task, fuel_slice);
+        if let Ok(outcome) = &result {
+            let outcome = match outcome {
+                PollResult::Completed { .. } => crate::profiler::TaskPollProfileOutcome::Completed,
+                PollResult::Pending(PendingReason::Fuel) => {
+                    crate::profiler::TaskPollProfileOutcome::FuelYielded
+                }
+                PollResult::Pending(PendingReason::ExplicitYield) => {
+                    crate::profiler::TaskPollProfileOutcome::ExplicitYielded
+                }
+                PollResult::Pending(PendingReason::HostRequest) => {
+                    crate::profiler::TaskPollProfileOutcome::WaitingHost
+                }
+                PollResult::Cancelled(_) => crate::profiler::TaskPollProfileOutcome::Cancelled,
+                PollResult::Trapped(_) => crate::profiler::TaskPollProfileOutcome::Trapped,
+            };
+            crate::profiler::record_task_poll(outcome);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn poll_task_raw_inner(
         &mut self,
         task: TaskHandle,
         fuel_slice: u64,
@@ -3447,7 +3473,13 @@ impl RealmRuntime {
 
     pub fn collect_garbage(&mut self) -> Result<CollectionStats, RealmError> {
         let roots = self.gc_roots()?;
-        Ok(self.heap.collect(&roots)?)
+        let stats = self.heap.collect(&roots)?;
+        crate::profiler::record_full_gc(
+            stats.marked,
+            stats.reclaimed,
+            self.heap.last_cycle_bytes_reclaimed(),
+        );
+        Ok(stats)
     }
 
     /// Precise root snapshot shared by full and incremental collection:
@@ -3493,6 +3525,14 @@ impl RealmRuntime {
     ) -> Result<IncrementalGcReport, RealmError> {
         let roots = self.gc_roots()?;
         let report = self.heap.collect_incremental(&roots, budget)?;
+        crate::profiler::record_incremental_gc(
+            report.roots_seeded,
+            report.objects_marked,
+            report.slots_swept,
+            report.barrier_shades,
+            report.bytes_reclaimed,
+            report.completed.map(|stats| stats.reclaimed),
+        );
         if report.completed.is_some() {
             self.gc_cycle_baseline = self.heap.vm_allocation_counters().object_allocations;
         }
