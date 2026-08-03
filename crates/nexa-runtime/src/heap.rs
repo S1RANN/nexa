@@ -2966,33 +2966,58 @@ impl Heap {
         }
     }
 
+    /// K3: lookups follow the same linear probe chain the insert side
+    /// writes, so a hit or miss costs the probe distance instead of a
+    /// full-capacity scan. The primary and rehash-new sides keep the
+    /// probe invariant through backshift deletion; the rehash-old side
+    /// has migration holes anywhere, so its un-migrated suffix is the
+    /// only part that is scanned linearly.
     fn find_map_entry(
         &self,
         map: &VmMap,
         key: RuntimeValue,
         hash: u64,
     ) -> Result<Option<MapLocation>, HeapError> {
-        for (index, entry) in map.slots.iter().enumerate() {
-            if entry.is_some_and(|entry| entry.hash == hash)
-                && self.runtime_value_equal(entry.expect("checked entry").key, key)?
-            {
-                return Ok(Some(MapLocation::Current(index)));
-            }
+        if let Some(index) = self.probe_map_slots(&map.slots, key, hash)? {
+            return Ok(Some(MapLocation::Current(index)));
         }
         if let Some(rehash) = &map.rehash {
-            for (index, entry) in rehash.new_slots.iter().enumerate() {
+            if let Some(index) = self.probe_map_slots(&rehash.new_slots, key, hash)? {
+                return Ok(Some(MapLocation::RehashNew(index)));
+            }
+            for (offset, entry) in rehash.old_slots[rehash.cursor..].iter().enumerate() {
                 if entry.is_some_and(|entry| entry.hash == hash)
                     && self.runtime_value_equal(entry.expect("checked entry").key, key)?
                 {
-                    return Ok(Some(MapLocation::RehashNew(index)));
+                    return Ok(Some(MapLocation::RehashOld(rehash.cursor + offset)));
                 }
             }
-            for (index, entry) in rehash.old_slots.iter().enumerate() {
-                if entry.is_some_and(|entry| entry.hash == hash)
-                    && self.runtime_value_equal(entry.expect("checked entry").key, key)?
-                {
-                    return Ok(Some(MapLocation::RehashOld(index)));
-                }
+        }
+        Ok(None)
+    }
+
+    /// One probe-chain walk: starts at the key's home slot and stops at
+    /// the first empty slot (backshift deletion guarantees no holes
+    /// inside a chain) or after a full cycle (tables pinned at the
+    /// capacity ceiling can run without an empty slot).
+    fn probe_map_slots(
+        &self,
+        slots: &[Option<MapEntry>],
+        key: RuntimeValue,
+        hash: u64,
+    ) -> Result<Option<usize>, HeapError> {
+        if slots.is_empty() {
+            return Ok(None);
+        }
+        let start =
+            usize::try_from(hash % slots.len() as u64).expect("hash modulo slot count fits usize");
+        for offset in 0..slots.len() {
+            let index = (start + offset) % slots.len();
+            let Some(entry) = slots[index] else {
+                return Ok(None);
+            };
+            if entry.hash == hash && self.runtime_value_equal(entry.key, key)? {
+                return Ok(Some(index));
             }
         }
         Ok(None)
@@ -3809,7 +3834,7 @@ fn map_entry_mut(map: &mut VmMap, location: MapLocation) -> &mut MapEntry {
 
 fn take_map_entry(map: &mut VmMap, location: MapLocation) -> MapEntry {
     match location {
-        MapLocation::Current(index) => map.slots[index].take().expect("located map entry exists"),
+        MapLocation::Current(index) => remove_probed_entry(&mut map.slots, index),
         MapLocation::RehashOld(index) => map
             .rehash
             .as_mut()
@@ -3817,14 +3842,44 @@ fn take_map_entry(map: &mut VmMap, location: MapLocation) -> MapEntry {
             .old_slots[index]
             .take()
             .expect("located map entry exists"),
-        MapLocation::RehashNew(index) => map
-            .rehash
-            .as_mut()
-            .expect("located rehash entry has state")
-            .new_slots[index]
-            .take()
-            .expect("located map entry exists"),
+        MapLocation::RehashNew(index) => remove_probed_entry(
+            &mut map
+                .rehash
+                .as_mut()
+                .expect("located rehash entry has state")
+                .new_slots,
+            index,
+        ),
     }
+}
+
+/// K3: removes one entry from a linear-probe table and restores the
+/// probe invariant by shifting displaced successors back over the hole
+/// (no tombstones). An entry moves back exactly when the hole lies on
+/// its probe path, i.e. its cyclic displacement from home reaches past
+/// the hole; entries sitting at or after their home stay put. The walk
+/// stops at the first empty slot, or after one full cycle for tables
+/// running without an empty slot at the capacity ceiling.
+fn remove_probed_entry(slots: &mut [Option<MapEntry>], index: usize) -> MapEntry {
+    let removed = slots[index].take().expect("located map entry exists");
+    let len = slots.len();
+    let mut hole = index;
+    let mut cursor = (index + 1) % len;
+    while cursor != index {
+        let Some(entry) = slots[cursor] else {
+            break;
+        };
+        let origin =
+            usize::try_from(entry.hash % len as u64).expect("hash modulo slot count fits usize");
+        let hole_distance = (cursor + len - hole) % len;
+        let origin_distance = (cursor + len - origin) % len;
+        if origin_distance >= hole_distance {
+            slots[hole] = slots[cursor].take();
+            hole = cursor;
+        }
+        cursor = (cursor + 1) % len;
+    }
+    removed
 }
 
 fn write_hash(hash: &mut u64, bytes: &[u8]) {
@@ -3849,8 +3904,111 @@ fn write_migration_object_hash(
 mod tests {
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, StableId};
 
-    use super::{GcRoots, Heap, HeapError, MapSetOutcome, Object};
+    use super::{
+        GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object, insert_map_entry,
+        remove_probed_entry,
+    };
     use crate::{RuntimeFailurePoint, RuntimeValue};
+
+    fn probe_entry(key: i32, hash: u64) -> MapEntry {
+        MapEntry {
+            key: RuntimeValue::I32(key),
+            value: RuntimeValue::I32(key),
+            hash,
+        }
+    }
+
+    #[test]
+    fn probe_backshift_removal_shifts_wrapping_clusters_back() {
+        // Five slots, three entries all homed at slot 3: the cluster wraps
+        // through (3, 4, 0). Removing the head must pull both successors
+        // back so a probe from home still reaches them before a hole.
+        let mut slots = vec![None; 5];
+        insert_map_entry(&mut slots, probe_entry(1, 3)).unwrap();
+        insert_map_entry(&mut slots, probe_entry(2, 3)).unwrap();
+        insert_map_entry(&mut slots, probe_entry(3, 3)).unwrap();
+        assert_eq!(remove_probed_entry(&mut slots, 3).key, RuntimeValue::I32(1));
+        assert_eq!(slots[3].unwrap().key, RuntimeValue::I32(2));
+        assert_eq!(slots[4].unwrap().key, RuntimeValue::I32(3));
+        assert!(slots[0].is_none());
+    }
+
+    #[test]
+    fn probe_backshift_removal_never_moves_entries_before_their_home() {
+        // The home-4 entry already sits at its home slot; removing the
+        // home-3 entry must not drag it backwards off its own chain.
+        let mut slots = vec![None; 5];
+        insert_map_entry(&mut slots, probe_entry(1, 3)).unwrap();
+        insert_map_entry(&mut slots, probe_entry(2, 4)).unwrap();
+        assert_eq!(remove_probed_entry(&mut slots, 3).key, RuntimeValue::I32(1));
+        assert!(slots[3].is_none());
+        assert_eq!(slots[4].unwrap().key, RuntimeValue::I32(2));
+    }
+
+    #[test]
+    fn probe_backshift_removal_terminates_on_full_tables() {
+        // A table pinned at the capacity ceiling can run with zero empty
+        // slots; removal must stop after one full cycle and keep every
+        // survivor reachable from its home.
+        let mut slots = vec![None; 3];
+        insert_map_entry(&mut slots, probe_entry(1, 0)).unwrap();
+        insert_map_entry(&mut slots, probe_entry(2, 0)).unwrap();
+        insert_map_entry(&mut slots, probe_entry(3, 0)).unwrap();
+        assert_eq!(remove_probed_entry(&mut slots, 0).key, RuntimeValue::I32(1));
+        assert_eq!(slots[0].unwrap().key, RuntimeValue::I32(2));
+        assert_eq!(slots[1].unwrap().key, RuntimeValue::I32(3));
+        assert!(slots[2].is_none());
+    }
+
+    #[test]
+    fn map_lookups_stay_correct_across_removal_churn() {
+        // K3 integration: interleaved removals and re-inserts must keep
+        // every surviving key reachable through the probe chains the
+        // lookup side now walks (a broken chain shows up as a false miss).
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 512);
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        let set = |heap: &mut Heap, key: i32, value: i32| {
+            while heap
+                .map_set(map, RuntimeValue::I32(key), RuntimeValue::I32(value))
+                .unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        };
+        for key in 0..64 {
+            set(&mut heap, key, key * 10);
+        }
+        for key in (0..64).step_by(2) {
+            assert_eq!(
+                heap.map_remove(map, RuntimeValue::I32(key)).unwrap(),
+                Some(RuntimeValue::I32(key * 10))
+            );
+        }
+        for key in 0..64 {
+            let expected = (key % 2 == 1).then_some(RuntimeValue::I32(key * 10));
+            assert_eq!(heap.map_get(map, RuntimeValue::I32(key)).unwrap(), expected);
+        }
+        // Re-inserting into the holes must keep both generations of
+        // entries reachable, including across any rehash this triggers.
+        for key in (0..64).step_by(2) {
+            set(&mut heap, key, key + 1000);
+        }
+        for key in 0..64 {
+            let expected = if key % 2 == 0 { key + 1000 } else { key * 10 };
+            assert_eq!(
+                heap.map_get(map, RuntimeValue::I32(key)).unwrap(),
+                Some(RuntimeValue::I32(expected))
+            );
+        }
+        assert_eq!(heap.map_len(map).unwrap(), 64);
+    }
 
     #[test]
     fn cycles_collect_but_suspended_task_roots_survive() {
