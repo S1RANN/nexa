@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use nexa_core::StableId;
 
+use crate::trusted::{ScalarArenaMut, ScalarArenaSet};
 use crate::{RuntimeFailureInjector, RuntimeFailurePoint, RuntimeValue};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -196,78 +197,8 @@ pub struct CollectionArena {
     capacity: usize,
 }
 
-/// Preallocated scalar collection storage. Unlike `CollectionArena`, each
-/// element occupies exactly `size_of::<T>()`; extents share the same bounded
-/// first-fit/release discipline and never allocate after heap construction.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ScalarArena<T> {
-    values: Vec<T>,
-    capacity: usize,
-    empty: T,
-}
-
-impl<T: Copy> ScalarArena<T> {
-    fn new(capacity: usize, empty: T) -> Self {
-        Self {
-            values: Vec::with_capacity(capacity),
-            capacity,
-            empty,
-        }
-    }
-
-    fn claim_exact(&mut self, range: CollectionRange) -> Result<(), HeapError> {
-        if range.end() > self.capacity {
-            return Err(HeapError::CapacityExhausted);
-        }
-        if self.values.len() < range.end() {
-            self.values.resize(range.end(), self.empty);
-        }
-        Ok(())
-    }
-
-    fn release(&mut self, range: CollectionRange) {
-        if range.length == 0 {
-            return;
-        }
-        if let Some(values) = self.values.get_mut(range.start..range.end()) {
-            values.fill(self.empty);
-        }
-    }
-
-    fn values(&self, range: CollectionRange) -> Result<&[T], HeapError> {
-        self.values
-            .get(range.start..range.end())
-            .ok_or(HeapError::IndexOutOfBounds {
-                index: range.end(),
-                length: self.capacity,
-            })
-    }
-
-    fn values_mut(&mut self, range: CollectionRange) -> Result<&mut [T], HeapError> {
-        self.values
-            .get_mut(range.start..range.end())
-            .ok_or(HeapError::IndexOutOfBounds {
-                index: range.end(),
-                length: self.capacity,
-            })
-    }
-
-    fn checkpoint_clone(&self) -> Self {
-        Self {
-            values: self.values.clone(),
-            capacity: self.capacity,
-            empty: self.empty,
-        }
-    }
-
-    fn restore_checkpoint(&mut self, checkpoint: Self) {
-        debug_assert_eq!(self.capacity, checkpoint.capacity);
-        restore_reserved_vec(&mut self.values, checkpoint.values);
-    }
-}
-
 fn claim_scalar_regrow<T: Copy>(
-    arena: &mut ScalarArena<T>,
+    arena: &mut ScalarArenaMut<'_, T>,
     new_range: CollectionRange,
     old_range: CollectionRange,
     live: usize,
@@ -279,21 +210,27 @@ fn claim_scalar_regrow<T: Copy>(
     let old_end = old_range.end();
     let new_start = new_range.start;
     let new_end = new_range.end();
+    if old_range.length != 0 && new_end > old_start && old_end > new_start {
+        arena.release(new_range);
+        return Err(HeapError::CapacityExhausted);
+    }
+    let arena_length = arena.length();
+    let all_values = arena.values_mut(CollectionRange {
+        start: 0,
+        length: arena_length,
+    })?;
     if old_range.length == 0 {
-        write(&mut arena.values[new_start..new_end]);
-    } else if new_end <= old_start || old_end <= new_start {
+        write(&mut all_values[new_start..new_end]);
+    } else {
         let (destination, source) = if new_end <= old_start {
-            let (left, right) = arena.values.split_at_mut(old_start);
+            let (left, right) = all_values.split_at_mut(old_start);
             (&mut left[new_start..new_end], &right[..old_range.length])
         } else {
-            let (left, right) = arena.values.split_at_mut(new_start);
+            let (left, right) = all_values.split_at_mut(new_start);
             (&mut right[..capacity], &left[old_start..old_end])
         };
         destination[..live].copy_from_slice(&source[..live]);
         write(destination);
-    } else {
-        arena.release(new_range);
-        return Err(HeapError::CapacityExhausted);
     }
     Ok(new_range)
 }
@@ -1318,15 +1255,9 @@ pub struct Heap {
     max_collection_elements: usize,
     collection_elements_used: usize,
     collections: CollectionArena,
-    /// K13/WP47: compact 4-byte cells for Array/Buffer<i32>.
-    i32_collections: ScalarArena<i32>,
-    i64_collections: ScalarArena<i64>,
-    f32_collections: ScalarArena<u32>,
-    f64_collections: ScalarArena<u64>,
-    bool_collections: ScalarArena<u8>,
-    rune_collections: ScalarArena<u32>,
-    string_collections: ScalarArena<(GcRef, u64)>,
-    ref_collections: ScalarArena<GcRef>,
+    /// K29/WP47: eight compact typed regions share one aligned allocator
+    /// backing while retaining their native contiguous element widths.
+    scalar_collections: ScalarArenaSet,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
     failure_injector: RuntimeFailureInjector,
@@ -1380,7 +1311,7 @@ pub struct Heap {
 /// Runtime limits and the failure-control plane remain Realm authority and are
 /// intentionally not snapshotted. Every mutable VM storage surface is: object
 /// slots/generations, free lists, collection storage, and Host return staging.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct HeapCheckpoint {
     slots: Vec<ObjectSlot>,
     free: Vec<u32>,
@@ -1388,14 +1319,7 @@ pub(crate) struct HeapCheckpoint {
     free_maps: Vec<u32>,
     map_slots: MapSlotArena,
     collections: CollectionArena,
-    i32_collections: ScalarArena<i32>,
-    i64_collections: ScalarArena<i64>,
-    f32_collections: ScalarArena<u32>,
-    f64_collections: ScalarArena<u64>,
-    bool_collections: ScalarArena<u8>,
-    rune_collections: ScalarArena<u32>,
-    string_collections: ScalarArena<(GcRef, u64)>,
-    ref_collections: ScalarArena<GcRef>,
+    scalar_collections: ScalarArenaSet,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
     collection_elements_used: usize,
@@ -1446,14 +1370,7 @@ impl Heap {
             free_maps: self.free_maps.clone(),
             map_slots: self.map_slots.clone(),
             collections: self.collections.checkpoint_clone(),
-            i32_collections: self.i32_collections.checkpoint_clone(),
-            i64_collections: self.i64_collections.checkpoint_clone(),
-            f32_collections: self.f32_collections.checkpoint_clone(),
-            f64_collections: self.f64_collections.checkpoint_clone(),
-            bool_collections: self.bool_collections.checkpoint_clone(),
-            rune_collections: self.rune_collections.checkpoint_clone(),
-            string_collections: self.string_collections.checkpoint_clone(),
-            ref_collections: self.ref_collections.checkpoint_clone(),
+            scalar_collections: self.scalar_collections.checkpoint_clone(),
             host_staging: self.host_staging.clone(),
             host_transaction_active: self.host_transaction_active,
             collection_elements_used: self.collection_elements_used,
@@ -1475,22 +1392,8 @@ impl Heap {
         restore_reserved_vec(&mut self.free_maps, checkpoint.free_maps);
         self.map_slots.restore_checkpoint(checkpoint.map_slots);
         self.collections.restore_checkpoint(checkpoint.collections);
-        self.i32_collections
-            .restore_checkpoint(checkpoint.i32_collections);
-        self.i64_collections
-            .restore_checkpoint(checkpoint.i64_collections);
-        self.f32_collections
-            .restore_checkpoint(checkpoint.f32_collections);
-        self.f64_collections
-            .restore_checkpoint(checkpoint.f64_collections);
-        self.bool_collections
-            .restore_checkpoint(checkpoint.bool_collections);
-        self.rune_collections
-            .restore_checkpoint(checkpoint.rune_collections);
-        self.string_collections
-            .restore_checkpoint(checkpoint.string_collections);
-        self.ref_collections
-            .restore_checkpoint(checkpoint.ref_collections);
+        self.scalar_collections
+            .restore_checkpoint(&checkpoint.scalar_collections);
         restore_reserved_vec(&mut self.host_staging, checkpoint.host_staging);
         self.host_transaction_active = checkpoint.host_transaction_active;
         self.collection_elements_used = checkpoint.collection_elements_used;
@@ -1532,29 +1435,7 @@ impl Heap {
                 max_collection_elements,
                 max_collection_ranges.max(max_objects as usize + 1),
             ),
-            i32_collections: ScalarArena::new(max_collection_elements, 0),
-            i64_collections: ScalarArena::new(max_collection_elements, 0),
-            f32_collections: ScalarArena::new(max_collection_elements, 0),
-            f64_collections: ScalarArena::new(max_collection_elements, 0),
-            bool_collections: ScalarArena::new(max_collection_elements, 0),
-            rune_collections: ScalarArena::new(max_collection_elements, 0),
-            string_collections: ScalarArena::new(
-                max_collection_elements,
-                (
-                    GcRef {
-                        index: u32::MAX,
-                        generation: u32::MAX,
-                    },
-                    0,
-                ),
-            ),
-            ref_collections: ScalarArena::new(
-                max_collection_elements,
-                GcRef {
-                    index: u32::MAX,
-                    generation: u32::MAX,
-                },
-            ),
+            scalar_collections: ScalarArenaSet::new(max_collection_elements),
             host_staging: Vec::with_capacity(max_objects as usize),
             host_transaction_active: false,
             failure_injector: RuntimeFailureInjector::default(),
@@ -2204,15 +2085,15 @@ impl Heap {
     ) -> Result<(), HeapError> {
         match storage {
             CollectionStorage::Values => self.collections.initialize(range),
-            CollectionStorage::I32 => self.i32_collections.claim_exact(range),
-            CollectionStorage::I64 => self.i64_collections.claim_exact(range),
-            CollectionStorage::F32 => self.f32_collections.claim_exact(range),
-            CollectionStorage::F64 => self.f64_collections.claim_exact(range),
-            CollectionStorage::Bool => self.bool_collections.claim_exact(range),
-            CollectionStorage::Rune => self.rune_collections.claim_exact(range),
-            CollectionStorage::String => self.string_collections.claim_exact(range),
+            CollectionStorage::I32 => self.scalar_collections.i32_mut().claim_exact(range),
+            CollectionStorage::I64 => self.scalar_collections.i64_mut().claim_exact(range),
+            CollectionStorage::F32 => self.scalar_collections.f32_mut().claim_exact(range),
+            CollectionStorage::F64 => self.scalar_collections.f64_mut().claim_exact(range),
+            CollectionStorage::Bool => self.scalar_collections.bools_mut().claim_exact(range),
+            CollectionStorage::Rune => self.scalar_collections.runes_mut().claim_exact(range),
+            CollectionStorage::String => self.scalar_collections.strings_mut().claim_exact(range),
             CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                self.ref_collections.claim_exact(range)
+                self.scalar_collections.refs_mut().claim_exact(range)
             }
         }
     }
@@ -2224,15 +2105,15 @@ impl Heap {
     ) {
         match storage {
             CollectionStorage::Values => {}
-            CollectionStorage::I32 => self.i32_collections.release(range),
-            CollectionStorage::I64 => self.i64_collections.release(range),
-            CollectionStorage::F32 => self.f32_collections.release(range),
-            CollectionStorage::F64 => self.f64_collections.release(range),
-            CollectionStorage::Bool => self.bool_collections.release(range),
-            CollectionStorage::Rune => self.rune_collections.release(range),
-            CollectionStorage::String => self.string_collections.release(range),
+            CollectionStorage::I32 => self.scalar_collections.i32_mut().release(range),
+            CollectionStorage::I64 => self.scalar_collections.i64_mut().release(range),
+            CollectionStorage::F32 => self.scalar_collections.f32_mut().release(range),
+            CollectionStorage::F64 => self.scalar_collections.f64_mut().release(range),
+            CollectionStorage::Bool => self.scalar_collections.bools_mut().release(range),
+            CollectionStorage::Rune => self.scalar_collections.runes_mut().release(range),
+            CollectionStorage::String => self.scalar_collections.strings_mut().release(range),
             CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                self.ref_collections.release(range);
+                self.scalar_collections.refs_mut().release(range);
             }
         }
         self.collections.release(range);
@@ -2249,26 +2130,36 @@ impl Heap {
             CollectionStorage::Values => {
                 Ok(CollectionView::Values(self.collections.values(range)?))
             }
-            CollectionStorage::I32 => Ok(CollectionView::I32(self.i32_collections.values(range)?)),
-            CollectionStorage::I64 => Ok(CollectionView::I64(self.i64_collections.values(range)?)),
-            CollectionStorage::F32 => Ok(CollectionView::F32(self.f32_collections.values(range)?)),
-            CollectionStorage::F64 => Ok(CollectionView::F64(self.f64_collections.values(range)?)),
-            CollectionStorage::Bool => {
-                Ok(CollectionView::Bool(self.bool_collections.values(range)?))
-            }
-            CollectionStorage::Rune => {
-                Ok(CollectionView::Rune(self.rune_collections.values(range)?))
-            }
-            CollectionStorage::String => Ok(CollectionView::String(
-                self.string_collections.values(range)?,
+            CollectionStorage::I32 => Ok(CollectionView::I32(
+                self.scalar_collections.i32().values(range)?,
             )),
-            CollectionStorage::Ref => Ok(CollectionView::Ref(self.ref_collections.values(range)?)),
+            CollectionStorage::I64 => Ok(CollectionView::I64(
+                self.scalar_collections.i64().values(range)?,
+            )),
+            CollectionStorage::F32 => Ok(CollectionView::F32(
+                self.scalar_collections.f32().values(range)?,
+            )),
+            CollectionStorage::F64 => Ok(CollectionView::F64(
+                self.scalar_collections.f64().values(range)?,
+            )),
+            CollectionStorage::Bool => Ok(CollectionView::Bool(
+                self.scalar_collections.bools().values(range)?,
+            )),
+            CollectionStorage::Rune => Ok(CollectionView::Rune(
+                self.scalar_collections.runes().values(range)?,
+            )),
+            CollectionStorage::String => Ok(CollectionView::String(
+                self.scalar_collections.strings().values(range)?,
+            )),
+            CollectionStorage::Ref => Ok(CollectionView::Ref(
+                self.scalar_collections.refs().values(range)?,
+            )),
             CollectionStorage::NamedRef => {
                 let nexa_bytecode::ValueType::Named(type_id) = element_type else {
                     return Err(invalid_value_reference());
                 };
                 Ok(CollectionView::NamedRef {
-                    values: self.ref_collections.values(range)?,
+                    values: self.scalar_collections.refs().values(range)?,
                     type_id,
                 })
             }
@@ -2312,7 +2203,11 @@ impl Heap {
     ) -> Result<RuntimeValue, HeapError> {
         macro_rules! scalar {
             ($arena:ident, $constructor:expr) => {{
-                let values = &self.$arena.values;
+                let arena = self.scalar_collections.$arena();
+                let values = arena.values(CollectionRange {
+                    start: 0,
+                    length: arena.length(),
+                })?;
                 values
                     .get(index)
                     .copied()
@@ -2324,23 +2219,23 @@ impl Heap {
             }};
         }
         match storage {
-            CollectionStorage::I32 => scalar!(i32_collections, RuntimeValue::I32),
-            CollectionStorage::I64 => scalar!(i64_collections, RuntimeValue::I64),
-            CollectionStorage::F32 => scalar!(f32_collections, RuntimeValue::F32),
-            CollectionStorage::F64 => scalar!(f64_collections, RuntimeValue::F64),
+            CollectionStorage::I32 => scalar!(i32, RuntimeValue::I32),
+            CollectionStorage::I64 => scalar!(i64, RuntimeValue::I64),
+            CollectionStorage::F32 => scalar!(f32, RuntimeValue::F32),
+            CollectionStorage::F64 => scalar!(f64, RuntimeValue::F64),
             CollectionStorage::Bool => {
-                scalar!(bool_collections, |value| RuntimeValue::Bool(value != 0))
+                scalar!(bools, |value| RuntimeValue::Bool(value != 0))
             }
-            CollectionStorage::Rune => scalar!(rune_collections, RuntimeValue::Rune),
-            CollectionStorage::String => scalar!(string_collections, |(reference, hash)| {
+            CollectionStorage::Rune => scalar!(runes, RuntimeValue::Rune),
+            CollectionStorage::String => scalar!(strings, |(reference, hash)| {
                 RuntimeValue::String { reference, hash }
             }),
-            CollectionStorage::Ref => scalar!(ref_collections, RuntimeValue::Ref),
+            CollectionStorage::Ref => scalar!(refs, RuntimeValue::Ref),
             CollectionStorage::NamedRef => {
                 let nexa_bytecode::ValueType::Named(type_id) = element_type else {
                     return Err(invalid_value_reference());
                 };
-                scalar!(ref_collections, |reference| RuntimeValue::NamedRef {
+                scalar!(refs, |reference| RuntimeValue::NamedRef {
                     reference,
                     type_id,
                 })
@@ -2371,7 +2266,8 @@ impl Heap {
                 let $pattern = value else {
                     return Err(invalid_value_reference());
                 };
-                let values = self.$arena.values_mut(range)?;
+                let mut arena = self.scalar_collections.$arena();
+                let values = arena.values_mut(range)?;
                 let length = values.len();
                 let slot = values
                     .get_mut(index)
@@ -2382,33 +2278,33 @@ impl Heap {
         }
         match storage {
             CollectionStorage::I32 => {
-                set_scalar!(i32_collections, RuntimeValue::I32(value) => value)
+                set_scalar!(i32_mut, RuntimeValue::I32(value) => value)
             }
             CollectionStorage::I64 => {
-                set_scalar!(i64_collections, RuntimeValue::I64(value) => value)
+                set_scalar!(i64_mut, RuntimeValue::I64(value) => value)
             }
             CollectionStorage::F32 => {
-                set_scalar!(f32_collections, RuntimeValue::F32(value) => value)
+                set_scalar!(f32_mut, RuntimeValue::F32(value) => value)
             }
             CollectionStorage::F64 => {
-                set_scalar!(f64_collections, RuntimeValue::F64(value) => value)
+                set_scalar!(f64_mut, RuntimeValue::F64(value) => value)
             }
             CollectionStorage::Bool => {
-                set_scalar!(bool_collections, RuntimeValue::Bool(value) => u8::from(value))
+                set_scalar!(bools_mut, RuntimeValue::Bool(value) => u8::from(value))
             }
             CollectionStorage::Rune => {
-                set_scalar!(rune_collections, RuntimeValue::Rune(value) => value)
+                set_scalar!(runes_mut, RuntimeValue::Rune(value) => value)
             }
             CollectionStorage::String => {
                 self.shade_on_write(value);
                 set_scalar!(
-                    string_collections,
+                    strings_mut,
                     RuntimeValue::String { reference, hash } => (reference, hash)
                 )
             }
             CollectionStorage::Ref => {
                 self.shade_on_write(value);
-                set_scalar!(ref_collections, RuntimeValue::Ref(reference) => reference)
+                set_scalar!(refs_mut, RuntimeValue::Ref(reference) => reference)
             }
             CollectionStorage::NamedRef => {
                 let nexa_bytecode::ValueType::Named(expected) = element_type else {
@@ -2421,7 +2317,8 @@ impl Heap {
                     return Err(invalid_value_reference());
                 }
                 self.shade_on_write(value);
-                let values = self.ref_collections.values_mut(range)?;
+                let mut arena = self.scalar_collections.refs_mut();
+                let values = arena.values_mut(range)?;
                 let length = values.len();
                 let slot = values
                     .get_mut(index)
@@ -2451,35 +2348,43 @@ impl Heap {
     ) -> Result<(), HeapError> {
         match storage {
             CollectionStorage::I32 => self
-                .i32_collections
+                .scalar_collections
+                .i32_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::I64 => self
-                .i64_collections
+                .scalar_collections
+                .i64_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::F32 => self
-                .f32_collections
+                .scalar_collections
+                .f32_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::F64 => self
-                .f64_collections
+                .scalar_collections
+                .f64_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::Bool => self
-                .bool_collections
+                .scalar_collections
+                .bools_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::Rune => self
-                .rune_collections
+                .scalar_collections
+                .runes_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::String => self
-                .string_collections
+                .scalar_collections
+                .strings_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::Ref | CollectionStorage::NamedRef => self
-                .ref_collections
+                .scalar_collections
+                .refs_mut()
                 .values_mut(range)?
                 .copy_within(source, destination),
             CollectionStorage::Values => self
@@ -2498,25 +2403,25 @@ impl Heap {
     ) -> Result<(), HeapError> {
         match storage {
             CollectionStorage::I32 => {
-                self.i32_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.i32_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::I64 => {
-                self.i64_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.i64_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::F32 => {
-                self.f32_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.f32_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::F64 => {
-                self.f64_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.f64_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::Bool => {
-                self.bool_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.bools_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::Rune => {
-                self.rune_collections.values_mut(range)?[cells].fill(0);
+                self.scalar_collections.runes_mut().values_mut(range)?[cells].fill(0);
             }
             CollectionStorage::String => {
-                self.string_collections.values_mut(range)?[cells].fill((
+                self.scalar_collections.strings_mut().values_mut(range)?[cells].fill((
                     GcRef {
                         index: u32::MAX,
                         generation: u32::MAX,
@@ -2525,7 +2430,7 @@ impl Heap {
                 ));
             }
             CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                self.ref_collections.values_mut(range)?[cells].fill(GcRef {
+                self.scalar_collections.refs_mut().values_mut(range)?[cells].fill(GcRef {
                     index: u32::MAX,
                     generation: u32::MAX,
                 });
@@ -3316,7 +3221,7 @@ impl Heap {
                 };
                 let stored = $stored;
                 if current < parts.range.length {
-                    self.$arena.values_mut(parts.range)?[current] = stored;
+                    self.scalar_collections.$arena().values_mut(parts.range)?[current] = stored;
                 } else {
                     let capacity = grown_array_capacity(
                         parts.range.length,
@@ -3325,13 +3230,16 @@ impl Heap {
                     );
                     let global_range =
                         self.claim_global_collection_range(capacity, size_of_val(&stored))?;
-                    let new_range = match claim_scalar_regrow(
-                        &mut self.$arena,
-                        global_range,
-                        parts.range,
-                        current,
-                        |values| values[current] = stored,
-                    ) {
+                    let new_range = match {
+                        let mut arena = self.scalar_collections.$arena();
+                        claim_scalar_regrow(
+                            &mut arena,
+                            global_range,
+                            parts.range,
+                            current,
+                            |values| values[current] = stored,
+                        )
+                    } {
                         Ok(range) => range,
                         Err(error) => {
                             self.collections.release(global_range);
@@ -3340,12 +3248,12 @@ impl Heap {
                         }
                     };
                     if let Err(error) = self.set_array_range(parts.reference, new_range) {
-                        self.$arena.release(new_range);
+                        self.scalar_collections.$arena().release(new_range);
                         self.collections.release(new_range);
                         self.release_collection_quota(new_range.length);
                         return Err(error);
                     }
-                    self.$arena.release(parts.range);
+                    self.scalar_collections.$arena().release(parts.range);
                     self.collections.release(parts.range);
                     self.release_collection_quota(parts.range.length);
                     let element_bytes = size_of_val(&stored) as u64;
@@ -3361,36 +3269,36 @@ impl Heap {
         }
         match parts.storage {
             CollectionStorage::I32 => {
-                return push_scalar!(i32_collections, RuntimeValue::I32(value) => value);
+                return push_scalar!(i32_mut, RuntimeValue::I32(value) => value);
             }
             CollectionStorage::I64 => {
-                return push_scalar!(i64_collections, RuntimeValue::I64(value) => value);
+                return push_scalar!(i64_mut, RuntimeValue::I64(value) => value);
             }
             CollectionStorage::F32 => {
-                return push_scalar!(f32_collections, RuntimeValue::F32(value) => value);
+                return push_scalar!(f32_mut, RuntimeValue::F32(value) => value);
             }
             CollectionStorage::F64 => {
-                return push_scalar!(f64_collections, RuntimeValue::F64(value) => value);
+                return push_scalar!(f64_mut, RuntimeValue::F64(value) => value);
             }
             CollectionStorage::Bool => {
                 return push_scalar!(
-                    bool_collections,
+                    bools_mut,
                     RuntimeValue::Bool(value) => u8::from(value)
                 );
             }
             CollectionStorage::Rune => {
-                return push_scalar!(rune_collections, RuntimeValue::Rune(value) => value);
+                return push_scalar!(runes_mut, RuntimeValue::Rune(value) => value);
             }
             CollectionStorage::String => {
                 self.shade_on_write(element);
                 return push_scalar!(
-                    string_collections,
+                    strings_mut,
                     RuntimeValue::String { reference, hash } => (reference, hash)
                 );
             }
             CollectionStorage::Ref => {
                 self.shade_on_write(element);
-                return push_scalar!(ref_collections, RuntimeValue::Ref(reference) => reference);
+                return push_scalar!(refs_mut, RuntimeValue::Ref(reference) => reference);
             }
             CollectionStorage::NamedRef => {
                 let nexa_bytecode::ValueType::Named(expected) = parts.element_type else {
@@ -3403,7 +3311,7 @@ impl Heap {
                     return Err(invalid_value_reference());
                 }
                 self.shade_on_write(element);
-                return push_scalar!(ref_collections, RuntimeValue::NamedRef { .. } => reference);
+                return push_scalar!(refs_mut, RuntimeValue::NamedRef { .. } => reference);
             }
             CollectionStorage::Values => {}
         }
@@ -3578,16 +3486,13 @@ impl Heap {
                     grown_array_capacity(parts.range.length, length, self.max_collection_length);
                 let global_range =
                     self.claim_global_collection_range(capacity, size_of_val(&stored))?;
-                let new_range = match claim_scalar_regrow(
-                    &mut self.$arena,
-                    global_range,
-                    parts.range,
-                    current,
-                    |values| {
+                let new_range = match {
+                    let mut arena = self.scalar_collections.$arena();
+                    claim_scalar_regrow(&mut arena, global_range, parts.range, current, |values| {
                         values.copy_within(index..current, index + 1);
                         values[index] = stored;
-                    },
-                ) {
+                    })
+                } {
                     Ok(range) => range,
                     Err(error) => {
                         self.collections.release(global_range);
@@ -3596,12 +3501,12 @@ impl Heap {
                     }
                 };
                 if let Err(error) = self.set_array_range(parts.reference, new_range) {
-                    self.$arena.release(new_range);
+                    self.scalar_collections.$arena().release(new_range);
                     self.collections.release(new_range);
                     self.release_collection_quota(new_range.length);
                     return Err(error);
                 }
-                self.$arena.release(parts.range);
+                self.scalar_collections.$arena().release(parts.range);
                 self.collections.release(parts.range);
                 self.release_collection_quota(parts.range.length);
                 let element_bytes = size_of_val(&stored) as u64;
@@ -3618,39 +3523,36 @@ impl Heap {
         }
         match parts.storage {
             CollectionStorage::I32 => {
-                grow_insert_scalar!(i32_collections, RuntimeValue::I32(value) => value);
+                grow_insert_scalar!(i32_mut, RuntimeValue::I32(value) => value);
             }
             CollectionStorage::I64 => {
-                grow_insert_scalar!(i64_collections, RuntimeValue::I64(value) => value);
+                grow_insert_scalar!(i64_mut, RuntimeValue::I64(value) => value);
             }
             CollectionStorage::F32 => {
-                grow_insert_scalar!(f32_collections, RuntimeValue::F32(value) => value);
+                grow_insert_scalar!(f32_mut, RuntimeValue::F32(value) => value);
             }
             CollectionStorage::F64 => {
-                grow_insert_scalar!(f64_collections, RuntimeValue::F64(value) => value);
+                grow_insert_scalar!(f64_mut, RuntimeValue::F64(value) => value);
             }
             CollectionStorage::Bool => {
                 grow_insert_scalar!(
-                    bool_collections,
+                    bools_mut,
                     RuntimeValue::Bool(value) => u8::from(value)
                 );
             }
             CollectionStorage::Rune => {
-                grow_insert_scalar!(rune_collections, RuntimeValue::Rune(value) => value);
+                grow_insert_scalar!(runes_mut, RuntimeValue::Rune(value) => value);
             }
             CollectionStorage::String => {
                 self.shade_on_write(element);
                 grow_insert_scalar!(
-                    string_collections,
+                    strings_mut,
                     RuntimeValue::String { reference, hash } => (reference, hash)
                 );
             }
             CollectionStorage::Ref => {
                 self.shade_on_write(element);
-                grow_insert_scalar!(
-                    ref_collections,
-                    RuntimeValue::Ref(reference) => reference
-                );
+                grow_insert_scalar!(refs_mut, RuntimeValue::Ref(reference) => reference);
             }
             CollectionStorage::NamedRef => {
                 let nexa_bytecode::ValueType::Named(expected) = parts.element_type else {
@@ -3664,7 +3566,7 @@ impl Heap {
                 }
                 self.shade_on_write(element);
                 grow_insert_scalar!(
-                    ref_collections,
+                    refs_mut,
                     RuntimeValue::NamedRef { .. } => reference
                 );
             }
@@ -4191,24 +4093,40 @@ impl Heap {
             .saturating_add((prepared.length * element_bytes) as u64);
         macro_rules! copy_typed {
             ($arena:ident) => {
-                self.$arena.values.copy_within(
-                    prepared.source_absolute..prepared.source_absolute + prepared.length,
-                    prepared.destination_absolute,
-                )
+                self.scalar_collections
+                    .$arena()
+                    .values_mut(CollectionRange {
+                        start: 0,
+                        length: prepared
+                            .source_absolute
+                            .saturating_add(prepared.length)
+                            .max(
+                                prepared
+                                    .destination_absolute
+                                    .saturating_add(prepared.length),
+                            ),
+                    })?
+                    .copy_within(
+                        prepared.source_absolute..prepared.source_absolute + prepared.length,
+                        prepared.destination_absolute,
+                    )
             };
         }
         match storage {
-            CollectionStorage::I32 => copy_typed!(i32_collections),
-            CollectionStorage::I64 => copy_typed!(i64_collections),
-            CollectionStorage::F32 => copy_typed!(f32_collections),
-            CollectionStorage::F64 => copy_typed!(f64_collections),
-            CollectionStorage::Bool => copy_typed!(bool_collections),
-            CollectionStorage::Rune => copy_typed!(rune_collections),
-            CollectionStorage::String => copy_typed!(string_collections),
+            CollectionStorage::I32 => copy_typed!(i32_mut),
+            CollectionStorage::I64 => copy_typed!(i64_mut),
+            CollectionStorage::F32 => copy_typed!(f32_mut),
+            CollectionStorage::F64 => copy_typed!(f64_mut),
+            CollectionStorage::Bool => copy_typed!(bools_mut),
+            CollectionStorage::Rune => copy_typed!(runes_mut),
+            CollectionStorage::String => copy_typed!(strings_mut),
             CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                copy_typed!(ref_collections);
+                copy_typed!(refs_mut);
             }
-            CollectionStorage::Values => copy_typed!(collections),
+            CollectionStorage::Values => self.collections.values.copy_within(
+                prepared.source_absolute..prepared.source_absolute + prepared.length,
+                prepared.destination_absolute,
+            ),
         }
         // G1 barrier: every reference just published into the destination
         // extent is shaded; the gray queue tolerates duplicates.
@@ -5235,7 +5153,7 @@ impl Heap {
                 }
             }
             CollectionStorage::String => {
-                for (child, _) in self.string_collections.values(range)?[..live]
+                for (child, _) in self.scalar_collections.strings().values(range)?[..live]
                     .iter()
                     .copied()
                 {
@@ -5243,7 +5161,10 @@ impl Heap {
                 }
             }
             CollectionStorage::Ref | CollectionStorage::NamedRef => {
-                for child in self.ref_collections.values(range)?[..live].iter().copied() {
+                for child in self.scalar_collections.refs().values(range)?[..live]
+                    .iter()
+                    .copied()
+                {
                     enqueue(child);
                 }
             }
@@ -5359,37 +5280,7 @@ impl Heap {
     }
 
     fn scalar_arena_reserved_bytes(&self) -> u64 {
-        (self.i32_collections.values.capacity() as u64)
-            .saturating_mul(size_of::<i32>() as u64)
-            .saturating_add(
-                (self.i64_collections.values.capacity() as u64)
-                    .saturating_mul(size_of::<i64>() as u64),
-            )
-            .saturating_add(
-                (self.f32_collections.values.capacity() as u64)
-                    .saturating_mul(size_of::<u32>() as u64),
-            )
-            .saturating_add(
-                (self.f64_collections.values.capacity() as u64)
-                    .saturating_mul(size_of::<u64>() as u64),
-            )
-            .saturating_add(self.bool_collections.values.capacity() as u64)
-            .saturating_add(
-                (self.rune_collections.values.capacity() as u64)
-                    .saturating_mul(size_of::<u32>() as u64),
-            )
-            .saturating_add(
-                (self.string_collections.values.capacity() as u64).saturating_mul(size_of::<(
-                    GcRef,
-                    u64,
-                )>(
-                )
-                    as u64),
-            )
-            .saturating_add(
-                (self.ref_collections.values.capacity() as u64)
-                    .saturating_mul(size_of::<GcRef>() as u64),
-            )
+        self.scalar_collections.reserved_bytes()
     }
 
     /// `GC_V1` heap byte accounting by category (G4). One full walk over the
@@ -6035,11 +5926,16 @@ mod tests {
             )
             .unwrap();
         heap.array_push(array, RuntimeValue::I32(7)).unwrap();
-        let reserved = heap.i32_collections.values.capacity();
+        let reserved = heap.scalar_collections.i32().capacity();
+        assert_eq!(
+            heap.scalar_collections.backing_allocations(),
+            1,
+            "all compact scalar types share one allocator backing"
+        );
         let checkpoint = heap.checkpoint();
         assert_eq!(reserved, 1_024);
         assert!(
-            checkpoint.i32_collections.values.capacity() < reserved,
+            checkpoint.scalar_collections.i32().capacity() < reserved,
             "checkpoint owns only the initialized prefix, not the reserved arena"
         );
         assert!(
@@ -6052,7 +5948,7 @@ mod tests {
         assert_eq!(heap.array_len(array), Ok(1));
         assert_eq!(heap.array_get(array, 0), Ok(RuntimeValue::I32(7)));
         assert_eq!(
-            heap.i32_collections.values.capacity(),
+            heap.scalar_collections.i32().capacity(),
             reserved,
             "restore reuses the heap's constructor-reserved backing"
         );

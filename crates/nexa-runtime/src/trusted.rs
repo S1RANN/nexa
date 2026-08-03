@@ -38,10 +38,12 @@
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::mem::MaybeUninit;
+use std::marker::PhantomData;
+use std::mem::{MaybeUninit, align_of, size_of};
 
 use crate::RuntimeValue;
 use crate::frame::{FrameArena, FrameError};
+use crate::heap::{CollectionRange, GcRef, HeapError};
 use crate::interpreter::InterpreterError;
 
 pub(crate) const STATIC_LEAF_REGISTER_CAPACITY: usize = 24;
@@ -202,10 +204,495 @@ pub(crate) fn advance_pc(arena: &mut FrameArena) -> Result<(), InterpreterError>
     Ok(())
 }
 
+/// One allocator-owned backing for every compact scalar collection arena.
+///
+/// The eight physical element types occupy disjoint, correctly aligned
+/// regions inside one allocation. Region lengths track initialized prefixes,
+/// so safe views never expose spare `Vec` capacity as initialized values.
+/// This preserves the old typed contiguous slices while replacing eight
+/// allocator calls (and eight timed frees) with one deterministic slab.
+pub(crate) struct ScalarArenaSet {
+    storage: ScalarStorage,
+    i32_values: ScalarRegion<i32>,
+    i64_values: ScalarRegion<i64>,
+    f32_values: ScalarRegion<u32>,
+    f64_values: ScalarRegion<u64>,
+    bool_values: ScalarRegion<u8>,
+    rune_values: ScalarRegion<u32>,
+    string_values: ScalarRegion<(GcRef, u64)>,
+    ref_values: ScalarRegion<GcRef>,
+}
+
+#[derive(Debug)]
+#[repr(C, align(16))]
+struct AlignedScalarBlock([MaybeUninit<u8>; 16]);
+
+#[derive(Debug)]
+struct ScalarStorage {
+    blocks: Vec<AlignedScalarBlock>,
+}
+
+#[derive(Clone, Copy)]
+struct ScalarRegion<T> {
+    byte_offset: usize,
+    capacity: usize,
+    length: usize,
+    empty: T,
+    marker: PhantomData<T>,
+}
+
+#[derive(Clone, Copy)]
+struct ScalarCapacities {
+    i32: usize,
+    i64: usize,
+    f32: usize,
+    f64: usize,
+    bools: usize,
+    runes: usize,
+    strings: usize,
+    refs: usize,
+}
+
+impl ScalarCapacities {
+    const fn uniform(capacity: usize) -> Self {
+        Self {
+            i32: capacity,
+            i64: capacity,
+            f32: capacity,
+            f64: capacity,
+            bools: capacity,
+            runes: capacity,
+            strings: capacity,
+            refs: capacity,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ScalarArena<'a, T> {
+    storage: &'a ScalarStorage,
+    region: &'a ScalarRegion<T>,
+}
+
+pub(crate) struct ScalarArenaMut<'a, T> {
+    storage: &'a mut ScalarStorage,
+    region: &'a mut ScalarRegion<T>,
+}
+
+impl<T: Copy> ScalarRegion<T> {
+    fn reserve(cursor: &mut usize, capacity: usize, empty: T) -> Self {
+        let aligned = cursor
+            .checked_add(align_of::<T>() - 1)
+            .map(|value| value & !(align_of::<T>() - 1))
+            .expect("scalar arena alignment must fit usize");
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .expect("scalar arena byte capacity must fit usize");
+        *cursor = aligned
+            .checked_add(bytes)
+            .expect("scalar arena layout must fit usize");
+        Self {
+            byte_offset: aligned,
+            capacity,
+            length: 0,
+            empty,
+            marker: PhantomData,
+        }
+    }
+}
+
+impl ScalarStorage {
+    fn new(bytes: usize) -> Self {
+        let blocks = bytes.div_ceil(size_of::<AlignedScalarBlock>());
+        Self {
+            blocks: Vec::with_capacity(blocks),
+        }
+    }
+
+    fn base(&self) -> *const u8 {
+        self.blocks.as_ptr().cast()
+    }
+
+    fn base_mut(&mut self) -> *mut u8 {
+        self.blocks.as_mut_ptr().cast()
+    }
+
+    fn values<T: Copy>(&self, region: &ScalarRegion<T>) -> &[T] {
+        debug_assert_eq!(
+            (self.base() as usize + region.byte_offset) % align_of::<T>(),
+            0
+        );
+        // SAFETY: `ScalarArenaSet::with_capacities` assigns this region a
+        // disjoint, `T`-aligned byte interval inside the allocation.
+        // `ScalarArenaMut::claim_exact` initializes every cell below
+        // `region.length` before increasing that length. The returned view is
+        // tied to the immutable borrow of the complete storage.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.base().add(region.byte_offset).cast::<T>(),
+                region.length,
+            )
+        }
+    }
+
+    fn values_mut<T: Copy>(&mut self, region: &ScalarRegion<T>) -> &mut [T] {
+        debug_assert_eq!(
+            (self.base() as usize + region.byte_offset) % align_of::<T>(),
+            0
+        );
+        // SAFETY: identical layout and initialization proof to `values`.
+        // The mutable borrow covers the entire slab, so no other typed region
+        // can be borrowed concurrently through the safe arena API.
+        unsafe {
+            std::slice::from_raw_parts_mut(
+                self.base_mut().add(region.byte_offset).cast::<T>(),
+                region.length,
+            )
+        }
+    }
+
+    fn initialize<T: Copy>(&mut self, region: &ScalarRegion<T>, start: usize, end: usize) {
+        debug_assert!(start <= end);
+        debug_assert!(end <= region.capacity);
+        // SAFETY: the constructor reserves `capacity * size_of::<T>()`
+        // aligned bytes for this region. `[start, end)` is within that
+        // interval and not exposed as initialized until this fill completes.
+        let values = unsafe {
+            std::slice::from_raw_parts_mut(
+                self.base_mut()
+                    .add(region.byte_offset)
+                    .cast::<T>()
+                    .add(start),
+                end - start,
+            )
+        };
+        values.fill(region.empty);
+    }
+}
+
+impl<'a, T: Copy> ScalarArena<'a, T> {
+    pub(crate) fn values(self, range: CollectionRange) -> Result<&'a [T], HeapError> {
+        let end = range
+            .start
+            .checked_add(range.length)
+            .ok_or(HeapError::CapacityExhausted)?;
+        self.storage
+            .values(self.region)
+            .get(range.start..end)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: end,
+                length: self.region.capacity,
+            })
+    }
+
+    pub(crate) const fn capacity(self) -> usize {
+        self.region.capacity
+    }
+
+    pub(crate) const fn length(self) -> usize {
+        self.region.length
+    }
+}
+
+impl<T: Copy> ScalarArenaMut<'_, T> {
+    pub(crate) fn claim_exact(&mut self, range: CollectionRange) -> Result<(), HeapError> {
+        let end = range
+            .start
+            .checked_add(range.length)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if end > self.region.capacity {
+            return Err(HeapError::CapacityExhausted);
+        }
+        if self.region.length < end {
+            self.storage
+                .initialize(self.region, self.region.length, end);
+            self.region.length = end;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn release(&mut self, range: CollectionRange) {
+        if range.length == 0 {
+            return;
+        }
+        let empty = self.region.empty;
+        if let Ok(values) = self.values_mut(range) {
+            values.fill(empty);
+        }
+    }
+
+    pub(crate) fn values_mut(&mut self, range: CollectionRange) -> Result<&mut [T], HeapError> {
+        let end = range
+            .start
+            .checked_add(range.length)
+            .ok_or(HeapError::CapacityExhausted)?;
+        let capacity = self.region.capacity;
+        self.storage
+            .values_mut(self.region)
+            .get_mut(range.start..end)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: end,
+                length: capacity,
+            })
+    }
+
+    pub(crate) const fn length(&self) -> usize {
+        self.region.length
+    }
+
+    fn restore(&mut self, source: &[T]) {
+        debug_assert!(source.len() <= self.region.capacity);
+        let previous_length = self.region.length;
+        let restored_length = source.len();
+        if previous_length < restored_length {
+            self.storage
+                .initialize(self.region, previous_length, restored_length);
+        }
+        self.region.length = previous_length.max(restored_length);
+        let empty = self.region.empty;
+        let all = self
+            .values_mut(CollectionRange {
+                start: 0,
+                length: self.region.length,
+            })
+            .expect("restored scalar prefix fits reserved storage");
+        all[..restored_length].copy_from_slice(source);
+        all[restored_length..].fill(empty);
+        self.region.length = restored_length;
+    }
+}
+
+impl ScalarArenaSet {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_capacities(ScalarCapacities::uniform(capacity))
+    }
+
+    fn with_capacities(capacities: ScalarCapacities) -> Self {
+        let mut cursor = 0_usize;
+        let i32_values = ScalarRegion::reserve(&mut cursor, capacities.i32, 0_i32);
+        let i64_values = ScalarRegion::reserve(&mut cursor, capacities.i64, 0_i64);
+        let f32_values = ScalarRegion::reserve(&mut cursor, capacities.f32, 0_u32);
+        let f64_values = ScalarRegion::reserve(&mut cursor, capacities.f64, 0_u64);
+        let bool_values = ScalarRegion::reserve(&mut cursor, capacities.bools, 0_u8);
+        let rune_values = ScalarRegion::reserve(&mut cursor, capacities.runes, 0_u32);
+        let string_values = ScalarRegion::reserve(
+            &mut cursor,
+            capacities.strings,
+            (
+                GcRef {
+                    index: u32::MAX,
+                    generation: u32::MAX,
+                },
+                0,
+            ),
+        );
+        let ref_values = ScalarRegion::reserve(
+            &mut cursor,
+            capacities.refs,
+            GcRef {
+                index: u32::MAX,
+                generation: u32::MAX,
+            },
+        );
+        Self {
+            storage: ScalarStorage::new(cursor),
+            i32_values,
+            i64_values,
+            f32_values,
+            f64_values,
+            bool_values,
+            rune_values,
+            string_values,
+            ref_values,
+        }
+    }
+
+    pub(crate) fn checkpoint_clone(&self) -> Self {
+        let mut snapshot = Self::with_capacities(ScalarCapacities {
+            i32: self.i32_values.length,
+            i64: self.i64_values.length,
+            f32: self.f32_values.length,
+            f64: self.f64_values.length,
+            bools: self.bool_values.length,
+            runes: self.rune_values.length,
+            strings: self.string_values.length,
+            refs: self.ref_values.length,
+        });
+        macro_rules! copy_prefix {
+            ($read:ident, $write:ident) => {{
+                let source = self.$read();
+                let range = CollectionRange {
+                    start: 0,
+                    length: source.length(),
+                };
+                let values = source
+                    .values(range)
+                    .expect("snapshot range is the initialized prefix");
+                let mut destination = snapshot.$write();
+                destination
+                    .claim_exact(range)
+                    .expect("snapshot reserves the exact initialized prefix");
+                destination
+                    .values_mut(range)
+                    .expect("snapshot range was initialized")
+                    .copy_from_slice(values);
+            }};
+        }
+        copy_prefix!(i32, i32_mut);
+        copy_prefix!(i64, i64_mut);
+        copy_prefix!(f32, f32_mut);
+        copy_prefix!(f64, f64_mut);
+        copy_prefix!(bools, bools_mut);
+        copy_prefix!(runes, runes_mut);
+        copy_prefix!(strings, strings_mut);
+        copy_prefix!(refs, refs_mut);
+        snapshot
+    }
+
+    pub(crate) fn restore_checkpoint(&mut self, snapshot: &Self) {
+        macro_rules! restore_prefix {
+            ($read:ident, $write:ident) => {{
+                let source = snapshot.$read();
+                let range = CollectionRange {
+                    start: 0,
+                    length: source.length(),
+                };
+                self.$write().restore(
+                    source
+                        .values(range)
+                        .expect("snapshot exposes its initialized prefix"),
+                );
+            }};
+        }
+        restore_prefix!(i32, i32_mut);
+        restore_prefix!(i64, i64_mut);
+        restore_prefix!(f32, f32_mut);
+        restore_prefix!(f64, f64_mut);
+        restore_prefix!(bools, bools_mut);
+        restore_prefix!(runes, runes_mut);
+        restore_prefix!(strings, strings_mut);
+        restore_prefix!(refs, refs_mut);
+    }
+
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        [
+            self.i32().capacity().saturating_mul(size_of::<i32>()),
+            self.i64().capacity().saturating_mul(size_of::<i64>()),
+            self.f32().capacity().saturating_mul(size_of::<u32>()),
+            self.f64().capacity().saturating_mul(size_of::<u64>()),
+            self.bools().capacity(),
+            self.runes().capacity().saturating_mul(size_of::<u32>()),
+            self.strings()
+                .capacity()
+                .saturating_mul(size_of::<(GcRef, u64)>()),
+            self.refs().capacity().saturating_mul(size_of::<GcRef>()),
+        ]
+        .into_iter()
+        .fold(0_u64, |total, bytes| total.saturating_add(bytes as u64))
+    }
+
+    pub(crate) fn backing_allocations(&self) -> usize {
+        usize::from(self.storage.blocks.capacity() != 0)
+    }
+}
+
+macro_rules! scalar_arena_accessors {
+    ($(($read:ident, $write:ident, $field:ident, $element:ty)),+ $(,)?) => {
+        impl ScalarArenaSet {
+            $(
+                pub(crate) fn $read(&self) -> ScalarArena<'_, $element> {
+                    ScalarArena {
+                        storage: &self.storage,
+                        region: &self.$field,
+                    }
+                }
+
+                pub(crate) fn $write(&mut self) -> ScalarArenaMut<'_, $element> {
+                    ScalarArenaMut {
+                        storage: &mut self.storage,
+                        region: &mut self.$field,
+                    }
+                }
+            )+
+        }
+    };
+}
+
+scalar_arena_accessors!(
+    (i32, i32_mut, i32_values, i32),
+    (i64, i64_mut, i64_values, i64),
+    (f32, f32_mut, f32_values, u32),
+    (f64, f64_mut, f64_values, u64),
+    (bools, bools_mut, bool_values, u8),
+    (runes, runes_mut, rune_values, u32),
+    (strings, strings_mut, string_values, (GcRef, u64)),
+    (refs, refs_mut, ref_values, GcRef),
+);
+
+impl std::fmt::Debug for ScalarArenaSet {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ScalarArenaSet")
+            .field("storage", &self.storage)
+            .field("backing_allocations", &self.backing_allocations())
+            .field("reserved_bytes", &self.reserved_bytes())
+            .field("i32_length", &self.i32_values.length)
+            .field("i64_length", &self.i64_values.length)
+            .field("f32_length", &self.f32_values.length)
+            .field("f64_length", &self.f64_values.length)
+            .field("bool_length", &self.bool_values.length)
+            .field("rune_length", &self.rune_values.length)
+            .field("string_length", &self.string_values.length)
+            .field("ref_length", &self.ref_values.length)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::frame::{FrameArena, FrameLimits};
-    use crate::{InterpreterError, RuntimeValue};
+    use crate::{CollectionRange, GcRef, InterpreterError, RuntimeValue};
+
+    #[test]
+    fn scalar_arenas_share_one_backing_and_restore_typed_prefixes() {
+        let mut arenas = super::ScalarArenaSet::new(8);
+        assert_eq!(arenas.backing_allocations(), 1);
+        assert_eq!(arenas.i32().capacity(), 8);
+        assert_eq!(
+            arenas.reserved_bytes(),
+            8 * (4 + 8 + 4 + 8 + 1 + 4 + 16 + 8)
+        );
+
+        let range = CollectionRange {
+            start: 2,
+            length: 2,
+        };
+        {
+            let mut values = arenas.i32_mut();
+            values.claim_exact(range).unwrap();
+            values.values_mut(range).unwrap().copy_from_slice(&[7, 9]);
+        }
+        let reference = GcRef {
+            index: 3,
+            generation: 5,
+        };
+        {
+            let mut values = arenas.strings_mut();
+            values.claim_exact(range).unwrap();
+            values.values_mut(range).unwrap()[0] = (reference, 11);
+        }
+        assert_eq!(arenas.i32().values(range).unwrap(), &[7, 9]);
+        assert_eq!(arenas.strings().values(range).unwrap()[0], (reference, 11));
+
+        let snapshot = arenas.checkpoint_clone();
+        assert_eq!(snapshot.i32().capacity(), range.start + range.length);
+        assert_eq!(snapshot.strings().capacity(), range.start + range.length);
+        arenas.i32_mut().values_mut(range).unwrap().fill(99);
+        arenas.restore_checkpoint(&snapshot);
+        assert_eq!(arenas.i32().values(range).unwrap(), &[7, 9]);
+        assert_eq!(arenas.strings().values(range).unwrap()[0], (reference, 11));
+        assert_eq!(arenas.i32().capacity(), 8);
+    }
 
     #[test]
     fn kernel_register_access_matches_the_checked_arena() {
