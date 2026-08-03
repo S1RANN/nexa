@@ -696,7 +696,7 @@ fn execute_static_leaf_instruction(
         instruction @ (Instruction::EnumNew { .. }
         | Instruction::EnumTag { .. }
         | Instruction::EnumPayload { .. }) => {
-            execute_static_leaf_enum(instruction, registers, module, heap)
+            execute_static_leaf_enum(instruction, row, registers, module, heap)
         }
         instruction @ (Instruction::ClassNew { .. }
         | Instruction::ClassGet { .. }
@@ -709,13 +709,13 @@ fn execute_static_leaf_instruction(
         | Instruction::ArraySet { .. }
         | Instruction::ArrayGet { .. }
         | Instruction::ArrayLen { .. }) => {
-            execute_static_leaf_array(instruction, registers, module, heap)?;
+            execute_static_leaf_array(instruction, row, registers, module, heap)?;
             Ok(StaticLeafStep::Next)
         }
         instruction @ (Instruction::MapNew { .. }
         | Instruction::MapSet { .. }
         | Instruction::MapGet { .. }) => {
-            execute_static_leaf_map(instruction, registers, module, heap)?;
+            execute_static_leaf_map(instruction, row, registers, module, heap)?;
             Ok(StaticLeafStep::Next)
         }
         instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
@@ -849,6 +849,7 @@ fn execute_static_leaf_control(
 
 fn execute_static_leaf_enum(
     instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
     module: &VerifiedModule,
     heap: &mut Heap,
@@ -860,12 +861,11 @@ fn execute_static_leaf_enum(
             payload,
             dst,
         } => {
-            let variant = module
-                .enum_variant(type_id.0, variant.0)
-                .ok_or(InterpreterError::TypeMismatch)?;
+            let (variant_id, tag) =
+                resolved_enum_variant(module, type_id, variant, row.resolved_nominal)?;
             let payload =
                 payload.map(|payload| crate::trusted::read_static_leaf(registers, payload));
-            let value = heap.allocate_enum(type_id, variant.stable_id, variant.tag, payload)?;
+            let value = heap.allocate_enum(type_id, variant_id, tag, payload)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
         Instruction::EnumTag { source, dst } => {
@@ -944,23 +944,15 @@ fn execute_static_leaf_class(
 
 fn execute_static_leaf_array(
     instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
     module: &VerifiedModule,
     heap: &mut Heap,
 ) -> Result<(), InterpreterError> {
     match instruction {
         Instruction::ArrayNew { type_id, dst } => {
-            let element_type = module
-                .array_type(type_id.0)
-                .map(|array_type| array_type.element)
-                .ok_or(InterpreterError::TypeMismatch)?;
-            let row_fields = match element_type {
-                ValueType::Named(element_id) => module
-                    .struct_type(element_id.0)
-                    .and_then(|layout| u8::try_from(layout.fields.len()).ok())
-                    .and_then(std::num::NonZeroU8::new),
-                _ => None,
-            };
+            let (element_type, row_fields) =
+                resolved_array_layout(module, type_id, row.resolved_nominal)?;
             let value = match row_fields {
                 Some(field_count) => {
                     heap.allocate_struct_row_array(type_id, element_type, field_count)?
@@ -1011,16 +1003,15 @@ fn execute_static_leaf_array(
 
 fn execute_static_leaf_map(
     instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
     module: &VerifiedModule,
     heap: &mut Heap,
 ) -> Result<(), InterpreterError> {
     match instruction {
         Instruction::MapNew { type_id, dst } => {
-            let map_type = module
-                .map_type(type_id.0)
-                .ok_or(InterpreterError::TypeMismatch)?;
-            let value = heap.allocate_map(type_id, map_type.key, map_type.value)?;
+            let (key, value) = resolved_map_layout(module, type_id, row.resolved_nominal)?;
+            let value = heap.allocate_map(type_id, key, value)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
         Instruction::MapSet { source, key, value } => {
@@ -1175,6 +1166,81 @@ fn finish_static_leaf(
         charge,
         fuel,
     })
+}
+
+fn resolved_enum_variant(
+    module: &VerifiedModule,
+    type_id: StableId,
+    variant: StableId,
+    resolved: ExecutableNominalOperand,
+) -> Result<(StableId, u32), InterpreterError> {
+    match resolved {
+        ExecutableNominalOperand::EnumVariant {
+            type_index,
+            variant_index,
+        } => module
+            .module()
+            .enum_types
+            .get(usize::from(type_index))
+            .and_then(|enum_type| enum_type.variants.get(usize::from(variant_index)))
+            .map(|variant| (variant.stable_id, variant.tag))
+            .ok_or(InterpreterError::TypeMismatch),
+        _ => module
+            .enum_variant(type_id.0, variant.0)
+            .map(|variant| (variant.stable_id, variant.tag))
+            .ok_or(InterpreterError::TypeMismatch),
+    }
+}
+
+fn resolved_array_layout(
+    module: &VerifiedModule,
+    type_id: StableId,
+    resolved: ExecutableNominalOperand,
+) -> Result<(ValueType, Option<std::num::NonZeroU8>), InterpreterError> {
+    if let ExecutableNominalOperand::ArrayType {
+        type_index,
+        row_fields,
+    } = resolved
+    {
+        module
+            .module()
+            .array_types
+            .get(usize::from(type_index))
+            .map(|array_type| (array_type.element, std::num::NonZeroU8::new(row_fields)))
+            .ok_or(InterpreterError::TypeMismatch)
+    } else {
+        let element = module
+            .array_type(type_id.0)
+            .map(|array_type| array_type.element)
+            .ok_or(InterpreterError::TypeMismatch)?;
+        let row_fields = match element {
+            ValueType::Named(element_id) => module
+                .struct_type(element_id.0)
+                .and_then(|layout| u8::try_from(layout.fields.len()).ok())
+                .and_then(std::num::NonZeroU8::new),
+            _ => None,
+        };
+        Ok((element, row_fields))
+    }
+}
+
+fn resolved_map_layout(
+    module: &VerifiedModule,
+    type_id: StableId,
+    resolved: ExecutableNominalOperand,
+) -> Result<(ValueType, ValueType), InterpreterError> {
+    match resolved {
+        ExecutableNominalOperand::MapType { type_index } => module
+            .module()
+            .map_types
+            .get(usize::from(type_index))
+            .map(|map_type| (map_type.key, map_type.value))
+            .ok_or(InterpreterError::TypeMismatch),
+        _ => module
+            .map_type(type_id.0)
+            .map(|map_type| (map_type.key, map_type.value))
+            .ok_or(InterpreterError::TypeMismatch),
+    }
 }
 
 fn resolved_class_field(
@@ -3263,17 +3329,15 @@ impl CheckedInterpreter {
                     payload,
                     dst,
                 } => {
-                    let variant = module
-                        .enum_variant(type_id.0, variant.0)
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let (variant_id, tag) =
+                        resolved_enum_variant(module, type_id, variant, resolved_nominal)?;
                     let payload = payload
                         .map(|payload| register(&continuation.arena, payload))
                         .transpose()?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?;
-                    let value =
-                        heap.allocate_enum(type_id, variant.stable_id, variant.tag, payload)?;
+                    let value = heap.allocate_enum(type_id, variant_id, tag, payload)?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -3548,10 +3612,8 @@ impl CheckedInterpreter {
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayNew { type_id, dst } => {
-                    let element_type = module
-                        .array_type(type_id.0)
-                        .map(|array_type| array_type.element)
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let (element_type, row_fields) =
+                        resolved_array_layout(module, type_id, resolved_nominal)?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
@@ -3559,13 +3621,6 @@ impl CheckedInterpreter {
                     // field cell per struct field, zero objects per element.
                     // Named element types that are not structs (classes,
                     // enums) and fieldless structs keep the cell layout.
-                    let row_fields = match element_type {
-                        nexa_bytecode::ValueType::Named(element_id) => module
-                            .struct_type(element_id.0)
-                            .and_then(|layout| u8::try_from(layout.fields.len()).ok())
-                            .and_then(std::num::NonZeroU8::new),
-                        _ => None,
-                    };
                     let value = match row_fields {
                         Some(field_count) => {
                             heap.allocate_struct_row_array(type_id, element_type, field_count)?
@@ -3720,13 +3775,11 @@ impl CheckedInterpreter {
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::MapNew { type_id, dst } => {
-                    let map_type = module
-                        .map_type(type_id.0)
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let (key, value) = resolved_map_layout(module, type_id, resolved_nominal)?;
                     let value = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?
-                        .allocate_map(type_id, map_type.key, map_type.value)?;
+                        .allocate_map(type_id, key, value)?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }

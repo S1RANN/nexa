@@ -212,6 +212,10 @@ impl ModuleProfileMetadata {
 pub enum ResolvedNominalOperand {
     #[default]
     None,
+    EnumVariant {
+        type_index: u16,
+        variant_index: u16,
+    },
     StructField {
         type_id: StableId,
         index: u16,
@@ -219,6 +223,13 @@ pub enum ResolvedNominalOperand {
     ClassField {
         type_index: u16,
         index: u16,
+    },
+    ArrayType {
+        type_index: u16,
+        row_fields: u8,
+    },
+    MapType {
+        type_index: u16,
     },
 }
 
@@ -1957,17 +1968,19 @@ fn verify_function(
                 payload,
                 dst,
             } => {
-                let enum_type = module
+                let (type_index, enum_type) = module
                     .enum_types
                     .iter()
-                    .find(|enum_type| enum_type.type_id == type_id)
+                    .enumerate()
+                    .find(|(_, enum_type)| enum_type.type_id == type_id)
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::EnumTypeOutOfRange(type_id.0))
                     })?;
-                let variant = enum_type
+                let (variant_index, variant) = enum_type
                     .variants
                     .iter()
-                    .find(|candidate| candidate.stable_id == variant)
+                    .enumerate()
+                    .find(|(_, candidate)| candidate.stable_id == variant)
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::EnumVariantOutOfRange(variant.0))
                     })?;
@@ -1978,6 +1991,12 @@ fn verify_function(
                     (None, None) => {}
                     _ => return Err(error(Some(pc), VerifyErrorKind::TypeMismatch)),
                 }
+                resolved_operands[pc] = ResolvedNominalOperand::EnumVariant {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    variant_index: u16::try_from(variant_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
             Instruction::EnumTag { source, dst } => {
@@ -2257,16 +2276,29 @@ fn verify_function(
                 state[register(dst)?] = Some(ValueType::Bool);
             }
             Instruction::ArrayNew { type_id, dst } => {
-                if !module
+                let (type_index, array_type) = module
                     .array_types
                     .iter()
-                    .any(|array_type| array_type.type_id == type_id)
-                {
-                    return Err(error(
-                        Some(pc),
-                        VerifyErrorKind::ArrayTypeOutOfRange(type_id.0),
-                    ));
-                }
+                    .enumerate()
+                    .find(|(_, array_type)| array_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::ArrayTypeOutOfRange(type_id.0))
+                    })?;
+                let row_fields = match array_type.element {
+                    ValueType::Named(element_id) => module
+                        .struct_types
+                        .iter()
+                        .find(|struct_type| struct_type.type_id == element_id)
+                        .and_then(|struct_type| u8::try_from(struct_type.fields.len()).ok())
+                        .filter(|field_count| *field_count != 0)
+                        .unwrap_or_default(),
+                    _ => 0,
+                };
+                resolved_operands[pc] = ResolvedNominalOperand::ArrayType {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    row_fields,
+                };
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
             Instruction::ArrayLen { source, dst } => {
@@ -2362,16 +2394,18 @@ fn verify_function(
                 array_element(&state, source)?;
             }
             Instruction::MapNew { type_id, dst } => {
-                if !module
+                let (type_index, _) = module
                     .map_types
                     .iter()
-                    .any(|map_type| map_type.type_id == type_id)
-                {
-                    return Err(error(
-                        Some(pc),
-                        VerifyErrorKind::MapTypeOutOfRange(type_id.0),
-                    ));
-                }
+                    .enumerate()
+                    .find(|(_, map_type)| map_type.type_id == type_id)
+                    .ok_or_else(|| {
+                        error(Some(pc), VerifyErrorKind::MapTypeOutOfRange(type_id.0))
+                    })?;
+                resolved_operands[pc] = ResolvedNominalOperand::MapType {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
             Instruction::MapLen { source, dst } => {

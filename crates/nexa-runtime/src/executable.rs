@@ -27,13 +27,18 @@ const STATIC_LEAF_MAX_INSTRUCTIONS: usize = 24;
 ///
 /// The portable verifier form also carries a Struct `StableId`, which is
 /// useful while building cold allocation provenance but redundant during
-/// execution: Struct operations need only the proven field slot, while Class
-/// operations need the proven type and field slots. Dropping that cold
-/// identity shrinks this value from 16 bytes to a compact dense layout.
+/// execution. Allocation rows retain only dense type/layout slots, Struct
+/// operations need only the proven field slot, and Class operations need the
+/// proven type and field slots. Dropping cold identities keeps this value in
+/// a compact dense layout.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ExecutableNominalOperand {
     #[default]
     None,
+    EnumVariant {
+        type_index: u16,
+        variant_index: u16,
+    },
     StructField {
         index: u16,
     },
@@ -41,16 +46,38 @@ pub(crate) enum ExecutableNominalOperand {
         type_index: u16,
         index: u16,
     },
+    ArrayType {
+        type_index: u16,
+        row_fields: u8,
+    },
+    MapType {
+        type_index: u16,
+    },
 }
 
 impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
     fn from(resolved: ResolvedNominalOperand) -> Self {
         match resolved {
             ResolvedNominalOperand::None => Self::None,
+            ResolvedNominalOperand::EnumVariant {
+                type_index,
+                variant_index,
+            } => Self::EnumVariant {
+                type_index,
+                variant_index,
+            },
             ResolvedNominalOperand::StructField { index, .. } => Self::StructField { index },
             ResolvedNominalOperand::ClassField { type_index, index } => {
                 Self::ClassField { type_index, index }
             }
+            ResolvedNominalOperand::ArrayType {
+                type_index,
+                row_fields,
+            } => Self::ArrayType {
+                type_index,
+                row_fields,
+            },
+            ResolvedNominalOperand::MapType { type_index } => Self::MapType { type_index },
         }
     }
 }
@@ -69,7 +96,7 @@ pub struct PooledStringConstant {
 /// density while preserving portable bytecode as the safety boundary.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutableInstruction {
-    /// Verifier-proven dense nominal operand for field instructions.
+    /// Verifier-proven dense nominal operand for allocation and field rows.
     pub(crate) resolved_nominal: ExecutableNominalOperand,
     /// Full attempt charge for static rows, base opcode charge for dynamic
     /// rows. The dynamic flag is a compact discriminator (unlike
@@ -1146,6 +1173,13 @@ fn update_counter() -> i32 {
             .flat_map(|(function, rows)| function.code.iter().copied().zip(rows.rows()))
         {
             match instruction {
+                Instruction::EnumNew { .. } => assert!(
+                    matches!(
+                        row.resolved_nominal,
+                        super::ExecutableNominalOperand::EnumVariant { .. }
+                    ),
+                    "enum construction rows carry dense type and variant slots"
+                ),
                 Instruction::StructGet { .. } | Instruction::StructWith { .. } => assert!(
                     matches!(
                         row.resolved_nominal,
@@ -1159,6 +1193,20 @@ fn update_counter() -> i32 {
                         super::ExecutableNominalOperand::ClassField { .. }
                     ),
                     "class field rows carry a verifier-proven dense index and type"
+                ),
+                Instruction::ArrayNew { .. } => assert!(
+                    matches!(
+                        row.resolved_nominal,
+                        super::ExecutableNominalOperand::ArrayType { .. }
+                    ),
+                    "array construction rows carry dense type and row-layout slots"
+                ),
+                Instruction::MapNew { .. } => assert!(
+                    matches!(
+                        row.resolved_nominal,
+                        super::ExecutableNominalOperand::MapType { .. }
+                    ),
+                    "map construction rows carry a dense type slot"
                 ),
                 _ => {}
             }
