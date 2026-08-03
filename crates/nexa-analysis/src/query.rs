@@ -566,6 +566,26 @@ impl QueryDatabase {
         Ok(tree)
     }
 
+    /// Seeds one immutable compiler-owned syntax tree into a fresh query
+    /// database. The embedded standard library is byte-identical for the
+    /// lifetime of the process, so reparsing it for every standalone
+    /// compilation produces no new semantic evidence.
+    pub(crate) fn seed_compiler_syntax(
+        &mut self,
+        key: SourceKey,
+        tree: Arc<nexa_syntax::SyntaxTree>,
+    ) {
+        let query = QueryKey::Parse(key.clone());
+        if self.values.contains_key(&query) {
+            return;
+        }
+        self.stats.misses = self.stats.misses.saturating_add(1);
+        if let Some(execution) = &mut self.execution {
+            execution.parsed_sources.insert(key);
+        }
+        self.insert(query, tree, []);
+    }
+
     /// Replaces one source and compares typed syntax headers before selecting an invalidation
     /// scope. A private body edit therefore preserves header/import caches.
     #[allow(clippy::needless_pass_by_value)]

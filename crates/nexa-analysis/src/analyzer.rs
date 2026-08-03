@@ -6,7 +6,8 @@
 //! produces byte-for-byte equivalent semantic records regardless of filesystem or worker order.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, OnceLock};
 
 use nexa_core::{
     CanonicalSymbolIdentity, StableId, StableSymbolId, StableSymbolRegistry, SymbolKind,
@@ -341,8 +342,70 @@ struct ParsedModule {
     source: SourceKey,
     role: SourceRole,
     syntax: Arc<nexa_syntax::SyntaxTree>,
-    ast: ast::NexaAst,
+    ast: ParsedAst,
     compiler_provided: bool,
+}
+
+/// Source modules remain uniquely owned because script lowering may append a
+/// synthetic entrypoint. Immutable compiler modules share their parsed AST;
+/// `DerefMut` performs copy-on-write if a future mode ever needs to mutate one.
+#[derive(Clone)]
+enum ParsedAst {
+    Owned(ast::NexaAst),
+    Shared(Arc<ast::NexaAst>),
+}
+
+impl Deref for ParsedAst {
+    type Target = ast::NexaAst;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(ast) => ast,
+            Self::Shared(ast) => ast,
+        }
+    }
+}
+
+impl DerefMut for ParsedAst {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Owned(ast) => ast,
+            Self::Shared(ast) => Arc::make_mut(ast),
+        }
+    }
+}
+
+struct CachedCompilerModule {
+    module: ModulePath,
+    source: SourceKey,
+    syntax: Arc<nexa_syntax::SyntaxTree>,
+    ast: Arc<ast::NexaAst>,
+}
+
+static CACHED_STANDARD_LIBRARY: OnceLock<Arc<[CachedCompilerModule]>> = OnceLock::new();
+
+fn cached_standard_library() -> &'static [CachedCompilerModule] {
+    CACHED_STANDARD_LIBRARY.get_or_init(|| {
+        nexa_stdlib::standard_library()
+            .modules()
+            .iter()
+            .map(|descriptor| {
+                let syntax = Arc::new(
+                    nexa_syntax::parse_nexa(descriptor.source)
+                        .expect("embedded standard-library source fits parser limits"),
+                );
+                let ast = Arc::new(parse_nexa_ast(&syntax));
+                CachedCompilerModule {
+                    module: ModulePath::new(descriptor.path)
+                        .expect("standard-library module path is valid"),
+                    source: standard_library_source_key(descriptor),
+                    syntax,
+                    ast,
+                }
+            })
+            .collect::<Vec<_>>()
+            .into()
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -2107,7 +2170,7 @@ impl<'a> Analyzer<'a> {
                 source: unit.key.clone(),
                 role: unit.role,
                 syntax,
-                ast,
+                ast: ParsedAst::Owned(ast),
                 compiler_provided: false,
             });
         }
@@ -2117,10 +2180,9 @@ impl<'a> Analyzer<'a> {
     fn parse_standard_library_sources(&mut self) {
         let package =
             PackageId::new(nexa_stdlib::PACKAGE_ID).expect("standard-library package ID is valid");
-        for descriptor in nexa_stdlib::standard_library().modules() {
-            let module =
-                ModulePath::new(descriptor.path).expect("standard-library module path is valid");
-            let source = standard_library_source_key(descriptor);
+        for cached in cached_standard_library() {
+            let module = cached.module.clone();
+            let source = cached.source.clone();
             let key = SourceModuleKey {
                 package: package.clone(),
                 module: module.clone(),
@@ -2144,19 +2206,9 @@ impl<'a> Analyzer<'a> {
                 );
                 continue;
             }
-            let syntax = match self.db.parse(source.clone(), descriptor.source) {
-                Ok(syntax) => syntax,
-                Err(error) => {
-                    self.push_source_error(
-                        ErrorCode::NX1002,
-                        &source,
-                        ByteRange::default(),
-                        error.to_string(),
-                        "embedded standard-library source exceeds parser limits",
-                    );
-                    continue;
-                }
-            };
+            let syntax = Arc::clone(&cached.syntax);
+            self.db
+                .seed_compiler_syntax(source.clone(), Arc::clone(&syntax));
             let _ = self.db.module_header(&source);
             for error in &syntax.errors {
                 self.push_source_error(
@@ -2167,7 +2219,7 @@ impl<'a> Analyzer<'a> {
                     "invalid embedded standard-library syntax",
                 );
             }
-            let ast = parse_nexa_ast(&syntax);
+            let ast = Arc::clone(&cached.ast);
             for error in &ast.errors {
                 self.push_source_error(
                     ErrorCode::NX1002,
@@ -2185,7 +2237,7 @@ impl<'a> Analyzer<'a> {
                 source,
                 role: SourceRole::Production,
                 syntax,
-                ast,
+                ast: ParsedAst::Shared(ast),
                 compiler_provided: true,
             });
         }
