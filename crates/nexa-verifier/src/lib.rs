@@ -242,6 +242,8 @@ pub enum ResolvedNominalOperand {
     },
     CallFrame {
         register_count: u16,
+        parameter_slots: u16,
+        result_slots: u16,
     },
 }
 
@@ -594,6 +596,7 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     for (index, function) in module.functions.iter().enumerate() {
         resolved_operands.push(verify_function(
             &module,
+            &module_abi,
             index,
             function,
             limits,
@@ -1446,6 +1449,7 @@ fn resolve_state_field(
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
+    module_abi: &nexa_bytecode::layout::ModuleAbi,
     function_index: usize,
     function: &Function,
     limits: VerifierLimits,
@@ -1793,10 +1797,14 @@ fn verify_function(
                 args_count,
                 dst,
             } => {
+                let callee_index = callee as usize;
                 let callee = module
                     .functions
-                    .get(callee as usize)
+                    .get(callee_index)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(callee)))?;
+                let callee_abi = module_abi
+                    .function(callee_index)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
                 if (immediate_context
                     && !matches!(
                         callee.effect,
@@ -1827,6 +1835,11 @@ fn verify_function(
                 }
                 resolved_operands[pc] = ResolvedNominalOperand::CallFrame {
                     register_count: callee.registers,
+                    parameter_slots: callee_abi.parameter_slots,
+                    result_slots: callee_abi
+                        .result
+                        .as_ref()
+                        .map_or(0, |result| result.slot_count),
                 };
                 if let Some(result) = callee.signature.result {
                     state[register(dst)?] = Some(result);
@@ -3917,6 +3930,37 @@ mod tests {
             .expect("legacy aggregate register is rooted")
             .emit(Instruction::Return { source: 0 });
         module.function(identity.finish().expect("identity function"));
+        let mut wrapper = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(record)],
+                result: Some(ValueType::Named(record)),
+            },
+            2,
+        );
+        wrapper
+            .set_root(0)
+            .expect("aggregate argument root")
+            .set_root(1)
+            .expect("aggregate result root")
+            .emit(Instruction::Call {
+                function: 0,
+                args_base: 0,
+                args_count: 1,
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
+        let mut wrapper = wrapper.finish().expect("wrapper function");
+        wrapper.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![false, true],
+            },
+        ];
+        module.function(wrapper);
 
         let verified =
             verify(module.finish(), VerifierLimits::default()).expect("verified physical module");
@@ -3930,6 +3974,14 @@ mod tests {
         assert_eq!(abi.parameter_slots, 2);
         assert_eq!(abi.parameters[0].slot_count, 2);
         assert_eq!(abi.result.as_ref().map(|result| result.slot_count), Some(2));
+        assert_eq!(
+            verified.resolved_operand(1, 0),
+            ResolvedNominalOperand::CallFrame {
+                register_count: 1,
+                parameter_slots: 2,
+                result_slots: 2,
+            }
+        );
     }
 
     #[test]

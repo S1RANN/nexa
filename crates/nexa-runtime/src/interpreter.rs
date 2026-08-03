@@ -3046,7 +3046,7 @@ impl CheckedInterpreter {
                     dst,
                 } => {
                     if function_rows.is_some() {
-                        let ExecutableNominalOperand::CallFrame { register_count } =
+                        let ExecutableNominalOperand::CallFrame { register_count, .. } =
                             resolved_nominal
                         else {
                             return Err(InterpreterError::TypeMismatch);

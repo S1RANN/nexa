@@ -61,6 +61,8 @@ pub(crate) enum ExecutableNominalOperand {
     },
     CallFrame {
         register_count: u16,
+        parameter_slots: u16,
+        result_slots: u16,
     },
 }
 
@@ -102,9 +104,15 @@ impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
                 row_fields,
             },
             ResolvedNominalOperand::MapType { type_index } => Self::MapType { type_index },
-            ResolvedNominalOperand::CallFrame { register_count } => {
-                Self::CallFrame { register_count }
-            }
+            ResolvedNominalOperand::CallFrame {
+                register_count,
+                parameter_slots,
+                result_slots,
+            } => Self::CallFrame {
+                register_count,
+                parameter_slots,
+                result_slots,
+            },
         }
     }
 }
