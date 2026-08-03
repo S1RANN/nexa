@@ -27,18 +27,26 @@ pub struct PooledStringConstant {
     pub hash: u64,
 }
 
-/// One predecoded instruction row: the hot fields fixed at build time.
+/// One predecoded metadata row parallel to verified bytecode.
+///
+/// The 48-byte portable `Instruction` remains in the verifier-owned function
+/// code instead of being duplicated here. Keeping only dense operands, fuel,
+/// and flags makes the hot row small enough for substantially better cache
+/// density while preserving portable bytecode as the safety boundary.
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutableInstruction {
-    pub instruction: Instruction,
     /// Verifier-proven dense nominal operand for field instructions.
     pub resolved_nominal: ResolvedNominalOperand,
-    /// Full load-time attempt charge (base cost, static work, and the
-    /// host-import surcharge for `HostCall`); `None` when the instruction
-    /// carries an operand-dependent dynamic surcharge.
-    pub static_fuel: Option<u64>,
+    /// Full attempt charge for static rows, base opcode charge for dynamic
+    /// rows. `dynamic_fuel` is the compact discriminator (unlike
+    /// `Option<u64>`, which occupies 16 bytes).
+    pub attempt_fuel: u64,
+    pub dynamic_fuel: bool,
     /// Fixed at build time; never recomputed per instruction.
     pub safepoint: bool,
+    /// Fuel must settle before this row (entry, resume-after-host, or
+    /// safepoint). This replaces the hot-loop previous-instruction lookup.
+    pub fuel_boundary: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -197,10 +205,18 @@ impl ExecutableModule {
                     static_fuel
                 };
                 rows.push(ExecutableInstruction {
-                    instruction,
                     resolved_nominal: module.resolved_operand(function_index as usize, pc as usize),
-                    static_fuel,
+                    attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
+                    dynamic_fuel: static_fuel.is_none(),
                     safepoint: crate::interpreter::is_safepoint(instruction, pc),
+                    fuel_boundary: pc == 0
+                        || crate::interpreter::is_safepoint(instruction, pc)
+                        || function
+                            .code
+                            .get(pc.saturating_sub(1) as usize)
+                            .is_some_and(|previous| {
+                                matches!(previous, Instruction::HostCall { .. })
+                            }),
                 });
             }
             functions.push(ExecutableFunction { rows });
@@ -238,11 +254,7 @@ impl ExecutableModule {
         let mut total = 0;
         for function in &self.functions {
             total += function.rows.len();
-            static_rows += function
-                .rows
-                .iter()
-                .filter(|row| row.static_fuel.is_some())
-                .count();
+            static_rows += function.rows.iter().filter(|row| !row.dynamic_fuel).count();
         }
         (static_rows, total)
     }
@@ -324,6 +336,10 @@ fn update_counter() -> i32 {
 
     #[test]
     fn rows_cover_the_corpus_and_pin_the_dynamic_surface() {
+        assert!(
+            std::mem::size_of::<super::ExecutableInstruction>() <= 40,
+            "hot metadata rows must not duplicate the 48-byte portable instruction"
+        );
         let module = nexa_compiler::compile(CORPUS).expect("F1 corpus compiles");
         let costs = OpcodeCostTable::default();
         let executable = ExecutableModule::build(&module, &costs).expect("build executable");
@@ -333,26 +349,28 @@ fn update_counter() -> i32 {
         );
         for (function, rows) in module.module().functions.iter().zip(executable.functions()) {
             assert_eq!(function.code.len(), rows.rows().len());
-            for (pc, row) in rows.rows().iter().enumerate() {
+            for (pc, (instruction, row)) in
+                function.code.iter().copied().zip(rows.rows()).enumerate()
+            {
                 let pc = u32::try_from(pc).expect("test corpus pcs fit u32");
                 assert_eq!(
                     row.safepoint,
-                    is_safepoint(row.instruction, pc),
+                    is_safepoint(instruction, pc),
                     "safepoint flag diverges at pc {pc}"
                 );
-                if row.static_fuel.is_none() {
+                if row.dynamic_fuel {
                     assert!(
-                        dynamic_surface(row.instruction),
+                        dynamic_surface(instruction),
                         "instruction unexpectedly dynamic at pc {pc}: {:?}",
-                        row.instruction
+                        instruction
                     );
                 } else {
                     assert!(
-                        !dynamic_surface(row.instruction),
+                        !dynamic_surface(instruction),
                         "operand-dependent instruction misclassified static at pc {pc}: {:?}",
-                        row.instruction
+                        instruction
                     );
-                    assert!(row.static_fuel.unwrap_or(0) > 0, "static rows charge fuel");
+                    assert!(row.attempt_fuel > 0, "static rows charge fuel");
                 }
             }
         }
@@ -366,25 +384,29 @@ fn update_counter() -> i32 {
             static_rows < total,
             "the corpus keeps a dynamic remainder ({static_rows}/{total})"
         );
-        for function in executable.functions() {
-            for row in function.rows() {
-                match row.instruction {
-                    Instruction::StructGet { .. } | Instruction::StructWith { .. } => assert!(
-                        matches!(
-                            row.resolved_nominal,
-                            nexa_verifier::ResolvedNominalOperand::StructField { .. }
-                        ),
-                        "struct field rows carry a verifier-proven dense index"
+        for (instruction, row) in module
+            .module()
+            .functions
+            .iter()
+            .zip(executable.functions())
+            .flat_map(|(function, rows)| function.code.iter().copied().zip(rows.rows()))
+        {
+            match instruction {
+                Instruction::StructGet { .. } | Instruction::StructWith { .. } => assert!(
+                    matches!(
+                        row.resolved_nominal,
+                        nexa_verifier::ResolvedNominalOperand::StructField { .. }
                     ),
-                    Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => assert!(
-                        matches!(
-                            row.resolved_nominal,
-                            nexa_verifier::ResolvedNominalOperand::ClassField { .. }
-                        ),
-                        "class field rows carry a verifier-proven dense index and type"
+                    "struct field rows carry a verifier-proven dense index"
+                ),
+                Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => assert!(
+                    matches!(
+                        row.resolved_nominal,
+                        nexa_verifier::ResolvedNominalOperand::ClassField { .. }
                     ),
-                    _ => {}
-                }
+                    "class field rows carry a verifier-proven dense index and type"
+                ),
+                _ => {}
             }
         }
     }
@@ -426,12 +448,14 @@ fn update_counter() -> i32 {
         let costs = OpcodeCostTable::default();
         let executable = ExecutableModule::build(&module, &costs).expect("build executable");
         let row = executable.functions()[0].rows()[0];
-        let bare = costs.cost(row.instruction);
+        let instruction = module.module().functions[0].code[0];
+        let bare = costs.cost(instruction);
         assert_eq!(
-            row.static_fuel,
-            Some(bare + 37),
+            row.attempt_fuel,
+            bare + 37,
             "HostCall rows carry the folded import surcharge"
         );
+        assert!(!row.dynamic_fuel);
     }
 
     #[test]

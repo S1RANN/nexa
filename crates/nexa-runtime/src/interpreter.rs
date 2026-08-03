@@ -1221,10 +1221,13 @@ impl CheckedInterpreter {
                     (function, rows)
                 }
             };
-            let instruction;
             let instruction_cost;
-            let safepoint;
+            let fuel_boundary;
             let resolved_nominal;
+            let instruction = *function
+                .code
+                .get(frame.pc as usize)
+                .ok_or(InterpreterError::FellOffFunction)?;
             if let Some(rows) = function_rows {
                 // F2: the predecoded row carries the full static charge
                 // (HostCall import surcharge folded at build time) and the
@@ -1233,31 +1236,23 @@ impl CheckedInterpreter {
                 let row = rows
                     .get(frame.pc as usize)
                     .ok_or(InterpreterError::FellOffFunction)?;
-                debug_assert_eq!(
-                    Some(&row.instruction),
-                    function.code.get(frame.pc as usize),
-                    "predecoded row diverges from verified bytecode"
-                );
-                instruction = row.instruction;
                 resolved_nominal = row.resolved_nominal;
-                instruction_cost = match row.static_fuel {
-                    Some(static_fuel) => static_fuel,
-                    None => dynamic_instruction_fuel(
+                instruction_cost = if row.dynamic_fuel {
+                    dynamic_instruction_fuel(
                         module.module(),
                         module.nominal_index_shape(),
-                        row.instruction,
+                        instruction,
                         &continuation.arena,
                         heap.as_deref(),
                         costs,
-                    )?,
+                        Some(row.attempt_fuel),
+                    )?
+                } else {
+                    row.attempt_fuel
                 };
-                safepoint = row.safepoint;
+                fuel_boundary = row.fuel_boundary;
             } else {
                 resolved_nominal = nexa_verifier::ResolvedNominalOperand::None;
-                instruction = *function
-                    .code
-                    .get(frame.pc as usize)
-                    .ok_or(InterpreterError::FellOffFunction)?;
                 instruction_cost = instruction_attempt_fuel(
                     module.module(),
                     module.nominal_index_shape(),
@@ -1279,17 +1274,18 @@ impl CheckedInterpreter {
                     0
                 })
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-                safepoint = is_safepoint(instruction, frame.pc);
+                let safepoint = is_safepoint(instruction, frame.pc);
+                let host_resume = frame.pc > 0
+                    && matches!(
+                        function.code.get(frame.pc as usize - 1),
+                        Some(Instruction::HostCall { .. })
+                    );
+                fuel_boundary = frame.pc == 0 || host_resume || safepoint;
             }
             let settlement = pending_cost
                 .checked_add(instruction_cost)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-            let host_resume = frame.pc > 0
-                && matches!(
-                    function.code.get(frame.pc as usize - 1),
-                    Some(Instruction::HostCall { .. })
-                );
-            if frame.pc == 0 || host_resume || safepoint {
+            if fuel_boundary {
                 let cumulative_after = fuel
                     .cumulative_used
                     .checked_add(settlement)
@@ -3090,7 +3086,7 @@ fn instruction_attempt_fuel(
     if let Some(static_fuel) = static_instruction_fuel(module, nominal_shape, instruction, costs)? {
         return Ok(static_fuel);
     }
-    dynamic_instruction_fuel(module, nominal_shape, instruction, arena, heap, costs)
+    dynamic_instruction_fuel(module, nominal_shape, instruction, arena, heap, costs, None)
 }
 
 /// Operand-dependent attempt-fuel surcharges (frame arena or heap inputs).
@@ -3103,9 +3099,10 @@ pub(crate) fn dynamic_instruction_fuel(
     arena: &FrameArena,
     heap: Option<&Heap>,
     costs: &OpcodeCostTable,
+    predecoded_base: Option<u64>,
 ) -> Result<u64, InterpreterError> {
     let heap_required = || heap.ok_or(InterpreterError::HeapUnavailable);
-    let base = costs.cost(instruction);
+    let base = predecoded_base.unwrap_or_else(|| costs.cost(instruction));
     let work = match instruction {
         Instruction::StandardIntrinsic {
             intrinsic,
