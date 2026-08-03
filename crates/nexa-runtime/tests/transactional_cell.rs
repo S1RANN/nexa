@@ -1224,7 +1224,7 @@ fn assert_committed_heap_unchanged(
     let fields = realm
         .resolve_heap_fields(class_reference)
         .expect("committed class fields survive");
-    assert_eq!(fields[0], RuntimeValue::I32(1));
+    assert_eq!(fields.get(0), Some(RuntimeValue::I32(1)));
     assert_eq!(realm.array_length(array), Ok(0));
     assert_eq!(realm.map_length(map), Ok(0));
 }

@@ -11,9 +11,9 @@ use nexa_bytecode::{
 };
 use nexa_core::{StableId, StateSchemaFingerprint};
 use nexa_runtime::{
-    CancelReason, CopyBuffer, EncodeHostReturn, Heap, HeapError, HostCallOutcome, HostErrorPayload,
-    HostFunctionAuthority, HostPayload, HostRegistry, HostReturnRequirements, HostTrap,
-    MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
+    CancelReason, CollectionView, CopyBuffer, EncodeHostReturn, Heap, HeapError, HostCallOutcome,
+    HostErrorPayload, HostFunctionAuthority, HostPayload, HostRegistry, HostReturnRequirements,
+    HostTrap, MigrationAllocationPhase, ModuleHandle, PendingHostRequest, RealmConfig, RealmError,
     RealmRuntime, ReleaseKind, ReleaseRecord, ResourceContext, RestartReloadOutcome,
     RestartReloadPolicy, RuntimeFailurePoint, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
     RuntimeLimits, RuntimeResources, RuntimeValue, StateObject, StateValue, StepConfig, TaskLimits,
@@ -678,9 +678,12 @@ fn validate_record(heap: &Heap, value: RuntimeValue, label: &str, number: i32) {
 
 // WP52: struct-element arrays store flattened rows, so array elements are
 // validated through their borrowed field view instead of a struct value.
-fn validate_record_fields(heap: &Heap, fields: &[RuntimeValue], label: &str, number: i32) {
-    assert_eq!(runtime_string(heap, fields[0]), label);
-    assert_eq!(fields[1], RuntimeValue::I32(number));
+fn validate_record_fields(heap: &Heap, fields: CollectionView<'_>, label: &str, number: i32) {
+    assert_eq!(
+        runtime_string(heap, fields.get(0).expect("record label")),
+        label
+    );
+    assert_eq!(fields.get(1), Some(RuntimeValue::I32(number)));
 }
 
 fn validate_return(
@@ -802,20 +805,21 @@ fn validate_return(
         }
         "return_nested" => {
             let fields = heap.struct_fields(*value).unwrap();
+            let records = fields.get(0).expect("nested records");
             validate_record_fields(
                 heap,
-                heap.array_element_fields(fields[0], 0).unwrap(),
+                heap.array_element_fields(records, 0).unwrap(),
                 "nested-a",
                 71,
             );
             validate_record_fields(
                 heap,
-                heap.array_element_fields(fields[0], 1).unwrap(),
+                heap.array_element_fields(records, 1).unwrap(),
                 "nested-b",
                 72,
             );
             assert_eq!(
-                heap.buffer_values(fields[1])
+                heap.buffer_values(fields.get(1).expect("nested buffer"))
                     .unwrap()
                     .iter()
                     .collect::<Vec<_>>(),
@@ -825,7 +829,10 @@ fn validate_return(
                     RuntimeValue::I32(10)
                 ]
             );
-            assert_eq!(runtime_string(heap, fields[2]), "nested-root");
+            assert_eq!(
+                runtime_string(heap, fields.get(2).expect("nested root")),
+                "nested-root"
+            );
             None
         }
         _ => panic!("unknown return case {name}"),

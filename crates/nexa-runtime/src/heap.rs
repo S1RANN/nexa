@@ -611,12 +611,14 @@ pub enum Object {
     // and released by sweep/rollback exactly like Array extents.
     Struct {
         type_id: StableId,
+        storage: CollectionStorage,
         range: CollectionRange,
         field_count: u8,
         hash: u64,
     },
     Class {
         type_id: StableId,
+        storage: CollectionStorage,
         range: CollectionRange,
         field_count: u8,
     },
@@ -675,11 +677,11 @@ impl Object {
     fn payload_bytes(&self) -> u64 {
         let bytes = match self {
             Self::String(text) => text.capacity(),
-            Self::Array { range, storage, .. } | Self::Buffer { range, storage, .. } => {
+            Self::Array { range, storage, .. }
+            | Self::Buffer { range, storage, .. }
+            | Self::Struct { storage, range, .. }
+            | Self::Class { storage, range, .. } => {
                 range.length.saturating_mul(storage.cell_size())
-            }
-            Self::Struct { range, .. } | Self::Class { range, .. } => {
-                range.length.saturating_mul(size_of::<RuntimeValue>())
             }
             // Shared literal bytes belong to ExecutableModule; Map payload
             // lives in its typed arena; Enum payload remains inline.
@@ -754,6 +756,66 @@ fn collection_storage_for_values(
         other => CollectionStorage::for_type(other),
     };
     Ok(storage)
+}
+
+/// Selects a compact physical arena for a homogeneous object field row.
+///
+/// Field signatures are not retained by `Heap`, so named values stay in the
+/// wide arena: reconstructing a named reference requires its declared
+/// `StableId`. Scalars, strings and untyped references carry all information
+/// needed at the storage boundary and can safely use their exact-width arena.
+fn homogeneous_field_storage(fields: &[RuntimeValue]) -> CollectionStorage {
+    let Some(first) = fields.first().copied() else {
+        return CollectionStorage::Values;
+    };
+    let storage = match first {
+        RuntimeValue::I32(_) => CollectionStorage::I32,
+        RuntimeValue::I64(_) => CollectionStorage::I64,
+        RuntimeValue::F32(_) => CollectionStorage::F32,
+        RuntimeValue::F64(_) => CollectionStorage::F64,
+        RuntimeValue::Bool(_) => CollectionStorage::Bool,
+        RuntimeValue::Rune(_) => CollectionStorage::Rune,
+        RuntimeValue::String { .. } => CollectionStorage::String,
+        RuntimeValue::Ref(_) => CollectionStorage::Ref,
+        _ => return CollectionStorage::Values,
+    };
+    if fields
+        .iter()
+        .copied()
+        .all(|value| field_value_matches_storage(value, storage))
+    {
+        storage
+    } else {
+        CollectionStorage::Values
+    }
+}
+
+const fn field_value_matches_storage(value: RuntimeValue, storage: CollectionStorage) -> bool {
+    matches!(
+        (value, storage),
+        (RuntimeValue::I32(_), CollectionStorage::I32)
+            | (RuntimeValue::I64(_), CollectionStorage::I64)
+            | (RuntimeValue::F32(_), CollectionStorage::F32)
+            | (RuntimeValue::F64(_), CollectionStorage::F64)
+            | (RuntimeValue::Bool(_), CollectionStorage::Bool)
+            | (RuntimeValue::Rune(_), CollectionStorage::Rune)
+            | (RuntimeValue::String { .. }, CollectionStorage::String)
+            | (RuntimeValue::Ref(_), CollectionStorage::Ref)
+    )
+}
+
+const fn field_type_for_storage(storage: CollectionStorage) -> Option<nexa_bytecode::ValueType> {
+    match storage {
+        CollectionStorage::I32 => Some(nexa_bytecode::ValueType::I32),
+        CollectionStorage::I64 => Some(nexa_bytecode::ValueType::I64),
+        CollectionStorage::F32 => Some(nexa_bytecode::ValueType::F32),
+        CollectionStorage::F64 => Some(nexa_bytecode::ValueType::F64),
+        CollectionStorage::Bool => Some(nexa_bytecode::ValueType::Bool),
+        CollectionStorage::Rune => Some(nexa_bytecode::ValueType::Rune),
+        CollectionStorage::String => Some(nexa_bytecode::ValueType::String),
+        CollectionStorage::Ref => Some(nexa_bytecode::ValueType::Ref),
+        CollectionStorage::Values | CollectionStorage::NamedRef => None,
+    }
 }
 
 /// Bounded geometric growth for the array capacity extent (WP49): at least
@@ -1813,12 +1875,11 @@ impl Heap {
     fn release_object_storage(&mut self, object: &Object) -> u64 {
         let payload = self.object_payload_bytes(object);
         match object {
-            Object::Array { range, storage, .. } | Object::Buffer { range, storage, .. } => {
+            Object::Array { range, storage, .. }
+            | Object::Buffer { range, storage, .. }
+            | Object::Struct { storage, range, .. }
+            | Object::Class { storage, range, .. } => {
                 self.release_typed_collection(*storage, *range);
-            }
-            Object::Struct { range, .. } | Object::Class { range, .. } => {
-                self.collections.release(*range);
-                self.release_collection_quota(range.length);
             }
             Object::Map { storage } => {
                 let storage = *storage as usize;
@@ -2166,6 +2227,21 @@ impl Heap {
         }
     }
 
+    fn field_view(
+        &self,
+        storage: CollectionStorage,
+        range: CollectionRange,
+        field_count: usize,
+    ) -> Result<CollectionView<'_>, HeapError> {
+        let element_type = field_type_for_storage(storage).unwrap_or(nexa_bytecode::ValueType::Ref);
+        self.typed_collection_view(storage, element_type, range)?
+            .prefix(field_count)
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: field_count,
+                length: range.length,
+            })
+    }
+
     fn typed_collection_get(
         &self,
         storage: CollectionStorage,
@@ -2444,12 +2520,10 @@ impl Heap {
                 released = released.saturating_add(self.object_payload_bytes(&object));
                 match object {
                     Object::Array { storage, range, .. }
-                    | Object::Buffer { storage, range, .. } => {
+                    | Object::Buffer { storage, range, .. }
+                    | Object::Struct { storage, range, .. }
+                    | Object::Class { storage, range, .. } => {
                         self.release_typed_collection(storage, range);
-                    }
-                    Object::Struct { range, .. } | Object::Class { range, .. } => {
-                        self.collections.release(range);
-                        self.release_collection_quota(range.length);
                     }
                     Object::Map { storage } => {
                         if let Some(map) = self.maps[storage as usize].take() {
@@ -2706,11 +2780,12 @@ impl Heap {
             return Err(HeapError::CapacityExhausted);
         }
         let hash = self.structural_hash(type_id, fields)?;
-        let range = self.claim_field_extent(fields)?;
+        let (storage, range) = self.claim_field_extent(fields)?;
         let reference = self.commit(
             reservation,
             Object::Struct {
                 type_id,
+                storage,
                 range,
                 field_count: u8::try_from(fields.len()).expect("struct field limit fits into u8"),
                 hash,
@@ -2731,36 +2806,33 @@ impl Heap {
     fn claim_field_extent(
         &mut self,
         fields: &[RuntimeValue],
-    ) -> Result<CollectionRange, HeapError> {
-        let bytes = u64::try_from(fields.len().saturating_mul(size_of::<RuntimeValue>()))
-            .unwrap_or(u64::MAX);
-        // G6 admission: field extents count toward the byte ceiling.
-        self.ensure_payload_headroom(bytes)?;
-        self.claim_collection_quota(fields.len())?;
-        let range = self.collections.find_free(fields.len()).ok_or_else(|| {
-            self.release_collection_quota(fields.len());
-            HeapError::CapacityExhausted
-        })?;
-        if let Err(error) = self.collections.claim(range) {
-            self.release_collection_quota(fields.len());
-            return Err(error);
+    ) -> Result<(CollectionStorage, CollectionRange), HeapError> {
+        let storage = homogeneous_field_storage(fields);
+        let range = self.claim_typed_collection(storage, fields.len())?;
+        let element_type = field_type_for_storage(storage);
+        for (index, field) in fields.iter().copied().enumerate() {
+            let result = if let Some(element_type) = element_type {
+                self.typed_collection_set(storage, element_type, range, index, field)
+            } else {
+                self.typed_collection_set(
+                    CollectionStorage::Values,
+                    nexa_bytecode::ValueType::Ref,
+                    range,
+                    index,
+                    field,
+                )
+            };
+            if let Err(error) = result {
+                self.release_typed_collection(storage, range);
+                return Err(error);
+            }
         }
-        if let Err(error) = self.collections.initialize(range) {
-            self.collections.release(range);
-            self.release_collection_quota(fields.len());
-            return Err(error);
-        }
-        self.collections.values_mut(range)?.copy_from_slice(fields);
         // G1: the owner is born marked while a cycle is active, so its
-        // children shade at the write - exactly the array-extent barrier;
-        // `Object::trace_references` no longer sees these fields.
-        for field in fields {
-            self.shade_on_write(*field);
-        }
-        Ok(range)
+        // children shade in `typed_collection_set`, exactly like Array.
+        Ok((storage, range))
     }
 
-    pub fn struct_fields(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+    pub fn struct_fields(&self, value: RuntimeValue) -> Result<CollectionView<'_>, HeapError> {
         let RuntimeValue::Struct {
             reference,
             type_id,
@@ -2775,12 +2847,12 @@ impl Heap {
         match self.resolve(reference)? {
             Object::Struct {
                 type_id: actual,
+                storage,
                 range,
                 field_count,
                 hash: actual_hash,
             } if *actual == type_id && *actual_hash == hash => {
-                let cells = self.collections.values(*range)?;
-                Ok(&cells[..usize::from(*field_count)])
+                self.field_view(*storage, *range, usize::from(*field_count))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -2793,7 +2865,6 @@ impl Heap {
     ) -> Result<RuntimeValue, HeapError> {
         self.struct_fields(value)?
             .get(index)
-            .copied()
             .ok_or(HeapError::InvalidReference(GcRef {
                 index: u32::MAX,
                 generation: u32::MAX,
@@ -2821,7 +2892,9 @@ impl Heap {
         }
         let field_count = fields.len();
         let mut updated = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-        updated[..field_count].copy_from_slice(fields);
+        for (destination, field) in updated[..field_count].iter_mut().zip(fields.iter()) {
+            *destination = field;
+        }
         updated[index] = replacement;
         self.allocate_struct(type_id, &updated[..field_count])
     }
@@ -2853,9 +2926,11 @@ impl Heap {
         if lhs.len() != rhs.len() {
             return Ok(false);
         }
-        lhs.iter().zip(rhs).try_fold(true, |equal, (lhs, rhs)| {
-            Ok(equal && self.runtime_value_equal(*lhs, *rhs)?)
-        })
+        lhs.iter()
+            .zip(rhs.iter())
+            .try_fold(true, |equal, (lhs, rhs)| {
+                Ok(equal && self.runtime_value_equal(lhs, rhs)?)
+            })
     }
 
     pub fn allocate_class(
@@ -2869,11 +2944,12 @@ impl Heap {
         // Slot preflight before the extent claim keeps the pair atomic:
         // once the extent is claimed, the commit cannot fail.
         let mut reservation = self.preflight(1)?;
-        let range = self.claim_field_extent(fields)?;
+        let (storage, range) = self.claim_field_extent(fields)?;
         let reference = self.commit(
             &mut reservation,
             Object::Class {
                 type_id,
+                storage,
                 range,
                 field_count: u8::try_from(fields.len()).expect("class field limit fits into u8"),
             },
@@ -2891,23 +2967,23 @@ impl Heap {
         };
         self.class_fields(value)?
             .get(index)
-            .copied()
             .ok_or(HeapError::InvalidReference(reference))
     }
 
-    pub(crate) fn class_fields(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+    pub(crate) fn class_fields(
+        &self,
+        value: RuntimeValue,
+    ) -> Result<CollectionView<'_>, HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
         match self.resolve(reference)? {
             Object::Class {
                 type_id: actual,
+                storage,
                 range,
                 field_count,
-            } if *actual == type_id => {
-                let cells = self.collections.values(*range)?;
-                Ok(&cells[..usize::from(*field_count)])
-            }
+            } if *actual == type_id => self.field_view(*storage, *range, usize::from(*field_count)),
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
@@ -2916,17 +2992,20 @@ impl Heap {
     /// reference alone (no value-side type or hash re-validation).
     /// Read-only tooling and tests use this where they previously
     /// destructured the inline field array out of [`Object`].
-    pub fn object_fields(&self, reference: GcRef) -> Result<&[RuntimeValue], HeapError> {
+    pub fn object_fields(&self, reference: GcRef) -> Result<CollectionView<'_>, HeapError> {
         match self.resolve(reference)? {
             Object::Struct {
-                range, field_count, ..
+                storage,
+                range,
+                field_count,
+                ..
             }
             | Object::Class {
-                range, field_count, ..
-            } => {
-                let cells = self.collections.values(*range)?;
-                Ok(&cells[..usize::from(*field_count)])
-            }
+                storage,
+                range,
+                field_count,
+                ..
+            } => self.field_view(*storage, *range, usize::from(*field_count)),
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
@@ -2944,13 +3023,14 @@ impl Heap {
         let range = match self.resolve(reference)? {
             Object::Class {
                 type_id: actual,
+                storage,
                 range,
                 field_count,
-            } if *actual == type_id && index < usize::from(*field_count) => *range,
+            } if *actual == type_id && index < usize::from(*field_count) => (*storage, *range),
             _ => return Err(HeapError::InvalidReference(reference)),
         };
-        self.collections.values_mut(range)?[index] = replacement;
-        Ok(())
+        let element_type = field_type_for_storage(range.0).unwrap_or(nexa_bytecode::ValueType::Ref);
+        self.typed_collection_set(range.0, element_type, range.1, index, replacement)
     }
 
     /// Publishes a value into an already allocated GC object.
@@ -3712,7 +3792,7 @@ impl Heap {
         &self,
         value: RuntimeValue,
         index: usize,
-    ) -> Result<&[RuntimeValue], HeapError> {
+    ) -> Result<CollectionView<'_>, HeapError> {
         let parts = self.array_parts(value)?;
         if index >= parts.length {
             return Err(HeapError::IndexOutOfBounds {
@@ -3722,7 +3802,9 @@ impl Heap {
         }
         if let Some(stride) = parts.rows() {
             let cells = self.collections.values(parts.range)?;
-            return Ok(&cells[index * stride..(index + 1) * stride]);
+            return Ok(CollectionView::Values(
+                &cells[index * stride..(index + 1) * stride],
+            ));
         }
         let element = self.collections.values(parts.range)?[index];
         self.struct_fields(element)
@@ -3737,13 +3819,10 @@ impl Heap {
         field: usize,
     ) -> Result<RuntimeValue, HeapError> {
         let fields = self.array_element_fields(value, index)?;
-        fields
-            .get(field)
-            .copied()
-            .ok_or(HeapError::IndexOutOfBounds {
-                index: field,
-                length: fields.len(),
-            })
+        fields.get(field).ok_or(HeapError::IndexOutOfBounds {
+            index: field,
+            length: fields.len(),
+        })
     }
 
     /// Copies `element`'s fields into a stack row after checking that it is
@@ -3766,7 +3845,9 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         let mut row = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-        row[..stride].copy_from_slice(fields);
+        for (destination, field) in row[..stride].iter_mut().zip(fields.iter()) {
+            *destination = field;
+        }
         Ok(row)
     }
 
@@ -5014,21 +5095,12 @@ impl Heap {
                 }
                 // Buffer and exact Struct/Class extents contain one live
                 // RuntimeValue per cell.
-                Object::Buffer { storage, range, .. } => {
+                Object::Buffer { storage, range, .. }
+                | Object::Struct { storage, range, .. }
+                | Object::Class { storage, range, .. } => {
                     let range = *range;
                     grayed +=
                         self.enqueue_collection_children(queue, *storage, range, range.length)?;
-                }
-                Object::Struct { range, .. } | Object::Class { range, .. } => {
-                    let range = *range;
-                    for index in 0..range.length {
-                        let value = self.collections.values(range)?[index];
-                        if let Some(child) = value_reference(value)
-                            && Self::enqueue_gray(&mut self.slots, queue, child)
-                        {
-                            grayed += 1;
-                        }
-                    }
                 }
                 Object::Map { storage } => {
                     let map = self
@@ -5165,11 +5237,17 @@ impl Heap {
                         .map_bytes
                         .saturating_add(self.object_payload_bytes(object));
                 }
-                Object::Class { .. } | Object::Struct { .. } => {
+                Object::Class { storage, .. } | Object::Struct { storage, .. } => {
                     inspection.class_payload_bytes = inspection
                         .class_payload_bytes
                         .saturating_add(object.payload_bytes());
-                    generic_arena_live = generic_arena_live.saturating_add(object.payload_bytes());
+                    if storage.is_compact() {
+                        scalar_arena_live =
+                            scalar_arena_live.saturating_add(object.payload_bytes());
+                    } else {
+                        generic_arena_live =
+                            generic_arena_live.saturating_add(object.payload_bytes());
+                    }
                 }
                 Object::Enum { .. } => {}
             }
@@ -5403,8 +5481,8 @@ mod tests {
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, StableId};
 
     use super::{
-        GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object, insert_map_entry,
-        remove_probed_entry,
+        CollectionView, GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object,
+        fnv_content_hash, insert_map_entry, remove_probed_entry,
     };
     use crate::{RuntimeFailurePoint, RuntimeValue};
 
@@ -5787,10 +5865,10 @@ mod tests {
         // Reads materialize equal transient values from the rows.
         let first = heap.array_get(array, 0).unwrap();
         let fields = heap.struct_fields(first).unwrap();
-        assert_eq!(fields[0], RuntimeValue::I32(0));
+        assert_eq!(fields.get(0), Some(RuntimeValue::I32(0)));
         let RuntimeValue::String {
             reference: label, ..
-        } = fields[1]
+        } = fields.get(1).expect("second row field")
         else {
             panic!("label field stays a string reference");
         };
@@ -5798,8 +5876,8 @@ mod tests {
 
         // The borrowed views agree with the materialized read.
         assert_eq!(
-            heap.array_element_fields(array, 0).unwrap()[0],
-            RuntimeValue::I32(0)
+            heap.array_element_fields(array, 0).unwrap().get(0),
+            Some(RuntimeValue::I32(0))
         );
         let view = heap.array_rows(array).unwrap().expect("row layout");
         assert_eq!(
@@ -5841,18 +5919,18 @@ mod tests {
         // [5, 11, 20]
         let removed = heap.array_remove(array, 0).unwrap();
         assert_eq!(
-            heap.struct_fields(removed).unwrap()[0],
-            RuntimeValue::I32(5)
+            heap.struct_fields(removed).unwrap().get(0),
+            Some(RuntimeValue::I32(5))
         );
         let popped = heap.array_pop(array).unwrap();
         assert_eq!(
-            heap.struct_fields(popped).unwrap()[0],
-            RuntimeValue::I32(20)
+            heap.struct_fields(popped).unwrap().get(0),
+            Some(RuntimeValue::I32(20))
         );
         assert_eq!(heap.array_len(array), Ok(1));
         assert_eq!(
-            heap.array_element_fields(array, 0).unwrap()[0],
-            RuntimeValue::I32(11)
+            heap.array_element_fields(array, 0).unwrap().get(0),
+            Some(RuntimeValue::I32(11))
         );
         // Type confusion is rejected: a struct of another type cannot
         // enter the rows.
@@ -5970,6 +6048,45 @@ mod tests {
             ..GcRoots::default()
         };
         assert_eq!(heap.collect(&roots).unwrap().live, 7);
+    }
+
+    #[test]
+    fn homogeneous_object_fields_use_exact_width_cells_and_trace_references() {
+        let mut heap = Heap::new_with_limits(16, 128, 16);
+        let scalar_type = StableId::from_name("heap-test::CompactScalarClass");
+        let scalar = heap
+            .allocate_class(scalar_type, &[RuntimeValue::I32(7), RuntimeValue::I32(9)])
+            .unwrap();
+        assert!(matches!(
+            heap.class_fields(scalar).unwrap(),
+            CollectionView::I32(&[7, 9])
+        ));
+        assert_eq!(
+            heap.byte_inspection().class_payload_bytes,
+            2 * size_of::<i32>() as u64
+        );
+
+        let text = heap.allocate_string("compact-root").unwrap();
+        let text_value = RuntimeValue::String {
+            reference: text,
+            hash: fnv_content_hash("compact-root"),
+        };
+        let string_type = StableId::from_name("heap-test::CompactStringClass");
+        let string_owner = heap.allocate_class(string_type, &[text_value]).unwrap();
+        assert!(matches!(
+            heap.class_fields(string_owner).unwrap(),
+            CollectionView::String(values) if values == [(text, fnv_content_hash("compact-root"))]
+        ));
+        let RuntimeValue::NamedRef {
+            reference: owner, ..
+        } = string_owner
+        else {
+            panic!("class is a named reference");
+        };
+        let mut roots = GcRoots::default();
+        roots.running_frames.push(owner);
+        heap.collect(&roots).unwrap();
+        assert_eq!(heap.string(text), Ok("compact-root"));
     }
 
     #[test]

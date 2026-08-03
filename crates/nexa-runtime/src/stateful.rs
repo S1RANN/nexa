@@ -2826,7 +2826,7 @@ mod tests {
         assert_eq!(registry.resolve(handle), Ok(state));
         assert_eq!(registry.gc_roots(), vec![reference]);
         assert!(heap.struct_fields(value).unwrap().iter().any(
-            |value| matches!(value, RuntimeValue::String { reference: field, .. } if *field == label)
+            |value| matches!(value, RuntimeValue::String { reference: field, .. } if field == label)
         ));
     }
 

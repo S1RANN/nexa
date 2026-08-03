@@ -545,12 +545,12 @@ fn compact_class_fields_are_arena_backed_and_charged_once() {
         .allocate_class(class_type(), &[RuntimeValue::I32(7)])
         .expect("class allocation");
     let reference = reference_of(class);
-    let field_bytes = u64::try_from(std::mem::size_of::<RuntimeValue>()).expect("value size");
+    let field_bytes = u64::try_from(std::mem::size_of::<i32>()).expect("value size");
     let inspection = heap.byte_inspection();
 
     assert_eq!(
-        heap.object_fields(reference),
-        Ok(&[RuntimeValue::I32(7)][..])
+        heap.object_fields(reference).unwrap().get(0),
+        Some(RuntimeValue::I32(7))
     );
     assert_eq!(inspection.class_payload_bytes, field_bytes);
     assert_eq!(
@@ -559,7 +559,10 @@ fn compact_class_fields_are_arena_backed_and_charged_once() {
         "the extent is charged by commit exactly once"
     );
     assert!(
-        inspection.object_header_bytes <= field_bytes.saturating_mul(2),
+        inspection.object_header_bytes
+            <= u64::try_from(std::mem::size_of::<RuntimeValue>())
+                .expect("value size")
+                .saturating_mul(2),
         "the compact slot must stay within two RuntimeValue cells instead of the removed \
          maximum-width field array"
     );

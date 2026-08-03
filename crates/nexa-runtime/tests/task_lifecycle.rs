@@ -566,7 +566,7 @@ fn complete_nominal_result_and_collect(
         .expect("retained Struct fields remain resolvable");
     let RuntimeValue::String {
         reference: text, ..
-    } = fields[1]
+    } = fields.get(1).expect("second struct field")
     else {
         panic!("Struct payload must retain its String field");
     };
@@ -754,13 +754,13 @@ fn host_error_preserves_the_declared_nominal_payload() {
         .resolve_heap_fields(*failure)
         .expect("Failure fields remain resolvable");
     assert_eq!(
-        fields[0],
-        RuntimeValue::Opaque {
+        fields.get(0),
+        Some(RuntimeValue::Opaque {
             value: 41,
             type_id: StableId::from_name("Trace"),
-        }
+        })
     );
-    assert!(matches!(fields[1], RuntimeValue::String { .. }));
+    assert!(matches!(fields.get(1), Some(RuntimeValue::String { .. })));
     assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 
@@ -817,13 +817,13 @@ fn host_success_preserves_the_declared_nominal_payload() {
         .resolve_heap_fields(*payload)
         .expect("Payload fields remain resolvable");
     assert_eq!(
-        fields[0],
-        RuntimeValue::Opaque {
+        fields.get(0),
+        Some(RuntimeValue::Opaque {
             value: 73,
             type_id: StableId::from_name("Trace"),
-        }
+        })
     );
-    assert!(matches!(fields[1], RuntimeValue::String { .. }));
+    assert!(matches!(fields.get(1), Some(RuntimeValue::String { .. })));
     assert_terminal_invariants(&mut realm, &host, task, ExpectedReleases::ONE_REQUEST);
 }
 

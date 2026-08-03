@@ -1168,7 +1168,7 @@ impl<'a> HostValueRef<'a> {
             }
             return Ok(HostStructRef {
                 type_id,
-                fields: row.fields,
+                fields: crate::CollectionView::Values(row.fields),
                 heap: self.heap()?,
             });
         }
@@ -1304,7 +1304,7 @@ impl<'a> HostValueRef<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct HostStructRef<'a> {
     type_id: StableId,
-    fields: &'a [crate::RuntimeValue],
+    fields: crate::CollectionView<'a>,
     heap: &'a crate::Heap,
 }
 
@@ -1327,7 +1327,6 @@ impl<'a> HostStructRef<'a> {
     pub fn field(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
         self.fields
             .get(index)
-            .copied()
             .map(|value| HostValueRef {
                 value,
                 heap: Some(self.heap),
@@ -1341,7 +1340,7 @@ impl<'a> HostStructRef<'a> {
 #[derive(Clone, Copy, Debug)]
 pub struct HostClassRef<'a> {
     type_id: StableId,
-    fields: &'a [crate::RuntimeValue],
+    fields: crate::CollectionView<'a>,
     heap: &'a crate::Heap,
 }
 
@@ -1364,7 +1363,6 @@ impl<'a> HostClassRef<'a> {
     pub fn field(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
         self.fields
             .get(index)
-            .copied()
             .map(|value| HostValueRef {
                 value,
                 heap: Some(self.heap),
@@ -1375,7 +1373,7 @@ impl<'a> HostClassRef<'a> {
 
     #[must_use]
     pub fn iter(self) -> impl ExactSizeIterator<Item = HostValueRef<'a>> + 'a {
-        self.fields.iter().copied().map(|value| HostValueRef {
+        self.fields.iter().map(|value| HostValueRef {
             value,
             heap: Some(self.heap),
             row: None,

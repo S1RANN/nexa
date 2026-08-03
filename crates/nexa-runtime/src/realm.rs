@@ -3423,7 +3423,10 @@ impl RealmRuntime {
     /// fields live in the collection arena, so read-only inspection of
     /// them resolves through the heap instead of destructuring an inline
     /// array out of the object header.
-    pub fn resolve_heap_fields(&self, reference: GcRef) -> Result<&[RuntimeValue], RealmError> {
+    pub fn resolve_heap_fields(
+        &self,
+        reference: GcRef,
+    ) -> Result<crate::CollectionView<'_>, RealmError> {
         Ok(self.heap.object_fields(reference)?)
     }
 

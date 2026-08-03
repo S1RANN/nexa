@@ -3485,10 +3485,13 @@ fn register_structural_hash_fuel(
     Ok(work)
 }
 
-fn runtime_values_hash_fuel(heap: &Heap, values: &[RuntimeValue]) -> Result<u64, InterpreterError> {
+fn runtime_values_hash_fuel(
+    heap: &Heap,
+    values: crate::CollectionView<'_>,
+) -> Result<u64, InterpreterError> {
     let mut work = value_visit_fuel(fuel_usize(values.len())?, 3)?;
-    for value in values {
-        work = fuel_add(work, runtime_value_hash_fuel(heap, *value)?)?;
+    for value in values.iter() {
+        work = fuel_add(work, runtime_value_hash_fuel(heap, value)?)?;
     }
     Ok(work)
 }
