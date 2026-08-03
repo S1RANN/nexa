@@ -2098,6 +2098,9 @@ mod tests {
              handler_fuel = 20000\n\
              cumulative_budget = 100000\n\
              heap_objects = 1024\n\
+             heap_bytes = 67108864\n\
+             string_bytes = 1048576\n\
+             collection_bytes = 33554432\n\
              host_resources = 32\n\
              tasks = 4\n\
              release_records = 64\n"
@@ -2485,6 +2488,9 @@ mod tests {
              handler_fuel = 20000\n\
              cumulative_budget = 100000\n\
              heap_objects = 1024\n\
+             heap_bytes = 67108864\n\
+             string_bytes = 1048576\n\
+             collection_bytes = 33554432\n\
              host_resources = 32\n\
              tasks = 4\n\
              release_records = 64\n",
@@ -2888,6 +2894,9 @@ mod tests {
              handler_fuel = 20000\n\
              cumulative_budget = 100000\n\
              heap_objects = 1024\n\
+             heap_bytes = 67108864\n\
+             string_bytes = 1048576\n\
+             collection_bytes = 33554432\n\
              host_resources = 32\n\
              tasks = 4\n\
              release_records = 64\n",

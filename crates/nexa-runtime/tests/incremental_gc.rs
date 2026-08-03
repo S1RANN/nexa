@@ -398,6 +398,8 @@ fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
         step_bytes, expected,
         "per-step reports sum to the cycle total"
     );
+    assert_eq!(incremental.live_payload_bytes(), 0);
+    assert_eq!(incremental.live_collection_bytes(), 0);
 }
 
 /// G5 gate: the byte axis slices sweeps at object-payload granularity -
@@ -529,12 +531,18 @@ fn live_payload_gauge_matches_the_inspection_across_the_lifecycle() {
             + inspection.class_payload_bytes,
         "the gauge equals the inspected out-of-slot payload"
     );
+    assert_eq!(
+        heap.live_collection_bytes(),
+        inspection.collection_total(),
+        "the collection gauge equals its exclusive inspected categories"
+    );
     heap.collect(&GcRoots::default()).expect("full collection");
     assert_eq!(
         heap.live_payload_bytes(),
         0,
         "reclaiming every object empties the gauge"
     );
+    assert_eq!(heap.live_collection_bytes(), 0);
 }
 
 /// K5 gate: class fields occupy an exact arena extent, contribute once to
@@ -590,18 +598,73 @@ fn compact_class_fields_are_arena_backed_and_charged_once() {
 #[test]
 fn heap_byte_ceiling_refuses_growth_until_collection_frees_it() {
     let mut heap = Heap::new(16);
-    heap.set_max_heap_bytes(32);
+    heap.allocate_string("").expect("header probe");
+    let object_header_bytes = heap.byte_inspection().object_header_bytes;
+    heap.collect(&GcRoots::default())
+        .expect("collect header probe");
+    heap.set_max_heap_bytes(object_header_bytes + 32);
     heap.allocate_string("0123456789abcdef")
-        .expect("a 16-byte string fits under the 32-byte ceiling");
+        .expect("one header plus a 16-byte string fits");
     let refused = heap.allocate_string("0123456789abcdef0123456789abcdef");
     assert_eq!(
         refused.unwrap_err(),
         nexa_runtime::HeapError::CapacityExhausted,
-        "16 + 32 bytes exceeds the ceiling"
+        "two headers plus 48 payload bytes exceed the total live-heap ceiling"
     );
     heap.collect(&GcRoots::default()).expect("full collection");
     heap.allocate_string("0123456789abcdef0123456789abcdef")
-        .expect("the reclaimed heap has headroom again");
+        .expect("one header plus a 32-byte string exactly fits after reclamation");
+}
+
+/// WP71 gate: the independent collection ceiling covers Array/Buffer/Map and
+/// Class/Struct arena extents, does not charge String payloads, and recovers
+/// exact headroom after collection.
+#[test]
+fn collection_byte_ceiling_is_exact_and_independent() {
+    let mut heap = Heap::new(64);
+    let limit = 4 * u64::try_from(std::mem::size_of::<i32>()).expect("i32 size");
+    heap.set_max_collection_bytes(limit);
+    let element = nexa_bytecode::ValueType::I32;
+    let array = heap
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("empty array owns no collection extent");
+    let mut accepted = 0_i32;
+    let refusal = loop {
+        match heap.array_push(array, RuntimeValue::I32(accepted)) {
+            Ok(()) => accepted += 1,
+            Err(error) => break error,
+        }
+    };
+    assert!(accepted > 0, "the configured extent admits useful storage");
+    assert_eq!(refusal, nexa_runtime::HeapError::CapacityExhausted);
+    assert!(heap.live_collection_bytes() <= limit);
+    assert_eq!(
+        heap.live_collection_bytes(),
+        heap.byte_inspection().collection_total()
+    );
+    let length_before = heap.array_len(array).expect("array remains valid");
+    assert_eq!(
+        length_before,
+        usize::try_from(accepted).expect("bounded accepted count"),
+        "the refused growth publishes no element"
+    );
+
+    heap.allocate_string("not-collection-storage")
+        .expect("String payload is outside the collection ceiling");
+    assert_eq!(
+        heap.array_len(array).expect("array remains valid"),
+        length_before
+    );
+    heap.collect(&GcRoots::default()).expect("full collection");
+    assert_eq!(heap.live_collection_bytes(), 0);
+
+    let replacement = heap
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("array header after collection");
+    for index in 0..accepted {
+        heap.array_push(replacement, RuntimeValue::I32(index))
+            .expect("collection restored the exact admitted capacity");
+    }
 }
 
 /// G6 gate: amortized array growth respects the byte ceiling - the
@@ -664,6 +727,22 @@ fn realm_config_wires_the_heap_byte_ceiling() {
     unlimited
         .allocate(Object::String(String::from("longer-than-eight-bytes")))
         .expect("the default configuration stays unlimited");
+
+    let mut collection_limited = RealmRuntime::isolated(RealmConfig {
+        max_collection_bytes: 0,
+        ..RealmConfig::default()
+    });
+    let element = nexa_bytecode::ValueType::I32;
+    collection_limited
+        .allocate_array(nexa_bytecode::array_type(element), element)
+        .expect("an empty array owns no collection bytes");
+    assert!(
+        collection_limited
+            .allocate_map(nexa_bytecode::map_type(element, element), element, element,)
+            .is_err(),
+        "the realm forwards the independent collection byte ceiling"
+    );
+    assert_eq!(collection_limited.live_collection_bytes(), 0);
 }
 
 /// WP75/WP79/WP81 gate: the five-phase machine latches Complete, advances
@@ -752,13 +831,22 @@ fn automatic_trigger_uses_bytes_allocation_rate_and_survival() {
     use nexa_runtime::{GcTriggerReasons, RealmConfig, RealmRuntime};
 
     let mut realm = RealmRuntime::isolated(RealmConfig {
-        max_heap_objects: 128,
-        max_heap_bytes: 1,
+        max_heap_objects: 4_096,
+        max_heap_bytes: 256,
         ..RealmConfig::default()
     });
-    realm
-        .allocate_class(class_type(), &[])
-        .expect("zero-payload class fits the payload admission limit");
+    for _ in 0..64 {
+        realm
+            .allocate_class(class_type(), &[])
+            .expect("empty class fits before total-byte pressure");
+        if realm
+            .gc_trigger_inspection()
+            .reasons
+            .contains(GcTriggerReasons::HEAP_BYTES)
+        {
+            break;
+        }
+    }
     let pressure = realm.gc_trigger_inspection();
     assert!(pressure.reasons.contains(GcTriggerReasons::HEAP_BYTES));
     assert!(!pressure.reasons.contains(GcTriggerReasons::OBJECT_SLOTS));

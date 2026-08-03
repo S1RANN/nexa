@@ -360,9 +360,10 @@ pub struct RealmConfig {
     /// content-identical load and reload reuse.
     pub execution_image_cache_capacity: usize,
     pub max_heap_objects: u32,
-    /// G6: ceiling over live out-of-slot payload bytes (`GC_V1` heap
-    /// accounting); `u64::MAX` disables the byte limit.
+    /// WP71 ceiling over total live VM heap bytes.
     pub max_heap_bytes: u64,
+    /// WP71 ceiling over live collection/map arena bytes.
+    pub max_collection_bytes: u64,
     pub max_string_bytes: usize,
     pub max_collection_elements: usize,
     pub max_collection_ranges: usize,
@@ -382,6 +383,7 @@ impl Default for RealmConfig {
             execution_image_cache_capacity: 8,
             max_heap_objects: 4_096,
             max_heap_bytes: u64::MAX,
+            max_collection_bytes: u64::MAX,
             max_string_bytes: 1024 * 1024,
             max_collection_elements: 65_536,
             max_collection_ranges: 4_097,
@@ -437,6 +439,8 @@ pub struct GcTriggerInspection {
     pub allocation_threshold: u64,
     pub collection_elements_used: usize,
     pub max_collection_elements: usize,
+    pub live_collection_bytes: u64,
+    pub max_collection_bytes: u64,
     pub fragmentation_per_mille: u16,
 }
 
@@ -1402,6 +1406,7 @@ impl RealmRuntime {
         );
         heap.set_failure_injector(failure_injector.clone());
         heap.set_max_heap_bytes(config.max_heap_bytes);
+        heap.set_max_collection_bytes(config.max_collection_bytes);
         Self {
             realm_id: config.realm_id,
             modules: SlotPool::with_capacity_limit(config.realm_id, config.max_modules),
@@ -3678,9 +3683,13 @@ impl RealmRuntime {
             .saturating_sub(self.gc_cycle_baseline);
         let collection_elements_used = self.heap.collection_elements_used();
         let max_collection_elements = self.heap.max_collection_elements();
+        let live_collection_bytes = self.heap.live_collection_bytes();
+        let max_collection_bytes = self.heap.max_collection_bytes();
         let fragmentation_per_mille = self.heap.collection_fragmentation_per_mille();
-        let collection_pressure = max_collection_elements != 0
-            && collection_elements_used.saturating_mul(4) >= max_collection_elements;
+        let collection_pressure = (max_collection_elements != 0
+            && collection_elements_used.saturating_mul(4) >= max_collection_elements)
+            || (max_collection_bytes != u64::MAX
+                && reaches_per_mille(live_collection_bytes, max_collection_bytes, 250));
         let cycle_active = self.heap.gc_phase().is_active();
         let heap_bytes_pressure = max_heap_bytes != u64::MAX
             && reaches_per_mille(
@@ -3719,6 +3728,8 @@ impl RealmRuntime {
             allocation_threshold,
             collection_elements_used,
             max_collection_elements,
+            live_collection_bytes,
+            max_collection_bytes,
             fragmentation_per_mille,
         }
     }
@@ -4027,6 +4038,12 @@ impl RealmRuntime {
     #[must_use]
     pub fn live_vm_bytes(&self) -> u64 {
         self.heap.live_vm_bytes()
+    }
+
+    /// O(1) live bytes held by collection/map arena extents.
+    #[must_use]
+    pub const fn live_collection_bytes(&self) -> u64 {
+        self.heap.live_collection_bytes()
     }
 
     #[must_use]

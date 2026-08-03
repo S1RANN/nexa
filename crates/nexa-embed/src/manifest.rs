@@ -109,6 +109,11 @@ pub(crate) fn apply_package_policy(
             .cumulative_budget
             .unwrap_or(ceiling.cumulative_budget),
         heap_objects: application.heap_objects.unwrap_or(ceiling.heap_objects),
+        heap_bytes: application.heap_bytes.unwrap_or(ceiling.heap_bytes),
+        string_bytes: application.string_bytes.unwrap_or(ceiling.string_bytes),
+        collection_bytes: application
+            .collection_bytes
+            .unwrap_or(ceiling.collection_bytes),
         host_resources: application.host_resources.unwrap_or(ceiling.host_resources),
         tasks: application.tasks.unwrap_or(ceiling.tasks),
         release_records: application

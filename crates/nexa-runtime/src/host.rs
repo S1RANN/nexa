@@ -4587,6 +4587,7 @@ mod tests {
             .arm_once(RuntimeFailurePoint::HostReturnCollectionWrite);
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);
+        assert_eq!(heap.live_collection_bytes(), 0);
         assert_eq!(heap.collection_inspection(), initial);
         assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 0);
 
@@ -4595,6 +4596,7 @@ mod tests {
             .arm_once(RuntimeFailurePoint::HostReturnCommit);
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);
+        assert_eq!(heap.live_collection_bytes(), 0);
         assert_eq!(heap.collection_inspection(), initial);
         assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 12);
 
@@ -4607,6 +4609,7 @@ mod tests {
                 RuntimeValue::I32(3)
             ]
         );
+        assert_eq!(heap.live_collection_bytes(), 12);
         assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 24);
         let RuntimeValue::NamedRef { reference, .. } = array else {
             unreachable!()

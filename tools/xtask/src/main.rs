@@ -2749,6 +2749,9 @@ fn write_builtin_cli_policy() -> Result<PathBuf, DynError> {
          handler_fuel = 30000\n\
          cumulative_budget = 200000\n\
          heap_objects = 4096\n\
+         heap_bytes = 67108864\n\
+         string_bytes = 1048576\n\
+         collection_bytes = 33554432\n\
          host_resources = 256\n\
          tasks = 8\n\
          release_records = 512\n",

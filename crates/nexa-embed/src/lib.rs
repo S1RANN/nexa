@@ -650,6 +650,10 @@ impl NexaEngine {
         let config = nexa_runtime::RealmConfig {
             realm_id: self.next_realm_id,
             max_heap_objects: record.effective.runtime_limits.heap_objects,
+            max_heap_bytes: record.effective.runtime_limits.heap_bytes,
+            max_string_bytes: usize::try_from(record.effective.runtime_limits.string_bytes)
+                .unwrap_or(usize::MAX),
+            max_collection_bytes: record.effective.runtime_limits.collection_bytes,
             max_host_resources: record.effective.runtime_limits.host_resources,
             release_capacity: record.effective.runtime_limits.release_records,
             runtime_limits: nexa_runtime::RuntimeLimits {

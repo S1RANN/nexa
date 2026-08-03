@@ -52,6 +52,9 @@ pub struct RuntimeLimitsConfig {
     pub handler_fuel: u64,
     pub cumulative_budget: u64,
     pub heap_objects: u32,
+    pub heap_bytes: u64,
+    pub string_bytes: u64,
+    pub collection_bytes: u64,
     pub host_resources: u32,
     pub tasks: u32,
     pub release_records: usize,
@@ -1821,6 +1824,24 @@ fn validate_manifest_policy(
     )?;
     check_optional_limit(
         package,
+        "heap_bytes",
+        application.heap_bytes,
+        policy.limits.heap_bytes,
+    )?;
+    check_optional_limit(
+        package,
+        "string_bytes",
+        application.string_bytes,
+        policy.limits.string_bytes,
+    )?;
+    check_optional_limit(
+        package,
+        "collection_bytes",
+        application.collection_bytes,
+        policy.limits.collection_bytes,
+    )?;
+    check_optional_limit(
+        package,
         "host_resources",
         application.host_resources,
         policy.limits.host_resources,
@@ -2333,6 +2354,9 @@ max_packages = 1\n\
 handler_fuel = 20000\n\
 cumulative_budget = 20000\n\
 heap_objects = 4096\n\
+heap_bytes = 67108864\n\
+string_bytes = 1048576\n\
+collection_bytes = 33554432\n\
 host_resources = 1024\n\
 tasks = 128\n\
 release_records = 2048\n",
@@ -2421,6 +2445,9 @@ max_packages = 1\n\
 handler_fuel = 20000\n\
 cumulative_budget = 20000\n\
 heap_objects = 4096\n\
+heap_bytes = 67108864\n\
+string_bytes = 1048576\n\
+collection_bytes = 33554432\n\
 host_resources = 1024\n\
 tasks = 128\n\
 release_records = 2048\n";

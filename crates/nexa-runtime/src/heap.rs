@@ -363,6 +363,16 @@ pub struct HeapByteInspection {
 }
 
 impl HeapByteInspection {
+    /// Bytes owned by live collection/map arena extents. Class and Struct
+    /// fields share the collection arena and therefore participate.
+    #[must_use]
+    pub const fn collection_total(&self) -> u64 {
+        self.class_payload_bytes
+            .saturating_add(self.array_bytes)
+            .saturating_add(self.buffer_bytes)
+            .saturating_add(self.map_bytes)
+    }
+
     /// Bytes owned by live VM objects, excluding reserved slack and profiler
     /// storage.
     #[must_use]
@@ -1404,13 +1414,19 @@ pub struct Heap {
     /// sweep, host rollback, array regrow, map rehash). Full collection
     /// re-derives it in debug builds to pin the gauge against drift.
     live_payload_bytes: u64,
+    /// WP71 live bytes held in the collection/map payload arenas. Class and
+    /// Struct field extents share that allocator and therefore participate
+    /// in the same resource ceiling.
+    live_collection_bytes: u64,
     /// Exact O(1) object population. Empty slots whose generation is
     /// exhausted cannot be inferred from `slots.len() - free.len()`, so every
     /// object commit and release updates this gauge directly.
     live_objects: usize,
-    /// G6 admission ceiling over `live_payload_bytes`; `u64::MAX` keeps
-    /// every existing constructor unlimited.
+    /// WP71 admission ceiling over total live VM bytes: occupied object/map
+    /// headers plus out-of-slot payload.
     max_heap_bytes: u64,
+    /// WP71 admission ceiling over collection/map arena bytes.
+    max_collection_bytes: u64,
 }
 
 /// Exact heap state owned by one staged transactional Cell.
@@ -1513,6 +1529,7 @@ impl Heap {
         // G6: the restored object population owns a different footprint;
         // re-derive the gauge from the ground truth walk.
         self.live_payload_bytes = self.recompute_live_payload_bytes();
+        self.live_collection_bytes = self.recompute_live_collection_bytes();
     }
 
     #[must_use]
@@ -1567,8 +1584,10 @@ impl Heap {
             gc_bytes_reclaimed: 0,
             last_cycle_bytes_reclaimed: 0,
             live_payload_bytes: 0,
+            live_collection_bytes: 0,
             live_objects: 0,
             max_heap_bytes: u64::MAX,
+            max_collection_bytes: u64::MAX,
         }
     }
 
@@ -1580,8 +1599,7 @@ impl Heap {
 
     pub fn allocate_string(&mut self, value: &str) -> Result<GcRef, HeapError> {
         self.validate_string_length(value.len())?;
-        // G6 admission: string storage counts toward the byte ceiling.
-        self.ensure_payload_headroom(value.len() as u64)?;
+        self.ensure_new_object_headroom(value.len() as u64, false)?;
         let mut reservation = self.preflight(1)?;
         let value = value.to_owned();
         Ok(self.commit(&mut reservation, Object::String(value)))
@@ -1656,6 +1674,7 @@ impl Heap {
             }
         }
         self.validate_string_length(value.len())?;
+        self.ensure_new_object_headroom(0, false)?;
         let mut reservation = self.preflight(1)?;
         let reference = self.commit(&mut reservation, Object::SharedString(value));
         let cached = CachedPooledString {
@@ -1685,8 +1704,7 @@ impl Heap {
                 max_bytes: self.max_string_bytes,
             })?;
         self.validate_string_length(length)?;
-        // G6 admission: the concatenated storage counts toward the ceiling.
-        self.ensure_payload_headroom(length as u64)?;
+        self.ensure_new_object_headroom(length as u64, false)?;
         let mut reservation = self.preflight(1)?;
         let mut value = String::with_capacity(length);
         value.push_str(self.string(lhs)?);
@@ -1775,19 +1793,12 @@ impl Heap {
         };
         self.validate_collection_length(part_count)?;
 
-        // Reserve both arenas before publishing any VM object. In
-        // particular, splitting on an empty delimiter cannot partially fill
-        // the heap, or even allocate owned part strings, before hitting a
-        // resource limit.
         let object_count = part_count
             .checked_add(1)
             .ok_or(HeapError::CapacityExhausted)?;
-        let mut objects = self.preflight(object_count)?;
         let storage = CollectionStorage::String;
-        let range = self.claim_typed_collection(storage, part_count)?;
         let mut parts = Vec::new();
         if parts.try_reserve_exact(part_count).is_err() {
-            self.release_typed_collection(storage, range);
             return Err(HeapError::CapacityExhausted);
         }
         {
@@ -1796,6 +1807,29 @@ impl Heap {
             parts.extend(value.split(delimiter).map(str::to_owned));
         }
         debug_assert_eq!(parts.len(), part_count);
+
+        // Admit the whole compound result before publishing its first VM
+        // object. Per-object checks alone would allow early part strings to
+        // commit before the final Array extent discovered a byte-ceiling
+        // failure.
+        let header_bytes = u64::try_from(object_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(Self::new_object_header_bytes(false));
+        let string_bytes = parts
+            .iter()
+            .map(|part| u64::try_from(part.capacity()).unwrap_or(u64::MAX))
+            .fold(0_u64, u64::saturating_add);
+        let collection_bytes = u64::try_from(part_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(storage.cell_size() as u64);
+        self.ensure_payload_headroom(
+            header_bytes
+                .saturating_add(string_bytes)
+                .saturating_add(collection_bytes),
+        )?;
+        self.ensure_collection_headroom(collection_bytes)?;
+        let mut objects = self.preflight(object_count)?;
+        let range = self.claim_typed_collection(storage, part_count)?;
         for (index, part) in parts.into_iter().enumerate() {
             let value = match self.commit_owned_string(&mut objects, part) {
                 Ok(value) => value,
@@ -1892,8 +1926,9 @@ impl Heap {
         if matches!(object, Object::Map { .. }) {
             return Err(invalid_value_reference());
         }
-        // G6 admission: the whole out-of-slot footprint is known here.
-        self.ensure_payload_headroom(self.object_payload_bytes(&object))?;
+        let payload_bytes = self.object_payload_bytes(&object);
+        self.ensure_new_object_headroom(payload_bytes, false)?;
+        self.ensure_collection_headroom(self.object_collection_bytes(&object))?;
         let mut reservation = self.preflight(1)?;
         Ok(self.commit(&mut reservation, object))
     }
@@ -1908,6 +1943,17 @@ impl Heap {
                     u64::try_from(map.storage_bytes()).unwrap_or(u64::MAX)
                 }),
             _ => object.payload_bytes(),
+        }
+    }
+
+    fn object_collection_bytes(&self, object: &Object) -> u64 {
+        match object {
+            Object::Array { .. }
+            | Object::Buffer { .. }
+            | Object::Map { .. }
+            | Object::Struct { .. }
+            | Object::Class { .. } => self.object_payload_bytes(object),
+            Object::String(_) | Object::SharedString(_) | Object::Enum { .. } => 0,
         }
     }
 
@@ -1943,6 +1989,16 @@ impl Heap {
         if self.failure_injector.trigger(RuntimeFailurePoint::HeapSlot) {
             return Err(HeapError::InjectedFailure(RuntimeFailurePoint::HeapSlot));
         }
+        // Every reserved slot will become one live object header. Pin the
+        // minimum byte admission here so mutation paths (notably MapRemove)
+        // cannot succeed and then discover that their result Enum has no
+        // byte headroom. Payload/map-header admission remains at the typed
+        // constructor where its exact footprint is known.
+        self.ensure_payload_headroom(
+            u64::try_from(count)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(Self::new_object_header_bytes(false)),
+        )?;
         let unused = usize::try_from(self.max_objects)
             .unwrap_or(usize::MAX)
             .saturating_sub(self.slots.len());
@@ -1969,10 +2025,15 @@ impl Heap {
                 0
             };
         self.counters.allocated_bytes = self.counters.allocated_bytes.saturating_add(header_bytes);
-        // G6: the commit funnel is the single charge point for every fresh
-        // object's out-of-slot footprint; later growth (array regrow, map
-        // rehash) adjusts the gauge at its own transition site.
-        self.charge_live_payload(self.object_payload_bytes(&object));
+        // WP71: the commit funnel charges both the total live payload and
+        // the collection-arena subset. Every caller preflights the complete
+        // object footprint before this infallible publication.
+        let payload_bytes = self.object_payload_bytes(&object);
+        let collection_bytes = self.object_collection_bytes(&object);
+        self.charge_live_payload(payload_bytes);
+        self.live_collection_bytes = self.live_collection_bytes.saturating_add(collection_bytes);
+        debug_assert!(self.live_vm_bytes() <= self.max_heap_bytes);
+        debug_assert!(self.live_collection_bytes <= self.max_collection_bytes);
         match &object {
             Object::String(value) => {
                 self.counters.string_allocations =
@@ -2066,8 +2127,10 @@ impl Heap {
         value: String,
     ) -> Result<RuntimeValue, HeapError> {
         self.validate_string_length(value.len())?;
-        // G6 admission: string storage counts toward the byte ceiling.
-        self.ensure_payload_headroom(u64::try_from(value.capacity()).unwrap_or(u64::MAX))?;
+        self.ensure_new_object_headroom(
+            u64::try_from(value.capacity()).unwrap_or(u64::MAX),
+            false,
+        )?;
         let hash = fnv_content_hash(&value);
         let reference = self.commit(reservation, Object::String(value));
         Ok(RuntimeValue::String { reference, hash })
@@ -2080,7 +2143,7 @@ impl Heap {
         bytes: usize,
     ) -> Result<HeapReservation, HeapError> {
         self.validate_string_length(bytes)?;
-        self.ensure_payload_headroom(u64::try_from(bytes).unwrap_or(u64::MAX))?;
+        self.ensure_new_object_headroom(u64::try_from(bytes).unwrap_or(u64::MAX), false)?;
         self.preflight(1)
     }
 
@@ -2109,7 +2172,9 @@ impl Heap {
         element_count: usize,
         element_bytes: usize,
     ) -> Result<CollectionRange, HeapError> {
-        self.ensure_payload_headroom((element_count as u64).saturating_mul(element_bytes as u64))?;
+        let bytes = (element_count as u64).saturating_mul(element_bytes as u64);
+        self.ensure_payload_headroom(bytes)?;
+        self.ensure_collection_headroom(bytes)?;
         self.claim_collection_quota(element_count)?;
         let range = self.collections.find_free(element_count).ok_or_else(|| {
             self.release_collection_quota(element_count);
@@ -2650,6 +2715,7 @@ impl Heap {
     pub(crate) fn rollback_host_transaction(&mut self) {
         self.host_transaction_active = false;
         let mut released = 0_u64;
+        let mut collection_released = 0_u64;
         let mut recycled = false;
         while let Some(reference) = self.host_staging.pop() {
             let object = self
@@ -2668,6 +2734,8 @@ impl Heap {
                 // extent here, while unfinished builders are released by the
                 // transaction drop path.
                 released = released.saturating_add(self.object_payload_bytes(&object));
+                collection_released =
+                    collection_released.saturating_add(self.object_collection_bytes(&object));
                 match object {
                     Object::Array { storage, range, .. }
                     | Object::Buffer { storage, range, .. }
@@ -2699,6 +2767,9 @@ impl Heap {
             self.pooled_string_cache.clear();
         }
         self.release_live_payload(released);
+        self.live_collection_bytes = self
+            .live_collection_bytes
+            .saturating_sub(collection_released);
     }
 
     pub(crate) fn commit_array_reserved(
@@ -2713,6 +2784,9 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         self.validate_collection_length(range.length)?;
+        let payload_bytes = (range.length as u64).saturating_mul(storage.cell_size() as u64);
+        self.ensure_new_object_headroom(payload_bytes, false)?;
+        self.ensure_collection_headroom(payload_bytes)?;
         let length = range.length;
         let reference = self.commit(
             reservation,
@@ -2740,6 +2814,9 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         self.validate_collection_length(range.length)?;
+        let payload_bytes = (range.length as u64).saturating_mul(storage.cell_size() as u64);
+        self.ensure_new_object_headroom(payload_bytes, false)?;
+        self.ensure_collection_headroom(payload_bytes)?;
         let reference = self.commit(
             reservation,
             Object::Buffer {
@@ -2811,6 +2888,7 @@ impl Heap {
         tag: u32,
         payload: Option<RuntimeValue>,
     ) -> Result<RuntimeValue, HeapError> {
+        self.ensure_new_object_headroom(0, false)?;
         let mut reservation = self.preflight(1)?;
         Ok(self.allocate_enum_reserved(&mut reservation, type_id, variant, tag, payload))
     }
@@ -2929,6 +3007,10 @@ impl Heap {
         if fields.len() > nexa_bytecode::MAX_STRUCT_FIELDS {
             return Err(HeapError::CapacityExhausted);
         }
+        let field_bytes = (fields.len() as u64)
+            .saturating_mul(homogeneous_field_storage(fields).cell_size() as u64);
+        self.ensure_new_object_headroom(field_bytes, false)?;
+        self.ensure_collection_headroom(field_bytes)?;
         let hash = self.structural_hash(type_id, fields)?;
         let (storage, range) = self.claim_field_extent(fields)?;
         let reference = self.commit(
@@ -3091,6 +3173,10 @@ impl Heap {
         if fields.len() > nexa_bytecode::MAX_CLASS_FIELDS {
             return Err(HeapError::CapacityExhausted);
         }
+        let field_bytes = (fields.len() as u64)
+            .saturating_mul(homogeneous_field_storage(fields).cell_size() as u64);
+        self.ensure_new_object_headroom(field_bytes, false)?;
+        self.ensure_collection_headroom(field_bytes)?;
         // Slot preflight before the extent claim keeps the pair atomic:
         // once the extent is claimed, the commit cannot fail.
         let mut reservation = self.preflight(1)?;
@@ -3650,8 +3736,10 @@ impl Heap {
                 self.collections.release(parts.range);
                 self.release_collection_quota(parts.range.length);
                 let element_bytes = size_of_val(&stored) as u64;
-                self.charge_live_payload((new_range.length as u64).saturating_mul(element_bytes));
-                self.release_live_payload(
+                self.charge_collection_payload(
+                    (new_range.length as u64).saturating_mul(element_bytes),
+                );
+                self.release_collection_payload(
                     (parts.range.length as u64).saturating_mul(element_bytes),
                 );
                 self.counters.collection_relocation_bytes = self
@@ -3854,7 +3942,7 @@ impl Heap {
             },
         )?;
         self.release_typed_collection(parts.storage, tail);
-        self.release_live_payload(
+        self.release_collection_payload(
             (tail.length as u64).saturating_mul(parts.storage.cell_size() as u64),
         );
         Ok(())
@@ -3869,6 +3957,7 @@ impl Heap {
         let additional_bytes =
             (additional_cells as u64).saturating_mul(parts.storage.cell_size() as u64);
         self.ensure_payload_headroom(additional_bytes)?;
+        self.ensure_collection_headroom(additional_bytes)?;
         self.claim_collection_quota(additional_cells)?;
         let tail = CollectionRange {
             start: parts.range.end(),
@@ -3893,7 +3982,7 @@ impl Heap {
             self.release_typed_collection(parts.storage, tail);
             return Err(error);
         }
-        self.charge_live_payload(additional_bytes);
+        self.charge_collection_payload(additional_bytes);
         Ok(true)
     }
 
@@ -3943,8 +4032,8 @@ impl Heap {
                 self.release_collection_quota(parts.range.length);
                 let new_bytes = (new_range.length as u64).saturating_mul(element_bytes as u64);
                 let old_bytes = (parts.range.length as u64).saturating_mul(element_bytes as u64);
-                self.charge_live_payload(new_bytes);
-                self.release_live_payload(old_bytes);
+                self.charge_collection_payload(new_bytes);
+                self.release_collection_payload(old_bytes);
                 self.counters.collection_relocation_bytes = self
                     .counters
                     .collection_relocation_bytes
@@ -4055,8 +4144,8 @@ impl Heap {
         // G6: the live object traded extents; adjust the gauge by the
         // actual swap instead of re-deriving the whole footprint.
         let value_bytes = size_of::<RuntimeValue>() as u64;
-        self.charge_live_payload((new_range.length as u64).saturating_mul(value_bytes));
-        self.release_live_payload((old_range.length as u64).saturating_mul(value_bytes));
+        self.charge_collection_payload((new_range.length as u64).saturating_mul(value_bytes));
+        self.release_collection_payload((old_range.length as u64).saturating_mul(value_bytes));
         Ok(())
     }
 
@@ -4484,10 +4573,10 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         let initial_capacity = self.empty_map_capacity();
-        // G6 admission: the initial typed slot extent counts toward the ceiling.
-        self.ensure_payload_headroom(
-            (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64),
-        )?;
+        let payload_bytes =
+            (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
+        self.ensure_new_object_headroom(payload_bytes, true)?;
+        self.ensure_collection_headroom(payload_bytes)?;
         let mut reservation = self.preflight(1)?;
         let slots = self.map_slots.claim(initial_capacity)?;
         let storage = self.claim_map_storage(VmMap {
@@ -4672,7 +4761,7 @@ impl Heap {
                 &mut self.map_slots,
             )?;
             // G6: rehash completion just released the old typed extent.
-            self.release_live_payload(released);
+            self.release_collection_payload(released);
             return Ok(MapSetOutcome::RehashPending);
         }
 
@@ -4713,9 +4802,11 @@ impl Heap {
                 // G6 admission and charge: the new slot vector joins the
                 // map's footprint now; the old vector is released when the
                 // rehash completes.
-                self.ensure_payload_headroom((new_capacity as u64).saturating_mul(entry_bytes))?;
+                let new_bytes = (new_capacity as u64).saturating_mul(entry_bytes);
+                self.ensure_payload_headroom(new_bytes)?;
+                self.ensure_collection_headroom(new_bytes)?;
                 let new_slots = self.map_slots.claim(new_capacity)?;
-                self.charge_live_payload(
+                self.charge_collection_payload(
                     u64::try_from(new_slots.length)
                         .unwrap_or(u64::MAX)
                         .saturating_mul(entry_bytes),
@@ -4811,7 +4902,7 @@ impl Heap {
             self.map_slots.release(rehash.new_slots);
             bytes
         });
-        self.release_live_payload(released);
+        self.release_collection_payload(released);
         Ok(())
     }
 
@@ -5155,6 +5246,7 @@ impl Heap {
         let marked = marked?;
         let mut reclaimed = 0;
         let mut bytes_reclaimed = 0_u64;
+        let mut collection_bytes_reclaimed = 0_u64;
         for index in 0..self.slots.len() {
             let condemned = {
                 let slot = &mut self.slots[index];
@@ -5168,6 +5260,8 @@ impl Heap {
                     .expect("a condemned object was counted as live");
                 // G4: payload bytes are measured before the drop; the slot
                 // header stays pool-owned and is not "released".
+                collection_bytes_reclaimed = collection_bytes_reclaimed
+                    .saturating_add(self.object_collection_bytes(&object));
                 bytes_reclaimed =
                     bytes_reclaimed.saturating_add(self.release_object_storage(&object));
                 let slot = &mut self.slots[index];
@@ -5181,6 +5275,9 @@ impl Heap {
         }
         self.last_cycle_bytes_reclaimed = bytes_reclaimed;
         self.release_live_payload(bytes_reclaimed);
+        self.live_collection_bytes = self
+            .live_collection_bytes
+            .saturating_sub(collection_bytes_reclaimed);
         // G6 drift pin: the incremental gauge must agree with a full
         // re-derivation at every full-collection boundary.
         debug_assert_eq!(
@@ -5192,6 +5289,11 @@ impl Heap {
             self.live_objects,
             self.recompute_live_objects(),
             "the live object gauge drifted from ground truth"
+        );
+        debug_assert_eq!(
+            self.live_collection_bytes,
+            self.recompute_live_collection_bytes(),
+            "the live collection byte gauge drifted from ground truth"
         );
         Ok(CollectionStats {
             marked,
@@ -5236,6 +5338,11 @@ impl Heap {
         self.live_payload_bytes
     }
 
+    #[must_use]
+    pub const fn live_collection_bytes(&self) -> u64 {
+        self.live_collection_bytes
+    }
+
     /// O(1) exact bytes owned by live VM objects: occupied object/map
     /// headers plus their out-of-slot payloads. Reserved allocator slack and
     /// profiler storage remain separate `GC_V1` inspection categories.
@@ -5250,27 +5357,53 @@ impl Heap {
             .saturating_add(self.live_payload_bytes)
     }
 
-    /// G6: caps [`Self::live_payload_bytes`]; growth past the ceiling is
-    /// refused with `CapacityExhausted` at the fallible allocation and
-    /// growth boundaries.
+    /// WP71 total live-heap byte ceiling.
     pub const fn set_max_heap_bytes(&mut self, limit: u64) {
         self.max_heap_bytes = limit;
     }
 
-    /// G6 admission check for `additional` payload bytes about to be
-    /// owned by live objects.
+    /// WP71 collection/map arena byte ceiling.
+    pub const fn set_max_collection_bytes(&mut self, limit: u64) {
+        self.max_collection_bytes = limit;
+    }
+
+    fn new_object_header_bytes(map: bool) -> u64 {
+        (size_of::<ObjectSlot>() as u64).saturating_add(if map {
+            size_of::<Option<VmMap>>() as u64
+        } else {
+            0
+        })
+    }
+
+    fn ensure_new_object_headroom(&self, payload: u64, map: bool) -> Result<(), HeapError> {
+        self.ensure_payload_headroom(Self::new_object_header_bytes(map).saturating_add(payload))
+    }
+
+    /// Admission check for bytes about to join the total live heap.
     fn ensure_payload_headroom(&self, additional: u64) -> Result<(), HeapError> {
-        if self.live_payload_bytes.saturating_add(additional) > self.max_heap_bytes {
+        if self.live_vm_bytes().saturating_add(additional) > self.max_heap_bytes {
             return Err(HeapError::CapacityExhausted);
         }
         Ok(())
     }
 
-    /// G6 gauge maintenance; saturating on both edges so accounting can
+    fn ensure_collection_headroom(&self, additional: u64) -> Result<(), HeapError> {
+        if self.live_collection_bytes.saturating_add(additional) > self.max_collection_bytes {
+            return Err(HeapError::CapacityExhausted);
+        }
+        Ok(())
+    }
+
+    /// WP71 gauge maintenance; saturating on both edges so accounting can
     /// never panic even if a footprint model bug under-releases.
     fn charge_live_payload(&mut self, bytes: u64) {
         self.counters.allocated_bytes = self.counters.allocated_bytes.saturating_add(bytes);
         self.live_payload_bytes = self.live_payload_bytes.saturating_add(bytes);
+    }
+
+    fn charge_collection_payload(&mut self, bytes: u64) {
+        self.charge_live_payload(bytes);
+        self.live_collection_bytes = self.live_collection_bytes.saturating_add(bytes);
     }
 
     /// WP13: records bytes physically copied by Host/Script codecs into VM
@@ -5307,6 +5440,11 @@ impl Heap {
         self.live_payload_bytes = self.live_payload_bytes.saturating_sub(bytes);
     }
 
+    fn release_collection_payload(&mut self, bytes: u64) {
+        self.release_live_payload(bytes);
+        self.live_collection_bytes = self.live_collection_bytes.saturating_sub(bytes);
+    }
+
     /// Ground truth for the G6 gauge: one full walk. Used on checkpoint
     /// restore and by the drift assertion inside full collection.
     fn recompute_live_payload_bytes(&self) -> u64 {
@@ -5314,6 +5452,14 @@ impl Heap {
             .iter()
             .filter_map(|slot| slot.object.as_ref())
             .map(|object| self.object_payload_bytes(object))
+            .fold(0, u64::saturating_add)
+    }
+
+    fn recompute_live_collection_bytes(&self) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.object.as_ref())
+            .map(|object| self.object_collection_bytes(object))
             .fold(0, u64::saturating_add)
     }
 
@@ -5339,6 +5485,11 @@ impl Heap {
     #[must_use]
     pub const fn max_heap_bytes(&self) -> u64 {
         self.max_heap_bytes
+    }
+
+    #[must_use]
+    pub const fn max_collection_bytes(&self) -> u64 {
+        self.max_collection_bytes
     }
 
     #[must_use]
@@ -5476,6 +5627,7 @@ impl Heap {
         if self.gc_phase != GcPhase::Sweep {
             return;
         }
+        let mut collection_bytes_reclaimed = 0_u64;
         while budget.available() && self.gc_sweep_cursor < self.slots.len() {
             let index = self.gc_sweep_cursor;
             self.gc_sweep_cursor += 1;
@@ -5492,6 +5644,8 @@ impl Heap {
                     .live_objects
                     .checked_sub(1)
                     .expect("a condemned object was counted as live");
+                collection_bytes_reclaimed = collection_bytes_reclaimed
+                    .saturating_add(self.object_collection_bytes(&object));
                 payload = self.release_object_storage(&object);
                 report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
                 self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
@@ -5506,11 +5660,19 @@ impl Heap {
             budget.charge(payload);
         }
         self.release_live_payload(report.bytes_reclaimed);
+        self.live_collection_bytes = self
+            .live_collection_bytes
+            .saturating_sub(collection_bytes_reclaimed);
         if self.gc_sweep_cursor >= self.slots.len() {
             debug_assert_eq!(
                 self.live_objects,
                 self.recompute_live_objects(),
                 "the incremental live object gauge drifted from ground truth"
+            );
+            debug_assert_eq!(
+                self.live_collection_bytes,
+                self.recompute_live_collection_bytes(),
+                "the incremental collection byte gauge drifted from ground truth"
             );
             report.completed = Some(CollectionStats {
                 marked: self.gc_marked,
@@ -5869,12 +6031,21 @@ impl Heap {
             .saturating_add(arena_free_bytes)
             .saturating_add(map_arena_free_bytes);
         inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
+        self.debug_assert_byte_gauges(inspection);
+        inspection
+    }
+
+    fn debug_assert_byte_gauges(&self, inspection: HeapByteInspection) {
         debug_assert_eq!(
             inspection.live_total(),
             self.live_vm_bytes(),
             "O(1) live byte gauge drifted from GC_V1 inspection"
         );
-        inspection
+        debug_assert_eq!(
+            inspection.collection_total(),
+            self.live_collection_bytes,
+            "O(1) collection byte gauge drifted from GC_V1 inspection"
+        );
     }
 
     pub(crate) fn failure_trigger(&self, point: RuntimeFailurePoint) -> bool {
@@ -6262,6 +6433,29 @@ mod tests {
         assert_eq!(heap.trim_string(source), Err(HeapError::CapacityExhausted));
         assert_eq!(heap.live_len(), 1);
         assert_eq!(heap.string(source), Ok("  rooted  "));
+    }
+
+    #[test]
+    fn string_split_byte_limit_is_preflighted_before_any_vm_publication() {
+        let mut heap = Heap::new(16);
+        let source = heap.allocate_string("a,b,c").unwrap();
+        let delimiter = heap.allocate_string(",").unwrap();
+        let before_objects = heap.live_len();
+        let before_bytes = heap.live_vm_bytes();
+        let before_payload = heap.live_payload_bytes();
+        let header_bytes = heap.byte_inspection().object_header_bytes / 2;
+        heap.set_max_heap_bytes(before_bytes.saturating_add(header_bytes).saturating_add(1));
+
+        assert_eq!(
+            heap.split_string(source, delimiter),
+            Err(HeapError::CapacityExhausted)
+        );
+        assert_eq!(heap.live_len(), before_objects);
+        assert_eq!(heap.live_vm_bytes(), before_bytes);
+        assert_eq!(heap.live_payload_bytes(), before_payload);
+        assert_eq!(heap.live_collection_bytes(), 0);
+        assert_eq!(heap.string(source), Ok("a,b,c"));
+        assert_eq!(heap.string(delimiter), Ok(","));
     }
 
     #[test]
@@ -7156,8 +7350,11 @@ mod tests {
             nexa_bytecode::ValueType::I32,
         )
         .unwrap();
+        assert!(heap.live_collection_bytes() > 0);
         heap.rollback_host_transaction();
         assert!(heap.maps.iter().all(Option::is_none));
+        assert_eq!(heap.live_collection_bytes(), 0);
+        assert_eq!(heap.live_payload_bytes(), 0);
         assert_eq!(
             heap.map_slots
                 .free_ranges

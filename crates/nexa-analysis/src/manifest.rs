@@ -39,6 +39,9 @@ pub struct ApplicationSettings {
     pub handler_fuel: Option<u64>,
     pub cumulative_budget: Option<u64>,
     pub heap_objects: Option<u32>,
+    pub heap_bytes: Option<u64>,
+    pub string_bytes: Option<u64>,
+    pub collection_bytes: Option<u64>,
     pub host_resources: Option<u32>,
     pub tasks: Option<u32>,
     pub release_records: Option<usize>,
@@ -102,6 +105,9 @@ impl PackageManifest {
                 handler_fuel: raw.handler_fuel,
                 cumulative_budget: raw.cumulative_budget,
                 heap_objects: raw.heap_objects,
+                heap_bytes: raw.heap_bytes,
+                string_bytes: raw.string_bytes,
+                collection_bytes: raw.collection_bytes,
                 host_resources: raw.host_resources,
                 tasks: raw.tasks,
                 release_records: raw.release_records,
@@ -199,6 +205,13 @@ impl PackageManifest {
                 application.cumulative_budget,
             );
             write_optional(&mut output, "heap_objects", application.heap_objects);
+            write_optional(&mut output, "heap_bytes", application.heap_bytes);
+            write_optional(&mut output, "string_bytes", application.string_bytes);
+            write_optional(
+                &mut output,
+                "collection_bytes",
+                application.collection_bytes,
+            );
             write_optional(&mut output, "host_resources", application.host_resources);
             write_optional(&mut output, "tasks", application.tasks);
             write_optional(&mut output, "release_records", application.release_records);
@@ -335,6 +348,9 @@ struct RawApplicationManifest {
     handler_fuel: Option<u64>,
     cumulative_budget: Option<u64>,
     heap_objects: Option<u32>,
+    heap_bytes: Option<u64>,
+    string_bytes: Option<u64>,
+    collection_bytes: Option<u64>,
     host_resources: Option<u32>,
     tasks: Option<u32>,
     release_records: Option<usize>,
@@ -420,6 +436,9 @@ entry = "snake.classic_rules"
 activation = "default-enabled"
 priority = 400
 handler_fuel = 20000
+heap_bytes = 67108864
+string_bytes = 1048576
+collection_bytes = 33554432
 capabilities = ["diagnostics.log"]
 
 [dependencies]
@@ -435,6 +454,14 @@ snake_common = { path = "../snake-common" }
             "src/snake/classic_rules.nexa"
         );
         assert_eq!(manifest.dependencies.len(), 1);
+        let application = manifest.application.as_ref().expect("application settings");
+        assert_eq!(application.heap_bytes, Some(67_108_864));
+        assert_eq!(application.string_bytes, Some(1_048_576));
+        assert_eq!(application.collection_bytes, Some(33_554_432));
+        let canonical = String::from_utf8(manifest.canonical_bytes()).expect("canonical TOML");
+        assert!(canonical.contains("heap_bytes = 67108864\n"));
+        assert!(canonical.contains("string_bytes = 1048576\n"));
+        assert!(canonical.contains("collection_bytes = 33554432\n"));
     }
 
     #[test]
