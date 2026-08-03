@@ -59,6 +59,9 @@ pub(crate) enum ExecutableNominalOperand {
     MapType {
         type_index: u16,
     },
+    CallFrame {
+        register_count: u16,
+    },
 }
 
 impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
@@ -99,6 +102,9 @@ impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
                 row_fields,
             },
             ResolvedNominalOperand::MapType { type_index } => Self::MapType { type_index },
+            ResolvedNominalOperand::CallFrame { register_count } => {
+                Self::CallFrame { register_count }
+            }
         }
     }
 }
@@ -1255,10 +1261,21 @@ fn update_counter() -> i32 {
                     ),
                     "map construction rows carry a dense type slot"
                 ),
+                Instruction::Call { .. } => assert_call_frame(row),
                 _ => {}
             }
         }
         assert_export_index(&module, &executable);
+    }
+
+    fn assert_call_frame(row: &super::ExecutableInstruction) {
+        assert!(
+            matches!(
+                row.resolved_nominal,
+                super::ExecutableNominalOperand::CallFrame { .. }
+            ),
+            "call rows carry the verifier-proven callee frame width"
+        );
     }
 
     fn assert_export_index(module: &VerifiedModule, executable: &ExecutableModule) {

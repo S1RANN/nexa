@@ -237,6 +237,9 @@ pub enum ResolvedNominalOperand {
     MapType {
         type_index: u16,
     },
+    CallFrame {
+        register_count: u16,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -1754,6 +1757,9 @@ fn verify_function(
                         })?;
                     require(&state, argument, ty)?;
                 }
+                resolved_operands[pc] = ResolvedNominalOperand::CallFrame {
+                    register_count: callee.registers,
+                };
                 if let Some(result) = callee.signature.result {
                     state[register(dst)?] = Some(result);
                 }

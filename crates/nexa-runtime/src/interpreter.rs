@@ -3021,48 +3021,65 @@ impl CheckedInterpreter {
                     args_count,
                     dst,
                 } => {
-                    let callee = module
-                        .module()
-                        .functions
-                        .get(callee_id as usize)
-                        .ok_or(InterpreterError::MissingFunction(callee_id))?;
-                    if usize::from(args_count) != callee.signature.parameters.len() {
-                        return Err(InterpreterError::ArgumentCount);
-                    }
-                    for (offset, expected) in
-                        (0..args_count).zip(callee.signature.parameters.iter().copied())
-                    {
-                        let argument = args_base
-                            .checked_add(offset)
-                            .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-                        if runtime_value_type(register(&continuation.arena, argument)?)
-                            != Some(expected)
-                        {
+                    if function_rows.is_some() {
+                        let ExecutableNominalOperand::CallFrame { register_count } =
+                            resolved_nominal
+                        else {
                             return Err(InterpreterError::TypeMismatch);
+                        };
+                        continuation.arena.push_verified_call(
+                            callee_id,
+                            register_count,
+                            dst,
+                            frame.pc,
+                            args_base,
+                            args_count,
+                        )?;
+                    } else {
+                        let callee = module
+                            .module()
+                            .functions
+                            .get(callee_id as usize)
+                            .ok_or(InterpreterError::MissingFunction(callee_id))?;
+                        if usize::from(args_count) != callee.signature.parameters.len() {
+                            return Err(InterpreterError::ArgumentCount);
                         }
+                        for (offset, expected) in
+                            (0..args_count).zip(callee.signature.parameters.iter().copied())
+                        {
+                            let argument = args_base
+                                .checked_add(offset)
+                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                            if runtime_value_type(register(&continuation.arena, argument)?)
+                                != Some(expected)
+                            {
+                                return Err(InterpreterError::TypeMismatch);
+                            }
+                        }
+                        let caller_index = continuation.arena.depth() - 1;
+                        continuation.arena.push_call_at(
+                            callee_id,
+                            callee.registers,
+                            Some(dst),
+                            Some(frame.pc),
+                        )?;
+                        for offset in 0..args_count {
+                            let argument = args_base
+                                .checked_add(offset)
+                                .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+                            let value =
+                                continuation.arena.frame_register(caller_index, argument)?;
+                            continuation
+                                .arena
+                                .set_register(usize::from(offset), value)?;
+                        }
+                        continuation
+                            .arena
+                            .set_frame_pc(caller_index, frame.pc + 1)?;
                     }
-                    let caller_index = continuation.arena.depth() - 1;
-                    continuation.arena.push_call_at(
-                        callee_id,
-                        callee.registers,
-                        Some(dst),
-                        Some(frame.pc),
-                    )?;
                     if let Some(migration) = migration.as_deref_mut() {
                         migration.observe_call_depth(continuation.arena.depth());
                     }
-                    for offset in 0..args_count {
-                        let argument = args_base
-                            .checked_add(offset)
-                            .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-                        let value = continuation.arena.frame_register(caller_index, argument)?;
-                        continuation
-                            .arena
-                            .set_register(usize::from(offset), value)?;
-                    }
-                    continuation
-                        .arena
-                        .set_frame_pc(caller_index, frame.pc + 1)?;
                 }
                 Instruction::HostCall {
                     import,

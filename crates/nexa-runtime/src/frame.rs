@@ -365,6 +365,55 @@ impl FrameArena {
         Ok(())
     }
 
+    /// Pushes a verifier-planned call and copies its contiguous argument
+    /// window directly into the callee frame. All checks that can fail are
+    /// completed before [`Self::push_call_at`] mutates the arena; the copy is
+    /// then an in-bounds move between disjoint live frame ranges.
+    pub(crate) fn push_verified_call(
+        &mut self,
+        function: u32,
+        register_count: u16,
+        return_target: u16,
+        call_site_pc: u32,
+        args_base: u16,
+        args_count: u16,
+    ) -> Result<(), FrameError> {
+        let caller_index = self
+            .frames
+            .len()
+            .checked_sub(1)
+            .ok_or(FrameError::NoFrame)?;
+        let caller = self.frames[caller_index];
+        let caller_next_pc = call_site_pc
+            .checked_add(1)
+            .ok_or(FrameError::RegisterOutOfRange)?;
+        if return_target >= caller.register_count
+            || args_count > register_count
+            || args_base
+                .checked_add(args_count)
+                .is_none_or(|end| end > caller.register_count)
+        {
+            return Err(FrameError::RegisterOutOfRange);
+        }
+        let source_start = caller.register_start as usize + usize::from(args_base);
+        let source_end = source_start + usize::from(args_count);
+        self.push_call_at(
+            function,
+            register_count,
+            Some(return_target),
+            Some(call_site_pc),
+        )?;
+        let destination = self
+            .frames
+            .last()
+            .expect("the verified call frame was just pushed")
+            .register_start as usize;
+        self.registers
+            .copy_within(source_start..source_end, destination);
+        self.frames[caller_index].pc = caller_next_pc;
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Result<Frame, FrameError> {
         self.pop_mode(true)
     }
@@ -692,6 +741,30 @@ mod tests {
         });
         assert_eq!(arena.push(1, 2), Err(FrameError::FrameByteLimit));
         assert_eq!(arena.depth(), 0);
+    }
+
+    #[test]
+    fn verified_call_copies_one_argument_window_and_is_fail_atomic() {
+        let mut arena = FrameArena::new(FrameLimits::default());
+        arena.push(1, 4).unwrap();
+        arena.set_register(1, RuntimeValue::I32(7)).unwrap();
+        arena.set_register(2, RuntimeValue::Bool(true)).unwrap();
+        arena.push_verified_call(2, 4, 3, 5, 1, 2).unwrap();
+        assert_eq!(arena.depth(), 2);
+        assert_eq!(arena.current().unwrap().function, 2);
+        assert_eq!(arena.register(0), Ok(RuntimeValue::I32(7)));
+        assert_eq!(arena.register(1), Ok(RuntimeValue::Bool(true)));
+        assert_eq!(arena.frame(0).unwrap().pc, 6);
+        arena.pop_verified().unwrap();
+
+        let before = arena.clone();
+        assert_eq!(
+            arena.push_verified_call(3, 1, 4, 6, 0, 2),
+            Err(FrameError::RegisterOutOfRange)
+        );
+        assert_eq!(arena.frames, before.frames);
+        assert_eq!(arena.register_top, before.register_top);
+        assert_eq!(arena.registers, before.registers);
     }
 
     #[test]
