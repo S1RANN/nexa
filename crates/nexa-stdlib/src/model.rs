@@ -178,6 +178,10 @@ pub enum Intrinsic {
     ArrayGet,
     ArrayPush,
     ArrayPop,
+    ArrayReserve,
+    ArrayCapacity,
+    ArrayClear,
+    ArrayShrinkToFit,
     MapLen,
     MapContains,
     MapGet,
@@ -229,6 +233,10 @@ impl Intrinsic {
             Self::ArrayGet => "intrinsic.array.get.v1",
             Self::ArrayPush => "intrinsic.array.push.v1",
             Self::ArrayPop => "intrinsic.array.pop.v1",
+            Self::ArrayReserve => "intrinsic.array.reserve.v1",
+            Self::ArrayCapacity => "intrinsic.array.capacity.v1",
+            Self::ArrayClear => "intrinsic.array.clear.v1",
+            Self::ArrayShrinkToFit => "intrinsic.array.shrink_to_fit.v1",
             Self::MapLen => "intrinsic.map.len.v1",
             Self::MapContains => "intrinsic.map.contains.v1",
             Self::MapGet => "intrinsic.map.get.v1",
@@ -311,6 +319,8 @@ impl FunctionBehavior {
     pub const MUTATES_OR_TRAPS: Self = Self::local_mutation(Allocation::None, Termination::MayTrap);
     pub const MUTATES_AND_ALLOCATES: Self =
         Self::local_mutation(Allocation::Result, Termination::Returns);
+    pub const MUTATES_ALLOCATES_OR_TRAPS: Self =
+        Self::local_mutation(Allocation::Result, Termination::MayTrap);
 
     #[must_use]
     pub const fn new(allocation: Allocation, termination: Termination) -> Self {

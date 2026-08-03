@@ -8299,6 +8299,27 @@ impl<'analyzer, 'input> BodyChecker<'analyzer, 'input> {
                             Vec::new(),
                             false,
                         ),
+                        "reserve" => (
+                            BuiltinOperationIr::ArrayReserve,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            vec![IrType::I32],
+                            false,
+                        ),
+                        "capacity" => (
+                            BuiltinOperationIr::ArrayCapacity,
+                            IrType::I32,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
+                        "shrink_to_fit" => (
+                            BuiltinOperationIr::ArrayShrinkToFit,
+                            IrType::Bool,
+                            operation_type_arguments,
+                            Vec::new(),
+                            false,
+                        ),
                         _ => return None,
                     }
                 }

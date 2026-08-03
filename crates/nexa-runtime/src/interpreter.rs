@@ -4681,6 +4681,14 @@ fn standard_intrinsic_attempt_fuel(
                 )?
             }
         }
+        StandardIntrinsicFuelModel::ArrayResize => {
+            array_resize_intrinsic_fuel(intrinsic, &arguments, heap_required()?)?
+        }
+        StandardIntrinsicFuelModel::ArrayClear => {
+            let heap = heap_required()?;
+            let (live, _) = heap.array_fuel_shape(arguments[0])?;
+            fuel_blocks(fuel_usize(live)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?
+        }
         StandardIntrinsicFuelModel::MapLookup => {
             map_lookup_fuel(heap_required()?, arguments[0], arguments[1])?
         }
@@ -4689,6 +4697,44 @@ fn standard_intrinsic_attempt_fuel(
         }
     };
     fuel_add(u64::from(intrinsic.base_fuel_cost()), work)
+}
+
+fn array_resize_intrinsic_fuel(
+    intrinsic: StandardIntrinsic,
+    arguments: &[RuntimeValue; 3],
+    heap: &Heap,
+) -> Result<u64, InterpreterError> {
+    let (live, capacity) = heap.array_fuel_shape(arguments[0])?;
+    match intrinsic {
+        StandardIntrinsic::ArrayReserve { .. } => {
+            let RuntimeValue::I32(additional) = arguments[1] else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let grows = usize::try_from(additional)
+                .ok()
+                .and_then(|additional| live.checked_add(additional))
+                .is_some_and(|needed| needed > capacity);
+            if !grows {
+                return Ok(0);
+            }
+            let move_work =
+                fuel_blocks(fuel_usize(live)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            fuel_add(
+                move_work,
+                collection_arena_metadata_fuel(heap, true, capacity != 0)?,
+            )
+        }
+        StandardIntrinsic::ArrayShrinkToFit { .. } => {
+            if live == capacity {
+                Ok(0)
+            } else {
+                // The typed arenas split and release the unused tail in
+                // place; no element scan or copy occurs.
+                collection_arena_metadata_fuel(heap, false, capacity != 0)
+            }
+        }
+        _ => unreachable!("array resize model belongs to resize intrinsics"),
+    }
 }
 
 fn fuel_usize(value: usize) -> Result<u64, InterpreterError> {
@@ -4940,16 +4986,20 @@ fn run_standard_intrinsic(
                     .split_string(value, delimiter)?,
             )
         }
-        Intrinsic::ArrayLen { .. } | Intrinsic::ArrayIsEmpty { .. } => {
-            let length = heap
-                .as_deref()
-                .ok_or(InterpreterError::HeapUnavailable)?
-                .array_len(arguments[0])?;
+        Intrinsic::ArrayLen { .. }
+        | Intrinsic::ArrayIsEmpty { .. }
+        | Intrinsic::ArrayCapacity { .. } => {
+            let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
+            let length = heap.array_len(arguments[0])?;
             returned(match intrinsic {
                 Intrinsic::ArrayLen { .. } => RuntimeValue::I32(
                     i32::try_from(length).map_err(|_| InterpreterError::StringLengthOverflow)?,
                 ),
                 Intrinsic::ArrayIsEmpty { .. } => RuntimeValue::Bool(length == 0),
+                Intrinsic::ArrayCapacity { .. } => RuntimeValue::I32(
+                    i32::try_from(heap.array_capacity(arguments[0])?)
+                        .map_err(|_| InterpreterError::StringLengthOverflow)?,
+                ),
                 _ => unreachable!(),
             })
         }
@@ -4995,6 +5045,39 @@ fn run_standard_intrinsic(
                 ));
             }
             returned(heap.array_pop(arguments[0])?)
+        }
+        Intrinsic::ArrayReserve { .. } => {
+            let RuntimeValue::I32(additional) = arguments[1] else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let Ok(additional) = usize::try_from(additional) else {
+                return Ok(StandardIntrinsicOutcome::Trapped(
+                    "array reserve additional capacity must be non-negative".into(),
+                ));
+            };
+            match heap
+                .as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_reserve(arguments[0], additional)
+            {
+                Ok(()) => returned(RuntimeValue::Bool(true)),
+                Err(HeapError::CollectionTooLarge { .. }) => Ok(StandardIntrinsicOutcome::Trapped(
+                    "array reserve exceeds the collection length limit".into(),
+                )),
+                Err(error) => Err(InterpreterError::Heap(error)),
+            }
+        }
+        Intrinsic::ArrayClear { .. } => {
+            heap.as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_clear(arguments[0])?;
+            returned(RuntimeValue::Bool(true))
+        }
+        Intrinsic::ArrayShrinkToFit { .. } => {
+            heap.as_deref_mut()
+                .ok_or(InterpreterError::HeapUnavailable)?
+                .array_shrink_to_fit(arguments[0])?;
+            returned(RuntimeValue::Bool(true))
         }
         Intrinsic::MapLen { .. } => {
             let length = heap

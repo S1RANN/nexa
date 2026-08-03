@@ -3159,6 +3159,50 @@ impl Heap {
         Ok(self.array_parts(value)?.length)
     }
 
+    /// Logical element capacity retained by the WP48 array header.
+    ///
+    /// Flattened struct rows store multiple arena cells per element, so the
+    /// physical extent must always be divided by its row stride at this API
+    /// boundary.
+    pub fn array_capacity(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        let parts = self.array_parts(value)?;
+        Ok(parts.range.length / parts.stride())
+    }
+
+    /// Ensures room for `additional` elements without changing the logical
+    /// length. Growth first attempts to extend the existing typed-arena
+    /// extent in place; relocation is the bounded fallback.
+    pub fn array_reserve(
+        &mut self,
+        value: RuntimeValue,
+        additional: usize,
+    ) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        let needed = parts
+            .length
+            .checked_add(additional)
+            .ok_or(HeapError::CollectionTooLarge {
+                length: usize::MAX,
+                max_length: self.max_collection_length,
+            })?;
+        self.validate_collection_length(needed)?;
+        let current = parts.range.length / parts.stride();
+        if needed <= current {
+            return Ok(());
+        }
+        let target = grown_array_capacity(current, needed, self.max_collection_length);
+        self.resize_array_capacity(parts, target)
+    }
+
+    /// Releases every unused capacity cell while preserving the live prefix.
+    ///
+    /// Arena ranges are tail-splittable, so shrinking never copies elements
+    /// and never asks the system allocator for temporary storage.
+    pub fn array_shrink_to_fit(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
+        let parts = self.array_parts(value)?;
+        self.resize_array_capacity(parts, parts.length)
+    }
+
     pub fn array_get(
         &mut self,
         value: RuntimeValue,
@@ -3690,6 +3734,164 @@ impl Heap {
         let live_cells = parts.length * parts.stride();
         self.typed_collection_clear(parts.storage, parts.range, 0..live_cells)?;
         self.set_array_length(parts.reference, 0)
+    }
+
+    /// Changes only the retained capacity of an array. `target` is expressed
+    /// in logical elements; the arena bookkeeping below operates in cells.
+    fn resize_array_capacity(&mut self, parts: ArrayParts, target: usize) -> Result<(), HeapError> {
+        if target < parts.length {
+            return Err(HeapError::CollectionTooLarge {
+                length: parts.length,
+                max_length: target,
+            });
+        }
+        self.validate_collection_length(target)?;
+        let stride = parts.stride();
+        let target_cells = target
+            .checked_mul(stride)
+            .ok_or(HeapError::CapacityExhausted)?;
+        let current_cells = parts.range.length;
+        if target_cells == current_cells {
+            return Ok(());
+        }
+        if target_cells < current_cells {
+            return self.shrink_array_capacity(parts, target_cells);
+        }
+        if self.try_extend_array_capacity(parts, target_cells)? {
+            return Ok(());
+        }
+        self.relocate_array_capacity(parts, target_cells)
+    }
+
+    fn shrink_array_capacity(
+        &mut self,
+        parts: ArrayParts,
+        target_cells: usize,
+    ) -> Result<(), HeapError> {
+        let tail = CollectionRange {
+            start: parts.range.start + target_cells,
+            length: parts.range.length - target_cells,
+        };
+        self.set_array_range(
+            parts.reference,
+            CollectionRange {
+                start: parts.range.start,
+                length: target_cells,
+            },
+        )?;
+        self.release_typed_collection(parts.storage, tail);
+        self.release_live_payload(
+            (tail.length as u64).saturating_mul(parts.storage.cell_size() as u64),
+        );
+        Ok(())
+    }
+
+    fn try_extend_array_capacity(
+        &mut self,
+        parts: ArrayParts,
+        target_cells: usize,
+    ) -> Result<bool, HeapError> {
+        let additional_cells = target_cells - parts.range.length;
+        let additional_bytes =
+            (additional_cells as u64).saturating_mul(parts.storage.cell_size() as u64);
+        self.ensure_payload_headroom(additional_bytes)?;
+        self.claim_collection_quota(additional_cells)?;
+        let tail = CollectionRange {
+            start: parts.range.end(),
+            length: additional_cells,
+        };
+        if self.collections.claim(tail).is_err() {
+            self.release_collection_quota(additional_cells);
+            return Ok(false);
+        }
+        if self.claim_physical_collection(parts.storage, tail).is_err() {
+            self.collections.release(tail);
+            self.release_collection_quota(additional_cells);
+            return Ok(false);
+        }
+        if let Err(error) = self.set_array_range(
+            parts.reference,
+            CollectionRange {
+                start: parts.range.start,
+                length: target_cells,
+            },
+        ) {
+            self.release_typed_collection(parts.storage, tail);
+            return Err(error);
+        }
+        self.charge_live_payload(additional_bytes);
+        Ok(true)
+    }
+
+    fn relocate_array_capacity(
+        &mut self,
+        parts: ArrayParts,
+        target_cells: usize,
+    ) -> Result<(), HeapError> {
+        let live_cells = parts
+            .length
+            .checked_mul(parts.stride())
+            .ok_or(HeapError::CapacityExhausted)?;
+        if parts.storage == CollectionStorage::Values {
+            return self.regrow_array(
+                parts.reference,
+                parts.range,
+                live_cells,
+                target_cells,
+                |_| {},
+            );
+        }
+
+        macro_rules! relocate_scalar {
+            ($arena:ident) => {{
+                let element_bytes = parts.storage.cell_size();
+                let global_range =
+                    self.claim_global_collection_range(target_cells, element_bytes)?;
+                let new_range = match {
+                    let mut arena = self.scalar_collections.$arena();
+                    claim_scalar_regrow(&mut arena, global_range, parts.range, live_cells, |_| {})
+                } {
+                    Ok(range) => range,
+                    Err(error) => {
+                        self.collections.release(global_range);
+                        self.release_collection_quota(target_cells);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.set_array_range(parts.reference, new_range) {
+                    self.scalar_collections.$arena().release(new_range);
+                    self.collections.release(new_range);
+                    self.release_collection_quota(new_range.length);
+                    return Err(error);
+                }
+                self.scalar_collections.$arena().release(parts.range);
+                self.collections.release(parts.range);
+                self.release_collection_quota(parts.range.length);
+                let new_bytes = (new_range.length as u64).saturating_mul(element_bytes as u64);
+                let old_bytes = (parts.range.length as u64).saturating_mul(element_bytes as u64);
+                self.charge_live_payload(new_bytes);
+                self.release_live_payload(old_bytes);
+                self.counters.collection_relocation_bytes = self
+                    .counters
+                    .collection_relocation_bytes
+                    .saturating_add((live_cells as u64).saturating_mul(element_bytes as u64));
+                return Ok(());
+            }};
+        }
+
+        match parts.storage {
+            CollectionStorage::I32 => relocate_scalar!(i32_mut),
+            CollectionStorage::I64 => relocate_scalar!(i64_mut),
+            CollectionStorage::F32 => relocate_scalar!(f32_mut),
+            CollectionStorage::F64 => relocate_scalar!(f64_mut),
+            CollectionStorage::Bool => relocate_scalar!(bools_mut),
+            CollectionStorage::Rune => relocate_scalar!(runes_mut),
+            CollectionStorage::String => relocate_scalar!(strings_mut),
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                relocate_scalar!(refs_mut)
+            }
+            CollectionStorage::Values => unreachable!("wide storage returned above"),
+        }
     }
 
     fn set_array_length(&mut self, reference: GcRef, new_length: usize) -> Result<(), HeapError> {
@@ -6201,6 +6403,50 @@ mod tests {
             })
         );
         heap.array_clear(array).unwrap();
+    }
+
+    #[test]
+    fn array_capacity_management_preserves_typed_storage_and_live_prefix() {
+        let mut heap = Heap::new_with_arena_limits(8, 4_096, 64, 64, 16);
+        let array_type = nexa_bytecode::array_type(nexa_bytecode::ValueType::I32);
+        let array = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+
+        heap.array_reserve(array, 3).unwrap();
+        assert_eq!(heap.array_capacity(array), Ok(4));
+        for value in [10, 20, 30] {
+            heap.array_push(array, RuntimeValue::I32(value)).unwrap();
+        }
+
+        // Occupy the adjacent arena range so the next reserve exercises the
+        // bounded relocation fallback instead of the in-place extension.
+        let blocker = heap
+            .allocate_array(array_type, nexa_bytecode::ValueType::I32)
+            .unwrap();
+        heap.array_reserve(blocker, 4).unwrap();
+        let relocation_before = heap.vm_allocation_counters().collection_relocation_bytes;
+        heap.array_reserve(array, 6).unwrap();
+        assert_eq!(heap.array_capacity(array), Ok(9));
+        assert_eq!(
+            heap.vm_allocation_counters().collection_relocation_bytes - relocation_before,
+            3 * std::mem::size_of::<i32>() as u64
+        );
+        assert_eq!(heap.array_get(array, 0), Ok(RuntimeValue::I32(10)));
+        assert_eq!(heap.array_get(array, 1), Ok(RuntimeValue::I32(20)));
+        assert_eq!(heap.array_get(array, 2), Ok(RuntimeValue::I32(30)));
+
+        heap.array_clear(array).unwrap();
+        assert_eq!(heap.array_len(array), Ok(0));
+        assert_eq!(heap.array_capacity(array), Ok(9));
+        let relocation_before = heap.vm_allocation_counters().collection_relocation_bytes;
+        heap.array_shrink_to_fit(array).unwrap();
+        assert_eq!(heap.array_capacity(array), Ok(0));
+        assert_eq!(
+            heap.vm_allocation_counters().collection_relocation_bytes,
+            relocation_before,
+            "tail-split shrink must not copy elements"
+        );
     }
 
     #[test]

@@ -14,6 +14,7 @@ use nexa_core::{CanonicalSymbolIdentity, FileId, StableId, SymbolKind};
 use nexa_runtime::{
     CheckedInterpreter, ContinuationReservation, FrameLimits, FuelState, Heap, HostTrap,
     InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, OpcodeCostTable, RuntimeValue,
+    TrapKind,
 };
 
 const EVIDENCE_PACKAGE: &str = "nexa.compiler.evidence";
@@ -846,6 +847,56 @@ fn typed_string_index_lowers_to_rune_at_and_executes_unicode_scalars() {
 }
 
 #[test]
+fn array_capacity_intrinsics_execute_with_clear_retention_and_tail_shrink() {
+    let verified = nexa_compiler::compile(
+        r"
+fn capacity_lifecycle() -> i32 {
+    let values: Array<i32> = [];
+    values.reserve(6);
+    values.push(1);
+    values.clear();
+    let retained: i32 = values.capacity();
+    values.shrink_to_fit();
+    return retained * 10 + values.capacity();
+}
+",
+    )
+    .unwrap();
+    let mut heap = Heap::new(16);
+    let outcome = CheckedInterpreter::run_with_heap(&verified, 0, &[], 1_000, &mut heap).unwrap();
+    assert!(matches!(
+        outcome,
+        InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::I32(60)),
+            ..
+        }
+    ));
+}
+
+#[test]
+fn array_reserve_rejects_negative_capacity_before_storage_mutation() {
+    let verified = nexa_compiler::compile(
+        r"
+fn invalid_reserve() -> i32 {
+    let values: Array<i32> = [];
+    values.reserve(-1);
+    return values.capacity();
+}
+",
+    )
+    .unwrap();
+    let mut heap = Heap::new(16);
+    let outcome = CheckedInterpreter::run_with_heap(&verified, 0, &[], 1_000, &mut heap).unwrap();
+    assert!(matches!(
+        outcome,
+        InterpreterOutcome::Trapped { trap, .. }
+            if trap.kind == TrapKind::StandardLibrary
+                && trap.message.to_string().contains("must be non-negative")
+    ));
+    assert_eq!(heap.vm_allocation_counters().collection_relocation_bytes, 0);
+}
+
+#[test]
 fn generic_standard_calls_carry_concrete_call_site_types() {
     let verified = nexa_compiler::compile(
         r"
@@ -940,6 +991,61 @@ fn result_default() -> i32 {
             ..
         }
     )));
+}
+
+#[test]
+fn array_capacity_calls_carry_concrete_types() {
+    let verified = nexa_compiler::compile(
+        r"
+use std::collections as collections;
+
+fn manage_i32(values: Array<i32>) -> i32 {
+    collections::array_reserve(values, 8);
+    collections::array_clear(values);
+    collections::array_shrink_to_fit(values);
+    return collections::array_capacity(values);
+}
+
+fn manage_i32_methods(values: Array<i32>) -> i32 {
+    values.reserve(8);
+    values.clear();
+    values.shrink_to_fit();
+    return values.capacity();
+}
+",
+    )
+    .unwrap();
+    let instructions = verified
+        .module()
+        .functions
+        .iter()
+        .flat_map(|function| function.code.iter())
+        .collect::<Vec<_>>();
+    for expected in [
+        StandardIntrinsic::ArrayReserve {
+            element: ValueType::I32,
+        },
+        StandardIntrinsic::ArrayCapacity {
+            element: ValueType::I32,
+        },
+        StandardIntrinsic::ArrayClear {
+            element: ValueType::I32,
+        },
+        StandardIntrinsic::ArrayShrinkToFit {
+            element: ValueType::I32,
+        },
+    ] {
+        assert!(instructions.iter().any(|instruction| matches!(
+            instruction,
+            Instruction::StandardIntrinsic { intrinsic, .. } if *intrinsic == expected
+        )));
+    }
+    assert!(
+        instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::ArrayClear { .. })),
+        "method clear keeps the dedicated array opcode"
+    );
 }
 
 #[test]

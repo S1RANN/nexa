@@ -63,6 +63,45 @@ const FUNCTIONS: &[FunctionDescriptor] = &[
         contract: "removes and returns the last element; traps when empty",
     },
     FunctionDescriptor {
+        name: "array_reserve",
+        type_parameters: &["T"],
+        parameters: &[
+            ParameterDescriptor::new("values", "Array<T>"),
+            ParameterDescriptor::new("additional", "i32"),
+        ],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayReserve),
+        behavior: FunctionBehavior::MUTATES_ALLOCATES_OR_TRAPS,
+        contract: "retains capacity for at least non-negative additional elements and returns true",
+    },
+    FunctionDescriptor {
+        name: "array_capacity",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "i32",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayCapacity),
+        behavior: FunctionBehavior::TOTAL,
+        contract: "number of elements that fit without relocating storage",
+    },
+    FunctionDescriptor {
+        name: "array_clear",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayClear),
+        behavior: FunctionBehavior::MUTATES,
+        contract: "removes all elements while retaining capacity and returns true",
+    },
+    FunctionDescriptor {
+        name: "array_shrink_to_fit",
+        type_parameters: &["T"],
+        parameters: &[ParameterDescriptor::new("values", "Array<T>")],
+        result: "bool",
+        lowering: Lowering::CompilerIntrinsic(Intrinsic::ArrayShrinkToFit),
+        behavior: FunctionBehavior::MUTATES,
+        contract: "releases unused capacity and returns true",
+    },
+    FunctionDescriptor {
         name: "map_len",
         type_parameters: &["K", "V"],
         parameters: &[ParameterDescriptor::new("values", "Map<K,V>")],
@@ -168,6 +207,27 @@ pub fn array_push<T>(values: &mut Vec<T>, value: T) -> bool {
 
 pub fn array_pop<T>(values: &mut Vec<T>) -> Result<T, CollectionError> {
     values.pop().ok_or(CollectionError::EmptyArray)
+}
+
+pub fn array_reserve<T>(values: &mut Vec<T>, additional: usize) -> bool {
+    values.reserve(additional);
+    true
+}
+
+#[must_use]
+#[allow(clippy::ptr_arg)]
+pub fn array_capacity<T>(values: &Vec<T>) -> usize {
+    values.capacity()
+}
+
+pub fn array_clear<T>(values: &mut Vec<T>) -> bool {
+    values.clear();
+    true
+}
+
+pub fn array_shrink_to_fit<T>(values: &mut Vec<T>) -> bool {
+    values.shrink_to_fit();
+    true
 }
 
 #[must_use]

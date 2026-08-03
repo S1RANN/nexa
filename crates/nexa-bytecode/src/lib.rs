@@ -198,6 +198,18 @@ pub enum StandardIntrinsic {
     ArrayPop {
         element: ValueType,
     },
+    ArrayReserve {
+        element: ValueType,
+    },
+    ArrayCapacity {
+        element: ValueType,
+    },
+    ArrayClear {
+        element: ValueType,
+    },
+    ArrayShrinkToFit {
+        element: ValueType,
+    },
     MapLen {
         key: ValueType,
         value: ValueType,
@@ -240,6 +252,10 @@ pub enum StandardIntrinsicFuelModel {
     StringSplit,
     /// Copy the current array range in 8-element work blocks.
     ArrayCopy,
+    /// Resize retained array storage, including claim/release metadata.
+    ArrayResize,
+    /// Clear the live array prefix while retaining its capacity.
+    ArrayClear,
     /// Scan the current map storage in 8-slot work blocks.
     MapLookup,
     /// Charge only the work performed by the current insert/rehash attempt.
@@ -257,8 +273,8 @@ pub const STANDARD_STRING_FUEL_BLOCK_BYTES: u64 = 32;
 pub const STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS: u64 = 8;
 
 impl StandardIntrinsic {
-    /// Number of `StandardIntrinsic` tags reserved by the bytecode v6 wire codec.
-    pub const WIRE_VARIANT_COUNT: usize = 38;
+    /// Number of `StandardIntrinsic` tags reserved by the bytecode v7 wire codec.
+    pub const WIRE_VARIANT_COUNT: usize = 42;
 
     #[must_use]
     pub const fn canonical_name(self) -> &'static str {
@@ -294,6 +310,10 @@ impl StandardIntrinsic {
             Self::ArrayGet { .. } => "intrinsic.array.get.v1",
             Self::ArrayPush { .. } => "intrinsic.array.push.v1",
             Self::ArrayPop { .. } => "intrinsic.array.pop.v1",
+            Self::ArrayReserve { .. } => "intrinsic.array.reserve.v1",
+            Self::ArrayCapacity { .. } => "intrinsic.array.capacity.v1",
+            Self::ArrayClear { .. } => "intrinsic.array.clear.v1",
+            Self::ArrayShrinkToFit { .. } => "intrinsic.array.shrink_to_fit.v1",
             Self::MapLen { .. } => "intrinsic.map.len.v1",
             Self::MapContains { .. } => "intrinsic.map.contains.v1",
             Self::MapGet { .. } => "intrinsic.map.get.v1",
@@ -329,6 +349,9 @@ impl StandardIntrinsic {
             | Self::ArrayLen { .. }
             | Self::ArrayIsEmpty { .. }
             | Self::ArrayPop { .. }
+            | Self::ArrayCapacity { .. }
+            | Self::ArrayClear { .. }
+            | Self::ArrayShrinkToFit { .. }
             | Self::MapLen { .. }
             | Self::DebugAssert
             | Self::DebugTrap => 1,
@@ -340,6 +363,7 @@ impl StandardIntrinsic {
             | Self::StringSplit
             | Self::ArrayGet { .. }
             | Self::ArrayPush { .. }
+            | Self::ArrayReserve { .. }
             | Self::MapContains { .. }
             | Self::MapGet { .. }
             | Self::MapRemove { .. } => 2,
@@ -408,13 +432,18 @@ impl StandardIntrinsic {
                 | Self::DebugTrap,
                 0,
             ) => Some(ValueType::String),
-            (Self::StringSubstring, 1 | 2) | (Self::ArrayGet { .. }, 1) => Some(ValueType::I32),
+            (Self::StringSubstring, 1 | 2)
+            | (Self::ArrayGet { .. } | Self::ArrayReserve { .. }, 1) => Some(ValueType::I32),
             (
                 Self::ArrayLen { element }
                 | Self::ArrayIsEmpty { element }
                 | Self::ArrayGet { element }
                 | Self::ArrayPush { element }
-                | Self::ArrayPop { element },
+                | Self::ArrayPop { element }
+                | Self::ArrayReserve { element }
+                | Self::ArrayCapacity { element }
+                | Self::ArrayClear { element }
+                | Self::ArrayShrinkToFit { element },
                 0,
             ) => Some(array(element)),
             (
@@ -442,6 +471,9 @@ impl StandardIntrinsic {
             | Self::StringEndsWith
             | Self::ArrayIsEmpty { .. }
             | Self::ArrayPush { .. }
+            | Self::ArrayReserve { .. }
+            | Self::ArrayClear { .. }
+            | Self::ArrayShrinkToFit { .. }
             | Self::MapContains { .. }
             | Self::MapInsert { .. }
             | Self::DebugAssert
@@ -460,9 +492,11 @@ impl StandardIntrinsic {
             | Self::F64Sqrt
             | Self::F64Sin
             | Self::F64Cos => ValueType::F64,
-            Self::StringLen | Self::StringByteLen | Self::ArrayLen { .. } | Self::MapLen { .. } => {
-                ValueType::I32
-            }
+            Self::StringLen
+            | Self::StringByteLen
+            | Self::ArrayLen { .. }
+            | Self::ArrayCapacity { .. }
+            | Self::MapLen { .. } => ValueType::I32,
             Self::StringSubstring | Self::StringTrim => ValueType::String,
             Self::StringSplit => ValueType::Named(array_type(ValueType::String)),
             Self::ArrayGet { element } => ValueType::Named(option_type(element).type_id),
@@ -479,12 +513,15 @@ impl StandardIntrinsic {
             self,
             Self::ArrayPush { .. }
                 | Self::ArrayPop { .. }
+                | Self::ArrayReserve { .. }
+                | Self::ArrayClear { .. }
+                | Self::ArrayShrinkToFit { .. }
                 | Self::MapInsert { .. }
                 | Self::MapRemove { .. }
         )
     }
 
-    /// Bytecode v6 opcode-cost-table deterministic base fuel cost.
+    /// Bytecode v7 opcode-cost-table deterministic base fuel cost.
     ///
     /// Variable work declared by [`Self::fuel_model`] is charged separately
     /// from read-only register and heap metadata before any mutation.
@@ -504,7 +541,12 @@ impl StandardIntrinsic {
             | Self::MapGet { .. }
             | Self::MapInsert { .. }
             | Self::MapRemove { .. } => 8,
-            Self::ArrayGet { .. } | Self::ArrayPush { .. } | Self::ArrayPop { .. } => 4,
+            Self::ArrayGet { .. }
+            | Self::ArrayPush { .. }
+            | Self::ArrayPop { .. }
+            | Self::ArrayReserve { .. }
+            | Self::ArrayClear { .. }
+            | Self::ArrayShrinkToFit { .. } => 4,
             Self::OptionUnwrapOr { .. }
             | Self::ResultUnwrapOr { .. }
             | Self::F32Floor
@@ -541,6 +583,10 @@ impl StandardIntrinsic {
             },
             Self::StringSplit => StandardIntrinsicFuelModel::StringSplit,
             Self::ArrayPush { .. } | Self::ArrayPop { .. } => StandardIntrinsicFuelModel::ArrayCopy,
+            Self::ArrayReserve { .. } | Self::ArrayShrinkToFit { .. } => {
+                StandardIntrinsicFuelModel::ArrayResize
+            }
+            Self::ArrayClear { .. } => StandardIntrinsicFuelModel::ArrayClear,
             Self::MapContains { .. } | Self::MapGet { .. } | Self::MapRemove { .. } => {
                 StandardIntrinsicFuelModel::MapLookup
             }
@@ -3132,6 +3178,10 @@ fn encode_standard_intrinsic(output: &mut Vec<u8>, intrinsic: StandardIntrinsic)
         StandardIntrinsic::DebugTrap => (35, &[]),
         StandardIntrinsic::StringLen => (36, &[]),
         StandardIntrinsic::StringByteLen => (37, &[]),
+        StandardIntrinsic::ArrayReserve { element } => (38, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayCapacity { element } => (39, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayClear { element } => (40, std::slice::from_ref(element)),
+        StandardIntrinsic::ArrayShrinkToFit { element } => (41, std::slice::from_ref(element)),
     };
     output.push(tag);
     for ty in types {
@@ -3221,6 +3271,18 @@ fn decode_standard_intrinsic(reader: &mut Reader<'_>) -> Result<StandardIntrinsi
         35 => StandardIntrinsic::DebugTrap,
         36 => StandardIntrinsic::StringLen,
         37 => StandardIntrinsic::StringByteLen,
+        38 => StandardIntrinsic::ArrayReserve {
+            element: unary(reader)?,
+        },
+        39 => StandardIntrinsic::ArrayCapacity {
+            element: unary(reader)?,
+        },
+        40 => StandardIntrinsic::ArrayClear {
+            element: unary(reader)?,
+        },
+        41 => StandardIntrinsic::ArrayShrinkToFit {
+            element: unary(reader)?,
+        },
         value => return Err(DecodeError::InvalidStandardIntrinsic(value)),
     })
 }
@@ -5992,7 +6054,7 @@ mod tests {
     }
 
     #[test]
-    fn every_standard_intrinsic_round_trips_in_bytecode_v6() {
+    fn every_standard_intrinsic_round_trips_in_bytecode_v7() {
         let value = ValueType::I32;
         let key = ValueType::String;
         let intrinsics = vec![
@@ -6036,6 +6098,10 @@ mod tests {
             StandardIntrinsic::ArrayGet { element: value },
             StandardIntrinsic::ArrayPush { element: value },
             StandardIntrinsic::ArrayPop { element: value },
+            StandardIntrinsic::ArrayReserve { element: value },
+            StandardIntrinsic::ArrayCapacity { element: value },
+            StandardIntrinsic::ArrayClear { element: value },
+            StandardIntrinsic::ArrayShrinkToFit { element: value },
             StandardIntrinsic::MapLen { key, value },
             StandardIntrinsic::MapContains { key, value },
             StandardIntrinsic::MapGet { key, value },
@@ -6044,7 +6110,7 @@ mod tests {
             StandardIntrinsic::DebugAssert,
             StandardIntrinsic::DebugTrap,
         ];
-        assert_eq!(intrinsics.len(), 38);
+        assert_eq!(intrinsics.len(), StandardIntrinsic::WIRE_VARIANT_COUNT);
         let mut function = FunctionBuilder::new(
             Signature {
                 parameters: Vec::new(),

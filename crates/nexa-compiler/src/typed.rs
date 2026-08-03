@@ -5479,6 +5479,34 @@ impl<'a> FunctionEmitter<'a> {
                 );
                 load_true(self)
             }
+            BuiltinOperationIr::ArrayReserve
+            | BuiltinOperationIr::ArrayCapacity
+            | BuiltinOperationIr::ArrayShrinkToFit => {
+                let [element] = type_arguments else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let element = lower_type(self.package, element, span)?;
+                let intrinsic = match operation {
+                    BuiltinOperationIr::ArrayReserve => StandardIntrinsic::ArrayReserve { element },
+                    BuiltinOperationIr::ArrayCapacity => {
+                        StandardIntrinsic::ArrayCapacity { element }
+                    }
+                    BuiltinOperationIr::ArrayShrinkToFit => {
+                        StandardIntrinsic::ArrayShrinkToFit { element }
+                    }
+                    _ => unreachable!("array capacity operations are matched above"),
+                };
+                self.push(
+                    Instruction::StandardIntrinsic {
+                        intrinsic,
+                        args_base,
+                        args_count: u16::try_from(arguments.len())
+                            .map_err(|_| CompileError::too_many_registers(span))?,
+                        dst: destination,
+                    },
+                    span,
+                )
+            }
             BuiltinOperationIr::MapLen => self.push(
                 Instruction::MapLen {
                     source: argument(0)?,
@@ -7144,13 +7172,16 @@ fn validate_builtin_call_signature(
         | BuiltinOperationIr::ArrayPop
         | BuiltinOperationIr::ArrayInsert
         | BuiltinOperationIr::ArrayRemove
-        | BuiltinOperationIr::ArrayClear => {
+        | BuiltinOperationIr::ArrayClear
+        | BuiltinOperationIr::ArrayReserve
+        | BuiltinOperationIr::ArrayCapacity
+        | BuiltinOperationIr::ArrayShrinkToFit => {
             let [element] = type_arguments else {
                 return Err(CompileError::type_mismatch(None, None, span));
             };
             let array = IrType::Array(Box::new(element.clone()));
             match operation {
-                BuiltinOperationIr::ArrayLen => {
+                BuiltinOperationIr::ArrayLen | BuiltinOperationIr::ArrayCapacity => {
                     validate_builtin_arguments(arguments, &[array], span)?;
                     validate_builtin_result(result, &IrType::I32, span)
                 }
@@ -7174,8 +7205,12 @@ fn validate_builtin_call_signature(
                     validate_builtin_arguments(arguments, &[array], span)?;
                     validate_builtin_result(result, element, span)
                 }
-                BuiltinOperationIr::ArrayClear => {
+                BuiltinOperationIr::ArrayClear | BuiltinOperationIr::ArrayShrinkToFit => {
                     validate_builtin_arguments(arguments, &[array], span)?;
+                    validate_builtin_result(result, &IrType::Bool, span)
+                }
+                BuiltinOperationIr::ArrayReserve => {
+                    validate_builtin_arguments(arguments, &[array, IrType::I32], span)?;
                     validate_builtin_result(result, &IrType::Bool, span)
                 }
                 _ => unreachable!("array operations are matched above"),
@@ -9398,21 +9433,18 @@ fn standard_call_lowering(
         I::StringSubstring => TypedStandardLowering::Intrinsic(StandardIntrinsic::StringSubstring),
         I::StringTrim => TypedStandardLowering::Intrinsic(StandardIntrinsic::StringTrim),
         I::StringSplit => TypedStandardLowering::Intrinsic(StandardIntrinsic::StringSplit),
-        I::ArrayLen => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayLen {
-            element: type_argument(0)?,
-        }),
-        I::ArrayIsEmpty => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayIsEmpty {
-            element: type_argument(0)?,
-        }),
-        I::ArrayGet => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayGet {
-            element: type_argument(0)?,
-        }),
-        I::ArrayPush => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayPush {
-            element: type_argument(0)?,
-        }),
-        I::ArrayPop => TypedStandardLowering::Intrinsic(StandardIntrinsic::ArrayPop {
-            element: type_argument(0)?,
-        }),
+        I::ArrayLen
+        | I::ArrayIsEmpty
+        | I::ArrayGet
+        | I::ArrayPush
+        | I::ArrayPop
+        | I::ArrayReserve
+        | I::ArrayCapacity
+        | I::ArrayClear
+        | I::ArrayShrinkToFit => TypedStandardLowering::Intrinsic(lower_standard_array_intrinsic(
+            intrinsic,
+            type_argument(0)?,
+        )),
         I::MapLen => TypedStandardLowering::Intrinsic(StandardIntrinsic::MapLen {
             key: type_argument(0)?,
             value: type_argument(1)?,
@@ -9438,6 +9470,26 @@ fn standard_call_lowering(
     };
     validate_concrete_standard_lowering(package, arguments, result, lowering, span)?;
     Ok(lowering)
+}
+
+fn lower_standard_array_intrinsic(
+    intrinsic: nexa_stdlib::Intrinsic,
+    element: ValueType,
+) -> StandardIntrinsic {
+    use nexa_stdlib::Intrinsic as I;
+
+    match intrinsic {
+        I::ArrayLen => StandardIntrinsic::ArrayLen { element },
+        I::ArrayIsEmpty => StandardIntrinsic::ArrayIsEmpty { element },
+        I::ArrayGet => StandardIntrinsic::ArrayGet { element },
+        I::ArrayPush => StandardIntrinsic::ArrayPush { element },
+        I::ArrayPop => StandardIntrinsic::ArrayPop { element },
+        I::ArrayReserve => StandardIntrinsic::ArrayReserve { element },
+        I::ArrayCapacity => StandardIntrinsic::ArrayCapacity { element },
+        I::ArrayClear => StandardIntrinsic::ArrayClear { element },
+        I::ArrayShrinkToFit => StandardIntrinsic::ArrayShrinkToFit { element },
+        _ => unreachable!("only array intrinsics reach array lowering"),
+    }
 }
 
 fn validate_concrete_standard_lowering(

@@ -126,6 +126,10 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
                 "array_get",
                 "array_push",
                 "array_pop",
+                "array_reserve",
+                "array_capacity",
+                "array_clear",
+                "array_shrink_to_fit",
                 "map_len",
                 "map_contains",
                 "map_get",
@@ -193,6 +197,13 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
         ("string::split", Intrinsic::StringSplit),
         ("collections::array_push", Intrinsic::ArrayPush),
         ("collections::array_pop", Intrinsic::ArrayPop),
+        ("collections::array_reserve", Intrinsic::ArrayReserve),
+        ("collections::array_capacity", Intrinsic::ArrayCapacity),
+        ("collections::array_clear", Intrinsic::ArrayClear),
+        (
+            "collections::array_shrink_to_fit",
+            Intrinsic::ArrayShrinkToFit,
+        ),
         ("collections::map_insert", Intrinsic::MapInsert),
         ("collections::map_remove", Intrinsic::MapRemove),
         ("debug::assert", Intrinsic::DebugAssert),
@@ -239,9 +250,9 @@ fn mandatory_api_catalog_and_canonical_descriptor_are_complete() {
     assert_eq!(library.version.to_string(), "1.0.0");
     let canonical = library.canonical_manifest();
     assert_eq!(canonical, library.canonical_manifest());
-    assert_eq!(library.descriptor_hash().0, 0x0b8d_0af1_0914_42c6);
+    assert_eq!(library.descriptor_hash().0, 0xf8b2_fd21_0b5d_acbf);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.symbols().count(), 75);
+    assert_eq!(library.symbols().count(), 79);
 
     let canonical_lower = canonical.to_ascii_lowercase();
     for forbidden in [
@@ -266,7 +277,7 @@ fn canonical_symbols_are_unique_versioned_and_deterministic() {
     let second_manifest = library.canonical_manifest();
     assert_eq!(first_manifest, second_manifest);
     assert_eq!(library.descriptor_hash(), library.descriptor_hash());
-    assert_eq!(library.descriptor_hash().0, 0x0b8d_0af1_0914_42c6);
+    assert_eq!(library.descriptor_hash().0, 0xf8b2_fd21_0b5d_acbf);
 
     let symbols = library
         .symbols()
@@ -595,6 +606,12 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
     assert_eq!(collections::array_pop(&mut values), Ok(3));
     assert_eq!(values, [1, 2]);
     assert!(collections::array_pop(&mut Vec::<i32>::new()).is_err());
+    assert!(collections::array_reserve(&mut values, 32));
+    assert!(collections::array_capacity(&values) >= 34);
+    assert!(collections::array_clear(&mut values));
+    assert!(values.is_empty());
+    assert!(collections::array_shrink_to_fit(&mut values));
+    assert_eq!(collections::array_capacity(&values), 0);
 
     let mut map = BTreeMap::new();
     assert!(collections::map_insert(&mut map, "key", 7));
@@ -605,6 +622,12 @@ fn collection_reference_helpers_cover_arrays_and_maps() {
     for (name, intrinsic) in [
         ("collections::array_push", Intrinsic::ArrayPush),
         ("collections::array_pop", Intrinsic::ArrayPop),
+        ("collections::array_reserve", Intrinsic::ArrayReserve),
+        ("collections::array_clear", Intrinsic::ArrayClear),
+        (
+            "collections::array_shrink_to_fit",
+            Intrinsic::ArrayShrinkToFit,
+        ),
         ("collections::map_insert", Intrinsic::MapInsert),
         ("collections::map_remove", Intrinsic::MapRemove),
     ] {
