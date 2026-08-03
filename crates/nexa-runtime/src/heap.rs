@@ -1366,6 +1366,10 @@ pub struct Heap {
     /// sweep, host rollback, array regrow, map rehash). Full collection
     /// re-derives it in debug builds to pin the gauge against drift.
     live_payload_bytes: u64,
+    /// Exact O(1) object population. Empty slots whose generation is
+    /// exhausted cannot be inferred from `slots.len() - free.len()`, so every
+    /// object commit and release updates this gauge directly.
+    live_objects: usize,
     /// G6 admission ceiling over `live_payload_bytes`; `u64::MAX` keeps
     /// every existing constructor unlimited.
     max_heap_bytes: u64,
@@ -1395,6 +1399,7 @@ pub(crate) struct HeapCheckpoint {
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
     collection_elements_used: usize,
+    live_objects: usize,
 }
 
 impl Heap {
@@ -1452,6 +1457,7 @@ impl Heap {
             host_staging: self.host_staging.clone(),
             host_transaction_active: self.host_transaction_active,
             collection_elements_used: self.collection_elements_used,
+            live_objects: self.live_objects,
         }
     }
 
@@ -1488,6 +1494,12 @@ impl Heap {
         restore_reserved_vec(&mut self.host_staging, checkpoint.host_staging);
         self.host_transaction_active = checkpoint.host_transaction_active;
         self.collection_elements_used = checkpoint.collection_elements_used;
+        self.live_objects = checkpoint.live_objects;
+        debug_assert_eq!(
+            self.live_objects,
+            self.recompute_live_objects(),
+            "checkpoint live object gauge drifted from restored slots"
+        );
         // G6: the restored object population owns a different footprint;
         // re-derive the gauge from the ground truth walk.
         self.live_payload_bytes = self.recompute_live_payload_bytes();
@@ -1558,6 +1570,7 @@ impl Heap {
             gc_bytes_reclaimed: 0,
             last_cycle_bytes_reclaimed: 0,
             live_payload_bytes: 0,
+            live_objects: 0,
             max_heap_bytes: u64::MAX,
         }
     }
@@ -1947,6 +1960,10 @@ impl Heap {
             .remaining
             .checked_sub(1)
             .expect("heap allocation was preflighted");
+        self.live_objects = self
+            .live_objects
+            .checked_add(1)
+            .expect("live objects cannot exceed the u32 heap limit");
         self.counters.object_allocations = self.counters.object_allocations.saturating_add(1);
         // G6: the commit funnel is the single charge point for every fresh
         // object's out-of-slot footprint; later growth (array regrow, map
@@ -2597,6 +2614,10 @@ impl Heap {
                 .filter(|slot| slot.generation == reference.generation)
                 .and_then(|slot| slot.object.take());
             if let Some(object) = object {
+                self.live_objects = self
+                    .live_objects
+                    .checked_sub(1)
+                    .expect("a staged object was counted as live");
                 // G6: staged objects vanish outside the sweep, so their
                 // footprint leaves the gauge here. Every collection now owns
                 // one typed extent; committed staged objects release that
@@ -4918,6 +4939,10 @@ impl Heap {
                     .then(|| slot.object.take().expect("presence checked"))
             };
             if let Some(object) = condemned {
+                self.live_objects = self
+                    .live_objects
+                    .checked_sub(1)
+                    .expect("a condemned object was counted as live");
                 // G4: payload bytes are measured before the drop; the slot
                 // header stays pool-owned and is not "released".
                 bytes_reclaimed =
@@ -4939,6 +4964,11 @@ impl Heap {
             self.live_payload_bytes,
             self.recompute_live_payload_bytes(),
             "the live payload gauge drifted from ground truth"
+        );
+        debug_assert_eq!(
+            self.live_objects,
+            self.recompute_live_objects(),
+            "the live object gauge drifted from ground truth"
         );
         Ok(CollectionStats {
             marked,
@@ -5008,6 +5038,13 @@ impl Heap {
             .filter_map(|slot| slot.object.as_ref())
             .map(|object| self.object_payload_bytes(object))
             .fold(0, u64::saturating_add)
+    }
+
+    fn recompute_live_objects(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|slot| slot.object.is_some())
+            .count()
     }
 
     /// Current incremental phase (G1); `Idle` outside an active cycle.
@@ -5128,6 +5165,10 @@ impl Heap {
                         .then(|| slot.object.take().expect("presence checked"))
                 };
                 if let Some(object) = condemned {
+                    self.live_objects = self
+                        .live_objects
+                        .checked_sub(1)
+                        .expect("a condemned object was counted as live");
                     // G4: measured before the drop, mirroring the full
                     // collection path byte for byte.
                     payload = self.release_object_storage(&object);
@@ -5147,6 +5188,11 @@ impl Heap {
             // reported for this step.
             self.release_live_payload(report.bytes_reclaimed);
             if self.gc_sweep_cursor >= self.slots.len() {
+                debug_assert_eq!(
+                    self.live_objects,
+                    self.recompute_live_objects(),
+                    "the incremental live object gauge drifted from ground truth"
+                );
                 report.completed = Some(CollectionStats {
                     marked: self.gc_marked,
                     reclaimed: self.gc_reclaimed,
@@ -5455,11 +5501,8 @@ impl Heap {
     }
 
     #[must_use]
-    pub fn live_len(&self) -> usize {
-        self.slots
-            .iter()
-            .filter(|slot| slot.object.is_some())
-            .count()
+    pub const fn live_len(&self) -> usize {
+        self.live_objects
     }
 
     #[cfg(any(test, feature = "model-adapter"))]
@@ -5786,6 +5829,24 @@ mod tests {
         };
         assert_eq!(heap.collect(&roots).unwrap().live, 1);
         assert!(heap.resolve(waiting).is_ok());
+    }
+
+    #[test]
+    fn live_object_gauge_excludes_generation_exhausted_slots() {
+        let mut heap = Heap::new(1);
+        let value = heap.allocate(Object::String("retired".into())).unwrap();
+        heap.slots[value.index as usize].generation = u32::MAX;
+        let stats = heap.collect(&GcRoots::default()).unwrap();
+        assert_eq!(stats.live, 0);
+        assert_eq!(heap.live_len(), 0);
+        assert!(
+            heap.free.is_empty(),
+            "an exhausted slot cannot return to the reusable free list"
+        );
+        assert_eq!(
+            heap.allocate(Object::String("replacement".into())),
+            Err(HeapError::CapacityExhausted)
+        );
     }
 
     #[test]
