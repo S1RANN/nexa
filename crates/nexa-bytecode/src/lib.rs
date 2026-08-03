@@ -1022,6 +1022,14 @@ pub enum Instruction {
         dst: u16,
         source: u16,
     },
+    /// Copies one verifier-typed logical value across its complete,
+    /// contiguous physical slot range. `slots` must equal the authoritative
+    /// `ValueLayout::physical_slots` for the source type.
+    CopyValue {
+        dst: u16,
+        source: u16,
+        slots: u16,
+    },
     Add {
         dst: u16,
         lhs: u16,
@@ -3356,6 +3364,12 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, dst);
             put_u16(output, source);
         }
+        Instruction::CopyValue { dst, source, slots } => {
+            output.push(110);
+            put_u16(output, dst);
+            put_u16(output, source);
+            put_u16(output, slots);
+        }
         Instruction::Add { dst, lhs, rhs }
         | Instruction::Sub { dst, lhs, rhs }
         | Instruction::Mul { dst, lhs, rhs }
@@ -3970,6 +3984,11 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
         2 => Instruction::Move {
             dst: reader.u16()?,
             source: reader.u16()?,
+        },
+        110 => Instruction::CopyValue {
+            dst: reader.u16()?,
+            source: reader.u16()?,
+            slots: reader.u16()?,
         },
         opcode @ (3..=6 | 95..=98) => {
             let dst = reader.u16()?;
@@ -6034,6 +6053,11 @@ mod tests {
                 field: x,
                 value: 3,
                 dst: 4,
+            })
+            .emit(Instruction::CopyValue {
+                dst: 2,
+                source: 4,
+                slots: 2,
             })
             .emit(Instruction::StructEqual {
                 lhs: 2,

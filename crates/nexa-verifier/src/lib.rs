@@ -594,10 +594,14 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     let immediate_closure = immediate_call_closure(&module);
     let restricted_closure = restricted_effect_call_closure(&module);
     let mut resolved_operands = Vec::with_capacity(module.functions.len());
+    let physical = PhysicalVerificationContext {
+        layouts: &layout_table,
+        module_abi: &module_abi,
+    };
     for (index, function) in module.functions.iter().enumerate() {
         resolved_operands.push(verify_function(
             &module,
-            &module_abi,
+            physical,
             index,
             function,
             limits,
@@ -1464,10 +1468,16 @@ fn resolve_state_field(
     Some((type_index, field_index, sorted_index, field.ty))
 }
 
+#[derive(Clone, Copy)]
+struct PhysicalVerificationContext<'module> {
+    layouts: &'module nexa_bytecode::layout::LayoutTable,
+    module_abi: &'module nexa_bytecode::layout::ModuleAbi,
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
-    module_abi: &nexa_bytecode::layout::ModuleAbi,
+    physical: PhysicalVerificationContext<'_>,
     function_index: usize,
     function: &Function,
     limits: VerifierLimits,
@@ -1490,7 +1500,8 @@ fn verify_function(
     }
     verify_loop_bounds(function_index, function, limits)?;
     let register_count = usize::from(function.registers);
-    let function_abi = module_abi
+    let function_abi = physical
+        .module_abi
         .function(function_index)
         .ok_or_else(|| error(None, VerifyErrorKind::InvalidPhysicalAbi))?;
     if usize::from(function_abi.parameter_slots) > register_count {
@@ -1636,6 +1647,52 @@ fn verify_function(
                 let ty =
                     state[source].ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
                 state[register(dst)?] = Some(ty);
+            }
+            Instruction::CopyValue { dst, source, slots } => {
+                let source_index = register(source)?;
+                let ty = state[source_index]
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                let layout = physical
+                    .layouts
+                    .layout_of(ty)
+                    .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                if slots != layout.physical_slots || slots < 2 {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                let source_end = source
+                    .checked_add(slots)
+                    .filter(|end| *end <= function.registers)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::RegisterOutOfRange(source)))?;
+                let destination_end = dst
+                    .checked_add(slots)
+                    .filter(|end| *end <= function.registers)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst)))?;
+                if (source + 1..source_end).any(|slot| state[usize::from(slot)].is_some()) {
+                    return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                }
+                let destination_start = usize::from(dst);
+                let destination_end = usize::from(destination_end);
+                for (base, existing) in state.iter().copied().enumerate() {
+                    let Some(existing) = existing else {
+                        continue;
+                    };
+                    let existing_slots = usize::from(
+                        physical
+                            .layouts
+                            .layout_of(existing)
+                            .map_err(|_| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?
+                            .physical_slots,
+                    );
+                    let existing_end = base
+                        .checked_add(existing_slots)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                    let overlaps = base < destination_end && destination_start < existing_end;
+                    if overlaps && base != destination_start {
+                        return Err(error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi));
+                    }
+                }
+                state[destination_start..destination_end].fill(None);
+                state[usize::from(dst)] = Some(ty);
             }
             Instruction::Add { dst, lhs, rhs }
             | Instruction::Sub { dst, lhs, rhs }
@@ -1822,7 +1879,8 @@ fn verify_function(
                     .functions
                     .get(callee_index)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::FunctionOutOfRange(callee)))?;
-                let callee_abi = module_abi
+                let callee_abi = physical
+                    .module_abi
                     .function(callee_index)
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
                 if (immediate_context
@@ -2984,6 +3042,7 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
     };
     match instruction {
         Instruction::Move { source, .. }
+        | Instruction::CopyValue { source, .. }
         | Instruction::StringLen { source, .. }
         | Instruction::StringByteLen { source, .. }
         | Instruction::StringHash { source, .. }
@@ -3174,6 +3233,7 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::LoadRune { dst, .. }
         | Instruction::LoadString { dst, .. }
         | Instruction::Move { dst, .. }
+        | Instruction::CopyValue { dst, .. }
         | Instruction::Add { dst, .. }
         | Instruction::Sub { dst, .. }
         | Instruction::Mul { dst, .. }
@@ -3948,8 +4008,7 @@ mod tests {
         ResolvedNominalOperand, VerifierLimits, VerifyErrorKind, verify, verify_reload_transition,
     };
 
-    #[test]
-    fn verified_module_owns_the_exact_physical_layout_and_function_abi() {
+    fn physical_record_module() -> (StableId, Module) {
         let record = StableId::from_name("PhysicalRecord");
         let mut module = ModuleBuilder::new();
         module.struct_type(StructType {
@@ -3970,14 +4029,32 @@ mod tests {
                 parameters: vec![ValueType::Named(record)],
                 result: Some(ValueType::Named(record)),
             },
-            2,
+            4,
         );
         identity
             .parameter_slots(2)
             .set_root(0)
-            .expect("legacy aggregate register is rooted")
-            .emit(Instruction::Return { source: 0 });
-        module.function(identity.finish().expect("identity function"));
+            .expect("aggregate parameter is rooted")
+            .set_root(2)
+            .expect("aggregate result is rooted")
+            .emit(Instruction::CopyValue {
+                dst: 2,
+                source: 0,
+                slots: 2,
+            })
+            .emit(Instruction::Return { source: 2 });
+        let mut identity = identity.finish().expect("identity function");
+        identity.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false, false, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![false, false, true, false],
+            },
+        ];
+        module.function(identity);
         let mut wrapper = FunctionBuilder::new(
             Signature {
                 parameters: vec![ValueType::Named(record)],
@@ -4010,9 +4087,13 @@ mod tests {
             },
         ];
         module.function(wrapper);
+        (record, module.finish())
+    }
 
-        let verified =
-            verify(module.finish(), VerifierLimits::default()).expect("verified physical module");
+    #[test]
+    fn verified_module_owns_the_exact_physical_layout_and_function_abi() {
+        let (record, module) = physical_record_module();
+        let verified = verify(module, VerifierLimits::default()).expect("verified physical module");
         let layout = verified
             .layout_table()
             .layout_of(ValueType::Named(record))
@@ -4026,13 +4107,22 @@ mod tests {
         assert_eq!(
             verified.resolved_operand(1, 0),
             ResolvedNominalOperand::CallFrame {
-                register_count: 2,
+                register_count: 4,
                 parameter_slots: 2,
                 result_slots: 2,
             }
         );
         let mut forged = verified.module().clone();
         forged.functions[0].parameter_slots = 1;
+        assert_eq!(
+            verify(forged, VerifierLimits::default()).unwrap_err().kind,
+            VerifyErrorKind::InvalidPhysicalAbi
+        );
+        let mut forged = verified.module().clone();
+        let Instruction::CopyValue { slots, .. } = &mut forged.functions[0].code[0] else {
+            unreachable!("identity starts with CopyValue")
+        };
+        *slots = 1;
         assert_eq!(
             verify(forged, VerifierLimits::default()).unwrap_err().kind,
             VerifyErrorKind::InvalidPhysicalAbi

@@ -1,6 +1,6 @@
 bytecode_version=7
 opcode_cost_table_version=7
-entries=110
+entries=111
 index	name	table_base	effective_base	dynamic_work
 000	LoadI32	1	fixed	fixed
 001	LoadBool	1	fixed	fixed
@@ -112,5 +112,6 @@ index	name	table_base	effective_base	dynamic_work
 107	ArrayFieldGet	1	fixed	fixed
 108	ArrayPushRow	1	fixed	ceil((old_len+new_len)/8)+collection_claim_release_metadata+fields_hash
 109	StringBuild	1	fixed	parts_scan+scalar_format+ceil(output_bytes/32)*2
+110	CopyValue	1	fixed	ceil(physical_slots/8)
 runtime_transitions=1
 run_cleanup_initial_defer	sum_until_call(call:ceil((cleanup_registers+args_count)/8),other:1)

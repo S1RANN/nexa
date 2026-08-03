@@ -616,6 +616,35 @@ impl FrameArena {
         Ok(())
     }
 
+    /// Copies one complete verifier-typed value range inside the current
+    /// frame. `copy_within` gives assignment snapshot semantics even when
+    /// source and destination overlap.
+    pub(crate) fn copy_register_range(
+        &mut self,
+        source: u16,
+        destination: u16,
+        slots: u16,
+    ) -> Result<(), FrameError> {
+        let frame = *self.current()?;
+        if slots == 0
+            || source
+                .checked_add(slots)
+                .is_none_or(|end| end > frame.register_count)
+            || destination
+                .checked_add(slots)
+                .is_none_or(|end| end > frame.register_count)
+        {
+            return Err(FrameError::RegisterOutOfRange);
+        }
+        let frame_start = frame.register_start as usize;
+        let source_start = frame_start + usize::from(source);
+        let source_end = source_start + usize::from(slots);
+        let destination_start = frame_start + usize::from(destination);
+        self.registers
+            .copy_within(source_start..source_end, destination_start);
+        Ok(())
+    }
+
     pub fn frame_register(
         &self,
         frame_index: usize,

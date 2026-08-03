@@ -553,7 +553,7 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 110],
+    costs: [u16; 111],
 }
 
 static CANONICAL_OPCODE_COST_TABLE: OpcodeCostTable = OpcodeCostTable {
@@ -569,7 +569,7 @@ impl Default for OpcodeCostTable {
 
 impl OpcodeCostTable {
     /// Shared immutable v7 schedule for the overwhelmingly common canonical
-    /// runtime. Avoids copying the 110-entry table at every convenience API
+    /// runtime. Avoids copying the 111-entry table at every convenience API
     /// call while custom-version tests can still own a mutable table.
     #[must_use]
     pub const fn canonical() -> &'static Self {
@@ -2666,6 +2666,10 @@ impl CheckedInterpreter {
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
+                Instruction::CopyValue { dst, source, slots } => {
+                    continuation.arena.copy_register_range(source, dst, slots)?;
+                    increment_pc(&mut continuation.arena)?;
+                }
                 Instruction::Add { dst, lhs, rhs }
                 | Instruction::Sub { dst, lhs, rhs }
                 | Instruction::Mul { dst, lhs, rhs }
@@ -4355,6 +4359,7 @@ pub(crate) fn static_instruction_fuel(
             args_count,
             ..
         } => call_frame_attempt_fuel(module, function, args_count)?,
+        Instruction::CopyValue { slots, .. } => value_visit_fuel(u64::from(slots), 1)?,
         Instruction::EnumNew { .. } => nominal_index_lookup_fuel(nominal_shape.enum_variants)?,
         Instruction::StructGet { .. } => nominal_index_lookup_fuel(nominal_shape.struct_fields)?,
         Instruction::ClassNew { fields_count, .. } => value_visit_fuel(u64::from(fields_count), 2)?,
@@ -5749,13 +5754,13 @@ macro_rules! define_opcode_cost_schedule {
             }
         ),+ $(,)?
     ) => {
-        const DEFAULT_OPCODE_COSTS: [u16; 110] = [$($base_cost),+];
+        const DEFAULT_OPCODE_COSTS: [u16; 111] = [$($base_cost),+];
 
         /// Stable opcode display names indexed by `opcode_index` (WP15).
-        pub(crate) const OPCODE_NAMES: [&str; 110] = [$($name),+];
+        pub(crate) const OPCODE_NAMES: [&str; 111] = [$($name),+];
 
         #[cfg(test)]
-        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 110] = [
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 111] = [
             $(
                 OpcodeCostScheduleEntry {
                     index: $index,
@@ -6094,6 +6099,12 @@ define_opcode_cost_schedule! {
         base_cost: 1,
         dynamic_work: "parts_scan+scalar_format+ceil(output_bytes/32)*2"
     },
+    Instruction::CopyValue { .. } => {
+        index: 110,
+        name: "CopyValue",
+        base_cost: 1,
+        dynamic_work: "ceil(physical_slots/8)"
+    },
 }
 
 #[cfg(test)]
@@ -6179,6 +6190,15 @@ fn work() -> i32 {
             })
             .collect::<Vec<_>>();
         assert_eq!(call_slots, [2, 3]);
+        assert!(
+            module
+                .module()
+                .functions
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| matches!(instruction, Instruction::CopyValue { slots: 2, .. })),
+            "aggregate references must copy their complete physical range"
+        );
 
         let mut portable_heap = Heap::new_with_limits(64, 4_096, 64);
         let portable =
@@ -6627,7 +6647,7 @@ fn work(x: i32) -> i32 {
     #[test]
     fn bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture() {
         assert_eq!(nexa_bytecode::BYTECODE_VERSION, 7);
-        assert_eq!(OPCODE_COST_SCHEDULE.len(), 110);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 111);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
         assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);

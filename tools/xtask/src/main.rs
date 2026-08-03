@@ -1606,6 +1606,15 @@ fn test_value_layout() -> Result<(), DynError> {
     cargo(&[
         "test",
         "-p",
+        "nexa-bytecode",
+        "--lib",
+        "tests::struct_metadata_and_opcodes_round_trip_in_bytecode_v7",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
         "nexa-verifier",
         "--lib",
         "tests::verified_module_owns_the_exact_physical_layout_and_function_abi",
@@ -1618,6 +1627,15 @@ fn test_value_layout() -> Result<(), DynError> {
         "nexa-runtime",
         "--lib",
         "interpreter::tests::physical_abi_scatter_preserves_aggregate_and_following_scalar_parameters",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--lib",
+        "interpreter::tests::bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture",
         "--",
         "--exact",
     ])

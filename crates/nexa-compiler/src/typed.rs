@@ -3786,13 +3786,10 @@ impl<'a> FunctionEmitter<'a> {
                     let destination = self.local(*definition)?;
                     let source = self.allocate_expression(value)?;
                     self.emit_expression(value, source)?;
-                    self.push(
-                        Instruction::Move {
-                            dst: destination,
-                            source,
-                        },
-                        self.span(&value.span)?,
-                    );
+                    let span = self.span(&value.span)?;
+                    let ty = lower_type(self.package, &value.ty, span)?;
+                    let instruction = self.copy_value_instruction(ty, destination, source, span)?;
+                    self.push(instruction, span);
                 }
                 TypedPlaceIr::Field { .. } => {
                     self.emit_assign_struct_place(target, value)?;
@@ -4175,7 +4172,7 @@ impl<'a> FunctionEmitter<'a> {
         if self.register_types.get(usize::from(updated)) != Some(&Some(root.ty())) {
             return Err(CompileError::type_mismatch(None, None, self.function_span));
         }
-        self.store_struct_place_root(root, updated);
+        self.store_struct_place_root(root, updated)?;
         Ok(())
     }
 
@@ -4337,12 +4334,15 @@ impl<'a> FunctionEmitter<'a> {
         }
     }
 
-    fn store_struct_place_root(&mut self, root: TypedStructPlaceRoot, source: u16) {
+    fn store_struct_place_root(
+        &mut self,
+        root: TypedStructPlaceRoot,
+        source: u16,
+    ) -> Result<(), CompileError> {
         let instruction = match root {
-            TypedStructPlaceRoot::Definition { register, .. } => Instruction::Move {
-                dst: register,
-                source,
-            },
+            TypedStructPlaceRoot::Definition { register, ty } => {
+                self.copy_value_instruction(ty, register, source, self.function_span)?
+            }
             TypedStructPlaceRoot::ClassField { object, field, .. } => Instruction::ClassSet {
                 source: object,
                 field,
@@ -4365,6 +4365,7 @@ impl<'a> FunctionEmitter<'a> {
             },
         };
         self.push(instruction, self.function_span);
+        Ok(())
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4381,13 +4382,9 @@ impl<'a> FunctionEmitter<'a> {
             }
             TypedExpressionKind::Reference(definition) => {
                 if let Some(source) = self.locals.get(definition).copied() {
-                    self.push(
-                        Instruction::Move {
-                            dst: destination,
-                            source,
-                        },
-                        span,
-                    );
+                    let ty = lower_type(self.package, &expression.ty, span)?;
+                    let instruction = self.copy_value_instruction(ty, destination, source, span)?;
+                    self.push(instruction, span);
                 } else if let Some(constant) = self.constants.get(definition).copied() {
                     if !self.constant_stack.insert(*definition) {
                         return Err(CompileError::invalid_effect(span));
@@ -5880,13 +5877,14 @@ impl<'a> FunctionEmitter<'a> {
                 .copied()
         {
             let source = self.inline_field_register(owner, fields_base, field, span)?;
-            self.push(
-                Instruction::Move {
-                    dst: destination,
-                    source,
-                },
-                span,
-            );
+            let (_, field_layout) = self
+                .layouts
+                .fields
+                .get(&field)
+                .ok_or_else(|| CompileError::unknown_name(self.definition_name(field), span))?;
+            let instruction =
+                self.copy_value_instruction(field_layout.ty, destination, source, span)?;
+            self.push(instruction, span);
             return Ok(());
         }
         let source = self.allocate_expression(base)?;
@@ -6331,13 +6329,9 @@ impl<'a> FunctionEmitter<'a> {
             TypedPatternKind::Wildcard => {}
             TypedPatternKind::Binding(definition) => {
                 let destination = self.local(*definition)?;
-                self.push(
-                    Instruction::Move {
-                        dst: destination,
-                        source,
-                    },
-                    span,
-                );
+                let ty = lower_type(self.package, &pattern.ty, span)?;
+                let instruction = self.copy_value_instruction(ty, destination, source, span)?;
+                self.push(instruction, span);
             }
             TypedPatternKind::Literal(literal) => {
                 let literal_register = self.allocate_expression(&TypedExpressionIr {
@@ -7102,6 +7096,21 @@ impl<'a> FunctionEmitter<'a> {
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
         self.register_types.push(Some(ty));
         Ok(register)
+    }
+
+    fn copy_value_instruction(
+        &self,
+        ty: ValueType,
+        dst: u16,
+        source: u16,
+        span: SourceSpan,
+    ) -> Result<Instruction, CompileError> {
+        let slots = self.layouts.physical_slots(ty, span)?;
+        Ok(if slots == 1 {
+            Instruction::Move { dst, source }
+        } else {
+            Instruction::CopyValue { dst, source, slots }
+        })
     }
 
     fn local(&self, definition: DefinitionId) -> Result<u16, CompileError> {
@@ -8009,6 +8018,7 @@ fn rewrite_emitted_source(instruction: &mut Instruction, from: u16, to: u16) -> 
     };
     match instruction {
         Instruction::Move { source, .. }
+        | Instruction::CopyValue { source, .. }
         | Instruction::StringLen { source, .. }
         | Instruction::StringByteLen { source, .. }
         | Instruction::StringHash { source, .. }
@@ -8164,6 +8174,7 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
     };
     match instruction {
         Instruction::Move { source, .. }
+        | Instruction::CopyValue { source, .. }
         | Instruction::StringLen { source, .. }
         | Instruction::StringByteLen { source, .. }
         | Instruction::StringHash { source, .. }
@@ -8346,6 +8357,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::LoadRune { dst, .. }
         | Instruction::LoadString { dst, .. }
         | Instruction::Move { dst, .. }
+        | Instruction::CopyValue { dst, .. }
         | Instruction::Add { dst, .. }
         | Instruction::Sub { dst, .. }
         | Instruction::Mul { dst, .. }
