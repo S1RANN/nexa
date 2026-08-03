@@ -825,6 +825,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "the cached pipeline case must exercise the hit path"
     );
 
+    // Stage I (WP93-95/WP98): the warm disk-artifact path. Each sample is
+    // one key hash + disk read + length/hash integrity check + wire decode
+    // + full re-verification + predecode + run - the cold-start shape of a
+    // standalone launch that finds a valid artifact on disk.
+    let artifact_directory = std::env::temp_dir().join(format!(
+        "nexa-bench-artifact-{}-{process_index}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&artifact_directory);
+    let artifact_cache = nexa_compiler::cache::ArtifactCache::new(&artifact_directory, u64::MAX)
+        .expect("benchmark artifact cache opens");
+    cases.push(bench(
+        "product_disk_cached_pipeline",
+        "product",
+        samples,
+        || (),
+        |()| {
+            let verified = artifact_cache
+                .compile(LANGUAGE_SOURCE_BASE)
+                .expect("disk-cached benchmark language compiles");
+            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+                .expect("disk-cached benchmark language predecodes");
+            let mut heap = Heap::new_with_limits(64, 4_096, 64);
+            run_returned(
+                &verified,
+                &rows,
+                0,
+                &[RuntimeValue::I32(41)],
+                &mut heap,
+                256,
+                &mut None,
+            )
+        },
+    ));
+    assert!(
+        artifact_cache.stats().hits > 0,
+        "the disk-cached pipeline case must exercise the hit path"
+    );
+    assert_eq!(
+        artifact_cache.stats().discarded,
+        0,
+        "the disk-cached pipeline case must never discard entries"
+    );
+    let _ = std::fs::remove_dir_all(&artifact_directory);
+
     let fast = fast_module();
     let snapshot_host = RuntimeHost::new(4_096);
     let mut snapshot_realm = RealmRuntime::hosted(
