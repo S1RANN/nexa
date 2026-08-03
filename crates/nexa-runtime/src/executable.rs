@@ -20,7 +20,7 @@ use nexa_verifier::{ResolvedNominalOperand, VerifiedModule};
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 
 static NEXT_STRING_POOL_ID: AtomicU64 = AtomicU64::new(1);
-const STATIC_LEAF_MAX_INSTRUCTIONS: usize = 16;
+const STATIC_LEAF_MAX_INSTRUCTIONS: usize = 24;
 
 #[derive(Clone, Debug)]
 pub struct PooledStringConstant {
@@ -53,6 +53,10 @@ pub struct ExecutableInstruction {
 #[derive(Clone, Debug)]
 pub struct ExecutableFunction {
     rows: Vec<ExecutableInstruction>,
+    /// Process-local identity of the verifier-owned instruction backing used
+    /// to build these rows. It prevents a direct caller from pairing a valid
+    /// certificate with a different same-shaped module.
+    code_identity: usize,
     /// Load-time proof for the bounded static leaf executor.
     /// `None` keeps the full continuation interpreter as the only path.
     static_leaf: Option<StaticLeafCertificate>,
@@ -66,6 +70,8 @@ pub(crate) struct StaticLeafCertificate {
     pub buffer_copy: Option<StaticLeafBufferCopy>,
     pub buffer_get: Option<StaticLeafBufferGet>,
     pub buffer_work_fuel: u64,
+    pub map_sets: u8,
+    pub map_lookups: u8,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -84,6 +90,18 @@ pub(crate) struct StaticLeafBufferGet {
 }
 
 impl ExecutableFunction {
+    fn new(
+        function: &nexa_bytecode::Function,
+        rows: Vec<ExecutableInstruction>,
+        static_leaf: Option<StaticLeafCertificate>,
+    ) -> Self {
+        Self {
+            rows,
+            code_identity: function.code.as_ptr() as usize,
+            static_leaf,
+        }
+    }
+
     #[must_use]
     pub fn rows(&self) -> &[ExecutableInstruction] {
         &self.rows
@@ -99,6 +117,10 @@ impl ExecutableFunction {
 
     pub(crate) const fn static_leaf_certificate(&self) -> Option<StaticLeafCertificate> {
         self.static_leaf
+    }
+
+    pub(crate) const fn code_identity(&self) -> usize {
+        self.code_identity
     }
 }
 
@@ -261,7 +283,7 @@ impl ExecutableModule {
                 });
             }
             let static_leaf = certify_static_leaf(function, &rows);
-            functions.push(ExecutableFunction { rows, static_leaf });
+            functions.push(ExecutableFunction::new(function, rows, static_leaf));
         }
         Ok(Self {
             functions,
@@ -313,12 +335,19 @@ struct StaticLeafAnalysis {
     // Original argument register for buffers; moves retain the origin so
     // preflight never needs to inspect an uninitialized temporary register.
     buffer_value: [Option<u16>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    // Identity for maps allocated inside the leaf. Argument maps are never
+    // admitted because their shape cannot be proven at load time.
+    local_map: [Option<u8>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
     next_array: u8,
+    next_map: u8,
     array_pushes: u8,
     array_push_element_fuel: u64,
     buffer_copy: Option<StaticLeafBufferCopy>,
     buffer_get: Option<StaticLeafBufferGet>,
     buffer_work_fuel: u64,
+    map_sets: u8,
+    map_lookups: u8,
+    saw_control_flow: bool,
 }
 
 impl StaticLeafAnalysis {
@@ -332,12 +361,17 @@ impl StaticLeafAnalysis {
             local_array: [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
             i32_constant: [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
             buffer_value,
+            local_map: [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
             next_array: 0,
+            next_map: 0,
             array_pushes: 0,
             array_push_element_fuel: 0,
             buffer_copy: None,
             buffer_get: None,
             buffer_work_fuel: 0,
+            map_sets: 0,
+            map_lookups: 0,
+            saw_control_flow: false,
         })
     }
 
@@ -346,10 +380,18 @@ impl StaticLeafAnalysis {
         *self.local_array.get_mut(usize::from(dst))? = None;
         *self.i32_constant.get_mut(usize::from(dst))? = None;
         *self.buffer_value.get_mut(usize::from(dst))? = None;
+        *self.local_map.get_mut(usize::from(dst))? = None;
         Some(())
     }
 
     fn observe(&mut self, instruction: Instruction) -> Option<()> {
+        // Once paths split, only scalar/enum control-tail operations remain
+        // admissible. This deliberately avoids pretending that a linear
+        // provenance walk can prove a class/array/map created on just one
+        // side of a branch.
+        if self.saw_control_flow && !static_leaf_control_tail_instruction(instruction) {
+            return None;
+        }
         match instruction {
             instruction @ (Instruction::ClassNew { .. }
             | Instruction::ClassGet { .. }
@@ -362,6 +404,9 @@ impl StaticLeafAnalysis {
             instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
                 self.observe_buffer(instruction)
             }
+            instruction @ (Instruction::MapNew { .. }
+            | Instruction::MapSet { .. }
+            | Instruction::MapGet { .. }) => self.observe_map(instruction),
             Instruction::Move { dst, source } => {
                 *self.local_class.get_mut(usize::from(dst))? =
                     *self.local_class.get(usize::from(source))?;
@@ -371,6 +416,8 @@ impl StaticLeafAnalysis {
                     *self.i32_constant.get(usize::from(source))?;
                 *self.buffer_value.get_mut(usize::from(dst))? =
                     *self.buffer_value.get(usize::from(source))?;
+                *self.local_map.get_mut(usize::from(dst))? =
+                    *self.local_map.get(usize::from(source))?;
                 Some(())
             }
             Instruction::LoadI32 { dst, value } => {
@@ -392,8 +439,15 @@ impl StaticLeafAnalysis {
             }
             Instruction::LoadString { dst, .. }
             | Instruction::StringByteLen { dst, .. }
-            | Instruction::EnumNew { dst, .. } => self.clear_destination(dst),
-            Instruction::Return { .. } => Some(()),
+            | Instruction::EnumNew { dst, .. }
+            | Instruction::EnumTag { dst, .. }
+            | Instruction::EnumPayload { dst, .. }
+            | Instruction::CompareEq { dst, .. } => self.clear_destination(dst),
+            Instruction::Jump { .. } | Instruction::JumpIfFalse { .. } => {
+                self.saw_control_flow = true;
+                Some(())
+            }
+            Instruction::Return { .. } | Instruction::Trap => Some(()),
             _ => None,
         }
     }
@@ -516,6 +570,40 @@ impl StaticLeafAnalysis {
         Some(())
     }
 
+    fn observe_map(&mut self, instruction: Instruction) -> Option<()> {
+        match instruction {
+            Instruction::MapNew { dst, .. } => {
+                let identity = self.next_map;
+                self.next_map = self.next_map.checked_add(1)?;
+                self.clear_destination(dst)?;
+                *self.local_map.get_mut(usize::from(dst))? = Some(identity);
+            }
+            Instruction::MapSet { source, key, .. } => {
+                (*self.local_map.get(usize::from(source))?)?;
+                (*self.i32_constant.get(usize::from(key))?)?;
+                // One insertion into a fresh local table cannot enter the
+                // incremental rehash protocol on admitted heap shapes.
+                if self.map_sets != 0 {
+                    return None;
+                }
+                self.map_sets = 1;
+            }
+            Instruction::MapGet {
+                source, key, dst, ..
+            } => {
+                (*self.local_map.get(usize::from(source))?)?;
+                (*self.i32_constant.get(usize::from(key))?)?;
+                if self.map_lookups != 0 {
+                    return None;
+                }
+                self.map_lookups = 1;
+                self.clear_destination(dst)?;
+            }
+            _ => unreachable!("map analysis receives only map instructions"),
+        }
+        Some(())
+    }
+
     const fn finish(self, fixed_fuel: u64) -> StaticLeafCertificate {
         StaticLeafCertificate {
             fixed_fuel,
@@ -524,6 +612,8 @@ impl StaticLeafAnalysis {
             buffer_copy: self.buffer_copy,
             buffer_get: self.buffer_get,
             buffer_work_fuel: self.buffer_work_fuel,
+            map_sets: self.map_sets,
+            map_lookups: self.map_lookups,
         }
     }
 }
@@ -538,9 +628,16 @@ fn certify_static_leaf(
         return None;
     }
     let mut analysis = StaticLeafAnalysis::new(function.signature.parameters.len())?;
-    for instruction in function.code.iter().copied() {
+    for (pc, instruction) in function.code.iter().copied().enumerate() {
         if !static_leaf_instruction_supported(instruction) {
             return None;
+        }
+        if let Instruction::Jump { target } | Instruction::JumpIfFalse { target, .. } = instruction
+        {
+            let target = usize::try_from(target).ok()?;
+            if target <= pc || target >= function.code.len() {
+                return None;
+            }
         }
         analysis.observe(instruction)?;
     }
@@ -557,8 +654,13 @@ const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {
             | Instruction::LoadString { .. }
             | Instruction::Move { .. }
             | Instruction::Add { .. }
+            | Instruction::CompareEq { .. }
+            | Instruction::Jump { .. }
+            | Instruction::JumpIfFalse { .. }
             | Instruction::StringByteLen { .. }
             | Instruction::EnumNew { .. }
+            | Instruction::EnumTag { .. }
+            | Instruction::EnumPayload { .. }
             | Instruction::ClassNew { .. }
             | Instruction::ClassGet { .. }
             | Instruction::ClassSet { .. }
@@ -567,9 +669,31 @@ const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {
             | Instruction::ArraySet { .. }
             | Instruction::ArrayGet { .. }
             | Instruction::ArrayLen { .. }
+            | Instruction::MapNew { .. }
+            | Instruction::MapSet { .. }
+            | Instruction::MapGet { .. }
             | Instruction::BufferCopy { .. }
             | Instruction::BufferGet { .. }
             | Instruction::Return { .. }
+            | Instruction::Trap
+    )
+}
+
+const fn static_leaf_control_tail_instruction(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::LoadI32 { .. }
+            | Instruction::LoadString { .. }
+            | Instruction::Move { .. }
+            | Instruction::Add { .. }
+            | Instruction::CompareEq { .. }
+            | Instruction::Jump { .. }
+            | Instruction::JumpIfFalse { .. }
+            | Instruction::StringByteLen { .. }
+            | Instruction::EnumTag { .. }
+            | Instruction::EnumPayload { .. }
+            | Instruction::Return { .. }
+            | Instruction::Trap
     )
 }
 
@@ -782,7 +906,7 @@ fn update_counter() -> i32 {
     }
 
     #[test]
-    fn static_leaf_instruction_surface_is_narrow() {
+    fn static_leaf_scalar_and_control_instruction_surface_is_narrow() {
         for instruction in [
             Instruction::LoadI32 { dst: 0, value: 7 },
             Instruction::LoadString { dst: 0, string: 0 },
@@ -792,6 +916,16 @@ fn update_counter() -> i32 {
                 lhs: 0,
                 rhs: 1,
             },
+            Instruction::CompareEq {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Instruction::Jump { target: 1 },
+            Instruction::JumpIfFalse {
+                condition: 0,
+                target: 1,
+            },
             Instruction::StringByteLen { dst: 1, source: 0 },
             Instruction::EnumNew {
                 type_id: StableId(1),
@@ -799,6 +933,49 @@ fn update_counter() -> i32 {
                 payload: Some(0),
                 dst: 1,
             },
+            Instruction::EnumTag { source: 0, dst: 1 },
+            Instruction::EnumPayload {
+                source: 0,
+                variant: StableId(8),
+                dst: 1,
+            },
+            Instruction::Return { source: 0 },
+            Instruction::Trap,
+        ] {
+            assert!(
+                static_leaf_instruction_supported(instruction),
+                "certified leaf instruction: {instruction:?}"
+            );
+        }
+        for instruction in [
+            Instruction::Div {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Instruction::Call {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            },
+            Instruction::DeferPush {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+            },
+            Instruction::Yield,
+        ] {
+            assert!(
+                !static_leaf_instruction_supported(instruction),
+                "effectful, suspending, or unbounded instruction: {instruction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_leaf_collection_instruction_surface_is_narrow() {
+        for instruction in [
             Instruction::ClassNew {
                 type_id: StableId(3),
                 fields_base: 0,
@@ -834,6 +1011,21 @@ fn update_counter() -> i32 {
                 dst: 2,
             },
             Instruction::ArrayLen { source: 0, dst: 1 },
+            Instruction::MapNew {
+                type_id: StableId(6),
+                dst: 0,
+            },
+            Instruction::MapSet {
+                source: 0,
+                key: 1,
+                value: 2,
+            },
+            Instruction::MapGet {
+                source: 0,
+                key: 1,
+                result_type: StableId(7),
+                dst: 2,
+            },
             Instruction::BufferCopy {
                 destination: 0,
                 source: 1,
@@ -846,36 +1038,10 @@ fn update_counter() -> i32 {
                 index: 1,
                 dst: 2,
             },
-            Instruction::Return { source: 0 },
         ] {
             assert!(
                 static_leaf_instruction_supported(instruction),
                 "certified leaf instruction: {instruction:?}"
-            );
-        }
-        for instruction in [
-            Instruction::Div {
-                dst: 2,
-                lhs: 0,
-                rhs: 1,
-            },
-            Instruction::Trap,
-            Instruction::Call {
-                function: 0,
-                args_base: 0,
-                args_count: 0,
-                dst: 0,
-            },
-            Instruction::DeferPush {
-                function: 0,
-                args_base: 0,
-                args_count: 0,
-            },
-            Instruction::Yield,
-        ] {
-            assert!(
-                !static_leaf_instruction_supported(instruction),
-                "effectful, trapping, or control-flow instruction: {instruction:?}"
             );
         }
     }
@@ -887,11 +1053,11 @@ fn update_counter() -> i32 {
                 parameters: vec![],
                 result: Some(ValueType::I32),
             },
-            17,
+            25,
         );
         function
-            .emit(Instruction::LoadI32 { dst: 16, value: 7 })
-            .emit(Instruction::Return { source: 16 });
+            .emit(Instruction::LoadI32 { dst: 24, value: 7 })
+            .emit(Instruction::Return { source: 24 });
         let mut builder = ModuleBuilder::new();
         builder.metadata(
             StableId::from_name("static-leaf-register-bound"),

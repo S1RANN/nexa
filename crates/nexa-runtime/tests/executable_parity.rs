@@ -261,6 +261,22 @@ fn leaf_buffer(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
 fn not_a_leaf(lhs: i32, rhs: i32) -> i32 {
     return lhs / rhs;
 }
+fn leaf_map_hit() -> i32 {
+    let values: Map<i32, string> = Map::new();
+    values.set(1, "one");
+    return match values.get(1) {
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
+    };
+}
+fn leaf_map_miss() -> i32 {
+    let values: Map<i32, string> = Map::new();
+    values.set(1, "one");
+    return match values.get(2) {
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
+    };
+}
 "#;
 
 fn run_executable_once(
@@ -361,6 +377,14 @@ fn assert_static_leaf_certification(module: &VerifiedModule, executable: &Execut
         None,
         "division retains the full trapping interpreter"
     );
+    assert!(
+        executable.functions()[9].static_leaf_fuel().is_some(),
+        "one-entry local map hit is certified"
+    );
+    assert!(
+        executable.functions()[10].static_leaf_fuel().is_some(),
+        "one-entry local map miss is certified"
+    );
 }
 
 fn assert_static_leaf_case(
@@ -384,6 +408,12 @@ fn assert_static_leaf_case(
     )
     .expect("static leaf executes")
     .expect("function is certified");
+    let leaf_value = leaf
+        .result
+        .as_ref()
+        .expect("certified leaf returns rather than traps")
+        .as_ref()
+        .copied();
 
     assert_eq!(
         leaf.charge, reference_charge,
@@ -391,7 +421,7 @@ fn assert_static_leaf_case(
     );
     assert_eq!(leaf.fuel, reference_fuel, "identical fuel settlement");
     assert_eq!(
-        leaf.value.map(|value| value_shape(&leaf_heap, value)),
+        leaf_value.map(|value| value_shape(&leaf_heap, value)),
         reference_value.map(|value| value_shape(&reference_heap, value)),
         "identical returned value shape"
     );
@@ -451,7 +481,12 @@ fn assert_static_buffer_leaf_case(module: &VerifiedModule, executable: &Executab
     )
     .expect("buffer leaf executes")
     .expect("buffer leaf is certified and in bounds");
-    assert_eq!(leaf.value, reference_value);
+    assert_eq!(
+        leaf.result
+            .as_ref()
+            .expect("buffer leaf returns rather than traps"),
+        &reference_value
+    );
     assert_eq!(leaf.charge, reference_charge);
     assert_eq!(leaf.fuel, reference_fuel);
     assert_eq!(
@@ -472,6 +507,8 @@ fn certified_static_leaves_match_full_execution_exactly() {
         (2, vec![RuntimeValue::I32(9)]),
         (3, vec![]),
         (5, vec![]),
+        (9, vec![]),
+        (10, vec![]),
     ] {
         assert_static_leaf_case(&module, &executable, function, &arguments);
     }

@@ -1502,6 +1502,7 @@ fn run_static_leaf_ab(
         ("class_allocation", 6, vec![]),
         ("enum_match", 7, vec![]),
         ("array_operations", 8, vec![]),
+        ("map_operations", 9, vec![]),
         ("buffer_copy", 10, vec![]),
     ];
     let mut reports = Vec::with_capacity(cases.len());
@@ -1694,7 +1695,7 @@ fn run_returned(
     // continuation storage cycles through `pool` exactly like realm task
     // admission, so steady-state samples measure execution, not arena
     // reservation; cold-start cases pass a fresh empty pool on purpose.
-    if let Some(returned) = CheckedInterpreter::try_run_static_leaf(
+    if let Some(outcome) = CheckedInterpreter::try_run_static_leaf(
         module,
         function,
         arguments,
@@ -1705,8 +1706,12 @@ fn run_returned(
     )
     .expect("verified static benchmark leaf")
     {
-        black_box(returned.value);
-        return observation(returned.charge, heap);
+        black_box(
+            outcome
+                .result
+                .expect("static benchmark leaf must return rather than trap"),
+        );
+        return observation(outcome.charge, heap);
     }
     run_returned_full(module, executable, function, arguments, heap, fuel, pool)
 }

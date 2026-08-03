@@ -2881,7 +2881,7 @@ impl RealmRuntime {
         let verified = Arc::clone(&loaded.verified);
         let executable = Arc::clone(&loaded.executable);
         let limits = crate::TaskLimits::default();
-        if let Some(returned) = crate::CheckedInterpreter::try_run_static_leaf(
+        if let Some(outcome) = crate::CheckedInterpreter::try_run_static_leaf(
             &verified,
             function,
             &values,
@@ -2892,10 +2892,15 @@ impl RealmRuntime {
         )
         .map_err(|error| crate::ScriptCallError::Runtime(error.to_string()))?
         {
-            let reader = crate::ScriptOutputReader::new(&self.heap);
-            let output =
-                E::decode_output(&reader, returned.value.unwrap_or(crate::RuntimeValue::Unit))?;
-            return Ok((output, returned.charge));
+            return match outcome.result {
+                Ok(value) => {
+                    let reader = crate::ScriptOutputReader::new(&self.heap);
+                    let output =
+                        E::decode_output(&reader, value.unwrap_or(crate::RuntimeValue::Unit))?;
+                    Ok((output, outcome.charge))
+                }
+                Err(trap) => Err(crate::ScriptCallError::HandlerTrapped(trap)),
+            };
         }
         let reservation = reservation_for_module(&verified, limits.frames);
         let continuation = crate::InterpreterContinuation::new_with_storage(

@@ -44,7 +44,7 @@ use crate::RuntimeValue;
 use crate::frame::{FrameArena, FrameError};
 use crate::interpreter::InterpreterError;
 
-pub(crate) const STATIC_LEAF_REGISTER_CAPACITY: usize = 16;
+pub(crate) const STATIC_LEAF_REGISTER_CAPACITY: usize = 24;
 pub(crate) type StaticLeafRegisters = [MaybeUninit<RuntimeValue>; STATIC_LEAF_REGISTER_CAPACITY];
 
 #[inline]

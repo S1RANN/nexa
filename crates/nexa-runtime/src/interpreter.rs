@@ -39,9 +39,9 @@ pub struct ExecutionCharge {
     pub fuel_used: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StaticLeafReturn {
-    pub value: Option<RuntimeValue>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaticLeafOutcome {
+    pub result: Result<Option<RuntimeValue>, Box<Trap>>,
     pub charge: ExecutionCharge,
     pub fuel: FuelState,
 }
@@ -310,6 +310,18 @@ impl ScriptCallStack {
         }
         stack
     }
+
+    fn from_static_leaf(module: &VerifiedModule, function: u32, pc: u32) -> Self {
+        let mut stack = Self::default();
+        stack.frames[0] = ScriptFrame {
+            function,
+            pc,
+            call_site_pc: None,
+            source_span: module.module().source_span(function, pc),
+        };
+        stack.len = 1;
+        stack
+    }
 }
 
 impl Default for ScriptCallStack {
@@ -389,6 +401,22 @@ impl Trap {
             task: None,
             script_call_stack,
             host_call_boundary: continuation.host_call_boundary,
+        }
+    }
+
+    fn from_static_leaf(module: &VerifiedModule, function: u32, pc: u32) -> Self {
+        let script_call_stack = ScriptCallStack::from_static_leaf(module, function, pc);
+        Self {
+            kind: TrapKind::BytecodeTrap,
+            message: crate::RuntimeMessage::from("bytecode trap"),
+            module: None,
+            epoch: None,
+            function,
+            pc,
+            source_span: module.module().source_span(function, pc),
+            task: None,
+            script_call_stack,
+            host_call_boundary: None,
         }
     }
 
@@ -566,6 +594,13 @@ const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
 
 pub struct CheckedInterpreter;
 
+enum StaticLeafStep {
+    Next,
+    Jump(usize),
+    Return(RuntimeValue),
+    Trap,
+}
+
 #[inline]
 fn execute_static_leaf_instruction(
     instruction: Instruction,
@@ -574,7 +609,68 @@ fn execute_static_leaf_instruction(
     module: &VerifiedModule,
     heap: &mut Heap,
     executable: &crate::executable::ExecutableModule,
-) -> Result<Option<RuntimeValue>, InterpreterError> {
+) -> Result<StaticLeafStep, InterpreterError> {
+    match instruction {
+        instruction @ (Instruction::LoadI32 { .. }
+        | Instruction::LoadString { .. }
+        | Instruction::Move { .. }
+        | Instruction::Add { .. }
+        | Instruction::StringByteLen { .. }) => {
+            execute_static_leaf_value(instruction, registers, module, heap, executable)
+        }
+        instruction @ (Instruction::CompareEq { .. }
+        | Instruction::Jump { .. }
+        | Instruction::JumpIfFalse { .. }) => execute_static_leaf_control(instruction, registers),
+        instruction @ (Instruction::EnumNew { .. }
+        | Instruction::EnumTag { .. }
+        | Instruction::EnumPayload { .. }) => {
+            execute_static_leaf_enum(instruction, registers, module, heap)
+        }
+        instruction @ (Instruction::ClassNew { .. }
+        | Instruction::ClassGet { .. }
+        | Instruction::ClassSet { .. }) => {
+            execute_static_leaf_class(instruction, row, registers, module, heap)?;
+            Ok(StaticLeafStep::Next)
+        }
+        instruction @ (Instruction::ArrayNew { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ArrayGet { .. }
+        | Instruction::ArrayLen { .. }) => {
+            execute_static_leaf_array(instruction, registers, module, heap)?;
+            Ok(StaticLeafStep::Next)
+        }
+        instruction @ (Instruction::MapNew { .. }
+        | Instruction::MapSet { .. }
+        | Instruction::MapGet { .. }) => {
+            execute_static_leaf_map(instruction, registers, module, heap)?;
+            Ok(StaticLeafStep::Next)
+        }
+        instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
+            execute_static_leaf_buffer(instruction, registers, heap)?;
+            Ok(StaticLeafStep::Next)
+        }
+        Instruction::Return { source } => Ok(StaticLeafStep::Return(
+            crate::trusted::read_static_leaf(registers, source),
+        )),
+        Instruction::Trap => Ok(StaticLeafStep::Trap),
+        _ => {
+            debug_assert!(
+                false,
+                "executable static-leaf certification and executor diverged"
+            );
+            Err(InterpreterError::TypeMismatch)
+        }
+    }
+}
+
+fn execute_static_leaf_value(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+    executable: &crate::executable::ExecutableModule,
+) -> Result<StaticLeafStep, InterpreterError> {
     match instruction {
         Instruction::LoadI32 { dst, value } => {
             crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(value));
@@ -628,6 +724,59 @@ fn execute_static_leaf_instruction(
             let length = string_length_to_i32(heap.string(reference)?.len())?;
             crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(length));
         }
+        _ => unreachable!("value leaf helper receives only value instructions"),
+    }
+    Ok(StaticLeafStep::Next)
+}
+
+fn execute_static_leaf_control(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+) -> Result<StaticLeafStep, InterpreterError> {
+    match instruction {
+        Instruction::CompareEq { dst, lhs, rhs } => {
+            let lhs = crate::trusted::read_static_leaf(registers, lhs);
+            let rhs = crate::trusted::read_static_leaf(registers, rhs);
+            if runtime_value_type(lhs).is_none()
+                || runtime_value_type(lhs) != runtime_value_type(rhs)
+            {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            crate::trusted::write_static_leaf(
+                registers,
+                dst,
+                RuntimeValue::Bool(runtime_values_equal(lhs, rhs)),
+            );
+            Ok(StaticLeafStep::Next)
+        }
+        Instruction::Jump { target } => Ok(StaticLeafStep::Jump(
+            usize::try_from(target).map_err(|_| InterpreterError::TypeMismatch)?,
+        )),
+        Instruction::JumpIfFalse { condition, target } => {
+            let RuntimeValue::Bool(condition) =
+                crate::trusted::read_static_leaf(registers, condition)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            Ok(if condition {
+                StaticLeafStep::Next
+            } else {
+                StaticLeafStep::Jump(
+                    usize::try_from(target).map_err(|_| InterpreterError::TypeMismatch)?,
+                )
+            })
+        }
+        _ => unreachable!("control leaf helper receives only control instructions"),
+    }
+}
+
+fn execute_static_leaf_enum(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+) -> Result<StaticLeafStep, InterpreterError> {
+    match instruction {
         Instruction::EnumNew {
             type_id,
             variant,
@@ -642,33 +791,24 @@ fn execute_static_leaf_instruction(
             let value = heap.allocate_enum(type_id, variant.stable_id, variant.tag, payload)?;
             crate::trusted::write_static_leaf(registers, dst, value);
         }
-        instruction @ (Instruction::ClassNew { .. }
-        | Instruction::ClassGet { .. }
-        | Instruction::ClassSet { .. }) => {
-            execute_static_leaf_class(instruction, row, registers, module, heap)?;
+        Instruction::EnumTag { source, dst } => {
+            let value = crate::trusted::read_static_leaf(registers, source);
+            let tag =
+                i32::try_from(heap.enum_tag(value)?).map_err(|_| InterpreterError::TypeMismatch)?;
+            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(tag));
         }
-        instruction @ (Instruction::ArrayNew { .. }
-        | Instruction::ArrayPush { .. }
-        | Instruction::ArraySet { .. }
-        | Instruction::ArrayGet { .. }
-        | Instruction::ArrayLen { .. }) => {
-            execute_static_leaf_array(instruction, registers, module, heap)?;
+        Instruction::EnumPayload {
+            source,
+            variant,
+            dst,
+        } => {
+            let value = crate::trusted::read_static_leaf(registers, source);
+            let payload = heap.enum_payload(value, variant)?;
+            crate::trusted::write_static_leaf(registers, dst, payload);
         }
-        instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
-            execute_static_leaf_buffer(instruction, registers, heap)?;
-        }
-        Instruction::Return { source } => {
-            return Ok(Some(crate::trusted::read_static_leaf(registers, source)));
-        }
-        _ => {
-            debug_assert!(
-                false,
-                "executable static-leaf certification and executor diverged"
-            );
-            return Err(InterpreterError::TypeMismatch);
-        }
+        _ => unreachable!("enum leaf helper receives only enum instructions"),
     }
-    Ok(None)
+    Ok(StaticLeafStep::Next)
 }
 
 fn execute_static_leaf_class(
@@ -792,6 +932,53 @@ fn execute_static_leaf_array(
     Ok(())
 }
 
+fn execute_static_leaf_map(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+) -> Result<(), InterpreterError> {
+    match instruction {
+        Instruction::MapNew { type_id, dst } => {
+            let map_type = module
+                .map_type(type_id.0)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let value = heap.allocate_map(type_id, map_type.key, map_type.value)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        Instruction::MapSet { source, key, value } => {
+            let map = crate::trusted::read_static_leaf(registers, source);
+            let key = crate::trusted::read_static_leaf(registers, key);
+            let value = crate::trusted::read_static_leaf(registers, value);
+            if heap.map_set(map, key, value)? != MapSetOutcome::Complete {
+                debug_assert!(false, "certified one-entry map unexpectedly entered rehash");
+                return Err(InterpreterError::TypeMismatch);
+            }
+        }
+        Instruction::MapGet {
+            source,
+            key,
+            result_type,
+            dst,
+        } => {
+            let map = crate::trusted::read_static_leaf(registers, source);
+            let key = crate::trusted::read_static_leaf(registers, key);
+            let mut reservation = heap.preflight(1)?;
+            let value = heap.map_get(map, key)?;
+            let (variant, tag, payload) = if let Some(value) = value {
+                (StableId::from_parts(&["Option", "::Some"]), 1, Some(value))
+            } else {
+                (StableId::from_parts(&["Option", "::None"]), 0, None)
+            };
+            let value =
+                heap.allocate_enum_reserved(&mut reservation, result_type, variant, tag, payload);
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        _ => unreachable!("map leaf helper receives only map instructions"),
+    }
+    Ok(())
+}
+
 fn execute_static_leaf_buffer(
     instruction: Instruction,
     registers: &mut crate::trusted::StaticLeafRegisters,
@@ -871,7 +1058,7 @@ fn resolved_class_field(
 fn static_leaf_upper_fuel(
     certificate: crate::executable::StaticLeafCertificate,
     heap: &Heap,
-) -> Result<u64, InterpreterError> {
+) -> Result<Option<u64>, InterpreterError> {
     let mut upper = fuel_add(
         certificate.fixed_fuel,
         fuel_add(
@@ -892,7 +1079,26 @@ fn static_leaf_upper_fuel(
             collection_arena_metadata_shape_fuel(ranges, true, true)?,
         )?;
     }
-    Ok(upper)
+    let map_attempts = u64::from(certificate.map_sets)
+        .checked_mul(2)
+        .and_then(|sets| sets.checked_add(u64::from(certificate.map_lookups)))
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    if map_attempts != 0 {
+        let slots = heap.empty_map_capacity();
+        // With fewer than two slots, even the first insertion enters the
+        // retrying rehash protocol. Keep those unusual heaps on the full
+        // interpreter before MapNew mutates them.
+        if slots < 2 {
+            return Ok(None);
+        }
+        let scan = fuel_blocks(fuel_usize(slots)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+        upper = fuel_add(
+            upper,
+            scan.checked_mul(map_attempts)
+                .ok_or(InterpreterError::FuelCostOverflow)?,
+        )?;
+    }
+    Ok(Some(upper))
 }
 
 fn static_leaf_attempt_fuel(
@@ -926,6 +1132,16 @@ fn static_leaf_attempt_fuel(
                 STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
             )?
         }
+        Instruction::MapSet { source, key, .. } => map_insert_attempt_fuel(
+            heap,
+            crate::trusted::read_static_leaf(registers, source),
+            crate::trusted::read_static_leaf(registers, key),
+        )?,
+        Instruction::MapGet { source, key, .. } => map_lookup_fuel(
+            heap,
+            crate::trusted::read_static_leaf(registers, source),
+            crate::trusted::read_static_leaf(registers, key),
+        )?,
         _ => {
             debug_assert!(false, "certified leaf dynamic-fuel surface diverged");
             return Err(InterpreterError::TypeMismatch);
@@ -1072,7 +1288,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         heap: &mut Heap,
         executable: &crate::executable::ExecutableModule,
-    ) -> Result<Option<StaticLeafReturn>, InterpreterError> {
+    ) -> Result<Option<StaticLeafOutcome>, InterpreterError> {
         if executable.cost_table_version() != costs.version {
             return Err(InterpreterError::OpcodeCostTableVersion {
                 expected: executable.cost_table_version(),
@@ -1094,10 +1310,12 @@ impl CheckedInterpreter {
         // `ExecutableModule` is normally owned beside the exact verified
         // module it was built from. Keep the fixed register kernel sound
         // even for direct callers that accidentally cross those objects:
-        // the verifier-owned function must independently fit the leaf
-        // register bank and have one bytecode row per executable row.
+        // the verifier-owned code backing must be the exact input used for
+        // certification, independently fit the leaf register bank, and have
+        // one bytecode row per executable row.
         if usize::from(function_meta.registers) > crate::trusted::STATIC_LEAF_REGISTER_CAPACITY
             || function_meta.code.len() != executable_function.rows().len()
+            || function_meta.code.as_ptr() as usize != executable_function.code_identity()
         {
             return Ok(None);
         }
@@ -1109,7 +1327,9 @@ impl CheckedInterpreter {
         if !static_leaf_buffers_valid(certificate, &registers, heap) {
             return Ok(None);
         }
-        let upper_fuel = static_leaf_upper_fuel(certificate, heap)?;
+        let Some(upper_fuel) = static_leaf_upper_fuel(certificate, heap)? else {
+            return Ok(None);
+        };
         let Some(cumulative_after_upper) = fuel.cumulative_used.checked_add(upper_fuel) else {
             return Ok(None);
         };
@@ -1133,27 +1353,43 @@ impl CheckedInterpreter {
                 .fuel_used
                 .checked_add(attempt_fuel)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-            if let Some(value) = execute_static_leaf_instruction(
+            let step = execute_static_leaf_instruction(
                 instruction,
                 *row,
                 &mut registers,
                 module,
                 heap,
                 executable,
-            )? {
-                debug_assert!(charge.fuel_used <= upper_fuel);
-                fuel.slice_remaining -= charge.fuel_used;
-                fuel.cumulative_used = fuel
-                    .cumulative_used
-                    .checked_add(charge.fuel_used)
-                    .ok_or(InterpreterError::FuelCostOverflow)?;
-                return Ok(Some(StaticLeafReturn {
-                    value: Some(value),
-                    charge,
-                    fuel,
-                }));
+            )?;
+            match step {
+                StaticLeafStep::Next => pc += 1,
+                StaticLeafStep::Jump(target) => pc = target,
+                StaticLeafStep::Return(_) | StaticLeafStep::Trap => {
+                    debug_assert!(charge.fuel_used <= upper_fuel);
+                    fuel.slice_remaining = fuel
+                        .slice_remaining
+                        .checked_sub(charge.fuel_used)
+                        .ok_or(InterpreterError::FuelCostOverflow)?;
+                    fuel.cumulative_used = fuel
+                        .cumulative_used
+                        .checked_add(charge.fuel_used)
+                        .ok_or(InterpreterError::FuelCostOverflow)?;
+                    let result = match step {
+                        StaticLeafStep::Return(value) => Ok(Some(value)),
+                        StaticLeafStep::Trap => Err(Box::new(Trap::from_static_leaf(
+                            module,
+                            function,
+                            u32::try_from(pc).map_err(|_| InterpreterError::TypeMismatch)?,
+                        ))),
+                        StaticLeafStep::Next | StaticLeafStep::Jump(_) => unreachable!(),
+                    };
+                    return Ok(Some(StaticLeafOutcome {
+                        result,
+                        charge,
+                        fuel,
+                    }));
+                }
             }
-            pc += 1;
         }
     }
 
@@ -5210,9 +5446,92 @@ mod tests {
         ensure_host_call_available, fuel_add, fuel_blocks, run_standard_intrinsic,
     };
     use crate::{
-        ContinuationReservation, FrameError, FrameLimits, GcRoots, Heap, HeapError, MapSetOutcome,
-        Object, OpcodeCostTable, RuntimeValue,
+        ContinuationReservation, ExecutableModule, FrameError, FrameLimits, GcRoots, Heap,
+        HeapError, MapSetOutcome, Object, OpcodeCostTable, RuntimeValue,
     };
+
+    #[test]
+    fn static_leaf_trap_matches_full_outcome_and_rejects_foreign_code_backing() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: Vec::new(),
+                result: Some(ValueType::I32),
+            },
+            1,
+        );
+        function.emit(Instruction::Trap);
+        let mut builder = ModuleBuilder::new();
+        builder.metadata(
+            StableId::from_name("static-leaf-trap"),
+            nexa_bytecode::StateSchema::default().fingerprint(),
+        );
+        builder.function(function.finish().expect("trap function"));
+        let module = verify(builder.finish(), VerifierLimits::default()).expect("verified trap");
+        let costs = OpcodeCostTable::canonical();
+        let executable = ExecutableModule::build(&module, costs).expect("trap executable");
+
+        let limits = FrameLimits::default();
+        let continuation = CheckedInterpreter::start(
+            &module,
+            0,
+            &[],
+            limits,
+            ContinuationReservation::for_limits(limits),
+        )
+        .expect("start full trap");
+        let mut full_heap = Heap::new_with_limits(8, 64, 8);
+        let full = CheckedInterpreter::poll_with_heap_and_executable(
+            &module,
+            continuation,
+            FuelState::new(64, 0, u64::MAX),
+            costs,
+            &mut full_heap,
+            &executable,
+        )
+        .expect("full trap executes");
+        let InterpreterOutcome::Trapped {
+            trap: full_trap,
+            charge: full_charge,
+            fuel: full_fuel,
+        } = full
+        else {
+            panic!("full trap must trap");
+        };
+
+        let mut leaf_heap = Heap::new_with_limits(8, 64, 8);
+        let leaf = CheckedInterpreter::try_run_static_leaf(
+            &module,
+            0,
+            &[],
+            FuelState::new(64, 0, u64::MAX),
+            costs,
+            &mut leaf_heap,
+            &executable,
+        )
+        .expect("leaf trap executes")
+        .expect("trap function is certified");
+        assert_eq!(*leaf.result.expect_err("leaf trap must trap"), full_trap);
+        assert_eq!(leaf.charge, full_charge);
+        assert_eq!(leaf.fuel, full_fuel);
+        assert_eq!(leaf_heap.byte_inspection(), full_heap.byte_inspection());
+
+        let foreign =
+            verify(module.module().clone(), VerifierLimits::default()).expect("foreign clone");
+        assert!(
+            CheckedInterpreter::try_run_static_leaf(
+                &foreign,
+                0,
+                &[],
+                FuelState::new(64, 0, u64::MAX),
+                costs,
+                &mut leaf_heap,
+                &executable,
+            )
+            .expect("foreign module falls back")
+            .is_none(),
+            "a same-shaped but separately verified code backing cannot reuse the certificate"
+        );
+    }
 
     /// F2: the predecoded-row path and the recompute path must charge
     /// bit-identical fuel and suspend at identical points across a

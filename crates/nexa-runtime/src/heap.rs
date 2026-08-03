@@ -4107,7 +4107,7 @@ impl Heap {
         if type_id != nexa_bytecode::map_type(key_type, value_type) {
             return Err(invalid_value_reference());
         }
-        let initial_capacity = self.max_collection_length.min(8);
+        let initial_capacity = self.empty_map_capacity();
         // G6 admission: the initial typed slot extent counts toward the ceiling.
         self.ensure_payload_headroom(
             (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64),
@@ -4197,6 +4197,15 @@ impl Heap {
             rehash_remaining,
             next_rehash_slots,
         })
+    }
+
+    #[must_use]
+    pub(crate) const fn empty_map_capacity(&self) -> usize {
+        if self.max_collection_length < 8 {
+            self.max_collection_length
+        } else {
+            8
+        }
     }
 
     pub(crate) fn map_key_fuel_shape(
