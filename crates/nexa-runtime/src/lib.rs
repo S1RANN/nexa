@@ -60,8 +60,8 @@ pub use frame::{
 };
 pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
-    CollectionStats, CollectionStorage, CollectionView, GcBudget, GcPhase, GcRef, GcRoots, Heap,
-    HeapByteInspection, HeapError, IncrementalGcReport, MapSetOutcome, Object,
+    CollectionStats, CollectionStorage, CollectionView, GcBudget, GcCycleTelemetry, GcPhase, GcRef,
+    GcRoots, Heap, HeapByteInspection, HeapError, IncrementalGcReport, MapSetOutcome, Object,
     VmAllocationCounters,
 };
 pub use host::{
@@ -97,13 +97,13 @@ pub use profiler::{
     PROFILER_SITE_CAPACITY, PerformanceProfile, TaskProfile,
 };
 pub use realm::{
-    CancelReason, CompletionDisposition, ExecutionImageCacheInspection, HostFunctionAuthorityField,
-    HostResult, ModuleHandle, ModuleLifecycle, NexaValue, RealmConfig, RealmError, RealmRuntime,
-    ReloadAccounting, RestartReloadMetrics, RestartReloadOutcome, RestartReloadPolicy,
-    RestartReloadResult, RuntimeCapacityReport, StagedCellTransaction, TaskPoll,
-    TaskTerminalReason, TaskTerminalRecord, TickBudget, TickReport, TransactionalCellCommit,
-    TransactionalCellEntrypoint, TransactionalCellFailure, TransactionalCellFailureCause,
-    TransactionalCellPoll, TransactionalCellRollback, YieldReason,
+    CancelReason, CompletionDisposition, ExecutionImageCacheInspection, GcTriggerInspection,
+    GcTriggerReasons, HostFunctionAuthorityField, HostResult, ModuleHandle, ModuleLifecycle,
+    NexaValue, RealmConfig, RealmError, RealmRuntime, ReloadAccounting, RestartReloadMetrics,
+    RestartReloadOutcome, RestartReloadPolicy, RestartReloadResult, RuntimeCapacityReport,
+    StagedCellTransaction, TaskPoll, TaskTerminalReason, TaskTerminalRecord, TickBudget,
+    TickReport, TransactionalCellCommit, TransactionalCellEntrypoint, TransactionalCellFailure,
+    TransactionalCellFailureCause, TransactionalCellPoll, TransactionalCellRollback, YieldReason,
 };
 #[cfg(any(test, feature = "model-adapter"))]
 pub use realm::{

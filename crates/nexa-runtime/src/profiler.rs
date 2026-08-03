@@ -95,12 +95,26 @@ pub struct GcProfile {
     pub full_collections: u64,
     pub incremental_steps: u64,
     pub completed_cycles: u64,
+    pub last_cycle: u64,
+    pub last_phase: crate::heap::GcPhase,
+    pub roots_scanned: u64,
     pub roots_seeded: u64,
     pub objects_marked: u64,
+    pub bytes_marked: u64,
     pub slots_swept: u64,
     pub objects_reclaimed: u64,
     pub bytes_reclaimed: u64,
+    pub barrier_writes: u64,
     pub barrier_shades: u64,
+    pub work_objects: u64,
+    pub work_bytes: u64,
+    pub object_budget_overrun: u64,
+    pub byte_budget_overrun: u64,
+    pub duration_budget_overrun_ns: u64,
+    pub max_pause_time_ns: u64,
+    pub incremental_work_time_ns: u64,
+    pub live_bytes: u64,
+    pub fragmentation_per_mille: u16,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -233,6 +247,12 @@ pub(crate) enum TaskPollProfileOutcome {
 
 /// Enables profiling for subsequent polls in this process.
 pub fn enable() {
+    // Allocate the bounded thread-local tables at the explicit enable
+    // boundary, never lazily inside an incremental Mark/Sweep slice.
+    PROFILE.with(|cell| {
+        let mut current = cell.borrow_mut();
+        current.get_or_insert_with(|| Rc::new(ProfileStorage::default()));
+    });
     PROFILER_ENABLED.store(true, Ordering::Relaxed);
 }
 
@@ -665,14 +685,7 @@ pub(crate) fn record_full_gc(marked: usize, reclaimed: usize, bytes_reclaimed: u
     });
 }
 
-pub(crate) fn record_incremental_gc(
-    roots_seeded: usize,
-    objects_marked: usize,
-    slots_swept: usize,
-    barrier_shades: u64,
-    bytes_reclaimed: u64,
-    completed_reclaimed: Option<usize>,
-) {
+pub(crate) fn record_incremental_gc(report: &crate::heap::IncrementalGcReport) {
     if !enabled() {
         return;
     }
@@ -683,22 +696,47 @@ pub(crate) fn record_incremental_gc(
         };
         let mut gc = storage.gc.get();
         gc.incremental_steps = gc.incremental_steps.saturating_add(1);
+        gc.last_cycle = report.cycle;
+        gc.last_phase = report.phase;
+        gc.roots_scanned = gc
+            .roots_scanned
+            .saturating_add(u64::try_from(report.roots_scanned).unwrap_or(u64::MAX));
         gc.roots_seeded = gc
             .roots_seeded
-            .saturating_add(u64::try_from(roots_seeded).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(report.roots_seeded).unwrap_or(u64::MAX));
         gc.objects_marked = gc
             .objects_marked
-            .saturating_add(u64::try_from(objects_marked).unwrap_or(u64::MAX));
+            .saturating_add(u64::try_from(report.objects_marked).unwrap_or(u64::MAX));
+        gc.bytes_marked = gc.bytes_marked.saturating_add(report.bytes_marked);
         gc.slots_swept = gc
             .slots_swept
-            .saturating_add(u64::try_from(slots_swept).unwrap_or(u64::MAX));
-        gc.barrier_shades = gc.barrier_shades.saturating_add(barrier_shades);
-        gc.bytes_reclaimed = gc.bytes_reclaimed.saturating_add(bytes_reclaimed);
-        if let Some(reclaimed) = completed_reclaimed {
+            .saturating_add(u64::try_from(report.slots_swept).unwrap_or(u64::MAX));
+        gc.barrier_writes = gc.barrier_writes.saturating_add(report.barrier_writes);
+        gc.barrier_shades = gc.barrier_shades.saturating_add(report.barrier_shades);
+        gc.bytes_reclaimed = gc.bytes_reclaimed.saturating_add(report.bytes_reclaimed);
+        gc.work_objects = gc
+            .work_objects
+            .saturating_add(u64::try_from(report.work_objects).unwrap_or(u64::MAX));
+        gc.work_bytes = gc.work_bytes.saturating_add(report.work_bytes);
+        gc.object_budget_overrun = gc
+            .object_budget_overrun
+            .saturating_add(u64::try_from(report.object_budget_overrun).unwrap_or(u64::MAX));
+        gc.byte_budget_overrun = gc
+            .byte_budget_overrun
+            .saturating_add(report.byte_budget_overrun);
+        gc.duration_budget_overrun_ns = gc.duration_budget_overrun_ns.saturating_add(
+            u64::try_from(report.duration_budget_overrun.as_nanos()).unwrap_or(u64::MAX),
+        );
+        let pause_ns = u64::try_from(report.pause_time.as_nanos()).unwrap_or(u64::MAX);
+        gc.max_pause_time_ns = gc.max_pause_time_ns.max(pause_ns);
+        gc.incremental_work_time_ns = gc.incremental_work_time_ns.saturating_add(pause_ns);
+        gc.live_bytes = report.live_bytes;
+        gc.fragmentation_per_mille = report.fragmentation_per_mille;
+        if let Some(stats) = report.completed {
             gc.completed_cycles = gc.completed_cycles.saturating_add(1);
             gc.objects_reclaimed = gc
                 .objects_reclaimed
-                .saturating_add(u64::try_from(reclaimed).unwrap_or(u64::MAX));
+                .saturating_add(u64::try_from(stats.reclaimed).unwrap_or(u64::MAX));
         }
         storage.gc.set(gc);
     });
@@ -733,6 +771,31 @@ mod tests {
     use super::*;
     use nexa_core::FileId;
     use nexa_verifier::FunctionProfileMetadata;
+
+    fn sample_incremental_gc_report() -> crate::heap::IncrementalGcReport {
+        crate::heap::IncrementalGcReport {
+            cycle: 7,
+            phase: crate::heap::GcPhase::Complete,
+            roots_scanned: 1,
+            roots_seeded: 1,
+            objects_marked: 2,
+            bytes_marked: 16,
+            slots_swept: 3,
+            barrier_writes: 5,
+            barrier_shades: 4,
+            work_objects: 5,
+            work_bytes: 48,
+            bytes_reclaimed: 32,
+            live_bytes: 96,
+            fragmentation_per_mille: 125,
+            completed: Some(crate::heap::CollectionStats {
+                marked: 2,
+                reclaimed: 1,
+                live: 2,
+            }),
+            ..crate::heap::IncrementalGcReport::default()
+        }
+    }
 
     // The enabled flag is process-global, so all scenarios run in one test
     // to avoid libtest interleaving.
@@ -785,7 +848,7 @@ mod tests {
             None,
         );
         record_full_gc(3, 2, 64);
-        record_incremental_gc(1, 2, 3, 4, 32, Some(1));
+        record_incremental_gc(&sample_incremental_gc_report());
         record_task_poll(TaskPollProfileOutcome::WaitingHost);
         record_task_poll(TaskPollProfileOutcome::Completed);
         drop(module);
@@ -814,6 +877,16 @@ mod tests {
         assert_eq!(report.gc.incremental_steps, 1);
         assert_eq!(report.gc.completed_cycles, 2);
         assert_eq!(report.gc.objects_reclaimed, 3);
+        assert_eq!(report.gc.last_cycle, 7);
+        assert_eq!(report.gc.last_phase, crate::heap::GcPhase::Complete);
+        assert_eq!(report.gc.roots_scanned, 1);
+        assert_eq!(report.gc.bytes_marked, 16);
+        assert_eq!(report.gc.barrier_writes, 5);
+        assert_eq!(report.gc.barrier_shades, 4);
+        assert_eq!(report.gc.work_objects, 5);
+        assert_eq!(report.gc.work_bytes, 48);
+        assert_eq!(report.gc.live_bytes, 96);
+        assert_eq!(report.gc.fragmentation_per_mille, 125);
         assert_eq!(report.tasks.polls, 2);
         assert_eq!(report.tasks.waiting_host, 1);
         assert_eq!(report.tasks.completed, 1);

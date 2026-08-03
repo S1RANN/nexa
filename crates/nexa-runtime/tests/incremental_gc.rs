@@ -1,7 +1,8 @@
-//! G1 incremental collector gate: budgeted `Idle -> Mark -> Sweep` cycles
-//! must reclaim exactly what a full stop-the-world collection reclaims,
-//! and the insertion barrier plus born-black allocation must keep every
-//! reachable object alive under mutation during an active mark phase.
+//! GC v1 incremental collector gate: budgeted
+//! `Idle -> RootSnapshot -> Mark -> Sweep -> Complete` cycles must reclaim
+//! exactly what a full stop-the-world collection reclaims, and the insertion
+//! barrier plus born-black allocation must keep every reachable object alive
+//! under mutation during an active mark phase.
 
 use nexa_core::StableId;
 use nexa_runtime::{GcBudget, GcPhase, GcRoots, Heap, RuntimeValue};
@@ -25,7 +26,8 @@ fn run_cycle(heap: &mut Heap, roots: &GcRoots, budget: usize) -> nexa_runtime::C
             .collect_incremental(roots, GcBudget::objects(budget))
             .expect("incremental step");
         if let Some(stats) = report.completed {
-            assert_eq!(heap.gc_phase(), GcPhase::Idle);
+            assert_eq!(heap.gc_phase(), GcPhase::Complete);
+            assert_eq!(report.phase, GcPhase::Complete);
             return stats;
         }
     }
@@ -662,4 +664,156 @@ fn realm_config_wires_the_heap_byte_ceiling() {
     unlimited
         .allocate(Object::String(String::from("longer-than-eight-bytes")))
         .expect("the default configuration stays unlimited");
+}
+
+/// WP75/WP79/WP81 gate: the five-phase machine latches Complete, advances
+/// its cycle id on the next explicit request, and reports actual work plus
+/// whole-cycle telemetry without exceeding an object-only budget.
+#[test]
+fn five_phase_cycle_reports_exact_work_and_latched_telemetry() {
+    let node = class_type();
+    let mut heap = Heap::new(16);
+    let root = heap
+        .allocate_class(node, &[RuntimeValue::I32(7)])
+        .expect("root");
+    heap.allocate_string("condemned").expect("garbage");
+    let roots = GcRoots {
+        running_frames: vec![reference_of(root)],
+        ..GcRoots::default()
+    };
+
+    let first = heap
+        .collect_incremental(&roots, GcBudget::objects(1))
+        .expect("root snapshot and first mark unit");
+    assert_eq!(first.cycle, 1);
+    assert_eq!(first.phase, GcPhase::Mark);
+    assert_eq!(first.roots_scanned, 1);
+    assert_eq!(first.roots_seeded, 1);
+    assert_eq!(first.work_objects, 1);
+    assert_eq!(first.object_budget_overrun, 0);
+
+    let mut completed = None;
+    for _ in 0..64 {
+        let report = heap
+            .collect_incremental(&roots, GcBudget::objects(1))
+            .expect("bounded cycle step");
+        assert!(report.work_objects <= 1);
+        assert_eq!(report.object_budget_overrun, 0);
+        if report.completed.is_some() {
+            completed = Some(report);
+            break;
+        }
+    }
+    let completed = completed.expect("cycle completes");
+    assert_eq!(heap.gc_phase(), GcPhase::Complete);
+    assert_eq!(completed.telemetry.phase, GcPhase::Complete);
+    assert_eq!(completed.telemetry.cycle, 1);
+    assert_eq!(completed.telemetry.roots, 1);
+    assert_eq!(completed.telemetry.objects_marked, 1);
+    assert_eq!(completed.telemetry.objects_swept, 2);
+    assert_eq!(completed.telemetry.live_bytes, completed.live_bytes);
+    assert!(completed.telemetry.incremental_work_time >= completed.telemetry.pause_time);
+
+    let next = heap
+        .collect_incremental(&roots, GcBudget::objects(1))
+        .expect("next explicit cycle");
+    assert_eq!(next.cycle, 2);
+    assert_eq!(next.phase, GcPhase::Mark);
+}
+
+/// WP79 gate: byte and duration axes use a first-unit guarantee and expose
+/// the exact overrun instead of silently exceeding the configured budget.
+#[test]
+fn gc_budget_reports_first_unit_byte_overrun() {
+    let mut heap = Heap::new(4);
+    heap.allocate_string("budget-overrun-payload")
+        .expect("condemned payload");
+    let report = heap
+        .collect_incremental(
+            &GcRoots::default(),
+            GcBudget {
+                max_objects: 1,
+                max_bytes: 0,
+                max_duration: std::time::Duration::MAX,
+            },
+        )
+        .expect("one guaranteed sweep unit");
+    assert_eq!(report.work_objects, 1);
+    assert!(report.work_bytes > 0);
+    assert_eq!(report.byte_budget_overrun, report.work_bytes);
+    assert_eq!(report.duration_budget_overrun, std::time::Duration::ZERO);
+    assert_eq!(report.phase, GcPhase::Complete);
+}
+
+/// WP78 gate: byte pressure and the previous survival rate are observable
+/// trigger inputs, not implicit constants.
+#[test]
+fn automatic_trigger_uses_bytes_allocation_rate_and_survival() {
+    use nexa_runtime::{GcTriggerReasons, RealmConfig, RealmRuntime};
+
+    let mut realm = RealmRuntime::isolated(RealmConfig {
+        max_heap_objects: 128,
+        max_heap_bytes: 1,
+        ..RealmConfig::default()
+    });
+    realm
+        .allocate_class(class_type(), &[])
+        .expect("zero-payload class fits the payload admission limit");
+    let pressure = realm.gc_trigger_inspection();
+    assert!(pressure.reasons.contains(GcTriggerReasons::HEAP_BYTES));
+    assert!(!pressure.reasons.contains(GcTriggerReasons::OBJECT_SLOTS));
+    assert!(!pressure.reasons.contains(GcTriggerReasons::ALLOCATION_RATE));
+    assert!(pressure.should_collect());
+
+    let mut survival = RealmRuntime::isolated(RealmConfig {
+        max_heap_objects: 32,
+        ..RealmConfig::default()
+    });
+    survival
+        .allocate_class(class_type(), &[])
+        .expect("short-lived class");
+    for _ in 0..128 {
+        if survival
+            .collect_garbage_incremental(GcBudget::objects(4))
+            .expect("cycle step")
+            .completed
+            .is_some()
+        {
+            break;
+        }
+    }
+    let after = survival.gc_trigger_inspection();
+    assert_eq!(after.last_survival_per_mille, Some(0));
+    assert_eq!(after.pressure_threshold_per_mille, 850);
+    assert_eq!(after.allocations_since_cycle, 0);
+}
+
+/// WP78 gate: free-range fragmentation is measured from both bounded arena
+/// indexes. Reclaiming a middle extent produces a non-zero score; reclaiming
+/// the remaining extents coalesces the arena back to zero.
+#[test]
+fn collection_fragmentation_tracks_holes_and_coalescing() {
+    let mut heap = Heap::new_with_arena_limits(16, usize::MAX, 16, 16, 32);
+    let element = nexa_bytecode::ValueType::I32;
+    let mut arrays = Vec::new();
+    for array_index in 0..3 {
+        let array = heap
+            .allocate_array(nexa_bytecode::array_type(element), element)
+            .expect("array");
+        for value in 0..4 {
+            heap.array_push(array, RuntimeValue::I32(array_index * 10 + value))
+                .expect("fill fixed extent");
+        }
+        arrays.push(array);
+    }
+    heap.collect(&GcRoots {
+        running_frames: vec![reference_of(arrays[0]), reference_of(arrays[2])],
+        ..GcRoots::default()
+    })
+    .expect("reclaim middle extent");
+    assert!(heap.collection_fragmentation_per_mille() >= 250);
+
+    heap.collect(&GcRoots::default())
+        .expect("reclaim remaining extents");
+    assert_eq!(heap.collection_fragmentation_per_mille(), 0);
 }

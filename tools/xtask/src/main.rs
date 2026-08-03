@@ -415,7 +415,7 @@ fn main() -> Result<(), DynError> {
         "test-optimization-differential" => test_optimization_differential(),
         "test-executable-parity" => test_executable_parity(),
         "test-executable-module" => test_executable_module(),
-        "test-incremental-gc" => test_incremental_gc(),
+        "test-gc-v1" => test_gc_v1(),
         "test-source-cache" => test_source_cache(),
         "test-artifact-cache" => test_artifact_cache(),
         "test-runtime-fast-paths" => test_runtime_fast_paths(),
@@ -454,7 +454,7 @@ fn main() -> Result<(), DynError> {
                  m4r1-scale-stress|finalize-m4-r1|test-performance-counters|\
                  test-profiler-overhead|test-value-layout|test-typed-collections|\
                  test-ir-optimizations|test-optimization-differential|\
-                 test-executable-parity|test-executable-module|test-incremental-gc|test-source-cache|\
+                 test-executable-parity|test-executable-module|test-gc-v1|test-source-cache|\
                  test-artifact-cache|test-runtime-fast-paths|m5-final-report|\
                  m5-v8-comparison|m5-performance-regression"
             );
@@ -536,7 +536,7 @@ fn check_m5_gates() -> Result<(), DynError> {
     test_ir_optimizations()?;
     test_optimization_differential()?;
     test_executable_parity()?;
-    test_incremental_gc()?;
+    test_gc_v1()?;
     test_source_cache()?;
     test_artifact_cache()?;
     test_runtime_fast_paths()?;
@@ -1651,10 +1651,67 @@ fn test_executable_module() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--test", "root_map_liveness"])
 }
 
-/// M5 stage-G gate (G1): budgeted incremental Mark/Sweep equivalence,
-/// insertion-barrier safety under mutation, and born-black allocation.
-fn test_incremental_gc() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-runtime", "--test", "incremental_gc"])
+/// M5 WP71-WP82 gate: five-phase incremental collection, exact accounting,
+/// adaptive triggering, every root/staging boundary, rollback/reload safety,
+/// and allocator-authoritative zero-allocation Mark/Sweep slices.
+fn test_gc_v1() -> Result<(), DynError> {
+    cargo(&["test", "-p", "nexa-runtime", "--test", "incremental_gc"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--lib",
+        "heap::tests::host_transaction_staging_is_an_incremental_gc_root",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "collection_string_stress",
+        "array_and_map_class_references_survive_mid_cycle_publication",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "runtime_baseline",
+        "gc_suspended_root::gc_suspended_root",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "transactional_cell",
+        "failed_cells_restore_class_array_and_map_heap_mutations_exactly",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--test",
+        "restart_reload",
+        "activation_fault_restores_the_previous_active_root",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-benchmark-v7",
+        "--test",
+        "gc_zero_allocation",
+    ])
 }
 
 /// M5 stage-I gate: the source compilation cache serves byte-identical

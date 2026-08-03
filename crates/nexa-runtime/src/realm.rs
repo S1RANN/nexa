@@ -17,15 +17,15 @@ use crate::stateful::{MigrationLimitError, MigrationLimits, StatefulDomainId, St
 use crate::task::TaskExecution;
 use crate::{
     CheckedInterpreter, CollectionStats, ContinuationReservation, DiagnosticCode, ExecutionCharge,
-    FuelState, GcBudget, GcPhase, GcRef, GcRoots, Heap, HeapError, HostCallOutcome,
-    HostCompletionDelivery, HostCompletionResult, HostErrorPayload, HostFunctionSlot, HostPayload,
-    HostRegistry, HostRequestError, HostRequestHandle, HostTrap, IncrementalGcReport,
-    InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
-    InterpreterState, Object, OpcodeCostTable, PendingHostRequest, ReloadError,
-    ResourceTokenHandle, RuntimeError, RuntimeHost, RuntimeHostArgs, RuntimeHostDomain,
-    RuntimeHostState, RuntimeLimits, RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue,
-    ScopeHandle, SlotAllocError, SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle,
-    TaskRuntime, TaskState, Trap, TrapKind,
+    FuelState, GcBudget, GcRef, GcRoots, Heap, HeapError, HostCallOutcome, HostCompletionDelivery,
+    HostCompletionResult, HostErrorPayload, HostFunctionSlot, HostPayload, HostRegistry,
+    HostRequestError, HostRequestHandle, HostTrap, IncrementalGcReport, InterpreterError,
+    InterpreterHost, InterpreterHostOutcome, InterpreterOutcome, InterpreterState, Object,
+    OpcodeCostTable, PendingHostRequest, ReloadError, ResourceTokenHandle, RuntimeError,
+    RuntimeHost, RuntimeHostArgs, RuntimeHostDomain, RuntimeHostState, RuntimeLimits,
+    RuntimeMessage, RuntimeResources, RuntimeTrace, RuntimeValue, ScopeHandle, SlotAllocError,
+    SlotPool, SnapshotHandle, StepConfig, SuspendReason, TaskHandle, TaskRuntime, TaskState, Trap,
+    TrapKind,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -391,6 +391,59 @@ impl Default for RealmConfig {
             cost_table: OpcodeCostTable::default(),
             migration_limits: MigrationLimits::default(),
         }
+    }
+}
+
+/// O(1) and bounded-scan inputs to the WP78 automatic GC trigger.
+///
+/// The thresholds are adaptive: a high previous survival rate starts the
+/// next cycle earlier because little capacity is expected to return, while a
+/// low survival rate permits a later collection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcTriggerReasons(u8);
+
+impl GcTriggerReasons {
+    pub const CYCLE_ACTIVE: Self = Self(1 << 0);
+    pub const HEAP_BYTES: Self = Self(1 << 1);
+    pub const OBJECT_SLOTS: Self = Self(1 << 2);
+    pub const ALLOCATION_RATE: Self = Self(1 << 3);
+    pub const FRAGMENTATION: Self = Self(1 << 4);
+
+    #[must_use]
+    pub const fn contains(self, reason: Self) -> bool {
+        self.0 & reason.0 != 0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    const fn insert(&mut self, reason: Self) {
+        self.0 |= reason.0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GcTriggerInspection {
+    pub reasons: GcTriggerReasons,
+    pub live_heap_bytes: u64,
+    pub max_heap_bytes: u64,
+    pub live_objects: usize,
+    pub max_objects: usize,
+    pub allocations_since_cycle: u64,
+    pub last_survival_per_mille: Option<u16>,
+    pub pressure_threshold_per_mille: u16,
+    pub allocation_threshold: u64,
+    pub collection_elements_used: usize,
+    pub max_collection_elements: usize,
+    pub fragmentation_per_mille: u16,
+}
+
+impl GcTriggerInspection {
+    #[must_use]
+    pub const fn should_collect(self) -> bool {
+        !self.reasons.is_empty()
     }
 }
 
@@ -1317,6 +1370,8 @@ pub struct RealmRuntime {
     /// G2 trigger baseline: cumulative object allocations at the moment
     /// the last incremental cycle completed.
     gc_cycle_baseline: u64,
+    /// WP78 adaptive trigger input from the last completed cycle.
+    gc_last_survival_per_mille: Option<u16>,
     /// H1: bounded pool of retired continuation arenas. Admission pops one
     /// and reuses its storage when the capacities satisfy the module's
     /// reservation; terminal polls push the storage back. Bounded so idle
@@ -1379,6 +1434,7 @@ impl RealmRuntime {
             failure_injector,
             execution_images: ExecutionImageCache::new(execution_image_cache_capacity),
             gc_cycle_baseline: 0,
+            gc_last_survival_per_mille: None,
             // H1: preallocated so terminal-path pushes never allocate; the
             // allocation-observer gates pin task terminals at zero.
             continuation_pool: Vec::with_capacity(Self::CONTINUATION_POOL_LIMIT),
@@ -3518,7 +3574,7 @@ impl RealmRuntime {
     /// globals, stateful registries, and host staging roots.
     fn gc_roots(&mut self) -> Result<GcRoots, RealmError> {
         let mut roots = GcRoots::default();
-        for task in self.tasks.task_handles() {
+        for task in self.tasks.task_handles_iter() {
             let snapshot = self.tasks.task_snapshot(task)?;
             let module = self.module_for_task(snapshot)?;
             let continuation = self.tasks.execution(task)?.continuation();
@@ -3535,15 +3591,20 @@ impl RealmRuntime {
                 };
                 terminal_value_gc_root(*value)
             }));
-        for raw in self.modules.occupied_handles() {
+        for raw in self.modules.occupied_handles_iter() {
             let module = self
                 .modules
                 .resolve(raw)
                 .expect("occupied module handle resolves");
             roots.module_globals.extend_from_slice(&module.globals);
-            roots.stateful_registry.extend(module.state.gc_roots());
+            roots
+                .stateful_registry
+                .extend_from_slice(module.state.gc_roots());
             roots.staging_heap.extend_from_slice(&module.staging_roots);
         }
+        roots
+            .staging_heap
+            .extend_from_slice(self.heap.host_staging_roots());
         Ok(roots)
     }
 
@@ -3555,40 +3616,120 @@ impl RealmRuntime {
         &mut self,
         budget: GcBudget,
     ) -> Result<IncrementalGcReport, RealmError> {
-        let roots = self.gc_roots()?;
+        // The heap consumes roots only in RootSnapshot. Rebuilding task and
+        // state root vectors during Mark/Sweep would allocate temporary
+        // vectors and violate WP74 without improving liveness.
+        let roots = if self.heap.gc_phase().is_active() {
+            GcRoots::default()
+        } else {
+            self.gc_roots()?
+        };
         let report = self.heap.collect_incremental(&roots, budget)?;
-        crate::profiler::record_incremental_gc(
-            report.roots_seeded,
-            report.objects_marked,
-            report.slots_swept,
-            report.barrier_shades,
-            report.bytes_reclaimed,
-            report.completed.map(|stats| stats.reclaimed),
-        );
-        if report.completed.is_some() {
+        crate::profiler::record_incremental_gc(&report);
+        if let Some(stats) = report.completed {
             self.gc_cycle_baseline = self.heap.vm_allocation_counters().object_allocations;
+            let population = stats.live.saturating_add(stats.reclaimed);
+            self.gc_last_survival_per_mille = Some(
+                u16::try_from(
+                    stats
+                        .live
+                        .saturating_mul(1_000)
+                        .checked_div(population)
+                        .unwrap_or(0),
+                )
+                .unwrap_or(1_000)
+                .min(1_000),
+            );
         }
         Ok(report)
     }
 
-    /// Water-mark trigger (G2): advances an active cycle, or starts one
-    /// when live slots pass 3/4 of the ceiling or allocations since the
-    /// last completed cycle exceed half the ceiling. Returns `None` when
-    /// the heap is idle and no trigger fires.
-    pub fn maybe_collect_garbage_incremental(
-        &mut self,
-        budget: GcBudget,
-    ) -> Result<Option<IncrementalGcReport>, RealmError> {
-        let ceiling = self.heap.max_objects() as usize;
-        let cycle_active = self.heap.gc_phase() != GcPhase::Idle;
-        let live_pressure = self.heap.live_len().saturating_mul(4) >= ceiling.saturating_mul(3);
-        let allocated_since = self
+    /// WP78 automatic trigger inputs and decisions.
+    #[must_use]
+    pub fn gc_trigger_inspection(&self) -> GcTriggerInspection {
+        fn reaches_per_mille(value: u64, limit: u64, threshold: u16) -> bool {
+            limit != 0
+                && u128::from(value).saturating_mul(1_000)
+                    >= u128::from(limit).saturating_mul(u128::from(threshold))
+        }
+
+        let survival = self.gc_last_survival_per_mille;
+        // High survival needs more headroom because the next cycle is
+        // unlikely to reclaim much. Low survival can safely wait longer.
+        let pressure_threshold_per_mille = match survival {
+            Some(800..=u16::MAX) => 650,
+            Some(0..300) => 850,
+            _ => 750,
+        };
+        let max_objects = self.heap.max_objects() as usize;
+        let allocation_threshold = if matches!(survival, Some(800..=u16::MAX)) {
+            (max_objects as u64).div_ceil(4)
+        } else {
+            (max_objects as u64).div_ceil(2)
+        }
+        .max(1);
+        let live_heap_bytes = self.heap.live_vm_bytes();
+        let max_heap_bytes = self.heap.max_heap_bytes();
+        let live_objects = self.heap.live_len();
+        let allocations_since_cycle = self
             .heap
             .vm_allocation_counters()
             .object_allocations
             .saturating_sub(self.gc_cycle_baseline);
-        let allocation_pressure = allocated_since >= (ceiling as u64).div_ceil(2);
-        if !(cycle_active || live_pressure || allocation_pressure) {
+        let collection_elements_used = self.heap.collection_elements_used();
+        let max_collection_elements = self.heap.max_collection_elements();
+        let fragmentation_per_mille = self.heap.collection_fragmentation_per_mille();
+        let collection_pressure = max_collection_elements != 0
+            && collection_elements_used.saturating_mul(4) >= max_collection_elements;
+        let cycle_active = self.heap.gc_phase().is_active();
+        let heap_bytes_pressure = max_heap_bytes != u64::MAX
+            && reaches_per_mille(
+                live_heap_bytes,
+                max_heap_bytes,
+                pressure_threshold_per_mille,
+            );
+        let object_slots_pressure = reaches_per_mille(
+            live_objects as u64,
+            max_objects as u64,
+            pressure_threshold_per_mille,
+        );
+        let allocation_rate_pressure = allocations_since_cycle >= allocation_threshold;
+        let fragmentation_pressure = collection_pressure && fragmentation_per_mille >= 250;
+        let mut reasons = GcTriggerReasons::default();
+        for (active, reason) in [
+            (cycle_active, GcTriggerReasons::CYCLE_ACTIVE),
+            (heap_bytes_pressure, GcTriggerReasons::HEAP_BYTES),
+            (object_slots_pressure, GcTriggerReasons::OBJECT_SLOTS),
+            (allocation_rate_pressure, GcTriggerReasons::ALLOCATION_RATE),
+            (fragmentation_pressure, GcTriggerReasons::FRAGMENTATION),
+        ] {
+            if active {
+                reasons.insert(reason);
+            }
+        }
+        GcTriggerInspection {
+            reasons,
+            live_heap_bytes,
+            max_heap_bytes,
+            live_objects,
+            max_objects,
+            allocations_since_cycle,
+            last_survival_per_mille: survival,
+            pressure_threshold_per_mille,
+            allocation_threshold,
+            collection_elements_used,
+            max_collection_elements,
+            fragmentation_per_mille,
+        }
+    }
+
+    /// Advances an active cycle or starts one when any adaptive WP78
+    /// trigger fires. Returns `None` when no collection work is warranted.
+    pub fn maybe_collect_garbage_incremental(
+        &mut self,
+        budget: GcBudget,
+    ) -> Result<Option<IncrementalGcReport>, RealmError> {
+        if !self.gc_trigger_inspection().should_collect() {
             return Ok(None);
         }
         self.collect_garbage_incremental(budget).map(Some)
@@ -5150,8 +5291,8 @@ fn validate_transactional_state_transition(
 fn migrated_graph_has_invalid_gc_root(heap: &Heap, state: &StatefulRegistry) -> bool {
     state
         .gc_roots()
-        .into_iter()
-        .any(|reference| heap.resolve(reference).is_err())
+        .iter()
+        .any(|reference| heap.resolve(*reference).is_err())
 }
 
 fn migration_requirement_error(

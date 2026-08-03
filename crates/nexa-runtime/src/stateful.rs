@@ -890,8 +890,8 @@ impl StatefulRegistry {
     }
 
     #[must_use]
-    pub fn gc_roots(&self) -> Vec<GcRef> {
-        self.gc_roots.clone()
+    pub fn gc_roots(&self) -> &[GcRef] {
+        &self.gc_roots
     }
 
     fn validate_handles(&self) -> Result<(), StatefulError> {

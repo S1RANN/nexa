@@ -1056,12 +1056,28 @@ pub struct CollectionStats {
     pub live: usize,
 }
 
-/// Incremental cycle phase (G1): `Idle -> Mark -> Sweep -> Idle`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Incremental cycle phase (WP75):
+/// `Idle -> RootSnapshot -> Mark -> Sweep -> Complete`.
+///
+/// `Complete` is a latched, inactive phase. A subsequent explicit
+/// incremental collection request starts the next cycle; ordinary trigger
+/// polling can therefore observe the completed cycle without treating it as
+/// active GC work.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum GcPhase {
+    #[default]
     Idle,
+    RootSnapshot,
     Mark,
     Sweep,
+    Complete,
+}
+
+impl GcPhase {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(self, Self::RootSnapshot | Self::Mark | Self::Sweep)
+    }
 }
 
 /// Per-step work budget for one incremental collection step, in the
@@ -1098,27 +1114,62 @@ impl GcBudget {
     }
 }
 
+/// Whole-cycle telemetry required by `GC_V1`. The value is a snapshot: it
+/// grows monotonically while a cycle is active and remains available in the
+/// latched [`GcPhase::Complete`] report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GcCycleTelemetry {
+    pub cycle: u64,
+    pub phase: GcPhase,
+    pub roots: usize,
+    pub objects_marked: usize,
+    pub bytes_marked: u64,
+    pub objects_swept: usize,
+    pub bytes_reclaimed: u64,
+    pub live_bytes: u64,
+    /// Longest individual incremental pause in this cycle.
+    pub pause_time: std::time::Duration,
+    /// Sum of all incremental pause durations in this cycle.
+    pub incremental_work_time: std::time::Duration,
+    /// Reference-publication barriers executed while Mark was active.
+    pub barrier_count: u64,
+    /// White references actually shaded by those barriers.
+    pub remembered_writes: u64,
+    pub fragmentation_per_mille: u16,
+}
+
 /// Live tracker for one incremental step (G5). The object axis is a strict
 /// pre-check (G1 semantics); bytes and deadline are charged after each
 /// completed unit with a first-unit guarantee, so a degenerate budget
 /// overruns by at most one unit instead of stalling the cycle.
 struct StepBudget {
+    limit: GcBudget,
     objects: usize,
     bytes: u64,
+    started: std::time::Instant,
     deadline: Option<std::time::Instant>,
     spent: bool,
+    work_objects: usize,
+    work_bytes: u64,
 }
 
 impl StepBudget {
     fn new(budget: GcBudget) -> Self {
+        let started = std::time::Instant::now();
         Self {
+            limit: budget,
             objects: budget.max_objects,
             bytes: budget.max_bytes,
-            // `Duration::MAX` disables the clock; adding it to `now` would
-            // overflow, and the deterministic path must not read time.
+            started,
+            // `Duration::MAX` disables the deadline; `checked_add` also
+            // makes unusually large host-provided durations fail open
+            // instead of panicking in the scheduler.
             deadline: (budget.max_duration != std::time::Duration::MAX)
-                .then(|| std::time::Instant::now() + budget.max_duration),
+                .then(|| started.checked_add(budget.max_duration))
+                .flatten(),
             spent: false,
+            work_objects: 0,
+            work_bytes: 0,
         }
     }
 
@@ -1142,6 +1193,22 @@ impl StepBudget {
         self.objects = self.objects.saturating_sub(1);
         self.bytes = self.bytes.saturating_sub(payload_bytes);
         self.spent = true;
+        self.work_objects = self.work_objects.saturating_add(1);
+        self.work_bytes = self.work_bytes.saturating_add(payload_bytes);
+    }
+
+    fn finish(self, report: &mut IncrementalGcReport) {
+        let elapsed = self.started.elapsed();
+        report.work_objects = self.work_objects;
+        report.work_bytes = self.work_bytes;
+        report.pause_time = elapsed;
+        report.object_budget_overrun = self.work_objects.saturating_sub(self.limit.max_objects);
+        report.byte_budget_overrun = self.work_bytes.saturating_sub(self.limit.max_bytes);
+        report.duration_budget_overrun = if self.limit.max_duration == std::time::Duration::MAX {
+            std::time::Duration::ZERO
+        } else {
+            elapsed.saturating_sub(self.limit.max_duration)
+        };
     }
 }
 
@@ -1149,13 +1216,29 @@ impl StepBudget {
 /// after the step, and the whole-cycle stats when the cycle completed.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct IncrementalGcReport {
+    pub cycle: u64,
+    pub phase: GcPhase,
+    pub roots_scanned: usize,
     pub roots_seeded: usize,
     pub objects_marked: usize,
+    pub bytes_marked: u64,
     pub slots_swept: usize,
+    pub barrier_writes: u64,
     pub barrier_shades: u64,
+    pub work_objects: usize,
+    pub work_bytes: u64,
+    pub object_budget_overrun: usize,
+    pub byte_budget_overrun: u64,
+    pub duration_budget_overrun: std::time::Duration,
+    pub pause_time: std::time::Duration,
     /// G4: payload bytes released by this step's sweep slice (String
     /// storage, i32 backing, map slot vectors, collection-arena extents).
     pub bytes_reclaimed: u64,
+    pub live_bytes: u64,
+    /// Fragmentation of free collection capacity in permille: zero means
+    /// all free cells are contiguous, 1000 means no useful contiguous run.
+    pub fragmentation_per_mille: u16,
+    pub telemetry: GcCycleTelemetry,
     pub completed: Option<CollectionStats>,
 }
 
@@ -1295,14 +1378,23 @@ pub struct Heap {
     /// every `collect` call. Pure scratch space, never heap state. During
     /// an incremental cycle (G1) it holds the persistent gray set.
     mark_scratch: VecDeque<GcRef>,
-    /// G1 incremental cycle state: current phase, the sweep resume
-    /// cursor, objects marked so far this cycle, and insertion-barrier
-    /// shade count for telemetry.
+    /// WP75/WP81 incremental cycle state. `gc_cycle` is monotonic for the
+    /// lifetime of the heap; the remaining counters describe the currently
+    /// active or latched-complete cycle.
     gc_phase: GcPhase,
+    gc_cycle: u64,
     gc_sweep_cursor: usize,
+    gc_roots_scanned: usize,
     gc_marked: usize,
+    gc_bytes_marked: u64,
+    gc_slots_swept: usize,
     gc_reclaimed: usize,
+    gc_barrier_writes: u64,
     gc_barrier_shades: u64,
+    gc_reported_barrier_writes: u64,
+    gc_reported_barrier_shades: u64,
+    gc_incremental_work_time: std::time::Duration,
+    gc_max_pause_time: std::time::Duration,
     /// G4: payload bytes released by the current cycle's sweep slices;
     /// latched into `last_cycle_bytes_reclaimed` when the cycle completes.
     gc_bytes_reclaimed: u64,
@@ -1459,10 +1551,19 @@ impl Heap {
             pooled_string_cache: Vec::with_capacity(max_objects as usize),
             mark_scratch: VecDeque::with_capacity(max_objects as usize),
             gc_phase: GcPhase::Idle,
+            gc_cycle: 0,
             gc_sweep_cursor: 0,
+            gc_roots_scanned: 0,
             gc_marked: 0,
+            gc_bytes_marked: 0,
+            gc_slots_swept: 0,
             gc_reclaimed: 0,
+            gc_barrier_writes: 0,
             gc_barrier_shades: 0,
+            gc_reported_barrier_writes: 0,
+            gc_reported_barrier_shades: 0,
+            gc_incremental_work_time: std::time::Duration::ZERO,
+            gc_max_pause_time: std::time::Duration::ZERO,
             gc_bytes_reclaimed: 0,
             last_cycle_bytes_reclaimed: 0,
             live_payload_bytes: 0,
@@ -1914,9 +2015,10 @@ impl Heap {
         // Sweep every nameable child is necessarily marked, so no shading
         // is needed. Array/Buffer extents shade through
         // `commit_collection_value`.
-        let born_marked = self.gc_phase != GcPhase::Idle;
+        let born_marked = self.gc_phase.is_active();
         if self.gc_phase == GcPhase::Mark {
             object.trace_references(&mut |child| {
+                self.gc_barrier_writes = self.gc_barrier_writes.saturating_add(1);
                 if Self::enqueue_gray(&mut self.slots, &mut self.mark_scratch, child) {
                     self.gc_marked += 1;
                     self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
@@ -2534,6 +2636,10 @@ impl Heap {
         self.host_staging.clear();
         self.host_transaction_active = true;
         Ok(())
+    }
+
+    pub(crate) fn host_staging_roots(&self) -> &[GcRef] {
+        &self.host_staging
     }
 
     pub(crate) fn commit_host_transaction(&mut self) {
@@ -5101,8 +5207,17 @@ impl Heap {
     fn reset_incremental_cycle(&mut self) {
         self.gc_phase = GcPhase::Idle;
         self.gc_sweep_cursor = 0;
+        self.gc_roots_scanned = 0;
         self.gc_marked = 0;
+        self.gc_bytes_marked = 0;
+        self.gc_slots_swept = 0;
         self.gc_reclaimed = 0;
+        self.gc_barrier_writes = 0;
+        self.gc_barrier_shades = 0;
+        self.gc_reported_barrier_writes = 0;
+        self.gc_reported_barrier_shades = 0;
+        self.gc_incremental_work_time = std::time::Duration::ZERO;
+        self.gc_max_pause_time = std::time::Duration::ZERO;
         self.gc_bytes_reclaimed = 0;
         self.mark_scratch.clear();
     }
@@ -5221,6 +5336,21 @@ impl Heap {
         self.max_objects
     }
 
+    #[must_use]
+    pub const fn max_heap_bytes(&self) -> u64 {
+        self.max_heap_bytes
+    }
+
+    #[must_use]
+    pub const fn collection_elements_used(&self) -> usize {
+        self.collection_elements_used
+    }
+
+    #[must_use]
+    pub const fn max_collection_elements(&self) -> usize {
+        self.max_collection_elements
+    }
+
     /// G3 gray-enqueue: marks on push (classic BFS deduplication), so every
     /// object enters the queue at most once per cycle and the preallocated
     /// queue capacity is a hard bound - Mark never allocates. Stale or
@@ -5252,25 +5382,189 @@ impl Heap {
         if self.gc_phase != GcPhase::Mark {
             return;
         }
-        if let Some(child) = value_reference(value)
-            && Self::enqueue_gray(&mut self.slots, &mut self.mark_scratch, child)
-        {
-            self.gc_marked += 1;
-            self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+        if let Some(child) = value_reference(value) {
+            self.gc_barrier_writes = self.gc_barrier_writes.saturating_add(1);
+            if Self::enqueue_gray(&mut self.slots, &mut self.mark_scratch, child) {
+                self.gc_marked += 1;
+                self.gc_barrier_shades = self.gc_barrier_shades.saturating_add(1);
+            }
         }
     }
 
-    /// One budgeted step of the incremental cycle (G1):
-    /// `Idle -> Mark -> Sweep -> Idle`, spanning as many calls as the
-    /// budget requires.
+    fn open_incremental_cycle(&mut self) {
+        if !matches!(self.gc_phase, GcPhase::Idle | GcPhase::Complete) {
+            return;
+        }
+        self.gc_cycle = self.gc_cycle.saturating_add(1);
+        for slot in &mut self.slots {
+            slot.marked = false;
+        }
+        self.gc_roots_scanned = 0;
+        self.gc_marked = 0;
+        self.gc_bytes_marked = 0;
+        self.gc_slots_swept = 0;
+        self.gc_reclaimed = 0;
+        self.gc_barrier_writes = 0;
+        self.gc_barrier_shades = 0;
+        self.gc_reported_barrier_writes = 0;
+        self.gc_reported_barrier_shades = 0;
+        self.gc_incremental_work_time = std::time::Duration::ZERO;
+        self.gc_max_pause_time = std::time::Duration::ZERO;
+        self.gc_bytes_reclaimed = 0;
+        self.gc_sweep_cursor = 0;
+        self.mark_scratch.clear();
+        self.gc_phase = GcPhase::RootSnapshot;
+    }
+
+    fn snapshot_incremental_roots(
+        &mut self,
+        roots: &GcRoots,
+        report: &mut IncrementalGcReport,
+    ) -> Result<(), HeapError> {
+        if self.gc_phase != GcPhase::RootSnapshot {
+            return Ok(());
+        }
+        // Validate the entire snapshot before changing a mark bit so a stale
+        // root cannot leave a half-seeded active cycle behind.
+        for root in roots.iter() {
+            if let Err(error) = self.validate_reference(root) {
+                self.reset_incremental_cycle();
+                return Err(error);
+            }
+            report.roots_scanned = report.roots_scanned.saturating_add(1);
+        }
+        let mut queue = std::mem::take(&mut self.mark_scratch);
+        for root in roots.iter() {
+            if Self::enqueue_gray(&mut self.slots, &mut queue, root) {
+                report.roots_seeded += 1;
+            }
+        }
+        self.mark_scratch = queue;
+        self.gc_roots_scanned = report.roots_scanned;
+        self.gc_marked = report.roots_seeded;
+        self.gc_phase = GcPhase::Mark;
+        Ok(())
+    }
+
+    fn run_incremental_mark(
+        &mut self,
+        budget: &mut StepBudget,
+        report: &mut IncrementalGcReport,
+    ) -> Result<(), HeapError> {
+        if self.gc_phase != GcPhase::Mark {
+            return Ok(());
+        }
+        let mut queue = std::mem::take(&mut self.mark_scratch);
+        let mark_bytes_before = budget.work_bytes;
+        let grayed = self.mark_step(&mut queue, budget);
+        self.mark_scratch = queue;
+        let grayed = grayed?;
+        report.bytes_marked = budget.work_bytes.saturating_sub(mark_bytes_before);
+        self.gc_bytes_marked = self.gc_bytes_marked.saturating_add(report.bytes_marked);
+        self.gc_marked += grayed;
+        report.objects_marked = grayed + report.roots_seeded;
+        // A budget-exhausting final pop transitions on the next slice,
+        // preserving the strict object-work bound.
+        if self.mark_scratch.is_empty() && budget.available() {
+            self.gc_phase = GcPhase::Sweep;
+            self.gc_sweep_cursor = 0;
+        }
+        Ok(())
+    }
+
+    fn run_incremental_sweep(&mut self, budget: &mut StepBudget, report: &mut IncrementalGcReport) {
+        if self.gc_phase != GcPhase::Sweep {
+            return;
+        }
+        while budget.available() && self.gc_sweep_cursor < self.slots.len() {
+            let index = self.gc_sweep_cursor;
+            self.gc_sweep_cursor += 1;
+            report.slots_swept += 1;
+            self.gc_slots_swept += 1;
+            let mut payload = 0;
+            let condemned = {
+                let slot = &mut self.slots[index];
+                (slot.object.is_some() && !slot.marked)
+                    .then(|| slot.object.take().expect("presence checked"))
+            };
+            if let Some(object) = condemned {
+                self.live_objects = self
+                    .live_objects
+                    .checked_sub(1)
+                    .expect("a condemned object was counted as live");
+                payload = self.release_object_storage(&object);
+                report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
+                self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
+                let slot = &mut self.slots[index];
+                if let Some(generation) = slot.generation.checked_add(1) {
+                    slot.generation = generation;
+                    self.free
+                        .push(u32::try_from(index).expect("slot indices originate as u32"));
+                }
+                self.gc_reclaimed += 1;
+            }
+            budget.charge(payload);
+        }
+        self.release_live_payload(report.bytes_reclaimed);
+        if self.gc_sweep_cursor >= self.slots.len() {
+            debug_assert_eq!(
+                self.live_objects,
+                self.recompute_live_objects(),
+                "the incremental live object gauge drifted from ground truth"
+            );
+            report.completed = Some(CollectionStats {
+                marked: self.gc_marked,
+                reclaimed: self.gc_reclaimed,
+                live: self.live_len(),
+            });
+            self.last_cycle_bytes_reclaimed = self.gc_bytes_reclaimed;
+            self.gc_phase = GcPhase::Complete;
+        }
+    }
+
+    fn finish_incremental_report(&mut self, budget: StepBudget, report: &mut IncrementalGcReport) {
+        report.barrier_writes = self
+            .gc_barrier_writes
+            .saturating_sub(self.gc_reported_barrier_writes);
+        report.barrier_shades = self
+            .gc_barrier_shades
+            .saturating_sub(self.gc_reported_barrier_shades);
+        self.gc_reported_barrier_writes = self.gc_barrier_writes;
+        self.gc_reported_barrier_shades = self.gc_barrier_shades;
+        report.phase = self.gc_phase;
+        report.live_bytes = self.live_vm_bytes();
+        report.fragmentation_per_mille = self.collection_fragmentation_per_mille();
+        budget.finish(report);
+        self.gc_incremental_work_time = self
+            .gc_incremental_work_time
+            .saturating_add(report.pause_time);
+        self.gc_max_pause_time = self.gc_max_pause_time.max(report.pause_time);
+        report.telemetry = GcCycleTelemetry {
+            cycle: self.gc_cycle,
+            phase: self.gc_phase,
+            roots: self.gc_roots_scanned,
+            objects_marked: self.gc_marked,
+            bytes_marked: self.gc_bytes_marked,
+            objects_swept: self.gc_slots_swept,
+            bytes_reclaimed: self.gc_bytes_reclaimed,
+            live_bytes: report.live_bytes,
+            pause_time: self.gc_max_pause_time,
+            incremental_work_time: self.gc_incremental_work_time,
+            barrier_count: self.gc_barrier_writes,
+            remembered_writes: self.gc_barrier_shades,
+            fragmentation_per_mille: report.fragmentation_per_mille,
+        };
+    }
+
+    /// One budgeted step of the WP75 incremental state machine:
+    /// `Idle -> RootSnapshot -> Mark -> Sweep -> Complete`.
     ///
-    /// Every mark step re-seeds the current precise roots before draining
-    /// the gray queue, so the root set may change between steps (task
-    /// suspend points move); Sweep begins only after a step whose freshly
-    /// seeded queue drains completely, which together with the insertion
-    /// barrier keeps every reachable object marked. Objects allocated
-    /// while a cycle is active are born marked and survive to the next
-    /// cycle.
+    /// `RootSnapshot` is atomic and allocation-free: it validates the precise
+    /// root set, then shades it into the preallocated gray queue exactly once
+    /// per cycle. Removing a root later is conservative; every operation
+    /// capable of publishing a new reference while Mark is active goes
+    /// through the insertion barrier. Objects allocated during any active
+    /// phase are born marked and survive to the next cycle.
     pub fn collect_incremental(
         &mut self,
         roots: &GcRoots,
@@ -5285,88 +5579,12 @@ impl Heap {
         // gray queue at most once per cycle and the preallocated capacity
         // is never outgrown - Mark performs zero system allocations.
         let queue_capacity_before = self.mark_scratch.capacity();
-        if self.gc_phase == GcPhase::Idle {
-            for slot in &mut self.slots {
-                slot.marked = false;
-            }
-            self.gc_marked = 0;
-            self.gc_reclaimed = 0;
-            self.gc_sweep_cursor = 0;
-            self.mark_scratch.clear();
-            self.gc_phase = GcPhase::Mark;
-        }
-        if self.gc_phase == GcPhase::Mark {
-            let mut queue = std::mem::take(&mut self.mark_scratch);
-            for root in roots.iter() {
-                self.validate_reference(root)?;
-                if Self::enqueue_gray(&mut self.slots, &mut queue, root) {
-                    report.roots_seeded += 1;
-                }
-            }
-            let grayed = self.mark_step(&mut queue, &mut budget);
-            self.mark_scratch = queue;
-            let grayed = grayed?;
-            self.gc_marked += grayed + report.roots_seeded;
-            report.objects_marked = grayed + report.roots_seeded;
-            // Conservative transition: only a step with leftover budget can
-            // prove the freshly seeded queue truly drained.
-            if self.mark_scratch.is_empty() && budget.available() {
-                self.gc_phase = GcPhase::Sweep;
-                self.gc_sweep_cursor = 0;
-            }
-        }
-        if self.gc_phase == GcPhase::Sweep {
-            while budget.available() && self.gc_sweep_cursor < self.slots.len() {
-                let index = self.gc_sweep_cursor;
-                self.gc_sweep_cursor += 1;
-                report.slots_swept += 1;
-                let mut payload = 0;
-                let condemned = {
-                    let slot = &mut self.slots[index];
-                    (slot.object.is_some() && !slot.marked)
-                        .then(|| slot.object.take().expect("presence checked"))
-                };
-                if let Some(object) = condemned {
-                    self.live_objects = self
-                        .live_objects
-                        .checked_sub(1)
-                        .expect("a condemned object was counted as live");
-                    // G4: measured before the drop, mirroring the full
-                    // collection path byte for byte.
-                    payload = self.release_object_storage(&object);
-                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
-                    self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
-                    let slot = &mut self.slots[index];
-                    if let Some(generation) = slot.generation.checked_add(1) {
-                        slot.generation = generation;
-                        self.free
-                            .push(u32::try_from(index).expect("slot indices originate as u32"));
-                    }
-                    self.gc_reclaimed += 1;
-                }
-                budget.charge(payload);
-            }
-            // G6: the sweep slice just released exactly the bytes it
-            // reported for this step.
-            self.release_live_payload(report.bytes_reclaimed);
-            if self.gc_sweep_cursor >= self.slots.len() {
-                debug_assert_eq!(
-                    self.live_objects,
-                    self.recompute_live_objects(),
-                    "the incremental live object gauge drifted from ground truth"
-                );
-                report.completed = Some(CollectionStats {
-                    marked: self.gc_marked,
-                    reclaimed: self.gc_reclaimed,
-                    live: self.live_len(),
-                });
-                // Latch the cycle total before the reset clears the
-                // accumulator; full collection sets the same latch.
-                self.last_cycle_bytes_reclaimed = self.gc_bytes_reclaimed;
-                self.reset_incremental_cycle();
-            }
-        }
-        report.barrier_shades = self.gc_barrier_shades;
+        self.open_incremental_cycle();
+        report.cycle = self.gc_cycle;
+        self.snapshot_incremental_roots(roots, &mut report)?;
+        self.run_incremental_mark(&mut budget, &mut report)?;
+        self.run_incremental_sweep(&mut budget, &mut report);
+        self.finish_incremental_report(budget, &mut report);
         debug_assert_eq!(
             self.mark_scratch.capacity(),
             queue_capacity_before,
@@ -5521,6 +5739,33 @@ impl Heap {
                 .saturating_sub(self.collection_elements_used),
             free_ranges: self.collections.free_ranges.len(),
         }
+    }
+
+    /// WP78 trigger/telemetry input. The score is the fraction of free
+    /// collection and map cells that are unavailable in the largest
+    /// contiguous extent of their respective arenas. It is computed without
+    /// allocation and is bounded by the preallocated free-range indexes.
+    #[must_use]
+    pub fn collection_fragmentation_per_mille(&self) -> u16 {
+        fn arena_fragmentation(ranges: &[CollectionRange]) -> u16 {
+            let total = ranges
+                .iter()
+                .map(|range| range.length)
+                .fold(0_usize, usize::saturating_add);
+            if total == 0 {
+                return 0;
+            }
+            let largest = ranges.iter().map(|range| range.length).max().unwrap_or(0);
+            u16::try_from(total.saturating_sub(largest).saturating_mul(1_000) / total)
+                .unwrap_or(1_000)
+                .min(1_000)
+        }
+
+        // The arenas serve different allocation classes, so the worst
+        // individual score is authoritative; combining their free cells
+        // would let an unfragmented map arena hide an unusable array arena.
+        arena_fragmentation(&self.collections.free_ranges)
+            .max(arena_fragmentation(&self.map_slots.free_ranges))
     }
 
     fn scalar_arena_reserved_bytes(&self) -> u64 {
@@ -5847,7 +6092,7 @@ mod tests {
     use nexa_core::{CANONICAL_NAN_F32_BITS, CANONICAL_NAN_F64_BITS, StableId};
 
     use super::{
-        CollectionView, GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object,
+        CollectionView, GcBudget, GcRoots, Heap, HeapError, MapEntry, MapSetOutcome, Object,
         fnv_content_hash, insert_map_entry, remove_probed_entry,
     };
     use crate::{RuntimeFailurePoint, RuntimeValue};
@@ -6113,6 +6358,43 @@ mod tests {
         );
         assert_eq!(heap.string(reloaded), Ok("staged-literal"));
         assert_eq!(heap.string(replacement), Ok("different-content"));
+    }
+
+    #[test]
+    fn host_transaction_staging_is_an_incremental_gc_root() {
+        let mut heap = Heap::new(8);
+        heap.begin_host_transaction().unwrap();
+        let staged = heap.allocate_string("staged-host-result").unwrap();
+        let roots = GcRoots {
+            staging_heap: heap.host_staging_roots().to_vec(),
+            ..GcRoots::default()
+        };
+        for _ in 0..32 {
+            if heap
+                .collect_incremental(&roots, GcBudget::objects(1))
+                .unwrap()
+                .completed
+                .is_some()
+            {
+                break;
+            }
+        }
+        assert!(heap.resolve(staged).is_ok());
+
+        heap.commit_host_transaction();
+        let mut reclaimed = None;
+        for _ in 0..32 {
+            if let Some(stats) = heap
+                .collect_incremental(&GcRoots::default(), GcBudget::objects(1))
+                .unwrap()
+                .completed
+            {
+                reclaimed = Some(stats.reclaimed);
+                break;
+            }
+        }
+        assert_eq!(reclaimed, Some(1));
+        assert!(heap.resolve(staged).is_err());
     }
 
     #[test]
