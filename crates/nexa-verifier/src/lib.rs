@@ -1862,7 +1862,22 @@ fn verify_function(
                         .map_or(0, |result| result.slot_count),
                 };
                 if let Some(result) = callee.signature.result {
+                    let result_slots =
+                        callee_abi
+                            .result
+                            .as_ref()
+                            .map(|result| result.slot_count)
+                            .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                    if dst
+                        .checked_add(result_slots)
+                        .is_none_or(|end| end > function.registers)
+                    {
+                        return Err(error(Some(pc), VerifyErrorKind::RegisterOutOfRange(dst)));
+                    }
                     state[register(dst)?] = Some(result);
+                    for continuation in 1..result_slots {
+                        state[usize::from(dst + continuation)] = None;
+                    }
                 }
             }
             Instruction::HostCall {
@@ -2648,6 +2663,17 @@ fn verify_function(
                     .signature
                     .result
                     .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidReturn))?;
+                let result_slots = function_abi
+                    .result
+                    .as_ref()
+                    .map(|result| result.slot_count)
+                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::InvalidPhysicalAbi))?;
+                if source
+                    .checked_add(result_slots)
+                    .is_none_or(|end| end > function.registers)
+                {
+                    return Err(error(Some(pc), VerifyErrorKind::RegisterOutOfRange(source)));
+                }
                 require(&state, source, result)?;
             }
             Instruction::ReturnVoid => {
@@ -3911,9 +3937,9 @@ mod tests {
     use nexa_bytecode::{
         AbandonPolicy, ArrayType, AsyncResultType, BufferType, CancelPolicy, ClassType, EnumType,
         EnumVariant, Function, FunctionBuilder, FunctionEffect, HostCallMode, HostImport,
-        Instruction, MapType, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport, Signature,
-        SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType, StateSchema,
-        StateType, StructField, StructType, ValueType,
+        Instruction, MapType, Module, ModuleBuilder, ResourceTokenType, RootMap, ScriptExport,
+        Signature, SnapshotType, SourceMapEntry, StandardIntrinsic, StateField, StateHandleType,
+        StateSchema, StateType, StructField, StructType, ValueType,
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
@@ -4453,7 +4479,7 @@ mod tests {
                 parameters: vec![ValueType::Named(map.type_id), ValueType::I32],
                 result: Some(ValueType::Named(option.type_id)),
             },
-            3,
+            4,
         );
         get.set_root(0)
             .unwrap()
@@ -4470,11 +4496,11 @@ mod tests {
         get.root_maps = vec![
             RootMap {
                 pc: 0,
-                bitmap: vec![true, false, false],
+                bitmap: vec![true, false, false, false],
             },
             RootMap {
                 pc: 1,
-                bitmap: vec![false, false, true],
+                bitmap: vec![false, false, true, false],
             },
         ];
         let mut valid = ModuleBuilder::new();
@@ -6276,56 +6302,9 @@ mod tests {
             .unwrap_or_else(|| panic!("missing frozen spec for {}", intrinsic.canonical_name()))
     }
 
-    fn intrinsic_module(spec: &FrozenIntrinsicSpec, effect: FunctionEffect) -> ModuleBuilder {
+    fn intrinsic_module(spec: &FrozenIntrinsicSpec, effect: FunctionEffect) -> Module {
         let parameters = spec.arguments.clone();
         let result = spec.result;
-        let dst = u16::try_from(parameters.len()).expect("frozen intrinsic arity fits in u16");
-        let registers = dst + 1;
-        let roots_at_entry = parameters
-            .iter()
-            .map(|ty| ty.is_reference())
-            .chain(std::iter::once(false))
-            .collect::<Vec<_>>();
-        let mut roots_at_return = vec![false; usize::from(registers)];
-        roots_at_return[usize::from(dst)] = result.is_reference();
-        let root_bitmap = roots_at_entry
-            .iter()
-            .zip(&roots_at_return)
-            .map(|(entry, returned)| *entry || *returned)
-            .collect::<Vec<_>>();
-        let function = Function {
-            signature: Signature {
-                parameters,
-                result: Some(result),
-            },
-            parameter_slots: dst,
-            registers,
-            frame_bytes: u32::from(registers) * 8,
-            root_bitmap,
-            root_maps: vec![
-                RootMap {
-                    pc: 0,
-                    bitmap: roots_at_entry,
-                },
-                RootMap {
-                    pc: 1,
-                    bitmap: roots_at_return,
-                },
-            ],
-            safepoints: vec![0, 1],
-            loop_bounds: Vec::new(),
-            effect,
-            max_static_call_depth: 1,
-            code: vec![
-                Instruction::StandardIntrinsic {
-                    intrinsic: spec.intrinsic,
-                    args_base: 0,
-                    args_count: dst,
-                    dst,
-                },
-                Instruction::Return { source: dst },
-            ],
-        };
         let mut module = ModuleBuilder::new();
         module
             .enum_type(nexa_bytecode::option_type(ValueType::I32))
@@ -6335,8 +6314,90 @@ mod tests {
             ))
             .array_type(ArrayType::new(ValueType::I32))
             .array_type(ArrayType::new(ValueType::String))
-            .map_type(MapType::new(ValueType::String, ValueType::I32))
-            .function(function);
+            .map_type(MapType::new(ValueType::String, ValueType::I32));
+        let mut module = module.finish();
+        let table = nexa_bytecode::layout::LayoutTable::for_module(&module).unwrap();
+        let signature = Signature {
+            parameters,
+            result: Some(result),
+        };
+        let abi = nexa_bytecode::layout::FunctionAbi::for_signature(&table, &signature).unwrap();
+        let argument_count =
+            u16::try_from(signature.parameters.len()).expect("frozen intrinsic arity fits in u16");
+        let args_base = abi.parameter_slots;
+        let dst = args_base + argument_count;
+        let result_slots = abi.result.as_ref().unwrap().slot_count;
+        let registers = dst + result_slots;
+        let mut code = abi
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| Instruction::Move {
+                dst: args_base + u16::try_from(index).unwrap(),
+                source: parameter.slot_offset,
+            })
+            .collect::<Vec<_>>();
+        let intrinsic_pc = u32::try_from(code.len()).unwrap();
+        code.push(Instruction::StandardIntrinsic {
+            intrinsic: spec.intrinsic,
+            args_base,
+            args_count: argument_count,
+            dst,
+        });
+        let return_pc = u32::try_from(code.len()).unwrap();
+        code.push(Instruction::Return { source: dst });
+        let mut roots_at_entry = vec![false; usize::from(registers)];
+        if argument_count != 0 {
+            for parameter in &abi.parameters {
+                roots_at_entry[usize::from(parameter.slot_offset)] =
+                    parameter.logical_type.is_reference();
+            }
+        }
+        let mut roots_at_intrinsic = vec![false; usize::from(registers)];
+        for (index, ty) in signature.parameters.iter().copied().enumerate() {
+            roots_at_intrinsic[usize::from(args_base) + index] = ty.is_reference();
+        }
+        let mut roots_at_return = vec![false; usize::from(registers)];
+        roots_at_return[usize::from(dst)] = result.is_reference();
+        let root_bitmap = roots_at_entry
+            .iter()
+            .zip(&roots_at_intrinsic)
+            .zip(&roots_at_return)
+            .map(|((entry, intrinsic), returned)| *entry || *intrinsic || *returned)
+            .collect::<Vec<_>>();
+        let mut root_maps = Vec::new();
+        if argument_count != 0 {
+            root_maps.push(RootMap {
+                pc: 0,
+                bitmap: roots_at_entry,
+            });
+        }
+        root_maps.push(RootMap {
+            pc: intrinsic_pc,
+            bitmap: roots_at_intrinsic,
+        });
+        root_maps.push(RootMap {
+            pc: return_pc,
+            bitmap: roots_at_return,
+        });
+        let function = Function {
+            signature,
+            parameter_slots: abi.parameter_slots,
+            registers,
+            frame_bytes: u32::from(registers) * 8,
+            root_bitmap,
+            root_maps,
+            safepoints: if argument_count == 0 {
+                vec![intrinsic_pc, return_pc]
+            } else {
+                vec![0, intrinsic_pc, return_pc]
+            },
+            loop_bounds: Vec::new(),
+            effect,
+            max_static_call_depth: 1,
+            code,
+        };
+        module.functions.push(function);
         module
     }
 
@@ -6381,7 +6442,7 @@ mod tests {
             );
             assert_ne!(intrinsic.base_fuel_cost(), 0);
             verify(
-                intrinsic_module(spec, FunctionEffect::Ordinary).finish(),
+                intrinsic_module(spec, FunctionEffect::Ordinary),
                 VerifierLimits::default(),
             )
             .unwrap_or_else(|error| panic!("{}: {error}", intrinsic.canonical_name()));
@@ -6391,9 +6452,14 @@ mod tests {
     #[test]
     fn standard_intrinsic_arity_effect_and_cost_guards_are_enforced() {
         let string_contains = frozen_intrinsic_spec(StandardIntrinsic::StringContains);
-        let mut wrong_count = intrinsic_module(&string_contains, FunctionEffect::Ordinary).finish();
+        let mut wrong_count = intrinsic_module(&string_contains, FunctionEffect::Ordinary);
+        let intrinsic_pc = wrong_count.functions[0]
+            .code
+            .iter()
+            .position(|instruction| matches!(instruction, Instruction::StandardIntrinsic { .. }))
+            .unwrap();
         let Instruction::StandardIntrinsic { args_count, .. } =
-            &mut wrong_count.functions[0].code[0]
+            &mut wrong_count.functions[0].code[intrinsic_pc]
         else {
             unreachable!()
         };
@@ -6412,8 +6478,7 @@ mod tests {
                         element: ValueType::I32,
                     }),
                     FunctionEffect::Immediate,
-                )
-                .finish(),
+                ),
                 VerifierLimits::default(),
             )
             .unwrap_err()
@@ -6426,8 +6491,7 @@ mod tests {
                 intrinsic_module(
                     &frozen_intrinsic_spec(StandardIntrinsic::StringContains),
                     FunctionEffect::Immediate,
-                )
-                .finish(),
+                ),
                 VerifierLimits::default(),
             )
             .unwrap_err()
@@ -6440,8 +6504,7 @@ mod tests {
                 intrinsic_module(
                     &frozen_intrinsic_spec(StandardIntrinsic::F64Sin),
                     FunctionEffect::Immediate,
-                )
-                .finish(),
+                ),
                 VerifierLimits {
                     max_immediate_cost: 15,
                     ..VerifierLimits::default()
@@ -6523,18 +6586,17 @@ mod tests {
                 VerifyErrorKind::InvalidEffect
             );
         }
+        let unknown = StableId::from_name("repl::UnknownEnvironment");
         assert_eq!(
             verify(
-                module(
-                    FunctionEffect::Ordinary,
-                    StableId::from_name("repl::UnknownEnvironment"),
-                    true,
-                ),
+                module(FunctionEffect::Ordinary, unknown, true),
                 VerifierLimits::default(),
             )
             .unwrap_err()
             .kind,
-            VerifyErrorKind::TypeMismatch
+            VerifyErrorKind::InvalidValueLayout(nexa_bytecode::layout::LayoutError::UnknownType(
+                unknown
+            ))
         );
         assert_eq!(
             verify(
@@ -6751,7 +6813,10 @@ mod tests {
             if declare_struct {
                 module.struct_type(StructType {
                     type_id: target_type,
-                    fields: Vec::new(),
+                    fields: vec![StructField {
+                        stable_id: StableId::from_name("PlainStruct::value"),
+                        ty: ValueType::I32,
+                    }],
                 });
             }
             module.reload_entries(Some(0), None);

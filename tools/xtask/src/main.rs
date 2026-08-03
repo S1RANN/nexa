@@ -1599,9 +1599,28 @@ fn test_profiler_overhead() -> Result<(), DynError> {
     }
 }
 
-/// M5 WP19-WP22 gate: deterministic physical layout derivation.
+/// M5 WP19-WP26 gate: deterministic layouts, verifier-owned physical ABI,
+/// parameter placement, contiguous return ranges, and portable/dense parity.
 fn test_value_layout() -> Result<(), DynError> {
-    cargo(&["test", "-p", "nexa-bytecode", "--test", "layout"])
+    cargo(&["test", "-p", "nexa-bytecode", "--test", "layout"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-verifier",
+        "--lib",
+        "tests::verified_module_owns_the_exact_physical_layout_and_function_abi",
+        "--",
+        "--exact",
+    ])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-runtime",
+        "--lib",
+        "interpreter::tests::physical_abi_scatter_preserves_aggregate_and_following_scalar_parameters",
+        "--",
+        "--exact",
+    ])
 }
 
 /// M5 WP47-WP58 gate: typed scalar/row storage, amortized push/pop,

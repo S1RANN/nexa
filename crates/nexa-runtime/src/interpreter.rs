@@ -3052,7 +3052,7 @@ impl CheckedInterpreter {
                         let ExecutableNominalOperand::CallFrame {
                             register_count,
                             parameter_slots,
-                            ..
+                            result_slots,
                         } = resolved_nominal
                         else {
                             return Err(InterpreterError::TypeMismatch);
@@ -3067,7 +3067,10 @@ impl CheckedInterpreter {
                             .push_verified_abi_call(VerifiedCallPlan {
                                 function: callee_id,
                                 register_count,
-                                return_range: ReturnRange::scalar(dst),
+                                return_range: ReturnRange {
+                                    start: dst,
+                                    slots: result_slots.max(1),
+                                },
                                 call_site_pc: frame.pc,
                                 args_base,
                                 args_count,
@@ -3098,12 +3101,17 @@ impl CheckedInterpreter {
                             .module_abi()
                             .function(callee_id as usize)
                             .ok_or(InterpreterError::TypeMismatch)?;
+                        let result_slots =
+                            abi.result.as_ref().map_or(0, |result| result.slot_count);
                         continuation
                             .arena
                             .push_verified_abi_call(VerifiedCallPlan {
                                 function: callee_id,
                                 register_count: callee.registers,
-                                return_range: ReturnRange::scalar(dst),
+                                return_range: ReturnRange {
+                                    start: dst,
+                                    slots: result_slots.max(1),
+                                },
                                 call_site_pc: frame.pc,
                                 args_base,
                                 args_count,
@@ -4098,7 +4106,16 @@ impl CheckedInterpreter {
                     if continuation.arena.depth() > 1
                         && continuation.arena.current()?.return_range.is_some()
                     {
-                        continuation.arena.return_verified_range(source, 1)?;
+                        let returning_function = continuation.arena.current()?.function as usize;
+                        let result_slots = module
+                            .module_abi()
+                            .function(returning_function)
+                            .and_then(|abi| abi.result.as_ref())
+                            .map(|result| result.slot_count)
+                            .ok_or(InterpreterError::TypeMismatch)?;
+                        continuation
+                            .arena
+                            .return_verified_range(source, result_slots)?;
                         pending_cost = 0;
                         continue;
                     }
@@ -6119,12 +6136,17 @@ mod tests {
         let source = r"
 struct Pair { first: i32, second: i32, }
 
+fn echo(pair: Pair) -> Pair {
+    return pair;
+}
+
 fn sum(pair: Pair, bias: i32) -> i32 {
     return pair.first + pair.second + bias;
 }
 
 fn work() -> i32 {
-    return sum(Pair { first: 3, second: 5 }, 4);
+    let pair: Pair = echo(Pair { first: 3, second: 5 });
+    return sum(pair, 4);
 }
 ";
         let module = nexa_compiler::compile(source).expect("physical ABI corpus compiles");
@@ -6143,6 +6165,23 @@ fn work() -> i32 {
             .expect("sum function");
         assert_eq!(sum.parameter_slots, 3);
         assert!(sum.registers >= 3);
+        let echo = module
+            .module()
+            .functions
+            .iter()
+            .position(|function| {
+                function.signature.parameters.len() == 1
+                    && function.signature.result == function.signature.parameters.first().copied()
+            })
+            .expect("echo function");
+        assert_eq!(
+            module
+                .module_abi()
+                .function(echo)
+                .and_then(|abi| abi.result.as_ref())
+                .map(|result| result.slot_count),
+            Some(2)
+        );
 
         let mut portable_heap = Heap::new_with_limits(64, 4_096, 64);
         let portable =

@@ -3415,6 +3415,8 @@ fn allocate_function_bindings(
             .map_err(|_| CompileError::too_many_registers(span))?;
         locals.insert(*definition, register);
         register_types.push(Some(ty));
+        let physical_slots = layouts.physical_slots(ty, span)?;
+        register_types.extend((1..physical_slots).map(|_| None));
     }
     Ok(AllocatedFunctionBindings {
         locals,
@@ -6877,7 +6879,7 @@ impl<'a> FunctionEmitter<'a> {
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
         for argument in arguments {
             let ty = lower_type(self.package, &argument.ty, self.span(&argument.span)?)?;
-            self.allocate(ty)?;
+            self.allocate_staging(ty)?;
         }
         Ok(base)
     }
@@ -6886,7 +6888,7 @@ impl<'a> FunctionEmitter<'a> {
         let base = u16::try_from(self.register_types.len())
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
         for ty in types {
-            self.allocate(*ty)?;
+            self.allocate_staging(*ty)?;
         }
         Ok(base)
     }
@@ -7067,6 +7069,16 @@ impl<'a> FunctionEmitter<'a> {
         let register = u16::try_from(self.register_types.len())
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
         self.register_types.push(Some(ty));
+        let physical_slots = self.layouts.physical_slots(ty, self.function_span)?;
+        self.register_types
+            .extend((1..physical_slots).map(|_| None));
+        Ok(register)
+    }
+
+    fn allocate_staging(&mut self, ty: ValueType) -> Result<u16, CompileError> {
+        let register = u16::try_from(self.register_types.len())
+            .map_err(|_| CompileError::too_many_registers(self.function_span))?;
+        self.register_types.push(Some(ty));
         Ok(register)
     }
 
@@ -7132,8 +7144,6 @@ impl<'a> FunctionEmitter<'a> {
     ) -> Result<(Function, Vec<SourceMapEntry>), CompileError> {
         if self.optimize {
             optimize_emitted_bytecode(&mut self.code, &mut self.spans, &mut self.loop_bounds);
-            self.register_types
-                .truncate(emitted_register_count(&self.code, self.parameter_slots));
         }
         let registers = u16::try_from(self.register_types.len().max(1))
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
@@ -7763,6 +7773,7 @@ fn optimize_emitted_bytecode(
     }
 }
 
+#[cfg(test)]
 fn emitted_register_count(code: &[Instruction], parameter_count: usize) -> usize {
     code.iter()
         .copied()
