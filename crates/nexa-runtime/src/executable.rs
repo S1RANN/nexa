@@ -337,7 +337,7 @@ fn update_counter() -> i32 {
     #[test]
     fn rows_cover_the_corpus_and_pin_the_dynamic_surface() {
         assert!(
-            std::mem::size_of::<super::ExecutableInstruction>() <= 40,
+            std::mem::size_of::<super::ExecutableInstruction>() <= 24,
             "hot metadata rows must not duplicate the 48-byte portable instruction"
         );
         let module = nexa_compiler::compile(CORPUS).expect("F1 corpus compiles");

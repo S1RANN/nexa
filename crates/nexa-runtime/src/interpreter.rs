@@ -2292,8 +2292,19 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let (index, expected) = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::ClassField { index, expected } => {
-                            (usize::from(index), expected)
+                        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
+                            (
+                                usize::from(index),
+                                module
+                                    .module()
+                                    .class_types
+                                    .get(usize::from(type_index))
+                                    .and_then(|class_type| {
+                                        class_type.fields.get(usize::from(index))
+                                    })
+                                    .map(|field| field.ty)
+                                    .ok_or(InterpreterError::TypeMismatch)?,
+                            )
                         }
                         _ => module
                             .class_field(type_id.0, field.0)
@@ -2346,8 +2357,19 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let (index, expected) = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::ClassField { index, expected } => {
-                            (usize::from(index), expected)
+                        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
+                            (
+                                usize::from(index),
+                                module
+                                    .module()
+                                    .class_types
+                                    .get(usize::from(type_index))
+                                    .and_then(|class_type| {
+                                        class_type.fields.get(usize::from(index))
+                                    })
+                                    .map(|field| field.ty)
+                                    .ok_or(InterpreterError::TypeMismatch)?,
+                            )
                         }
                         _ => module
                             .class_field(type_id.0, field.0)

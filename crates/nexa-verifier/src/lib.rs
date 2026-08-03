@@ -119,8 +119,8 @@ pub enum ResolvedNominalOperand {
         index: u16,
     },
     ClassField {
+        type_index: u16,
         index: u16,
-        expected: ValueType,
     },
 }
 
@@ -1990,25 +1990,28 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let (field_index, field_type) = module
+                let (type_index, field_index, field_type) = module
                     .class_types
                     .iter()
-                    .find(|class_type| class_type.type_id == type_id)
-                    .and_then(|class_type| {
+                    .enumerate()
+                    .find(|(_, class_type)| class_type.type_id == type_id)
+                    .and_then(|(type_index, class_type)| {
                         class_type
                             .fields
                             .iter()
                             .enumerate()
                             .find(|(_, candidate)| candidate.stable_id == field)
+                            .map(|(field_index, field)| (type_index, field_index, field))
                     })
-                    .map(|(index, field)| (index, field.ty))
+                    .map(|(type_index, field_index, field)| (type_index, field_index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
                 resolved_operands[pc] = ResolvedNominalOperand::ClassField {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
-                    expected: field_type,
                 };
                 state[register(dst)?] = Some(field_type);
             }
@@ -2021,25 +2024,28 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let (field_index, field_type) = module
+                let (type_index, field_index, field_type) = module
                     .class_types
                     .iter()
-                    .find(|class_type| class_type.type_id == type_id)
-                    .and_then(|class_type| {
+                    .enumerate()
+                    .find(|(_, class_type)| class_type.type_id == type_id)
+                    .and_then(|(type_index, class_type)| {
                         class_type
                             .fields
                             .iter()
                             .enumerate()
                             .find(|(_, candidate)| candidate.stable_id == field)
+                            .map(|(field_index, field)| (type_index, field_index, field))
                     })
-                    .map(|(index, field)| (index, field.ty))
+                    .map(|(type_index, field_index, field)| (type_index, field_index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
                 resolved_operands[pc] = ResolvedNominalOperand::ClassField {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
-                    expected: field_type,
                 };
                 require(&state, value, field_type)?;
             }
