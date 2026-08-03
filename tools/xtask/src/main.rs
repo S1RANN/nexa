@@ -408,6 +408,7 @@ fn main() -> Result<(), DynError> {
         "finalize-m3-r2" => finalize_m3_r2(),
         "finalize-m3-r3" => finalize_m3_r3(),
         "test-performance-counters" => test_performance_counters(),
+        "test-profiler-overhead" => test_profiler_overhead(),
         "test-value-layout" => test_value_layout(),
         "test-ir-optimizations" => test_ir_optimizations(),
         "test-optimization-differential" => test_optimization_differential(),
@@ -1442,6 +1443,155 @@ fn test_performance_counters() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-runtime", "--lib", "profiler"])
 }
 
+/// M5 WP16 formal profiler A/B gate.
+///
+/// All three modes execute the same Benchmark v7 binary and product corpus:
+/// a measurement-only monomorph with profiler support compiled out, the
+/// production disabled path, and the enabled path. Seven independent
+/// processes with 1,000 samples each remove scheduler/order noise; every hot
+/// product case must independently meet the 2%/15% ceilings.
+#[allow(
+    clippy::too_many_lines,
+    // Ratios are presentation and threshold values; integer precision above
+    // the f64 mantissa is irrelevant for nanosecond-scale samples.
+    clippy::cast_precision_loss
+)]
+fn test_profiler_overhead() -> Result<(), DynError> {
+    const SAMPLES: usize = 1_000;
+    const PROCESSES: usize = 7;
+    const DISABLED_LIMIT: f64 = 1.02;
+    const ENABLED_LIMIT: f64 = 1.15;
+
+    let root = workspace_root();
+    let output_dir = root.join("target/nexa-artifacts/m5/profiler-overhead");
+    fs::create_dir_all(&output_dir)?;
+    let control_path = output_dir.join("control-7x1000.json");
+    let disabled_path = output_dir.join("disabled-7x1000.json");
+    let enabled_path = output_dir.join("enabled-7x1000.json");
+
+    let run = |mode: Option<&str>, output: &Path| -> Result<(), DynError> {
+        let mut arguments = vec![
+            "run",
+            "--release",
+            "--quiet",
+            "-p",
+            "nexa-benchmark-v7",
+            "--",
+            "--samples",
+            "1000",
+            "--processes",
+            "7",
+        ];
+        if let Some(mode) = mode {
+            arguments.push(mode);
+        }
+        arguments.push("--output");
+        arguments.push(output.to_str().ok_or("non-UTF-8 profiler report path")?);
+        cargo(&arguments)
+    };
+    run(Some("--profiler-control"), &control_path)?;
+    run(None, &disabled_path)?;
+    run(Some("--profile"), &enabled_path)?;
+
+    let control: Value = serde_json::from_slice(&fs::read(&control_path)?)?;
+    let disabled: Value = serde_json::from_slice(&fs::read(&disabled_path)?)?;
+    let enabled: Value = serde_json::from_slice(&fs::read(&enabled_path)?)?;
+    for (name, report) in [
+        ("control", &control),
+        ("disabled", &disabled),
+        ("enabled", &enabled),
+    ] {
+        if report["process_count"].as_u64()
+            != Some(u64::try_from(PROCESSES).expect("formal process count fits u64"))
+            || report["samples_per_process"].as_u64()
+                != Some(u64::try_from(SAMPLES).expect("formal sample count fits u64"))
+        {
+            return Err(format!("{name} report is not formal 7x1000").into());
+        }
+    }
+    for field in [
+        "implementation_commit",
+        "benchmark_source_hash",
+        "benchmark_version",
+    ] {
+        if control[field] != disabled[field] || control[field] != enabled[field] {
+            return Err(format!("profiler A/B reports disagree on {field}").into());
+        }
+    }
+
+    let p50 = |report: &Value, name: &str| -> Option<u64> {
+        report["cases"]
+            .as_array()?
+            .iter()
+            .find(|case| case["case"] == name)?
+            .get("median_p50_ns")?
+            .as_u64()
+    };
+    let mut cases = Vec::new();
+    let mut failures = Vec::new();
+    for name in PROFILER_HOT_CASES {
+        let control_ns = p50(&control, name)
+            .ok_or_else(|| format!("control report omitted hot profiler case {name}"))?;
+        let disabled_ns = p50(&disabled, name)
+            .ok_or_else(|| format!("disabled report omitted hot profiler case {name}"))?;
+        let enabled_ns = p50(&enabled, name)
+            .ok_or_else(|| format!("enabled report omitted hot profiler case {name}"))?;
+        let disabled_ratio = disabled_ns as f64 / control_ns.max(1) as f64;
+        let enabled_ratio = enabled_ns as f64 / disabled_ns.max(1) as f64;
+        if disabled_ratio > DISABLED_LIMIT {
+            failures.push(format!(
+                "{name}: disabled overhead {:.2}% exceeds 2%",
+                (disabled_ratio - 1.0) * 100.0
+            ));
+        }
+        if enabled_ratio > ENABLED_LIMIT {
+            failures.push(format!(
+                "{name}: enabled overhead {:.2}% exceeds 15%",
+                (enabled_ratio - 1.0) * 100.0
+            ));
+        }
+        cases.push(serde_json::json!({
+            "case": name,
+            "control_p50_ns": control_ns,
+            "disabled_p50_ns": disabled_ns,
+            "enabled_p50_ns": enabled_ns,
+            "disabled_ratio": disabled_ratio,
+            "enabled_ratio": enabled_ratio,
+            "disabled_pass": disabled_ratio <= DISABLED_LIMIT,
+            "enabled_pass": enabled_ratio <= ENABLED_LIMIT,
+        }));
+    }
+    let passed = failures.is_empty();
+    let report = serde_json::json!({
+        "schema": 1,
+        "protocol": "same Benchmark v7 source; compiled-out/disabled/enabled; median of seven process medians; 1000 samples per process",
+        "implementation_commit": control["implementation_commit"],
+        "benchmark_source_hash": control["benchmark_source_hash"],
+        "processes": PROCESSES,
+        "samples_per_process": SAMPLES,
+        "disabled_limit_ratio": DISABLED_LIMIT,
+        "enabled_limit_ratio": ENABLED_LIMIT,
+        "cases": cases,
+        "failures": failures,
+        "status": if passed { "PASS" } else { "FAIL" },
+    });
+    let report_path = output_dir.join("formal-7x1000.json");
+    fs::write(
+        &report_path,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    if passed {
+        Ok(())
+    } else {
+        Err(format!(
+            "profiler overhead gate failed; see {}",
+            report_path.display()
+        )
+        .into())
+    }
+}
+
 /// M5 WP19-WP22 gate: deterministic physical layout derivation.
 fn test_value_layout() -> Result<(), DynError> {
     cargo(&["test", "-p", "nexa-bytecode", "--test", "layout"])
@@ -1920,6 +2070,14 @@ const PRODUCT_CPU_CASES: &[&str] = &[
     "product_data_sweep",
     "product_combat_tick",
     "product_grid_score",
+];
+/// WP16 covers the current hot interpreter corpus, including cases added
+/// after the frozen M5 baseline bucket.
+const PROFILER_HOT_CASES: &[&str] = &[
+    "product_data_sweep",
+    "product_combat_tick",
+    "product_grid_score",
+    "product_struct_rows",
 ];
 const HOST_TASK_ENGINE_CASES: &[&str] = &[
     "immediate_call",

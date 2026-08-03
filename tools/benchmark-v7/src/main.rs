@@ -347,6 +347,7 @@ struct BenchmarkReport {
     process_index: usize,
     started_at_unix_ms: u128,
     profiler_enabled: bool,
+    profiler_mode: &'static str,
     profiler: Option<ProfilerSummary>,
     allocation_scope: &'static str,
     cases: Vec<CaseStats>,
@@ -355,6 +356,7 @@ struct BenchmarkReport {
 /// WP15/WP16 profiler evidence attached to profiled runs.
 #[derive(Debug, Serialize)]
 struct ProfilerSummary {
+    schema: u32,
     host_calls: u64,
     host_function_count: usize,
     function_count: usize,
@@ -446,6 +448,7 @@ fn profiler_summary(enabled: bool) -> Option<ProfilerSummary> {
     let gc = report.gc;
     let tasks = report.tasks;
     Some(ProfilerSummary {
+        schema: report.schema,
         host_calls: report
             .host_calls
             .iter()
@@ -562,6 +565,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(1_usize);
     let profiler_enabled = arguments.iter().any(|argument| argument == "--profile");
+    let profiler_control = arguments
+        .iter()
+        .any(|argument| argument == "--profiler-control");
+    if profiler_enabled && profiler_control {
+        return Err("--profile and --profiler-control are mutually exclusive".into());
+    }
     if arguments
         .iter()
         .any(|argument| argument == "--static-leaf-ab")
@@ -574,6 +583,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if profiler_enabled {
         nexa_runtime::profiler::enable();
     }
+    let run_returned_case: RunReturned = if profiler_control {
+        run_returned_without_profiler
+    } else {
+        run_returned
+    };
     let started_at_unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis())
@@ -596,7 +610,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 0,
@@ -613,7 +627,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            let first = run_returned(
+            let first = run_returned_case(
                 &language,
                 &language_rows,
                 1,
@@ -622,7 +636,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 256,
                 &mut continuation_pool,
             );
-            let second = run_returned(
+            let second = run_returned_case(
                 &language,
                 &language_rows,
                 2,
@@ -655,7 +669,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 4,
@@ -672,7 +686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 5,
@@ -689,7 +703,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 6,
@@ -706,7 +720,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 7,
@@ -723,7 +737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 8,
@@ -740,7 +754,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(64, 4_096, 64),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 9,
@@ -783,7 +797,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             (heap, destination, source)
         },
         |(mut heap, destination, source)| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 10,
@@ -800,7 +814,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 PRODUCT_DATA_SWEEP_FUNCTION,
@@ -819,7 +833,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 PRODUCT_COMBAT_TICK_FUNCTION,
@@ -838,7 +852,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 PRODUCT_GRID_SCORE_FUNCTION,
@@ -857,7 +871,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         samples,
         || Heap::new_with_limits(1_024, 65_536, 512),
         |mut heap| {
-            run_returned(
+            run_returned_case(
                 &language,
                 &language_rows,
                 14,
@@ -885,7 +899,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
             // Cold start on purpose: the arena reservation is part of the
             // standalone-pipeline cost shape, so no pooled storage here.
-            run_returned(
+            run_returned_case(
                 &verified,
                 &rows,
                 0,
@@ -913,7 +927,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = ExecutableModule::build(&verified, OpcodeCostTable::canonical())
                 .expect("cached benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
-            run_returned(
+            run_returned_case(
                 &verified,
                 &rows,
                 0,
@@ -952,7 +966,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let rows = ExecutableModule::build(&verified, OpcodeCostTable::canonical())
                 .expect("disk-cached benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
-            run_returned(
+            run_returned_case(
                 &verified,
                 &rows,
                 0,
@@ -1245,6 +1259,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         process_index,
         started_at_unix_ms,
         profiler_enabled,
+        profiler_mode: if profiler_enabled {
+            "enabled"
+        } else if profiler_control {
+            "compiled-out-control"
+        } else {
+            "disabled"
+        },
         profiler: profiler_summary(profiler_enabled),
         allocation_scope: "timed operation only; per-sample setup and result storage excluded",
         cases,
@@ -1278,6 +1299,12 @@ fn run_multi_process(
         }
         if arguments.iter().any(|argument| argument == "--profile") {
             child_arguments.push("--profile".to_owned());
+        }
+        if arguments
+            .iter()
+            .any(|argument| argument == "--profiler-control")
+        {
+            child_arguments.push("--profiler-control".to_owned());
         }
         let output = std::process::Command::new(&executable)
             .args(&child_arguments)
@@ -1621,7 +1648,7 @@ fn run_static_leaf_ab(
             ));
             let (mut full_heap, full_arguments) =
                 static_leaf_ab_input(&module, function, &arguments);
-            black_box(run_returned_full(
+            black_box(run_returned_full::<true>(
                 &module,
                 &executable,
                 function,
@@ -1649,7 +1676,7 @@ fn run_static_leaf_ab(
                         &mut None,
                     )
                 } else {
-                    run_returned_full(
+                    run_returned_full::<true>(
                         &module,
                         &executable,
                         function,
@@ -1773,7 +1800,42 @@ fn returned_i32(
     }
 }
 
+type RunReturned = fn(
+    &VerifiedModule,
+    &ExecutableModule,
+    u32,
+    &[RuntimeValue],
+    &mut Heap,
+    u64,
+    &mut Option<nexa_runtime::FrameArena>,
+) -> Observation;
+
 fn run_returned(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+    heap: &mut Heap,
+    fuel: u64,
+    pool: &mut Option<nexa_runtime::FrameArena>,
+) -> Observation {
+    run_returned_mode::<true>(module, executable, function, arguments, heap, fuel, pool)
+}
+
+fn run_returned_without_profiler(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+    heap: &mut Heap,
+    fuel: u64,
+    pool: &mut Option<nexa_runtime::FrameArena>,
+) -> Observation {
+    run_returned_mode::<false>(module, executable, function, arguments, heap, fuel, pool)
+}
+
+#[inline(always)]
+fn run_returned_mode<const PROFILING: bool>(
     module: &VerifiedModule,
     executable: &ExecutableModule,
     function: u32,
@@ -1788,17 +1850,28 @@ fn run_returned(
     // continuation storage cycles through `pool` exactly like realm task
     // admission, so steady-state samples measure execution, not arena
     // reservation; cold-start cases pass a fresh empty pool on purpose.
-    if let Some(outcome) = CheckedInterpreter::try_run_static_leaf(
-        module,
-        function,
-        arguments,
-        FuelState::new(fuel, 0, u64::MAX),
-        OpcodeCostTable::canonical(),
-        heap,
-        executable,
-    )
-    .expect("verified static benchmark leaf")
-    {
+    let static_outcome = if PROFILING {
+        CheckedInterpreter::try_run_static_leaf(
+            module,
+            function,
+            arguments,
+            FuelState::new(fuel, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            heap,
+            executable,
+        )
+    } else {
+        CheckedInterpreter::try_run_static_leaf_without_profiler(
+            module,
+            function,
+            arguments,
+            FuelState::new(fuel, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            heap,
+            executable,
+        )
+    };
+    if let Some(outcome) = static_outcome.expect("verified static benchmark leaf") {
         black_box(
             outcome
                 .result
@@ -1806,10 +1879,11 @@ fn run_returned(
         );
         return observation(outcome.charge, heap);
     }
-    run_returned_full(module, executable, function, arguments, heap, fuel, pool)
+    run_returned_full::<PROFILING>(module, executable, function, arguments, heap, fuel, pool)
 }
 
-fn run_returned_full(
+#[inline(always)]
+fn run_returned_full<const PROFILING: bool>(
     module: &VerifiedModule,
     executable: &ExecutableModule,
     function: u32,
@@ -1828,15 +1902,27 @@ fn run_returned_full(
         pool.take(),
     )
     .expect("verified benchmark function starts");
-    let outcome = CheckedInterpreter::poll_recycling(
-        module,
-        continuation,
-        FuelState::new(fuel, 0, u64::MAX),
-        OpcodeCostTable::canonical(),
-        Some(heap),
-        Some(executable),
-        pool,
-    )
+    let outcome = if PROFILING {
+        CheckedInterpreter::poll_recycling(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            Some(heap),
+            Some(executable),
+            pool,
+        )
+    } else {
+        CheckedInterpreter::poll_recycling_without_profiler(
+            module,
+            continuation,
+            FuelState::new(fuel, 0, u64::MAX),
+            OpcodeCostTable::canonical(),
+            heap,
+            executable,
+            pool,
+        )
+    }
     .expect("verified benchmark function");
     let InterpreterOutcome::Returned { charge, value, .. } = outcome else {
         panic!("benchmark function did not return");

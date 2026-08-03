@@ -23,7 +23,7 @@ use nexa_verifier::VerifiedModule;
 
 use crate::{
     ContinuationReservation, FrameArena, FrameError, FrameLimits, GcRef, Heap, HeapError,
-    MapSetOutcome, RuntimeMessage, RuntimeValue,
+    MapSetOutcome, RuntimeMessage, RuntimeValue, executable::ExecutableNominalOperand,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -622,26 +622,30 @@ pub(crate) const fn allocation_profile(
     }
 }
 
+#[inline]
 fn record_executable_profile_instruction(
-    profile_module: crate::profiler::ProfileModuleSlot,
+    profile_poll: &mut crate::profiler::ProfilePoll,
     function: u32,
     pc: u32,
-    instruction: Instruction,
-    row: crate::executable::ExecutableProfileRow,
+    execution_row: crate::executable::ExecutableInstruction,
+    profile_row: crate::executable::ExecutableProfileRow,
 ) {
-    crate::profiler::record_instruction(
-        profile_module,
-        opcode_index(instruction),
-        function,
-        row.allocation
-            .map(|(kind, type_id)| crate::profiler::AllocationEvent {
-                pc,
-                source_span: row.source_span,
-                kind,
-                type_id,
-            }),
-        row.host_call,
-    );
+    crate::profiler::record_instruction(profile_poll, execution_row.profile_opcode());
+    if execution_row.has_profile_event() {
+        crate::profiler::record_instruction_event(
+            profile_poll,
+            function,
+            profile_row
+                .allocation
+                .map(|(kind, type_id)| crate::profiler::AllocationEvent {
+                    pc,
+                    source_span: profile_row.source_span,
+                    kind,
+                    type_id,
+                }),
+            profile_row.host_call,
+        );
+    }
 }
 
 pub struct CheckedInterpreter;
@@ -1176,10 +1180,10 @@ fn resolved_class_field(
     module: &VerifiedModule,
     type_id: StableId,
     field: StableId,
-    resolved: nexa_verifier::ResolvedNominalOperand,
+    resolved: ExecutableNominalOperand,
 ) -> Result<(usize, ValueType), InterpreterError> {
     match resolved {
-        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
+        ExecutableNominalOperand::ClassField { type_index, index } => {
             let expected = module
                 .module()
                 .class_types
@@ -1248,7 +1252,7 @@ fn static_leaf_attempt_fuel(
     registers: &crate::trusted::StaticLeafRegisters,
     heap: &Heap,
 ) -> Result<u64, InterpreterError> {
-    if !row.dynamic_fuel || matches!(instruction, Instruction::Return { .. }) {
+    if !row.dynamic_fuel() || matches!(instruction, Instruction::Return { .. }) {
         return Ok(row.attempt_fuel);
     }
     let work = match instruction {
@@ -1421,8 +1425,42 @@ impl CheckedInterpreter {
     /// insufficient budgets return `None` before any heap mutation so the
     /// caller can preserve ordinary suspension semantics through the full
     /// interpreter.
-    #[allow(clippy::too_many_lines)]
     pub fn try_run_static_leaf(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<Option<StaticLeafOutcome>, InterpreterError> {
+        Self::try_run_static_leaf_internal::<true>(
+            module, function, arguments, fuel, costs, heap, executable,
+        )
+    }
+
+    /// Measurement-only A/B control with profiler support compiled out.
+    ///
+    /// This exists only for the Benchmark v7 WP16 overhead authority and is
+    /// unavailable in normal Runtime builds.
+    #[cfg(feature = "profiler-overhead-control")]
+    #[doc(hidden)]
+    pub fn try_run_static_leaf_without_profiler(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<Option<StaticLeafOutcome>, InterpreterError> {
+        Self::try_run_static_leaf_internal::<false>(
+            module, function, arguments, fuel, costs, heap, executable,
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn try_run_static_leaf_internal<const PROFILING: bool>(
         module: &VerifiedModule,
         function: u32,
         arguments: &[RuntimeValue],
@@ -1479,15 +1517,20 @@ impl CheckedInterpreter {
         if upper_fuel > fuel.slice_remaining || cumulative_after_upper > fuel.cumulative_limit {
             return Ok(None);
         }
-        let profile_module = crate::profiler::enabled()
-            .then(|| crate::profiler::begin_module(module))
-            .flatten();
-        let record_prefix = |count: usize| {
-            let Some(profile_module) = profile_module else {
+        let mut profile_module = if PROFILING && crate::profiler::enabled() {
+            crate::profiler::begin_module(module)
+        } else {
+            None
+        };
+        if let Some(profile_module) = profile_module.as_mut() {
+            profile_module.resolve_function(function);
+        }
+        let mut record_prefix = |count: usize| {
+            let Some(profile_module) = profile_module.as_mut() else {
                 return;
             };
-            for (pc, (instruction, row)) in function_meta
-                .code
+            for (pc, (execution_row, profile_row)) in executable_function
+                .rows()
                 .iter()
                 .copied()
                 .zip(executable_function.profile_rows())
@@ -1498,8 +1541,8 @@ impl CheckedInterpreter {
                     profile_module,
                     function,
                     u32::try_from(pc).unwrap_or(u32::MAX),
-                    instruction,
-                    *row,
+                    execution_row,
+                    *profile_row,
                 );
             }
         };
@@ -1538,7 +1581,7 @@ impl CheckedInterpreter {
                 .fuel_used
                 .checked_add(attempt_fuel)
                 .ok_or(InterpreterError::FuelCostOverflow)?;
-            if let Some(profile_module) = profile_module {
+            if let Some(profile_module) = profile_module.as_mut() {
                 let profile_row = executable_function
                     .profile_rows()
                     .get(pc)
@@ -1548,7 +1591,7 @@ impl CheckedInterpreter {
                     profile_module,
                     function,
                     u32::try_from(pc).unwrap_or(u32::MAX),
-                    instruction,
+                    *row,
                     profile_row,
                 );
             }
@@ -1578,7 +1621,7 @@ impl CheckedInterpreter {
         fuel: FuelState,
         costs: &OpcodeCostTable,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1599,7 +1642,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         host: &mut dyn InterpreterHost,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1620,7 +1663,7 @@ impl CheckedInterpreter {
         costs: &OpcodeCostTable,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1645,7 +1688,7 @@ impl CheckedInterpreter {
         heap: &mut Heap,
         executable: &crate::executable::ExecutableModule,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<true>(
+        Self::execute::<true, true>(
             module,
             continuation,
             fuel,
@@ -1677,7 +1720,7 @@ impl CheckedInterpreter {
         recycle: &mut Option<FrameArena>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
         match (heap, executable) {
-            (Some(heap), Some(executable)) => Self::execute::<true>(
+            (Some(heap), Some(executable)) => Self::execute::<true, true>(
                 module,
                 continuation,
                 fuel,
@@ -1689,7 +1732,7 @@ impl CheckedInterpreter {
                 Some(executable),
                 Some(recycle),
             ),
-            (heap, executable) => Self::execute::<false>(
+            (heap, executable) => Self::execute::<false, true>(
                 module,
                 continuation,
                 fuel,
@@ -1704,6 +1747,35 @@ impl CheckedInterpreter {
         }
     }
 
+    /// Measurement-only predecoded A/B control with profiler support
+    /// compiled out. Benchmark v7 compares this monomorphization with the
+    /// ordinary disabled and enabled paths for WP16.
+    #[cfg(feature = "profiler-overhead-control")]
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn poll_recycling_without_profiler(
+        module: &VerifiedModule,
+        continuation: InterpreterContinuation,
+        fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+        recycle: &mut Option<FrameArena>,
+    ) -> Result<InterpreterOutcome, InterpreterError> {
+        Self::execute::<true, false>(
+            module,
+            continuation,
+            fuel,
+            costs,
+            None,
+            None,
+            None,
+            Some(heap),
+            Some(executable),
+            Some(recycle),
+        )
+    }
+
     pub fn poll_with_host_and_heap(
         module: &VerifiedModule,
         continuation: InterpreterContinuation,
@@ -1712,7 +1784,7 @@ impl CheckedInterpreter {
         host: &mut dyn InterpreterHost,
         heap: &mut Heap,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1737,7 +1809,7 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1763,7 +1835,7 @@ impl CheckedInterpreter {
         executable: Option<&crate::executable::ExecutableModule>,
         recycle: Option<&mut Option<FrameArena>>,
     ) -> Result<InterpreterOutcome, InterpreterError> {
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             fuel,
@@ -1866,7 +1938,7 @@ impl CheckedInterpreter {
             limits,
             ContinuationReservation::for_limits(limits),
         )?;
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
@@ -1896,7 +1968,7 @@ impl CheckedInterpreter {
             limits,
             ContinuationReservation::for_limits(limits),
         )?;
-        Self::execute::<false>(
+        Self::execute::<false, true>(
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
@@ -2005,7 +2077,7 @@ impl CheckedInterpreter {
     }
 
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-    fn execute<const PREDECODED: bool>(
+    fn execute<const PREDECODED: bool, const PROFILING: bool>(
         module: &VerifiedModule,
         mut continuation: InterpreterContinuation,
         mut fuel: FuelState,
@@ -2138,10 +2210,11 @@ impl CheckedInterpreter {
         }
         // WP15/WP16: the enabled flag is read once per poll; the disabled
         // hot path costs one predictable branch per instruction.
-        let profiling = crate::profiler::enabled();
-        let profile_module = profiling
-            .then(|| crate::profiler::begin_module(module))
-            .flatten();
+        let mut profile_module = if PROFILING && crate::profiler::enabled() {
+            crate::profiler::begin_module(module)
+        } else {
+            None
+        };
         // K2: the verified function metadata and its predecoded rows are
         // immutable for the whole poll, so they are re-resolved only when
         // the executing function changes (Call/Return/defer boundaries)
@@ -2168,19 +2241,24 @@ impl CheckedInterpreter {
                             .ok_or(InterpreterError::FellOffFunction)?;
                         (
                             Some(executable_function.rows()),
-                            profile_module.map(|_| executable_function.profile_rows()),
+                            profile_module
+                                .as_ref()
+                                .map(|_| executable_function.profile_rows()),
                         )
                     } else {
                         let executable_function = executable
                             .and_then(|rows| rows.functions().get(frame.function as usize));
                         (
                             executable_function.map(crate::executable::ExecutableFunction::rows),
-                            profile_module.and_then(|_| {
+                            profile_module.as_ref().and_then(|_| {
                                 executable_function
                                     .map(crate::executable::ExecutableFunction::profile_rows)
                             }),
                         )
                     };
+                    if let Some(profile_module) = profile_module.as_mut() {
+                        profile_module.resolve_function(frame.function);
+                    }
                     cached_function = Some((frame.function, function, rows, profile_rows));
                     (function, rows, profile_rows)
                 }
@@ -2203,7 +2281,7 @@ impl CheckedInterpreter {
                     .get(frame.pc as usize)
                     .ok_or(InterpreterError::FellOffFunction)?;
                 resolved_nominal = row.resolved_nominal;
-                instruction_cost = if row.dynamic_fuel {
+                instruction_cost = if row.dynamic_fuel() {
                     dynamic_instruction_fuel(
                         module.module(),
                         module.nominal_index_shape(),
@@ -2216,13 +2294,13 @@ impl CheckedInterpreter {
                 } else {
                     row.attempt_fuel
                 };
-                fuel_boundary = row.fuel_boundary;
+                fuel_boundary = row.fuel_boundary();
             } else if let Some(rows) = function_rows {
                 let row = rows
                     .get(frame.pc as usize)
                     .ok_or(InterpreterError::FellOffFunction)?;
                 resolved_nominal = row.resolved_nominal;
-                instruction_cost = if row.dynamic_fuel {
+                instruction_cost = if row.dynamic_fuel() {
                     dynamic_instruction_fuel(
                         module.module(),
                         module.nominal_index_shape(),
@@ -2235,10 +2313,11 @@ impl CheckedInterpreter {
                 } else {
                     row.attempt_fuel
                 };
-                fuel_boundary = row.fuel_boundary;
+                fuel_boundary = row.fuel_boundary();
             } else {
-                resolved_nominal =
-                    module.resolved_operand(frame.function as usize, frame.pc as usize);
+                resolved_nominal = module
+                    .resolved_operand(frame.function as usize, frame.pc as usize)
+                    .into();
                 instruction_cost = instruction_attempt_fuel(
                     module.module(),
                     module.nominal_index_shape(),
@@ -2301,48 +2380,64 @@ impl CheckedInterpreter {
                 pending_cost = settlement;
             }
             charge.instructions = charge.instructions.saturating_add(1);
-            if let Some(profile_module) = profile_module {
-                let (allocation, host_call) = if let Some(row) =
-                    function_profile_rows.and_then(|rows| rows.get(frame.pc as usize))
+            if let Some(profile_module) = profile_module.as_mut() {
+                if let Some(execution_row) = function_rows
+                    .and_then(|rows| rows.get(frame.pc as usize))
+                    .copied()
                 {
-                    (
-                        row.allocation
-                            .map(|(kind, type_id)| crate::profiler::AllocationEvent {
-                                pc: frame.pc,
-                                source_span: row.source_span,
-                                kind,
-                                type_id,
+                    crate::profiler::record_instruction(
+                        profile_module,
+                        execution_row.profile_opcode(),
+                    );
+                    if execution_row.has_profile_event() {
+                        let profile_row = function_profile_rows
+                            .and_then(|rows| rows.get(frame.pc as usize))
+                            .copied()
+                            .ok_or(InterpreterError::FellOffFunction)?;
+                        crate::profiler::record_instruction_event(
+                            profile_module,
+                            frame.function,
+                            profile_row.allocation.map(|(kind, type_id)| {
+                                crate::profiler::AllocationEvent {
+                                    pc: frame.pc,
+                                    source_span: profile_row.source_span,
+                                    kind,
+                                    type_id,
+                                }
                             }),
-                        row.host_call,
-                    )
+                            profile_row.host_call,
+                        );
+                    }
                 } else {
-                    (
-                        allocation_profile(instruction, resolved_nominal).map(|(kind, type_id)| {
-                            crate::profiler::AllocationEvent {
-                                pc: frame.pc,
-                                source_span: module.module().source_span(frame.function, frame.pc),
-                                kind,
-                                type_id,
-                            }
-                        }),
-                        if let Instruction::HostCall { import, .. } = instruction {
-                            module
-                                .module()
-                                .host_imports
-                                .get(import as usize)
-                                .map(|host| (host.stable_id, host.mode))
-                        } else {
-                            None
-                        },
+                    let allocation = allocation_profile(
+                        instruction,
+                        module.resolved_operand(frame.function as usize, frame.pc as usize),
                     )
-                };
-                crate::profiler::record_instruction(
-                    profile_module,
-                    opcode_index(instruction),
-                    frame.function,
-                    allocation,
-                    host_call,
-                );
+                    .map(|(kind, type_id)| crate::profiler::AllocationEvent {
+                        pc: frame.pc,
+                        source_span: module.module().source_span(frame.function, frame.pc),
+                        kind,
+                        type_id,
+                    });
+                    let host_call = if let Instruction::HostCall { import, .. } = instruction {
+                        module
+                            .module()
+                            .host_imports
+                            .get(import as usize)
+                            .map(|host| (host.stable_id, host.mode))
+                    } else {
+                        None
+                    };
+                    crate::profiler::record_instruction(profile_module, opcode_index(instruction));
+                    if allocation.is_some() || host_call.is_some() {
+                        crate::profiler::record_instruction_event(
+                            profile_module,
+                            frame.function,
+                            allocation,
+                            host_call,
+                        );
+                    }
+                }
             }
             match instruction {
                 Instruction::LoadI32 { dst, value } => {
@@ -3233,9 +3328,7 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::StructField { index, .. } => {
-                            usize::from(index)
-                        }
+                        ExecutableNominalOperand::StructField { index } => usize::from(index),
                         _ => module
                             .struct_field(type_id.0, field.0)
                             .map(|(index, _)| index)
@@ -3261,9 +3354,7 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let index = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::StructField { index, .. } => {
-                            usize::from(index)
-                        }
+                        ExecutableNominalOperand::StructField { index } => usize::from(index),
                         _ => module
                             .struct_field(type_id.0, field.0)
                             .map(|(index, _)| index)
@@ -3316,20 +3407,16 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let (index, expected) = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
-                            (
-                                usize::from(index),
-                                module
-                                    .module()
-                                    .class_types
-                                    .get(usize::from(type_index))
-                                    .and_then(|class_type| {
-                                        class_type.fields.get(usize::from(index))
-                                    })
-                                    .map(|field| field.ty)
-                                    .ok_or(InterpreterError::TypeMismatch)?,
-                            )
-                        }
+                        ExecutableNominalOperand::ClassField { type_index, index } => (
+                            usize::from(index),
+                            module
+                                .module()
+                                .class_types
+                                .get(usize::from(type_index))
+                                .and_then(|class_type| class_type.fields.get(usize::from(index)))
+                                .map(|field| field.ty)
+                                .ok_or(InterpreterError::TypeMismatch)?,
+                        ),
                         _ => module
                             .class_field(type_id.0, field.0)
                             .map(|(index, field)| (index, field.ty))
@@ -3381,20 +3468,16 @@ impl CheckedInterpreter {
                         return Err(InterpreterError::TypeMismatch);
                     };
                     let (index, expected) = match resolved_nominal {
-                        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
-                            (
-                                usize::from(index),
-                                module
-                                    .module()
-                                    .class_types
-                                    .get(usize::from(type_index))
-                                    .and_then(|class_type| {
-                                        class_type.fields.get(usize::from(index))
-                                    })
-                                    .map(|field| field.ty)
-                                    .ok_or(InterpreterError::TypeMismatch)?,
-                            )
-                        }
+                        ExecutableNominalOperand::ClassField { type_index, index } => (
+                            usize::from(index),
+                            module
+                                .module()
+                                .class_types
+                                .get(usize::from(type_index))
+                                .and_then(|class_type| class_type.fields.get(usize::from(index)))
+                                .map(|field| field.ty)
+                                .ok_or(InterpreterError::TypeMismatch)?,
+                        ),
                         _ => module
                             .class_field(type_id.0, field.0)
                             .map(|(index, field)| (index, field.ty))
@@ -5328,7 +5411,8 @@ macro_rules! define_opcode_cost_schedule {
         ];
 
         #[allow(clippy::too_many_lines)]
-        fn opcode_index(instruction: Instruction) -> usize {
+        #[inline(always)]
+        pub(crate) const fn opcode_index(instruction: Instruction) -> usize {
             match instruction {
                 $($pattern => $index,)+
             }
@@ -6019,7 +6103,7 @@ fn work(x: i32) -> i32 {
             let mut trace = Vec::new();
             loop {
                 let outcome = match rows {
-                    Some(rows) => CheckedInterpreter::execute::<true>(
+                    Some(rows) => CheckedInterpreter::execute::<true, true>(
                         &module,
                         continuation,
                         FuelState::new(64, cumulative, u64::MAX),
@@ -6031,7 +6115,7 @@ fn work(x: i32) -> i32 {
                         Some(rows),
                         None,
                     ),
-                    None => CheckedInterpreter::execute::<false>(
+                    None => CheckedInterpreter::execute::<false, true>(
                         &module,
                         continuation,
                         FuelState::new(64, cumulative, u64::MAX),

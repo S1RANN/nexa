@@ -20,6 +20,7 @@ nexa-idl = { path = "../nexa-idl" }
 allocation-counting = []
 fuzzing = ["model-adapter"]
 model-adapter = ["dep:nexa-compiler", "dep:nexa-idl"]
+profiler-overhead-control = []
 
 # M5 K1: the runtime hosts the single sanctioned unsafe kernel
 # (src/trusted.rs). The crate lowers the workspace's `forbid` to `deny`

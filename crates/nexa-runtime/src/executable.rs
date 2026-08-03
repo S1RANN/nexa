@@ -23,6 +23,38 @@ use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 static NEXT_STRING_POOL_ID: AtomicU64 = AtomicU64::new(1);
 const STATIC_LEAF_MAX_INSTRUCTIONS: usize = 24;
 
+/// Dense verifier result used by executable rows.
+///
+/// The portable verifier form also carries a Struct `StableId`, which is
+/// useful while building cold allocation provenance but redundant during
+/// execution: Struct operations need only the proven field slot, while Class
+/// operations need the proven type and field slots. Dropping that cold
+/// identity shrinks this value from 16 bytes to a compact dense layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ExecutableNominalOperand {
+    #[default]
+    None,
+    StructField {
+        index: u16,
+    },
+    ClassField {
+        type_index: u16,
+        index: u16,
+    },
+}
+
+impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
+    fn from(resolved: ResolvedNominalOperand) -> Self {
+        match resolved {
+            ResolvedNominalOperand::None => Self::None,
+            ResolvedNominalOperand::StructField { index, .. } => Self::StructField { index },
+            ResolvedNominalOperand::ClassField { type_index, index } => {
+                Self::ClassField { type_index, index }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PooledStringConstant {
     pub value: Arc<str>,
@@ -38,17 +70,51 @@ pub struct PooledStringConstant {
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutableInstruction {
     /// Verifier-proven dense nominal operand for field instructions.
-    pub resolved_nominal: ResolvedNominalOperand,
+    pub(crate) resolved_nominal: ExecutableNominalOperand,
     /// Full attempt charge for static rows, base opcode charge for dynamic
-    /// rows. `dynamic_fuel` is the compact discriminator (unlike
+    /// rows. The dynamic flag is a compact discriminator (unlike
     /// `Option<u64>`, which occupies 16 bytes).
     pub attempt_fuel: u64,
-    pub dynamic_fuel: bool,
-    /// Fixed at build time; never recomputed per instruction.
-    pub safepoint: bool,
-    /// Fuel must settle before this row (entry, resume-after-host, or
-    /// safepoint). This replaces the hot-loop previous-instruction lookup.
-    pub fuel_boundary: bool,
+    /// Three execution flags plus the eight-bit profiler code share one word.
+    /// This keeps the row at 24 bytes while avoiding a cold metadata read.
+    flags: u16,
+}
+
+impl ExecutableInstruction {
+    const DYNAMIC_FUEL: u16 = 1 << 0;
+    const SAFEPOINT: u16 = 1 << 1;
+    const FUEL_BOUNDARY: u16 = 1 << 2;
+    const PROFILE_SHIFT: u32 = 3;
+
+    #[inline]
+    pub(crate) const fn dynamic_fuel(self) -> bool {
+        self.flags & Self::DYNAMIC_FUEL != 0
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn safepoint(self) -> bool {
+        self.flags & Self::SAFEPOINT != 0
+    }
+
+    #[inline]
+    pub(crate) const fn fuel_boundary(self) -> bool {
+        self.flags & Self::FUEL_BOUNDARY != 0
+    }
+
+    #[inline]
+    pub(crate) fn profile_opcode(self) -> usize {
+        usize::from(((self.flags >> Self::PROFILE_SHIFT) & 0x7f) as u8)
+    }
+
+    #[inline]
+    pub(crate) const fn has_profile_event(self) -> bool {
+        self.flags & (0x80_u16 << Self::PROFILE_SHIFT) != 0
+    }
+
+    fn with_profile_code(mut self, profile_code: u8) -> Self {
+        self.flags |= u16::from(profile_code) << Self::PROFILE_SHIFT;
+        self
+    }
 }
 
 /// Cold profiler metadata parallel to one executable instruction row.
@@ -302,7 +368,11 @@ impl ExecutableModule {
         let mut total = 0;
         for function in &self.functions {
             total += function.rows.len();
-            static_rows += function.rows.iter().filter(|row| !row.dynamic_fuel).count();
+            static_rows += function
+                .rows
+                .iter()
+                .filter(|row| !row.dynamic_fuel())
+                .count();
         }
         (static_rows, total)
     }
@@ -331,27 +401,36 @@ fn build_executable_function(
     for (pc, instruction) in function.code.iter().copied().enumerate() {
         let pc = u32::try_from(pc).unwrap_or(u32::MAX);
         let resolved = module.resolved_operand(function_id as usize, pc as usize);
-        rows.push(build_executable_row(
-            module,
-            nominal_shape,
-            function,
-            function_id,
-            pc,
-            instruction,
-            costs,
-        )?);
         let allocation = crate::interpreter::allocation_profile(instruction, resolved);
+        let host_call = if let Instruction::HostCall { import, .. } = instruction {
+            bytecode
+                .host_imports
+                .get(import as usize)
+                .map(|host| (host.stable_id, host.mode))
+        } else {
+            None
+        };
+        let mut profile_code = u8::try_from(crate::interpreter::opcode_index(instruction))
+            .expect("opcode table fits u8");
+        if allocation.is_some() || host_call.is_some() {
+            profile_code |= 0x80;
+        }
+        rows.push(
+            build_executable_row(
+                module,
+                nominal_shape,
+                function,
+                function_id,
+                pc,
+                instruction,
+                costs,
+            )?
+            .with_profile_code(profile_code),
+        );
         profile_rows.push(ExecutableProfileRow {
             allocation,
             source_span: allocation.and_then(|_| bytecode.source_span(function_id, pc)),
-            host_call: if let Instruction::HostCall { import, .. } = instruction {
-                bytecode
-                    .host_imports
-                    .get(import as usize)
-                    .map(|host| (host.stable_id, host.mode))
-            } else {
-                None
-            },
+            host_call,
         });
     }
     let static_leaf = certify_static_leaf(function, &rows);
@@ -420,17 +499,28 @@ fn build_executable_row(
         static_fuel
     };
     let safepoint = crate::interpreter::is_safepoint(instruction, pc);
+    let fuel_boundary = pc == 0
+        || safepoint
+        || function
+            .code
+            .get(pc.saturating_sub(1) as usize)
+            .is_some_and(|previous| matches!(previous, Instruction::HostCall { .. }));
+    let mut flags = 0;
+    if static_fuel.is_none() {
+        flags |= ExecutableInstruction::DYNAMIC_FUEL;
+    }
+    if safepoint {
+        flags |= ExecutableInstruction::SAFEPOINT;
+    }
+    if fuel_boundary {
+        flags |= ExecutableInstruction::FUEL_BOUNDARY;
+    }
     Ok(ExecutableInstruction {
-        resolved_nominal: module.resolved_operand(function_id as usize, pc as usize),
+        resolved_nominal: module
+            .resolved_operand(function_id as usize, pc as usize)
+            .into(),
         attempt_fuel: static_fuel.unwrap_or_else(|| costs.cost(instruction)),
-        dynamic_fuel: static_fuel.is_none(),
-        safepoint,
-        fuel_boundary: pc == 0
-            || safepoint
-            || function
-                .code
-                .get(pc.saturating_sub(1) as usize)
-                .is_some_and(|previous| matches!(previous, Instruction::HostCall { .. })),
+        flags,
     })
 }
 
@@ -1000,7 +1090,10 @@ fn update_counter() -> i32 {
     fn rows_cover_the_corpus_and_pin_the_dynamic_surface() {
         assert!(
             std::mem::size_of::<super::ExecutableInstruction>() <= 24,
-            "hot metadata rows must not duplicate the 48-byte portable instruction"
+            "hot metadata rows must not duplicate the 48-byte portable instruction: row={} dense_nominal={} verifier_nominal={}",
+            std::mem::size_of::<super::ExecutableInstruction>(),
+            std::mem::size_of::<super::ExecutableNominalOperand>(),
+            std::mem::size_of::<nexa_verifier::ResolvedNominalOperand>()
         );
         let module = nexa_compiler::compile(CORPUS).expect("F1 corpus compiles");
         let costs = OpcodeCostTable::default();
@@ -1016,11 +1109,11 @@ fn update_counter() -> i32 {
             {
                 let pc = u32::try_from(pc).expect("test corpus pcs fit u32");
                 assert_eq!(
-                    row.safepoint,
+                    row.safepoint(),
                     is_safepoint(instruction, pc),
                     "safepoint flag diverges at pc {pc}"
                 );
-                if row.dynamic_fuel {
+                if row.dynamic_fuel() {
                     assert!(
                         dynamic_surface(instruction),
                         "instruction unexpectedly dynamic at pc {pc}: {instruction:?}"
@@ -1055,14 +1148,14 @@ fn update_counter() -> i32 {
                 Instruction::StructGet { .. } | Instruction::StructWith { .. } => assert!(
                     matches!(
                         row.resolved_nominal,
-                        nexa_verifier::ResolvedNominalOperand::StructField { .. }
+                        super::ExecutableNominalOperand::StructField { .. }
                     ),
                     "struct field rows carry a verifier-proven dense index"
                 ),
                 Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => assert!(
                     matches!(
                         row.resolved_nominal,
-                        nexa_verifier::ResolvedNominalOperand::ClassField { .. }
+                        super::ExecutableNominalOperand::ClassField { .. }
                     ),
                     "class field rows carry a verifier-proven dense index and type"
                 ),
@@ -1115,7 +1208,7 @@ fn update_counter() -> i32 {
             bare + 37,
             "HostCall rows carry the folded import surcharge"
         );
-        assert!(!row.dynamic_fuel);
+        assert!(!row.dynamic_fuel());
     }
 
     #[test]
