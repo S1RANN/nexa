@@ -8624,7 +8624,9 @@ fn emit_typed_type_metadata(
     for host in package.metadata().host_bindings.iter() {
         for ty in &host.types {
             match &ty.layout {
-                HostTypeLayoutIr::Opaque => {}
+                HostTypeLayoutIr::Opaque => {
+                    builder.opaque_type(ty.stable_id);
+                }
                 HostTypeLayoutIr::Struct { fields } => {
                     let mut fields = fields.iter().collect::<Vec<_>>();
                     fields.sort_by_key(|field| field.order);

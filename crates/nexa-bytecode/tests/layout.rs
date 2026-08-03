@@ -6,8 +6,8 @@ use nexa_bytecode::layout::{
     PhysicalSlotKind,
 };
 use nexa_bytecode::{
-    ArrayType, ClassType, EnumType, EnumVariant, ModuleBuilder, Signature, StructField, StructType,
-    ValueType, option_type,
+    ArrayType, ClassType, EnumType, EnumVariant, FunctionBuilder, Instruction, ModuleBuilder,
+    Signature, StructField, StructType, ValueType, option_type,
 };
 use nexa_core::StableId;
 
@@ -89,6 +89,10 @@ fn layout_table_is_deterministic_and_flattens_nested_aggregates() {
     assert_eq!(offsets.len(), 4);
     assert_eq!((offsets[0].offset, offsets[0].slots), (0, 1));
     assert_eq!((offsets[1].offset, offsets[1].slots), (1, 2));
+    assert_eq!(
+        offsets[1].logical_type,
+        ValueType::Named(StableId::from_name("Inner"))
+    );
     assert_eq!((offsets[2].offset, offsets[2].slots), (3, 1));
     assert_eq!((offsets[3].offset, offsets[3].slots), (4, 2));
 }
@@ -159,7 +163,7 @@ fn recursive_struct_nesting_is_rejected() {
 }
 
 #[test]
-fn unknown_field_types_defer_layout_instead_of_guessing_bitmaps() {
+fn bytecode_v7_rejects_dangling_field_types() {
     let dangling = StableId::from_name("Dangling");
     let holder = StableId::from_name("Holder");
     let mut builder = ModuleBuilder::new();
@@ -172,14 +176,119 @@ fn unknown_field_types_defer_layout_instead_of_guessing_bitmaps() {
         fields: vec![field("Holder::value", ValueType::Named(dangling))],
     });
     let module = builder.finish();
-    // Bytecode v6 legally references host nominals outside the type
-    // sections: the aggregate is skipped, never given a guessed bitmap,
-    // and stays unavailable through layout_of until the v7 closure.
-    let table = LayoutTable::for_module(&module).expect("derivation succeeds");
     assert_eq!(
-        table.layout_of(ValueType::Named(holder)),
-        Err(LayoutError::UnknownType(holder))
+        LayoutTable::for_module(&module),
+        Err(LayoutError::UnknownType(dangling))
     );
+}
+
+#[test]
+fn host_opaque_scalars_are_explicit_non_gc_slots() {
+    let entity = StableId::from_name("host::Entity");
+    let wrapper = StableId::from_name("EntityWrapper");
+    let mut builder = ModuleBuilder::new();
+    builder.metadata(
+        StableId::from_name("layout-host"),
+        nexa_bytecode::StateSchema::default().fingerprint(),
+    );
+    builder.opaque_type(entity);
+    builder.struct_type(StructType {
+        type_id: wrapper,
+        fields: vec![field("EntityWrapper::entity", ValueType::Named(entity))],
+    });
+    let module = builder.finish();
+    let encoded = module.encode();
+    let module = nexa_bytecode::Module::decode(&encoded).expect("opaque type wire round-trip");
+    assert_eq!(module.opaque_types, vec![entity]);
+    let table = LayoutTable::for_module(&module).expect("explicit opaque layout");
+    let opaque = table
+        .layout_of(ValueType::Named(entity))
+        .expect("opaque scalar");
+    assert_eq!(opaque.slot_kinds, vec![PhysicalSlotKind::Opaque]);
+    assert_eq!(opaque.gc_bitmap, vec![false]);
+    let wrapper = table
+        .layout_of(ValueType::Named(wrapper))
+        .expect("opaque-containing struct");
+    assert_eq!(wrapper.slot_kinds, vec![PhysicalSlotKind::Opaque]);
+    assert_eq!(wrapper.gc_bitmap, vec![false]);
+}
+
+#[test]
+fn module_abi_rejects_a_dangling_signature_type() {
+    let dangling = StableId::from_name("DanglingParameter");
+    let mut builder = ModuleBuilder::new();
+    builder.metadata(
+        StableId::from_name("layout-host"),
+        nexa_bytecode::StateSchema::default().fingerprint(),
+    );
+    let mut function = FunctionBuilder::new(
+        Signature {
+            parameters: vec![ValueType::Named(dangling)],
+            result: None,
+        },
+        1,
+    );
+    function.emit(Instruction::ReturnVoid);
+    builder.function(function.finish().expect("syntactic function"));
+    let module = builder.finish();
+    let table = LayoutTable::for_module(&module).expect("empty type table derives");
+    assert_eq!(
+        ModuleAbi::for_module(&module, &table),
+        Err(LayoutError::UnknownType(dangling))
+    );
+}
+
+#[test]
+fn enum_payload_union_keeps_active_variant_root_metadata_exact() {
+    let node = StableId::from_name("UnionNode");
+    let mixed = StableId::from_name("Mixed");
+    let mut builder = ModuleBuilder::new();
+    builder.metadata(
+        StableId::from_name("layout-host"),
+        nexa_bytecode::StateSchema::default().fingerprint(),
+    );
+    builder.class_type(ClassType {
+        type_id: node,
+        fields: vec![],
+    });
+    builder.enum_type(EnumType {
+        type_id: mixed,
+        variants: vec![
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Mixed", "::Bits"]),
+                tag: 0,
+                payload_type: Some(ValueType::I64),
+            },
+            EnumVariant {
+                stable_id: StableId::from_parts(&["Mixed", "::Node"]),
+                tag: 1,
+                payload_type: Some(ValueType::Named(node)),
+            },
+        ],
+    });
+    let module = builder.finish();
+    let table = LayoutTable::for_module(&module).expect("mixed enum layout");
+    let layout = table
+        .layout_of(ValueType::Named(mixed))
+        .expect("mixed enum");
+    assert_eq!(
+        layout.slot_kinds,
+        vec![PhysicalSlotKind::I32, PhysicalSlotKind::Opaque],
+        "a variant-dependent slot is not assigned a forged fixed kind"
+    );
+    assert_eq!(
+        layout.gc_bitmap,
+        vec![false, true],
+        "the top-level bitmap records that the payload may contain a root"
+    );
+    let variants = &layout.enum_layout.expect("enum metadata").variants;
+    assert_eq!(variants[0].payload_slot_kinds, vec![PhysicalSlotKind::I64]);
+    assert_eq!(variants[0].payload_gc_bitmap, vec![false]);
+    assert_eq!(
+        variants[1].payload_slot_kinds,
+        vec![PhysicalSlotKind::GcReference]
+    );
+    assert_eq!(variants[1].payload_gc_bitmap, vec![true]);
 }
 
 #[test]

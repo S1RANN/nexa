@@ -30,6 +30,9 @@ pub enum PhysicalSlotKind {
     /// Snapshot, resource-token, state-handle, and host-request handles;
     /// rooted through their own registries, never through frame bitmaps.
     HostHandle,
+    /// Host-defined, non-GC scalar whose interpretation stays behind the
+    /// generated ABI boundary.
+    Opaque,
 }
 
 /// How a value crosses assignment and call boundaries.
@@ -68,6 +71,7 @@ pub enum HashStrategy {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FieldOffset {
     pub stable_id: StableId,
+    pub logical_type: ValueType,
     pub offset: u16,
     pub slots: u16,
 }
@@ -78,7 +82,9 @@ pub struct FieldOffset {
 pub struct EnumVariantLayout {
     pub stable_id: StableId,
     pub tag: u32,
+    pub payload_type: Option<ValueType>,
     pub payload_slots: u16,
+    pub payload_slot_kinds: Vec<PhysicalSlotKind>,
     pub payload_gc_bitmap: Vec<bool>,
 }
 
@@ -136,31 +142,19 @@ pub struct LayoutTable {
 impl LayoutTable {
     /// Derives the table for every layoutable named type in the module.
     ///
-    /// Recursive value types and slot overflows are hard errors. Aggregates
-    /// referencing types outside the module's type sections (bytecode v6
-    /// legally omits host nominal definitions) are skipped rather than
-    /// guessed: a wrong GC bitmap would be worse than an absent layout.
-    /// Full-closure enforcement arrives with bytecode v7 (WP34).
+    /// Recursive value types, dangling named types, and slot overflows are
+    /// hard errors. Bytecode v7 carries the complete nominal closure,
+    /// including explicit Host opaque scalar identities.
     pub fn for_module(module: &Module) -> Result<Self, LayoutError> {
         let mut table = Self::default();
         let context = LayoutContext { module };
         for struct_type in &module.struct_types {
-            match context.struct_layout(struct_type, &mut Vec::new()) {
-                Ok(layout) => {
-                    table.named.insert(struct_type.type_id.0, layout);
-                }
-                Err(LayoutError::UnknownType(_)) => {}
-                Err(error) => return Err(error),
-            }
+            let layout = context.struct_layout(struct_type, &mut Vec::new())?;
+            table.named.insert(struct_type.type_id.0, layout);
         }
         for enum_type in &module.enum_types {
-            match context.enum_value_layout(enum_type, &mut Vec::new()) {
-                Ok(layout) => {
-                    table.named.insert(enum_type.type_id.0, layout);
-                }
-                Err(LayoutError::UnknownType(_)) => {}
-                Err(error) => return Err(error),
-            }
+            let layout = context.enum_value_layout(enum_type, &mut Vec::new())?;
+            table.named.insert(enum_type.type_id.0, layout);
         }
         for class_type in &module.class_types {
             table.named.insert(
@@ -212,6 +206,11 @@ impl LayoutTable {
                 handle_layout(ValueType::Named(state_type.stable_id)),
             );
         }
+        for type_id in &module.opaque_types {
+            table
+                .named
+                .insert(type_id.0, opaque_layout(ValueType::Named(*type_id)));
+        }
         Ok(table)
     }
 
@@ -247,21 +246,29 @@ struct LayoutContext<'module> {
     module: &'module Module,
 }
 
+#[derive(Clone, Debug)]
+struct SlotExpansion {
+    slot_kinds: Vec<PhysicalSlotKind>,
+    gc_bitmap: Vec<bool>,
+}
+
 impl LayoutContext<'_> {
     /// Slot expansion of one logical type, flattening nested value types.
     fn expand(
         &self,
         ty: ValueType,
         visiting: &mut Vec<StableId>,
-    ) -> Result<Vec<PhysicalSlotKind>, LayoutError> {
+    ) -> Result<SlotExpansion, LayoutError> {
         match ty {
-            ValueType::I32 => Ok(vec![PhysicalSlotKind::I32]),
-            ValueType::I64 => Ok(vec![PhysicalSlotKind::I64]),
-            ValueType::F32 => Ok(vec![PhysicalSlotKind::F32]),
-            ValueType::F64 => Ok(vec![PhysicalSlotKind::F64]),
-            ValueType::Bool => Ok(vec![PhysicalSlotKind::Bool]),
-            ValueType::Rune => Ok(vec![PhysicalSlotKind::Rune]),
-            ValueType::String | ValueType::Ref => Ok(vec![PhysicalSlotKind::GcReference]),
+            ValueType::I32 => Ok(scalar_expansion(PhysicalSlotKind::I32)),
+            ValueType::I64 => Ok(scalar_expansion(PhysicalSlotKind::I64)),
+            ValueType::F32 => Ok(scalar_expansion(PhysicalSlotKind::F32)),
+            ValueType::F64 => Ok(scalar_expansion(PhysicalSlotKind::F64)),
+            ValueType::Bool => Ok(scalar_expansion(PhysicalSlotKind::Bool)),
+            ValueType::Rune => Ok(scalar_expansion(PhysicalSlotKind::Rune)),
+            ValueType::String | ValueType::Ref => {
+                Ok(scalar_expansion(PhysicalSlotKind::GcReference))
+            }
             ValueType::Named(id) => self.expand_named(id, visiting),
         }
     }
@@ -270,7 +277,7 @@ impl LayoutContext<'_> {
         &self,
         id: StableId,
         visiting: &mut Vec<StableId>,
-    ) -> Result<Vec<PhysicalSlotKind>, LayoutError> {
+    ) -> Result<SlotExpansion, LayoutError> {
         if visiting.contains(&id) {
             return Err(LayoutError::RecursiveValueType(id));
         }
@@ -281,12 +288,18 @@ impl LayoutContext<'_> {
             .find(|candidate| candidate.type_id == id)
         {
             visiting.push(id);
-            let mut slots = Vec::new();
+            let mut slot_kinds = Vec::new();
+            let mut gc_bitmap = Vec::new();
             for field in &struct_type.fields {
-                slots.extend(self.expand(field.ty, visiting)?);
+                let field = self.expand(field.ty, visiting)?;
+                slot_kinds.extend(field.slot_kinds);
+                gc_bitmap.extend(field.gc_bitmap);
             }
             visiting.pop();
-            return Ok(slots);
+            return Ok(SlotExpansion {
+                slot_kinds,
+                gc_bitmap,
+            });
         }
         if let Some(enum_type) = self
             .module
@@ -300,13 +313,19 @@ impl LayoutContext<'_> {
             return Ok(layout);
         }
         if self.is_reference_type(id) {
-            return Ok(vec![PhysicalSlotKind::GcReference]);
+            return Ok(scalar_expansion(PhysicalSlotKind::GcReference));
         }
         if self.is_handle_type(id) {
-            return Ok(vec![PhysicalSlotKind::HostHandle]);
+            return Ok(scalar_expansion(PhysicalSlotKind::HostHandle));
+        }
+        if self.module.opaque_types.contains(&id) {
+            return Ok(scalar_expansion(PhysicalSlotKind::Opaque));
         }
         if let Some(layout) = builtin_named_layout(id) {
-            return Ok(layout.slot_kinds);
+            return Ok(SlotExpansion {
+                slot_kinds: layout.slot_kinds,
+                gc_bitmap: layout.gc_bitmap,
+            });
         }
         Err(LayoutError::UnknownType(id))
     }
@@ -315,20 +334,52 @@ impl LayoutContext<'_> {
         &self,
         enum_type: &EnumType,
         visiting: &mut Vec<StableId>,
-    ) -> Result<Vec<PhysicalSlotKind>, LayoutError> {
-        // Tag slot followed by the widest payload range (WP28).
-        let mut payload = Vec::new();
+    ) -> Result<SlotExpansion, LayoutError> {
+        // Tag slot followed by the widest payload range (WP28). A physical
+        // position used by different scalar kinds is explicitly Opaque;
+        // the active variant retains the exact kind and GC bitmap below.
+        let mut payloads = Vec::with_capacity(enum_type.variants.len());
         for variant in &enum_type.variants {
-            if let Some(payload_type) = variant.payload_type {
-                let slots = self.expand(payload_type, visiting)?;
-                if slots.len() > payload.len() {
-                    payload = slots;
-                }
-            }
+            payloads.push(
+                variant
+                    .payload_type
+                    .map(|payload_type| self.expand(payload_type, visiting))
+                    .transpose()?
+                    .unwrap_or_else(empty_expansion),
+            );
         }
-        let mut slots = vec![PhysicalSlotKind::I32];
-        slots.extend(payload);
-        Ok(slots)
+        let payload_slots = payloads
+            .iter()
+            .map(|payload| payload.slot_kinds.len())
+            .max()
+            .unwrap_or(0);
+        let mut merged_kinds = Vec::with_capacity(payload_slots);
+        let mut possible_gc = Vec::with_capacity(payload_slots);
+        for offset in 0..payload_slots {
+            let mut merged = None;
+            let mut may_hold_gc = false;
+            for payload in &payloads {
+                let Some(kind) = payload.slot_kinds.get(offset).copied() else {
+                    continue;
+                };
+                merged = Some(match merged {
+                    None => kind,
+                    Some(existing) if existing == kind => existing,
+                    Some(_) => PhysicalSlotKind::Opaque,
+                });
+                may_hold_gc |= payload.gc_bitmap[offset];
+            }
+            merged_kinds.push(merged.expect("widest payload owns every merged offset"));
+            possible_gc.push(may_hold_gc);
+        }
+        let mut slot_kinds = vec![PhysicalSlotKind::I32];
+        slot_kinds.extend(merged_kinds);
+        let mut gc_bitmap = vec![false];
+        gc_bitmap.extend(possible_gc);
+        Ok(SlotExpansion {
+            slot_kinds,
+            gc_bitmap,
+        })
     }
 
     fn is_reference_type(&self, id: StableId) -> bool {
@@ -383,21 +434,23 @@ impl LayoutContext<'_> {
     ) -> Result<ValueLayout, LayoutError> {
         visiting.push(struct_type.type_id);
         let mut slot_kinds = Vec::new();
+        let mut gc_bitmap = Vec::new();
         let mut field_offsets = Vec::with_capacity(struct_type.fields.len());
         for field in &struct_type.fields {
             let field_slots = self.expand(field.ty, visiting)?;
             let offset = to_u16(slot_kinds.len(), struct_type.type_id)?;
-            let slots = to_u16(field_slots.len(), struct_type.type_id)?;
+            let slots = to_u16(field_slots.slot_kinds.len(), struct_type.type_id)?;
             field_offsets.push(FieldOffset {
                 stable_id: field.stable_id,
+                logical_type: field.ty,
                 offset,
                 slots,
             });
-            slot_kinds.extend(field_slots);
+            slot_kinds.extend(field_slots.slot_kinds);
+            gc_bitmap.extend(field_slots.gc_bitmap);
         }
         visiting.pop();
         let physical_slots = to_u16(slot_kinds.len(), struct_type.type_id)?;
-        let gc_bitmap = gc_bitmap(&slot_kinds);
         Ok(ValueLayout {
             logical_type: ValueType::Named(struct_type.type_id),
             physical_slots,
@@ -418,30 +471,31 @@ impl LayoutContext<'_> {
         visiting: &mut Vec<StableId>,
     ) -> Result<ValueLayout, LayoutError> {
         visiting.push(enum_type.type_id);
-        let slot_kinds = self.enum_slot_expansion(enum_type, visiting)?;
+        let expansion = self.enum_slot_expansion(enum_type, visiting)?;
         let mut variants = Vec::with_capacity(enum_type.variants.len());
         for variant in &enum_type.variants {
-            let payload_kinds = match variant.payload_type {
+            let payload = match variant.payload_type {
                 Some(payload_type) => self.expand(payload_type, visiting)?,
-                None => Vec::new(),
+                None => empty_expansion(),
             };
             variants.push(EnumVariantLayout {
                 stable_id: variant.stable_id,
                 tag: variant.tag,
-                payload_slots: to_u16(payload_kinds.len(), enum_type.type_id)?,
-                payload_gc_bitmap: gc_bitmap(&payload_kinds),
+                payload_type: variant.payload_type,
+                payload_slots: to_u16(payload.slot_kinds.len(), enum_type.type_id)?,
+                payload_slot_kinds: payload.slot_kinds,
+                payload_gc_bitmap: payload.gc_bitmap,
             });
         }
         visiting.pop();
-        let physical_slots = to_u16(slot_kinds.len(), enum_type.type_id)?;
+        let physical_slots = to_u16(expansion.slot_kinds.len(), enum_type.type_id)?;
         let payload_slots = physical_slots - 1;
-        let gc_bitmap = gc_bitmap(&slot_kinds);
         Ok(ValueLayout {
             logical_type: ValueType::Named(enum_type.type_id),
             physical_slots,
             alignment: 1,
-            gc_bitmap,
-            slot_kinds,
+            gc_bitmap: expansion.gc_bitmap,
+            slot_kinds: expansion.slot_kinds,
             field_offsets: Vec::new(),
             enum_layout: Some(EnumLayout {
                 tag_offset: 0,
@@ -456,11 +510,18 @@ impl LayoutContext<'_> {
     }
 }
 
-fn gc_bitmap(slot_kinds: &[PhysicalSlotKind]) -> Vec<bool> {
-    slot_kinds
-        .iter()
-        .map(|kind| matches!(kind, PhysicalSlotKind::GcReference))
-        .collect()
+fn scalar_expansion(kind: PhysicalSlotKind) -> SlotExpansion {
+    SlotExpansion {
+        slot_kinds: vec![kind],
+        gc_bitmap: vec![matches!(kind, PhysicalSlotKind::GcReference)],
+    }
+}
+
+fn empty_expansion() -> SlotExpansion {
+    SlotExpansion {
+        slot_kinds: Vec::new(),
+        gc_bitmap: Vec::new(),
+    }
 }
 
 fn to_u16(value: usize, owner: StableId) -> Result<u16, LayoutError> {
@@ -562,11 +623,29 @@ fn handle_layout(ty: ValueType) -> ValueLayout {
     }
 }
 
+fn opaque_layout(ty: ValueType) -> ValueLayout {
+    ValueLayout {
+        logical_type: ty,
+        physical_slots: 1,
+        alignment: 1,
+        slot_kinds: vec![PhysicalSlotKind::Opaque],
+        gc_bitmap: vec![false],
+        field_offsets: Vec::new(),
+        enum_layout: None,
+        copy_strategy: CopyStrategy::Scalar,
+        equality_strategy: EqualityStrategy::Bits,
+        hash_strategy: HashStrategy::Bits,
+    }
+}
+
 /// Well-known runtime-builtin type names that never appear in module type
 /// sections; the runtime's own value taxonomy treats them the same way.
 fn builtin_named_layout(id: StableId) -> Option<ValueLayout> {
     if id == StableId::from_name("HostRequest") || id == StableId::from_name("HostError") {
         return Some(handle_layout(ValueType::Named(id)));
+    }
+    if id == StableId::from_name("StableId") {
+        return Some(opaque_layout(ValueType::Named(id)));
     }
     if id == StableId::from_name("Buffer") {
         return Some(reference_layout(ValueType::Named(id)));

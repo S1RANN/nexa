@@ -70,6 +70,7 @@ pub enum VerifyErrorKind {
     InvalidBufferMetadata,
     InvalidSnapshotMetadata,
     InvalidResourceTokenMetadata,
+    InvalidOpaqueMetadata,
     InvalidSourceMap,
     /// M5 WP35: every verified module must yield a deterministic layout
     /// table and function ABI; recursion, dangling types, and slot
@@ -612,6 +613,15 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
         }
     }
     let mut named_ids = enum_ids;
+    for type_id in &module.opaque_types {
+        if !named_ids.insert(*type_id) {
+            return Err(VerifyError {
+                function: 0,
+                instruction: None,
+                kind: VerifyErrorKind::InvalidOpaqueMetadata,
+            });
+        }
+    }
     for struct_type in &module.struct_types {
         let mut field_ids = BTreeSet::new();
         if !named_ids.insert(struct_type.type_id)
@@ -702,6 +712,21 @@ fn verify_named_type_metadata(module: &Module) -> Result<(), VerifyError> {
                 kind: VerifyErrorKind::InvalidArrayMetadata,
             });
         }
+    }
+    if module.opaque_types.iter().any(|opaque| {
+        module.map_types.iter().any(|ty| ty.type_id == *opaque)
+            || module.buffer_types.iter().any(|ty| ty.type_id == *opaque)
+            || module.snapshot_types.iter().any(|ty| ty.type_id == *opaque)
+            || module
+                .resource_token_types
+                .iter()
+                .any(|ty| ty.type_id == *opaque)
+    }) {
+        return Err(VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidOpaqueMetadata,
+        });
     }
     verify_map_metadata(module)?;
     verify_buffer_metadata(module)?;
@@ -1018,13 +1043,16 @@ fn has_state_handle_type(module: &Module, target: ValueType) -> bool {
         .any(|handle_type| handle_type.type_id == type_id && handle_type.target == target)
 }
 
-/// M5 WP35 first stage: the layout table must derive for every verified
-/// module, rejecting recursive value types, dangling aggregate fields, and
-/// slot overflows. Signature-level ABI enforcement needs the full type
-/// closure in the module and therefore lands with the bytecode v7 upgrade
-/// (WP34); host nominal types legally stay outside v6 type sections.
+/// M5 WP35: bytecode v7 carries a complete nominal closure, so both every
+/// layout and every function ABI must derive before execution.
 fn verify_value_layouts(module: &Module) -> Result<(), VerifyError> {
-    nexa_bytecode::layout::LayoutTable::for_module(module).map_err(|error| VerifyError {
+    let table =
+        nexa_bytecode::layout::LayoutTable::for_module(module).map_err(|error| VerifyError {
+            function: 0,
+            instruction: None,
+            kind: VerifyErrorKind::InvalidValueLayout(error),
+        })?;
+    nexa_bytecode::layout::ModuleAbi::for_module(module, &table).map_err(|error| VerifyError {
         function: 0,
         instruction: None,
         kind: VerifyErrorKind::InvalidValueLayout(error),

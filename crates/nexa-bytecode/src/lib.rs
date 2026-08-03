@@ -11,9 +11,8 @@ use nexa_core::{
 pub const MAGIC: [u8; 4] = *b"NXBC";
 /// Current wire-format version.
 ///
-/// Version 6 adds typed resource-token identities, deterministic
-/// scalar-to-string instructions, and nominal enum equality. The decoder
-/// intentionally accepts only the current version:
+/// Version 7 adds physical ValueLayout/ABI metadata and explicit Host opaque
+/// scalar identities. The decoder intentionally accepts only the current version:
 /// bytecode is an internal package artifact and has no cross-version decoding
 /// compatibility promise.
 pub use nexa_core::BYTECODE_VERSION;
@@ -1523,6 +1522,8 @@ pub struct Module {
     pub buffer_types: Vec<BufferType>,
     pub snapshot_types: Vec<SnapshotType>,
     pub resource_token_types: Vec<ResourceTokenType>,
+    /// Host-defined scalar identities carried in `PhysicalSlotKind::Opaque`.
+    pub opaque_types: Vec<StableId>,
     pub enum_types: Vec<EnumType>,
     pub struct_types: Vec<StructType>,
     pub class_types: Vec<ClassType>,
@@ -2127,7 +2128,8 @@ impl Module {
                     .saturating_add(self.map_types.len())
                     .saturating_add(self.buffer_types.len())
                     .saturating_add(self.snapshot_types.len())
-                    .saturating_add(self.resource_token_types.len()),
+                    .saturating_add(self.resource_token_types.len())
+                    .saturating_add(self.opaque_types.len()),
             )
             .expect("parameterized type count exceeds wire format"),
         );
@@ -2161,6 +2163,10 @@ impl Module {
             types.push(6);
             put_u64(&mut types, token.type_id.0);
             put_u64(&mut types, token.content_type.0);
+        }
+        for type_id in &self.opaque_types {
+            types.push(7);
+            put_u64(&mut types, type_id.0);
         }
         let empty = || {
             let mut section = Vec::new();
@@ -2270,6 +2276,7 @@ impl Module {
         let mut buffer_types = Vec::new();
         let mut snapshot_types = Vec::new();
         let mut resource_token_types = Vec::new();
+        let mut opaque_types = Vec::new();
         for _ in 0..state_handle_type_count {
             let kind = types_reader.u8()?;
             let type_id = StableId(types_reader.u64()?);
@@ -2299,6 +2306,7 @@ impl Module {
                     type_id,
                     content_type: StableId(types_reader.u64()?),
                 }),
+                7 => opaque_types.push(type_id),
                 _ => return Err(DecodeError::InvalidType(kind)),
             }
         }
@@ -2746,6 +2754,7 @@ impl Module {
             buffer_types,
             snapshot_types,
             resource_token_types,
+            opaque_types,
             enum_types,
             struct_types,
             class_types,
@@ -4457,6 +4466,7 @@ pub struct ModuleBuilder {
     buffer_types: Vec<BufferType>,
     snapshot_types: Vec<SnapshotType>,
     resource_token_types: Vec<ResourceTokenType>,
+    opaque_types: Vec<StableId>,
     enum_types: Vec<EnumType>,
     struct_types: Vec<StructType>,
     class_types: Vec<ClassType>,
@@ -4481,6 +4491,7 @@ impl ModuleBuilder {
             buffer_types: Vec::new(),
             snapshot_types: Vec::new(),
             resource_token_types: Vec::new(),
+            opaque_types: Vec::new(),
             enum_types: Vec::new(),
             struct_types: Vec::new(),
             class_types: Vec::new(),
@@ -4584,6 +4595,11 @@ impl ModuleBuilder {
         self
     }
 
+    pub fn opaque_type(&mut self, type_id: StableId) -> &mut Self {
+        self.opaque_types.push(type_id);
+        self
+    }
+
     pub fn script_export(&mut self, export: ScriptExport) -> &mut Self {
         self.exports.push(export);
         self
@@ -4626,6 +4642,7 @@ impl ModuleBuilder {
             buffer_types: self.buffer_types,
             snapshot_types: self.snapshot_types,
             resource_token_types: self.resource_token_types,
+            opaque_types: self.opaque_types,
             enum_types: self.enum_types,
             struct_types: self.struct_types,
             class_types: self.class_types,
