@@ -146,6 +146,39 @@ fn row_projection_trap(n: i32) -> i32 {
     let cell: Pair = cells.get(n);
     return cell.first;
 }
+fn scalar_array() -> i32 {
+    let values: Array<i32> = Array::new();
+    values.push(1);
+    values.push(2);
+    values.set(0, 3);
+    return values.get(0) + values.len();
+}
+fn scalar_map_hit() -> i32 {
+    let values: Map<i32, string> = Map::new();
+    values.set(1, "one");
+    return match values.get(1) {
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
+    };
+}
+fn scalar_map_miss() -> i32 {
+    let values: Map<i32, string> = Map::new();
+    values.set(1, "one");
+    return match values.get(2) {
+        Option::Some(value) => value.byte_len(),
+        Option::None => 0,
+    };
+}
+fn scalar_map_binding_fallback() -> i32 {
+    let values: Map<i32, string> = Map::new();
+    values.set(1, "one");
+    return match values.get(1) {
+        option => match option {
+            Option::Some(value) => value.byte_len(),
+            Option::None => 0,
+        },
+    };
+}
 "#;
 
 const FOLD_CHAIN: u32 = 0;
@@ -164,6 +197,10 @@ const DIV_TRAP: u32 = 13;
 const INDEX_TRAP: u32 = 14;
 const ROW_PROJECTION: u32 = 15;
 const ROW_PROJECTION_TRAP: u32 = 16;
+const SCALAR_ARRAY: u32 = 17;
+const SCALAR_MAP_HIT: u32 = 18;
+const SCALAR_MAP_MISS: u32 = 19;
+const SCALAR_MAP_BINDING_FALLBACK: u32 = 20;
 
 const FUEL: u64 = 1_000_000;
 
@@ -272,6 +309,10 @@ fn optimized_and_reference_pipelines_agree_on_results_and_traps() {
         (ROW_PROJECTION, vec![RuntimeValue::I32(16)], returns(360)),
         (ROW_PROJECTION, vec![RuntimeValue::I32(0)], returns(0)),
         (ROW_PROJECTION_TRAP, vec![RuntimeValue::I32(0)], returns(1)),
+        (SCALAR_ARRAY, vec![], returns(5)),
+        (SCALAR_MAP_HIT, vec![], returns(3)),
+        (SCALAR_MAP_MISS, vec![], returns(0)),
+        (SCALAR_MAP_BINDING_FALLBACK, vec![], returns(3)),
         (
             ROW_PROJECTION_TRAP,
             vec![RuntimeValue::I32(3)],
@@ -281,6 +322,50 @@ fn optimized_and_reference_pipelines_agree_on_results_and_traps() {
     for (function, arguments, expected) in cases {
         assert_case(&modules, *function, arguments, expected);
     }
+}
+
+fn assert_scalar_collection_materializations(
+    optimized: &VerifiedModule,
+    reference: &VerifiedModule,
+) {
+    let array_materializations = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::ArrayNew { .. }))
+            .count()
+    };
+    assert_eq!(
+        array_materializations(optimized, SCALAR_ARRAY),
+        0,
+        "optimized pipeline scalar-replaces the bounded local array"
+    );
+    assert!(
+        array_materializations(reference, SCALAR_ARRAY) > 0,
+        "reference pipeline materializes the bounded local array"
+    );
+    let map_materializations = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::MapNew { .. }))
+            .count()
+    };
+    for function in [SCALAR_MAP_HIT, SCALAR_MAP_MISS] {
+        assert_eq!(
+            map_materializations(optimized, function),
+            0,
+            "optimized pipeline scalar-replaces the local map"
+        );
+        assert!(
+            map_materializations(reference, function) > 0,
+            "reference pipeline materializes the local map"
+        );
+    }
+    assert!(
+        map_materializations(optimized, SCALAR_MAP_BINDING_FALLBACK) > 0,
+        "binding the complete get result keeps the map on the heap"
+    );
 }
 
 #[test]
@@ -373,6 +458,7 @@ fn reference_pipeline_actually_disables_the_optimizations() {
         0,
         "the fused row workload emits no StructNew anywhere"
     );
+    assert_scalar_collection_materializations(&optimized, &reference);
     // WP37/WP38: constant folding shortens the arithmetic chain, so the
     // optimized body must be strictly smaller. If this ever fails the
     // reference switch is wired wrong and the gate is comparing a pipeline

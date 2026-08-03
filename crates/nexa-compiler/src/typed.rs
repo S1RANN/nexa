@@ -537,6 +537,14 @@ struct FunctionEmitter<'a> {
     /// Inlined enum locals: statically known variant plus the optional
     /// payload register (M5 stage-C enum slice).
     inline_enums: BTreeMap<DefinitionId, (DefinitionId, Option<u16>)>,
+    /// WP45 local-map scalar replacement. Each admitted map has at most one
+    /// constant-key write in a straight-line block, so its sole value lives
+    /// in one typed register until a use requires materialization.
+    inline_maps: BTreeMap<DefinitionId, InlineMapState>,
+    /// WP45 local-array scalar replacement for bounded straight-line arrays.
+    /// Each logical element owns one typed register; dynamic indexes,
+    /// control-flow mutation, and escaping handles retain the heap path.
+    inline_arrays: BTreeMap<DefinitionId, InlineArrayState>,
     /// Whether the M5 optimized emission profile is active; the WP36
     /// reference pipeline keeps every fused form disabled.
     optimize: bool,
@@ -550,6 +558,30 @@ struct FunctionEmitter<'a> {
     loop_stack: Vec<LoopPatch>,
     function_span: SourceSpan,
     constant_stack: BTreeSet<DefinitionId>,
+}
+
+#[derive(Clone)]
+struct InlineMapPlan {
+    value_type: IrType,
+}
+
+#[derive(Clone, Copy)]
+struct InlineMapState {
+    value_register: u16,
+    entry_key: Option<i32>,
+}
+
+#[derive(Clone)]
+struct InlineArrayPlan {
+    element_type: IrType,
+    capacity: u16,
+}
+
+#[derive(Clone, Copy)]
+struct InlineArrayState {
+    slots_base: u16,
+    capacity: u16,
+    length: u16,
 }
 
 /// Lowers already-resolved, already-typed package IR directly to bytecode.
@@ -2228,6 +2260,473 @@ fn emit_standalone_main_export(
     }))
 }
 
+/// WP45 bounded local-array scalar replacement.
+const MAX_INLINE_ARRAY_SLOTS: u16 = 16;
+
+fn inline_array_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, InlineArrayPlan> {
+    let mut declarations = BTreeMap::new();
+    for statement in &function.body.statements {
+        let TypedStatementIr::Let {
+            definition,
+            mutable: false,
+            value: Some(value),
+        } = statement
+        else {
+            continue;
+        };
+        let TypedExpressionKind::BuiltinCall {
+            operation: BuiltinOperationIr::ArrayNew,
+            ..
+        } = &value.kind
+        else {
+            continue;
+        };
+        let IrType::Array(element_type) = &value.ty else {
+            continue;
+        };
+        declarations.insert(*definition, element_type.as_ref().clone());
+    }
+    declarations
+        .into_iter()
+        .filter_map(|(definition, element_type)| {
+            inline_array_candidate_capacity(function, definition).map(|capacity| {
+                (
+                    definition,
+                    InlineArrayPlan {
+                        element_type,
+                        capacity,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn allocate_inline_array_states(
+    package: &TypedPackageIr,
+    function: &TypedFunctionIr,
+    function_span: SourceSpan,
+    register_types: &mut Vec<Option<ValueType>>,
+) -> Result<BTreeMap<DefinitionId, InlineArrayState>, CompileError> {
+    let mut states = BTreeMap::new();
+    for (definition, plan) in inline_array_candidates(function) {
+        let slots_base = u16::try_from(register_types.len())
+            .map_err(|_| CompileError::too_many_registers(function_span))?;
+        let element_type = lower_type(package, &plan.element_type, function_span)?;
+        register_types.extend((0..plan.capacity).map(|_| Some(element_type)));
+        states.insert(
+            definition,
+            InlineArrayState {
+                slots_base,
+                capacity: plan.capacity,
+                length: 0,
+            },
+        );
+    }
+    Ok(states)
+}
+
+fn inline_array_candidate_capacity(
+    function: &TypedFunctionIr,
+    definition: DefinitionId,
+) -> Option<u16> {
+    let mut length = 0_u16;
+    for statement in &function.body.statements {
+        match statement {
+            TypedStatementIr::Expression(expression) => {
+                match apply_inline_array_write(expression, definition, &mut length) {
+                    Ok(true) => continue,
+                    Ok(false) => {}
+                    Err(()) => return None,
+                }
+                if !inline_array_read_expression_allowed(expression, definition, length) {
+                    return None;
+                }
+            }
+            TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
+                if value.as_ref().is_some_and(|value| {
+                    !inline_array_read_expression_allowed(value, definition, length)
+                }) {
+                    return None;
+                }
+            }
+            TypedStatementIr::Assign { target, value } => {
+                if place_references_definition(target, definition)
+                    || !inline_array_read_expression_allowed(value, definition, length)
+                {
+                    return None;
+                }
+            }
+            TypedStatementIr::If { .. }
+            | TypedStatementIr::While { .. }
+            | TypedStatementIr::StaticRangeFor { .. }
+            | TypedStatementIr::Defer { .. } => {
+                if statement_references_definition(statement, definition) {
+                    return None;
+                }
+            }
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
+        }
+    }
+    function
+        .body
+        .tail
+        .as_ref()
+        .is_none_or(|tail| inline_array_read_expression_allowed(tail, definition, length))
+        .then_some(length)
+}
+
+fn apply_inline_array_write(
+    expression: &TypedExpressionIr,
+    definition: DefinitionId,
+    length: &mut u16,
+) -> Result<bool, ()> {
+    let TypedExpressionKind::BuiltinCall {
+        operation,
+        arguments,
+        ..
+    } = &expression.kind
+    else {
+        return Ok(false);
+    };
+    if !matches!(
+        arguments.first().map(|argument| &argument.kind),
+        Some(TypedExpressionKind::Reference(receiver)) if *receiver == definition
+    ) {
+        return Ok(false);
+    }
+    match operation {
+        BuiltinOperationIr::ArrayPush
+            if arguments.len() == 2
+                && !expression_references_definition(&arguments[1], definition) =>
+        {
+            if *length >= MAX_INLINE_ARRAY_SLOTS {
+                return Err(());
+            }
+            *length += 1;
+            Ok(true)
+        }
+        BuiltinOperationIr::ArraySet
+            if arguments.len() == 3
+                && !expression_references_definition(&arguments[2], definition) =>
+        {
+            let TypedExpressionKind::Literal(IrLiteral::I32(index)) = &arguments[1].kind else {
+                return Err(());
+            };
+            if usize::try_from(*index)
+                .ok()
+                .is_none_or(|index| index >= usize::from(*length))
+            {
+                return Err(());
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+fn inline_array_read_expression_allowed(
+    expression: &TypedExpressionIr,
+    definition: DefinitionId,
+    length: u16,
+) -> bool {
+    match &expression.kind {
+        TypedExpressionKind::Reference(candidate) => *candidate != definition,
+        TypedExpressionKind::BuiltinCall {
+            operation,
+            arguments,
+            ..
+        } if matches!(
+            arguments.first().map(|argument| &argument.kind),
+            Some(TypedExpressionKind::Reference(receiver)) if *receiver == definition
+        ) =>
+        {
+            match operation {
+                BuiltinOperationIr::ArrayLen => arguments.len() == 1,
+                BuiltinOperationIr::ArrayGet if arguments.len() == 2 => {
+                    let TypedExpressionKind::Literal(IrLiteral::I32(index)) = &arguments[1].kind
+                    else {
+                        return false;
+                    };
+                    usize::try_from(*index)
+                        .ok()
+                        .is_some_and(|index| index < usize::from(length))
+                }
+                _ => false,
+            }
+        }
+        _ => {
+            let mut children = Vec::new();
+            collect_expression_children(expression, &mut children);
+            children
+                .into_iter()
+                .all(|child| inline_array_read_expression_allowed(child, definition, length))
+        }
+    }
+}
+
+/// WP45 local-map scalar replacement candidates.
+///
+/// This first complete slice is intentionally path-insensitive: the binding
+/// must be created in the function's top-level block, may have at most one
+/// top-level constant-key `set`, and may otherwise only be read by
+/// constant-key `get`. Any use under control flow or as an ordinary value
+/// escapes and keeps the real heap map.
+fn inline_map_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, InlineMapPlan> {
+    let mut candidates = BTreeMap::new();
+    for statement in &function.body.statements {
+        let TypedStatementIr::Let {
+            definition,
+            mutable: false,
+            value: Some(value),
+        } = statement
+        else {
+            continue;
+        };
+        let TypedExpressionKind::BuiltinCall {
+            operation: BuiltinOperationIr::MapNew,
+            ..
+        } = &value.kind
+        else {
+            continue;
+        };
+        let IrType::Map(_, value_type) = &value.ty else {
+            continue;
+        };
+        candidates.insert(
+            *definition,
+            InlineMapPlan {
+                value_type: value_type.as_ref().clone(),
+            },
+        );
+    }
+    candidates.retain(|definition, _| inline_map_candidate_is_scalar(function, *definition));
+    candidates
+}
+
+fn inline_map_candidate_is_scalar(function: &TypedFunctionIr, definition: DefinitionId) -> bool {
+    let mut writes = 0_u8;
+    for statement in &function.body.statements {
+        match statement {
+            TypedStatementIr::Expression(expression)
+                if inline_map_set_expression(expression, definition) =>
+            {
+                writes = writes.saturating_add(1);
+                if writes > 1 {
+                    return false;
+                }
+            }
+            TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => {
+                if value
+                    .as_ref()
+                    .is_some_and(|value| !inline_map_read_expression_allowed(value, definition))
+                {
+                    return false;
+                }
+            }
+            TypedStatementIr::Expression(expression) => {
+                if !inline_map_read_expression_allowed(expression, definition) {
+                    return false;
+                }
+            }
+            TypedStatementIr::Assign { target, value } => {
+                if place_references_definition(target, definition)
+                    || !inline_map_read_expression_allowed(value, definition)
+                {
+                    return false;
+                }
+            }
+            TypedStatementIr::If { .. }
+            | TypedStatementIr::While { .. }
+            | TypedStatementIr::StaticRangeFor { .. }
+            | TypedStatementIr::Defer { .. } => {
+                if statement_references_definition(statement, definition) {
+                    return false;
+                }
+            }
+            TypedStatementIr::Break
+            | TypedStatementIr::Continue
+            | TypedStatementIr::Yield { .. } => {}
+        }
+    }
+    function
+        .body
+        .tail
+        .as_ref()
+        .is_none_or(|tail| inline_map_read_expression_allowed(tail, definition))
+}
+
+fn inline_map_set_expression(expression: &TypedExpressionIr, definition: DefinitionId) -> bool {
+    let TypedExpressionKind::BuiltinCall {
+        operation: BuiltinOperationIr::MapSet,
+        arguments,
+        ..
+    } = &expression.kind
+    else {
+        return false;
+    };
+    arguments.len() == 3
+        && matches!(
+            arguments[0].kind,
+            TypedExpressionKind::Reference(receiver) if receiver == definition
+        )
+        && matches!(
+            arguments[1].kind,
+            TypedExpressionKind::Literal(IrLiteral::I32(_))
+        )
+        && !expression_references_definition(&arguments[2], definition)
+}
+
+fn inline_map_read_expression_allowed(
+    expression: &TypedExpressionIr,
+    definition: DefinitionId,
+) -> bool {
+    match &expression.kind {
+        TypedExpressionKind::Reference(candidate) => *candidate != definition,
+        TypedExpressionKind::Match { value, arms }
+            if inline_map_get_expression(value, definition) =>
+        {
+            arms.iter().all(|arm| {
+                matches!(
+                    arm.pattern.kind,
+                    TypedPatternKind::BuiltinVariant { .. } | TypedPatternKind::Wildcard
+                ) && inline_map_read_expression_allowed(&arm.value, definition)
+            })
+        }
+        TypedExpressionKind::BuiltinCall {
+            operation,
+            arguments,
+            ..
+        } if matches!(
+            arguments.first().map(|argument| &argument.kind),
+            Some(TypedExpressionKind::Reference(receiver)) if *receiver == definition
+        ) =>
+        {
+            *operation == BuiltinOperationIr::MapGet
+                && arguments.len() == 2
+                && matches!(
+                    arguments[1].kind,
+                    TypedExpressionKind::Literal(IrLiteral::I32(_))
+                )
+        }
+        _ => {
+            let mut children = Vec::new();
+            collect_expression_children(expression, &mut children);
+            children
+                .into_iter()
+                .all(|child| inline_map_read_expression_allowed(child, definition))
+        }
+    }
+}
+
+fn inline_map_get_expression(expression: &TypedExpressionIr, definition: DefinitionId) -> bool {
+    matches!(
+        &expression.kind,
+        TypedExpressionKind::BuiltinCall {
+            operation: BuiltinOperationIr::MapGet,
+            arguments,
+            ..
+        } if arguments.len() == 2
+            && matches!(
+                arguments[0].kind,
+                TypedExpressionKind::Reference(receiver) if receiver == definition
+            )
+            && matches!(
+                arguments[1].kind,
+                TypedExpressionKind::Literal(IrLiteral::I32(_))
+            )
+    )
+}
+
+fn expression_references_definition(
+    expression: &TypedExpressionIr,
+    definition: DefinitionId,
+) -> bool {
+    if matches!(
+        expression.kind,
+        TypedExpressionKind::Reference(candidate) if candidate == definition
+    ) {
+        return true;
+    }
+    let mut children = Vec::new();
+    collect_expression_children(expression, &mut children);
+    children
+        .into_iter()
+        .any(|child| expression_references_definition(child, definition))
+}
+
+fn place_references_definition(place: &TypedPlaceIr, definition: DefinitionId) -> bool {
+    match place {
+        TypedPlaceIr::Definition(candidate) => *candidate == definition,
+        TypedPlaceIr::Field { base, .. } => place_references_definition(base, definition),
+        TypedPlaceIr::ClassField { object, .. } | TypedPlaceIr::StateField { base: object, .. } => {
+            expression_references_definition(object, definition)
+        }
+        TypedPlaceIr::Index { base, index } => {
+            expression_references_definition(base, definition)
+                || expression_references_definition(index, definition)
+        }
+    }
+}
+
+fn statement_references_definition(statement: &TypedStatementIr, definition: DefinitionId) -> bool {
+    match statement {
+        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => value
+            .as_ref()
+            .is_some_and(|value| expression_references_definition(value, definition)),
+        TypedStatementIr::Assign { target, value } => {
+            place_references_definition(target, definition)
+                || expression_references_definition(value, definition)
+        }
+        TypedStatementIr::Expression(expression) => {
+            expression_references_definition(expression, definition)
+        }
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            expression_references_definition(condition, definition)
+                || block_references_definition(then_block, definition)
+                || else_block
+                    .as_ref()
+                    .is_some_and(|block| block_references_definition(block, definition))
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => {
+            expression_references_definition(condition, definition)
+                || block_references_definition(body, definition)
+        }
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            expression_references_definition(start, definition)
+                || expression_references_definition(end, definition)
+                || block_references_definition(body, definition)
+        }
+        TypedStatementIr::Defer { captures, .. } => captures
+            .iter()
+            .any(|capture| expression_references_definition(capture, definition)),
+        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {
+            false
+        }
+    }
+}
+
+fn block_references_definition(block: &TypedBlockIr, definition: DefinitionId) -> bool {
+    block
+        .statements
+        .iter()
+        .any(|statement| statement_references_definition(statement, definition))
+        || block
+            .tail
+            .as_ref()
+            .is_some_and(|tail| expression_references_definition(tail, definition))
+}
+
 /// M5 WP45 minimal escape analysis: immutable locals initialized by a
 /// struct construction whose every later use is a direct field read.
 ///
@@ -2718,6 +3217,8 @@ impl<'a> FunctionEmitter<'a> {
         // reference pipeline materializes every struct on the heap.
         let mut inline_structs = BTreeMap::new();
         let mut inline_enums = BTreeMap::new();
+        let mut inline_maps = BTreeMap::new();
+        let mut inline_arrays = BTreeMap::new();
         if optimize {
             for (definition, owner) in inline_struct_candidates(function) {
                 let Some(layout) = layouts.aggregates.get(&owner) else {
@@ -2750,6 +3251,24 @@ impl<'a> FunctionEmitter<'a> {
                 };
                 inline_enums.insert(definition, (variant_definition, payload_register));
             }
+            for (definition, plan) in inline_map_candidates(function) {
+                let value_register = u16::try_from(register_types.len())
+                    .map_err(|_| CompileError::too_many_registers(function_span))?;
+                register_types.push(Some(lower_type(package, &plan.value_type, function_span)?));
+                inline_maps.insert(
+                    definition,
+                    InlineMapState {
+                        value_register,
+                        entry_key: None,
+                    },
+                );
+            }
+            inline_arrays = allocate_inline_array_states(
+                package,
+                function,
+                function_span,
+                &mut register_types,
+            )?;
         }
         Ok(Self {
             package,
@@ -2763,6 +3282,8 @@ impl<'a> FunctionEmitter<'a> {
             locals,
             inline_structs,
             inline_enums,
+            inline_maps,
+            inline_arrays,
             optimize,
             register_types,
             parameter_count: function.parameters.len(),
@@ -2825,6 +3346,43 @@ impl<'a> FunctionEmitter<'a> {
                 definition, value, ..
             } => {
                 if let Some(value) = value {
+                    if self.inline_arrays.contains_key(definition) {
+                        if !matches!(
+                            value.kind,
+                            TypedExpressionKind::BuiltinCall {
+                                operation: BuiltinOperationIr::ArrayNew,
+                                ..
+                            }
+                        ) {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        }
+                        // The bounded local array is represented exclusively
+                        // by its element registers. Candidate analysis rejects
+                        // every use that could observe an array identity.
+                        return Ok(());
+                    }
+                    if self.inline_maps.contains_key(definition) {
+                        if !matches!(
+                            value.kind,
+                            TypedExpressionKind::BuiltinCall {
+                                operation: BuiltinOperationIr::MapNew,
+                                ..
+                            }
+                        ) {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        }
+                        // The map has no physical representation until an
+                        // escaping use (which the candidate scan rejects).
+                        return Ok(());
+                    }
                     if let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
                     {
                         // WP27 slice: evaluate initializers straight into the
@@ -4273,6 +4831,157 @@ impl<'a> FunctionEmitter<'a> {
         Ok(())
     }
 
+    fn emit_inline_map_call(
+        &mut self,
+        operation: BuiltinOperationIr,
+        arguments: &[TypedExpressionIr],
+        result: &IrType,
+        destination: u16,
+        span: SourceSpan,
+    ) -> Result<bool, CompileError> {
+        let Some(TypedExpressionKind::Reference(definition)) =
+            arguments.first().map(|argument| &argument.kind)
+        else {
+            return Ok(false);
+        };
+        let Some(state) = self.inline_maps.get(definition).copied() else {
+            return Ok(false);
+        };
+        match operation {
+            BuiltinOperationIr::MapSet if arguments.len() == 3 => {
+                let TypedExpressionKind::Literal(IrLiteral::I32(key)) = &arguments[1].kind else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                self.emit_expression(&arguments[2], state.value_register)?;
+                self.inline_maps
+                    .get_mut(definition)
+                    .expect("inline map receiver was resolved")
+                    .entry_key = Some(*key);
+                self.push(
+                    Instruction::LoadBool {
+                        dst: destination,
+                        value: true,
+                    },
+                    span,
+                );
+            }
+            BuiltinOperationIr::MapGet if arguments.len() == 2 => {
+                let TypedExpressionKind::Literal(IrLiteral::I32(key)) = &arguments[1].kind else {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                };
+                let hit = state.entry_key == Some(*key);
+                let variant = if hit {
+                    BuiltinVariantIr::OptionSome
+                } else {
+                    BuiltinVariantIr::OptionNone
+                };
+                let (enum_type, variant) =
+                    builtin_variant_layout(self.package, variant, result, span)?;
+                self.push(
+                    Instruction::EnumNew {
+                        type_id: enum_type.type_id,
+                        variant: variant.stable_id,
+                        payload: hit.then_some(state.value_register),
+                        dst: destination,
+                    },
+                    span,
+                );
+            }
+            _ => {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+        }
+        Ok(true)
+    }
+
+    fn emit_inline_array_call(
+        &mut self,
+        operation: BuiltinOperationIr,
+        arguments: &[TypedExpressionIr],
+        destination: u16,
+        span: SourceSpan,
+    ) -> Result<bool, CompileError> {
+        let Some(TypedExpressionKind::Reference(definition)) =
+            arguments.first().map(|argument| &argument.kind)
+        else {
+            return Ok(false);
+        };
+        let Some(state) = self.inline_arrays.get(definition).copied() else {
+            return Ok(false);
+        };
+        let slot = |index: u16| {
+            state
+                .slots_base
+                .checked_add(index)
+                .ok_or_else(|| CompileError::too_many_registers(span))
+        };
+        let literal_index = |argument: &TypedExpressionIr| {
+            let TypedExpressionKind::Literal(IrLiteral::I32(index)) = argument.kind else {
+                return Err(CompileError::type_mismatch(None, None, span));
+            };
+            u16::try_from(index).map_err(|_| CompileError::type_mismatch(None, None, span))
+        };
+        match operation {
+            BuiltinOperationIr::ArrayPush if arguments.len() == 2 => {
+                if state.length >= state.capacity {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                }
+                self.emit_expression(&arguments[1], slot(state.length)?)?;
+                self.inline_arrays
+                    .get_mut(definition)
+                    .expect("inline array receiver was resolved")
+                    .length += 1;
+                self.push(
+                    Instruction::LoadBool {
+                        dst: destination,
+                        value: true,
+                    },
+                    span,
+                );
+            }
+            BuiltinOperationIr::ArraySet if arguments.len() == 3 => {
+                let index = literal_index(&arguments[1])?;
+                if index >= state.length {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                }
+                self.emit_expression(&arguments[2], slot(index)?)?;
+                self.push(
+                    Instruction::LoadBool {
+                        dst: destination,
+                        value: true,
+                    },
+                    span,
+                );
+            }
+            BuiltinOperationIr::ArrayGet if arguments.len() == 2 => {
+                let index = literal_index(&arguments[1])?;
+                if index >= state.length {
+                    return Err(CompileError::type_mismatch(None, None, span));
+                }
+                self.push(
+                    Instruction::Move {
+                        dst: destination,
+                        source: slot(index)?,
+                    },
+                    span,
+                );
+            }
+            BuiltinOperationIr::ArrayLen if arguments.len() == 1 => {
+                self.push(
+                    Instruction::LoadI32 {
+                        dst: destination,
+                        value: i32::from(state.length),
+                    },
+                    span,
+                );
+            }
+            _ => {
+                return Err(CompileError::type_mismatch(None, None, span));
+            }
+        }
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn emit_builtin_call(
         &mut self,
@@ -4304,6 +5013,14 @@ impl<'a> FunctionEmitter<'a> {
             IrEffect::Migration | IrEffect::Cleanup
         ) {
             return Err(CompileError::invalid_effect(span));
+        }
+        if self.optimize && self.emit_inline_array_call(operation, arguments, destination, span)? {
+            return Ok(());
+        }
+        if self.optimize
+            && self.emit_inline_map_call(operation, arguments, result, destination, span)?
+        {
+            return Ok(());
         }
 
         // WP52 push-side fusion: a struct literal pushed into an array
@@ -5108,6 +5825,29 @@ impl<'a> FunctionEmitter<'a> {
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
+        if let TypedExpressionKind::BuiltinCall {
+            operation: BuiltinOperationIr::MapGet,
+            arguments,
+            ..
+        } = &value.kind
+            && arguments.len() == 2
+            && let TypedExpressionKind::Reference(definition) = &arguments[0].kind
+            && let Some(state) = self.inline_maps.get(definition).copied()
+            && let TypedExpressionKind::Literal(IrLiteral::I32(key)) = &arguments[1].kind
+        {
+            let hit = state.entry_key == Some(*key);
+            return self.emit_inline_builtin_match(
+                if hit {
+                    BuiltinVariantIr::OptionSome
+                } else {
+                    BuiltinVariantIr::OptionNone
+                },
+                hit.then_some(state.value_register),
+                arms,
+                destination,
+                span,
+            );
+        }
         // Enum slice: a match over an inlined binding selects its arm at
         // compile time; no scrutinee register and no tag comparison exist.
         if let TypedExpressionKind::Reference(definition) = &value.kind
@@ -5184,6 +5924,51 @@ impl<'a> FunctionEmitter<'a> {
                     // matches; anything else is a compiler bug.
                     return Err(CompileError::type_mismatch(None, None, span));
                 }
+            }
+            let unconditional = failures.is_empty();
+            self.emit_expression(&arm.value, destination)?;
+            ends.push(self.push(Instruction::Jump { target: 0 }, span));
+            let next = self.position();
+            for failure in failures {
+                self.patch_target(failure, next)?;
+            }
+            if unconditional {
+                break;
+            }
+        }
+        self.push(Instruction::Trap, span);
+        let end = self.position();
+        for patch in ends {
+            self.patch_target(patch, end)?;
+        }
+        Ok(())
+    }
+
+    fn emit_inline_builtin_match(
+        &mut self,
+        variant: BuiltinVariantIr,
+        payload_register: Option<u16>,
+        arms: &[nexa_analysis::TypedMatchArmIr],
+        destination: u16,
+        span: SourceSpan,
+    ) -> Result<(), CompileError> {
+        let mut ends = Vec::new();
+        for arm in arms {
+            let mut failures = Vec::new();
+            match &arm.pattern.kind {
+                TypedPatternKind::BuiltinVariant {
+                    variant: candidate,
+                    payload,
+                } if *candidate == variant => match (payload.as_deref(), payload_register) {
+                    (None, None) => {}
+                    (Some(pattern), Some(register)) => {
+                        self.emit_pattern_guard(register, pattern, &mut failures, span)?;
+                    }
+                    _ => return Err(CompileError::type_mismatch(None, None, span)),
+                },
+                TypedPatternKind::BuiltinVariant { .. } => continue,
+                TypedPatternKind::Wildcard => {}
+                _ => return Err(CompileError::type_mismatch(None, None, span)),
             }
             let unconditional = failures.is_empty();
             self.emit_expression(&arm.value, destination)?;
