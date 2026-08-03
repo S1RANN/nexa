@@ -170,6 +170,7 @@ struct Observation {
     fuel: u64,
     instructions: u64,
     heap_slots: u64,
+    live_vm_bytes: Option<u64>,
     vm: Option<nexa_runtime::VmAllocationCounters>,
     gc: Option<GcObservation>,
     resources: PeakResources,
@@ -261,8 +262,9 @@ struct CaseStats {
     peak_resources: PeakResources,
 }
 
-/// WP13 runtime counters. Fields the runtime does not expose yet are `null`
-/// so reports never fake zeros for unimplemented instrumentation.
+/// WP13 runtime allocation/copy work plus the WP71 exact live-byte gauge.
+/// Cases without a VM heap (for example offline migration) retain `null`
+/// instead of fabricating zero work.
 #[derive(Debug, Default, Serialize)]
 struct VmCounters {
     live_heap_slots_peak: u64,
@@ -275,38 +277,44 @@ struct VmCounters {
     enum_materializations: Option<u64>,
     allocated_bytes: Option<u64>,
     live_bytes: Option<u64>,
+    collection_relocation_bytes: Option<u64>,
+    string_copy_bytes: Option<u64>,
+    host_codec_copy_bytes: Option<u64>,
     bytes_copied: Option<u64>,
 }
 
 impl VmCounters {
     fn from_totals(
         live_heap_slots_peak: u64,
+        live_vm_bytes_peak: Option<u64>,
         totals: Option<nexa_runtime::VmAllocationCounters>,
     ) -> Self {
-        let Some(totals) = totals else {
-            return Self {
-                live_heap_slots_peak,
-                ..Self::default()
-            };
-        };
-        Self {
+        let mut counters = Self {
             live_heap_slots_peak,
-            allocations: Some(totals.object_allocations),
-            string_allocations: Some(totals.string_allocations),
-            class_allocations: Some(totals.class_allocations),
-            collection_storage_allocations: Some(totals.collection_storage_allocations),
-            map_slot_allocations: Some(totals.map_slot_allocations),
-            struct_materializations: Some(totals.struct_materializations),
-            enum_materializations: Some(totals.enum_materializations),
-            // Precise per-kind heap byte accounting is stage-G work (WP71).
-            allocated_bytes: None,
-            live_bytes: None,
-            bytes_copied: Some(
-                totals
-                    .collection_relocation_bytes
-                    .saturating_add(totals.string_copy_bytes),
-            ),
-        }
+            live_bytes: live_vm_bytes_peak,
+            ..Self::default()
+        };
+        let Some(totals) = totals else {
+            return counters;
+        };
+        counters.allocations = Some(totals.object_allocations);
+        counters.string_allocations = Some(totals.string_allocations);
+        counters.class_allocations = Some(totals.class_allocations);
+        counters.collection_storage_allocations = Some(totals.collection_storage_allocations);
+        counters.map_slot_allocations = Some(totals.map_slot_allocations);
+        counters.struct_materializations = Some(totals.struct_materializations);
+        counters.enum_materializations = Some(totals.enum_materializations);
+        counters.allocated_bytes = Some(totals.allocated_bytes);
+        counters.collection_relocation_bytes = Some(totals.collection_relocation_bytes);
+        counters.string_copy_bytes = Some(totals.string_copy_bytes);
+        counters.host_codec_copy_bytes = Some(totals.host_codec_copy_bytes);
+        counters.bytes_copied = Some(
+            totals
+                .collection_relocation_bytes
+                .saturating_add(totals.string_copy_bytes)
+                .saturating_add(totals.host_codec_copy_bytes),
+        );
+        counters
     }
 }
 
@@ -919,6 +927,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("snapshot data"),
             );
             Observation {
+                live_vm_bytes: Some(snapshot_realm.live_vm_bytes()),
                 resources: PeakResources::from_ledger(snapshot_realm.resource_ledger()),
                 ..Observation::default()
             }
@@ -977,6 +986,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: async_instructions,
                 instructions: async_instructions,
                 heap_slots: async_realm.resource_ledger().heap_objects,
+                live_vm_bytes: Some(async_realm.live_vm_bytes()),
                 vm: Some(async_realm.vm_allocation_counters().delta_since(vm_before)),
                 gc: None,
                 resources: peak,
@@ -1005,6 +1015,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: result.usage.fuel_used,
                 instructions: result.usage.fuel_used,
                 heap_slots: result.usage.object_peak as u64,
+                live_vm_bytes: None,
                 vm: None,
                 gc: None,
                 resources: PeakResources {
@@ -1044,6 +1055,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fuel: 1,
                 instructions: 1,
                 heap_slots: after.heap_objects,
+                live_vm_bytes: Some(prepared.realm.live_vm_bytes()),
                 vm: Some(prepared.realm.vm_allocation_counters()),
                 gc: None,
                 resources,
@@ -1121,6 +1133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             Observation {
                 heap_slots: realm.resource_ledger().heap_objects,
+                live_vm_bytes: Some(realm.live_vm_bytes()),
                 gc: Some(GcObservation {
                     completed_cycles: u64::from(report.completed.is_some()),
                     objects_reclaimed: reclaimed,
@@ -1824,6 +1837,7 @@ fn observation(charge: ExecutionCharge, heap: &Heap) -> Observation {
         fuel: charge.fuel_used,
         instructions: charge.instructions,
         heap_slots: u64::try_from(heap.live_len()).unwrap_or(u64::MAX),
+        live_vm_bytes: Some(heap.live_vm_bytes()),
         vm: Some(heap.vm_allocation_counters()),
         ..Observation::default()
     }
@@ -1836,6 +1850,10 @@ fn combine(first: Observation, second: Observation, heap_slots: usize) -> Observ
         fuel: first.fuel.saturating_add(second.fuel),
         instructions: first.instructions.saturating_add(second.instructions),
         heap_slots: u64::try_from(heap_slots).unwrap_or(u64::MAX),
+        live_vm_bytes: match (first.live_vm_bytes, second.live_vm_bytes) {
+            (Some(first), Some(second)) => Some(first.max(second)),
+            (first, second) => second.or(first),
+        },
         // Counters are cumulative per heap; the later observation subsumes
         // the earlier one taken from the same heap.
         vm: second.vm.or(first.vm),
@@ -2226,6 +2244,7 @@ fn bench<T>(
     let mut fuel = 0_u64;
     let mut instructions = 0_u64;
     let mut heap_slots = 0_u64;
+    let mut live_vm_bytes: Option<u64> = None;
     let mut vm_totals: Option<nexa_runtime::VmAllocationCounters> = None;
     let mut gc_totals: Option<GcObservation> = None;
     let mut resources = PeakResources::default();
@@ -2240,6 +2259,10 @@ fn bench<T>(
         fuel = fuel.saturating_add(observation.fuel);
         instructions = instructions.saturating_add(observation.instructions);
         heap_slots = heap_slots.max(observation.heap_slots);
+        if let Some(sample_live_bytes) = observation.live_vm_bytes {
+            live_vm_bytes =
+                Some(live_vm_bytes.map_or(sample_live_bytes, |peak| peak.max(sample_live_bytes)));
+        }
         if let Some(sample_vm) = observation.vm {
             vm_totals.get_or_insert_default().accumulate(sample_vm);
         }
@@ -2287,7 +2310,7 @@ fn bench<T>(
         system_allocated_bytes: allocation_totals.allocated_bytes,
         system_reallocated_bytes: allocation_totals.reallocated_bytes,
         system_peak_outstanding_bytes: allocation_totals.peak_outstanding_bytes,
-        vm: VmCounters::from_totals(heap_slots, vm_totals),
+        vm: VmCounters::from_totals(heap_slots, live_vm_bytes, vm_totals),
         gc: gc_totals.map_or_else(GcCounters::default, |totals| GcCounters {
             cycles: Some(totals.completed_cycles),
             pause_ns_max: Some(

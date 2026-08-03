@@ -363,16 +363,23 @@ pub struct HeapByteInspection {
 }
 
 impl HeapByteInspection {
-    /// Exclusive-category sum: headers, out-of-slot payloads, slack, and
-    /// profiler storage.
+    /// Bytes owned by live VM objects, excluding reserved slack and profiler
+    /// storage.
     #[must_use]
-    pub const fn total(&self) -> u64 {
+    pub const fn live_total(&self) -> u64 {
         self.object_header_bytes
             .saturating_add(self.class_payload_bytes)
             .saturating_add(self.string_bytes)
             .saturating_add(self.array_bytes)
             .saturating_add(self.buffer_bytes)
             .saturating_add(self.map_bytes)
+    }
+
+    /// Exclusive-category sum: headers, out-of-slot payloads, slack, and
+    /// profiler storage.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.live_total()
             .saturating_add(self.allocator_slack_bytes)
             .saturating_add(self.profiler_bytes)
     }
@@ -660,7 +667,7 @@ impl CollectionStorage {
         }
     }
 
-    const fn cell_size(self) -> usize {
+    pub(crate) const fn cell_size(self) -> usize {
         match self {
             Self::I32 | Self::F32 | Self::Rune => 4,
             Self::I64 | Self::F64 | Self::Ref | Self::NamedRef => 8,
@@ -1156,9 +1163,7 @@ pub struct IncrementalGcReport {
 ///
 /// Counters are monotonic work totals, not live-state gauges: checkpoint
 /// restores (REPL transaction rollback) intentionally do not rewind them,
-/// because the allocation and copy work still happened. Host codec copy
-/// accounting lands with the stage-H boundary work and is reported as
-/// unavailable until then.
+/// because the allocation and copy work still happened.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct VmAllocationCounters {
     pub object_allocations: u64,
@@ -1168,8 +1173,10 @@ pub struct VmAllocationCounters {
     pub map_slot_allocations: u64,
     pub struct_materializations: u64,
     pub enum_materializations: u64,
+    pub allocated_bytes: u64,
     pub collection_relocation_bytes: u64,
     pub string_copy_bytes: u64,
+    pub host_codec_copy_bytes: u64,
 }
 
 impl VmAllocationCounters {
@@ -1196,12 +1203,16 @@ impl VmAllocationCounters {
         self.enum_materializations = self
             .enum_materializations
             .saturating_add(other.enum_materializations);
+        self.allocated_bytes = self.allocated_bytes.saturating_add(other.allocated_bytes);
         self.collection_relocation_bytes = self
             .collection_relocation_bytes
             .saturating_add(other.collection_relocation_bytes);
         self.string_copy_bytes = self
             .string_copy_bytes
             .saturating_add(other.string_copy_bytes);
+        self.host_codec_copy_bytes = self
+            .host_codec_copy_bytes
+            .saturating_add(other.host_codec_copy_bytes);
     }
 
     /// Work performed since an `earlier` snapshot of the same counters.
@@ -1229,12 +1240,16 @@ impl VmAllocationCounters {
             enum_materializations: self
                 .enum_materializations
                 .saturating_sub(earlier.enum_materializations),
+            allocated_bytes: self.allocated_bytes.saturating_sub(earlier.allocated_bytes),
             collection_relocation_bytes: self
                 .collection_relocation_bytes
                 .saturating_sub(earlier.collection_relocation_bytes),
             string_copy_bytes: self
                 .string_copy_bytes
                 .saturating_sub(earlier.string_copy_bytes),
+            host_codec_copy_bytes: self
+                .host_codec_copy_bytes
+                .saturating_sub(earlier.host_codec_copy_bytes),
         }
     }
 }
@@ -1846,6 +1861,13 @@ impl Heap {
             .checked_add(1)
             .expect("live objects cannot exceed the u32 heap limit");
         self.counters.object_allocations = self.counters.object_allocations.saturating_add(1);
+        let header_bytes = size_of::<ObjectSlot>() as u64
+            + if matches!(&object, Object::Map { .. }) {
+                size_of::<Option<VmMap>>() as u64
+            } else {
+                0
+            };
+        self.counters.allocated_bytes = self.counters.allocated_bytes.saturating_add(header_bytes);
         // G6: the commit funnel is the single charge point for every fresh
         // object's out-of-slot footprint; later growth (array regrow, map
         // rehash) adjusts the gauge at its own transition site.
@@ -4922,6 +4944,20 @@ impl Heap {
         self.live_payload_bytes
     }
 
+    /// O(1) exact bytes owned by live VM objects: occupied object/map
+    /// headers plus their out-of-slot payloads. Reserved allocator slack and
+    /// profiler storage remain separate `GC_V1` inspection categories.
+    #[must_use]
+    pub fn live_vm_bytes(&self) -> u64 {
+        let object_headers =
+            (self.live_objects as u64).saturating_mul(size_of::<ObjectSlot>() as u64);
+        let live_maps = self.maps.len().saturating_sub(self.free_maps.len()) as u64;
+        let map_headers = live_maps.saturating_mul(size_of::<Option<VmMap>>() as u64);
+        object_headers
+            .saturating_add(map_headers)
+            .saturating_add(self.live_payload_bytes)
+    }
+
     /// G6: caps [`Self::live_payload_bytes`]; growth past the ceiling is
     /// refused with `CapacityExhausted` at the fallible allocation and
     /// growth boundaries.
@@ -4941,7 +4977,38 @@ impl Heap {
     /// G6 gauge maintenance; saturating on both edges so accounting can
     /// never panic even if a footprint model bug under-releases.
     fn charge_live_payload(&mut self, bytes: u64) {
+        self.counters.allocated_bytes = self.counters.allocated_bytes.saturating_add(bytes);
         self.live_payload_bytes = self.live_payload_bytes.saturating_add(bytes);
+    }
+
+    /// WP13: records bytes physically copied by Host/Script codecs into VM
+    /// object or collection storage. The counter is a monotonic work total,
+    /// so a later transactional rollback intentionally does not rewind it.
+    pub(crate) fn record_host_codec_copy(&mut self, bytes: u64) {
+        self.counters.host_codec_copy_bytes =
+            self.counters.host_codec_copy_bytes.saturating_add(bytes);
+    }
+
+    pub(crate) fn record_host_codec_storage_copy(
+        &mut self,
+        storage: CollectionStorage,
+        elements: usize,
+    ) {
+        self.record_host_codec_copy((elements as u64).saturating_mul(storage.cell_size() as u64));
+    }
+
+    pub(crate) fn record_host_codec_field_copy(&mut self, fields: &[RuntimeValue]) {
+        self.record_host_codec_storage_copy(homogeneous_field_storage(fields), fields.len());
+    }
+
+    pub(crate) fn record_host_codec_collection_copy(
+        &mut self,
+        element_type: nexa_bytecode::ValueType,
+        values: &[RuntimeValue],
+    ) -> Result<(), HeapError> {
+        let storage = collection_storage_for_values(element_type, values)?;
+        self.record_host_codec_storage_copy(storage, values.len());
+        Ok(())
     }
 
     fn release_live_payload(&mut self, bytes: u64) {
@@ -5380,6 +5447,11 @@ impl Heap {
             .saturating_add(arena_free_bytes)
             .saturating_add(map_arena_free_bytes);
         inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
+        debug_assert_eq!(
+            inspection.live_total(),
+            self.live_vm_bytes(),
+            "O(1) live byte gauge drifted from GC_V1 inspection"
+        );
         inspection
     }
 
@@ -5906,6 +5978,8 @@ mod tests {
         assert_eq!(counters.string_copy_bytes, 5);
         assert_eq!(counters.collection_storage_allocations, 1);
         assert_eq!(counters.object_allocations, 2);
+        assert!(counters.allocated_bytes > counters.string_copy_bytes);
+        assert_eq!(counters.host_codec_copy_bytes, 0);
         // WP49 amortized growth: the first push grows an empty extent
         // (zero live elements copied) and the second lands in spare
         // capacity, so no relocation bytes accrue at all.

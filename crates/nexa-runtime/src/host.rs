@@ -1906,9 +1906,12 @@ impl<'a> HostReturnTransaction<'a> {
             .remaining_struct_fields
             .checked_sub(fields.len())
             .ok_or(HostTrap::Type)?;
-        self.heap
+        let value = self
+            .heap
             .commit_struct(&mut self.heap_reservation, type_id, fields)
-            .map_err(|_| HostTrap::Type)
+            .map_err(|_| HostTrap::Type)?;
+        self.heap.record_host_codec_field_copy(fields);
+        Ok(value)
     }
 
     pub fn write_enum(
@@ -1918,13 +1921,18 @@ impl<'a> HostReturnTransaction<'a> {
         tag: u32,
         payload: Option<crate::RuntimeValue>,
     ) -> Result<crate::RuntimeValue, HostTrap> {
-        Ok(self.heap.allocate_enum_reserved(
+        let value = self.heap.allocate_enum_reserved(
             &mut self.heap_reservation,
             type_id,
             variant,
             tag,
             payload,
-        ))
+        );
+        if payload.is_some() {
+            self.heap
+                .record_host_codec_copy(std::mem::size_of::<crate::RuntimeValue>() as u64);
+        }
+        Ok(value)
     }
 
     pub fn begin_array(
@@ -2091,6 +2099,7 @@ impl<'a> HostReturnTransaction<'a> {
                 value,
             )
             .map_err(|_| HostTrap::Type)?;
+        self.heap.record_host_codec_storage_copy(builder.storage, 1);
         builder.written += 1;
         Ok(())
     }
@@ -4579,6 +4588,7 @@ mod tests {
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);
         assert_eq!(heap.collection_inspection(), initial);
+        assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 0);
 
         let _commit_probe = heap
             .failure_injector()
@@ -4586,6 +4596,7 @@ mod tests {
         assert_eq!(encode_three_i32(&mut heap), Err(super::HostTrap::Type));
         assert_eq!(heap.live_len(), 0);
         assert_eq!(heap.collection_inspection(), initial);
+        assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 12);
 
         let array = encode_three_i32(&mut heap).unwrap();
         assert_eq!(
@@ -4596,6 +4607,7 @@ mod tests {
                 RuntimeValue::I32(3)
             ]
         );
+        assert_eq!(heap.vm_allocation_counters().host_codec_copy_bytes, 24);
         let RuntimeValue::NamedRef { reference, .. } = array else {
             unreachable!()
         };

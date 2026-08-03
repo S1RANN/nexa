@@ -801,7 +801,9 @@ fn commit_planned_payload(
     match payload {
         PlannedResultPayload::Value(value) => Ok(value),
         PlannedResultPayload::String(value) => {
+            let copied = value.len() as u64;
             let reference = heap.commit(reservation, Object::String(value));
+            heap.record_host_codec_copy(copied);
             let hash = heap.string_hash(reference)?;
             Ok(RuntimeValue::String { reference, hash })
         }
@@ -811,8 +813,12 @@ fn commit_planned_payload(
             for (index, field) in fields.into_iter().enumerate() {
                 values[index] = commit_planned_payload(heap, reservation, field)?;
             }
-            heap.commit_struct(reservation, type_id, &values[..field_count])
-                .map_err(RealmError::Heap)
+            let fields = &values[..field_count];
+            let value = heap
+                .commit_struct(reservation, type_id, fields)
+                .map_err(RealmError::Heap)?;
+            heap.record_host_codec_field_copy(fields);
+            Ok(value)
         }
         PlannedResultPayload::Enum {
             type_id,
@@ -823,6 +829,7 @@ fn commit_planned_payload(
             let payload = payload
                 .map(|payload| commit_planned_payload(heap, reservation, *payload))
                 .transpose()?;
+            let has_payload = payload.is_some();
             let reference = heap.commit(
                 reservation,
                 Object::Enum {
@@ -832,6 +839,9 @@ fn commit_planned_payload(
                     payload,
                 },
             );
+            if has_payload {
+                heap.record_host_codec_copy(std::mem::size_of::<RuntimeValue>() as u64);
+            }
             Ok(RuntimeValue::NamedRef { reference, type_id })
         }
         PlannedResultPayload::Array {
@@ -843,8 +853,11 @@ fn commit_planned_payload(
                 .into_iter()
                 .map(|value| commit_planned_payload(heap, reservation, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            heap.commit_array_values_reserved(reservation, type_id, element_type, &values)
-                .map_err(RealmError::Heap)
+            let value = heap
+                .commit_array_values_reserved(reservation, type_id, element_type, &values)
+                .map_err(RealmError::Heap)?;
+            heap.record_host_codec_collection_copy(element_type, &values)?;
+            Ok(value)
         }
         PlannedResultPayload::Buffer {
             type_id,
@@ -855,8 +868,11 @@ fn commit_planned_payload(
                 .into_iter()
                 .map(|value| commit_planned_payload(heap, reservation, value))
                 .collect::<Result<Vec<_>, _>>()?;
-            heap.commit_buffer_values_reserved(reservation, type_id, element_type, &values)
-                .map_err(RealmError::Heap)
+            let value = heap
+                .commit_buffer_values_reserved(reservation, type_id, element_type, &values)
+                .map_err(RealmError::Heap)?;
+            heap.record_host_codec_collection_copy(element_type, &values)?;
+            Ok(value)
         }
     }
 }
@@ -3782,6 +3798,22 @@ impl RealmRuntime {
     #[must_use]
     pub const fn vm_allocation_counters(&self) -> crate::VmAllocationCounters {
         self.heap.vm_allocation_counters()
+    }
+
+    /// Exact current VM-owned heap bytes by `GC_V1` category.
+    ///
+    /// This is an inspection operation with a full live-slot walk; runtime
+    /// execution never calls it from an instruction or GC step.
+    #[must_use]
+    pub fn heap_byte_inspection(&self) -> crate::HeapByteInspection {
+        self.heap.byte_inspection()
+    }
+
+    /// O(1) live object/header/payload byte gauge used by performance and
+    /// resource telemetry.
+    #[must_use]
+    pub fn live_vm_bytes(&self) -> u64 {
+        self.heap.live_vm_bytes()
     }
 
     #[must_use]
