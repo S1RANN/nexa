@@ -1966,9 +1966,20 @@ impl Heap {
         self.validate_string_length(value.len())?;
         // G6 admission: string storage counts toward the byte ceiling.
         self.ensure_payload_headroom(u64::try_from(value.capacity()).unwrap_or(u64::MAX))?;
+        let hash = fnv_content_hash(&value);
         let reference = self.commit(reservation, Object::String(value));
-        let hash = self.string_hash(reference)?;
         Ok(RuntimeValue::String { reference, hash })
+    }
+
+    /// Validates every bounded VM resource needed by one owned string before
+    /// its backing allocation is attempted.
+    pub(crate) fn preflight_string_build(
+        &mut self,
+        bytes: usize,
+    ) -> Result<HeapReservation, HeapError> {
+        self.validate_string_length(bytes)?;
+        self.ensure_payload_headroom(u64::try_from(bytes).unwrap_or(u64::MAX))?;
+        self.preflight(1)
     }
 
     pub fn preflight_collection(

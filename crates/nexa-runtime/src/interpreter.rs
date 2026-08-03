@@ -526,7 +526,7 @@ impl fmt::Write for ScalarText {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpcodeCostTable {
     pub version: u32,
-    costs: [u16; 109],
+    costs: [u16; 110],
 }
 
 static CANONICAL_OPCODE_COST_TABLE: OpcodeCostTable = OpcodeCostTable {
@@ -542,7 +542,7 @@ impl Default for OpcodeCostTable {
 
 impl OpcodeCostTable {
     /// Shared immutable v7 schedule for the overwhelmingly common canonical
-    /// runtime. Avoids copying the 109-entry table at every convenience API
+    /// runtime. Avoids copying the 110-entry table at every convenience API
     /// call while custom-version tests can still own a mutable table.
     #[must_use]
     pub const fn canonical() -> &'static Self {
@@ -608,6 +608,7 @@ pub(crate) const fn allocation_profile(
         },
         Instruction::LoadString { .. }
         | Instruction::StringConcat { .. }
+        | Instruction::StringBuild { .. }
         | Instruction::StringToString { .. }
         | Instruction::I32ToString { .. }
         | Instruction::I64ToString { .. }
@@ -2688,31 +2689,19 @@ impl CheckedInterpreter {
                 | Instruction::BoolToString { dst, source }
                 | Instruction::RuneToString { dst, source } => {
                     let value = register(&continuation.arena, source)?;
-                    let mut text = ScalarText::new();
-                    match (instruction, value) {
-                        (Instruction::I32ToString { .. }, RuntimeValue::I32(value)) => {
-                            write!(&mut text, "{value}")
-                        }
-                        (Instruction::I64ToString { .. }, RuntimeValue::I64(value)) => {
-                            write!(&mut text, "{value}")
-                        }
-                        (Instruction::F32ToString { .. }, RuntimeValue::F32(bits)) => {
-                            write!(&mut text, "{}", f32::from_bits(bits))
-                        }
-                        (Instruction::F64ToString { .. }, RuntimeValue::F64(bits)) => {
-                            write!(&mut text, "{}", f64::from_bits(bits))
-                        }
-                        (Instruction::BoolToString { .. }, RuntimeValue::Bool(value)) => {
-                            write!(&mut text, "{value}")
-                        }
-                        (Instruction::RuneToString { .. }, RuntimeValue::Rune(value)) => {
-                            let value =
-                                char::from_u32(value).ok_or(InterpreterError::TypeMismatch)?;
-                            write!(&mut text, "{value}")
-                        }
-                        _ => return Err(InterpreterError::TypeMismatch),
+                    if !matches!(
+                        (instruction, value),
+                        (Instruction::I32ToString { .. }, RuntimeValue::I32(_))
+                            | (Instruction::I64ToString { .. }, RuntimeValue::I64(_))
+                            | (Instruction::F32ToString { .. }, RuntimeValue::F32(_))
+                            | (Instruction::F64ToString { .. }, RuntimeValue::F64(_))
+                            | (Instruction::BoolToString { .. }, RuntimeValue::Bool(_))
+                            | (Instruction::RuneToString { .. }, RuntimeValue::Rune(_))
+                    ) {
+                        return Err(InterpreterError::TypeMismatch);
                     }
-                    .map_err(|_| InterpreterError::StringLengthOverflow)?;
+                    let mut text = ScalarText::new();
+                    write_scalar_text(value, &mut text)?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
@@ -2804,6 +2793,24 @@ impl CheckedInterpreter {
                         dst,
                         RuntimeValue::String { reference, hash },
                     )?;
+                    increment_pc(&mut continuation.arena)?;
+                }
+                Instruction::StringBuild {
+                    dst,
+                    parts_base,
+                    parts_count,
+                } => {
+                    let parts = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        parts_base,
+                        parts_count,
+                    )?;
+                    let value = build_runtime_string(
+                        heap.as_deref_mut()
+                            .ok_or(InterpreterError::HeapUnavailable)?,
+                        parts,
+                    )?;
+                    set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::StringRuneAt { dst, source, index } => {
@@ -4143,6 +4150,7 @@ pub(crate) fn static_instruction_fuel(
         | Instruction::StringRuneAt { .. }
         | Instruction::StringEqual { .. }
         | Instruction::StringConcat { .. }
+        | Instruction::StringBuild { .. }
         | Instruction::StructNew { .. }
         | Instruction::StructWith { .. }
         | Instruction::EnumEqual { .. }
@@ -4262,6 +4270,11 @@ pub(crate) fn dynamic_instruction_fuel(
                 .checked_mul(2)
                 .ok_or(InterpreterError::FuelCostOverflow)?
         }
+        Instruction::StringBuild {
+            parts_base,
+            parts_count,
+            ..
+        } => string_build_attempt_fuel(arena, heap_required()?, parts_base, parts_count)?,
         Instruction::Return { .. } | Instruction::ReturnVoid | Instruction::CleanupReturn => {
             return_defer_attempt_fuel(module, instruction, arena)?
         }
@@ -4495,6 +4508,46 @@ fn register_string_bytes(
         return Err(InterpreterError::TypeMismatch);
     };
     fuel_usize(heap.string(reference)?.len())
+}
+
+fn string_build_attempt_fuel(
+    arena: &FrameArena,
+    heap: &Heap,
+    parts_base: u16,
+    parts_count: u16,
+) -> Result<u64, InterpreterError> {
+    let parts = crate::trusted::read_register_window(arena, parts_base, parts_count)?;
+    let mut output_bytes = 0_u64;
+    let mut scalar_parts = 0_u64;
+    for part in parts {
+        output_bytes = output_bytes
+            .checked_add(fuel_usize(runtime_text_length(heap, *part)?)?)
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+        if !matches!(*part, RuntimeValue::String { .. }) {
+            scalar_parts = scalar_parts
+                .checked_add(1)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+        }
+    }
+    let part_scan = fuel_blocks(
+        u64::from(parts_count),
+        STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+    )?;
+    let output_work = fuel_blocks(output_bytes, STANDARD_STRING_FUEL_BLOCK_BYTES)?
+        .checked_mul(2)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    let scalar_unit = fuel_blocks(SCALAR_TO_STRING_MAX_BYTES, STANDARD_STRING_FUEL_BLOCK_BYTES)?
+        .checked_mul(SCALAR_TO_STRING_FUEL_PASSES)
+        .ok_or(InterpreterError::FuelCostOverflow)?;
+    fuel_add(
+        part_scan,
+        fuel_add(
+            output_work,
+            scalar_parts
+                .checked_mul(scalar_unit)
+                .ok_or(InterpreterError::FuelCostOverflow)?,
+        )?,
+    )
 }
 
 fn runtime_value_comparison_fuel(
@@ -5177,6 +5230,67 @@ fn allocate_runtime_string(heap: &mut Heap, value: &str) -> Result<RuntimeValue,
     Ok(RuntimeValue::String { reference, hash })
 }
 
+fn write_scalar_text(value: RuntimeValue, text: &mut ScalarText) -> Result<(), InterpreterError> {
+    match value {
+        RuntimeValue::I32(value) => write!(text, "{value}"),
+        RuntimeValue::I64(value) => write!(text, "{value}"),
+        RuntimeValue::F32(bits) => write!(text, "{}", f32::from_bits(bits)),
+        RuntimeValue::F64(bits) => write!(text, "{}", f64::from_bits(bits)),
+        RuntimeValue::Bool(value) => write!(text, "{value}"),
+        RuntimeValue::Rune(value) => {
+            let value = char::from_u32(value).ok_or(InterpreterError::TypeMismatch)?;
+            write!(text, "{value}")
+        }
+        _ => return Err(InterpreterError::TypeMismatch),
+    }
+    .map_err(|_| InterpreterError::StringLengthOverflow)
+}
+
+fn runtime_text_length(heap: &Heap, value: RuntimeValue) -> Result<usize, InterpreterError> {
+    if let RuntimeValue::String { reference, .. } = value {
+        return Ok(heap.string(reference)?.len());
+    }
+    let mut text = ScalarText::new();
+    write_scalar_text(value, &mut text)?;
+    Ok(text.as_str().len())
+}
+
+fn append_runtime_text(
+    output: &mut String,
+    heap: &Heap,
+    value: RuntimeValue,
+) -> Result<(), InterpreterError> {
+    if let RuntimeValue::String { reference, .. } = value {
+        output.push_str(heap.string(reference)?);
+        return Ok(());
+    }
+    let mut text = ScalarText::new();
+    write_scalar_text(value, &mut text)?;
+    output.push_str(text.as_str());
+    Ok(())
+}
+
+fn build_runtime_string(
+    heap: &mut Heap,
+    parts: &[RuntimeValue],
+) -> Result<RuntimeValue, InterpreterError> {
+    let length = parts.iter().try_fold(0_usize, |length, part| {
+        length
+            .checked_add(runtime_text_length(heap, *part)?)
+            .ok_or(InterpreterError::StringLengthOverflow)
+    })?;
+    let mut reservation = heap.preflight_string_build(length)?;
+    let mut output = String::new();
+    output
+        .try_reserve_exact(length)
+        .map_err(|_| InterpreterError::Heap(HeapError::CapacityExhausted))?;
+    for part in parts {
+        append_runtime_text(&mut output, heap, *part)?;
+    }
+    debug_assert_eq!(output.len(), length);
+    Ok(heap.commit_owned_string(&mut reservation, output)?)
+}
+
 fn allocate_option(
     heap: &mut Heap,
     payload_type: ValueType,
@@ -5378,6 +5492,7 @@ pub(crate) fn is_safepoint(instruction: Instruction, pc: u32) -> bool {
         | Instruction::StringLen { .. }
         | Instruction::StringEqual { .. }
         | Instruction::StringConcat { .. }
+        | Instruction::StringBuild { .. }
         | Instruction::StringRuneAt { .. }
         | Instruction::StringHash { .. }
         | Instruction::I32ToString { .. }
@@ -5475,13 +5590,13 @@ macro_rules! define_opcode_cost_schedule {
             }
         ),+ $(,)?
     ) => {
-        const DEFAULT_OPCODE_COSTS: [u16; 109] = [$($base_cost),+];
+        const DEFAULT_OPCODE_COSTS: [u16; 110] = [$($base_cost),+];
 
         /// Stable opcode display names indexed by `opcode_index` (WP15).
-        pub(crate) const OPCODE_NAMES: [&str; 109] = [$($name),+];
+        pub(crate) const OPCODE_NAMES: [&str; 110] = [$($name),+];
 
         #[cfg(test)]
-        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 109] = [
+        const OPCODE_COST_SCHEDULE: [OpcodeCostScheduleEntry; 110] = [
             $(
                 OpcodeCostScheduleEntry {
                     index: $index,
@@ -5813,6 +5928,12 @@ define_opcode_cost_schedule! {
         name: "ArrayPushRow",
         base_cost: 1,
         dynamic_work: "ceil((old_len+new_len)/8)+collection_claim_release_metadata+fields_hash"
+    },
+    Instruction::StringBuild { .. } => {
+        index: 109,
+        name: "StringBuild",
+        base_cost: 1,
+        dynamic_work: "parts_scan+scalar_format+ceil(output_bytes/32)*2"
     },
 }
 
@@ -6254,7 +6375,7 @@ fn work(x: i32) -> i32 {
     #[test]
     fn bytecode_v7_opcode_cost_schedule_matches_the_frozen_fixture() {
         assert_eq!(nexa_bytecode::BYTECODE_VERSION, 7);
-        assert_eq!(OPCODE_COST_SCHEDULE.len(), 109);
+        assert_eq!(OPCODE_COST_SCHEDULE.len(), 110);
         assert_eq!(STANDARD_STRING_FUEL_BLOCK_BYTES, 32);
         assert_eq!(STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS, 8);
         assert_eq!(SCALAR_TO_STRING_MAX_BYTES, 64);
@@ -8346,6 +8467,86 @@ fn work(x: i32) -> i32 {
             panic!("large concat must complete with its exact deterministic fuel");
         };
         assert_eq!(charge.fuel_used, 6);
+    }
+
+    #[test]
+    fn string_build_precharges_fuel_and_publishes_once() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![
+                    ValueType::String,
+                    ValueType::I32,
+                    ValueType::Bool,
+                    ValueType::Rune,
+                ],
+                result: Some(ValueType::String),
+            },
+            5,
+        );
+        function.set_root(0).unwrap().set_root(4).unwrap();
+        function
+            .emit(Instruction::StringBuild {
+                dst: 4,
+                parts_base: 0,
+                parts_count: 4,
+            })
+            .emit(Instruction::Return { source: 4 });
+        let mut function = function.finish().unwrap();
+        function.root_maps = vec![
+            RootMap {
+                pc: 0,
+                bitmap: vec![true, false, false, false, false],
+            },
+            RootMap {
+                pc: 1,
+                bitmap: vec![false, false, false, false, true],
+            },
+        ];
+        let mut module = ModuleBuilder::new();
+        module.function(function);
+        let module = verify(module.finish(), VerifierLimits::default()).unwrap();
+
+        let mut heap = Heap::new_with_arena_limits(16, 4096, 64, 128, 16);
+        let text = allocate_runtime_string(&mut heap, "Nexa").unwrap();
+        let before = heap.vm_allocation_counters().string_allocations;
+        let InterpreterOutcome::Suspended { continuation, .. } = CheckedInterpreter::run_with_heap(
+            &module,
+            0,
+            &[
+                text,
+                RuntimeValue::I32(-7),
+                RuntimeValue::Bool(true),
+                RuntimeValue::Rune(u32::from('界')),
+            ],
+            1,
+            &mut heap,
+        )
+        .unwrap() else {
+            panic!("underfunded string build must suspend before allocation");
+        };
+        assert_eq!(heap.vm_allocation_counters().string_allocations, before);
+        let roots = GcRoots {
+            suspended_tasks: continuation.checked_gc_roots(&module).unwrap(),
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().live, 1);
+
+        let InterpreterOutcome::Returned {
+            value: Some(RuntimeValue::String { reference, .. }),
+            ..
+        } = CheckedInterpreter::poll_with_heap(
+            &module,
+            continuation,
+            FuelState::new(64, 0, u64::MAX),
+            &OpcodeCostTable::default(),
+            &mut heap,
+        )
+        .unwrap()
+        else {
+            panic!("funded string build must return");
+        };
+        assert_eq!(heap.string(reference), Ok("Nexa-7true界"));
+        assert_eq!(heap.vm_allocation_counters().string_allocations - before, 1);
     }
 
     #[test]

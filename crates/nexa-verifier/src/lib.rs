@@ -1219,7 +1219,11 @@ fn standard_intrinsic_metadata_is_complete(module: &Module, intrinsic: StandardI
         StandardIntrinsic::ArrayLen { element }
         | StandardIntrinsic::ArrayIsEmpty { element }
         | StandardIntrinsic::ArrayPush { element }
-        | StandardIntrinsic::ArrayPop { element } => has_array(element),
+        | StandardIntrinsic::ArrayPop { element }
+        | StandardIntrinsic::ArrayReserve { element }
+        | StandardIntrinsic::ArrayCapacity { element }
+        | StandardIntrinsic::ArrayClear { element }
+        | StandardIntrinsic::ArrayShrinkToFit { element } => has_array(element),
         StandardIntrinsic::MapGet { key, value } | StandardIntrinsic::MapRemove { key, value } => {
             has_map(key, value) && has_enum(nexa_bytecode::option_type(value))
         }
@@ -1257,6 +1261,7 @@ const fn string_instruction_requires_heap(instruction: Instruction) -> bool {
             | Instruction::StringByteLen { .. }
             | Instruction::StringEqual { .. }
             | Instruction::StringConcat { .. }
+            | Instruction::StringBuild { .. }
             | Instruction::StringRuneAt { .. }
             | Instruction::StringHash { .. }
             | Instruction::I32ToString { .. }
@@ -1461,6 +1466,7 @@ fn verify_function(
             Instruction::StringLen { .. }
                 | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
+                | Instruction::StringBuild { .. }
                 | Instruction::StringRuneAt { .. }
                 | Instruction::EnumEqual { .. }
                 | Instruction::StructEqual { .. }
@@ -1543,6 +1549,33 @@ fn verify_function(
             Instruction::StringConcat { dst, lhs, rhs } => {
                 require(&state, lhs, ValueType::String)?;
                 require(&state, rhs, ValueType::String)?;
+                state[register(dst)?] = Some(ValueType::String);
+            }
+            Instruction::StringBuild {
+                dst,
+                parts_base,
+                parts_count,
+            } => {
+                let parts_end = parts_base.checked_add(parts_count).ok_or_else(|| {
+                    error(Some(pc), VerifyErrorKind::RegisterOutOfRange(u16::MAX))
+                })?;
+                for source in parts_base..parts_end {
+                    let Some(ty) = state[register(source)?] else {
+                        return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                    };
+                    if !matches!(
+                        ty,
+                        ValueType::I32
+                            | ValueType::I64
+                            | ValueType::F32
+                            | ValueType::F64
+                            | ValueType::Bool
+                            | ValueType::Rune
+                            | ValueType::String
+                    ) {
+                        return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
+                    }
+                }
                 state[register(dst)?] = Some(ValueType::String);
             }
             Instruction::StringRuneAt { dst, source, index } => {
@@ -2803,6 +2836,11 @@ fn instruction_sources(instruction: Instruction) -> Vec<u16> {
             args_count,
             ..
         }
+        | Instruction::StringBuild {
+            parts_base: args_base,
+            parts_count: args_count,
+            ..
+        }
         | Instruction::Call {
             args_base,
             args_count,
@@ -2950,6 +2988,7 @@ fn instruction_destination(module: &Module, instruction: Instruction) -> Option<
         | Instruction::StringByteLen { dst, .. }
         | Instruction::StringEqual { dst, .. }
         | Instruction::StringConcat { dst, .. }
+        | Instruction::StringBuild { dst, .. }
         | Instruction::StringRuneAt { dst, .. }
         | Instruction::StringHash { dst, .. }
         | Instruction::I32ToString { dst, .. }
@@ -3048,6 +3087,7 @@ fn instruction_requires_safepoint(
                 | Instruction::StringLen { .. }
                 | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
+                | Instruction::StringBuild { .. }
                 | Instruction::StringRuneAt { .. }
                 | Instruction::StringHash { .. }
                 | Instruction::I32ToString { .. }
@@ -5333,6 +5373,92 @@ mod tests {
     }
 
     #[test]
+    fn string_build_accepts_only_initialized_scalar_windows() {
+        fn build_function(
+            parameters: Vec<ValueType>,
+            parts_base: u16,
+            parts_count: u16,
+        ) -> nexa_bytecode::Function {
+            let dst = u16::try_from(parameters.len()).unwrap();
+            let registers = dst + 1;
+            let entry_roots = parameters
+                .iter()
+                .map(|ty| ty.is_reference())
+                .chain(std::iter::once(false))
+                .collect::<Vec<_>>();
+            let mut return_roots = vec![false; usize::from(registers)];
+            return_roots[usize::from(dst)] = true;
+            let mut function = FunctionBuilder::new(
+                Signature {
+                    parameters,
+                    result: Some(ValueType::String),
+                },
+                registers,
+            );
+            for (register, root) in entry_roots.iter().copied().enumerate() {
+                if root {
+                    function.set_root(u16::try_from(register).unwrap()).unwrap();
+                }
+            }
+            function.set_root(dst).unwrap();
+            function
+                .emit(Instruction::StringBuild {
+                    dst,
+                    parts_base,
+                    parts_count,
+                })
+                .emit(Instruction::Return { source: dst });
+            let mut function = function.finish().unwrap();
+            function.root_maps = vec![
+                RootMap {
+                    pc: 0,
+                    bitmap: entry_roots,
+                },
+                RootMap {
+                    pc: 1,
+                    bitmap: return_roots,
+                },
+            ];
+            function
+        }
+
+        let mut valid = ModuleBuilder::new();
+        valid.function(build_function(
+            vec![
+                ValueType::String,
+                ValueType::I32,
+                ValueType::F64,
+                ValueType::Bool,
+                ValueType::Rune,
+            ],
+            0,
+            5,
+        ));
+        assert!(verify(valid.finish(), VerifierLimits::default()).is_ok());
+
+        let array = nexa_bytecode::array_type(ValueType::I32);
+        let mut aggregate = ModuleBuilder::new();
+        aggregate
+            .array_type(ArrayType::new(ValueType::I32))
+            .function(build_function(vec![ValueType::Named(array)], 0, 1));
+        assert_eq!(
+            verify(aggregate.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::TypeMismatch
+        );
+
+        let mut out_of_range = ModuleBuilder::new();
+        out_of_range.function(build_function(vec![ValueType::I32], u16::MAX, 1));
+        assert_eq!(
+            verify(out_of_range.finish(), VerifierLimits::default())
+                .unwrap_err()
+                .kind,
+            VerifyErrorKind::RegisterOutOfRange(u16::MAX)
+        );
+    }
+
+    #[test]
     fn scalar_ordering_requires_matching_numeric_operands() {
         fn ordering_function(
             source_type: ValueType,
@@ -5517,6 +5643,10 @@ mod tests {
         ArrayGet,
         ArrayPush,
         ArrayPop,
+        ArrayReserve,
+        ArrayCapacity,
+        ArrayClear,
+        ArrayShrinkToFit,
         MapLen,
         MapContains,
         MapGet,
@@ -5527,7 +5657,7 @@ mod tests {
     }
 
     impl FrozenIntrinsicKind {
-        const ALL: [Self; 38] = [
+        const ALL: [Self; 42] = [
             Self::OptionIsSome,
             Self::OptionIsNone,
             Self::ResultIsOk,
@@ -5559,6 +5689,10 @@ mod tests {
             Self::ArrayGet,
             Self::ArrayPush,
             Self::ArrayPop,
+            Self::ArrayReserve,
+            Self::ArrayCapacity,
+            Self::ArrayClear,
+            Self::ArrayShrinkToFit,
             Self::MapLen,
             Self::MapContains,
             Self::MapGet,
@@ -5602,6 +5736,10 @@ mod tests {
             StandardIntrinsic::ArrayGet { .. } => FrozenIntrinsicKind::ArrayGet,
             StandardIntrinsic::ArrayPush { .. } => FrozenIntrinsicKind::ArrayPush,
             StandardIntrinsic::ArrayPop { .. } => FrozenIntrinsicKind::ArrayPop,
+            StandardIntrinsic::ArrayReserve { .. } => FrozenIntrinsicKind::ArrayReserve,
+            StandardIntrinsic::ArrayCapacity { .. } => FrozenIntrinsicKind::ArrayCapacity,
+            StandardIntrinsic::ArrayClear { .. } => FrozenIntrinsicKind::ArrayClear,
+            StandardIntrinsic::ArrayShrinkToFit { .. } => FrozenIntrinsicKind::ArrayShrinkToFit,
             StandardIntrinsic::MapLen { .. } => FrozenIntrinsicKind::MapLen,
             StandardIntrinsic::MapContains { .. } => FrozenIntrinsicKind::MapContains,
             StandardIntrinsic::MapGet { .. } => FrozenIntrinsicKind::MapGet,
@@ -5796,6 +5934,26 @@ mod tests {
                 StandardIntrinsic::ArrayPop { element: value },
                 vec![array],
                 value,
+            ),
+            spec(
+                StandardIntrinsic::ArrayReserve { element: value },
+                vec![array, ValueType::I32],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayCapacity { element: value },
+                vec![array],
+                ValueType::I32,
+            ),
+            spec(
+                StandardIntrinsic::ArrayClear { element: value },
+                vec![array],
+                ValueType::Bool,
+            ),
+            spec(
+                StandardIntrinsic::ArrayShrinkToFit { element: value },
+                vec![array],
+                ValueType::Bool,
             ),
             spec(
                 StandardIntrinsic::MapLen { key, value },

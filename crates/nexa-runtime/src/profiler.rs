@@ -22,7 +22,7 @@ use nexa_core::{SourceSpan, StableId};
 use nexa_verifier::{ModuleProfileMetadata, VerifiedModule};
 
 pub const PROFILER_SCHEMA_VERSION: u32 = 1;
-pub(crate) const OPCODE_TABLE_SIZE: usize = 109;
+pub(crate) const OPCODE_TABLE_SIZE: usize = 110;
 pub const PROFILER_MODULE_CAPACITY: usize = 32;
 pub const PROFILER_FUNCTION_CAPACITY: usize = 256;
 pub const PROFILER_SITE_CAPACITY: usize = 512;

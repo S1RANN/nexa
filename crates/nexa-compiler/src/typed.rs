@@ -4499,28 +4499,33 @@ impl<'a> FunctionEmitter<'a> {
                 )?;
             }
             TypedExpressionKind::StringInterpolation(parts) => {
-                self.push(
-                    Instruction::LoadString {
-                        dst: destination,
-                        string: self.string_indices[""],
-                    },
-                    span,
-                );
-                for part in parts {
-                    let source = self.allocate_expression(part)?;
-                    self.emit_expression(part, source)?;
-                    let converted = self.allocate(ValueType::String)?;
-                    let part_span = self.span(&part.span)?;
-                    let conversion = TypedScalarToString::from_ir_type(&part.ty, part_span)?;
-                    self.push(conversion.instruction(converted, source), part_span);
+                if self.optimize {
+                    let parts = parts.iter().collect::<Vec<_>>();
+                    self.emit_string_build(&parts, destination, span)?;
+                } else {
                     self.push(
-                        Instruction::StringConcat {
+                        Instruction::LoadString {
                             dst: destination,
-                            lhs: destination,
-                            rhs: converted,
+                            string: self.string_indices[""],
                         },
                         span,
                     );
+                    for part in parts {
+                        let source = self.allocate_expression(part)?;
+                        self.emit_expression(part, source)?;
+                        let converted = self.allocate(ValueType::String)?;
+                        let part_span = self.span(&part.span)?;
+                        let conversion = TypedScalarToString::from_ir_type(&part.ty, part_span)?;
+                        self.push(conversion.instruction(converted, source), part_span);
+                        self.push(
+                            Instruction::StringConcat {
+                                dst: destination,
+                                lhs: destination,
+                                rhs: converted,
+                            },
+                            span,
+                        );
+                    }
                 }
             }
             TypedExpressionKind::Yield => {
@@ -6561,6 +6566,12 @@ impl<'a> FunctionEmitter<'a> {
             return self.emit_short_circuit(operator, left, right, destination, span);
         }
         let ty = lower_type(self.package, &left.ty, self.span(&left.span)?)?;
+        if self.optimize && operator == BinaryOperator::Add && ty == ValueType::String {
+            let mut parts = Vec::new();
+            collect_string_concat_parts(left, &mut parts);
+            collect_string_concat_parts(right, &mut parts);
+            return self.emit_string_build(&parts, destination, span);
+        }
         let lhs = self.allocate_expression(left)?;
         let rhs = self.allocate_expression(right)?;
         self.emit_expression(left, lhs)?;
@@ -6638,6 +6649,50 @@ impl<'a> FunctionEmitter<'a> {
             BinaryOperator::And | BinaryOperator::Or => unreachable!("handled above"),
         };
         self.push(instruction, span);
+        Ok(())
+    }
+
+    fn emit_string_build(
+        &mut self,
+        parts: &[&TypedExpressionIr],
+        destination: u16,
+        span: SourceSpan,
+    ) -> Result<(), CompileError> {
+        if parts.is_empty() {
+            self.push(
+                Instruction::LoadString {
+                    dst: destination,
+                    string: self.string_indices[""],
+                },
+                span,
+            );
+            return Ok(());
+        }
+        let mut types = Vec::with_capacity(parts.len());
+        for part in parts {
+            let part_span = self.span(&part.span)?;
+            TypedScalarToString::from_ir_type(&part.ty, part_span)?;
+            types.push(lower_type(self.package, &part.ty, part_span)?);
+        }
+        let parts_base = self.reserve_types(&types)?;
+        for (offset, part) in parts.iter().enumerate() {
+            let register = parts_base
+                .checked_add(
+                    u16::try_from(offset)
+                        .map_err(|_| CompileError::too_many_registers(self.function_span))?,
+                )
+                .ok_or_else(|| CompileError::too_many_registers(self.function_span))?;
+            self.emit_expression(part, register)?;
+        }
+        self.push(
+            Instruction::StringBuild {
+                dst: destination,
+                parts_base,
+                parts_count: u16::try_from(parts.len())
+                    .map_err(|_| CompileError::too_many_registers(span))?,
+            },
+            span,
+        );
         Ok(())
     }
 
@@ -7060,6 +7115,24 @@ impl<'a> FunctionEmitter<'a> {
             },
             source_map,
         ))
+    }
+}
+
+fn collect_string_concat_parts<'a>(
+    expression: &'a TypedExpressionIr,
+    parts: &mut Vec<&'a TypedExpressionIr>,
+) {
+    if let TypedExpressionKind::Binary {
+        operator: BinaryOperator::Add,
+        left,
+        right,
+    } = &expression.kind
+        && expression.ty == IrType::String
+    {
+        collect_string_concat_parts(left, parts);
+        collect_string_concat_parts(right, parts);
+    } else {
+        parts.push(expression);
     }
 }
 
@@ -8059,6 +8132,11 @@ fn typed_instruction_sources(instruction: Instruction) -> Vec<u16> {
             args_count,
             ..
         }
+        | Instruction::StringBuild {
+            parts_base: args_base,
+            parts_count: args_count,
+            ..
+        }
         | Instruction::Call {
             args_base,
             args_count,
@@ -8198,6 +8276,7 @@ fn typed_instruction_destination(instruction: Instruction) -> Option<u16> {
         | Instruction::StringByteLen { dst, .. }
         | Instruction::StringEqual { dst, .. }
         | Instruction::StringConcat { dst, .. }
+        | Instruction::StringBuild { dst, .. }
         | Instruction::StringRuneAt { dst, .. }
         | Instruction::StringHash { dst, .. }
         | Instruction::I32ToString { dst, .. }
@@ -11142,6 +11221,7 @@ fn collect_safepoints(code: &[Instruction]) -> Vec<u32> {
                     | Instruction::StringLen { .. }
                     | Instruction::StringEqual { .. }
                     | Instruction::StringConcat { .. }
+                    | Instruction::StringBuild { .. }
                     | Instruction::StringRuneAt { .. }
                     | Instruction::StringHash { .. }
                     | Instruction::I32ToString { .. }

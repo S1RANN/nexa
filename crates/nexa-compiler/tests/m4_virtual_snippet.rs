@@ -740,10 +740,7 @@ pub fn value() -> i32 {
     }
 }
 
-#[test]
-fn typed_numeric_and_scalar_domains_lower_exhaustively() {
-    let verified = nexa_compiler::compile(
-        r#"
+const NUMERIC_AND_SCALAR_TEXT_SOURCE: &str = r#"
 fn numeric(a: i32, b: i64, c: f32, d: f64) -> bool {
     let i: i32 = -a + 2;
     let j: i64 = -b * 3;
@@ -763,9 +760,12 @@ fn scalar_text(
 ) -> string {
     return "${text}:${i}:${j}:${x}:${y}:${flag}:${glyph}";
 }
-"#,
-    )
-    .unwrap();
+"#;
+
+#[test]
+fn typed_numeric_domains_and_string_builder_lower_exhaustively() {
+    let verified = nexa_compiler::compile(NUMERIC_AND_SCALAR_TEXT_SOURCE).unwrap();
+    let reference = nexa_compiler::compile_reference(NUMERIC_AND_SCALAR_TEXT_SOURCE).unwrap();
     let instructions = verified
         .module()
         .functions
@@ -778,13 +778,6 @@ fn scalar_text(
         "i64 arithmetic",
         "f32 arithmetic",
         "f64 arithmetic",
-        "i32 conversion",
-        "i64 conversion",
-        "f32 conversion",
-        "f64 conversion",
-        "bool conversion",
-        "rune conversion",
-        "string conversion",
     ] {
         let present = match expected {
             "i32 arithmetic" => instructions
@@ -799,31 +792,187 @@ fn scalar_text(
             "f64 arithmetic" => instructions
                 .iter()
                 .any(|instruction| matches!(instruction, Instruction::RemF64 { .. })),
-            "i32 conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::I32ToString { .. })),
-            "i64 conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::I64ToString { .. })),
-            "f32 conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::F32ToString { .. })),
-            "f64 conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::F64ToString { .. })),
-            "bool conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::BoolToString { .. })),
-            "rune conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::RuneToString { .. })),
-            "string conversion" => instructions
-                .iter()
-                .any(|instruction| matches!(instruction, Instruction::StringToString { .. })),
             _ => false,
         };
         assert!(present, "missing {expected}");
     }
+    assert_eq!(
+        instructions
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::StringBuild { .. }))
+            .count(),
+        1
+    );
+    assert!(!instructions.iter().any(|instruction| matches!(
+        instruction,
+        Instruction::StringConcat { .. }
+            | Instruction::I32ToString { .. }
+            | Instruction::I64ToString { .. }
+            | Instruction::F32ToString { .. }
+            | Instruction::F64ToString { .. }
+            | Instruction::BoolToString { .. }
+            | Instruction::RuneToString { .. }
+            | Instruction::StringToString { .. }
+    )));
+
+    let reference_instructions = reference
+        .module()
+        .functions
+        .iter()
+        .flat_map(|function| &function.code)
+        .collect::<Vec<_>>();
+    for conversion in ["i32", "i64", "f32", "f64", "bool", "rune", "string"] {
+        let present = reference_instructions
+            .iter()
+            .any(|instruction| match conversion {
+                "i32" => matches!(instruction, Instruction::I32ToString { .. }),
+                "i64" => matches!(instruction, Instruction::I64ToString { .. }),
+                "f32" => matches!(instruction, Instruction::F32ToString { .. }),
+                "f64" => matches!(instruction, Instruction::F64ToString { .. }),
+                "bool" => matches!(instruction, Instruction::BoolToString { .. }),
+                "rune" => matches!(instruction, Instruction::RuneToString { .. }),
+                "string" => matches!(instruction, Instruction::StringToString { .. }),
+                _ => false,
+            });
+        assert!(
+            present,
+            "reference lowering is missing {conversion} conversion"
+        );
+    }
+    assert!(
+        reference_instructions
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::StringConcat { .. }))
+    );
+}
+
+#[test]
+fn string_builder_formats_all_scalar_domains_and_publishes_once() {
+    let verified = nexa_compiler::compile(NUMERIC_AND_SCALAR_TEXT_SOURCE).unwrap();
+    let signature = vec![
+        ValueType::String,
+        ValueType::I32,
+        ValueType::I64,
+        ValueType::F32,
+        ValueType::F64,
+        ValueType::Bool,
+        ValueType::Rune,
+    ];
+    let function = verified
+        .module()
+        .functions
+        .iter()
+        .position(|function| function.signature.parameters == signature)
+        .expect("optimized scalar_text function");
+    let mut heap = Heap::new(128);
+    let text = heap.allocate_string("prefix").unwrap();
+    for literal in &verified.module().strings {
+        heap.load_string_literal(literal).unwrap();
+    }
+    let before = heap.vm_allocation_counters().string_allocations;
+    let outcome = CheckedInterpreter::run_with_heap(
+        &verified,
+        u32::try_from(function).unwrap(),
+        &[
+            RuntimeValue::String {
+                reference: text,
+                hash: heap.string_hash(text).unwrap(),
+            },
+            RuntimeValue::I32(-7),
+            RuntimeValue::I64(42),
+            RuntimeValue::F32(1.25_f32.to_bits()),
+            RuntimeValue::F64((-2.5_f64).to_bits()),
+            RuntimeValue::Bool(true),
+            RuntimeValue::Rune(u32::from('界')),
+        ],
+        10_000,
+        &mut heap,
+    )
+    .unwrap();
+    let InterpreterOutcome::Returned {
+        value: Some(RuntimeValue::String { reference, .. }),
+        ..
+    } = outcome
+    else {
+        panic!("optimized string builder must return a string");
+    };
+    assert_eq!(
+        heap.string(reference).unwrap(),
+        "prefix:-7:42:1.25:-2.5:true:界"
+    );
+    assert_eq!(
+        heap.vm_allocation_counters().string_allocations - before,
+        1,
+        "optimized interpolation must publish exactly one owned result string"
+    );
+}
+
+#[test]
+fn chained_string_concat_fuses_to_one_builder_and_one_result_allocation() {
+    let source = r"
+fn chain(first: string, second: string, third: string) -> string {
+    return first + second + third;
+}
+";
+    let verified = nexa_compiler::compile(source).unwrap();
+    let code = &verified.module().functions[0].code;
+    assert_eq!(
+        code.iter()
+            .filter(|instruction| matches!(instruction, Instruction::StringBuild { .. }))
+            .count(),
+        1
+    );
+    assert!(
+        !code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::StringConcat { .. }))
+    );
+
+    let reference = nexa_compiler::compile_reference(source).unwrap();
+    assert_eq!(
+        reference.module().functions[0]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::StringConcat { .. }))
+            .count(),
+        2
+    );
+
+    let mut heap = Heap::new(32);
+    let first = heap.allocate_string("Nexa").unwrap();
+    let second = heap.allocate_string("界").unwrap();
+    let third = heap.allocate_string("!").unwrap();
+    let before = heap.vm_allocation_counters().string_allocations;
+    let outcome = CheckedInterpreter::run_with_heap(
+        &verified,
+        0,
+        &[
+            RuntimeValue::String {
+                reference: first,
+                hash: heap.string_hash(first).unwrap(),
+            },
+            RuntimeValue::String {
+                reference: second,
+                hash: heap.string_hash(second).unwrap(),
+            },
+            RuntimeValue::String {
+                reference: third,
+                hash: heap.string_hash(third).unwrap(),
+            },
+        ],
+        1_000,
+        &mut heap,
+    )
+    .unwrap();
+    let InterpreterOutcome::Returned {
+        value: Some(RuntimeValue::String { reference, .. }),
+        ..
+    } = outcome
+    else {
+        panic!("fused concat must return a string");
+    };
+    assert_eq!(heap.string(reference).unwrap(), "Nexa界!");
+    assert_eq!(heap.vm_allocation_counters().string_allocations - before, 1);
 }
 
 #[test]

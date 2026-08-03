@@ -1141,6 +1141,13 @@ pub enum Instruction {
         lhs: u16,
         rhs: u16,
     },
+    /// WP57: converts and concatenates a contiguous scalar/string register
+    /// window into one freshly published string.
+    StringBuild {
+        dst: u16,
+        parts_base: u16,
+        parts_count: u16,
+    },
     StringRuneAt {
         dst: u16,
         source: u16,
@@ -3445,6 +3452,16 @@ fn encode_instruction(output: &mut Vec<u8>, instruction: Instruction) {
             put_u16(output, lhs);
             put_u16(output, rhs);
         }
+        Instruction::StringBuild {
+            dst,
+            parts_base,
+            parts_count,
+        } => {
+            output.push(109);
+            put_u16(output, dst);
+            put_u16(output, parts_base);
+            put_u16(output, parts_count);
+        }
         Instruction::StandardIntrinsic {
             intrinsic,
             args_base,
@@ -4162,6 +4179,11 @@ fn decode_instruction(reader: &mut Reader<'_>) -> Result<Instruction, DecodeErro
                 _ => unreachable!(),
             }
         }
+        109 => Instruction::StringBuild {
+            dst: reader.u16()?,
+            parts_base: reader.u16()?,
+            parts_count: reader.u16()?,
+        },
         100 => Instruction::StandardIntrinsic {
             intrinsic: decode_standard_intrinsic(reader)?,
             args_base: reader.u16()?,
@@ -4727,6 +4749,7 @@ impl FunctionBuilder {
                         | Instruction::StringLen { .. }
                         | Instruction::StringEqual { .. }
                         | Instruction::StringConcat { .. }
+                        | Instruction::StringBuild { .. }
                         | Instruction::StringRuneAt { .. }
                         | Instruction::StringHash { .. }
                         | Instruction::I32ToString { .. }
@@ -5889,6 +5912,11 @@ mod tests {
                 dst: 5,
                 lhs: 0,
                 rhs: 1,
+            })
+            .emit(Instruction::StringBuild {
+                dst: 5,
+                parts_base: 0,
+                parts_count: 2,
             })
             .emit(Instruction::StringRuneAt {
                 dst: 6,

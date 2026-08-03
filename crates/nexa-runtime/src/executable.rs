@@ -1064,6 +1064,7 @@ fn update_counter() -> i32 {
                 | Instruction::StringRuneAt { .. }
                 | Instruction::StringEqual { .. }
                 | Instruction::StringConcat { .. }
+                | Instruction::StringBuild { .. }
                 | Instruction::StructNew { .. }
                 | Instruction::StructWith { .. }
                 | Instruction::EnumEqual { .. }
