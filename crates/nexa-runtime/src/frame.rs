@@ -257,7 +257,7 @@ impl FrameArena {
     }
 
     /// H1: an allocation-free arena shell for storage swaps; unusable for
-    /// execution until [`Self::reset_for`] succeeds on it.
+    /// execution until [`Self::reset_for_verified`] succeeds on it.
     #[must_use]
     pub(crate) fn empty_shell() -> Self {
         Self {
@@ -274,7 +274,10 @@ impl FrameArena {
     /// (and the reservation satisfies the limits), so a reused arena is
     /// indistinguishable from a freshly reserved one - including the
     /// admission byte ceiling checks - and performs zero allocations.
-    pub(crate) fn reset_for(
+    /// Exact root maps and definite initialization make stale backing bits
+    /// unreachable, so pooled scalar-heavy calls do not rescan wide register
+    /// slots merely to overwrite values no instruction can observe.
+    pub(crate) fn reset_for_verified(
         &mut self,
         limits: FrameLimits,
         reservation: ContinuationReservation,
@@ -293,12 +296,9 @@ impl FrameArena {
             return Err(FrameError::ReservationExceedsLimit);
         }
         self.frames.clear();
-        // Verified definite-initialization guarantees that an instruction
-        // never observes an old slot before writing it. Keep scalar bits at
-        // the initialized high-water mark, but clear GC-backed values before
-        // the range becomes available to a new frame: the conservative
-        // `gc_roots` view must never retain a stale object.
-        clear_gc_values(&mut self.registers[..self.register_top]);
+        // Verified definite-initialization guarantees that no instruction
+        // observes these retained bits before writing the corresponding
+        // slot; exact root maps never trace an uninitialized slot.
         self.register_top = 0;
         self.defer_records.clear();
         self.limits = limits;
@@ -366,8 +366,18 @@ impl FrameArena {
     }
 
     pub fn pop(&mut self) -> Result<Frame, FrameError> {
+        self.pop_mode(true)
+    }
+
+    pub(crate) fn pop_verified(&mut self) -> Result<Frame, FrameError> {
+        self.pop_mode(false)
+    }
+
+    fn pop_mode(&mut self, clear_gc_backing: bool) -> Result<Frame, FrameError> {
         let frame = self.frames.pop().ok_or(FrameError::NoFrame)?;
-        clear_gc_values(&mut self.registers[frame.register_start as usize..self.register_top]);
+        if clear_gc_backing {
+            clear_gc_values(&mut self.registers[frame.register_start as usize..self.register_top]);
+        }
         self.register_top = frame.register_start as usize;
         self.defer_records.truncate(frame.defer_start as usize);
         Ok(frame)
@@ -685,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn pooled_reset_retains_scalar_storage_but_clears_stale_gc_roots() {
+    fn verified_pooled_reset_retains_backing_but_exact_maps_ignore_stale_slots() {
         let limits = FrameLimits::default();
         let reservation = ContinuationReservation::for_limits(limits);
         let mut arena = FrameArena::with_reserved_capacity(limits, reservation).unwrap();
@@ -702,14 +712,19 @@ mod tests {
             .unwrap();
         let initialized_high_water = arena.registers.len();
 
-        arena.reset_for(limits, reservation).unwrap();
+        arena.reset_for_verified(limits, reservation).unwrap();
         assert_eq!(arena.register_len(), 0);
         assert_eq!(arena.registers.len(), initialized_high_water);
         assert_eq!(arena.registers[0], RuntimeValue::I32(41));
-        assert_eq!(arena.registers[1], RuntimeValue::Unit);
+        assert!(matches!(arena.registers[1], RuntimeValue::Ref(_)));
 
         arena.push(2, 2).unwrap();
-        assert!(arena.gc_roots().is_empty());
+        assert!(
+            arena
+                .iter_gc_roots(|_, _| Some(vec![false, false]))
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(arena.registers.len(), initialized_high_water);
     }
 

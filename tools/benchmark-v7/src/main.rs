@@ -477,7 +477,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let language = nexa_compiler::compile(&full_language_source())?;
     // Stage F: rows are built once at load, exactly like realm admission.
-    let language_rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
+    let language_rows = ExecutableModule::build(&language, OpcodeCostTable::canonical())?;
     // Stage H: one pooled continuation arena serves every steady-state case;
     // cold-start cases pass a fresh empty pool on purpose.
     let mut continuation_pool: Option<nexa_runtime::FrameArena> = None;
@@ -776,7 +776,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // case stays comparable across the whole M5 window.
             let verified =
                 nexa_compiler::compile(LANGUAGE_SOURCE_BASE).expect("benchmark language compiles");
-            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+            let rows = ExecutableModule::build(&verified, OpcodeCostTable::canonical())
                 .expect("benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
             // Cold start on purpose: the arena reservation is part of the
@@ -806,7 +806,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let verified = source_cache
                 .compile(LANGUAGE_SOURCE_BASE)
                 .expect("cached benchmark language compiles");
-            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+            let rows = ExecutableModule::build(&verified, OpcodeCostTable::canonical())
                 .expect("cached benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
             run_returned(
@@ -845,7 +845,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let verified = artifact_cache
                 .compile(LANGUAGE_SOURCE_BASE)
                 .expect("disk-cached benchmark language compiles");
-            let rows = ExecutableModule::build(&verified, &OpcodeCostTable::default())
+            let rows = ExecutableModule::build(&verified, OpcodeCostTable::canonical())
                 .expect("disk-cached benchmark language predecodes");
             let mut heap = Heap::new_with_limits(64, 4_096, 64);
             run_returned(
@@ -1442,7 +1442,7 @@ fn full_language_source() -> String {
 /// through the same predecoded-row path the benchmark cases execute.
 fn verify_products() -> Result<(), Box<dyn std::error::Error>> {
     let language = nexa_compiler::compile(&full_language_source())?;
-    let rows = ExecutableModule::build(&language, &OpcodeCostTable::default())?;
+    let rows = ExecutableModule::build(&language, OpcodeCostTable::canonical())?;
     let report = serde_json::json!({
         "product_data_sweep": returned_i32(
             &language,
@@ -1491,7 +1491,7 @@ fn returned_i32(
         module,
         continuation,
         FuelState::new(fuel, 0, u64::MAX),
-        &OpcodeCostTable::default(),
+        OpcodeCostTable::canonical(),
         Some(&mut heap),
         Some(executable),
         &mut pool,
@@ -1535,7 +1535,7 @@ fn run_returned(
         module,
         continuation,
         FuelState::new(fuel, 0, u64::MAX),
-        &OpcodeCostTable::default(),
+        OpcodeCostTable::canonical(),
         Some(heap),
         Some(executable),
         pool,
@@ -1569,7 +1569,7 @@ fn run_two_slices(
         module,
         continuation,
         FuelState::new(first_fuel, 0, 1_024),
-        &OpcodeCostTable::default(),
+        OpcodeCostTable::canonical(),
         None,
         None,
         pool,
@@ -1588,7 +1588,7 @@ fn run_two_slices(
         module,
         continuation,
         FuelState::new(64, fuel.cumulative_used, 1_024),
-        &OpcodeCostTable::default(),
+        OpcodeCostTable::canonical(),
         None,
         None,
         pool,

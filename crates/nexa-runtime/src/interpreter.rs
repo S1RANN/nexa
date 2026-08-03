@@ -105,7 +105,7 @@ impl InterpreterContinuation {
         validate_arguments(arguments, &function_meta.signature.parameters)?;
         let mut arena = match storage {
             Some(mut arena) => {
-                if arena.reset_for(limits, reservation).is_ok() {
+                if arena.reset_for_verified(limits, reservation).is_ok() {
                     arena
                 } else {
                     FrameArena::with_reserved_capacity(limits, reservation)?
@@ -494,16 +494,26 @@ pub struct OpcodeCostTable {
     costs: [u16; 109],
 }
 
+static CANONICAL_OPCODE_COST_TABLE: OpcodeCostTable = OpcodeCostTable {
+    version: OPCODE_COST_TABLE_VERSION,
+    costs: DEFAULT_OPCODE_COSTS,
+};
+
 impl Default for OpcodeCostTable {
     fn default() -> Self {
-        Self {
-            version: OPCODE_COST_TABLE_VERSION,
-            costs: DEFAULT_OPCODE_COSTS,
-        }
+        CANONICAL_OPCODE_COST_TABLE.clone()
     }
 }
 
 impl OpcodeCostTable {
+    /// Shared immutable v7 schedule for the overwhelmingly common canonical
+    /// runtime. Avoids copying the 109-entry table at every convenience API
+    /// call while custom-version tests can still own a mutable table.
+    #[must_use]
+    pub const fn canonical() -> &'static Self {
+        &CANONICAL_OPCODE_COST_TABLE
+    }
+
     fn validate_version(&self) -> Result<(), InterpreterError> {
         if self.version != OPCODE_COST_TABLE_VERSION {
             return Err(InterpreterError::OpcodeCostTableVersion {
@@ -866,7 +876,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
         )
     }
 
@@ -889,7 +899,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
             heap,
         )
     }
@@ -916,7 +926,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
             heap,
             executable,
         )
@@ -941,7 +951,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
             None,
             Some(migration),
             None,
@@ -971,7 +981,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
             None,
             Some(migration),
             None,
@@ -990,7 +1000,7 @@ impl CheckedInterpreter {
             module,
             continuation,
             FuelState::new(fuel, 0, u64::MAX),
-            &OpcodeCostTable::default(),
+            OpcodeCostTable::canonical(),
         )
     }
 
@@ -2879,7 +2889,7 @@ impl CheckedInterpreter {
                         continue;
                     }
                     let result = register(&continuation.arena, source)?;
-                    let completed = continuation.arena.pop()?;
+                    let completed = continuation.arena.pop_verified()?;
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
@@ -2925,7 +2935,7 @@ impl CheckedInterpreter {
                         pending_cost = 0;
                         continue;
                     }
-                    let completed = continuation.arena.pop()?;
+                    let completed = continuation.arena.pop_verified()?;
                     let returning_cleanup =
                         completed.return_target.is_none() && continuation.arena.depth() > 0;
                     if returning_cleanup {
@@ -3006,7 +3016,7 @@ impl CheckedInterpreter {
                     if let Some(migration) = migration.as_deref_mut() {
                         migration.observe_fuel_used(charge.fuel_used);
                     }
-                    continuation.arena.pop()?;
+                    continuation.arena.pop_verified()?;
                     if continuation.cleanup_mode
                         && continuation.arena.depth() > 0
                         && !start_next_defer(module, &mut continuation.arena)?
