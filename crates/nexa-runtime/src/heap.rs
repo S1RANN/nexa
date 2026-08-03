@@ -14,8 +14,8 @@ pub struct MapEntry {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MapRehash {
-    old_slots: Vec<Option<MapEntry>>,
-    new_slots: Vec<Option<MapEntry>>,
+    old_slots: CollectionRange,
+    new_slots: CollectionRange,
     cursor: usize,
 }
 
@@ -24,7 +24,7 @@ pub struct VmMap {
     type_id: StableId,
     key_type: nexa_bytecode::ValueType,
     value_type: nexa_bytecode::ValueType,
-    slots: Vec<Option<MapEntry>>,
+    slots: CollectionRange,
     length: usize,
     rehash: Option<MapRehash>,
 }
@@ -32,17 +32,17 @@ pub struct VmMap {
 impl VmMap {
     // WP73: stream child references into the mark queue instead of
     // materializing a temporary Vec per object during GC.
-    fn trace_references(&self, visit: &mut impl FnMut(GcRef)) {
-        let current = self
-            .slots
+    fn trace_references(&self, arena: &MapSlotArena, visit: &mut impl FnMut(GcRef)) {
+        let current = arena
+            .slots(self.slots)
             .iter()
             .filter_map(Option::as_ref)
             .flat_map(|entry| [entry.key, entry.value]);
         let rehash = self.rehash.iter().flat_map(|rehash| {
-            rehash
-                .old_slots
+            arena
+                .slots(rehash.old_slots)
                 .iter()
-                .chain(&rehash.new_slots)
+                .chain(arena.slots(rehash.new_slots))
                 .filter_map(Option::as_ref)
                 .flat_map(|entry| [entry.key, entry.value])
         });
@@ -58,11 +58,11 @@ impl VmMap {
         let rehash_slots = self.rehash.as_ref().map_or(0, |rehash| {
             rehash
                 .old_slots
-                .capacity()
-                .saturating_add(rehash.new_slots.capacity())
+                .length
+                .saturating_add(rehash.new_slots.length)
         });
         self.slots
-            .capacity()
+            .length
             .saturating_add(rehash_slots)
             .saturating_mul(slot_bytes)
     }
@@ -184,6 +184,104 @@ pub struct CollectionArena {
     values: Vec<RuntimeValue>,
     free_ranges: Vec<CollectionRange>,
     capacity: usize,
+}
+
+/// Preallocated typed storage for Map entries. Extents move between maps
+/// during incremental rehash without asking the system allocator for a new
+/// `Vec`, so Map creation and its common growth path stay allocation-free
+/// after Heap construction.
+#[derive(Debug)]
+struct MapSlotArena {
+    values: Vec<Option<MapEntry>>,
+    free_ranges: Vec<CollectionRange>,
+}
+
+impl MapSlotArena {
+    fn new(capacity: usize, max_ranges: usize) -> Self {
+        let mut free_ranges = Vec::with_capacity(max_ranges.max(1));
+        if capacity != 0 {
+            free_ranges.push(CollectionRange {
+                start: 0,
+                length: capacity,
+            });
+        }
+        Self {
+            values: Vec::with_capacity(capacity),
+            free_ranges,
+        }
+    }
+
+    fn claim(&mut self, count: usize) -> Result<CollectionRange, HeapError> {
+        if count == 0 {
+            return Ok(CollectionRange::default());
+        }
+        let index = self
+            .free_ranges
+            .iter()
+            .position(|range| range.length >= count)
+            .ok_or(HeapError::CapacityExhausted)?;
+        let range = CollectionRange {
+            start: self.free_ranges[index].start,
+            length: count,
+        };
+        if self.free_ranges[index].length == count {
+            self.free_ranges.remove(index);
+        } else {
+            self.free_ranges[index].start += count;
+            self.free_ranges[index].length -= count;
+        }
+        if self.values.len() < range.end() {
+            // The full address capacity was reserved at Heap construction;
+            // extending the initialized prefix cannot invoke the allocator.
+            self.values.resize(range.end(), None);
+        }
+        Ok(range)
+    }
+
+    fn release(&mut self, range: CollectionRange) {
+        if range.length == 0 {
+            return;
+        }
+        self.values[range.start..range.end()].fill(None);
+        let insertion = self
+            .free_ranges
+            .partition_point(|candidate| candidate.start < range.start);
+        debug_assert!(self.free_ranges.len() < self.free_ranges.capacity());
+        self.free_ranges.insert(insertion, range);
+        let mut index = insertion.saturating_sub(1);
+        while index + 1 < self.free_ranges.len() {
+            let left = self.free_ranges[index];
+            let right = self.free_ranges[index + 1];
+            if left.end() < right.start {
+                index += 1;
+                continue;
+            }
+            debug_assert!(left.end() <= right.start, "map slot ranges overlap");
+            self.free_ranges[index].length = right.end() - left.start;
+            self.free_ranges.remove(index + 1);
+        }
+    }
+
+    fn slots(&self, range: CollectionRange) -> &[Option<MapEntry>] {
+        &self.values[range.start..range.end()]
+    }
+
+    fn slots_mut(&mut self, range: CollectionRange) -> &mut [Option<MapEntry>] {
+        &mut self.values[range.start..range.end()]
+    }
+}
+
+impl Clone for MapSlotArena {
+    fn clone(&self) -> Self {
+        let mut values = Vec::with_capacity(self.values.capacity());
+        values.extend_from_slice(&self.values);
+        let mut free_ranges = Vec::with_capacity(self.free_ranges.capacity());
+        free_ranges.extend_from_slice(&self.free_ranges);
+        Self {
+            values,
+            free_ranges,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -810,6 +908,7 @@ pub struct Heap {
     /// creation/recycling never grows this index vector on the hot path.
     maps: Vec<Option<VmMap>>,
     free_maps: Vec<u32>,
+    map_slots: MapSlotArena,
     max_objects: u32,
     max_string_bytes: usize,
     max_collection_length: usize,
@@ -865,6 +964,7 @@ pub(crate) struct HeapCheckpoint {
     free: Vec<u32>,
     maps: Vec<Option<VmMap>>,
     free_maps: Vec<u32>,
+    map_slots: MapSlotArena,
     collections: CollectionArena,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
@@ -922,6 +1022,7 @@ impl Heap {
             free,
             maps,
             free_maps,
+            map_slots: self.map_slots.clone(),
             collections: self.collections.checkpoint_clone(),
             host_staging,
             host_transaction_active: self.host_transaction_active,
@@ -939,6 +1040,7 @@ impl Heap {
         self.free = checkpoint.free;
         self.maps = checkpoint.maps;
         self.free_maps = checkpoint.free_maps;
+        self.map_slots = checkpoint.map_slots;
         self.collections = checkpoint.collections;
         self.host_staging = checkpoint.host_staging;
         self.host_transaction_active = checkpoint.host_transaction_active;
@@ -960,6 +1062,11 @@ impl Heap {
             free: Vec::with_capacity(max_objects as usize),
             maps: Vec::with_capacity(max_objects as usize),
             free_maps: Vec::with_capacity(max_objects as usize),
+            map_slots: MapSlotArena::new(
+                max_collection_elements,
+                max_collection_ranges
+                    .max((max_objects as usize).saturating_mul(3).saturating_add(1)),
+            ),
             max_objects,
             max_string_bytes,
             max_collection_length: max_collection_length.min(i32::MAX as usize),
@@ -1281,9 +1388,12 @@ impl Heap {
             | Object::Class { range, .. } => self.collections.release(*range),
             Object::Map { storage } => {
                 let storage = *storage as usize;
-                if let Some(entry) = self.maps.get_mut(storage)
-                    && entry.take().is_some()
-                {
+                if let Some(map) = self.maps.get_mut(storage).and_then(Option::take) {
+                    self.map_slots.release(map.slots);
+                    if let Some(rehash) = map.rehash {
+                        self.map_slots.release(rehash.old_slots);
+                        self.map_slots.release(rehash.new_slots);
+                    }
                     self.free_maps
                         .push(u32::try_from(storage).expect("map arena index originates as u32"));
                 }
@@ -1560,8 +1670,15 @@ impl Heap {
                     Object::Struct { range, .. } | Object::Class { range, .. } => {
                         self.collections.release(range);
                     }
-                    Object::Map { storage } if self.maps[storage as usize].take().is_some() => {
-                        self.free_maps.push(storage);
+                    Object::Map { storage } => {
+                        if let Some(map) = self.maps[storage as usize].take() {
+                            self.map_slots.release(map.slots);
+                            if let Some(rehash) = map.rehash {
+                                self.map_slots.release(rehash.old_slots);
+                                self.map_slots.release(rehash.new_slots);
+                            }
+                            self.free_maps.push(storage);
+                        }
                     }
                     _ => {}
                 }
@@ -2813,12 +2930,12 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         let initial_capacity = self.max_collection_length.min(8);
-        // G6 admission: the initial slot vector counts toward the ceiling.
+        // G6 admission: the initial typed slot extent counts toward the ceiling.
         self.ensure_payload_headroom(
             (initial_capacity as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64),
         )?;
         let mut reservation = self.preflight(1)?;
-        let slots = empty_map_slots(initial_capacity)?;
+        let slots = self.map_slots.claim(initial_capacity)?;
         let storage = self.claim_map_storage(VmMap {
             type_id,
             key_type,
@@ -2858,10 +2975,13 @@ impl Heap {
         let map = self.map(value)?;
         let empty: &[Option<MapEntry>] = &[];
         let (old, new) = map.rehash.as_ref().map_or((empty, empty), |rehash| {
-            (rehash.old_slots.as_slice(), rehash.new_slots.as_slice())
+            (
+                self.map_slots.slots(rehash.old_slots),
+                self.map_slots.slots(rehash.new_slots),
+            )
         });
         Ok(MapEntries {
-            current: &map.slots,
+            current: self.map_slots.slots(map.slots),
             old,
             new,
             phase: 0,
@@ -2876,24 +2996,24 @@ impl Heap {
         let (old_slots, new_slots, rehash_remaining) =
             map.rehash.as_ref().map_or((0, 0, 0), |rehash| {
                 (
-                    rehash.old_slots.len(),
-                    rehash.new_slots.len(),
+                    rehash.old_slots.length,
+                    rehash.new_slots.length,
                     rehash
                         .old_slots
-                        .len()
+                        .length
                         .saturating_sub(rehash.cursor)
                         .min(REHASH_CHUNK),
                 )
             });
         let next_rehash_slots = if map.rehash.is_none() {
             next_map_capacity(map, self.max_collection_length)
-                .filter(|capacity| *capacity > map.slots.len())
+                .filter(|capacity| *capacity > map.slots.length)
                 .unwrap_or(0)
         } else {
             0
         };
         Ok(MapFuelShape {
-            current_slots: map.slots.len(),
+            current_slots: map.slots.length,
             old_slots,
             new_slots,
             rehash_remaining,
@@ -2951,7 +3071,7 @@ impl Heap {
         let map = self.map(value)?;
         Ok(self
             .find_map_entry(map, key, hash)?
-            .map(|location| map_entry(map, location).value))
+            .map(|location| map_entry(map, &self.map_slots, location).value))
     }
 
     pub fn map_contains(&self, value: RuntimeValue, key: RuntimeValue) -> Result<bool, HeapError> {
@@ -2972,8 +3092,14 @@ impl Heap {
         // again here would repeat an entire map scan on every retry and make
         // deterministic attempt-based fuel either free or overcharged.
         if self.map(value)?.rehash.is_some() {
-            let released = progress_map_rehash(self.map_mut(value)?)?;
-            // G6: rehash completion just dropped the old slot vector.
+            let storage = self.map_storage_index(value)?;
+            let released = progress_map_rehash(
+                self.maps[storage]
+                    .as_mut()
+                    .expect("validated map storage exists"),
+                &mut self.map_slots,
+            )?;
+            // G6: rehash completion just released the old typed extent.
             self.release_live_payload(released);
             return Ok(MapSetOutcome::RehashPending);
         }
@@ -2984,7 +3110,15 @@ impl Heap {
             self.find_map_entry(map, key, hash)?
         };
         if let Some(location) = location {
-            map_entry_mut(self.map_mut(value)?, location).value = replacement;
+            let storage = self.map_storage_index(value)?;
+            let map = self.maps[storage]
+                .as_ref()
+                .expect("validated map storage exists");
+            let range = map_location_range(map, location);
+            self.map_slots.slots_mut(range)[map_location_index(location)]
+                .as_mut()
+                .expect("located map entry exists")
+                .value = replacement;
             return Ok(MapSetOutcome::Complete);
         }
 
@@ -2995,7 +3129,7 @@ impl Heap {
             });
         }
         if map_needs_rehash(self.map(value)?) {
-            let old_capacity = self.map(value)?.slots.len();
+            let old_capacity = self.map(value)?.slots.length;
             let new_capacity = next_map_capacity(self.map(value)?, self.max_collection_length)
                 .expect("map needs rehash");
             if new_capacity > old_capacity {
@@ -3004,9 +3138,9 @@ impl Heap {
                 // map's footprint now; the old vector is released when the
                 // rehash completes.
                 self.ensure_payload_headroom((new_capacity as u64).saturating_mul(entry_bytes))?;
-                let new_slots = empty_map_slots(new_capacity)?;
+                let new_slots = self.map_slots.claim(new_capacity)?;
                 self.charge_live_payload(
-                    u64::try_from(new_slots.capacity())
+                    u64::try_from(new_slots.length)
                         .unwrap_or(u64::MAX)
                         .saturating_mul(entry_bytes),
                 );
@@ -3014,8 +3148,12 @@ impl Heap {
                     .counters
                     .map_slot_allocations
                     .saturating_add(new_capacity as u64);
-                let map = self.map_mut(value)?;
-                let old_slots = std::mem::take(&mut map.slots);
+                let storage = self.map_storage_index(value)?;
+                let map = self.maps[storage]
+                    .as_mut()
+                    .expect("validated map storage exists");
+                let old_slots = map.slots;
+                map.slots = CollectionRange::default();
                 map.rehash = Some(MapRehash {
                     old_slots,
                     new_slots,
@@ -3031,9 +3169,16 @@ impl Heap {
             hash,
         };
         self.counters.map_slot_allocations = self.counters.map_slot_allocations.saturating_add(1);
-        let map = self.map_mut(value)?;
-        insert_map_entry(&mut map.slots, entry)?;
-        map.length += 1;
+        let storage = self.map_storage_index(value)?;
+        let range = self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists")
+            .slots;
+        insert_map_entry(self.map_slots.slots_mut(range), entry)?;
+        self.maps[storage]
+            .as_mut()
+            .expect("validated map storage exists")
+            .length += 1;
         Ok(MapSetOutcome::Complete)
     }
 
@@ -3050,26 +3195,72 @@ impl Heap {
         let Some(location) = location else {
             return Ok(None);
         };
-        let entry = take_map_entry(self.map_mut(value)?, location);
-        self.map_mut(value)?.length -= 1;
+        let storage = self.map_storage_index(value)?;
+        let map = self.maps[storage]
+            .as_ref()
+            .expect("validated map storage exists");
+        let range = map_location_range(map, location);
+        let entry = match location {
+            MapLocation::RehashOld(_) => self.map_slots.slots_mut(range)
+                [map_location_index(location)]
+            .take()
+            .expect("located map entry exists"),
+            MapLocation::Current(_) | MapLocation::RehashNew(_) => remove_probed_entry(
+                self.map_slots.slots_mut(range),
+                map_location_index(location),
+            ),
+        };
+        self.maps[storage]
+            .as_mut()
+            .expect("validated map storage exists")
+            .length -= 1;
         Ok(Some(entry.value))
     }
 
     pub fn map_clear(&mut self, value: RuntimeValue) -> Result<(), HeapError> {
-        let map = self.map_mut(value)?;
-        map.slots.fill(None);
-        // G6: dropping an in-flight rehash releases both side vectors;
-        // the primary slot vector keeps its capacity.
-        let released = map.rehash.take().map_or(0, |rehash| {
-            (rehash
-                .old_slots
-                .capacity()
-                .saturating_add(rehash.new_slots.capacity()) as u64)
-                .saturating_mul(size_of::<Option<MapEntry>>() as u64)
-        });
+        let storage = self.map_storage_index(value)?;
+        let map = self.maps[storage]
+            .as_mut()
+            .expect("validated map storage exists");
+        self.map_slots.slots_mut(map.slots).fill(None);
+        // G6: dropping an in-flight rehash releases both side extents;
+        // the primary extent keeps its capacity.
+        let rehash = map.rehash.take();
         map.length = 0;
+        let released = rehash.map_or(0, |rehash| {
+            let bytes = (rehash
+                .old_slots
+                .length
+                .saturating_add(rehash.new_slots.length) as u64)
+                .saturating_mul(size_of::<Option<MapEntry>>() as u64);
+            self.map_slots.release(rehash.old_slots);
+            self.map_slots.release(rehash.new_slots);
+            bytes
+        });
         self.release_live_payload(released);
         Ok(())
+    }
+
+    fn map_storage_index(&self, value: RuntimeValue) -> Result<usize, HeapError> {
+        let RuntimeValue::NamedRef { reference, type_id } = value else {
+            return Err(invalid_value_reference());
+        };
+        let Object::Map { storage } = self.resolve(reference)? else {
+            return Err(HeapError::InvalidReference(reference));
+        };
+        let storage = *storage as usize;
+        let map = self
+            .maps
+            .get(storage)
+            .and_then(Option::as_ref)
+            .ok_or(HeapError::InvalidReference(reference))?;
+        if map.type_id == type_id
+            && type_id == nexa_bytecode::map_type(map.key_type, map.value_type)
+        {
+            Ok(storage)
+        } else {
+            Err(HeapError::InvalidReference(reference))
+        }
     }
 
     fn map(&self, value: RuntimeValue) -> Result<&VmMap, HeapError> {
@@ -3093,28 +3284,6 @@ impl Heap {
         }
     }
 
-    fn map_mut(&mut self, value: RuntimeValue) -> Result<&mut VmMap, HeapError> {
-        let RuntimeValue::NamedRef { reference, type_id } = value else {
-            return Err(invalid_value_reference());
-        };
-        let storage = match self.resolve(reference)? {
-            Object::Map { storage } => *storage,
-            _ => return Err(HeapError::InvalidReference(reference)),
-        };
-        let map = self
-            .maps
-            .get_mut(storage as usize)
-            .and_then(Option::as_mut)
-            .ok_or(HeapError::InvalidReference(reference))?;
-        if map.type_id == type_id
-            && type_id == nexa_bytecode::map_type(map.key_type, map.value_type)
-        {
-            Ok(map)
-        } else {
-            Err(HeapError::InvalidReference(reference))
-        }
-    }
-
     /// K3: lookups follow the same linear probe chain the insert side
     /// writes, so a hit or miss costs the probe distance instead of a
     /// full-capacity scan. The primary and rehash-new sides keep the
@@ -3127,14 +3296,19 @@ impl Heap {
         key: RuntimeValue,
         hash: u64,
     ) -> Result<Option<MapLocation>, HeapError> {
-        if let Some(index) = self.probe_map_slots(&map.slots, key, hash)? {
+        if let Some(index) = self.probe_map_slots(self.map_slots.slots(map.slots), key, hash)? {
             return Ok(Some(MapLocation::Current(index)));
         }
         if let Some(rehash) = &map.rehash {
-            if let Some(index) = self.probe_map_slots(&rehash.new_slots, key, hash)? {
+            if let Some(index) =
+                self.probe_map_slots(self.map_slots.slots(rehash.new_slots), key, hash)?
+            {
                 return Ok(Some(MapLocation::RehashNew(index)));
             }
-            for (offset, entry) in rehash.old_slots[rehash.cursor..].iter().enumerate() {
+            for (offset, entry) in self.map_slots.slots(rehash.old_slots)[rehash.cursor..]
+                .iter()
+                .enumerate()
+            {
                 if entry.is_some_and(|entry| entry.hash == hash)
                     && self.runtime_value_equal(entry.expect("checked entry").key, key)?
                 {
@@ -3733,7 +3907,7 @@ impl Heap {
                         .and_then(Option::as_ref)
                         .ok_or(HeapError::InvalidReference(reference))?;
                     let slots = &mut self.slots;
-                    map.trace_references(&mut |child| {
+                    map.trace_references(&self.map_slots, &mut |child| {
                         if Self::enqueue_gray(slots, queue, child) {
                             grayed += 1;
                         }
@@ -3841,9 +4015,17 @@ impl Heap {
             .map(|range| range.length)
             .sum::<usize>() as u64)
             .saturating_mul(value_bytes);
+        let map_arena_free_bytes = (self
+            .map_slots
+            .free_ranges
+            .iter()
+            .map(|range| range.length)
+            .sum::<usize>() as u64)
+            .saturating_mul(size_of::<Option<MapEntry>>() as u64);
         inspection.allocator_slack_bytes = vacant_pool_bytes
             .saturating_add(vacant_map_pool_bytes)
-            .saturating_add(arena_free_bytes);
+            .saturating_add(arena_free_bytes)
+            .saturating_add(map_arena_free_bytes);
         inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
         inspection
     }
@@ -3896,18 +4078,9 @@ fn checked_collection_end(
     }
 }
 
-fn empty_map_slots(capacity: usize) -> Result<Vec<Option<MapEntry>>, HeapError> {
-    let mut slots = Vec::new();
-    slots
-        .try_reserve_exact(capacity)
-        .map_err(|_| HeapError::CapacityExhausted)?;
-    slots.resize(capacity, None);
-    Ok(slots)
-}
-
 fn map_needs_rehash(map: &VmMap) -> bool {
-    map.slots.is_empty()
-        || map.length.saturating_add(1).saturating_mul(4) > map.slots.len().saturating_mul(3)
+    map.slots.length == 0
+        || map.length.saturating_add(1).saturating_mul(4) > map.slots.length.saturating_mul(3)
 }
 
 fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize> {
@@ -3920,7 +4093,7 @@ fn next_map_capacity(map: &VmMap, max_collection_length: usize) -> Option<usize>
         .unwrap_or(usize::MAX);
     Some(
         map.slots
-            .len()
+            .length
             .saturating_mul(2)
             .max(1)
             .min(maximum_capacity),
@@ -3946,85 +4119,58 @@ fn insert_map_entry(slots: &mut [Option<MapEntry>], entry: MapEntry) -> Result<(
 /// Advances one bounded rehash chunk. Returns the payload bytes released
 /// by completing the rehash (the dropped old slot vector), zero while the
 /// rehash is still in flight (G6).
-fn progress_map_rehash(map: &mut VmMap) -> Result<u64, HeapError> {
+fn progress_map_rehash(map: &mut VmMap, arena: &mut MapSlotArena) -> Result<u64, HeapError> {
     const REHASH_CHUNK: usize = 8;
     let rehash = map.rehash.as_mut().expect("rehash state checked by caller");
     let end = rehash
         .cursor
         .saturating_add(REHASH_CHUNK)
-        .min(rehash.old_slots.len());
+        .min(rehash.old_slots.length);
     for index in rehash.cursor..end {
-        if let Some(entry) = rehash.old_slots[index].take() {
-            insert_map_entry(&mut rehash.new_slots, entry)?;
+        if let Some(entry) = arena.slots_mut(rehash.old_slots)[index].take() {
+            insert_map_entry(arena.slots_mut(rehash.new_slots), entry)?;
         }
     }
     rehash.cursor = end;
-    if end == rehash.old_slots.len() {
-        let released = (rehash.old_slots.capacity() as u64)
-            .saturating_mul(size_of::<Option<MapEntry>>() as u64);
-        map.slots = std::mem::take(&mut rehash.new_slots);
+    if end == rehash.old_slots.length {
+        let released =
+            (rehash.old_slots.length as u64).saturating_mul(size_of::<Option<MapEntry>>() as u64);
+        arena.release(rehash.old_slots);
+        map.slots = rehash.new_slots;
         map.rehash = None;
         return Ok(released);
     }
     Ok(0)
 }
 
-fn map_entry(map: &VmMap, location: MapLocation) -> MapEntry {
-    match location {
-        MapLocation::Current(index) => map.slots[index].expect("located map entry exists"),
-        MapLocation::RehashOld(index) => map
-            .rehash
-            .as_ref()
-            .expect("located rehash entry has state")
-            .old_slots[index]
-            .expect("located map entry exists"),
-        MapLocation::RehashNew(index) => map
-            .rehash
-            .as_ref()
-            .expect("located rehash entry has state")
-            .new_slots[index]
-            .expect("located map entry exists"),
-    }
+fn map_entry(map: &VmMap, arena: &MapSlotArena, location: MapLocation) -> MapEntry {
+    arena.slots(map_location_range(map, location))[map_location_index(location)]
+        .expect("located map entry exists")
 }
 
-fn map_entry_mut(map: &mut VmMap, location: MapLocation) -> &mut MapEntry {
+fn map_location_range(map: &VmMap, location: MapLocation) -> CollectionRange {
     match location {
-        MapLocation::Current(index) => map.slots[index].as_mut().expect("located map entry exists"),
-        MapLocation::RehashOld(index) => map
-            .rehash
-            .as_mut()
-            .expect("located rehash entry has state")
-            .old_slots[index]
-            .as_mut()
-            .expect("located map entry exists"),
-        MapLocation::RehashNew(index) => map
-            .rehash
-            .as_mut()
-            .expect("located rehash entry has state")
-            .new_slots[index]
-            .as_mut()
-            .expect("located map entry exists"),
-    }
-}
-
-fn take_map_entry(map: &mut VmMap, location: MapLocation) -> MapEntry {
-    match location {
-        MapLocation::Current(index) => remove_probed_entry(&mut map.slots, index),
-        MapLocation::RehashOld(index) => map
-            .rehash
-            .as_mut()
-            .expect("located rehash entry has state")
-            .old_slots[index]
-            .take()
-            .expect("located map entry exists"),
-        MapLocation::RehashNew(index) => remove_probed_entry(
-            &mut map
-                .rehash
-                .as_mut()
+        MapLocation::Current(_) => map.slots,
+        MapLocation::RehashOld(_) => {
+            map.rehash
+                .as_ref()
                 .expect("located rehash entry has state")
-                .new_slots,
-            index,
-        ),
+                .old_slots
+        }
+        MapLocation::RehashNew(_) => {
+            map.rehash
+                .as_ref()
+                .expect("located rehash entry has state")
+                .new_slots
+        }
+    }
+}
+
+const fn map_location_index(location: MapLocation) -> usize {
+    match location {
+        MapLocation::Current(index)
+        | MapLocation::RehashOld(index)
+        | MapLocation::RehashNew(index) => index,
     }
 }
 
@@ -4752,6 +4898,83 @@ mod tests {
         assert_eq!(heap.map_remove(map, RuntimeValue::I32(2)), Ok(None));
         heap.map_clear(map).unwrap();
         assert_eq!(heap.map_len(map), Ok(0));
+    }
+
+    #[test]
+    fn map_slot_arena_rehashes_and_recycles_without_growing() {
+        let mut heap = Heap::new_with_limits(8, usize::MAX, 32);
+        let arena_pointer = heap.map_slots.values.as_ptr();
+        let arena_capacity = heap.map_slots.values.capacity();
+        let arena_limit = heap
+            .map_slots
+            .free_ranges
+            .iter()
+            .map(|range| range.length)
+            .sum::<usize>();
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        let map = heap
+            .allocate_map(
+                map_type,
+                nexa_bytecode::ValueType::I32,
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        for key in 0..24 {
+            while heap
+                .map_set(map, RuntimeValue::I32(key), RuntimeValue::I32(key))
+                .unwrap()
+                == MapSetOutcome::RehashPending
+            {}
+        }
+        assert_eq!(heap.map_slots.values.as_ptr(), arena_pointer);
+        assert_eq!(heap.map_slots.values.capacity(), arena_capacity);
+        let RuntimeValue::NamedRef { reference, .. } = map else {
+            unreachable!("map allocations are named references")
+        };
+        assert_eq!(heap.collect(&GcRoots::default()).unwrap().reclaimed, 1);
+        assert_eq!(
+            heap.resolve(reference),
+            Err(HeapError::InvalidReference(reference))
+        );
+        assert_eq!(
+            heap.map_slots
+                .free_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum::<usize>(),
+            arena_limit
+        );
+    }
+
+    #[test]
+    fn host_rollback_releases_map_slot_extents() {
+        let mut heap = Heap::new_with_limits(4, usize::MAX, 16);
+        let arena_limit = heap
+            .map_slots
+            .free_ranges
+            .iter()
+            .map(|range| range.length)
+            .sum::<usize>();
+        heap.begin_host_transaction().unwrap();
+        let map_type =
+            nexa_bytecode::map_type(nexa_bytecode::ValueType::I32, nexa_bytecode::ValueType::I32);
+        heap.allocate_map(
+            map_type,
+            nexa_bytecode::ValueType::I32,
+            nexa_bytecode::ValueType::I32,
+        )
+        .unwrap();
+        heap.rollback_host_transaction();
+        assert!(heap.maps.iter().all(Option::is_none));
+        assert_eq!(
+            heap.map_slots
+                .free_ranges
+                .iter()
+                .map(|range| range.length)
+                .sum::<usize>(),
+            arena_limit
+        );
     }
 
     #[test]
