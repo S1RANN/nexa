@@ -5966,6 +5966,8 @@ impl<'a> FunctionEmitter<'a> {
     ) -> Result<(Function, Vec<SourceMapEntry>), CompileError> {
         if self.optimize {
             optimize_emitted_bytecode(&mut self.code, &mut self.spans, &mut self.loop_bounds);
+            self.register_types
+                .truncate(emitted_register_count(&self.code, self.parameter_count));
         }
         let registers = u16::try_from(self.register_types.len().max(1))
             .map_err(|_| CompileError::too_many_registers(self.function_span))?;
@@ -6566,6 +6568,22 @@ fn optimize_emitted_bytecode(
     if simplify_emitted_control_flow(code, spans, loop_bounds) || forwarded {
         optimize_emitted_bytecode(code, spans, loop_bounds);
     }
+}
+
+fn emitted_register_count(code: &[Instruction], parameter_count: usize) -> usize {
+    code.iter()
+        .copied()
+        .flat_map(|instruction| {
+            typed_instruction_sources(instruction)
+                .into_iter()
+                .chain(typed_instruction_destination(instruction))
+        })
+        .map(usize::from)
+        .max()
+        .map_or(parameter_count, |maximum| {
+            parameter_count.max(maximum.saturating_add(1))
+        })
+        .max(1)
 }
 
 fn simplify_emitted_control_flow(
@@ -10133,8 +10151,9 @@ fn empty_debug_info(package: &TypedPackageIr, entry_module: &str) -> PackageDebu
 mod tests {
     use super::{
         STANDALONE_MAIN_IDENTITY, STANDALONE_MAIN_STABLE_ID, checked_async_result,
-        collect_safepoints, migration_field_owner, migration_state_type_exists,
-        optimize_emitted_bytecode, typed_exact_root_maps, validate_static_range_bound,
+        collect_safepoints, emitted_register_count, migration_field_owner,
+        migration_state_type_exists, optimize_emitted_bytecode, typed_exact_root_maps,
+        validate_static_range_bound,
     };
     use nexa_analysis::{
         DefinitionId, HostAsyncResultIr, IrAbandonPolicy, IrCancelPolicy, IrEffect, IrLiteral,
@@ -10211,6 +10230,7 @@ mod tests {
                 Instruction::Return { source: 1 },
             ]
         );
+        assert_eq!(emitted_register_count(&code, 1), 4);
         assert_eq!(spans.len(), code.len());
         assert!(loop_bounds.is_empty());
 
