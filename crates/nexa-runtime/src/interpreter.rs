@@ -1224,6 +1224,7 @@ impl CheckedInterpreter {
             let instruction;
             let instruction_cost;
             let safepoint;
+            let resolved_nominal;
             if let Some(rows) = function_rows {
                 // F2: the predecoded row carries the full static charge
                 // (HostCall import surcharge folded at build time) and the
@@ -1238,6 +1239,7 @@ impl CheckedInterpreter {
                     "predecoded row diverges from verified bytecode"
                 );
                 instruction = row.instruction;
+                resolved_nominal = row.resolved_nominal;
                 instruction_cost = match row.static_fuel {
                     Some(static_fuel) => static_fuel,
                     None => dynamic_instruction_fuel(
@@ -1251,6 +1253,7 @@ impl CheckedInterpreter {
                 };
                 safepoint = row.safepoint;
             } else {
+                resolved_nominal = nexa_verifier::ResolvedNominalOperand::None;
                 instruction = *function
                     .code
                     .get(frame.pc as usize)
@@ -2196,10 +2199,15 @@ impl CheckedInterpreter {
                     let RuntimeValue::Struct { type_id, .. } = value else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = module
-                        .struct_field(type_id.0, field.0)
-                        .map(|(index, _)| index)
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let index = match resolved_nominal {
+                        nexa_verifier::ResolvedNominalOperand::StructField { index } => {
+                            usize::from(index)
+                        }
+                        _ => module
+                            .struct_field(type_id.0, field.0)
+                            .map(|(index, _)| index)
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                    };
                     let heap = heap.as_deref().ok_or(InterpreterError::HeapUnavailable)?;
                     set_register(
                         &mut continuation.arena,
@@ -2219,10 +2227,15 @@ impl CheckedInterpreter {
                     let RuntimeValue::Struct { type_id, .. } = source else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let index = module
-                        .struct_field(type_id.0, field.0)
-                        .map(|(index, _)| index)
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let index = match resolved_nominal {
+                        nexa_verifier::ResolvedNominalOperand::StructField { index } => {
+                            usize::from(index)
+                        }
+                        _ => module
+                            .struct_field(type_id.0, field.0)
+                            .map(|(index, _)| index)
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                    };
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
@@ -2269,10 +2282,15 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected) = module
-                        .class_field(type_id.0, field.0)
-                        .map(|(index, field)| (index, field.ty))
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let (index, expected) = match resolved_nominal {
+                        nexa_verifier::ResolvedNominalOperand::ClassField { index, expected } => {
+                            (usize::from(index), expected)
+                        }
+                        _ => module
+                            .class_field(type_id.0, field.0)
+                            .map(|(index, field)| (index, field.ty))
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                    };
                     let field_value = match value {
                         RuntimeValue::NamedRef { .. } => heap
                             .as_deref()
@@ -2318,10 +2336,15 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected) = module
-                        .class_field(type_id.0, field.0)
-                        .map(|(index, field)| (index, field.ty))
-                        .ok_or(InterpreterError::TypeMismatch)?;
+                    let (index, expected) = match resolved_nominal {
+                        nexa_verifier::ResolvedNominalOperand::ClassField { index, expected } => {
+                            (usize::from(index), expected)
+                        }
+                        _ => module
+                            .class_field(type_id.0, field.0)
+                            .map(|(index, field)| (index, field.ty))
+                            .ok_or(InterpreterError::TypeMismatch)?,
+                    };
                     if runtime_value_type(replacement) != Some(expected) {
                         return Err(InterpreterError::TypeMismatch);
                     }

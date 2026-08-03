@@ -103,6 +103,25 @@ impl std::error::Error for VerifyError {}
 pub struct VerifiedModule {
     module: Module,
     nominal_indexes: NominalIndexes,
+    resolved_operands: Vec<Vec<ResolvedNominalOperand>>,
+}
+
+/// Dense nominal metadata proven by the verifier for one instruction.
+///
+/// This data is derived from the exact register-type state at the
+/// instruction and is never serialized. Runtime executable rows can use it
+/// without repeating stable-ID lookups in the hot loop.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResolvedNominalOperand {
+    #[default]
+    None,
+    StructField {
+        index: u16,
+    },
+    ClassField {
+        index: u16,
+        expected: ValueType,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -209,11 +228,12 @@ impl NominalIndexes {
 }
 
 impl VerifiedModule {
-    fn new(module: Module) -> Self {
+    fn new(module: Module, resolved_operands: Vec<Vec<ResolvedNominalOperand>>) -> Self {
         let nominal_indexes = NominalIndexes::new(&module);
         Self {
             module,
             nominal_indexes,
+            resolved_operands,
         }
     }
 
@@ -236,6 +256,15 @@ impl VerifiedModule {
             array_types: self.nominal_indexes.array_types.len(),
             map_types: self.nominal_indexes.map_types.len(),
         }
+    }
+
+    #[must_use]
+    pub fn resolved_operand(&self, function: usize, instruction: usize) -> ResolvedNominalOperand {
+        self.resolved_operands
+            .get(function)
+            .and_then(|operands| operands.get(instruction))
+            .copied()
+            .unwrap_or_default()
     }
 
     #[must_use]
@@ -362,15 +391,16 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
     }
     let immediate_closure = immediate_call_closure(&module);
     let restricted_closure = restricted_effect_call_closure(&module);
+    let mut resolved_operands = Vec::with_capacity(module.functions.len());
     for (index, function) in module.functions.iter().enumerate() {
-        verify_function(
+        resolved_operands.push(verify_function(
             &module,
             index,
             function,
             limits,
             immediate_closure[index],
             restricted_closure[index],
-        )?;
+        )?);
     }
     let immediate_costs = immediate_wcets(&module, &immediate_closure, limits.max_wcet_states)?;
     for (index, function) in module.functions.iter().enumerate() {
@@ -384,7 +414,7 @@ pub fn verify(mut module: Module, limits: VerifierLimits) -> Result<VerifiedModu
             });
         }
     }
-    Ok(VerifiedModule::new(module))
+    Ok(VerifiedModule::new(module, resolved_operands))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -1150,7 +1180,7 @@ fn verify_function(
     limits: VerifierLimits,
     immediate_context: bool,
     restricted_context: bool,
-) -> Result<(), VerifyError> {
+) -> Result<Vec<ResolvedNominalOperand>, VerifyError> {
     let error = |instruction, kind| VerifyError {
         function: function_index,
         instruction,
@@ -1176,6 +1206,7 @@ fn verify_function(
         entry[register] = Some(ty);
     }
     let mut states = vec![None; function.code.len()];
+    let mut resolved_operands = vec![ResolvedNominalOperand::None; function.code.len()];
     states[0] = Some(entry);
     let mut queue = VecDeque::from([0_usize]);
     while let Some(pc) = queue.pop_front() {
@@ -1855,7 +1886,7 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field_type = module
+                let (field_index, field_type) = module
                     .struct_types
                     .iter()
                     .find(|struct_type| struct_type.type_id == type_id)
@@ -1863,12 +1894,17 @@ fn verify_function(
                         struct_type
                             .fields
                             .iter()
-                            .find(|candidate| candidate.stable_id == field)
+                            .enumerate()
+                            .find(|(_, candidate)| candidate.stable_id == field)
                     })
-                    .map(|field| field.ty)
+                    .map(|(index, field)| (index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
+                resolved_operands[pc] = ResolvedNominalOperand::StructField {
+                    index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
                 state[register(dst)?] = Some(field_type);
             }
             Instruction::StructWith {
@@ -1881,7 +1917,7 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field_type = module
+                let (field_index, field_type) = module
                     .struct_types
                     .iter()
                     .find(|struct_type| struct_type.type_id == type_id)
@@ -1889,12 +1925,17 @@ fn verify_function(
                         struct_type
                             .fields
                             .iter()
-                            .find(|candidate| candidate.stable_id == field)
+                            .enumerate()
+                            .find(|(_, candidate)| candidate.stable_id == field)
                     })
-                    .map(|field| field.ty)
+                    .map(|(index, field)| (index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::StructFieldOutOfRange(field.0))
                     })?;
+                resolved_operands[pc] = ResolvedNominalOperand::StructField {
+                    index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
                 require(&state, value, field_type)?;
                 state[register(dst)?] = Some(ValueType::Named(type_id));
             }
@@ -1949,7 +1990,7 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field_type = module
+                let (field_index, field_type) = module
                     .class_types
                     .iter()
                     .find(|class_type| class_type.type_id == type_id)
@@ -1957,12 +1998,18 @@ fn verify_function(
                         class_type
                             .fields
                             .iter()
-                            .find(|candidate| candidate.stable_id == field)
+                            .enumerate()
+                            .find(|(_, candidate)| candidate.stable_id == field)
                     })
-                    .map(|field| field.ty)
+                    .map(|(index, field)| (index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                resolved_operands[pc] = ResolvedNominalOperand::ClassField {
+                    index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    expected: field_type,
+                };
                 state[register(dst)?] = Some(field_type);
             }
             Instruction::ClassSet {
@@ -1974,7 +2021,7 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[source] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field_type = module
+                let (field_index, field_type) = module
                     .class_types
                     .iter()
                     .find(|class_type| class_type.type_id == type_id)
@@ -1982,12 +2029,18 @@ fn verify_function(
                         class_type
                             .fields
                             .iter()
-                            .find(|candidate| candidate.stable_id == field)
+                            .enumerate()
+                            .find(|(_, candidate)| candidate.stable_id == field)
                     })
-                    .map(|field| field.ty)
+                    .map(|(index, field)| (index, field.ty))
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                resolved_operands[pc] = ResolvedNominalOperand::ClassField {
+                    index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    expected: field_type,
+                };
                 require(&state, value, field_type)?;
             }
             Instruction::ClassEqual { lhs, rhs, dst } => {
@@ -2324,7 +2377,7 @@ fn verify_function(
         }
     }
     verify_safepoints(module, function_index, function, &states)?;
-    Ok(())
+    Ok(resolved_operands)
 }
 
 fn verify_loop_bounds(

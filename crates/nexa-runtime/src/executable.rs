@@ -12,7 +12,7 @@
 //! metadata separation, and the interpreter switch-over.
 
 use nexa_bytecode::Instruction;
-use nexa_verifier::VerifiedModule;
+use nexa_verifier::{ResolvedNominalOperand, VerifiedModule};
 
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 
@@ -20,6 +20,8 @@ use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 #[derive(Clone, Copy, Debug)]
 pub struct ExecutableInstruction {
     pub instruction: Instruction,
+    /// Verifier-proven dense nominal operand for field instructions.
+    pub resolved_nominal: ResolvedNominalOperand,
     /// Full load-time attempt charge (base cost, static work, and the
     /// host-import surcharge for `HostCall`); `None` when the instruction
     /// carries an operand-dependent dynamic surcharge.
@@ -175,6 +177,7 @@ impl ExecutableModule {
                 };
                 rows.push(ExecutableInstruction {
                     instruction,
+                    resolved_nominal: module.resolved_operand(function_index as usize, pc as usize),
                     static_fuel,
                     safepoint: crate::interpreter::is_safepoint(instruction, pc),
                 });
@@ -229,6 +232,7 @@ mod tests {
 
     const CORPUS: &str = r#"
 struct Pair { first: i32, second: i32, }
+class Counter { mut value: i32, }
 enum Signal { Quiet, Loud(i32), }
 
 fn mixed(x: i32) -> i32 {
@@ -247,6 +251,11 @@ fn mixed(x: i32) -> i32 {
 }
 fn helper(x: i32) -> i32 {
     return x + 1;
+}
+fn update_counter() -> i32 {
+    let counter: Counter = new Counter { value: 1 };
+    counter.value = counter.value + 1;
+    return counter.value;
 }
 "#;
 
@@ -327,6 +336,27 @@ fn helper(x: i32) -> i32 {
             static_rows < total,
             "the corpus keeps a dynamic remainder ({static_rows}/{total})"
         );
+        for function in executable.functions() {
+            for row in function.rows() {
+                match row.instruction {
+                    Instruction::StructGet { .. } | Instruction::StructWith { .. } => assert!(
+                        matches!(
+                            row.resolved_nominal,
+                            nexa_verifier::ResolvedNominalOperand::StructField { .. }
+                        ),
+                        "struct field rows carry a verifier-proven dense index"
+                    ),
+                    Instruction::ClassGet { .. } | Instruction::ClassSet { .. } => assert!(
+                        matches!(
+                            row.resolved_nominal,
+                            nexa_verifier::ResolvedNominalOperand::ClassField { .. }
+                        ),
+                        "class field rows carry a verifier-proven dense index and type"
+                    ),
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]
