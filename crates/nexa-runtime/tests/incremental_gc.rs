@@ -269,12 +269,12 @@ fn water_mark_trigger_sustains_one_hundred_thousand_short_lived_objects() {
         // Short-lived: the reference is dropped immediately; nothing roots
         // the object, so the next completed cycle reclaims it.
         let _ = realm
-            .allocate(nexa_runtime::Object::Class {
-                type_id: node,
-                fields: [RuntimeValue::I32(i32::try_from(index % 1_000).expect("bounded"));
-                    nexa_bytecode::MAX_CLASS_FIELDS],
-                field_count: 1,
-            })
+            .allocate_class(
+                node,
+                &[RuntimeValue::I32(
+                    i32::try_from(index % 1_000).expect("bounded"),
+                )],
+            )
             .expect("allocation never hits capacity under the trigger");
         if let Some(report) = realm
             .maybe_collect_garbage_incremental(budget)
@@ -301,8 +301,8 @@ fn water_mark_trigger_sustains_one_hundred_thousand_short_lived_objects() {
 }
 
 /// Builds one condemned object of every byte-carrying kind (string, array
-/// with a live extent, map with entries, class) plus a class whose payload
-/// is inline and therefore reports zero out-of-slot bytes.
+/// with a live extent, map with entries, and a class with an arena-backed
+/// field extent.
 fn build_byte_graph(heap: &mut Heap) {
     let node = class_type();
     heap.allocate_string("byte-accounting-corpus")
@@ -337,12 +337,15 @@ fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
     let mut full = Heap::new(64);
     build_byte_graph(&mut full);
     let before = full.byte_inspection();
-    let expected =
-        before.string_bytes + before.array_bytes + before.buffer_bytes + before.map_bytes;
+    let expected = before.string_bytes
+        + before.array_bytes
+        + before.buffer_bytes
+        + before.map_bytes
+        + before.class_payload_bytes;
     assert!(expected > 0, "the corpus owns out-of-slot bytes");
     assert!(
         before.class_payload_bytes > 0,
-        "inline class payload is visible as the informational sub-view"
+        "class field extent is visible as an out-of-slot category"
     );
     let stats = full.collect(&roots).expect("full collection");
     assert_eq!(stats.live, 0);
@@ -353,7 +356,11 @@ fn reclaimed_bytes_match_the_inspection_across_full_and_incremental() {
     );
     let after = full.byte_inspection();
     assert_eq!(
-        after.string_bytes + after.array_bytes + after.buffer_bytes + after.map_bytes,
+        after.string_bytes
+            + after.array_bytes
+            + after.buffer_bytes
+            + after.map_bytes
+            + after.class_payload_bytes,
         0,
         "no payload bytes survive an empty-root collection"
     );
@@ -403,6 +410,7 @@ fn byte_budget_slices_the_sweep_without_changing_the_outcome() {
             + inspection.array_bytes
             + inspection.buffer_bytes
             + inspection.map_bytes
+            + inspection.class_payload_bytes
     };
     let expected_stats = reference.collect(&roots).expect("reference collection");
 
@@ -512,7 +520,8 @@ fn live_payload_gauge_matches_the_inspection_across_the_lifecycle() {
         inspection.string_bytes
             + inspection.array_bytes
             + inspection.buffer_bytes
-            + inspection.map_bytes,
+            + inspection.map_bytes
+            + inspection.class_payload_bytes,
         "the gauge equals the inspected out-of-slot payload"
     );
     heap.collect(&GcRoots::default()).expect("full collection");
@@ -521,6 +530,50 @@ fn live_payload_gauge_matches_the_inspection_across_the_lifecycle() {
         0,
         "reclaiming every object empties the gauge"
     );
+}
+
+/// K5 gate: class fields occupy an exact arena extent, contribute once to
+/// the live-payload gauge, and no longer widen every object slot to the
+/// maximum inline field array.
+#[test]
+fn compact_class_fields_are_arena_backed_and_charged_once() {
+    let mut heap = Heap::new(8);
+    let class = heap
+        .allocate_class(class_type(), &[RuntimeValue::I32(7)])
+        .expect("class allocation");
+    let reference = reference_of(class);
+    let field_bytes = u64::try_from(std::mem::size_of::<RuntimeValue>()).expect("value size");
+    let inspection = heap.byte_inspection();
+
+    assert_eq!(
+        heap.object_fields(reference),
+        Ok(&[RuntimeValue::I32(7)][..])
+    );
+    assert_eq!(inspection.class_payload_bytes, field_bytes);
+    assert_eq!(
+        heap.live_payload_bytes(),
+        field_bytes,
+        "the extent is charged by commit exactly once"
+    );
+    assert!(
+        inspection.object_header_bytes <= field_bytes.saturating_mul(2),
+        "the compact slot must stay within two RuntimeValue cells instead of the removed \
+         maximum-width field array"
+    );
+    assert_eq!(
+        inspection.total(),
+        inspection
+            .object_header_bytes
+            .saturating_add(inspection.class_payload_bytes)
+            .saturating_add(inspection.allocator_slack_bytes)
+            .saturating_add(inspection.profiler_bytes),
+        "class payload is an exclusive category in the byte total"
+    );
+
+    heap.collect(&GcRoots::default())
+        .expect("unrooted class collection");
+    assert_eq!(heap.live_payload_bytes(), 0);
+    assert_eq!(heap.byte_inspection().class_payload_bytes, 0);
 }
 
 /// G6 gate: `max_heap_bytes` refuses growth past the ceiling at the

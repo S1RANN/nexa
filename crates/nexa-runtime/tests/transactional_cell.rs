@@ -1148,15 +1148,16 @@ fn heap_rollback_realm() -> (
     let old = realm
         .load_module(old_module, HOST_CONTRACT_ID, schema)
         .expect("old heap module");
-    let mut class_fields = [RuntimeValue::Unit; nexa_bytecode::MAX_CLASS_FIELDS];
-    class_fields[0] = RuntimeValue::I32(1);
-    let class_reference = realm
-        .allocate(Object::Class {
-            type_id: NESTED_CLASS_TYPE,
-            fields: class_fields,
-            field_count: 1,
-        })
+    let class = realm
+        .allocate_class(NESTED_CLASS_TYPE, &[RuntimeValue::I32(1)])
         .expect("committed class");
+    let RuntimeValue::NamedRef {
+        reference: class_reference,
+        ..
+    } = class
+    else {
+        panic!("class allocation returns a named reference");
+    };
     let array_type = nexa_bytecode::array_type(ValueType::I32);
     let array = realm
         .allocate_array(array_type, ValueType::I32)
@@ -1214,12 +1215,15 @@ fn assert_committed_heap_unchanged(
     array: RuntimeValue,
     map: RuntimeValue,
 ) {
-    let Object::Class { fields, .. } = realm
+    let Object::Class { .. } = realm
         .resolve_heap_object(class_reference)
         .expect("committed class survives")
     else {
         panic!("committed object remains a class");
     };
+    let fields = realm
+        .resolve_heap_fields(class_reference)
+        .expect("committed class fields survive");
     assert_eq!(fields[0], RuntimeValue::I32(1));
     assert_eq!(realm.array_length(array), Ok(0));
     assert_eq!(realm.map_length(map), Ok(0));

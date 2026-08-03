@@ -69,6 +69,36 @@ pub(crate) fn read_register(
     Ok(unsafe { *registers.get_unchecked(frame.register_start as usize + usize::from(register)) })
 }
 
+/// Borrows one contiguous register window from the current frame.
+///
+/// Struct/class construction and fused row pushes consume fields in
+/// declared register order. Returning the verified window directly avoids
+/// initializing and copying a maximum-width `[RuntimeValue; 16]` scratch
+/// row for every operation while retaining one safe slice bounds check.
+#[inline]
+pub(crate) fn read_register_window(
+    arena: &FrameArena,
+    base: u16,
+    count: u16,
+) -> Result<&[RuntimeValue], InterpreterError> {
+    let (frames, registers) = arena.trusted_parts();
+    let Some(frame) = frames.last() else {
+        return Err(InterpreterError::RegisterOutOfRange(base));
+    };
+    let end = base
+        .checked_add(count)
+        .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
+    debug_assert!(
+        end <= frame.register_count,
+        "verifier bounds every contiguous register window inside the function"
+    );
+    let start = frame.register_start as usize + usize::from(base);
+    let end = frame.register_start as usize + usize::from(end);
+    registers
+        .get(start..end)
+        .ok_or(InterpreterError::RegisterOutOfRange(base))
+}
+
 /// Writes one register of the current frame; the mirror of
 /// [`read_register`] with the same invariants and error mapping.
 #[inline]
@@ -128,6 +158,11 @@ mod tests {
         assert_eq!(
             super::read_register(&arena, 2).unwrap(),
             RuntimeValue::I32(41)
+        );
+        super::write_register(&mut arena, 3, RuntimeValue::I32(42)).unwrap();
+        assert_eq!(
+            super::read_register_window(&arena, 2, 2).unwrap(),
+            &[RuntimeValue::I32(41), RuntimeValue::I32(42)]
         );
         assert_eq!(arena.register(2).unwrap(), RuntimeValue::I32(41));
 

@@ -1079,19 +1079,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // in-flight garbage well below the 1024-slot ceiling across a
             // full mark+sweep cycle (~9 steps at this budget). One string
             // per sample gives the sweep real out-of-slot payload bytes to
-            // account (G4); class payloads are inline and report zero.
+            // account (G4); class field extents use the compact arena and
+            // are included in the same byte ledger.
             let mut realm = gc_realm.borrow_mut();
             realm
                 .allocate(Object::String(String::from("gc-churn-payload-bytes")))
                 .expect("churn string stays below the heap ceiling");
             for index in 0..31_u32 {
                 realm
-                    .allocate(Object::Class {
-                        type_id: churn_type,
-                        fields: [RuntimeValue::I32(i32::try_from(index).expect("bounded"));
-                            nexa_bytecode::MAX_CLASS_FIELDS],
-                        field_count: 1,
-                    })
+                    .allocate_class(
+                        churn_type,
+                        &[RuntimeValue::I32(i32::try_from(index).expect("bounded"))],
+                    )
                     .expect("churn stays below the heap ceiling");
             }
         },

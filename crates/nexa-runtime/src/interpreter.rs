@@ -2179,20 +2179,15 @@ impl CheckedInterpreter {
                     fields_count,
                     dst,
                 } => {
-                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-                    for index in 0..fields_count {
-                        fields[usize::from(index)] = register(
-                            &continuation.arena,
-                            fields_base
-                                .checked_add(index)
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                        )?;
-                    }
+                    let fields = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        fields_base,
+                        fields_count,
+                    )?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
-                    let value =
-                        heap.allocate_struct(type_id, &fields[..usize::from(fields_count)])?;
+                    let value = heap.allocate_struct(type_id, fields)?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -2255,20 +2250,15 @@ impl CheckedInterpreter {
                     fields_count,
                     dst,
                 } => {
-                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_CLASS_FIELDS];
-                    for index in 0..fields_count {
-                        fields[usize::from(index)] = register(
-                            &continuation.arena,
-                            fields_base
-                                .checked_add(index)
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                        )?;
-                    }
+                    let fields = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        fields_base,
+                        fields_count,
+                    )?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
-                    let value =
-                        heap.allocate_class(type_id, &fields[..usize::from(fields_count)])?;
+                    let value = heap.allocate_class(type_id, fields)?;
                     set_register(&mut continuation.arena, dst, value)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -2502,18 +2492,14 @@ impl CheckedInterpreter {
                     // WP52 push-side fusion: the element's fields flow from
                     // their registers straight into the row storage.
                     let array = register(&continuation.arena, source)?;
-                    let mut fields = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-                    for index in 0..fields_count {
-                        fields[usize::from(index)] = register(
-                            &continuation.arena,
-                            fields_base
-                                .checked_add(index)
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                        )?;
-                    }
+                    let fields = crate::trusted::read_register_window(
+                        &continuation.arena,
+                        fields_base,
+                        fields_count,
+                    )?;
                     heap.as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?
-                        .array_push_row(array, &fields[..usize::from(fields_count)])?;
+                        .array_push_row(array, fields)?;
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::ArrayPop { source, dst } => {
@@ -3375,14 +3361,9 @@ fn register_structural_hash_fuel(
         return Err(InterpreterError::TypeMismatch);
     }
     let mut work = value_visit_fuel(u64::from(fields_count), 3)?;
-    for offset in 0..fields_count {
-        let field = fields_base
-            .checked_add(offset)
-            .ok_or(InterpreterError::RegisterOutOfRange(u16::MAX))?;
-        work = fuel_add(
-            work,
-            runtime_value_hash_fuel(heap, register(arena, field)?)?,
-        )?;
+    let fields = crate::trusted::read_register_window(arena, fields_base, fields_count)?;
+    for field in fields {
+        work = fuel_add(work, runtime_value_hash_fuel(heap, *field)?)?;
     }
     Ok(work)
 }

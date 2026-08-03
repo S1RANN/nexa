@@ -3381,6 +3381,14 @@ impl RealmRuntime {
         Ok(self.heap.allocate_array(type_id, element_type)?)
     }
 
+    pub fn allocate_class(
+        &mut self,
+        type_id: StableId,
+        fields: &[RuntimeValue],
+    ) -> Result<RuntimeValue, RealmError> {
+        Ok(self.heap.allocate_class(type_id, fields)?)
+    }
+
     pub fn allocate_map(
         &mut self,
         type_id: StableId,
@@ -3409,6 +3417,14 @@ impl RealmRuntime {
 
     pub fn resolve_heap_object(&self, reference: GcRef) -> Result<&Object, RealmError> {
         Ok(self.heap.resolve(reference)?)
+    }
+
+    /// K5 companion to [`Self::resolve_heap_object`]: struct and class
+    /// fields live in the collection arena, so read-only inspection of
+    /// them resolves through the heap instead of destructuring an inline
+    /// array out of the object header.
+    pub fn resolve_heap_fields(&self, reference: GcRef) -> Result<&[RuntimeValue], RealmError> {
+        Ok(self.heap.object_fields(reference)?)
     }
 
     #[allow(dead_code)]

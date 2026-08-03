@@ -195,12 +195,11 @@ pub struct CollectionArenaInspection {
 
 /// `GC_V1` byte accounting by category (G4).
 ///
-/// `object_header_bytes` counts occupied slots at their physical pool size,
-/// which under the current inline representation already contains
-/// Class/Struct/Enum payload storage; `class_payload_bytes` reports the
-/// *live* inline field bytes as an informational sub-view and is therefore
-/// excluded from [`Self::total`]. Compact out-of-slot class storage is a
-/// later stage-G representation change.
+/// `object_header_bytes` counts occupied physical slots plus occupied typed
+/// header-arena cells (currently maps). It includes the inline Enum payload,
+/// but never separately allocated collection/map storage. Class/Struct fields
+/// live in exclusive collection-arena extents, so `class_payload_bytes` is an
+/// out-of-slot category and participates in [`Self::total`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeapByteInspection {
     pub object_header_bytes: u64,
@@ -215,10 +214,11 @@ pub struct HeapByteInspection {
 
 impl HeapByteInspection {
     /// Exclusive-category sum: headers, out-of-slot payloads, slack, and
-    /// profiler storage. `class_payload_bytes` is subsumed by headers.
+    /// profiler storage.
     #[must_use]
     pub const fn total(&self) -> u64 {
         self.object_header_bytes
+            .saturating_add(self.class_payload_bytes)
             .saturating_add(self.string_bytes)
             .saturating_add(self.array_bytes)
             .saturating_add(self.buffer_bytes)
@@ -358,28 +358,35 @@ impl CollectionArena {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-// Struct storage stays inline so construction and `with` updates use only the
-// preallocated heap slot pool instead of allocating a system-heap side object.
-#[allow(clippy::large_enum_variant)]
 pub enum Object {
     String(String),
     I32Array(Vec<i32>),
-    Map(VmMap),
+    /// WP72: map headers live in the heap's typed map arena. The physical
+    /// object slot carries only the arena index instead of the widest
+    /// `VmMap` header (including its optional rehash state).
+    Map {
+        storage: u32,
+    },
     Enum {
         type_id: StableId,
         variant: StableId,
         tag: u32,
         payload: Option<RuntimeValue>,
     },
+    // K5: Struct/Class fields live in the collection arena (`field_count`
+    // cells starting at `range.start`), so every heap slot stops carrying
+    // the maximum inline field array (GC_V1: slots must not bear the
+    // widest object-enum footprint). Extents are claimed at construction
+    // and released by sweep/rollback exactly like Array extents.
     Struct {
         type_id: StableId,
-        fields: [RuntimeValue; nexa_bytecode::MAX_STRUCT_FIELDS],
+        range: CollectionRange,
         field_count: u8,
         hash: u64,
     },
     Class {
         type_id: StableId,
-        fields: [RuntimeValue; nexa_bytecode::MAX_CLASS_FIELDS],
+        range: CollectionRange,
         field_count: u8,
     },
     Array {
@@ -406,54 +413,43 @@ pub enum Object {
 
 impl Object {
     // WP73: allocation-free reference traversal for the GC mark phase.
-    // Array/Buffer extents live in the collection arena and are traced
-    // directly inside `collect`, which owns the arena borrow.
+    // Array/Buffer extents and (K5) Struct/Class field extents live in
+    // the collection arena and are traced directly inside `collect`,
+    // which owns the arena borrow.
     fn trace_references(&self, visit: &mut impl FnMut(GcRef)) {
         match self {
-            // MAX_CLASS_FIELDS == MAX_STRUCT_FIELDS, so both inline field
-            // arrays share one arm.
-            Self::Class {
-                fields,
-                field_count,
-                ..
-            }
-            | Self::Struct {
-                fields,
-                field_count,
-                ..
-            } => {
-                for reference in fields[..usize::from(*field_count)]
-                    .iter()
-                    .copied()
-                    .filter_map(value_reference)
-                {
-                    visit(reference);
-                }
-            }
-            Self::Map(map) => map.trace_references(visit),
             Self::Enum { payload, .. } => {
                 for reference in payload.iter().copied().filter_map(value_reference) {
                     visit(reference);
                 }
             }
-            Self::Array { .. } | Self::Buffer { .. } | Self::String(_) | Self::I32Array(_) => {}
+            Self::Array { .. }
+            | Self::Buffer { .. }
+            | Self::Struct { .. }
+            | Self::Class { .. }
+            | Self::Map { .. }
+            | Self::String(_)
+            | Self::I32Array(_) => {}
         }
     }
 
     /// G4 byte accounting: bytes this object owns *outside* its slot -
     /// system allocations (String storage, i32 backing, map slot vectors)
-    /// plus exclusively held collection-arena extents. Class/Struct/Enum
-    /// payloads are inline in the slot and report zero here; the slot
-    /// header itself is pool-owned and accounted separately.
+    /// plus exclusively held collection-arena extents (Array/Buffer
+    /// capacity and, since K5, Struct/Class field extents). Enum payloads
+    /// are inline in the slot and report zero here; the slot header
+    /// itself is pool-owned and accounted separately.
     fn payload_bytes(&self) -> u64 {
         let bytes = match self {
             Self::String(text) => text.capacity(),
             Self::I32Array(values) => values.capacity().saturating_mul(size_of::<i32>()),
-            Self::Map(map) => map.storage_bytes(),
-            Self::Array { range, .. } | Self::Buffer { range, .. } => {
-                range.length.saturating_mul(size_of::<RuntimeValue>())
-            }
-            Self::Enum { .. } | Self::Struct { .. } | Self::Class { .. } => 0,
+            Self::Array { range, .. }
+            | Self::Buffer { range, .. }
+            | Self::Struct { range, .. }
+            | Self::Class { range, .. } => range.length.saturating_mul(size_of::<RuntimeValue>()),
+            // Map payload lives in the typed map arena and is accounted by
+            // `Heap::object_payload_bytes`; Enum payload remains inline.
+            Self::Map { .. } | Self::Enum { .. } => 0,
         };
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
@@ -810,6 +806,10 @@ impl VmAllocationCounters {
 pub struct Heap {
     slots: Vec<ObjectSlot>,
     free: Vec<u32>,
+    /// WP72 typed payload arena: capacity is reserved with the heap, so map
+    /// creation/recycling never grows this index vector on the hot path.
+    maps: Vec<Option<VmMap>>,
+    free_maps: Vec<u32>,
     max_objects: u32,
     max_string_bytes: usize,
     max_collection_length: usize,
@@ -863,6 +863,8 @@ pub struct Heap {
 pub(crate) struct HeapCheckpoint {
     slots: Vec<ObjectSlot>,
     free: Vec<u32>,
+    maps: Vec<Option<VmMap>>,
+    free_maps: Vec<u32>,
     collections: CollectionArena,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
@@ -909,11 +911,17 @@ impl Heap {
         slots.extend_from_slice(&self.slots);
         let mut free = Vec::with_capacity(self.free.capacity());
         free.extend_from_slice(&self.free);
+        let mut maps = Vec::with_capacity(self.maps.capacity());
+        maps.extend_from_slice(&self.maps);
+        let mut free_maps = Vec::with_capacity(self.free_maps.capacity());
+        free_maps.extend_from_slice(&self.free_maps);
         let mut host_staging = Vec::with_capacity(self.host_staging.capacity());
         host_staging.extend_from_slice(&self.host_staging);
         HeapCheckpoint {
             slots,
             free,
+            maps,
+            free_maps,
             collections: self.collections.checkpoint_clone(),
             host_staging,
             host_transaction_active: self.host_transaction_active,
@@ -929,6 +937,8 @@ impl Heap {
         self.string_literal_cache.clear();
         self.slots = checkpoint.slots;
         self.free = checkpoint.free;
+        self.maps = checkpoint.maps;
+        self.free_maps = checkpoint.free_maps;
         self.collections = checkpoint.collections;
         self.host_staging = checkpoint.host_staging;
         self.host_transaction_active = checkpoint.host_transaction_active;
@@ -948,6 +958,8 @@ impl Heap {
         Self {
             slots: Vec::with_capacity(max_objects as usize),
             free: Vec::with_capacity(max_objects as usize),
+            maps: Vec::with_capacity(max_objects as usize),
+            free_maps: Vec::with_capacity(max_objects as usize),
             max_objects,
             max_string_bytes,
             max_collection_length: max_collection_length.min(i32::MAX as usize),
@@ -1233,10 +1245,52 @@ impl Heap {
     }
 
     pub fn allocate(&mut self, object: Object) -> Result<GcRef, HeapError> {
+        // Typed payload handles are created only by their dedicated
+        // allocation funnels; accepting a caller-forged map index would
+        // break the slot/arena ownership invariant.
+        if matches!(object, Object::Map { .. }) {
+            return Err(invalid_value_reference());
+        }
         // G6 admission: the whole out-of-slot footprint is known here.
-        self.ensure_payload_headroom(object.payload_bytes())?;
+        self.ensure_payload_headroom(self.object_payload_bytes(&object))?;
         let mut reservation = self.preflight(1)?;
         Ok(self.commit(&mut reservation, object))
+    }
+
+    fn object_payload_bytes(&self, object: &Object) -> u64 {
+        match object {
+            Object::Map { storage } => self
+                .maps
+                .get(*storage as usize)
+                .and_then(Option::as_ref)
+                .map_or(0, |map| {
+                    u64::try_from(map.storage_bytes()).unwrap_or(u64::MAX)
+                }),
+            _ => object.payload_bytes(),
+        }
+    }
+
+    /// Releases the exclusively owned payload behind a condemned slot and
+    /// returns the exact G4/G6 byte count that left the live heap.
+    fn release_object_storage(&mut self, object: &Object) -> u64 {
+        let payload = self.object_payload_bytes(object);
+        match object {
+            Object::Array { range, .. }
+            | Object::Buffer { range, .. }
+            | Object::Struct { range, .. }
+            | Object::Class { range, .. } => self.collections.release(*range),
+            Object::Map { storage } => {
+                let storage = *storage as usize;
+                if let Some(entry) = self.maps.get_mut(storage)
+                    && entry.take().is_some()
+                {
+                    self.free_maps
+                        .push(u32::try_from(storage).expect("map arena index originates as u32"));
+                }
+            }
+            Object::String(_) | Object::I32Array(_) | Object::Enum { .. } => {}
+        }
+        payload
     }
 
     pub(crate) fn preflight(&mut self, count: usize) -> Result<HeapReservation, HeapError> {
@@ -1261,7 +1315,7 @@ impl Heap {
         // G6: the commit funnel is the single charge point for every fresh
         // object's out-of-slot footprint; later growth (array regrow, map
         // rehash) adjusts the gauge at its own transition site.
-        self.charge_live_payload(object.payload_bytes());
+        self.charge_live_payload(self.object_payload_bytes(&object));
         match &object {
             Object::String(value) => {
                 self.counters.string_allocations =
@@ -1280,7 +1334,7 @@ impl Heap {
                     .collection_storage_allocations
                     .saturating_add(1);
             }
-            Object::Map(_) => {
+            Object::Map { .. } => {
                 self.counters.collection_storage_allocations = self
                     .counters
                     .collection_storage_allocations
@@ -1488,15 +1542,29 @@ impl Heap {
         let mut released = 0_u64;
         let mut recycled = false;
         while let Some(reference) = self.host_staging.pop() {
-            if let Some(slot) = self.slots.get_mut(reference.index as usize)
-                && slot.generation == reference.generation
-                && let Some(object) = slot.object.take()
-            {
+            let object = self
+                .slots
+                .get_mut(reference.index as usize)
+                .filter(|slot| slot.generation == reference.generation)
+                .and_then(|slot| slot.object.take());
+            if let Some(object) = object {
                 // G6: staged objects vanish outside the sweep, so their
-                // footprint leaves the gauge here. Arena extents are NOT
-                // released here: the host decode path owns one shared
-                // collection reservation and releases it itself.
-                released = released.saturating_add(object.payload_bytes());
+                // footprint leaves the gauge here. Array/Buffer extents are
+                // NOT released here: the host decode path owns one shared
+                // collection reservation and releases it itself. Struct and
+                // Class field extents (K5) ARE released: they are claimed
+                // directly from the arena at commit time and belong to no
+                // reservation.
+                released = released.saturating_add(self.object_payload_bytes(&object));
+                match object {
+                    Object::Struct { range, .. } | Object::Class { range, .. } => {
+                        self.collections.release(range);
+                    }
+                    Object::Map { storage } if self.maps[storage as usize].take().is_some() => {
+                        self.free_maps.push(storage);
+                    }
+                    _ => {}
+                }
                 self.free.push(reference.index);
                 recycled = true;
             }
@@ -1721,13 +1789,12 @@ impl Heap {
             return Err(HeapError::CapacityExhausted);
         }
         let hash = self.structural_hash(type_id, fields)?;
-        let mut stored = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-        stored[..fields.len()].copy_from_slice(fields);
+        let range = self.claim_field_extent(fields)?;
         let reference = self.commit(
             reservation,
             Object::Struct {
                 type_id,
-                fields: stored,
+                range,
                 field_count: u8::try_from(fields.len()).expect("struct field limit fits into u8"),
                 hash,
             },
@@ -1737,6 +1804,34 @@ impl Heap {
             type_id,
             hash,
         })
+    }
+
+    /// K5: claims one collection-arena extent for a struct/class field
+    /// row, writes the fields, and settles G1 bookkeeping. The caller
+    /// commits the owning object immediately afterwards (no fallible step
+    /// in between), so a claimed extent can never leak on an error path.
+    /// G6 is charged once by the owning object's commit funnel.
+    fn claim_field_extent(
+        &mut self,
+        fields: &[RuntimeValue],
+    ) -> Result<CollectionRange, HeapError> {
+        let bytes = u64::try_from(fields.len().saturating_mul(size_of::<RuntimeValue>()))
+            .unwrap_or(u64::MAX);
+        // G6 admission: field extents count toward the byte ceiling.
+        self.ensure_payload_headroom(bytes)?;
+        let range = self
+            .collections
+            .find_free(fields.len())
+            .ok_or(HeapError::CapacityExhausted)?;
+        self.collections.claim(range)?;
+        self.collections.values_mut(range)?.copy_from_slice(fields);
+        // G1: the owner is born marked while a cycle is active, so its
+        // children shade at the write - exactly the array-extent barrier;
+        // `Object::trace_references` no longer sees these fields.
+        for field in fields {
+            self.shade_on_write(*field);
+        }
+        Ok(range)
     }
 
     pub fn struct_fields(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
@@ -1754,11 +1849,12 @@ impl Heap {
         match self.resolve(reference)? {
             Object::Struct {
                 type_id: actual,
-                fields,
+                range,
                 field_count,
                 hash: actual_hash,
             } if *actual == type_id && *actual_hash == hash => {
-                Ok(&fields[..usize::from(*field_count)])
+                let cells = self.collections.values(*range)?;
+                Ok(&cells[..usize::from(*field_count)])
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -1797,10 +1893,11 @@ impl Heap {
                 generation: u32::MAX,
             }));
         }
+        let field_count = fields.len();
         let mut updated = [RuntimeValue::Unit; nexa_bytecode::MAX_STRUCT_FIELDS];
-        updated[..fields.len()].copy_from_slice(fields);
+        updated[..field_count].copy_from_slice(fields);
         updated[index] = replacement;
-        self.allocate_struct(type_id, &updated[..fields.len()])
+        self.allocate_struct(type_id, &updated[..field_count])
     }
 
     pub fn struct_equal(&self, lhs: RuntimeValue, rhs: RuntimeValue) -> Result<bool, HeapError> {
@@ -1843,13 +1940,18 @@ impl Heap {
         if fields.len() > nexa_bytecode::MAX_CLASS_FIELDS {
             return Err(HeapError::CapacityExhausted);
         }
-        let mut stored = [RuntimeValue::Unit; nexa_bytecode::MAX_CLASS_FIELDS];
-        stored[..fields.len()].copy_from_slice(fields);
-        let reference = self.allocate(Object::Class {
-            type_id,
-            fields: stored,
-            field_count: u8::try_from(fields.len()).expect("class field limit fits into u8"),
-        })?;
+        // Slot preflight before the extent claim keeps the pair atomic:
+        // once the extent is claimed, the commit cannot fail.
+        let mut reservation = self.preflight(1)?;
+        let range = self.claim_field_extent(fields)?;
+        let reference = self.commit(
+            &mut reservation,
+            Object::Class {
+                type_id,
+                range,
+                field_count: u8::try_from(fields.len()).expect("class field limit fits into u8"),
+            },
+        );
         Ok(RuntimeValue::NamedRef { reference, type_id })
     }
 
@@ -1874,9 +1976,31 @@ impl Heap {
         match self.resolve(reference)? {
             Object::Class {
                 type_id: actual,
-                fields,
+                range,
                 field_count,
-            } if *actual == type_id => Ok(&fields[..usize::from(*field_count)]),
+            } if *actual == type_id => {
+                let cells = self.collections.values(*range)?;
+                Ok(&cells[..usize::from(*field_count)])
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    /// K5 inspection: the field cells of a struct or class resolved by
+    /// reference alone (no value-side type or hash re-validation).
+    /// Read-only tooling and tests use this where they previously
+    /// destructured the inline field array out of [`Object`].
+    pub fn object_fields(&self, reference: GcRef) -> Result<&[RuntimeValue], HeapError> {
+        match self.resolve(reference)? {
+            Object::Struct {
+                range, field_count, ..
+            }
+            | Object::Class {
+                range, field_count, ..
+            } => {
+                let cells = self.collections.values(*range)?;
+                Ok(&cells[..usize::from(*field_count)])
+            }
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
@@ -1891,17 +2015,16 @@ impl Heap {
             return Err(invalid_value_reference());
         };
         self.write_barrier(reference, replacement)?;
-        match self.resolve_mut(reference)? {
+        let range = match self.resolve(reference)? {
             Object::Class {
                 type_id: actual,
-                fields,
+                range,
                 field_count,
-            } if *actual == type_id && index < usize::from(*field_count) => {
-                fields[index] = replacement;
-                Ok(())
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
-        }
+            } if *actual == type_id && index < usize::from(*field_count) => *range,
+            _ => return Err(HeapError::InvalidReference(reference)),
+        };
+        self.collections.values_mut(range)?[index] = replacement;
+        Ok(())
     }
 
     /// Publishes a value into an already allocated GC object.
@@ -2696,18 +2819,31 @@ impl Heap {
         )?;
         let mut reservation = self.preflight(1)?;
         let slots = empty_map_slots(initial_capacity)?;
-        let reference = self.commit(
-            &mut reservation,
-            Object::Map(VmMap {
-                type_id,
-                key_type,
-                value_type,
-                slots,
-                length: 0,
-                rehash: None,
-            }),
-        );
+        let storage = self.claim_map_storage(VmMap {
+            type_id,
+            key_type,
+            value_type,
+            slots,
+            length: 0,
+            rehash: None,
+        });
+        let reference = self.commit(&mut reservation, Object::Map { storage });
         Ok(RuntimeValue::NamedRef { reference, type_id })
+    }
+
+    fn claim_map_storage(&mut self, map: VmMap) -> u32 {
+        if let Some(index) = self.free_maps.pop() {
+            self.maps[index as usize] = Some(map);
+            return index;
+        }
+        let index = u32::try_from(self.maps.len()).expect("map arena is bounded by heap slots");
+        debug_assert!(index < self.max_objects);
+        debug_assert!(
+            self.maps.len() < self.maps.capacity(),
+            "map arena capacity is reserved with the heap"
+        );
+        self.maps.push(Some(map));
+        index
     }
 
     pub fn map_len(&self, value: RuntimeValue) -> Result<usize, HeapError> {
@@ -2940,14 +3076,20 @@ impl Heap {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
-        match self.resolve(reference)? {
-            Object::Map(map)
-                if map.type_id == type_id
-                    && type_id == nexa_bytecode::map_type(map.key_type, map.value_type) =>
-            {
-                Ok(map)
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
+        let Object::Map { storage } = self.resolve(reference)? else {
+            return Err(HeapError::InvalidReference(reference));
+        };
+        let map = self
+            .maps
+            .get(*storage as usize)
+            .and_then(Option::as_ref)
+            .ok_or(HeapError::InvalidReference(reference))?;
+        if map.type_id == type_id
+            && type_id == nexa_bytecode::map_type(map.key_type, map.value_type)
+        {
+            Ok(map)
+        } else {
+            Err(HeapError::InvalidReference(reference))
         }
     }
 
@@ -2955,14 +3097,21 @@ impl Heap {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
-        match self.resolve_mut(reference)? {
-            Object::Map(map)
-                if map.type_id == type_id
-                    && type_id == nexa_bytecode::map_type(map.key_type, map.value_type) =>
-            {
-                Ok(map)
-            }
-            _ => Err(HeapError::InvalidReference(reference)),
+        let storage = match self.resolve(reference)? {
+            Object::Map { storage } => *storage,
+            _ => return Err(HeapError::InvalidReference(reference)),
+        };
+        let map = self
+            .maps
+            .get_mut(storage as usize)
+            .and_then(Option::as_mut)
+            .ok_or(HeapError::InvalidReference(reference))?;
+        if map.type_id == type_id
+            && type_id == nexa_bytecode::map_type(map.key_type, map.value_type)
+        {
+            Ok(map)
+        } else {
+            Err(HeapError::InvalidReference(reference))
         }
     }
 
@@ -3258,16 +3407,18 @@ impl Heap {
         let marked = marked?;
         let mut reclaimed = 0;
         let mut bytes_reclaimed = 0_u64;
-        for (index, slot) in self.slots.iter_mut().enumerate() {
-            if slot.object.is_some() && !slot.marked {
-                if let Some(object) = slot.object.take() {
-                    // G4: payload bytes are measured before the drop; the
-                    // slot header stays pool-owned and is not "released".
-                    bytes_reclaimed = bytes_reclaimed.saturating_add(object.payload_bytes());
-                    if let Object::Array { range, .. } | Object::Buffer { range, .. } = object {
-                        self.collections.release(range);
-                    }
-                }
+        for index in 0..self.slots.len() {
+            let condemned = {
+                let slot = &mut self.slots[index];
+                (slot.object.is_some() && !slot.marked)
+                    .then(|| slot.object.take().expect("presence checked"))
+            };
+            if let Some(object) = condemned {
+                // G4: payload bytes are measured before the drop; the slot
+                // header stays pool-owned and is not "released".
+                bytes_reclaimed =
+                    bytes_reclaimed.saturating_add(self.release_object_storage(&object));
+                let slot = &mut self.slots[index];
                 if let Some(generation) = slot.generation.checked_add(1) {
                     slot.generation = generation;
                     self.free
@@ -3351,7 +3502,7 @@ impl Heap {
         self.slots
             .iter()
             .filter_map(|slot| slot.object.as_ref())
-            .map(Object::payload_bytes)
+            .map(|object| self.object_payload_bytes(object))
             .fold(0, u64::saturating_add)
     }
 
@@ -3466,19 +3617,19 @@ impl Heap {
                 let index = self.gc_sweep_cursor;
                 self.gc_sweep_cursor += 1;
                 report.slots_swept += 1;
-                let slot = &mut self.slots[index];
                 let mut payload = 0;
-                if slot.object.is_some() && !slot.marked {
-                    if let Some(object) = slot.object.take() {
-                        // G4: measured before the drop, mirroring the full
-                        // collection path byte for byte.
-                        payload = object.payload_bytes();
-                        report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
-                        self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
-                        if let Object::Array { range, .. } | Object::Buffer { range, .. } = object {
-                            self.collections.release(range);
-                        }
-                    }
+                let condemned = {
+                    let slot = &mut self.slots[index];
+                    (slot.object.is_some() && !slot.marked)
+                        .then(|| slot.object.take().expect("presence checked"))
+                };
+                if let Some(object) = condemned {
+                    // G4: measured before the drop, mirroring the full
+                    // collection path byte for byte.
+                    payload = self.release_object_storage(&object);
+                    report.bytes_reclaimed = report.bytes_reclaimed.saturating_add(payload);
+                    self.gc_bytes_reclaimed = self.gc_bytes_reclaimed.saturating_add(payload);
+                    let slot = &mut self.slots[index];
                     if let Some(generation) = slot.generation.checked_add(1) {
                         slot.generation = generation;
                         self.free
@@ -3538,7 +3689,7 @@ impl Heap {
                 self.slots[reference.index as usize].marked,
                 "gray queue entries are marked at enqueue time"
             );
-            let payload = slot.payload_bytes();
+            let payload = self.object_payload_bytes(slot);
             match slot {
                 Object::Array {
                     range,
@@ -3560,7 +3711,11 @@ impl Heap {
                         }
                     }
                 }
-                Object::Buffer { range, .. } => {
+                // Buffer and exact Struct/Class extents contain one live
+                // RuntimeValue per cell.
+                Object::Buffer { range, .. }
+                | Object::Struct { range, .. }
+                | Object::Class { range, .. } => {
                     let range = *range;
                     for index in 0..range.length {
                         let value = self.collections.values(range)?[index];
@@ -3570,6 +3725,19 @@ impl Heap {
                             grayed += 1;
                         }
                     }
+                }
+                Object::Map { storage } => {
+                    let map = self
+                        .maps
+                        .get(*storage as usize)
+                        .and_then(Option::as_ref)
+                        .ok_or(HeapError::InvalidReference(reference))?;
+                    let slots = &mut self.slots;
+                    map.trace_references(&mut |child| {
+                        if Self::enqueue_gray(slots, queue, child) {
+                            grayed += 1;
+                        }
+                    });
                 }
                 _ => {
                     // The object is briefly taken out of its slot so the
@@ -3616,6 +3784,7 @@ impl Heap {
     #[must_use]
     pub fn byte_inspection(&self) -> HeapByteInspection {
         let slot_bytes = size_of::<ObjectSlot>() as u64;
+        let map_header_bytes = size_of::<Option<VmMap>>() as u64;
         let value_bytes = size_of::<RuntimeValue>() as u64;
         let mut inspection = HeapByteInspection::default();
         let mut occupied = 0_u64;
@@ -3640,27 +3809,31 @@ impl Heap {
                         .buffer_bytes
                         .saturating_add(object.payload_bytes());
                 }
-                Object::Map(_) => {
-                    inspection.map_bytes =
-                        inspection.map_bytes.saturating_add(object.payload_bytes());
+                Object::Map { .. } => {
+                    inspection.map_bytes = inspection
+                        .map_bytes
+                        .saturating_add(self.object_payload_bytes(object));
                 }
-                Object::Class { field_count, .. } | Object::Struct { field_count, .. } => {
+                Object::Class { .. } | Object::Struct { .. } => {
                     inspection.class_payload_bytes = inspection
                         .class_payload_bytes
-                        .saturating_add(u64::from(*field_count).saturating_mul(value_bytes));
+                        .saturating_add(object.payload_bytes());
                 }
-                Object::Enum { payload, .. } => {
-                    inspection.class_payload_bytes = inspection
-                        .class_payload_bytes
-                        .saturating_add(u64::from(payload.is_some()).saturating_mul(value_bytes));
-                }
+                Object::Enum { .. } => {}
             }
         }
-        inspection.object_header_bytes = occupied.saturating_mul(slot_bytes);
+        let occupied_map_headers = self.maps.iter().filter(|map| map.is_some()).count() as u64;
+        inspection.object_header_bytes = occupied
+            .saturating_mul(slot_bytes)
+            .saturating_add(occupied_map_headers.saturating_mul(map_header_bytes));
         let pool_slots = self.slots.capacity().max(self.slots.len()) as u64;
         let vacant_pool_bytes = pool_slots
             .saturating_sub(occupied)
             .saturating_mul(slot_bytes);
+        let map_pool_slots = self.maps.capacity().max(self.maps.len()) as u64;
+        let vacant_map_pool_bytes = map_pool_slots
+            .saturating_sub(occupied_map_headers)
+            .saturating_mul(map_header_bytes);
         let arena_free_bytes = (self
             .collections
             .free_ranges
@@ -3668,7 +3841,9 @@ impl Heap {
             .map(|range| range.length)
             .sum::<usize>() as u64)
             .saturating_mul(value_bytes);
-        inspection.allocator_slack_bytes = vacant_pool_bytes.saturating_add(arena_free_bytes);
+        inspection.allocator_slack_bytes = vacant_pool_bytes
+            .saturating_add(vacant_map_pool_bytes)
+            .saturating_add(arena_free_bytes);
         inspection.profiler_bytes = crate::profiler::thread_storage_bytes();
         inspection
     }

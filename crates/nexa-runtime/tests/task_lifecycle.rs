@@ -554,17 +554,16 @@ fn complete_nominal_result_and_collect(
         panic!("Result::Ok must retain its Struct payload");
     };
     let payload = *payload;
-    let Object::Struct {
-        fields,
-        field_count,
-        ..
-    } = realm
+    let Object::Struct { field_count, .. } = realm
         .resolve_heap_object(payload)
         .expect("retained Struct remains resolvable")
     else {
         panic!("Result payload must be a Struct");
     };
     assert_eq!(*field_count, 2);
+    let fields = realm
+        .resolve_heap_fields(payload)
+        .expect("retained Struct fields remain resolvable");
     let RuntimeValue::String {
         reference: text, ..
     } = fields[1]
@@ -743,7 +742,6 @@ fn host_error_preserves_the_declared_nominal_payload() {
     assert_eq!(*tag, 1);
     let Object::Struct {
         type_id: stored_failure_type,
-        fields,
         field_count,
         ..
     } = realm.resolve_heap_object(*failure).expect("Failure object")
@@ -752,6 +750,9 @@ fn host_error_preserves_the_declared_nominal_payload() {
     };
     assert_eq!(*stored_failure_type, *failure_type);
     assert_eq!(*field_count, 2);
+    let fields = realm
+        .resolve_heap_fields(*failure)
+        .expect("Failure fields remain resolvable");
     assert_eq!(
         fields[0],
         RuntimeValue::Opaque {
@@ -804,7 +805,6 @@ fn host_success_preserves_the_declared_nominal_payload() {
     assert_eq!(*tag, 0);
     let Object::Struct {
         type_id: stored_payload_type,
-        fields,
         field_count,
         ..
     } = realm.resolve_heap_object(*payload).expect("Payload object")
@@ -813,6 +813,9 @@ fn host_success_preserves_the_declared_nominal_payload() {
     };
     assert_eq!(*stored_payload_type, *payload_type);
     assert_eq!(*field_count, 2);
+    let fields = realm
+        .resolve_heap_fields(*payload)
+        .expect("Payload fields remain resolvable");
     assert_eq!(
         fields[0],
         RuntimeValue::Opaque {
