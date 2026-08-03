@@ -545,6 +545,9 @@ struct FunctionEmitter<'a> {
     /// Each logical element owns one typed register; dynamic indexes,
     /// control-flow mutation, and escaping handles retain the heap path.
     inline_arrays: BTreeMap<DefinitionId, InlineArrayState>,
+    /// WP45 non-escaping local classes. Direct field reads and writes use
+    /// typed registers; identity-observing or aliasing uses retain `ClassNew`.
+    inline_classes: BTreeMap<DefinitionId, (DefinitionId, u16)>,
     /// Whether the M5 optimized emission profile is active; the WP36
     /// reference pipeline keeps every fused form disabled.
     optimize: bool,
@@ -2727,6 +2730,177 @@ fn block_references_definition(block: &TypedBlockIr, definition: DefinitionId) -
             .is_some_and(|tail| expression_references_definition(tail, definition))
 }
 
+fn inline_class_candidates(function: &TypedFunctionIr) -> BTreeMap<DefinitionId, DefinitionId> {
+    let mut candidates = BTreeMap::new();
+    collect_inline_class_candidates(&function.body, &mut candidates);
+    candidates.retain(|definition, _| inline_class_block_is_scalar(&function.body, *definition));
+    candidates
+}
+
+fn collect_inline_class_candidates(
+    block: &TypedBlockIr,
+    candidates: &mut BTreeMap<DefinitionId, DefinitionId>,
+) {
+    for statement in &block.statements {
+        match statement {
+            TypedStatementIr::Let {
+                definition,
+                value: Some(value),
+                ..
+            } => {
+                if let TypedExpressionKind::ClassConstruct {
+                    definition: owner,
+                    update: None,
+                    ..
+                } = &value.kind
+                {
+                    candidates.insert(*definition, *owner);
+                }
+            }
+            TypedStatementIr::If {
+                then_block,
+                else_block,
+                ..
+            } => {
+                collect_inline_class_candidates(then_block, candidates);
+                if let Some(else_block) = else_block {
+                    collect_inline_class_candidates(else_block, candidates);
+                }
+            }
+            TypedStatementIr::While { body, .. }
+            | TypedStatementIr::StaticRangeFor { body, .. } => {
+                collect_inline_class_candidates(body, candidates);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn inline_class_block_is_scalar(block: &TypedBlockIr, definition: DefinitionId) -> bool {
+    block
+        .statements
+        .iter()
+        .all(|statement| inline_class_statement_is_scalar(statement, definition))
+        && block
+            .tail
+            .as_ref()
+            .is_none_or(|tail| inline_class_expression_is_scalar(tail, definition))
+}
+
+fn inline_class_statement_is_scalar(
+    statement: &TypedStatementIr,
+    definition: DefinitionId,
+) -> bool {
+    match statement {
+        TypedStatementIr::Let { value, .. } | TypedStatementIr::Return(value) => value
+            .as_ref()
+            .is_none_or(|value| inline_class_expression_is_scalar(value, definition)),
+        TypedStatementIr::Assign { target, value } => {
+            inline_class_place_is_scalar(target, definition)
+                && inline_class_expression_is_scalar(value, definition)
+        }
+        TypedStatementIr::Expression(expression) => {
+            inline_class_expression_is_scalar(expression, definition)
+        }
+        TypedStatementIr::If {
+            condition,
+            then_block,
+            else_block,
+        } => {
+            inline_class_expression_is_scalar(condition, definition)
+                && inline_class_block_is_scalar(then_block, definition)
+                && else_block
+                    .as_ref()
+                    .is_none_or(|block| inline_class_block_is_scalar(block, definition))
+        }
+        TypedStatementIr::While {
+            condition, body, ..
+        } => {
+            inline_class_expression_is_scalar(condition, definition)
+                && inline_class_block_is_scalar(body, definition)
+        }
+        TypedStatementIr::StaticRangeFor {
+            start, end, body, ..
+        } => {
+            inline_class_expression_is_scalar(start, definition)
+                && inline_class_expression_is_scalar(end, definition)
+                && inline_class_block_is_scalar(body, definition)
+        }
+        TypedStatementIr::Defer { captures, .. } => captures
+            .iter()
+            .all(|capture| inline_class_expression_is_scalar(capture, definition)),
+        TypedStatementIr::Break | TypedStatementIr::Continue | TypedStatementIr::Yield { .. } => {
+            true
+        }
+    }
+}
+
+fn inline_class_place_is_scalar(place: &TypedPlaceIr, definition: DefinitionId) -> bool {
+    match place {
+        TypedPlaceIr::Definition(candidate) => *candidate != definition,
+        TypedPlaceIr::Field { base, .. } => inline_class_place_is_scalar(base, definition),
+        TypedPlaceIr::ClassField { object, .. } => {
+            matches!(
+                object.kind,
+                TypedExpressionKind::Reference(candidate) if candidate == definition
+            ) || inline_class_expression_is_scalar(object, definition)
+        }
+        TypedPlaceIr::StateField { base, .. } => {
+            inline_class_expression_is_scalar(base, definition)
+        }
+        TypedPlaceIr::Index { base, index } => {
+            inline_class_expression_is_scalar(base, definition)
+                && inline_class_expression_is_scalar(index, definition)
+        }
+    }
+}
+
+fn inline_class_expression_is_scalar(
+    expression: &TypedExpressionIr,
+    definition: DefinitionId,
+) -> bool {
+    match &expression.kind {
+        TypedExpressionKind::Reference(candidate) => *candidate != definition,
+        TypedExpressionKind::Field { base, .. }
+            if matches!(
+                base.kind,
+                TypedExpressionKind::Reference(candidate) if candidate == definition
+            ) =>
+        {
+            true
+        }
+        _ => {
+            let mut children = Vec::new();
+            collect_expression_children(expression, &mut children);
+            children
+                .into_iter()
+                .all(|child| inline_class_expression_is_scalar(child, definition))
+        }
+    }
+}
+
+fn allocate_inline_class_states(
+    layouts: &TypedLayoutContext,
+    function: &TypedFunctionIr,
+    function_span: SourceSpan,
+    register_types: &mut Vec<Option<ValueType>>,
+) -> Result<BTreeMap<DefinitionId, (DefinitionId, u16)>, CompileError> {
+    let mut states = BTreeMap::new();
+    for (definition, owner) in inline_class_candidates(function) {
+        let Some(layout) = layouts.aggregates.get(&owner) else {
+            continue;
+        };
+        if layout.kind != TypedAggregateKind::Class {
+            continue;
+        }
+        let fields_base = u16::try_from(register_types.len())
+            .map_err(|_| CompileError::too_many_registers(function_span))?;
+        register_types.extend(layout.fields.iter().map(|field| Some(field.ty)));
+        states.insert(definition, (owner, fields_base));
+    }
+    Ok(states)
+}
+
 /// M5 WP45 minimal escape analysis: immutable locals initialized by a
 /// struct construction whose every later use is a direct field read.
 ///
@@ -3219,6 +3393,7 @@ impl<'a> FunctionEmitter<'a> {
         let mut inline_enums = BTreeMap::new();
         let mut inline_maps = BTreeMap::new();
         let mut inline_arrays = BTreeMap::new();
+        let mut inline_classes = BTreeMap::new();
         if optimize {
             for (definition, owner) in inline_struct_candidates(function) {
                 let Some(layout) = layouts.aggregates.get(&owner) else {
@@ -3269,6 +3444,12 @@ impl<'a> FunctionEmitter<'a> {
                 function_span,
                 &mut register_types,
             )?;
+            inline_classes = allocate_inline_class_states(
+                layouts,
+                function,
+                function_span,
+                &mut register_types,
+            )?;
         }
         Ok(Self {
             package,
@@ -3284,6 +3465,7 @@ impl<'a> FunctionEmitter<'a> {
             inline_enums,
             inline_maps,
             inline_arrays,
+            inline_classes,
             optimize,
             register_types,
             parameter_count: function.parameters.len(),
@@ -3381,6 +3563,30 @@ impl<'a> FunctionEmitter<'a> {
                         }
                         // The map has no physical representation until an
                         // escaping use (which the candidate scan rejects).
+                        return Ok(());
+                    }
+                    if let Some((owner, fields_base)) = self.inline_classes.get(definition).copied()
+                    {
+                        let TypedExpressionKind::ClassConstruct {
+                            definition: constructed,
+                            fields,
+                            update: None,
+                        } = &value.kind
+                        else {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        };
+                        if *constructed != owner {
+                            return Err(CompileError::type_mismatch(
+                                None,
+                                None,
+                                self.span(&value.span)?,
+                            ));
+                        }
+                        self.emit_inline_struct_fields(owner, fields_base, fields, value)?;
                         return Ok(());
                     }
                     if let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
@@ -3484,6 +3690,35 @@ impl<'a> FunctionEmitter<'a> {
                     // Right-hand sides evaluate through their own temporary
                     // registers, so reads of the old field value complete
                     // before this final write lands.
+                    self.emit_expression(value, register)?;
+                }
+                TypedPlaceIr::ClassField { object, field }
+                    if matches!(&object.kind, TypedExpressionKind::Reference(definition)
+                        if self.inline_classes.contains_key(definition)) =>
+                {
+                    let TypedExpressionKind::Reference(definition) = &object.kind else {
+                        unreachable!("guard matched a reference object");
+                    };
+                    let (owner, fields_base) = self.inline_classes[definition];
+                    let (field_owner, field_layout) =
+                        self.layouts.fields.get(field).ok_or_else(|| {
+                            CompileError::unknown_name(
+                                self.definition_name(*field),
+                                self.function_span,
+                            )
+                        })?;
+                    if *field_owner != owner
+                        || self.layouts.aggregates[&owner].kind != TypedAggregateKind::Class
+                        || !field_layout.mutable
+                    {
+                        return Err(CompileError::type_mismatch(
+                            None,
+                            None,
+                            self.span(&value.span)?,
+                        ));
+                    }
+                    let register =
+                        self.inline_field_register(owner, fields_base, *field, self.function_span)?;
                     self.emit_expression(value, register)?;
                 }
                 TypedPlaceIr::Definition(definition) => {
@@ -5543,10 +5778,14 @@ impl<'a> FunctionEmitter<'a> {
         destination: u16,
         span: SourceSpan,
     ) -> Result<(), CompileError> {
-        // WP27 slice: field reads off an inlined struct binding are plain
-        // register moves; the aggregate never existed on the heap.
+        // WP27/WP45: field reads off scalar-replaced aggregate bindings are
+        // plain register moves; the aggregate never existed on the heap.
         if let TypedExpressionKind::Reference(definition) = &base.kind
-            && let Some((owner, fields_base)) = self.inline_structs.get(definition).copied()
+            && let Some((owner, fields_base)) = self
+                .inline_structs
+                .get(definition)
+                .or_else(|| self.inline_classes.get(definition))
+                .copied()
         {
             let source = self.inline_field_register(owner, fields_base, field, span)?;
             self.push(

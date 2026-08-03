@@ -13,6 +13,7 @@ use nexa_verifier::VerifiedModule;
 /// Declaration order fixes the function indices used by the cases below.
 const CORPUS: &str = r#"
 struct Pair { first: i32, second: i32, }
+class Cell { mut value: i32, next: Option<Cell>, }
 enum Signal { Quiet, Loud(i32), }
 
 fn fold_chain(x: i32) -> i32 {
@@ -179,6 +180,18 @@ fn scalar_map_binding_fallback() -> i32 {
         },
     };
 }
+fn class_value(cell: Cell) -> i32 {
+    return cell.value;
+}
+fn scalar_class() -> i32 {
+    let cell: Cell = new Cell { value: 7, next: Option::None };
+    cell.value = cell.value + 1;
+    return cell.value;
+}
+fn scalar_class_escape() -> i32 {
+    let cell: Cell = new Cell { value: 7, next: Option::None };
+    return class_value(cell);
+}
 "#;
 
 const FOLD_CHAIN: u32 = 0;
@@ -201,6 +214,8 @@ const SCALAR_ARRAY: u32 = 17;
 const SCALAR_MAP_HIT: u32 = 18;
 const SCALAR_MAP_MISS: u32 = 19;
 const SCALAR_MAP_BINDING_FALLBACK: u32 = 20;
+const SCALAR_CLASS: u32 = 22;
+const SCALAR_CLASS_ESCAPE: u32 = 23;
 
 const FUEL: u64 = 1_000_000;
 
@@ -313,6 +328,8 @@ fn optimized_and_reference_pipelines_agree_on_results_and_traps() {
         (SCALAR_MAP_HIT, vec![], returns(3)),
         (SCALAR_MAP_MISS, vec![], returns(0)),
         (SCALAR_MAP_BINDING_FALLBACK, vec![], returns(3)),
+        (SCALAR_CLASS, vec![], returns(8)),
+        (SCALAR_CLASS_ESCAPE, vec![], returns(7)),
         (
             ROW_PROJECTION_TRAP,
             vec![RuntimeValue::I32(3)],
@@ -365,6 +382,26 @@ fn assert_scalar_collection_materializations(
     assert!(
         map_materializations(optimized, SCALAR_MAP_BINDING_FALLBACK) > 0,
         "binding the complete get result keeps the map on the heap"
+    );
+    let class_materializations = |module: &VerifiedModule, function: u32| {
+        module.module().functions[function as usize]
+            .code
+            .iter()
+            .filter(|instruction| matches!(instruction, Instruction::ClassNew { .. }))
+            .count()
+    };
+    assert_eq!(
+        class_materializations(optimized, SCALAR_CLASS),
+        0,
+        "optimized pipeline scalar-replaces the non-escaping local class"
+    );
+    assert!(
+        class_materializations(reference, SCALAR_CLASS) > 0,
+        "reference pipeline materializes the local class"
+    );
+    assert!(
+        class_materializations(optimized, SCALAR_CLASS_ESCAPE) > 0,
+        "passing the class to another function preserves its identity"
     );
 }
 
