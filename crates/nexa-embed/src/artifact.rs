@@ -145,7 +145,10 @@ pub(crate) fn compile_package_candidate(
             .ok()
             .and_then(|index| artifact.module().functions.get(index))
             .map(|function| function.effect);
-        if found.signature != requirement.signature || found_effect != Some(requirement.effect) {
+        if found.signature != requirement.signature
+            || !found_effect
+                .is_some_and(|found| crate::effect_satisfies_declaration(found, requirement.effect))
+        {
             let mut diagnostic = EngineDiagnostic::without_source(
                 Some(package_id.clone()),
                 Some(source_id.clone()),

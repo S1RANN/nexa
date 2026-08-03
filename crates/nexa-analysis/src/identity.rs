@@ -9,8 +9,11 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 macro_rules! string_identity {
     ($name:ident, $validator:ident, $kind:literal) => {
+        // M5 WP92: identities are shared, immutable strings. Cloning one
+        // is a reference-count bump, so identity-bearing outputs on the
+        // steady-state dispatch path allocate nothing.
         #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-        pub struct $name(String);
+        pub struct $name(std::sync::Arc<str>);
 
         impl $name {
             pub fn new(value: impl Into<String>) -> Result<Self, IdentityError> {
@@ -18,7 +21,7 @@ macro_rules! string_identity {
                 if !$validator(&value) {
                     return Err(IdentityError::Invalid { kind: $kind, value });
                 }
-                Ok(Self(value))
+                Ok(Self(value.into()))
             }
 
             #[must_use]
@@ -28,7 +31,7 @@ macro_rules! string_identity {
 
             #[must_use]
             pub fn into_string(self) -> String {
-                self.0
+                self.0.as_ref().to_owned()
             }
         }
 

@@ -15,5 +15,9 @@ nexa-verifier = { path = "../../crates/nexa-verifier" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[dev-dependencies]
+nexa = { path = "../../crates/nexa" }
+nexa-embed = { path = "../../crates/nexa-embed" }
+
 [lints.rust]
 unsafe_code = "allow"

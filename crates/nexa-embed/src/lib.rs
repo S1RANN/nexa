@@ -114,6 +114,20 @@ where
     }
 }
 
+/// WP89 effect satisfaction shared by every engine export check: exact
+/// match, or a module that strengthens an Ordinary declaration to
+/// `@immediate` (same synchronous ABI, strictly fewer rights - the
+/// verifier rejects suspension points inside Immediate functions). No
+/// other effect pair is substitutable.
+pub(crate) fn effect_satisfies_declaration(
+    found: nexa_runtime::FunctionEffect,
+    declared: nexa_runtime::FunctionEffect,
+) -> bool {
+    found == declared
+        || (declared == nexa_runtime::FunctionEffect::Ordinary
+            && found == nexa_runtime::FunctionEffect::Immediate)
+}
+
 pub struct NexaEngine {
     contract: HostContract,
     idl: nexa_idl::ValidatedContract,
@@ -125,6 +139,12 @@ pub struct NexaEngine {
     storage_dir: Option<PathBuf>,
     runtime_host: nexa_runtime::RuntimeHost,
     packages: Vec<PackageRecord>,
+    /// WP90: the cached deterministic broadcast order - indexes of Enabled
+    /// packages, highest priority first, package id as the tie-break.
+    /// Never trusted blindly: every dispatch revalidates it against the
+    /// live package table in O(n) without allocating, so any lifecycle or
+    /// priority change simply rebuilds the plan in place.
+    dispatch_plan: Vec<usize>,
     diagnostics: BoundedDiagnosticLog,
     required_exports: Vec<ExportRequirement>,
     declared_entrypoints: Vec<EntrypointSignature>,
@@ -259,6 +279,7 @@ impl NexaEngine {
                 .runtime_host
                 .unwrap_or_else(|| nexa_runtime::RuntimeHost::new(builder.runtime_host_capacity)),
             packages: Vec::new(),
+            dispatch_plan: Vec::new(),
             diagnostics: BoundedDiagnosticLog::default(),
             required_exports,
             declared_entrypoints,
@@ -714,7 +735,10 @@ impl NexaEngine {
                 .ok()
                 .and_then(|index| verified.module().functions.get(index))
                 .map(|function| function.effect);
-            if found.signature != declared.signature || found_effect != Some(declared.effect) {
+            if found.signature != declared.signature
+                || !found_effect
+                    .is_some_and(|found| effect_satisfies_declaration(found, declared.effect))
+            {
                 return Err(EngineError::ExportSignature(id, declared.name.clone()));
             }
         }
@@ -731,7 +755,9 @@ impl NexaEngine {
                 .ok()
                 .and_then(|index| verified.module().functions.get(index))
                 .map(|function| function.effect);
-            if found.signature != requirement.signature || found_effect != Some(requirement.effect)
+            if found.signature != requirement.signature
+                || !found_effect
+                    .is_some_and(|found| effect_satisfies_declaration(found, requirement.effect))
             {
                 return Err(EngineError::ExportSignature(id, requirement.name.clone()));
             }
@@ -2829,7 +2855,9 @@ impl NexaEngine {
             return false;
         };
         self.package_entrypoint(index, E::STABLE_ID)
-            .is_some_and(|(signature, effect)| signature == E::signature() && effect == E::effect())
+            .is_some_and(|(signature, effect)| {
+                signature == E::signature() && effect_satisfies_declaration(effect, E::effect())
+            })
     }
 
     /// Calls `E` when the selected package implements it.
@@ -2846,7 +2874,7 @@ impl NexaEngine {
             Err(error) => return Some(Err(error)),
         };
         let (signature, effect) = self.package_entrypoint(index, E::STABLE_ID)?;
-        if signature != E::signature() || effect != E::effect() {
+        if signature != E::signature() || !effect_satisfies_declaration(effect, E::effect()) {
             return Some(Err(EngineError::ExportSignature(
                 id.clone(),
                 E::NAME.to_owned(),
@@ -2867,7 +2895,10 @@ impl NexaEngine {
             .filter(|(index, record)| {
                 record.lifecycle.status() == PackageStatus::Enabled
                     && self.package_entrypoint(*index, E::STABLE_ID).is_some_and(
-                        |(signature, effect)| signature == E::signature() && effect == E::effect(),
+                        |(signature, effect)| {
+                            signature == E::signature()
+                                && effect_satisfies_declaration(effect, E::effect())
+                        },
                     )
             })
             .map(|(index, record)| {
@@ -2934,10 +2965,21 @@ impl NexaEngine {
             EngineError::InvalidState(manifest.id.clone(), PackageStatus::Enabled)
         })?;
         record.handler_calls_this_tick = record.handler_calls_this_tick.saturating_add(1);
-        // WP89: `@immediate` exports skip the Task/scheduler/tombstone
-        // lifecycle entirely (the realm settles them in one predecoded
-        // poll); every other effect keeps the metered Task path.
-        let called = if E::effect() == nexa_runtime::FunctionEffect::Immediate {
+        // WP89: exports whose module function is `@immediate` skip the
+        // Task/scheduler/tombstone lifecycle entirely (the realm settles
+        // them in one predecoded poll). Routing keys off the module's
+        // verified effect - not `E::effect()` - because a module may
+        // strengthen an Ordinary declaration to `@immediate` and every
+        // Ordinary caller must still benefit. All other effects keep the
+        // metered Task path.
+        let immediate = runtime
+            .artifact
+            .module()
+            .exports
+            .iter()
+            .find(|export| export.stable_id == E::STABLE_ID)
+            .is_some_and(|export| export.effect == nexa_runtime::FunctionEffect::Immediate);
+        let called = if immediate {
             runtime
                 .realm
                 .call_export_immediate::<E>(runtime.module, args, policy)
@@ -2998,24 +3040,17 @@ impl NexaEngine {
         &mut self,
         args: &E::Args,
     ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
-        let mut indexes = self
-            .packages
+        self.refresh_dispatch_plan();
+        // The plan is moved out for the duration of the calls (call_index
+        // needs `&mut self`) and restored afterwards; steady-state
+        // dispatches therefore allocate nothing beyond the output vector.
+        let plan = std::mem::take(&mut self.dispatch_plan);
+        let outputs = plan
             .iter()
-            .enumerate()
-            .filter(|(_, record)| record.lifecycle.status() == PackageStatus::Enabled)
-            .map(|(index, record)| {
-                (
-                    index,
-                    record.effective.priority,
-                    record.candidate.manifest.id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        indexes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
-        indexes
-            .into_iter()
-            .map(|(index, _, _)| self.call_index::<E>(index, args))
-            .collect()
+            .map(|&index| self.call_index::<E>(index, args))
+            .collect();
+        self.dispatch_plan = plan;
+        outputs
     }
 
     /// Deterministically dispatches while allowing package-specific immutable
@@ -3024,27 +3059,78 @@ impl NexaEngine {
         &mut self,
         mut args: impl FnMut(&PackageInfo) -> E::Args,
     ) -> Vec<Result<PackageOutput<E::Output>, EngineError>> {
-        let mut indexes = self
-            .packages
+        self.refresh_dispatch_plan();
+        let plan = std::mem::take(&mut self.dispatch_plan);
+        let outputs = plan
             .iter()
-            .enumerate()
-            .filter(|(_, record)| record.lifecycle.status() == PackageStatus::Enabled)
-            .map(|(index, record)| {
-                (
-                    index,
-                    record.effective.priority,
-                    record.candidate.manifest.id.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        indexes.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.2.cmp(&right.2)));
-        indexes
-            .into_iter()
-            .map(|(index, _, _)| {
+            .map(|&index| {
                 let package = self.packages[index].info();
                 self.call_index::<E>(index, &args(&package))
             })
-            .collect()
+            .collect();
+        self.dispatch_plan = plan;
+        outputs
+    }
+
+    /// WP90: rebuilds the broadcast plan only when the revalidation scan
+    /// says the cached one no longer matches the live package table.
+    fn refresh_dispatch_plan(&mut self) {
+        if self.dispatch_plan_is_current() {
+            return;
+        }
+        let packages = &self.packages;
+        self.dispatch_plan.clear();
+        self.dispatch_plan.extend(
+            packages
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.lifecycle.status() == PackageStatus::Enabled)
+                .map(|(index, _)| index),
+        );
+        self.dispatch_plan.sort_by(|&left, &right| {
+            let left = &packages[left];
+            let right = &packages[right];
+            right
+                .effective
+                .priority
+                .cmp(&left.effective.priority)
+                .then_with(|| left.candidate.manifest.id.cmp(&right.candidate.manifest.id))
+        });
+    }
+
+    /// The allocation-free O(n) plan check: every cached index must still
+    /// be an Enabled package, the walk must strictly follow the broadcast
+    /// order (priority descending, package id ascending - duplicates are
+    /// conservatively treated as stale), and the Enabled population must
+    /// match the plan length so no newly enabled package is missing.
+    fn dispatch_plan_is_current(&self) -> bool {
+        let enabled = self
+            .packages
+            .iter()
+            .filter(|record| record.lifecycle.status() == PackageStatus::Enabled)
+            .count();
+        if enabled != self.dispatch_plan.len() {
+            return false;
+        }
+        let mut previous: Option<&PackageRecord> = None;
+        for &index in &self.dispatch_plan {
+            let Some(record) = self.packages.get(index) else {
+                return false;
+            };
+            if record.lifecycle.status() != PackageStatus::Enabled {
+                return false;
+            }
+            if let Some(previous) = previous {
+                let ordered = previous.effective.priority > record.effective.priority
+                    || (previous.effective.priority == record.effective.priority
+                        && previous.candidate.manifest.id < record.candidate.manifest.id);
+                if !ordered {
+                    return false;
+                }
+            }
+            previous = Some(record);
+        }
+        true
     }
 
     /// Inserts or replaces one scalar field in a package's typed state domain.
@@ -3562,18 +3648,19 @@ impl NexaEngine {
     }
 
     fn unique_index(&self, id: &PackageId) -> Result<usize, EngineError> {
-        let indexes = self
-            .packages
-            .iter()
-            .enumerate()
-            .filter(|(_, record)| record.candidate.manifest.id == *id)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        match indexes.as_slice() {
-            [index] => Ok(*index),
-            [] => Err(EngineError::UnknownPackage(id.clone())),
-            _ => Err(EngineError::Incompatible(id.clone())),
+        // Allocation-free uniqueness scan (WP92): `call` sits on the
+        // steady-state path, so ambiguity is detected by the second match
+        // instead of collecting every match first.
+        let mut unique = None;
+        for (index, record) in self.packages.iter().enumerate() {
+            if record.candidate.manifest.id == *id {
+                if unique.is_some() {
+                    return Err(EngineError::Incompatible(id.clone()));
+                }
+                unique = Some(index);
+            }
         }
+        unique.ok_or_else(|| EngineError::UnknownPackage(id.clone()))
     }
 
     fn persist_selections(&self) -> Result<(), EngineError> {

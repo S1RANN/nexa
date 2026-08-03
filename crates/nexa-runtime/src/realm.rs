@@ -2704,6 +2704,21 @@ impl RealmRuntime {
         &self,
         module: ModuleHandle,
     ) -> Result<u32, crate::ScriptCallError> {
+        self.resolve_export::<E>(module)
+            .map(|(function, _)| function)
+    }
+
+    /// Resolves one export and reports the module function's verified
+    /// effect. The declared effect check uses the WP89 satisfaction rule:
+    /// a module may strengthen an Ordinary declaration to `@immediate` -
+    /// the ABI is identical and the rights are strictly narrower (the
+    /// verifier rejects suspension points inside Immediate functions) -
+    /// so callers compiled against the Ordinary declaration stay correct
+    /// while the effect-aware paths may settle the call task-free.
+    fn resolve_export<E: crate::ScriptExport>(
+        &self,
+        module: ModuleHandle,
+    ) -> Result<(u32, FunctionEffect), crate::ScriptCallError> {
         let loaded = self
             .modules
             .resolve(module.raw())
@@ -2721,7 +2736,7 @@ impl RealmRuntime {
         if export.signature != E::signature() {
             return Err(crate::ScriptCallError::SignatureMismatch { name: E::NAME });
         }
-        if export.effect != E::effect() {
+        if !export_effect_satisfies(export.effect, E::effect()) {
             return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
         }
         let function = loaded
@@ -2733,7 +2748,7 @@ impl RealmRuntime {
                     .map_err(|_| crate::ScriptCallError::SignatureMismatch { name: E::NAME })?,
             )
             .ok_or(crate::ScriptCallError::SignatureMismatch { name: E::NAME })?;
-        if function.effect != E::effect() {
+        if function.effect != export.effect {
             return Err(crate::ScriptCallError::EffectMismatch { name: E::NAME });
         }
         if matches!(
@@ -2742,7 +2757,7 @@ impl RealmRuntime {
         ) {
             return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
         }
-        Ok(export.function)
+        Ok((export.function, function.effect))
     }
 
     pub fn spawn_export<E: crate::ScriptExport>(
@@ -2846,8 +2861,8 @@ impl RealmRuntime {
         args: &E::Args,
         policy: crate::MustCompletePolicy,
     ) -> Result<(E::Output, ExecutionCharge), crate::ScriptCallError> {
-        let function = self.resolve_export_index::<E>(module)?;
-        if E::effect() != FunctionEffect::Immediate {
+        let (function, effect) = self.resolve_export::<E>(module)?;
+        if effect != FunctionEffect::Immediate {
             return Err(crate::ScriptCallError::EffectNotCallable { name: E::NAME });
         }
         let requirements = E::argument_requirements(args)?;
@@ -4959,6 +4974,18 @@ fn requires_host_capabilities(
                 .iter()
                 .any(|field| requires_host_capabilities(module, field.ty, visited))
         })
+}
+
+/// WP89 effect satisfaction: an export satisfies the caller's declared
+/// effect when they match exactly, or when the module strengthened an
+/// Ordinary declaration to Immediate. Immediate keeps the synchronous
+/// single-poll ABI while granting strictly fewer rights (the verifier
+/// rejects suspension points inside Immediate functions), so every caller
+/// compiled against the Ordinary declaration remains sound. No other
+/// effect pair is substitutable.
+fn export_effect_satisfies(found: FunctionEffect, declared: FunctionEffect) -> bool {
+    found == declared
+        || (declared == FunctionEffect::Ordinary && found == FunctionEffect::Immediate)
 }
 
 fn reservation_for_module(

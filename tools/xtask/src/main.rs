@@ -1491,8 +1491,9 @@ fn test_artifact_cache() -> Result<(), DynError> {
 }
 
 /// M5 stage-H gate: the WP89 immediate entrypoint settles with no Task,
-/// scheduler token, or tombstone, and the H1 continuation pool feeds
-/// steady-state admissions.
+/// scheduler token, or tombstone, the H1 continuation pool feeds
+/// steady-state admissions, and the WP90/WP92 engine dispatch path is
+/// allocation-exact in steady state.
 fn test_runtime_fast_paths() -> Result<(), DynError> {
     cargo(&[
         "test",
@@ -1501,7 +1502,14 @@ fn test_runtime_fast_paths() -> Result<(), DynError> {
         "--test",
         "immediate_entrypoint",
     ])?;
-    cargo(&["test", "-p", "nexa-runtime", "--test", "continuation_pool"])
+    cargo(&["test", "-p", "nexa-runtime", "--test", "continuation_pool"])?;
+    cargo(&[
+        "test",
+        "-p",
+        "nexa-benchmark-v7",
+        "--test",
+        "steady_state_allocation",
+    ])
 }
 
 /// M5 stage-J: produces the decision artifacts named by
