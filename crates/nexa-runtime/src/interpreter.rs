@@ -1186,26 +1186,51 @@ impl CheckedInterpreter {
         // WP15/WP16: the enabled flag is read once per poll; the disabled
         // hot path costs one predictable branch per instruction.
         let profiling = crate::profiler::enabled();
+        // K2: the verified function metadata and its predecoded rows are
+        // immutable for the whole poll, so they are re-resolved only when
+        // the executing function changes (Call/Return/defer boundaries)
+        // instead of once per instruction.
+        let mut cached_function: Option<(
+            u32,
+            &nexa_bytecode::Function,
+            Option<&[crate::executable::ExecutableInstruction]>,
+        )> = None;
         loop {
             let frame = *continuation.arena.current()?;
             continuation.current_function = frame.function;
-            let function = module
-                .module()
-                .functions
-                .get(frame.function as usize)
-                .ok_or(InterpreterError::MissingFunction(frame.function))?;
+            let (function, function_rows) = match cached_function {
+                Some((cached_id, function, rows)) if cached_id == frame.function => {
+                    (function, rows)
+                }
+                _ => {
+                    let function = module
+                        .module()
+                        .functions
+                        .get(frame.function as usize)
+                        .ok_or(InterpreterError::MissingFunction(frame.function))?;
+                    let rows = match executable {
+                        Some(rows) => Some(
+                            rows.functions()
+                                .get(frame.function as usize)
+                                .ok_or(InterpreterError::FellOffFunction)?
+                                .rows(),
+                        ),
+                        None => None,
+                    };
+                    cached_function = Some((frame.function, function, rows));
+                    (function, rows)
+                }
+            };
             let instruction;
             let instruction_cost;
             let safepoint;
-            if let Some(rows) = executable {
+            if let Some(rows) = function_rows {
                 // F2: the predecoded row carries the full static charge
                 // (HostCall import surcharge folded at build time) and the
                 // load-time safepoint flag; only operand-dependent
                 // surcharges still consult the arena and heap.
                 let row = rows
-                    .functions()
-                    .get(frame.function as usize)
-                    .and_then(|function| function.rows().get(frame.pc as usize))
+                    .get(frame.pc as usize)
                     .ok_or(InterpreterError::FellOffFunction)?;
                 debug_assert_eq!(
                     Some(&row.instruction),
