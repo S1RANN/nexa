@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
+use std::sync::Arc;
 
 use nexa_core::StableId;
 
@@ -458,6 +459,10 @@ impl CollectionArena {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Object {
     String(String),
+    /// Immutable module-owned string storage (WP56). The heap owns only an
+    /// `Arc` reference and a GC header; literal bytes are allocated once by
+    /// `ExecutableModule`, never on `LoadString`.
+    SharedString(Arc<str>),
     I32Array(Vec<i32>),
     /// WP72: map headers live in the heap's typed map arena. The physical
     /// object slot carries only the arena index instead of the widest
@@ -527,6 +532,7 @@ impl Object {
             | Self::Class { .. }
             | Self::Map { .. }
             | Self::String(_)
+            | Self::SharedString(_)
             | Self::I32Array(_) => {}
         }
     }
@@ -545,9 +551,9 @@ impl Object {
             | Self::Buffer { range, .. }
             | Self::Struct { range, .. }
             | Self::Class { range, .. } => range.length.saturating_mul(size_of::<RuntimeValue>()),
-            // Map payload lives in the typed map arena and is accounted by
-            // `Heap::object_payload_bytes`; Enum payload remains inline.
-            Self::Map { .. } | Self::Enum { .. } => 0,
+            // Shared literal bytes belong to ExecutableModule; Map payload
+            // lives in its typed arena; Enum payload remains inline.
+            Self::SharedString(_) | Self::Map { .. } | Self::Enum { .. } => 0,
         };
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
@@ -587,7 +593,7 @@ struct ObjectSlot {
 
 /// Deterministic FNV-1a content hash shared by string values and the
 /// WP56 literal cache; computed once per interned literal (WP69).
-fn fnv_content_hash(value: &str) -> u64 {
+pub(crate) fn fnv_content_hash(value: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in value.bytes() {
         hash ^= u64::from(byte);
@@ -600,6 +606,14 @@ fn fnv_content_hash(value: &str) -> u64 {
 /// hash, computed once at interning time (WP69 hot-path discipline).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CachedStringLiteral {
+    reference: GcRef,
+    hash: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CachedPooledString {
+    pool: u64,
+    literal: u32,
     reference: GcRef,
     hash: u64,
 }
@@ -926,6 +940,10 @@ pub struct Heap {
     /// host-transaction rollback and checkpoint restore - clear the cache
     /// instead, so a generation match always implies content identity.
     string_literal_cache: BTreeMap<String, CachedStringLiteral>,
+    /// Allocation-free runtime index for module-owned literal pools. The
+    /// vector is reserved to the heap object limit and stale generation
+    /// entries are replaced in place across GC/reload.
+    pooled_string_cache: Vec<CachedPooledString>,
     /// WP74: reusable mark-phase work queue. Capacity converges to the
     /// high-water mark of prior collections instead of reallocating on
     /// every `collect` call. Pure scratch space, never heap state. During
@@ -1036,6 +1054,7 @@ impl Heap {
         // The restored slots may pair a cached literal's generation with
         // different content; the cache trades that ambiguity for a rebuild.
         self.string_literal_cache.clear();
+        self.pooled_string_cache.clear();
         self.slots = checkpoint.slots;
         self.free = checkpoint.free;
         self.maps = checkpoint.maps;
@@ -1079,6 +1098,7 @@ impl Heap {
             failure_injector: RuntimeFailureInjector::default(),
             counters: VmAllocationCounters::default(),
             string_literal_cache: BTreeMap::new(),
+            pooled_string_cache: Vec::with_capacity(max_objects as usize),
             mark_scratch: VecDeque::with_capacity(max_objects as usize),
             gc_phase: GcPhase::Idle,
             gc_sweep_cursor: 0,
@@ -1149,6 +1169,53 @@ impl Heap {
         Ok((reference, hash))
     }
 
+    pub(crate) fn load_pooled_string(
+        &mut self,
+        pool: u64,
+        literal: u32,
+        value: Arc<str>,
+        hash: u64,
+    ) -> Result<(GcRef, u64), HeapError> {
+        let mut reusable = None;
+        for (index, cached) in self.pooled_string_cache.iter().copied().enumerate() {
+            let live = self
+                .slots
+                .get(cached.reference.index as usize)
+                .filter(|slot| slot.generation == cached.reference.generation)
+                .and_then(|slot| slot.object.as_ref());
+            if cached.pool == pool && cached.literal == literal {
+                if let Some(Object::SharedString(current)) = live {
+                    debug_assert_eq!(&**current, &*value);
+                    return Ok((cached.reference, cached.hash));
+                }
+                reusable = Some(index);
+                break;
+            }
+            if live.is_none() && reusable.is_none() {
+                reusable = Some(index);
+            }
+        }
+        self.validate_string_length(value.len())?;
+        let mut reservation = self.preflight(1)?;
+        let reference = self.commit(&mut reservation, Object::SharedString(value));
+        let cached = CachedPooledString {
+            pool,
+            literal,
+            reference,
+            hash,
+        };
+        if let Some(index) = reusable {
+            self.pooled_string_cache[index] = cached;
+        } else {
+            debug_assert!(
+                self.pooled_string_cache.len() < self.pooled_string_cache.capacity(),
+                "every pooled literal consumes one bounded heap object"
+            );
+            self.pooled_string_cache.push(cached);
+        }
+        Ok((reference, hash))
+    }
+
     pub fn concat_strings(&mut self, lhs: GcRef, rhs: GcRef) -> Result<GcRef, HeapError> {
         let (lhs_len, rhs_len) = (self.string(lhs)?.len(), self.string(rhs)?.len());
         let length = lhs_len
@@ -1208,6 +1275,7 @@ impl Heap {
     pub fn string(&self, reference: GcRef) -> Result<&str, HeapError> {
         match self.resolve(reference)? {
             Object::String(value) => Ok(value),
+            Object::SharedString(value) => Ok(value),
             _ => Err(HeapError::InvalidReference(reference)),
         }
     }
@@ -1398,7 +1466,10 @@ impl Heap {
                         .push(u32::try_from(storage).expect("map arena index originates as u32"));
                 }
             }
-            Object::String(_) | Object::I32Array(_) | Object::Enum { .. } => {}
+            Object::String(_)
+            | Object::SharedString(_)
+            | Object::I32Array(_)
+            | Object::Enum { .. } => {}
         }
         payload
     }
@@ -1435,6 +1506,7 @@ impl Heap {
                     .string_copy_bytes
                     .saturating_add(value.len() as u64);
             }
+            Object::SharedString(_) => {}
             Object::Class { .. } => {
                 self.counters.class_allocations = self.counters.class_allocations.saturating_add(1);
             }
@@ -1691,6 +1763,7 @@ impl Heap {
             // literal cached at the same (index, generation) could later
             // alias different content; drop the cache instead.
             self.string_literal_cache.clear();
+            self.pooled_string_cache.clear();
         }
         self.release_live_payload(released);
     }
@@ -3968,7 +4041,7 @@ impl Heap {
             };
             occupied += 1;
             match object {
-                Object::String(_) => {
+                Object::String(_) | Object::SharedString(_) => {
                     inspection.string_bytes = inspection
                         .string_bytes
                         .saturating_add(object.payload_bytes());
@@ -4426,6 +4499,30 @@ mod tests {
         let third = heap.load_string_literal("pooled").unwrap();
         assert_ne!(first, third, "collected entries fall back to allocation");
         assert_eq!(heap.string(third), Ok("pooled"));
+    }
+
+    #[test]
+    fn executable_string_pool_reuses_module_bytes_and_cache_slots() {
+        let mut heap = Heap::new_with_limits(4, 64, 4);
+        let shared = std::sync::Arc::<str>::from("module-owned");
+        let hash = super::fnv_content_hash(&shared);
+        let first = heap
+            .load_pooled_string(7, 3, std::sync::Arc::clone(&shared), hash)
+            .unwrap();
+        let second = heap
+            .load_pooled_string(7, 3, std::sync::Arc::clone(&shared), hash)
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(heap.string(first.0), Ok("module-owned"));
+        assert_eq!(heap.vm_allocation_counters().string_allocations, 0);
+        assert_eq!(heap.pooled_string_cache.len(), 1);
+
+        assert_eq!(heap.collect(&GcRoots::default()).unwrap().reclaimed, 1);
+        let reloaded = heap
+            .load_pooled_string(7, 3, shared, hash)
+            .expect("stale cache entry is replaced in place");
+        assert_ne!(first.0.generation, reloaded.0.generation);
+        assert_eq!(heap.pooled_string_cache.len(), 1);
     }
 
     #[test]

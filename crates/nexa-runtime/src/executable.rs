@@ -11,10 +11,21 @@
 //! ever serialized. Later F slices add dense identity resolution, hot/cold
 //! metadata separation, and the interpreter switch-over.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use nexa_bytecode::Instruction;
 use nexa_verifier::{ResolvedNominalOperand, VerifiedModule};
 
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
+
+static NEXT_STRING_POOL_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug)]
+pub struct PooledStringConstant {
+    pub value: Arc<str>,
+    pub hash: u64,
+}
 
 /// One predecoded instruction row: the hot fields fixed at build time.
 #[derive(Clone, Copy, Debug)]
@@ -94,6 +105,8 @@ impl std::error::Error for ExecutableBuildError {}
 #[derive(Clone, Debug)]
 pub struct ExecutableModule {
     functions: Vec<ExecutableFunction>,
+    string_pool: Vec<PooledStringConstant>,
+    string_pool_id: u64,
     cost_table_version: u32,
 }
 
@@ -116,6 +129,14 @@ impl ExecutableModule {
         }
         let nominal_shape = module.nominal_index_shape();
         let bytecode = module.module();
+        let string_pool = bytecode
+            .strings
+            .iter()
+            .map(|value| PooledStringConstant {
+                value: Arc::<str>::from(value.as_str()),
+                hash: crate::heap::fnv_content_hash(value),
+            })
+            .collect();
         let mut functions = Vec::with_capacity(bytecode.functions.len());
         for (function_index, function) in bytecode.functions.iter().enumerate() {
             let function_index = u32::try_from(function_index).unwrap_or(u32::MAX);
@@ -186,6 +207,8 @@ impl ExecutableModule {
         }
         Ok(Self {
             functions,
+            string_pool,
+            string_pool_id: NEXT_STRING_POOL_ID.fetch_add(1, Ordering::Relaxed),
             cost_table_version: costs.version,
         })
     }
@@ -198,6 +221,13 @@ impl ExecutableModule {
     #[must_use]
     pub const fn cost_table_version(&self) -> u32 {
         self.cost_table_version
+    }
+
+    #[must_use]
+    pub fn pooled_string(&self, index: u32) -> Option<(u64, &PooledStringConstant)> {
+        self.string_pool
+            .get(index as usize)
+            .map(|constant| (self.string_pool_id, constant))
     }
 
     /// Share of instruction rows whose whole charge is settled at load

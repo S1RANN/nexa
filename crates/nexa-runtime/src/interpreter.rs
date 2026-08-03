@@ -1353,17 +1353,30 @@ impl CheckedInterpreter {
                     increment_pc(&mut continuation.arena)?;
                 }
                 Instruction::LoadString { dst, string } => {
-                    let value = module
-                        .module()
-                        .strings
-                        .get(string as usize)
-                        .ok_or(InterpreterError::TypeMismatch)?;
                     let heap = heap
                         .as_deref_mut()
                         .ok_or(InterpreterError::HeapUnavailable)?;
-                    // WP56/WP69: one cache lookup returns the shared copy
-                    // and its interning-time hash; hot loads rehash nothing.
-                    let (reference, hash) = heap.load_string_literal_with_hash(value)?;
+                    // WP56: executable modules allocate immutable literal
+                    // bytes and hashes once at load. The heap publishes only
+                    // a GC header plus Arc reference; the portable path keeps
+                    // the content-keyed fallback.
+                    let (reference, hash) = if let Some((pool, constant)) =
+                        executable.and_then(|image| image.pooled_string(string))
+                    {
+                        heap.load_pooled_string(
+                            pool,
+                            string,
+                            std::sync::Arc::clone(&constant.value),
+                            constant.hash,
+                        )?
+                    } else {
+                        let value = module
+                            .module()
+                            .strings
+                            .get(string as usize)
+                            .ok_or(InterpreterError::TypeMismatch)?;
+                        heap.load_string_literal_with_hash(value)?
+                    };
                     set_register(
                         &mut continuation.arena,
                         dst,

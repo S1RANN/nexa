@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -152,16 +153,27 @@ pub enum RuntimeFailureConfigError {
 pub struct RuntimeFailureInjector {
     rules: Arc<Mutex<[RuntimeFailureRule; RuntimeFailurePoint::ALL.len()]>>,
     observations: Arc<Mutex<VecDeque<FailureObservation>>>,
+    attempted: Arc<[AtomicU64; RuntimeFailurePoint::ALL.len()]>,
+    armed: Arc<AtomicU32>,
 }
 
 impl Default for RuntimeFailureInjector {
     fn default() -> Self {
-        Self {
+        let injector = Self {
             rules: Arc::new(Mutex::new(
                 [RuntimeFailureRule::default(); RuntimeFailurePoint::ALL.len()],
             )),
             observations: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
-        }
+            attempted: Arc::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            armed: Arc::new(AtomicU32::new(0)),
+        };
+        // macOS lazily allocates pthread mutex state on the first lock.
+        // Heap/Realm construction is the initialization boundary; warming
+        // both locks here keeps the first runtime allocation probe out of
+        // the measured execution path.
+        drop(injector.rules());
+        drop(injector.observation_log());
+        injector
     }
 }
 
@@ -242,10 +254,15 @@ impl RuntimeFailureInjector {
 
     pub fn disarm(&self, point: RuntimeFailurePoint) {
         self.rules()[point.index()].mode = RuntimeFailureMode::Off;
+        self.clear_armed(point);
     }
 
     pub fn clear(&self) {
         self.rules().fill(RuntimeFailureRule::default());
+        for attempted in self.attempted.iter() {
+            attempted.store(0, Ordering::Relaxed);
+        }
+        self.armed.store(0, Ordering::Release);
         self.observation_log().clear();
     }
 
@@ -256,11 +273,16 @@ impl RuntimeFailureInjector {
 
     #[must_use]
     pub fn stats(&self, point: RuntimeFailurePoint) -> FailurePointStats {
-        self.rules()[point.index()].stats
+        FailurePointStats {
+            attempted: self.attempted[point.index()].load(Ordering::Relaxed),
+            injected: self.rules()[point.index()].stats.injected,
+        }
     }
 
     #[must_use]
-    pub fn all_stats(&self) -> [(RuntimeFailurePoint, FailurePointStats); 21] {
+    pub fn all_stats(
+        &self,
+    ) -> [(RuntimeFailurePoint, FailurePointStats); RuntimeFailurePoint::ALL.len()] {
         std::array::from_fn(|index| {
             let point = RuntimeFailurePoint::ALL[index];
             (point, self.stats(point))
@@ -284,9 +306,15 @@ impl RuntimeFailureInjector {
         task_handle: Option<crate::TaskHandle>,
         request_handle: Option<crate::HostRequestHandle>,
     ) -> bool {
+        let attempted = self.attempted[point.index()]
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let mask = 1_u32 << point.index();
+        if self.armed.load(Ordering::Acquire) & mask == 0 {
+            return false;
+        }
         let mut rules = self.rules();
         let rule = &mut rules[point.index()];
-        rule.stats.attempted = rule.stats.attempted.saturating_add(1);
         let injected = match rule.mode {
             RuntimeFailureMode::Off => false,
             RuntimeFailureMode::Once => {
@@ -294,7 +322,7 @@ impl RuntimeFailureInjector {
                 true
             }
             RuntimeFailureMode::At(occurrence) => {
-                if rule.stats.attempted == occurrence {
+                if attempted == occurrence {
                     rule.mode = RuntimeFailureMode::Off;
                     true
                 } else {
@@ -307,6 +335,9 @@ impl RuntimeFailureInjector {
             rule.stats.injected = rule.stats.injected.saturating_add(1);
         }
         let armed = rule.mode != RuntimeFailureMode::Off || injected;
+        if rule.mode == RuntimeFailureMode::Off {
+            self.clear_armed(point);
+        }
         drop(rules);
         if armed {
             self.record(FailureObservation {
@@ -330,10 +361,17 @@ impl RuntimeFailureInjector {
     }
 
     fn configure(&self, point: RuntimeFailurePoint, mode: RuntimeFailureMode) {
+        self.attempted[point.index()].store(0, Ordering::Relaxed);
         self.rules()[point.index()] = RuntimeFailureRule {
             mode,
             stats: FailurePointStats::default(),
         };
+        if mode == RuntimeFailureMode::Off {
+            self.clear_armed(point);
+        } else {
+            self.armed
+                .fetch_or(1_u32 << point.index(), Ordering::Release);
+        }
     }
 
     fn rules(
@@ -345,7 +383,14 @@ impl RuntimeFailureInjector {
     }
 
     fn rules_snapshot(&self) -> [RuntimeFailureRule; RuntimeFailurePoint::ALL.len()] {
-        *self.rules()
+        let rules = *self.rules();
+        std::array::from_fn(|index| RuntimeFailureRule {
+            mode: rules[index].mode,
+            stats: FailurePointStats {
+                attempted: self.attempted[index].load(Ordering::Relaxed),
+                injected: rules[index].stats.injected,
+            },
+        })
     }
 
     fn observation_log(&self) -> std::sync::MutexGuard<'_, VecDeque<FailureObservation>> {
@@ -361,6 +406,11 @@ impl RuntimeFailureInjector {
             observations.pop_front();
         }
         observations.push_back(observation);
+    }
+
+    fn clear_armed(&self, point: RuntimeFailurePoint) {
+        self.armed
+            .fetch_and(!(1_u32 << point.index()), Ordering::Release);
     }
 }
 
