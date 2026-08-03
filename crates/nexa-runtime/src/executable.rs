@@ -45,6 +45,12 @@ pub(crate) enum ExecutableNominalOperand {
     ClassField {
         type_index: u16,
         index: u16,
+        state_index: Option<u16>,
+    },
+    StateField {
+        type_index: u16,
+        field_index: u16,
+        sorted_index: u16,
     },
     ArrayType {
         type_index: u16,
@@ -67,9 +73,24 @@ impl From<ResolvedNominalOperand> for ExecutableNominalOperand {
                 variant_index,
             },
             ResolvedNominalOperand::StructField { index, .. } => Self::StructField { index },
-            ResolvedNominalOperand::ClassField { type_index, index } => {
-                Self::ClassField { type_index, index }
-            }
+            ResolvedNominalOperand::ClassField {
+                type_index,
+                index,
+                state_index,
+            } => Self::ClassField {
+                type_index,
+                index,
+                state_index,
+            },
+            ResolvedNominalOperand::StateField {
+                type_index,
+                field_index,
+                sorted_index,
+            } => Self::StateField {
+                type_index,
+                field_index,
+                sorted_index,
+            },
             ResolvedNominalOperand::ArrayType {
                 type_index,
                 row_fields,

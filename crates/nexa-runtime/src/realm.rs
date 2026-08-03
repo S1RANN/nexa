@@ -255,7 +255,19 @@ impl InterpreterState for RealmStateBridge<'_> {
         expected: ValueType,
     ) -> Result<RuntimeValue, RuntimeMessage> {
         self.registry
-            .current_object_field(stable_id, type_id, field_id, expected)
+            .current_object_field(stable_id, type_id, field_id, usize::MAX, expected)
+    }
+
+    fn object_field_dense(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
+        self.registry
+            .current_object_field(stable_id, type_id, field_id, field_index, expected)
     }
 
     fn set_object_field(
@@ -266,8 +278,33 @@ impl InterpreterState for RealmStateBridge<'_> {
         expected: ValueType,
         value: RuntimeValue,
     ) -> Result<(), RuntimeMessage> {
-        self.registry
-            .set_current_object_field(stable_id, type_id, field_id, expected, value)
+        self.registry.set_current_object_field(
+            stable_id,
+            type_id,
+            field_id,
+            usize::MAX,
+            expected,
+            value,
+        )
+    }
+
+    fn set_object_field_dense(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), RuntimeMessage> {
+        self.registry.set_current_object_field(
+            stable_id,
+            type_id,
+            field_id,
+            field_index,
+            expected,
+            value,
+        )
     }
 
     fn resolve(

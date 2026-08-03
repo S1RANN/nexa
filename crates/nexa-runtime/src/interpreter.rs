@@ -912,7 +912,7 @@ fn execute_static_leaf_class(
             let RuntimeValue::NamedRef { type_id, .. } = value else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (index, expected) =
+            let (index, expected, _) =
                 resolved_class_field(module, type_id, field, row.resolved_nominal)?;
             let field_value = heap.class_field(value, index)?;
             if runtime_value_type(field_value) != Some(expected) {
@@ -930,7 +930,7 @@ fn execute_static_leaf_class(
             let RuntimeValue::NamedRef { type_id, .. } = object else {
                 return Err(InterpreterError::TypeMismatch);
             };
-            let (index, expected) =
+            let (index, expected, _) =
                 resolved_class_field(module, type_id, field, row.resolved_nominal)?;
             if runtime_value_type(replacement) != Some(expected) {
                 return Err(InterpreterError::TypeMismatch);
@@ -1248,9 +1248,13 @@ fn resolved_class_field(
     type_id: StableId,
     field: StableId,
     resolved: ExecutableNominalOperand,
-) -> Result<(usize, ValueType), InterpreterError> {
+) -> Result<(usize, ValueType, Option<usize>), InterpreterError> {
     match resolved {
-        ExecutableNominalOperand::ClassField { type_index, index } => {
+        ExecutableNominalOperand::ClassField {
+            type_index,
+            index,
+            state_index,
+        } => {
             let expected = module
                 .module()
                 .class_types
@@ -1258,13 +1262,36 @@ fn resolved_class_field(
                 .and_then(|class_type| class_type.fields.get(usize::from(index)))
                 .map(|field| field.ty)
                 .ok_or(InterpreterError::TypeMismatch)?;
-            Ok((usize::from(index), expected))
+            Ok((usize::from(index), expected, state_index.map(usize::from)))
         }
         _ => module
             .class_field(type_id.0, field.0)
-            .map(|(index, field)| (index, field.ty))
+            .map(|(index, field)| (index, field.ty, None))
             .ok_or(InterpreterError::TypeMismatch),
     }
+}
+
+fn resolved_state_field(
+    module: &VerifiedModule,
+    resolved: ExecutableNominalOperand,
+) -> Result<(usize, ValueType), InterpreterError> {
+    let ExecutableNominalOperand::StateField {
+        type_index,
+        field_index,
+        sorted_index,
+    } = resolved
+    else {
+        return Err(InterpreterError::TypeMismatch);
+    };
+    let expected = module
+        .module()
+        .state_schema
+        .types
+        .get(usize::from(type_index))
+        .and_then(|state_type| state_type.fields.get(usize::from(field_index)))
+        .map(|field| field.ty)
+        .ok_or(InterpreterError::TypeMismatch)?;
+    Ok((usize::from(sorted_index), expected))
 }
 
 fn static_leaf_upper_fuel(
@@ -1415,6 +1442,16 @@ pub trait InterpreterMigration {
         field_id: StableId,
         expected: ValueType,
     ) -> Result<RuntimeValue, crate::RuntimeMessage>;
+    fn old_field_get_dense(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, crate::RuntimeMessage> {
+        let _ = field_index;
+        self.old_field_get(object, field_id, expected)
+    }
     fn new_create(
         &mut self,
         stable_id: StableId,
@@ -1426,6 +1463,17 @@ pub trait InterpreterMigration {
         field_id: StableId,
         value: RuntimeValue,
     ) -> Result<(), crate::RuntimeMessage>;
+    fn new_set_dense(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), crate::RuntimeMessage> {
+        let _ = (field_index, expected);
+        self.new_set(object, field_id, value)
+    }
     fn preserve(&mut self, stable_id: StableId) -> Result<(), crate::RuntimeMessage>;
     fn replace(
         &mut self,
@@ -1450,6 +1498,17 @@ pub trait InterpreterState {
         field_id: StableId,
         expected: ValueType,
     ) -> Result<RuntimeValue, crate::RuntimeMessage>;
+    fn object_field_dense(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+    ) -> Result<RuntimeValue, crate::RuntimeMessage> {
+        let _ = field_index;
+        self.object_field(stable_id, type_id, field_id, expected)
+    }
 
     fn set_object_field(
         &mut self,
@@ -1459,6 +1518,18 @@ pub trait InterpreterState {
         expected: ValueType,
         value: RuntimeValue,
     ) -> Result<(), crate::RuntimeMessage>;
+    fn set_object_field_dense(
+        &mut self,
+        stable_id: StableId,
+        type_id: StableId,
+        field_id: StableId,
+        field_index: usize,
+        expected: ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), crate::RuntimeMessage> {
+        let _ = field_index;
+        self.set_object_field(stable_id, type_id, field_id, expected, value)
+    }
 
     fn resolve(
         &mut self,
@@ -3153,10 +3224,14 @@ impl CheckedInterpreter {
                     dst,
                 } => {
                     let object = register(&continuation.arena, object)?;
+                    let (field_index, expected) = resolved_state_field(module, resolved_nominal)?;
+                    if expected != ty {
+                        return Err(InterpreterError::TypeMismatch);
+                    }
                     let value = migration
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
-                        .old_field_get(object, field_id, ty)
+                        .old_field_get_dense(object, field_id, field_index, ty)
                         .map_err(InterpreterError::Migration)?;
                     if runtime_value_type(value) != Some(ty) {
                         return Err(InterpreterError::TypeMismatch);
@@ -3187,10 +3262,11 @@ impl CheckedInterpreter {
                 } => {
                     let object = register(&continuation.arena, object)?;
                     let value = register(&continuation.arena, source)?;
+                    let (field_index, expected) = resolved_state_field(module, resolved_nominal)?;
                     migration
                         .as_deref_mut()
                         .ok_or(InterpreterError::HostUnavailable)?
-                        .new_set(object, field_id, value)
+                        .new_set_dense(object, field_id, field_index, expected, value)
                         .map_err(InterpreterError::Migration)?;
                     increment_pc(&mut continuation.arena)?;
                 }
@@ -3477,22 +3553,8 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected) = match resolved_nominal {
-                        ExecutableNominalOperand::ClassField { type_index, index } => (
-                            usize::from(index),
-                            module
-                                .module()
-                                .class_types
-                                .get(usize::from(type_index))
-                                .and_then(|class_type| class_type.fields.get(usize::from(index)))
-                                .map(|field| field.ty)
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                        ),
-                        _ => module
-                            .class_field(type_id.0, field.0)
-                            .map(|(index, field)| (index, field.ty))
-                            .ok_or(InterpreterError::TypeMismatch)?,
-                    };
+                    let (index, expected, state_index) =
+                        resolved_class_field(module, type_id, field, resolved_nominal)?;
                     let field_value = match value {
                         RuntimeValue::NamedRef { .. } => heap
                             .as_deref()
@@ -3501,6 +3563,7 @@ impl CheckedInterpreter {
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
+                            let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let field_value = state_registry.as_deref_mut().map_or_else(
                                 || {
                                     Err(RuntimeMessage::Static(
@@ -3508,10 +3571,11 @@ impl CheckedInterpreter {
                                     ))
                                 },
                                 |registry| {
-                                    registry.object_field(
+                                    registry.object_field_dense(
                                         StableId(stable_id),
                                         type_id,
                                         field,
+                                        state_index,
                                         expected,
                                     )
                                 },
@@ -3538,22 +3602,8 @@ impl CheckedInterpreter {
                     else {
                         return Err(InterpreterError::TypeMismatch);
                     };
-                    let (index, expected) = match resolved_nominal {
-                        ExecutableNominalOperand::ClassField { type_index, index } => (
-                            usize::from(index),
-                            module
-                                .module()
-                                .class_types
-                                .get(usize::from(type_index))
-                                .and_then(|class_type| class_type.fields.get(usize::from(index)))
-                                .map(|field| field.ty)
-                                .ok_or(InterpreterError::TypeMismatch)?,
-                        ),
-                        _ => module
-                            .class_field(type_id.0, field.0)
-                            .map(|(index, field)| (index, field.ty))
-                            .ok_or(InterpreterError::TypeMismatch)?,
-                    };
+                    let (index, expected, state_index) =
+                        resolved_class_field(module, type_id, field, resolved_nominal)?;
                     if runtime_value_type(replacement) != Some(expected) {
                         return Err(InterpreterError::TypeMismatch);
                     }
@@ -3565,6 +3615,7 @@ impl CheckedInterpreter {
                         RuntimeValue::Opaque {
                             value: stable_id, ..
                         } => {
+                            let state_index = state_index.ok_or(InterpreterError::TypeMismatch)?;
                             let update = state_registry.as_deref_mut().map_or_else(
                                 || {
                                     Err(RuntimeMessage::Static(
@@ -3572,10 +3623,11 @@ impl CheckedInterpreter {
                                     ))
                                 },
                                 |registry| {
-                                    registry.set_object_field(
+                                    registry.set_object_field_dense(
                                         StableId(stable_id),
                                         type_id,
                                         field,
+                                        state_index,
                                         expected,
                                         replacement,
                                     )

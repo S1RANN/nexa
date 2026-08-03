@@ -637,6 +637,7 @@ impl StatefulRegistry {
         stable_id: StableId,
         type_id: StableId,
         field_id: StableId,
+        field_index: usize,
         expected: ValueType,
     ) -> Result<RuntimeValue, RuntimeMessage> {
         let slot = self
@@ -646,17 +647,23 @@ impl StatefulRegistry {
             return Err(RuntimeMessage::Static("current state object type mismatch"));
         }
         let fields = self.object_fields(slot);
-        let field =
-            if let Ok(index) = fields.binary_search_by_key(&field_id, |field| field.field_id) {
-                &fields[index]
-            } else {
-                if self.pending_field(stable_id, field_id).is_some() {
-                    return Err(RuntimeMessage::Static(
-                        "current state field is uninitialized",
-                    ));
-                }
-                return Err(RuntimeMessage::Static("current state field does not exist"));
-            };
+        let Some(field) = fields
+            .get(field_index)
+            .filter(|field| field.field_id == field_id)
+            .or_else(|| {
+                fields
+                    .binary_search_by_key(&field_id, |field| field.field_id)
+                    .ok()
+                    .map(|index| &fields[index])
+            })
+        else {
+            if self.pending_field(stable_id, field_id).is_some() {
+                return Err(RuntimeMessage::Static(
+                    "current state field is uninitialized",
+                ));
+            }
+            return Err(RuntimeMessage::Static("current state field does not exist"));
+        };
         let handle_target = match &field.value {
             StateValue::Handle(handle) if handle.domain == self.domain => self
                 .objects
@@ -677,6 +684,7 @@ impl StatefulRegistry {
         stable_id: StableId,
         type_id: StableId,
         field_id: StableId,
+        field_index: usize,
         expected: ValueType,
         value: RuntimeValue,
     ) -> Result<(), RuntimeMessage> {
@@ -692,8 +700,14 @@ impl StatefulRegistry {
             return Err(RuntimeMessage::Static("current state object type mismatch"));
         }
         let field_start = slot.field_start as usize;
-        let field_search = self.fields[field_start..field_start + slot.field_len as usize]
-            .binary_search_by_key(&field_id, |field| field.field_id);
+        let fields = &self.fields[field_start..field_start + slot.field_len as usize];
+        let field_search = fields
+            .get(field_index)
+            .filter(|field| field.field_id == field_id)
+            .map_or_else(
+                || fields.binary_search_by_key(&field_id, |field| field.field_id),
+                |_| Ok(field_index),
+            );
         let pending_index = if field_search.is_err() {
             self.pending_fields
                 .binary_search_by_key(&(stable_id, field_id), |field| {
@@ -1896,6 +1910,22 @@ impl InterpreterMigration for MigrationContext {
         field_id: StableId,
         expected: nexa_bytecode::ValueType,
     ) -> Result<RuntimeValue, RuntimeMessage> {
+        <Self as InterpreterMigration>::old_field_get_dense(
+            self,
+            object,
+            field_id,
+            usize::MAX,
+            expected,
+        )
+    }
+
+    fn old_field_get_dense(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        field_index: usize,
+        expected: nexa_bytecode::ValueType,
+    ) -> Result<RuntimeValue, RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::OldFieldGet);
         self.ensure_open()?;
         let RuntimeValue::MigrationOldObject(object) = object else {
@@ -1911,9 +1941,15 @@ impl InterpreterMigration for MigrationContext {
         }
         let fields = self.old.object_fields(slot);
         let field = fields
-            .binary_search_by_key(&field_id, |field| field.field_id)
-            .map(|index| &fields[index])
-            .map_err(|_| RuntimeMessage::Static("old state field does not exist"))?;
+            .get(field_index)
+            .filter(|field| field.field_id == field_id)
+            .or_else(|| {
+                fields
+                    .binary_search_by_key(&field_id, |field| field.field_id)
+                    .ok()
+                    .map(|index| &fields[index])
+            })
+            .ok_or(RuntimeMessage::Static("old state field does not exist"))?;
         let value = state_field_to_runtime_value(field_id, &field.value, expected)?;
         if runtime_state_type(value) != expected {
             return Err("old state field type mismatch".into());
@@ -1968,6 +2004,50 @@ impl InterpreterMigration for MigrationContext {
         field_id: StableId,
         value: RuntimeValue,
     ) -> Result<(), RuntimeMessage> {
+        let (field_index, expected) = if let RuntimeValue::MigrationStagingObject(handle) = object {
+            let (_, _, type_id, _) = handle.parts();
+            let state_type = self
+                .schema
+                .types
+                .iter()
+                .find(|state_type| state_type.stable_id == type_id)
+                .ok_or(RuntimeMessage::Static(
+                    "candidate state type does not exist",
+                ))?;
+            let field = state_type
+                .fields
+                .iter()
+                .find(|field| field.stable_id == field_id)
+                .ok_or(RuntimeMessage::Static(
+                    "candidate state field does not exist",
+                ))?;
+            let field_index = state_type
+                .fields
+                .iter()
+                .filter(|candidate| candidate.stable_id < field_id)
+                .count();
+            (field_index, field.ty)
+        } else {
+            (usize::MAX, ValueType::I32)
+        };
+        <Self as InterpreterMigration>::new_set_dense(
+            self,
+            object,
+            field_id,
+            field_index,
+            expected,
+            value,
+        )
+    }
+
+    fn new_set_dense(
+        &mut self,
+        object: RuntimeValue,
+        field_id: StableId,
+        field_index: usize,
+        expected: nexa_bytecode::ValueType,
+        value: RuntimeValue,
+    ) -> Result<(), RuntimeMessage> {
         let _observation = self.observe_opcode(MigrationAllocationPhase::NewSet);
         self.ensure_open()?;
         let RuntimeValue::MigrationStagingObject(object) = object else {
@@ -1986,21 +2066,6 @@ impl InterpreterMigration for MigrationContext {
             return Err("staging object type mismatch".into());
         }
         let value = runtime_to_state_value(value, &self.arena, self.domain)?;
-        let expected = self
-            .schema
-            .types
-            .iter()
-            .find(|state_type| state_type.stable_id == type_id)
-            .and_then(|state_type| {
-                state_type
-                    .fields
-                    .iter()
-                    .find(|field| field.stable_id == field_id)
-            })
-            .map(|field| field.ty)
-            .ok_or(RuntimeMessage::Static(
-                "candidate state field does not exist",
-            ))?;
         let handle_target = match &value {
             StateValue::Handle(handle) if handle.domain == self.domain => self
                 .arena
@@ -2015,7 +2080,13 @@ impl InterpreterMigration for MigrationContext {
         }
         let start = slot.field_start as usize;
         let fields = &self.arena.fields[start..start + slot.field_len as usize];
-        let search = fields.binary_search_by_key(&field_id, |field| field.field_id);
+        let search = fields
+            .get(field_index)
+            .filter(|field| field.field_id == field_id)
+            .map_or_else(
+                || fields.binary_search_by_key(&field_id, |field| field.field_id),
+                |_| Ok(field_index),
+            );
         let usage = self.arena.usage();
         let old = search.ok().map(|offset| &fields[offset].value);
         let payload_bytes = usage
@@ -2918,6 +2989,51 @@ mod tests {
             limits,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn current_state_fields_use_the_predecoded_sorted_slot() {
+        let domain = StatefulDomainId::new(17);
+        let object_id = StableId::from_name("dense-state-object");
+        let type_id = StableId::from_name("DenseState");
+        let low_field = StableId(10);
+        let high_field = StableId(20);
+        let mut registry = StatefulRegistry::new(domain);
+        registry
+            .insert(
+                object_id,
+                StateValue::Object(StateObject {
+                    type_id,
+                    version: 1,
+                    fields: BTreeMap::from([
+                        (low_field, StateValue::Bool(true)),
+                        (high_field, StateValue::I32(7)),
+                    ]),
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .current_object_field(object_id, type_id, high_field, 1, ValueType::I32)
+                .unwrap(),
+            RuntimeValue::I32(7)
+        );
+        registry
+            .set_current_object_field(
+                object_id,
+                type_id,
+                high_field,
+                1,
+                ValueType::I32,
+                RuntimeValue::I32(9),
+            )
+            .unwrap();
+        assert_eq!(
+            registry
+                .current_object_field(object_id, type_id, high_field, 1, ValueType::I32)
+                .unwrap(),
+            RuntimeValue::I32(9)
+        );
     }
 
     fn run_migration(

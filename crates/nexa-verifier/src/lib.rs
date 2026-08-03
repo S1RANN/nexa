@@ -223,6 +223,12 @@ pub enum ResolvedNominalOperand {
     ClassField {
         type_index: u16,
         index: u16,
+        state_index: Option<u16>,
+    },
+    StateField {
+        type_index: u16,
+        field_index: u16,
+        sorted_index: u16,
     },
     ArrayType {
         type_index: u16,
@@ -1342,6 +1348,30 @@ const fn instruction_requires_heap(instruction: Instruction) -> bool {
     }
 }
 
+fn resolve_state_field(
+    module: &Module,
+    type_id: StableId,
+    field_id: StableId,
+) -> Option<(usize, usize, usize, ValueType)> {
+    let (type_index, state_type) = module
+        .state_schema
+        .types
+        .iter()
+        .enumerate()
+        .find(|(_, state_type)| state_type.stable_id == type_id)?;
+    let (field_index, field) = state_type
+        .fields
+        .iter()
+        .enumerate()
+        .find(|(_, field)| field.stable_id == field_id)?;
+    let sorted_index = state_type
+        .fields
+        .iter()
+        .filter(|candidate| candidate.stable_id < field_id)
+        .count();
+    Some((type_index, field_index, sorted_index, field.ty))
+}
+
 #[allow(clippy::too_many_lines)]
 fn verify_function(
     module: &Module,
@@ -1795,21 +1825,20 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[object] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field = module
-                    .state_schema
-                    .types
-                    .iter()
-                    .find(|state_type| state_type.stable_id == type_id)
-                    .and_then(|state_type| {
-                        state_type
-                            .fields
-                            .iter()
-                            .find(|field| field.stable_id == field_id)
-                    })
-                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                if field.ty != ty {
+                let (type_index, field_index, sorted_index, field_type) =
+                    resolve_state_field(module, type_id, field_id)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                if field_type != ty {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 }
+                resolved_operands[pc] = ResolvedNominalOperand::StateField {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    field_index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    sorted_index: u16::try_from(sorted_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
                 state[register(dst)?] = Some(ty);
             }
             Instruction::StateHandleResolve {
@@ -1924,19 +1953,18 @@ fn verify_function(
                 let Some(ValueType::Named(type_id)) = state[object] else {
                     return Err(error(Some(pc), VerifyErrorKind::TypeMismatch));
                 };
-                let field = module
-                    .state_schema
-                    .types
-                    .iter()
-                    .find(|state_type| state_type.stable_id == type_id)
-                    .and_then(|state_type| {
-                        state_type
-                            .fields
-                            .iter()
-                            .find(|field| field.stable_id == field_id)
-                    })
-                    .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
-                require(&state, source, field.ty)?;
+                let (type_index, field_index, sorted_index, field_type) =
+                    resolve_state_field(module, type_id, field_id)
+                        .ok_or_else(|| error(Some(pc), VerifyErrorKind::TypeMismatch))?;
+                resolved_operands[pc] = ResolvedNominalOperand::StateField {
+                    type_index: u16::try_from(type_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    field_index: u16::try_from(field_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    sorted_index: u16::try_from(sorted_index)
+                        .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                };
+                require(&state, source, field_type)?;
             }
             Instruction::StateReplace { target, .. } => {
                 if function.effect != FunctionEffect::Migration {
@@ -2215,11 +2243,18 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                let state_index = resolve_state_field(module, type_id, field)
+                    .map(|(_, _, sorted_index, _)| {
+                        u16::try_from(sorted_index)
+                            .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))
+                    })
+                    .transpose()?;
                 resolved_operands[pc] = ResolvedNominalOperand::ClassField {
                     type_index: u16::try_from(type_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    state_index,
                 };
                 state[register(dst)?] = Some(field_type);
             }
@@ -2249,11 +2284,18 @@ fn verify_function(
                     .ok_or_else(|| {
                         error(Some(pc), VerifyErrorKind::ClassFieldOutOfRange(field.0))
                     })?;
+                let state_index = resolve_state_field(module, type_id, field)
+                    .map(|(_, _, sorted_index, _)| {
+                        u16::try_from(sorted_index)
+                            .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))
+                    })
+                    .transpose()?;
                 resolved_operands[pc] = ResolvedNominalOperand::ClassField {
                     type_index: u16::try_from(type_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
                     index: u16::try_from(field_index)
                         .map_err(|_| error(Some(pc), VerifyErrorKind::TypeMismatch))?,
+                    state_index,
                 };
                 require(&state, value, field_type)?;
             }
@@ -3768,7 +3810,9 @@ mod tests {
     };
     use nexa_core::{FileId, SourceSpan, StableId};
 
-    use super::{VerifierLimits, VerifyErrorKind, verify, verify_reload_transition};
+    use super::{
+        ResolvedNominalOperand, VerifierLimits, VerifyErrorKind, verify, verify_reload_transition,
+    };
 
     #[test]
     fn host_import_authority_metadata_is_canonical() {
@@ -6326,6 +6370,72 @@ mod tests {
     }
 
     #[test]
+    fn current_state_class_fields_carry_their_sorted_dense_slot() {
+        let type_id = StableId::from_name("DenseState");
+        let high_field = StableId(20);
+        let low_field = StableId(10);
+        let fields = vec![
+            StructField {
+                stable_id: high_field,
+                ty: ValueType::I32,
+            },
+            StructField {
+                stable_id: low_field,
+                ty: ValueType::Bool,
+            },
+        ];
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![ValueType::Named(type_id)],
+                result: Some(ValueType::I32),
+            },
+            2,
+        );
+        function
+            .set_root(0)
+            .unwrap()
+            .emit(Instruction::ClassGet {
+                source: 0,
+                field: high_field,
+                dst: 1,
+            })
+            .emit(Instruction::Return { source: 1 });
+        let mut function = function.finish().unwrap();
+        function
+            .root_maps
+            .iter_mut()
+            .find(|root_map| root_map.pc == 1)
+            .expect("return root map")
+            .bitmap[0] = false;
+        let mut module = ModuleBuilder::new();
+        module
+            .state_schema(StateSchema {
+                types: vec![StateType {
+                    stable_id: type_id,
+                    version: 1,
+                    fields: fields
+                        .iter()
+                        .map(|field| StateField {
+                            stable_id: field.stable_id,
+                            ty: field.ty,
+                        })
+                        .collect(),
+                }],
+            })
+            .class_type(ClassType { type_id, fields })
+            .function(function);
+        let verified = verify(module.finish(), VerifierLimits::default()).unwrap();
+        assert!(matches!(
+            verified.resolved_operand(0, 0),
+            ResolvedNominalOperand::ClassField {
+                type_index: 0,
+                index: 0,
+                state_index: Some(1),
+            }
+        ));
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn migration_fields_and_replace_targets_require_exact_state_schema_nominals() {
         let owner = StableId::from_name("Owner");
@@ -6386,11 +6496,19 @@ mod tests {
                 module.finish()
             };
 
-        verify(
+        let verified = verify(
             old_field_module(owner, ValueType::I32),
             VerifierLimits::default(),
         )
         .unwrap();
+        assert!(matches!(
+            verified.resolved_operand(0, 0),
+            ResolvedNominalOperand::StateField {
+                type_index: 0,
+                field_index: 0,
+                sorted_index: 0,
+            }
+        ));
         for forged in [
             old_field_module(other_owner, ValueType::I32),
             old_field_module(owner, ValueType::Bool),
