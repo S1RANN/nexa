@@ -253,6 +253,8 @@ fn host_collections_are_typed_views_and_prelude_types_are_qualified() {
                     bytes: Buffer<Option<Vec>>,
                 );
                 fn token() -> Token<Some>;
+                fn compact() -> Buffer<Option<Vec>>;
+                fn structs() -> Array<Vec>;
                 async fn load(values: Array<String>) -> Result<Vec, Error>;
             }
         }
@@ -265,6 +267,14 @@ fn host_collections_are_typed_views_and_prelude_types_are_qualified() {
     assert!(source.contains("__NexaBufferRef<'a, ::std::option::Option<VecRef<'a>>>"));
     assert!(source.contains("::std::string::String"));
     assert!(source.contains("::std::boxed::Box"));
+    assert!(
+        source.contains("begin_reference_buffer"),
+        "Buffer<Option<T>> must select compact named-reference storage"
+    );
+    assert!(
+        source.contains("begin_array"),
+        "Array<Struct> must retain value/row storage"
+    );
     assert!(!source.contains("values: nexa_runtime::HostArrayRef"));
     assert!(!source.contains("bytes: nexa_runtime::HostBufferRef"));
 }

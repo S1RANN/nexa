@@ -721,8 +721,8 @@ fn validate_return(
         "return_array" => {
             let values = heap.array_values(*value).unwrap();
             assert_eq!(
-                values,
-                [
+                values.iter().collect::<Vec<_>>(),
+                vec![
                     RuntimeValue::I32(1),
                     RuntimeValue::I32(2),
                     RuntimeValue::I32(3)
@@ -733,8 +733,8 @@ fn validate_return(
         "return_buffer" => {
             let values = heap.buffer_values(*value).unwrap();
             assert_eq!(
-                values,
-                [
+                values.iter().collect::<Vec<_>>(),
+                vec![
                     RuntimeValue::I32(4),
                     RuntimeValue::I32(5),
                     RuntimeValue::I32(6)
@@ -761,8 +761,8 @@ fn validate_return(
         }
         "return_buffer_struct" => {
             let values = heap.buffer_values(*value).unwrap();
-            validate_record(heap, values[0], "buffer-a", 31);
-            validate_record(heap, values[1], "buffer-b", 32);
+            validate_record(heap, values.get(0).unwrap(), "buffer-a", 31);
+            validate_record(heap, values.get(1).unwrap(), "buffer-b", 32);
             Some(values.len())
         }
         "return_nested_enum" => {
@@ -785,19 +785,19 @@ fn validate_return(
         "return_result_buffer" => {
             let (_, _, _, payload) = heap.enum_parts(*value).unwrap();
             let records = heap.buffer_values(payload.unwrap()).unwrap();
-            validate_record(heap, records[0], "result-buffer", 61);
+            validate_record(heap, records.get(0).unwrap(), "result-buffer", 61);
             Some(records.len())
         }
         "return_large_array" => {
             let values = heap.array_values(*value).unwrap();
             assert_eq!(values.len(), 31);
-            assert_eq!(values[30], RuntimeValue::I32(30));
+            assert_eq!(values.get(30), Some(RuntimeValue::I32(30)));
             Some(values.len())
         }
         "return_large_buffer" => {
             let values = heap.buffer_values(*value).unwrap();
             assert_eq!(values.len(), 32);
-            assert_eq!(values[31], RuntimeValue::I32(31));
+            assert_eq!(values.get(31), Some(RuntimeValue::I32(31)));
             Some(values.len())
         }
         "return_nested" => {
@@ -815,8 +815,11 @@ fn validate_return(
                 72,
             );
             assert_eq!(
-                heap.buffer_values(fields[1]).unwrap(),
-                [
+                heap.buffer_values(fields[1])
+                    .unwrap()
+                    .iter()
+                    .collect::<Vec<_>>(),
+                vec![
                     RuntimeValue::I32(8),
                     RuntimeValue::I32(9),
                     RuntimeValue::I32(10)

@@ -60,8 +60,9 @@ pub use frame::{
 };
 pub use heap::{
     CollectionArena, CollectionArenaInspection, CollectionRange, CollectionReservation,
-    CollectionStats, GcBudget, GcPhase, GcRef, GcRoots, Heap, HeapByteInspection, HeapError,
-    IncrementalGcReport, MapSetOutcome, Object, VmAllocationCounters,
+    CollectionStats, CollectionStorage, CollectionView, GcBudget, GcPhase, GcRef, GcRoots, Heap,
+    HeapByteInspection, HeapError, IncrementalGcReport, MapSetOutcome, Object,
+    VmAllocationCounters,
 };
 pub use host::{
     CompletionAccounting, CopyBuffer, DecodeTypedSnapshot, EncodeHostReturn, EncodedSnapshot,

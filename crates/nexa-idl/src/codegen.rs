@@ -2225,12 +2225,21 @@ fn encode_runtime_value(
             let type_id = nexa_bytecode::array_type(binding_value_type(inner)).0;
             let element_type = runtime_value_type(inner);
             let nested = encode_runtime_value(model, inner, quote!(value), writer.clone())?;
-            quote! {{
-                let mut __nexa_array = #writer.begin_array(
+            let begin = if uses_compact_named_reference(inner) {
+                quote!(#writer.begin_reference_array(
                     nexa_runtime::StableId(#type_id),
                     #element_type,
                     (#source).len(),
-                )?;
+                )?)
+            } else {
+                quote!(#writer.begin_array(
+                    nexa_runtime::StableId(#type_id),
+                    #element_type,
+                    (#source).len(),
+                )?)
+            };
+            quote! {{
+                let mut __nexa_array = #begin;
                 for value in #source {
                     let __nexa_encoded = #nested;
                     #writer.push_array_value(&mut __nexa_array, __nexa_encoded)?;
@@ -2242,12 +2251,21 @@ fn encode_runtime_value(
             let type_id = nexa_bytecode::buffer_type(binding_value_type(inner)).0;
             let element_type = runtime_value_type(inner);
             let nested = encode_runtime_value(model, inner, quote!(value), writer.clone())?;
-            quote! {{
-                let mut __nexa_buffer = #writer.begin_buffer(
+            let begin = if uses_compact_named_reference(inner) {
+                quote!(#writer.begin_reference_buffer(
                     nexa_runtime::StableId(#type_id),
                     #element_type,
                     (#source).len(),
-                )?;
+                )?)
+            } else {
+                quote!(#writer.begin_buffer(
+                    nexa_runtime::StableId(#type_id),
+                    #element_type,
+                    (#source).len(),
+                )?)
+            };
+            quote! {{
+                let mut __nexa_buffer = #begin;
                 for value in (#source).into_vec() {
                     let __nexa_encoded = #nested;
                     #writer.push_buffer_value(&mut __nexa_buffer, __nexa_encoded)?;
@@ -2354,6 +2372,25 @@ fn encode_runtime_value(
             }
         },
     })
+}
+
+fn uses_compact_named_reference(ty: &ResolvedTypeRef) -> bool {
+    match &ty.kind {
+        ResolvedTypeKind::Array(_)
+        | ResolvedTypeKind::Buffer(_)
+        | ResolvedTypeKind::Option(_)
+        | ResolvedTypeKind::Result(_, _) => true,
+        ResolvedTypeKind::Named(named) => matches!(named.kind, NamedAbiKind::Enum),
+        ResolvedTypeKind::I32
+        | ResolvedTypeKind::I64
+        | ResolvedTypeKind::F32
+        | ResolvedTypeKind::F64
+        | ResolvedTypeKind::Bool
+        | ResolvedTypeKind::Rune
+        | ResolvedTypeKind::String
+        | ResolvedTypeKind::Token(_)
+        | ResolvedTypeKind::Snapshot(_) => false,
+    }
 }
 
 fn decode_host_value_ref(

@@ -1241,7 +1241,7 @@ impl<'a> HostValueRef<'a> {
         if let Some(rows) = heap.array_rows(self.value).map_err(|_| HostTrap::Type)? {
             return Ok(HostArrayRef {
                 type_id,
-                values: rows.cells,
+                values: crate::CollectionView::Values(rows.cells),
                 rows: Some((rows.stride, rows.struct_type)),
                 heap,
             });
@@ -1426,7 +1426,7 @@ macro_rules! host_collection_ref {
             type_id: StableId,
             /// Live arena cells: one per element, or `stride` per element
             /// for flattened struct rows (WP52).
-            values: &'a [crate::RuntimeValue],
+            values: crate::CollectionView<'a>,
             /// `Some((stride, struct_type))` when elements are flattened
             /// struct rows served as borrowed views.
             rows: Option<(usize, StableId)>,
@@ -1457,8 +1457,10 @@ macro_rules! host_collection_ref {
 
             pub fn get(self, index: usize) -> Result<HostValueRef<'a>, HostTrap> {
                 if let Some((stride, struct_type)) = self.rows {
-                    let fields = self
-                        .values
+                    let crate::CollectionView::Values(values) = self.values else {
+                        return Err(HostTrap::Type);
+                    };
+                    let fields = values
                         .get(index * stride..(index + 1) * stride)
                         .ok_or(HostTrap::Type)?;
                     return Ok(HostValueRef {
@@ -1472,7 +1474,6 @@ macro_rules! host_collection_ref {
                 }
                 self.values
                     .get(index)
-                    .copied()
                     .map(|value| HostValueRef {
                         value,
                         heap: Some(self.heap),
@@ -1820,20 +1821,29 @@ impl HostReturnRequirements {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct HostCollectionBuilder {
     range: crate::heap::CollectionRange,
     written: usize,
     type_id: StableId,
     element_type: nexa_bytecode::ValueType,
+    storage: crate::CollectionStorage,
     buffer: bool,
+    pending: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingHostCollection {
+    range: crate::heap::CollectionRange,
+    storage: crate::CollectionStorage,
 }
 
 /// An all-or-nothing encoder over pre-reserved object and collection storage.
 pub struct HostReturnTransaction<'a> {
     heap: &'a mut crate::Heap,
     heap_reservation: crate::heap::HeapReservation,
-    collection_reservation: crate::heap::CollectionReservation,
+    collection_quota: crate::heap::CollectionQuotaReservation,
+    pending_collections: [Option<PendingHostCollection>; MAX_HOST_RETURN_FIELDS],
     remaining_string_bytes: usize,
     remaining_struct_fields: usize,
     committed: bool,
@@ -1855,17 +1865,18 @@ impl<'a> HostReturnTransaction<'a> {
         if heap.failure_trigger(crate::RuntimeFailurePoint::HostReturnCollectionReservation) {
             return Err(HostTrap::Type);
         }
-        let mut collection_reservation = heap
-            .preflight_collection(requirements.collection_elements)
+        let mut collection_quota = heap
+            .preflight_collection_quota(requirements.collection_elements)
             .map_err(|_| HostTrap::Type)?;
         if heap.begin_host_transaction().is_err() {
-            heap.release_collection_reservation(&mut collection_reservation);
+            heap.release_collection_quota_reservation(&mut collection_quota);
             return Err(HostTrap::Type);
         }
         Ok(Self {
             heap,
             heap_reservation,
-            collection_reservation,
+            collection_quota,
+            pending_collections: [None; MAX_HOST_RETURN_FIELDS],
             remaining_string_bytes: requirements.string_bytes,
             remaining_struct_fields: requirements.struct_fields,
             committed: false,
@@ -1927,15 +1938,32 @@ impl<'a> HostReturnTransaction<'a> {
         self.heap
             .validate_collection_length(length)
             .map_err(|_| HostTrap::Type)?;
-        let range =
-            crate::Heap::reserve_collection_segment(&mut self.collection_reservation, length)
-                .map_err(|_| HostTrap::Type)?;
+        let pending = self
+            .pending_collections
+            .iter()
+            .position(Option::is_none)
+            .ok_or(HostTrap::Type)?;
+        // A bare Named type is ambiguous at this API boundary: structs and
+        // opaque handles require wide value cells. Generated bindings use
+        // the explicit compact-reference entrypoint for enum/collection
+        // references.
+        let storage = match element_type {
+            nexa_bytecode::ValueType::Named(_) => crate::CollectionStorage::Values,
+            other => crate::CollectionStorage::for_type(other),
+        };
+        let range = self
+            .heap
+            .claim_reserved_typed_collection(&mut self.collection_quota, storage, length)
+            .map_err(|_| HostTrap::Type)?;
+        self.pending_collections[pending] = Some(PendingHostCollection { range, storage });
         Ok(HostCollectionBuilder {
             range,
             written: 0,
             type_id,
             element_type,
+            storage,
             buffer: false,
+            pending,
         })
     }
 
@@ -1947,6 +1975,31 @@ impl<'a> HostReturnTransaction<'a> {
         self.push_collection_value(builder, value)
     }
 
+    /// Starts an Array whose named elements are represented by one compact
+    /// GC reference (enum/class/collection values), not a wide value cell.
+    pub fn begin_reference_array(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        length: usize,
+    ) -> Result<HostCollectionBuilder, HostTrap> {
+        if !matches!(element_type, nexa_bytecode::ValueType::Named(_)) {
+            return Err(HostTrap::Type);
+        }
+        let mut builder = self.begin_array(type_id, element_type, length)?;
+        let storage = crate::CollectionStorage::NamedRef;
+        self.heap
+            .claim_physical_collection(storage, builder.range)
+            .map_err(|_| HostTrap::Type)?;
+        builder.storage = storage;
+        self.pending_collections[builder.pending] = Some(PendingHostCollection {
+            range: builder.range,
+            storage,
+        });
+        Ok(builder)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
     pub fn finish_array(
         &mut self,
         builder: HostCollectionBuilder,
@@ -1954,14 +2007,18 @@ impl<'a> HostReturnTransaction<'a> {
         if builder.buffer || builder.written != builder.range.length {
             return Err(HostTrap::Type);
         }
-        self.heap
+        let value = self
+            .heap
             .commit_array_reserved(
                 &mut self.heap_reservation,
                 builder.type_id,
                 builder.element_type,
+                builder.storage,
                 builder.range,
             )
-            .map_err(|_| HostTrap::Type)
+            .map_err(|_| HostTrap::Type)?;
+        self.pending_collections[builder.pending] = None;
+        Ok(value)
     }
 
     pub fn begin_buffer(
@@ -1975,6 +2032,17 @@ impl<'a> HostReturnTransaction<'a> {
         Ok(builder)
     }
 
+    pub fn begin_reference_buffer(
+        &mut self,
+        type_id: StableId,
+        element_type: nexa_bytecode::ValueType,
+        length: usize,
+    ) -> Result<HostCollectionBuilder, HostTrap> {
+        let mut builder = self.begin_reference_array(type_id, element_type, length)?;
+        builder.buffer = true;
+        Ok(builder)
+    }
+
     pub fn push_buffer_value(
         &mut self,
         builder: &mut HostCollectionBuilder,
@@ -1983,6 +2051,7 @@ impl<'a> HostReturnTransaction<'a> {
         self.push_collection_value(builder, value)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn finish_buffer(
         &mut self,
         builder: HostCollectionBuilder,
@@ -1990,14 +2059,18 @@ impl<'a> HostReturnTransaction<'a> {
         if !builder.buffer || builder.written != builder.range.length {
             return Err(HostTrap::Type);
         }
-        self.heap
+        let value = self
+            .heap
             .commit_buffer_reserved(
                 &mut self.heap_reservation,
                 builder.type_id,
                 builder.element_type,
+                builder.storage,
                 builder.range,
             )
-            .map_err(|_| HostTrap::Type)
+            .map_err(|_| HostTrap::Type)?;
+        self.pending_collections[builder.pending] = None;
+        Ok(value)
     }
 
     fn push_collection_value(
@@ -2012,7 +2085,13 @@ impl<'a> HostReturnTransaction<'a> {
             return Err(HostTrap::Type);
         }
         self.heap
-            .write_collection_at(builder.range, builder.written, value)
+            .typed_collection_set(
+                builder.storage,
+                builder.element_type,
+                builder.range,
+                builder.written,
+                value,
+            )
             .map_err(|_| HostTrap::Type)?;
         builder.written += 1;
         Ok(())
@@ -2038,8 +2117,8 @@ impl<'a> HostReturnTransaction<'a> {
             || !crate::Heap::reservation_complete(&self.heap_reservation)
             || self.remaining_string_bytes != 0
             || self.remaining_struct_fields != 0
-            || crate::Heap::complete_collection_reservation(&mut self.collection_reservation)
-                .is_err()
+            || !crate::Heap::collection_quota_complete(&self.collection_quota)
+            || self.pending_collections.iter().any(Option::is_some)
         {
             return Err(HostTrap::Type);
         }
@@ -2053,8 +2132,14 @@ impl Drop for HostReturnTransaction<'_> {
     fn drop(&mut self) {
         if !self.committed {
             self.heap.rollback_host_transaction();
+            for pending in &mut self.pending_collections {
+                if let Some(pending) = pending.take() {
+                    self.heap
+                        .release_typed_collection(pending.storage, pending.range);
+                }
+            }
             self.heap
-                .release_collection_reservation(&mut self.collection_reservation);
+                .release_collection_quota_reservation(&mut self.collection_quota);
         }
     }
 }
@@ -4458,8 +4543,8 @@ mod tests {
 
         let array = encode_three_i32(&mut heap).unwrap();
         assert_eq!(
-            heap.array_values(array).unwrap(),
-            [
+            heap.array_values(array).unwrap().iter().collect::<Vec<_>>(),
+            vec![
                 RuntimeValue::I32(1),
                 RuntimeValue::I32(2),
                 RuntimeValue::I32(3)

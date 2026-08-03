@@ -6554,7 +6554,7 @@ fn work(x: i32) -> i32 {
                 let RuntimeValue::String { reference, .. } = part else {
                     panic!("expected string")
                 };
-                heap.string(*reference).unwrap()
+                heap.string(reference).unwrap()
             })
             .collect::<Vec<_>>();
         assert_eq!(rendered, ["a", "b", ""]);

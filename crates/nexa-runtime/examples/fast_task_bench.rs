@@ -286,7 +286,7 @@ fn main() {
     results.push(bench("nexa_gc_collect", host_samples, || {
         let (mut realm, _, _) = loaded(fast.clone());
         realm
-            .allocate(nexa_runtime::Object::I32Array(vec![1, 2, 3]))
+            .allocate(nexa_runtime::Object::String("gc-probe".into()))
             .unwrap();
         black_box(realm.collect_garbage().unwrap());
     }));

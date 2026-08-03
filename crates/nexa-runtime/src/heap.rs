@@ -187,6 +187,105 @@ pub struct CollectionArena {
     capacity: usize,
 }
 
+/// Preallocated scalar collection storage. Unlike `CollectionArena`, each
+/// element occupies exactly `size_of::<T>()`; extents share the same bounded
+/// first-fit/release discipline and never allocate after heap construction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScalarArena<T> {
+    values: Vec<T>,
+    capacity: usize,
+    empty: T,
+}
+
+impl<T: Copy> ScalarArena<T> {
+    fn new(capacity: usize, empty: T) -> Self {
+        Self {
+            values: Vec::with_capacity(capacity),
+            capacity,
+            empty,
+        }
+    }
+
+    fn claim_exact(&mut self, range: CollectionRange) -> Result<(), HeapError> {
+        if range.end() > self.capacity {
+            return Err(HeapError::CapacityExhausted);
+        }
+        if self.values.len() < range.end() {
+            self.values.resize(range.end(), self.empty);
+        }
+        Ok(())
+    }
+
+    fn release(&mut self, range: CollectionRange) {
+        if range.length == 0 {
+            return;
+        }
+        if let Some(values) = self.values.get_mut(range.start..range.end()) {
+            values.fill(self.empty);
+        }
+    }
+
+    fn values(&self, range: CollectionRange) -> Result<&[T], HeapError> {
+        self.values
+            .get(range.start..range.end())
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: range.end(),
+                length: self.capacity,
+            })
+    }
+
+    fn values_mut(&mut self, range: CollectionRange) -> Result<&mut [T], HeapError> {
+        self.values
+            .get_mut(range.start..range.end())
+            .ok_or(HeapError::IndexOutOfBounds {
+                index: range.end(),
+                length: self.capacity,
+            })
+    }
+
+    fn checkpoint_clone(&self) -> Self {
+        let mut values = Vec::with_capacity(self.values.capacity());
+        values.extend_from_slice(&self.values);
+        Self {
+            values,
+            capacity: self.capacity,
+            empty: self.empty,
+        }
+    }
+}
+
+fn claim_scalar_regrow<T: Copy>(
+    arena: &mut ScalarArena<T>,
+    new_range: CollectionRange,
+    old_range: CollectionRange,
+    live: usize,
+    write: impl FnOnce(&mut [T]),
+) -> Result<CollectionRange, HeapError> {
+    arena.claim_exact(new_range)?;
+    let capacity = new_range.length;
+    let old_start = old_range.start;
+    let old_end = old_range.end();
+    let new_start = new_range.start;
+    let new_end = new_range.end();
+    if old_range.length == 0 {
+        write(&mut arena.values[new_start..new_end]);
+    } else if new_end <= old_start || old_end <= new_start {
+        let (destination, source) = if new_end <= old_start {
+            let (left, right) = arena.values.split_at_mut(old_start);
+            (&mut left[new_start..new_end], &right[..old_range.length])
+        } else {
+            let (left, right) = arena.values.split_at_mut(new_start);
+            (&mut right[..capacity], &left[old_start..old_end])
+        };
+        destination[..live].copy_from_slice(&source[..live]);
+        write(destination);
+    } else {
+        arena.release(new_range);
+        return Err(HeapError::CapacityExhausted);
+    }
+    Ok(new_range)
+}
+
 /// Preallocated typed storage for Map entries. Extents move between maps
 /// during incremental rehash without asking the system allocator for a new
 /// `Vec`, so Map creation and its common growth path stay allocation-free
@@ -463,7 +562,6 @@ pub enum Object {
     /// `Arc` reference and a GC header; literal bytes are allocated once by
     /// `ExecutableModule`, never on `LoadString`.
     SharedString(Arc<str>),
-    I32Array(Vec<i32>),
     /// WP72: map headers live in the heap's typed map arena. The physical
     /// object slot carries only the arena index instead of the widest
     /// `VmMap` header (including its optional rehash state).
@@ -495,6 +593,7 @@ pub enum Object {
     Array {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
+        storage: CollectionStorage,
         /// Capacity extent inside the collection arena (WP48); `length`
         /// tracks the live prefix so pushes grow amortized (WP49). The
         /// extent is measured in arena cells: `row_stride` cells per
@@ -510,6 +609,7 @@ pub enum Object {
     Buffer {
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
+        storage: CollectionStorage,
         range: CollectionRange,
     },
 }
@@ -532,8 +632,7 @@ impl Object {
             | Self::Class { .. }
             | Self::Map { .. }
             | Self::String(_)
-            | Self::SharedString(_)
-            | Self::I32Array(_) => {}
+            | Self::SharedString(_) => {}
         }
     }
 
@@ -546,17 +645,85 @@ impl Object {
     fn payload_bytes(&self) -> u64 {
         let bytes = match self {
             Self::String(text) => text.capacity(),
-            Self::I32Array(values) => values.capacity().saturating_mul(size_of::<i32>()),
-            Self::Array { range, .. }
-            | Self::Buffer { range, .. }
-            | Self::Struct { range, .. }
-            | Self::Class { range, .. } => range.length.saturating_mul(size_of::<RuntimeValue>()),
+            Self::Array { range, storage, .. } | Self::Buffer { range, storage, .. } => {
+                range.length.saturating_mul(storage.cell_size())
+            }
+            Self::Struct { range, .. } | Self::Class { range, .. } => {
+                range.length.saturating_mul(size_of::<RuntimeValue>())
+            }
             // Shared literal bytes belong to ExecutableModule; Map payload
             // lives in its typed arena; Enum payload remains inline.
             Self::SharedString(_) | Self::Map { .. } | Self::Enum { .. } => 0,
         };
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
+}
+
+/// Physical arena selected for one logical collection element. Named values
+/// are deliberately split between flattened/wide values and references:
+/// `ValueType::Named` alone cannot distinguish structs from classes/enums.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectionStorage {
+    Values,
+    I32,
+    I64,
+    F32,
+    F64,
+    Bool,
+    Rune,
+    String,
+    Ref,
+    NamedRef,
+}
+
+impl CollectionStorage {
+    pub(crate) const fn for_type(element_type: nexa_bytecode::ValueType) -> Self {
+        match element_type {
+            nexa_bytecode::ValueType::I32 => Self::I32,
+            nexa_bytecode::ValueType::I64 => Self::I64,
+            nexa_bytecode::ValueType::F32 => Self::F32,
+            nexa_bytecode::ValueType::F64 => Self::F64,
+            nexa_bytecode::ValueType::Bool => Self::Bool,
+            nexa_bytecode::ValueType::Rune => Self::Rune,
+            nexa_bytecode::ValueType::String => Self::String,
+            nexa_bytecode::ValueType::Ref => Self::Ref,
+            nexa_bytecode::ValueType::Named(_) => Self::NamedRef,
+        }
+    }
+
+    const fn cell_size(self) -> usize {
+        match self {
+            Self::I32 | Self::F32 | Self::Rune => 4,
+            Self::I64 | Self::F64 | Self::Ref | Self::NamedRef => 8,
+            Self::Bool => 1,
+            Self::String => size_of::<(GcRef, u64)>(),
+            Self::Values => size_of::<RuntimeValue>(),
+        }
+    }
+
+    const fn is_compact(self) -> bool {
+        !matches!(self, Self::Values)
+    }
+}
+
+fn collection_storage_for_values(
+    element_type: nexa_bytecode::ValueType,
+    values: &[RuntimeValue],
+) -> Result<CollectionStorage, HeapError> {
+    let storage = match element_type {
+        nexa_bytecode::ValueType::Named(expected) => match values.first().copied() {
+            Some(RuntimeValue::NamedRef { type_id, .. }) if type_id == expected => {
+                CollectionStorage::NamedRef
+            }
+            Some(RuntimeValue::Struct { type_id, .. }) if type_id == expected => {
+                CollectionStorage::Values
+            }
+            None => CollectionStorage::Values,
+            Some(_) => return Err(invalid_value_reference()),
+        },
+        other => CollectionStorage::for_type(other),
+    };
+    Ok(storage)
 }
 
 /// Bounded geometric growth for the array capacity extent (WP49): at least
@@ -627,6 +794,97 @@ pub struct ArrayRowsView<'a> {
     pub struct_type: StableId,
 }
 
+/// Borrowed logical collection elements over their physical WP47 storage.
+/// Scalar variants reconstruct `RuntimeValue` only at the API edge; the VM
+/// hot path reads and writes the compact typed cells directly.
+#[derive(Clone, Copy, Debug)]
+pub enum CollectionView<'a> {
+    Values(&'a [RuntimeValue]),
+    I32(&'a [i32]),
+    I64(&'a [i64]),
+    F32(&'a [u32]),
+    F64(&'a [u64]),
+    Bool(&'a [u8]),
+    Rune(&'a [u32]),
+    String(&'a [(GcRef, u64)]),
+    Ref(&'a [GcRef]),
+    NamedRef {
+        values: &'a [GcRef],
+        type_id: StableId,
+    },
+}
+
+impl<'a> CollectionView<'a> {
+    #[must_use]
+    pub const fn len(self) -> usize {
+        match self {
+            Self::Values(values) => values.len(),
+            Self::I32(values) => values.len(),
+            Self::I64(values) => values.len(),
+            Self::F32(values) | Self::Rune(values) => values.len(),
+            Self::F64(values) => values.len(),
+            Self::Bool(values) => values.len(),
+            Self::String(values) => values.len(),
+            Self::Ref(values) | Self::NamedRef { values, .. } => values.len(),
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<RuntimeValue> {
+        match self {
+            Self::Values(values) => values.get(index).copied(),
+            Self::I32(values) => values.get(index).copied().map(RuntimeValue::I32),
+            Self::I64(values) => values.get(index).copied().map(RuntimeValue::I64),
+            Self::F32(values) => values.get(index).copied().map(RuntimeValue::F32),
+            Self::F64(values) => values.get(index).copied().map(RuntimeValue::F64),
+            Self::Bool(values) => values
+                .get(index)
+                .copied()
+                .map(|value| RuntimeValue::Bool(value != 0)),
+            Self::Rune(values) => values.get(index).copied().map(RuntimeValue::Rune),
+            Self::String(values) => values
+                .get(index)
+                .copied()
+                .map(|(reference, hash)| RuntimeValue::String { reference, hash }),
+            Self::Ref(values) => values.get(index).copied().map(RuntimeValue::Ref),
+            Self::NamedRef { values, type_id } => values
+                .get(index)
+                .copied()
+                .map(|reference| RuntimeValue::NamedRef { reference, type_id }),
+        }
+    }
+
+    #[must_use]
+    pub fn iter(self) -> impl ExactSizeIterator<Item = RuntimeValue> + 'a {
+        (0..self.len()).map(move |index| {
+            self.get(index)
+                .expect("collection view iterator stays within bounds")
+        })
+    }
+
+    fn prefix(self, length: usize) -> Option<Self> {
+        match self {
+            Self::Values(values) => values.get(..length).map(Self::Values),
+            Self::I32(values) => values.get(..length).map(Self::I32),
+            Self::I64(values) => values.get(..length).map(Self::I64),
+            Self::F32(values) => values.get(..length).map(Self::F32),
+            Self::F64(values) => values.get(..length).map(Self::F64),
+            Self::Bool(values) => values.get(..length).map(Self::Bool),
+            Self::Rune(values) => values.get(..length).map(Self::Rune),
+            Self::String(values) => values.get(..length).map(Self::String),
+            Self::Ref(values) => values.get(..length).map(Self::Ref),
+            Self::NamedRef { values, type_id } => values
+                .get(..length)
+                .map(|values| Self::NamedRef { values, type_id }),
+        }
+    }
+}
+
 /// Resolved array header shared by every logical array operation (WP52).
 #[derive(Clone, Copy)]
 struct ArrayParts {
@@ -636,6 +894,7 @@ struct ArrayParts {
     length: usize,
     row_stride: Option<std::num::NonZeroU8>,
     element_type: nexa_bytecode::ValueType,
+    storage: CollectionStorage,
 }
 
 impl ArrayParts {
@@ -693,6 +952,13 @@ pub struct CollectionReservation {
     range: CollectionRange,
     written: usize,
     claimed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct CollectionQuotaReservation {
+    range: CollectionRange,
+    written: usize,
+    remaining: usize,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -926,7 +1192,18 @@ pub struct Heap {
     max_objects: u32,
     max_string_bytes: usize,
     max_collection_length: usize,
+    max_collection_elements: usize,
+    collection_elements_used: usize,
     collections: CollectionArena,
+    /// K13/WP47: compact 4-byte cells for Array/Buffer<i32>.
+    i32_collections: ScalarArena<i32>,
+    i64_collections: ScalarArena<i64>,
+    f32_collections: ScalarArena<u32>,
+    f64_collections: ScalarArena<u64>,
+    bool_collections: ScalarArena<u8>,
+    rune_collections: ScalarArena<u32>,
+    string_collections: ScalarArena<(GcRef, u64)>,
+    ref_collections: ScalarArena<GcRef>,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
     failure_injector: RuntimeFailureInjector,
@@ -984,8 +1261,17 @@ pub(crate) struct HeapCheckpoint {
     free_maps: Vec<u32>,
     map_slots: MapSlotArena,
     collections: CollectionArena,
+    i32_collections: ScalarArena<i32>,
+    i64_collections: ScalarArena<i64>,
+    f32_collections: ScalarArena<u32>,
+    f64_collections: ScalarArena<u64>,
+    bool_collections: ScalarArena<u8>,
+    rune_collections: ScalarArena<u32>,
+    string_collections: ScalarArena<(GcRef, u64)>,
+    ref_collections: ScalarArena<GcRef>,
     host_staging: Vec<GcRef>,
     host_transaction_active: bool,
+    collection_elements_used: usize,
 }
 
 impl Heap {
@@ -1042,8 +1328,17 @@ impl Heap {
             free_maps,
             map_slots: self.map_slots.clone(),
             collections: self.collections.checkpoint_clone(),
+            i32_collections: self.i32_collections.checkpoint_clone(),
+            i64_collections: self.i64_collections.checkpoint_clone(),
+            f32_collections: self.f32_collections.checkpoint_clone(),
+            f64_collections: self.f64_collections.checkpoint_clone(),
+            bool_collections: self.bool_collections.checkpoint_clone(),
+            rune_collections: self.rune_collections.checkpoint_clone(),
+            string_collections: self.string_collections.checkpoint_clone(),
+            ref_collections: self.ref_collections.checkpoint_clone(),
             host_staging,
             host_transaction_active: self.host_transaction_active,
+            collection_elements_used: self.collection_elements_used,
         }
     }
 
@@ -1061,8 +1356,17 @@ impl Heap {
         self.free_maps = checkpoint.free_maps;
         self.map_slots = checkpoint.map_slots;
         self.collections = checkpoint.collections;
+        self.i32_collections = checkpoint.i32_collections;
+        self.i64_collections = checkpoint.i64_collections;
+        self.f32_collections = checkpoint.f32_collections;
+        self.f64_collections = checkpoint.f64_collections;
+        self.bool_collections = checkpoint.bool_collections;
+        self.rune_collections = checkpoint.rune_collections;
+        self.string_collections = checkpoint.string_collections;
+        self.ref_collections = checkpoint.ref_collections;
         self.host_staging = checkpoint.host_staging;
         self.host_transaction_active = checkpoint.host_transaction_active;
+        self.collection_elements_used = checkpoint.collection_elements_used;
         // G6: the restored object population owns a different footprint;
         // re-derive the gauge from the ground truth walk.
         self.live_payload_bytes = self.recompute_live_payload_bytes();
@@ -1089,9 +1393,34 @@ impl Heap {
             max_objects,
             max_string_bytes,
             max_collection_length: max_collection_length.min(i32::MAX as usize),
+            max_collection_elements,
+            collection_elements_used: 0,
             collections: CollectionArena::new(
                 max_collection_elements,
                 max_collection_ranges.max(max_objects as usize + 1),
+            ),
+            i32_collections: ScalarArena::new(max_collection_elements, 0),
+            i64_collections: ScalarArena::new(max_collection_elements, 0),
+            f32_collections: ScalarArena::new(max_collection_elements, 0),
+            f64_collections: ScalarArena::new(max_collection_elements, 0),
+            bool_collections: ScalarArena::new(max_collection_elements, 0),
+            rune_collections: ScalarArena::new(max_collection_elements, 0),
+            string_collections: ScalarArena::new(
+                max_collection_elements,
+                (
+                    GcRef {
+                        index: u32::MAX,
+                        generation: u32::MAX,
+                    },
+                    0,
+                ),
+            ),
+            ref_collections: ScalarArena::new(
+                max_collection_elements,
+                GcRef {
+                    index: u32::MAX,
+                    generation: u32::MAX,
+                },
             ),
             host_staging: Vec::with_capacity(max_objects as usize),
             host_transaction_active: false,
@@ -1323,10 +1652,11 @@ impl Heap {
             .checked_add(1)
             .ok_or(HeapError::CapacityExhausted)?;
         let mut objects = self.preflight(object_count)?;
-        let mut collection = self.preflight_collection(part_count)?;
+        let storage = CollectionStorage::String;
+        let range = self.claim_typed_collection(storage, part_count)?;
         let mut parts = Vec::new();
         if parts.try_reserve_exact(part_count).is_err() {
-            self.release_collection_reservation(&mut collection);
+            self.release_typed_collection(storage, range);
             return Err(HeapError::CapacityExhausted);
         }
         {
@@ -1335,25 +1665,30 @@ impl Heap {
             parts.extend(value.split(delimiter).map(str::to_owned));
         }
         debug_assert_eq!(parts.len(), part_count);
-        for part in parts {
+        for (index, part) in parts.into_iter().enumerate() {
             let value = match self.commit_owned_string(&mut objects, part) {
                 Ok(value) => value,
                 Err(error) => {
-                    self.release_collection_reservation(&mut collection);
+                    self.release_typed_collection(storage, range);
                     return Err(error);
                 }
             };
-            if let Err(error) = self.commit_collection_value(&mut collection, value) {
-                self.release_collection_reservation(&mut collection);
+            if let Err(error) = self.typed_collection_set(
+                storage,
+                nexa_bytecode::ValueType::String,
+                range,
+                index,
+                value,
+            ) {
+                self.release_typed_collection(storage, range);
                 return Err(error);
             }
         }
-        let range = collection.range;
-        Self::complete_collection_reservation(&mut collection)?;
         self.commit_array_reserved(
             &mut objects,
             nexa_bytecode::array_type(nexa_bytecode::ValueType::String),
             nexa_bytecode::ValueType::String,
+            storage,
             range,
         )
     }
@@ -1450,10 +1785,13 @@ impl Heap {
     fn release_object_storage(&mut self, object: &Object) -> u64 {
         let payload = self.object_payload_bytes(object);
         match object {
-            Object::Array { range, .. }
-            | Object::Buffer { range, .. }
-            | Object::Struct { range, .. }
-            | Object::Class { range, .. } => self.collections.release(*range),
+            Object::Array { range, storage, .. } | Object::Buffer { range, storage, .. } => {
+                self.release_typed_collection(*storage, *range);
+            }
+            Object::Struct { range, .. } | Object::Class { range, .. } => {
+                self.collections.release(*range);
+                self.release_collection_quota(range.length);
+            }
             Object::Map { storage } => {
                 let storage = *storage as usize;
                 if let Some(map) = self.maps.get_mut(storage).and_then(Option::take) {
@@ -1466,10 +1804,7 @@ impl Heap {
                         .push(u32::try_from(storage).expect("map arena index originates as u32"));
                 }
             }
-            Object::String(_)
-            | Object::SharedString(_)
-            | Object::I32Array(_)
-            | Object::Enum { .. } => {}
+            Object::String(_) | Object::SharedString(_) | Object::Enum { .. } => {}
         }
         payload
     }
@@ -1510,7 +1845,7 @@ impl Heap {
             Object::Class { .. } => {
                 self.counters.class_allocations = self.counters.class_allocations.saturating_add(1);
             }
-            Object::Array { .. } | Object::Buffer { .. } | Object::I32Array(_) => {
+            Object::Array { .. } | Object::Buffer { .. } => {
                 self.counters.collection_storage_allocations = self
                     .counters
                     .collection_storage_allocations
@@ -1603,19 +1938,392 @@ impl Heap {
         // G6 admission: extent bytes count toward the heap byte ceiling.
         // For regrow this is conservative - the old extent is still held -
         // which is exactly the safe direction.
-        self.ensure_payload_headroom(
-            (element_count as u64).saturating_mul(size_of::<RuntimeValue>() as u64),
-        )?;
-        let range = self
-            .collections
-            .find_free(element_count)
-            .ok_or(HeapError::CapacityExhausted)?;
-        self.collections.claim(range)?;
+        let range = self.claim_global_collection_range(element_count, size_of::<RuntimeValue>())?;
         Ok(CollectionReservation {
             range,
             written: 0,
             claimed: true,
         })
+    }
+
+    fn claim_global_collection_range(
+        &mut self,
+        element_count: usize,
+        element_bytes: usize,
+    ) -> Result<CollectionRange, HeapError> {
+        self.ensure_payload_headroom((element_count as u64).saturating_mul(element_bytes as u64))?;
+        self.claim_collection_quota(element_count)?;
+        let range = self.collections.find_free(element_count).ok_or_else(|| {
+            self.release_collection_quota(element_count);
+            HeapError::CapacityExhausted
+        })?;
+        if let Err(error) = self.collections.claim(range) {
+            self.release_collection_quota(element_count);
+            return Err(error);
+        }
+        Ok(range)
+    }
+
+    fn claim_collection_quota(&mut self, count: usize) -> Result<(), HeapError> {
+        let claimed = self
+            .collection_elements_used
+            .checked_add(count)
+            .ok_or(HeapError::CapacityExhausted)?;
+        if claimed > self.max_collection_elements {
+            return Err(HeapError::CapacityExhausted);
+        }
+        self.collection_elements_used += count;
+        Ok(())
+    }
+
+    fn release_collection_quota(&mut self, count: usize) {
+        self.collection_elements_used = self
+            .collection_elements_used
+            .checked_sub(count)
+            .expect("released collection extent was charged");
+    }
+
+    pub(crate) fn preflight_collection_quota(
+        &mut self,
+        count: usize,
+    ) -> Result<CollectionQuotaReservation, HeapError> {
+        let range = self.claim_global_collection_range(count, size_of::<RuntimeValue>())?;
+        Ok(CollectionQuotaReservation {
+            range,
+            written: 0,
+            remaining: count,
+        })
+    }
+
+    pub(crate) fn claim_reserved_typed_collection(
+        &mut self,
+        reservation: &mut CollectionQuotaReservation,
+        storage: CollectionStorage,
+        count: usize,
+    ) -> Result<CollectionRange, HeapError> {
+        if count > reservation.remaining {
+            return Err(HeapError::CapacityExhausted);
+        }
+        let range = CollectionRange {
+            start: reservation.range.start + reservation.written,
+            length: count,
+        };
+        let claimed = self.claim_physical_collection(storage, range);
+        match claimed {
+            Ok(()) => {
+                reservation.written += count;
+                reservation.remaining -= count;
+                Ok(range)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn release_collection_quota_reservation(
+        &mut self,
+        reservation: &mut CollectionQuotaReservation,
+    ) {
+        if reservation.remaining != 0 {
+            let tail = CollectionRange {
+                start: reservation.range.start + reservation.written,
+                length: reservation.remaining,
+            };
+            self.collections.release(tail);
+            self.release_collection_quota(tail.length);
+        }
+        reservation.remaining = 0;
+    }
+
+    pub(crate) const fn collection_quota_complete(
+        reservation: &CollectionQuotaReservation,
+    ) -> bool {
+        reservation.remaining == 0
+    }
+
+    fn claim_typed_collection(
+        &mut self,
+        storage: CollectionStorage,
+        element_count: usize,
+    ) -> Result<CollectionRange, HeapError> {
+        let range = self.claim_global_collection_range(element_count, storage.cell_size())?;
+        let claimed = self.claim_physical_collection(storage, range);
+        if let Err(error) = claimed {
+            self.collections.release(range);
+            self.release_collection_quota(element_count);
+            return Err(error);
+        }
+        Ok(range)
+    }
+
+    pub(crate) fn claim_physical_collection(
+        &mut self,
+        storage: CollectionStorage,
+        range: CollectionRange,
+    ) -> Result<(), HeapError> {
+        match storage {
+            CollectionStorage::Values => Ok(()),
+            CollectionStorage::I32 => self.i32_collections.claim_exact(range),
+            CollectionStorage::I64 => self.i64_collections.claim_exact(range),
+            CollectionStorage::F32 => self.f32_collections.claim_exact(range),
+            CollectionStorage::F64 => self.f64_collections.claim_exact(range),
+            CollectionStorage::Bool => self.bool_collections.claim_exact(range),
+            CollectionStorage::Rune => self.rune_collections.claim_exact(range),
+            CollectionStorage::String => self.string_collections.claim_exact(range),
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                self.ref_collections.claim_exact(range)
+            }
+        }
+    }
+
+    pub(crate) fn release_typed_collection(
+        &mut self,
+        storage: CollectionStorage,
+        range: CollectionRange,
+    ) {
+        match storage {
+            CollectionStorage::Values => {}
+            CollectionStorage::I32 => self.i32_collections.release(range),
+            CollectionStorage::I64 => self.i64_collections.release(range),
+            CollectionStorage::F32 => self.f32_collections.release(range),
+            CollectionStorage::F64 => self.f64_collections.release(range),
+            CollectionStorage::Bool => self.bool_collections.release(range),
+            CollectionStorage::Rune => self.rune_collections.release(range),
+            CollectionStorage::String => self.string_collections.release(range),
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                self.ref_collections.release(range);
+            }
+        }
+        self.collections.release(range);
+        self.release_collection_quota(range.length);
+    }
+
+    fn typed_collection_view(
+        &self,
+        storage: CollectionStorage,
+        element_type: nexa_bytecode::ValueType,
+        range: CollectionRange,
+    ) -> Result<CollectionView<'_>, HeapError> {
+        match storage {
+            CollectionStorage::Values => {
+                Ok(CollectionView::Values(self.collections.values(range)?))
+            }
+            CollectionStorage::I32 => Ok(CollectionView::I32(self.i32_collections.values(range)?)),
+            CollectionStorage::I64 => Ok(CollectionView::I64(self.i64_collections.values(range)?)),
+            CollectionStorage::F32 => Ok(CollectionView::F32(self.f32_collections.values(range)?)),
+            CollectionStorage::F64 => Ok(CollectionView::F64(self.f64_collections.values(range)?)),
+            CollectionStorage::Bool => {
+                Ok(CollectionView::Bool(self.bool_collections.values(range)?))
+            }
+            CollectionStorage::Rune => {
+                Ok(CollectionView::Rune(self.rune_collections.values(range)?))
+            }
+            CollectionStorage::String => Ok(CollectionView::String(
+                self.string_collections.values(range)?,
+            )),
+            CollectionStorage::Ref => Ok(CollectionView::Ref(self.ref_collections.values(range)?)),
+            CollectionStorage::NamedRef => {
+                let nexa_bytecode::ValueType::Named(type_id) = element_type else {
+                    return Err(invalid_value_reference());
+                };
+                Ok(CollectionView::NamedRef {
+                    values: self.ref_collections.values(range)?,
+                    type_id,
+                })
+            }
+        }
+    }
+
+    fn typed_collection_get(
+        &self,
+        storage: CollectionStorage,
+        element_type: nexa_bytecode::ValueType,
+        range: CollectionRange,
+        index: usize,
+    ) -> Result<RuntimeValue, HeapError> {
+        let view = self.typed_collection_view(storage, element_type, range)?;
+        view.get(index).ok_or(HeapError::IndexOutOfBounds {
+            index,
+            length: view.len(),
+        })
+    }
+
+    pub(crate) fn typed_collection_set(
+        &mut self,
+        storage: CollectionStorage,
+        element_type: nexa_bytecode::ValueType,
+        range: CollectionRange,
+        index: usize,
+        value: RuntimeValue,
+    ) -> Result<(), HeapError> {
+        macro_rules! set_scalar {
+            ($arena:ident, $pattern:pat => $stored:expr) => {{
+                let $pattern = value else {
+                    return Err(invalid_value_reference());
+                };
+                let values = self.$arena.values_mut(range)?;
+                let length = values.len();
+                let slot = values
+                    .get_mut(index)
+                    .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+                *slot = $stored;
+                Ok(())
+            }};
+        }
+        match storage {
+            CollectionStorage::I32 => {
+                set_scalar!(i32_collections, RuntimeValue::I32(value) => value)
+            }
+            CollectionStorage::I64 => {
+                set_scalar!(i64_collections, RuntimeValue::I64(value) => value)
+            }
+            CollectionStorage::F32 => {
+                set_scalar!(f32_collections, RuntimeValue::F32(value) => value)
+            }
+            CollectionStorage::F64 => {
+                set_scalar!(f64_collections, RuntimeValue::F64(value) => value)
+            }
+            CollectionStorage::Bool => {
+                set_scalar!(bool_collections, RuntimeValue::Bool(value) => u8::from(value))
+            }
+            CollectionStorage::Rune => {
+                set_scalar!(rune_collections, RuntimeValue::Rune(value) => value)
+            }
+            CollectionStorage::String => {
+                self.shade_on_write(value);
+                set_scalar!(
+                    string_collections,
+                    RuntimeValue::String { reference, hash } => (reference, hash)
+                )
+            }
+            CollectionStorage::Ref => {
+                self.shade_on_write(value);
+                set_scalar!(ref_collections, RuntimeValue::Ref(reference) => reference)
+            }
+            CollectionStorage::NamedRef => {
+                let nexa_bytecode::ValueType::Named(expected) = element_type else {
+                    return Err(invalid_value_reference());
+                };
+                let RuntimeValue::NamedRef { reference, type_id } = value else {
+                    return Err(invalid_value_reference());
+                };
+                if type_id != expected {
+                    return Err(invalid_value_reference());
+                }
+                self.shade_on_write(value);
+                let values = self.ref_collections.values_mut(range)?;
+                let length = values.len();
+                let slot = values
+                    .get_mut(index)
+                    .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+                *slot = reference;
+                Ok(())
+            }
+            CollectionStorage::Values => {
+                self.shade_on_write(value);
+                let values = self.collections.values_mut(range)?;
+                let length = values.len();
+                let slot = values
+                    .get_mut(index)
+                    .ok_or(HeapError::IndexOutOfBounds { index, length })?;
+                *slot = value;
+                Ok(())
+            }
+        }
+    }
+
+    fn typed_collection_copy_within(
+        &mut self,
+        storage: CollectionStorage,
+        range: CollectionRange,
+        source: std::ops::Range<usize>,
+        destination: usize,
+    ) -> Result<(), HeapError> {
+        match storage {
+            CollectionStorage::I32 => self
+                .i32_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::I64 => self
+                .i64_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::F32 => self
+                .f32_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::F64 => self
+                .f64_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::Bool => self
+                .bool_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::Rune => self
+                .rune_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::String => self
+                .string_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::Ref | CollectionStorage::NamedRef => self
+                .ref_collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+            CollectionStorage::Values => self
+                .collections
+                .values_mut(range)?
+                .copy_within(source, destination),
+        }
+        Ok(())
+    }
+
+    fn typed_collection_clear(
+        &mut self,
+        storage: CollectionStorage,
+        range: CollectionRange,
+        cells: std::ops::Range<usize>,
+    ) -> Result<(), HeapError> {
+        match storage {
+            CollectionStorage::I32 => {
+                self.i32_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::I64 => {
+                self.i64_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::F32 => {
+                self.f32_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::F64 => {
+                self.f64_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::Bool => {
+                self.bool_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::Rune => {
+                self.rune_collections.values_mut(range)?[cells].fill(0);
+            }
+            CollectionStorage::String => {
+                self.string_collections.values_mut(range)?[cells].fill((
+                    GcRef {
+                        index: u32::MAX,
+                        generation: u32::MAX,
+                    },
+                    0,
+                ));
+            }
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                self.ref_collections.values_mut(range)?[cells].fill(GcRef {
+                    index: u32::MAX,
+                    generation: u32::MAX,
+                });
+            }
+            CollectionStorage::Values => {
+                self.collections.values_mut(range)?[cells].fill(RuntimeValue::Unit);
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -1645,48 +2353,13 @@ impl Heap {
         Ok(())
     }
 
-    pub(crate) fn reserve_collection_segment(
-        reservation: &mut CollectionReservation,
-        length: usize,
-    ) -> Result<CollectionRange, HeapError> {
-        let start = reservation.written;
-        let end = start
-            .checked_add(length)
-            .ok_or(HeapError::CapacityExhausted)?;
-        if end > reservation.range.length {
-            return Err(HeapError::IndexOutOfBounds {
-                index: end,
-                length: reservation.range.length,
-            });
-        }
-        reservation.written = end;
-        Ok(CollectionRange {
-            start: reservation.range.start + start,
-            length,
-        })
-    }
-
-    pub(crate) fn write_collection_at(
-        &mut self,
-        range: CollectionRange,
-        index: usize,
-        value: RuntimeValue,
-    ) -> Result<(), HeapError> {
-        let values = self.collections.values_mut(range)?;
-        let length = values.len();
-        let slot = values
-            .get_mut(index)
-            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
-        *slot = value;
-        Ok(())
-    }
-
     pub(crate) fn release_collection_reservation(
         &mut self,
         reservation: &mut CollectionReservation,
     ) {
         if reservation.claimed {
             self.collections.release(reservation.range);
+            self.release_collection_quota(reservation.range.length);
             reservation.claimed = false;
             reservation.written = 0;
         }
@@ -1731,16 +2404,19 @@ impl Heap {
                 .and_then(|slot| slot.object.take());
             if let Some(object) = object {
                 // G6: staged objects vanish outside the sweep, so their
-                // footprint leaves the gauge here. Array/Buffer extents are
-                // NOT released here: the host decode path owns one shared
-                // collection reservation and releases it itself. Struct and
-                // Class field extents (K5) ARE released: they are claimed
-                // directly from the arena at commit time and belong to no
-                // reservation.
+                // footprint leaves the gauge here. Every collection now owns
+                // one typed extent; committed staged objects release that
+                // extent here, while unfinished builders are released by the
+                // transaction drop path.
                 released = released.saturating_add(self.object_payload_bytes(&object));
                 match object {
+                    Object::Array { storage, range, .. }
+                    | Object::Buffer { storage, range, .. } => {
+                        self.release_typed_collection(storage, range);
+                    }
                     Object::Struct { range, .. } | Object::Class { range, .. } => {
                         self.collections.release(range);
+                        self.release_collection_quota(range.length);
                     }
                     Object::Map { storage } => {
                         if let Some(map) = self.maps[storage as usize].take() {
@@ -1773,6 +2449,7 @@ impl Heap {
         reservation: &mut HeapReservation,
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
+        storage: CollectionStorage,
         range: CollectionRange,
     ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::array_type(element_type) {
@@ -1785,6 +2462,7 @@ impl Heap {
             Object::Array {
                 type_id,
                 element_type,
+                storage,
                 range,
                 length,
                 row_stride: None,
@@ -1798,6 +2476,7 @@ impl Heap {
         reservation: &mut HeapReservation,
         type_id: StableId,
         element_type: nexa_bytecode::ValueType,
+        storage: CollectionStorage,
         range: CollectionRange,
     ) -> Result<RuntimeValue, HeapError> {
         if type_id != nexa_bytecode::buffer_type(element_type) {
@@ -1809,6 +2488,7 @@ impl Heap {
             Object::Buffer {
                 type_id,
                 element_type,
+                storage,
                 range,
             },
         );
@@ -1822,16 +2502,23 @@ impl Heap {
         element_type: nexa_bytecode::ValueType,
         values: &[RuntimeValue],
     ) -> Result<RuntimeValue, HeapError> {
-        let mut collection = self.preflight_collection(values.len())?;
-        for value in values {
-            if let Err(error) = self.commit_collection_value(&mut collection, *value) {
-                self.release_collection_reservation(&mut collection);
+        let storage = collection_storage_for_values(element_type, values)?;
+        let range = self.claim_typed_collection(storage, values.len())?;
+        for (index, value) in values.iter().copied().enumerate() {
+            if let Err(error) =
+                self.typed_collection_set(storage, element_type, range, index, value)
+            {
+                self.release_typed_collection(storage, range);
                 return Err(error);
             }
         }
-        let range = collection.range;
-        Self::complete_collection_reservation(&mut collection)?;
-        self.commit_array_reserved(reservation, type_id, element_type, range)
+        match self.commit_array_reserved(reservation, type_id, element_type, storage, range) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.release_typed_collection(storage, range);
+                Err(error)
+            }
+        }
     }
 
     pub(crate) fn commit_buffer_values_reserved(
@@ -1841,16 +2528,23 @@ impl Heap {
         element_type: nexa_bytecode::ValueType,
         values: &[RuntimeValue],
     ) -> Result<RuntimeValue, HeapError> {
-        let mut collection = self.preflight_collection(values.len())?;
-        for value in values {
-            if let Err(error) = self.commit_collection_value(&mut collection, *value) {
-                self.release_collection_reservation(&mut collection);
+        let storage = collection_storage_for_values(element_type, values)?;
+        let range = self.claim_typed_collection(storage, values.len())?;
+        for (index, value) in values.iter().copied().enumerate() {
+            if let Err(error) =
+                self.typed_collection_set(storage, element_type, range, index, value)
+            {
+                self.release_typed_collection(storage, range);
                 return Err(error);
             }
         }
-        let range = collection.range;
-        Self::complete_collection_reservation(&mut collection)?;
-        self.commit_buffer_reserved(reservation, type_id, element_type, range)
+        match self.commit_buffer_reserved(reservation, type_id, element_type, storage, range) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.release_typed_collection(storage, range);
+                Err(error)
+            }
+        }
     }
 
     pub fn allocate_enum(
@@ -2009,11 +2703,15 @@ impl Heap {
             .unwrap_or(u64::MAX);
         // G6 admission: field extents count toward the byte ceiling.
         self.ensure_payload_headroom(bytes)?;
-        let range = self
-            .collections
-            .find_free(fields.len())
-            .ok_or(HeapError::CapacityExhausted)?;
-        self.collections.claim(range)?;
+        self.claim_collection_quota(fields.len())?;
+        let range = self.collections.find_free(fields.len()).ok_or_else(|| {
+            self.release_collection_quota(fields.len());
+            HeapError::CapacityExhausted
+        })?;
+        if let Err(error) = self.collections.claim(range) {
+            self.release_collection_quota(fields.len());
+            return Err(error);
+        }
         self.collections.values_mut(range)?.copy_from_slice(fields);
         // G1: the owner is born marked while a cycle is active, so its
         // children shade at the write - exactly the array-extent barrier;
@@ -2272,6 +2970,7 @@ impl Heap {
         let reference = self.allocate(Object::Array {
             type_id,
             element_type,
+            storage: CollectionStorage::for_type(element_type),
             range: CollectionRange::default(),
             length: 0,
             row_stride: None,
@@ -2297,6 +2996,7 @@ impl Heap {
         let reference = self.allocate(Object::Array {
             type_id,
             element_type,
+            storage: CollectionStorage::Values,
             range: CollectionRange::default(),
             length: 0,
             row_stride: Some(field_count),
@@ -2321,7 +3021,12 @@ impl Heap {
             });
         }
         let Some(stride) = parts.rows() else {
-            return Ok(self.collections.values(parts.range)?[index]);
+            return self.typed_collection_get(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                index,
+            );
         };
         // WP52 rows: reading a logical element materializes one transient
         // struct value from the flattened cells; the storage itself never
@@ -2348,9 +3053,13 @@ impl Heap {
             });
         }
         let Some(stride) = parts.rows() else {
-            self.shade_on_write(replacement);
-            self.collections.values_mut(parts.range)?[index] = replacement;
-            return Ok(());
+            return self.typed_collection_set(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                index,
+                replacement,
+            );
         };
         let row = self.struct_row(parts.element_struct_type()?, stride, replacement)?;
         for field in &row[..stride] {
@@ -2361,6 +3070,7 @@ impl Heap {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn array_push(
         &mut self,
         value: RuntimeValue,
@@ -2375,6 +3085,104 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
+        macro_rules! push_scalar {
+            ($arena:ident, $pattern:pat => $stored:expr) => {{
+                let $pattern = element else {
+                    return Err(invalid_value_reference());
+                };
+                let stored = $stored;
+                if current < parts.range.length {
+                    self.$arena.values_mut(parts.range)?[current] = stored;
+                } else {
+                    let capacity = grown_array_capacity(
+                        parts.range.length,
+                        length,
+                        self.max_collection_length,
+                    );
+                    let global_range =
+                        self.claim_global_collection_range(capacity, size_of_val(&stored))?;
+                    let new_range = match claim_scalar_regrow(
+                        &mut self.$arena,
+                        global_range,
+                        parts.range,
+                        current,
+                        |values| values[current] = stored,
+                    ) {
+                        Ok(range) => range,
+                        Err(error) => {
+                            self.collections.release(global_range);
+                            self.release_collection_quota(capacity);
+                            return Err(error);
+                        }
+                    };
+                    if let Err(error) = self.set_array_range(parts.reference, new_range) {
+                        self.$arena.release(new_range);
+                        self.collections.release(new_range);
+                        self.release_collection_quota(new_range.length);
+                        return Err(error);
+                    }
+                    self.$arena.release(parts.range);
+                    self.collections.release(parts.range);
+                    self.release_collection_quota(parts.range.length);
+                    let element_bytes = size_of_val(&stored) as u64;
+                    self.charge_live_payload(
+                        (new_range.length as u64).saturating_mul(element_bytes),
+                    );
+                    self.release_live_payload(
+                        (parts.range.length as u64).saturating_mul(element_bytes),
+                    );
+                }
+                self.set_array_length(parts.reference, length)
+            }};
+        }
+        match parts.storage {
+            CollectionStorage::I32 => {
+                return push_scalar!(i32_collections, RuntimeValue::I32(value) => value);
+            }
+            CollectionStorage::I64 => {
+                return push_scalar!(i64_collections, RuntimeValue::I64(value) => value);
+            }
+            CollectionStorage::F32 => {
+                return push_scalar!(f32_collections, RuntimeValue::F32(value) => value);
+            }
+            CollectionStorage::F64 => {
+                return push_scalar!(f64_collections, RuntimeValue::F64(value) => value);
+            }
+            CollectionStorage::Bool => {
+                return push_scalar!(
+                    bool_collections,
+                    RuntimeValue::Bool(value) => u8::from(value)
+                );
+            }
+            CollectionStorage::Rune => {
+                return push_scalar!(rune_collections, RuntimeValue::Rune(value) => value);
+            }
+            CollectionStorage::String => {
+                self.shade_on_write(element);
+                return push_scalar!(
+                    string_collections,
+                    RuntimeValue::String { reference, hash } => (reference, hash)
+                );
+            }
+            CollectionStorage::Ref => {
+                self.shade_on_write(element);
+                return push_scalar!(ref_collections, RuntimeValue::Ref(reference) => reference);
+            }
+            CollectionStorage::NamedRef => {
+                let nexa_bytecode::ValueType::Named(expected) = parts.element_type else {
+                    return Err(invalid_value_reference());
+                };
+                let RuntimeValue::NamedRef { reference, type_id } = element else {
+                    return Err(invalid_value_reference());
+                };
+                if type_id != expected {
+                    return Err(invalid_value_reference());
+                }
+                self.shade_on_write(element);
+                return push_scalar!(ref_collections, RuntimeValue::NamedRef { .. } => reference);
+            }
+            CollectionStorage::Values => {}
+        }
         let Some(stride) = parts.rows() else {
             self.shade_on_write(element);
             if current < parts.range.length {
@@ -2473,11 +3281,13 @@ impl Heap {
             return Err(HeapError::IndexOutOfBounds { index: 0, length });
         }
         let Some(stride) = parts.rows() else {
-            let values = self.collections.values_mut(parts.range)?;
-            let result = values[length - 1];
-            // Clear the vacated tail slot so no stale reference lingers in
-            // the retained capacity extent.
-            values[length - 1] = RuntimeValue::Unit;
+            let result = self.typed_collection_get(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                length - 1,
+            )?;
+            self.typed_collection_clear(parts.storage, parts.range, length - 1..length)?;
             self.set_array_length(parts.reference, length - 1)?;
             return Ok(result);
         };
@@ -2490,6 +3300,7 @@ impl Heap {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn array_insert(
         &mut self,
         value: RuntimeValue,
@@ -2511,19 +3322,132 @@ impl Heap {
                 max_length: self.max_collection_length,
             })?;
         self.validate_collection_length(length)?;
+        if parts.rows().is_none() && current < parts.range.length {
+            self.typed_collection_copy_within(
+                parts.storage,
+                parts.range,
+                index..current,
+                index + 1,
+            )?;
+            self.typed_collection_set(
+                parts.storage,
+                parts.element_type,
+                parts.range,
+                index,
+                element,
+            )?;
+            let element_bytes = parts.storage.cell_size();
+            self.counters.collection_relocation_bytes = self
+                .counters
+                .collection_relocation_bytes
+                .saturating_add(((current - index) * element_bytes) as u64);
+            self.set_array_length(parts.reference, length)?;
+            return Ok(());
+        }
+        macro_rules! grow_insert_scalar {
+            ($arena:ident, $pattern:pat => $stored:expr) => {{
+                let $pattern = element else {
+                    return Err(invalid_value_reference());
+                };
+                let stored = $stored;
+                let capacity =
+                    grown_array_capacity(parts.range.length, length, self.max_collection_length);
+                let global_range =
+                    self.claim_global_collection_range(capacity, size_of_val(&stored))?;
+                let new_range = match claim_scalar_regrow(
+                    &mut self.$arena,
+                    global_range,
+                    parts.range,
+                    current,
+                    |values| {
+                        values.copy_within(index..current, index + 1);
+                        values[index] = stored;
+                    },
+                ) {
+                    Ok(range) => range,
+                    Err(error) => {
+                        self.collections.release(global_range);
+                        self.release_collection_quota(capacity);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = self.set_array_range(parts.reference, new_range) {
+                    self.$arena.release(new_range);
+                    self.collections.release(new_range);
+                    self.release_collection_quota(new_range.length);
+                    return Err(error);
+                }
+                self.$arena.release(parts.range);
+                self.collections.release(parts.range);
+                self.release_collection_quota(parts.range.length);
+                let element_bytes = size_of_val(&stored) as u64;
+                self.charge_live_payload((new_range.length as u64).saturating_mul(element_bytes));
+                self.release_live_payload(
+                    (parts.range.length as u64).saturating_mul(element_bytes),
+                );
+                self.counters.collection_relocation_bytes = self
+                    .counters
+                    .collection_relocation_bytes
+                    .saturating_add((current as u64).saturating_mul(element_bytes));
+                return self.set_array_length(parts.reference, length);
+            }};
+        }
+        match parts.storage {
+            CollectionStorage::I32 => {
+                grow_insert_scalar!(i32_collections, RuntimeValue::I32(value) => value);
+            }
+            CollectionStorage::I64 => {
+                grow_insert_scalar!(i64_collections, RuntimeValue::I64(value) => value);
+            }
+            CollectionStorage::F32 => {
+                grow_insert_scalar!(f32_collections, RuntimeValue::F32(value) => value);
+            }
+            CollectionStorage::F64 => {
+                grow_insert_scalar!(f64_collections, RuntimeValue::F64(value) => value);
+            }
+            CollectionStorage::Bool => {
+                grow_insert_scalar!(
+                    bool_collections,
+                    RuntimeValue::Bool(value) => u8::from(value)
+                );
+            }
+            CollectionStorage::Rune => {
+                grow_insert_scalar!(rune_collections, RuntimeValue::Rune(value) => value);
+            }
+            CollectionStorage::String => {
+                self.shade_on_write(element);
+                grow_insert_scalar!(
+                    string_collections,
+                    RuntimeValue::String { reference, hash } => (reference, hash)
+                );
+            }
+            CollectionStorage::Ref => {
+                self.shade_on_write(element);
+                grow_insert_scalar!(
+                    ref_collections,
+                    RuntimeValue::Ref(reference) => reference
+                );
+            }
+            CollectionStorage::NamedRef => {
+                let nexa_bytecode::ValueType::Named(expected) = parts.element_type else {
+                    return Err(invalid_value_reference());
+                };
+                let RuntimeValue::NamedRef { reference, type_id } = element else {
+                    return Err(invalid_value_reference());
+                };
+                if type_id != expected {
+                    return Err(invalid_value_reference());
+                }
+                self.shade_on_write(element);
+                grow_insert_scalar!(
+                    ref_collections,
+                    RuntimeValue::NamedRef { .. } => reference
+                );
+            }
+            CollectionStorage::Values => {}
+        }
         let Some(stride) = parts.rows() else {
             self.shade_on_write(element);
-            if current < parts.range.length {
-                let values = self.collections.values_mut(parts.range)?;
-                values.copy_within(index..current, index + 1);
-                values[index] = element;
-                self.counters.collection_relocation_bytes =
-                    self.counters.collection_relocation_bytes.saturating_add(
-                        ((current - index) * std::mem::size_of::<RuntimeValue>()) as u64,
-                    );
-                self.set_array_length(parts.reference, length)?;
-                return Ok(());
-            }
             let capacity =
                 grown_array_capacity(parts.range.length, length, self.max_collection_length);
             self.regrow_array(parts.reference, parts.range, current, capacity, |values| {
@@ -2580,14 +3504,20 @@ impl Heap {
             return Err(HeapError::IndexOutOfBounds { index, length });
         }
         let Some(stride) = parts.rows() else {
-            let values = self.collections.values_mut(parts.range)?;
-            let removed = values[index];
-            values.copy_within(index + 1..length, index);
-            values[length - 1] = RuntimeValue::Unit;
-            self.counters.collection_relocation_bytes =
-                self.counters.collection_relocation_bytes.saturating_add(
-                    ((length - 1 - index) * std::mem::size_of::<RuntimeValue>()) as u64,
-                );
+            let removed =
+                self.typed_collection_get(parts.storage, parts.element_type, parts.range, index)?;
+            self.typed_collection_copy_within(
+                parts.storage,
+                parts.range,
+                index + 1..length,
+                index,
+            )?;
+            self.typed_collection_clear(parts.storage, parts.range, length - 1..length)?;
+            let element_bytes = parts.storage.cell_size();
+            self.counters.collection_relocation_bytes = self
+                .counters
+                .collection_relocation_bytes
+                .saturating_add(((length - 1 - index) * element_bytes) as u64);
             self.set_array_length(parts.reference, length - 1)?;
             return Ok(removed);
         };
@@ -2610,8 +3540,7 @@ impl Heap {
         // references survive in the extent.
         let parts = self.array_parts(value)?;
         let live_cells = parts.length * parts.stride();
-        let values = self.collections.values_mut(parts.range)?;
-        values[..live_cells].fill(RuntimeValue::Unit);
+        self.typed_collection_clear(parts.storage, parts.range, 0..live_cells)?;
         self.set_array_length(parts.reference, 0)
     }
 
@@ -2619,6 +3548,20 @@ impl Heap {
         match self.resolve_mut(reference)? {
             Object::Array { length, .. } => {
                 *length = new_length;
+                Ok(())
+            }
+            _ => Err(HeapError::InvalidReference(reference)),
+        }
+    }
+
+    fn set_array_range(
+        &mut self,
+        reference: GcRef,
+        new_range: CollectionRange,
+    ) -> Result<(), HeapError> {
+        match self.resolve_mut(reference)? {
+            Object::Array { range, .. } => {
+                *range = new_range;
                 Ok(())
             }
             _ => Err(HeapError::InvalidReference(reference)),
@@ -2677,6 +3620,7 @@ impl Heap {
             _ => return Err(HeapError::InvalidReference(reference)),
         }
         self.collections.release(old_range);
+        self.release_collection_quota(old_range.length);
         // G6: the live object traded extents; adjust the gauge by the
         // actual swap instead of re-deriving the whole footprint.
         let value_bytes = size_of::<RuntimeValue>() as u64;
@@ -2687,17 +3631,16 @@ impl Heap {
 
     /// One-cell-per-element live view. Flattened struct-row arrays have no
     /// such view and are read through [`Self::array_rows`] instead (WP52).
-    pub fn array_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+    pub fn array_values(&self, value: RuntimeValue) -> Result<CollectionView<'_>, HeapError> {
         let parts = self.array_parts(value)?;
         if parts.rows().is_some() {
             return Err(HeapError::InvalidReference(parts.reference));
         }
-        let values = self.collections.values(parts.range)?;
-        values
-            .get(..parts.length)
+        self.typed_collection_view(parts.storage, parts.element_type, parts.range)?
+            .prefix(parts.length)
             .ok_or(HeapError::IndexOutOfBounds {
                 index: parts.length,
-                length: values.len(),
+                length: parts.range.length,
             })
     }
 
@@ -2800,6 +3743,7 @@ impl Heap {
                 range,
                 length,
                 row_stride,
+                storage,
             } if *actual == type_id && type_id == nexa_bytecode::array_type(*element_type) => {
                 Ok(ArrayParts {
                     reference,
@@ -2807,6 +3751,7 @@ impl Heap {
                     length: *length,
                     row_stride: *row_stride,
                     element_type: *element_type,
+                    storage: *storage,
                 })
             }
             _ => Err(HeapError::InvalidReference(reference)),
@@ -2829,16 +3774,26 @@ impl Heap {
             });
         }
         let mut heap = self.preflight(1)?;
-        let mut collection = self.preflight_collection(source.len())?;
-        for value in source {
-            self.commit_collection_value(&mut collection, *value)?;
+        let storage = collection_storage_for_values(element_type, source)?;
+        let range = self.claim_typed_collection(storage, source.len())?;
+        for (index, value) in source.iter().copied().enumerate() {
+            if let Err(error) =
+                self.typed_collection_set(storage, element_type, range, index, value)
+            {
+                self.release_typed_collection(storage, range);
+                return Err(error);
+            }
         }
-        let range = collection.range;
-        Self::complete_collection_reservation(&mut collection)?;
-        self.commit_buffer_reserved(&mut heap, type_id, element_type, range)
+        match self.commit_buffer_reserved(&mut heap, type_id, element_type, storage, range) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.release_typed_collection(storage, range);
+                Err(error)
+            }
+        }
     }
 
-    pub fn buffer_values(&self, value: RuntimeValue) -> Result<&[RuntimeValue], HeapError> {
+    pub fn buffer_values(&self, value: RuntimeValue) -> Result<CollectionView<'_>, HeapError> {
         let RuntimeValue::NamedRef { reference, type_id } = value else {
             return Err(invalid_value_reference());
         };
@@ -2846,9 +3801,10 @@ impl Heap {
             Object::Buffer {
                 type_id: actual,
                 element_type,
+                storage,
                 range,
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                self.collections.values(*range)
+                self.typed_collection_view(*storage, *element_type, *range)
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -2859,14 +3815,9 @@ impl Heap {
     }
 
     pub fn buffer_get(&self, value: RuntimeValue, index: usize) -> Result<RuntimeValue, HeapError> {
-        let values = self.buffer_values(value)?;
-        values
-            .get(index)
-            .copied()
-            .ok_or(HeapError::IndexOutOfBounds {
-                index,
-                length: values.len(),
-            })
+        let (_, element_type, storage) = self.buffer_metadata(value)?;
+        let (_, range) = self.buffer_range(value)?;
+        self.typed_collection_get(storage, element_type, range, index)
     }
 
     pub fn buffer_set(
@@ -2875,14 +3826,9 @@ impl Heap {
         index: usize,
         replacement: RuntimeValue,
     ) -> Result<(), HeapError> {
-        self.shade_on_write(replacement);
-        let values = self.buffer_values_mut(value)?;
-        let length = values.len();
-        let slot = values
-            .get_mut(index)
-            .ok_or(HeapError::IndexOutOfBounds { index, length })?;
-        *slot = replacement;
-        Ok(())
+        let (_, element_type, storage) = self.buffer_metadata(value)?;
+        let (_, range) = self.buffer_range(value)?;
+        self.typed_collection_set(storage, element_type, range, index, replacement)
     }
 
     pub fn buffer_slice(
@@ -2891,20 +3837,29 @@ impl Heap {
         start: usize,
         length: usize,
     ) -> Result<RuntimeValue, HeapError> {
-        let (type_id, element_type) = self.buffer_metadata(value)?;
-        let values = self.buffer_values(value)?;
-        let end = checked_collection_end(start, length, values.len())?;
+        let (type_id, element_type, storage) = self.buffer_metadata(value)?;
+        let (_, source_range) = self.buffer_range(value)?;
+        let end = checked_collection_end(start, length, source_range.length)?;
         // Reserve the object slot before claiming/copying collection storage,
         // so a full heap cannot strand an otherwise unreachable arena range.
         let mut heap = self.preflight(1)?;
-        let mut collection = self.preflight_collection(length)?;
-        for index in start..end {
-            let item = self.buffer_values(value)?[index];
-            self.commit_collection_value(&mut collection, item)?;
+        let range = self.claim_typed_collection(storage, length)?;
+        for (destination, source) in (start..end).enumerate() {
+            let item = self.typed_collection_get(storage, element_type, source_range, source)?;
+            if let Err(error) =
+                self.typed_collection_set(storage, element_type, range, destination, item)
+            {
+                self.release_typed_collection(storage, range);
+                return Err(error);
+            }
         }
-        let range = collection.range;
-        Self::complete_collection_reservation(&mut collection)?;
-        self.commit_buffer_reserved(&mut heap, type_id, element_type, range)
+        match self.commit_buffer_reserved(&mut heap, type_id, element_type, storage, range) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                self.release_typed_collection(storage, range);
+                Err(error)
+            }
+        }
     }
 
     pub fn buffer_copy(
@@ -2920,30 +3875,55 @@ impl Heap {
             return Err(invalid_value_reference());
         }
         let source_end =
-            checked_collection_end(source_start, length, self.buffer_values(source)?.len())?;
+            checked_collection_end(source_start, length, self.buffer_range(source)?.1.length)?;
         let destination_end = checked_collection_end(
             destination_start,
             length,
-            self.buffer_values(destination)?.len(),
+            self.buffer_range(destination)?.1.length,
         )?;
         let (_, source_range) = self.buffer_range(source)?;
         let (_, destination_range) = self.buffer_range(destination)?;
         let source_absolute = source_range.start + source_start;
         let destination_absolute = destination_range.start + destination_start;
-        self.counters.collection_relocation_bytes =
-            self.counters.collection_relocation_bytes.saturating_add(
-                ((source_end - source_start) * std::mem::size_of::<RuntimeValue>()) as u64,
-            );
-        self.collections.values.copy_within(
-            source_absolute..source_absolute + (source_end - source_start),
-            destination_absolute,
-        );
+        let copied = source_end - source_start;
+        let element_type = destination_metadata.1;
+        let storage = destination_metadata.2;
+        let element_bytes = storage.cell_size();
+        self.counters.collection_relocation_bytes = self
+            .counters
+            .collection_relocation_bytes
+            .saturating_add((copied * element_bytes) as u64);
+        macro_rules! copy_typed {
+            ($arena:ident) => {
+                self.$arena.values.copy_within(
+                    source_absolute..source_absolute + copied,
+                    destination_absolute,
+                )
+            };
+        }
+        match storage {
+            CollectionStorage::I32 => copy_typed!(i32_collections),
+            CollectionStorage::I64 => copy_typed!(i64_collections),
+            CollectionStorage::F32 => copy_typed!(f32_collections),
+            CollectionStorage::F64 => copy_typed!(f64_collections),
+            CollectionStorage::Bool => copy_typed!(bool_collections),
+            CollectionStorage::Rune => copy_typed!(rune_collections),
+            CollectionStorage::String => copy_typed!(string_collections),
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                copy_typed!(ref_collections);
+            }
+            CollectionStorage::Values => copy_typed!(collections),
+        }
         // G1 barrier: every reference just published into the destination
         // extent is shaded; the gray queue tolerates duplicates.
         if self.gc_phase == GcPhase::Mark {
             for offset in 0..(source_end - source_start) {
-                let value = self.collections.values[destination_absolute + offset];
-                self.shade_on_write(value);
+                if let Some(value) = self
+                    .typed_collection_view(storage, element_type, destination_range)?
+                    .get(destination_start + offset)
+                {
+                    self.shade_on_write(value);
+                }
             }
         }
         debug_assert_eq!(destination_end - destination_start, length);
@@ -2953,7 +3933,7 @@ impl Heap {
     fn buffer_metadata(
         &self,
         value: RuntimeValue,
-    ) -> Result<(StableId, nexa_bytecode::ValueType), HeapError> {
+    ) -> Result<(StableId, nexa_bytecode::ValueType, CollectionStorage), HeapError> {
         let RuntimeValue::NamedRef { type_id, .. } = value else {
             return Err(invalid_value_reference());
         };
@@ -2964,9 +3944,10 @@ impl Heap {
             Object::Buffer {
                 type_id: actual,
                 element_type,
+                storage,
                 ..
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
-                Ok((type_id, *element_type))
+                Ok((type_id, *element_type, *storage))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
@@ -2981,16 +3962,12 @@ impl Heap {
                 type_id: actual,
                 element_type,
                 range,
+                ..
             } if *actual == type_id && type_id == nexa_bytecode::buffer_type(*element_type) => {
                 Ok((reference, *range))
             }
             _ => Err(HeapError::InvalidReference(reference)),
         }
-    }
-
-    fn buffer_values_mut(&mut self, value: RuntimeValue) -> Result<&mut [RuntimeValue], HeapError> {
-        let (_, range) = self.buffer_range(value)?;
-        self.collections.values_mut(range)
     }
 
     pub fn allocate_map(
@@ -3910,6 +4887,50 @@ impl Heap {
         Ok(report)
     }
 
+    fn enqueue_collection_children(
+        &mut self,
+        queue: &mut VecDeque<GcRef>,
+        storage: CollectionStorage,
+        range: CollectionRange,
+        live: usize,
+    ) -> Result<usize, HeapError> {
+        let mut grayed = 0;
+        let mut enqueue = |child| {
+            if Self::enqueue_gray(&mut self.slots, queue, child) {
+                grayed += 1;
+            }
+        };
+        match storage {
+            CollectionStorage::Values => {
+                for value in self.collections.values(range)?[..live].iter().copied() {
+                    if let Some(child) = value_reference(value) {
+                        enqueue(child);
+                    }
+                }
+            }
+            CollectionStorage::String => {
+                for (child, _) in self.string_collections.values(range)?[..live]
+                    .iter()
+                    .copied()
+                {
+                    enqueue(child);
+                }
+            }
+            CollectionStorage::Ref | CollectionStorage::NamedRef => {
+                for child in self.ref_collections.values(range)?[..live].iter().copied() {
+                    enqueue(child);
+                }
+            }
+            CollectionStorage::I32
+            | CollectionStorage::I64
+            | CollectionStorage::F32
+            | CollectionStorage::F64
+            | CollectionStorage::Bool
+            | CollectionStorage::Rune => {}
+        }
+        Ok(grayed)
+    }
+
     /// Drains gray references within the step budget; every pop was already
     /// marked at enqueue time, so this only scans children, streaming them
     /// back through [`Self::enqueue_gray`] with no temporary allocation
@@ -3942,6 +4963,7 @@ impl Heap {
                     range,
                     length,
                     row_stride,
+                    storage,
                     ..
                 } => {
                     let range = *range;
@@ -3949,20 +4971,17 @@ impl Heap {
                     // beyond the live prefix never enters the mark queue.
                     let live =
                         length.saturating_mul(row_stride.map_or(1, |s| usize::from(s.get())));
-                    for index in 0..live.min(range.length) {
-                        let value = self.collections.values(range)?[index];
-                        if let Some(child) = value_reference(value)
-                            && Self::enqueue_gray(&mut self.slots, queue, child)
-                        {
-                            grayed += 1;
-                        }
-                    }
+                    let live = live.min(range.length);
+                    grayed += self.enqueue_collection_children(queue, *storage, range, live)?;
                 }
                 // Buffer and exact Struct/Class extents contain one live
                 // RuntimeValue per cell.
-                Object::Buffer { range, .. }
-                | Object::Struct { range, .. }
-                | Object::Class { range, .. } => {
+                Object::Buffer { storage, range, .. } => {
+                    let range = *range;
+                    grayed +=
+                        self.enqueue_collection_children(queue, *storage, range, range.length)?;
+                }
+                Object::Struct { range, .. } | Object::Class { range, .. } => {
                     let range = *range;
                     for index in 0..range.length {
                         let value = self.collections.values(range)?[index];
@@ -4014,15 +5033,46 @@ impl Heap {
     #[must_use]
     pub fn collection_inspection(&self) -> CollectionArenaInspection {
         CollectionArenaInspection {
-            capacity: self.collections.capacity,
+            capacity: self.max_collection_elements,
             free_elements: self
-                .collections
-                .free_ranges
-                .iter()
-                .map(|range| range.length)
-                .sum(),
+                .max_collection_elements
+                .saturating_sub(self.collection_elements_used),
             free_ranges: self.collections.free_ranges.len(),
         }
+    }
+
+    fn scalar_arena_reserved_bytes(&self) -> u64 {
+        (self.i32_collections.values.capacity() as u64)
+            .saturating_mul(size_of::<i32>() as u64)
+            .saturating_add(
+                (self.i64_collections.values.capacity() as u64)
+                    .saturating_mul(size_of::<i64>() as u64),
+            )
+            .saturating_add(
+                (self.f32_collections.values.capacity() as u64)
+                    .saturating_mul(size_of::<u32>() as u64),
+            )
+            .saturating_add(
+                (self.f64_collections.values.capacity() as u64)
+                    .saturating_mul(size_of::<u64>() as u64),
+            )
+            .saturating_add(self.bool_collections.values.capacity() as u64)
+            .saturating_add(
+                (self.rune_collections.values.capacity() as u64)
+                    .saturating_mul(size_of::<u32>() as u64),
+            )
+            .saturating_add(
+                (self.string_collections.values.capacity() as u64).saturating_mul(size_of::<(
+                    GcRef,
+                    u64,
+                )>(
+                )
+                    as u64),
+            )
+            .saturating_add(
+                (self.ref_collections.values.capacity() as u64)
+                    .saturating_mul(size_of::<GcRef>() as u64),
+            )
     }
 
     /// `GC_V1` heap byte accounting by category (G4). One full walk over the
@@ -4035,6 +5085,8 @@ impl Heap {
         let value_bytes = size_of::<RuntimeValue>() as u64;
         let mut inspection = HeapByteInspection::default();
         let mut occupied = 0_u64;
+        let mut generic_arena_live = 0_u64;
+        let mut scalar_arena_live = 0_u64;
         for slot in &self.slots {
             let Some(object) = slot.object.as_ref() else {
                 continue;
@@ -4046,15 +5098,29 @@ impl Heap {
                         .string_bytes
                         .saturating_add(object.payload_bytes());
                 }
-                Object::Array { .. } | Object::I32Array(_) => {
+                Object::Array { storage, .. } => {
                     inspection.array_bytes = inspection
                         .array_bytes
                         .saturating_add(object.payload_bytes());
+                    if storage.is_compact() {
+                        scalar_arena_live =
+                            scalar_arena_live.saturating_add(object.payload_bytes());
+                    } else {
+                        generic_arena_live =
+                            generic_arena_live.saturating_add(object.payload_bytes());
+                    }
                 }
-                Object::Buffer { .. } => {
+                Object::Buffer { storage, .. } => {
                     inspection.buffer_bytes = inspection
                         .buffer_bytes
                         .saturating_add(object.payload_bytes());
+                    if storage.is_compact() {
+                        scalar_arena_live =
+                            scalar_arena_live.saturating_add(object.payload_bytes());
+                    } else {
+                        generic_arena_live =
+                            generic_arena_live.saturating_add(object.payload_bytes());
+                    }
                 }
                 Object::Map { .. } => {
                     inspection.map_bytes = inspection
@@ -4065,6 +5131,7 @@ impl Heap {
                     inspection.class_payload_bytes = inspection
                         .class_payload_bytes
                         .saturating_add(object.payload_bytes());
+                    generic_arena_live = generic_arena_live.saturating_add(object.payload_bytes());
                 }
                 Object::Enum { .. } => {}
             }
@@ -4081,13 +5148,12 @@ impl Heap {
         let vacant_map_pool_bytes = map_pool_slots
             .saturating_sub(occupied_map_headers)
             .saturating_mul(map_header_bytes);
-        let arena_free_bytes = (self
-            .collections
-            .free_ranges
-            .iter()
-            .map(|range| range.length)
-            .sum::<usize>() as u64)
-            .saturating_mul(value_bytes);
+        let generic_arena_reserved =
+            (self.collections.values.capacity() as u64).saturating_mul(value_bytes);
+        let scalar_arena_reserved = self.scalar_arena_reserved_bytes();
+        let arena_free_bytes = generic_arena_reserved
+            .saturating_sub(generic_arena_live)
+            .saturating_add(scalar_arena_reserved.saturating_sub(scalar_arena_live));
         let map_arena_free_bytes = (self
             .map_slots
             .free_ranges
@@ -4456,7 +5522,7 @@ mod tests {
     #[test]
     fn allocation_failure_does_not_drop_live_objects() {
         let mut heap = Heap::new(2);
-        let live = heap.allocate(Object::I32Array(vec![1, 2])).unwrap();
+        let live = heap.allocate(Object::String("live".into())).unwrap();
         let _probe = heap
             .failure_injector()
             .arm_once(RuntimeFailurePoint::HeapSlot);
@@ -4775,6 +5841,112 @@ mod tests {
     }
 
     #[test]
+    fn scalar_arrays_use_typed_cells_and_share_one_exact_quota() {
+        let mut heap = Heap::new_with_arena_limits(16, 4_096, 8, 24, 32);
+        let cases = [
+            (nexa_bytecode::ValueType::I32, RuntimeValue::I32(-7)),
+            (nexa_bytecode::ValueType::I64, RuntimeValue::I64(-9)),
+            (
+                nexa_bytecode::ValueType::F32,
+                RuntimeValue::F32(1.5_f32.to_bits()),
+            ),
+            (
+                nexa_bytecode::ValueType::F64,
+                RuntimeValue::F64((-2.25_f64).to_bits()),
+            ),
+            (nexa_bytecode::ValueType::Bool, RuntimeValue::Bool(true)),
+            (
+                nexa_bytecode::ValueType::Rune,
+                RuntimeValue::Rune('界' as u32),
+            ),
+        ];
+        let mut arrays = Vec::new();
+        for (element_type, value) in cases {
+            let array = heap
+                .allocate_array(nexa_bytecode::array_type(element_type), element_type)
+                .unwrap();
+            heap.array_push(array, value).unwrap();
+            assert_eq!(heap.array_get(array, 0), Ok(value));
+            let view = heap.array_values(array).unwrap();
+            assert_eq!(view.len(), 1);
+            assert_eq!(view.get(0), Some(value));
+            arrays.push(array);
+        }
+        // Each first push claims the bounded geometric minimum of four
+        // cells. The global quota is shared across physical arenas, so a
+        // seventh independent scalar array cannot silently consume another
+        // per-type capacity pool.
+        let extra = heap
+            .allocate_array(
+                nexa_bytecode::array_type(nexa_bytecode::ValueType::I32),
+                nexa_bytecode::ValueType::I32,
+            )
+            .unwrap();
+        assert_eq!(
+            heap.array_push(extra, RuntimeValue::I32(1)),
+            Err(HeapError::CapacityExhausted)
+        );
+
+        let roots = GcRoots {
+            running_frames: arrays
+                .iter()
+                .chain(std::iter::once(&extra))
+                .filter_map(|value| match value {
+                    RuntimeValue::NamedRef { reference, .. } => Some(*reference),
+                    _ => None,
+                })
+                .collect(),
+            ..GcRoots::default()
+        };
+        assert_eq!(heap.collect(&roots).unwrap().live, 7);
+    }
+
+    #[test]
+    fn named_reference_arrays_use_eight_byte_cells_and_trace_enum_graphs() {
+        let mut heap = Heap::new_with_arena_limits(16, 4_096, 8, 16, 32);
+        let enum_type = StableId::from_name("heap-test::CompactEnum");
+        let variant = StableId::from_name("heap-test::CompactEnum::Some");
+        let payload = heap.allocate_string("payload").unwrap();
+        let payload = RuntimeValue::String {
+            reference: payload,
+            hash: heap.string_hash(payload).unwrap(),
+        };
+        let value = heap
+            .allocate_enum(enum_type, variant, 1, Some(payload))
+            .unwrap();
+        let array = heap
+            .allocate_array(
+                nexa_bytecode::array_type(nexa_bytecode::ValueType::Named(enum_type)),
+                nexa_bytecode::ValueType::Named(enum_type),
+            )
+            .unwrap();
+        heap.array_push(array, value).unwrap();
+        assert_eq!(heap.array_get(array, 0), Ok(value));
+        assert_eq!(
+            heap.byte_inspection().array_bytes,
+            4 * size_of::<super::GcRef>() as u64,
+            "geometric capacity is physically eight bytes per enum reference"
+        );
+
+        let RuntimeValue::NamedRef {
+            reference: array_root,
+            ..
+        } = array
+        else {
+            panic!("array is a named reference")
+        };
+        let roots = GcRoots {
+            running_frames: vec![array_root],
+            ..GcRoots::default()
+        };
+        assert_eq!(
+            heap.collect(&roots).unwrap().live,
+            3,
+            "array -> enum -> string payload remains precisely traced"
+        );
+    }
+
+    #[test]
     fn array_elements_are_traced_from_the_array_root() {
         let mut heap = Heap::new_with_limits(4, usize::MAX, 4);
         let string = heap.allocate_string("kept").unwrap();
@@ -4808,6 +5980,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn buffers_copy_slice_and_enforce_bounds_without_partial_mutation() {
         let mut heap = Heap::new_with_limits(8, usize::MAX, 4);
         let element = nexa_bytecode::ValueType::I32;
@@ -4840,21 +6013,27 @@ mod tests {
             .unwrap();
         heap.buffer_copy(destination, source, 0, 1, 2).unwrap();
         assert_eq!(
-            heap.buffer_values(destination),
-            Ok(&[
+            heap.buffer_values(destination)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
                 RuntimeValue::I32(6),
                 RuntimeValue::I32(9),
                 RuntimeValue::I32(8),
                 RuntimeValue::I32(4),
-            ][..])
+            ]
         );
         assert_eq!(
-            heap.buffer_values(source),
-            Ok(&[
+            heap.buffer_values(source)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![
                 RuntimeValue::I32(9),
                 RuntimeValue::I32(8),
                 RuntimeValue::I32(7),
-            ][..])
+            ]
         );
 
         let slice = heap.buffer_slice(destination, 1, 2).unwrap();
@@ -4862,7 +6041,11 @@ mod tests {
         assert_eq!(heap.buffer_get(slice, 0), Ok(RuntimeValue::I32(5)));
         assert_eq!(heap.buffer_get(destination, 1), Ok(RuntimeValue::I32(9)));
 
-        let before = heap.buffer_values(destination).unwrap().to_vec();
+        let before = heap
+            .buffer_values(destination)
+            .unwrap()
+            .iter()
+            .collect::<Vec<_>>();
         assert_eq!(
             heap.buffer_copy(destination, source, 2, 0, 2),
             Err(HeapError::IndexOutOfBounds {
@@ -4870,7 +6053,13 @@ mod tests {
                 length: 3,
             })
         );
-        assert_eq!(heap.buffer_values(destination), Ok(before.as_slice()));
+        assert_eq!(
+            heap.buffer_values(destination)
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            before
+        );
         assert_eq!(
             heap.buffer_get(destination, 4),
             Err(HeapError::IndexOutOfBounds {

@@ -631,10 +631,10 @@ fn array_growth_stops_at_the_byte_ceiling_without_corruption() {
         "every accepted push is visible, the refused one changed nothing"
     );
     let values = heap.array_values(array).expect("contents stay readable");
-    assert_eq!(values[0], RuntimeValue::I32(0));
+    assert_eq!(values.get(0), Some(RuntimeValue::I32(0)));
     assert_eq!(
-        values[usize::try_from(accepted - 1).expect("bounded")],
-        RuntimeValue::I32(accepted - 1)
+        values.get(usize::try_from(accepted - 1).expect("bounded")),
+        Some(RuntimeValue::I32(accepted - 1))
     );
 }
 
