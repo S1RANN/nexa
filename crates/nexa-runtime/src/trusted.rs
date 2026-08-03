@@ -38,9 +38,66 @@
 #![allow(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::mem::MaybeUninit;
+
 use crate::RuntimeValue;
 use crate::frame::{FrameArena, FrameError};
 use crate::interpreter::InterpreterError;
+
+pub(crate) const STATIC_LEAF_REGISTER_CAPACITY: usize = 16;
+pub(crate) type StaticLeafRegisters = [MaybeUninit<RuntimeValue>; STATIC_LEAF_REGISTER_CAPACITY];
+
+#[inline]
+pub(crate) const fn new_static_leaf_registers() -> StaticLeafRegisters {
+    [MaybeUninit::uninit(); STATIC_LEAF_REGISTER_CAPACITY]
+}
+
+#[inline]
+pub(crate) fn read_static_leaf(registers: &StaticLeafRegisters, register: u16) -> RuntimeValue {
+    debug_assert!(usize::from(register) < registers.len());
+    // SAFETY: `ExecutableModule::build` admits a static leaf only when its
+    // verified register count fits this fixed array. The verifier proves
+    // every operand is below that declared count and definite-initialization
+    // proves every read is preceded by an argument copy or instruction
+    // write. `RuntimeValue` is `Copy` and has no destructor.
+    unsafe {
+        registers
+            .get_unchecked(usize::from(register))
+            .assume_init_read()
+    }
+}
+
+#[inline]
+pub(crate) fn write_static_leaf(
+    registers: &mut StaticLeafRegisters,
+    register: u16,
+    value: RuntimeValue,
+) {
+    debug_assert!(usize::from(register) < registers.len());
+    // SAFETY: identical bound proof to `read_static_leaf`; writing initializes
+    // the selected `MaybeUninit` cell and never drops stale bits.
+    unsafe {
+        registers
+            .get_unchecked_mut(usize::from(register))
+            .write(value);
+    }
+}
+
+#[inline]
+pub(crate) fn read_static_leaf_window(
+    registers: &StaticLeafRegisters,
+    base: u16,
+    count: u16,
+) -> &[RuntimeValue] {
+    let start = usize::from(base);
+    let count = usize::from(count);
+    debug_assert!(start.saturating_add(count) <= registers.len());
+    // SAFETY: the verifier proves both the range bound and definite
+    // initialization of every class-constructor field. `MaybeUninit<T>` has
+    // the same layout as `T`, and this immutable view cannot outlive or
+    // overlap a mutable access to the register bank.
+    unsafe { std::slice::from_raw_parts(registers.as_ptr().add(start).cast(), count) }
+}
 
 /// Reads one register of the current frame with the bounds re-checks the
 /// verifier already discharged removed. Error mapping matches the checked

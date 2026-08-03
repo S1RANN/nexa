@@ -20,6 +20,7 @@ use nexa_verifier::{ResolvedNominalOperand, VerifiedModule};
 use crate::interpreter::{OpcodeCostTable, static_instruction_fuel};
 
 static NEXT_STRING_POOL_ID: AtomicU64 = AtomicU64::new(1);
+const STATIC_LEAF_MAX_INSTRUCTIONS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct PooledStringConstant {
@@ -52,12 +53,52 @@ pub struct ExecutableInstruction {
 #[derive(Clone, Debug)]
 pub struct ExecutableFunction {
     rows: Vec<ExecutableInstruction>,
+    /// Load-time proof for the bounded static leaf executor.
+    /// `None` keeps the full continuation interpreter as the only path.
+    static_leaf: Option<StaticLeafCertificate>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticLeafCertificate {
+    pub fixed_fuel: u64,
+    pub array_pushes: u8,
+    pub array_push_element_fuel: u64,
+    pub buffer_copy: Option<StaticLeafBufferCopy>,
+    pub buffer_get: Option<StaticLeafBufferGet>,
+    pub buffer_work_fuel: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticLeafBufferCopy {
+    pub destination: u16,
+    pub source: u16,
+    pub source_start: usize,
+    pub destination_start: usize,
+    pub length: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StaticLeafBufferGet {
+    pub source: u16,
+    pub index: usize,
 }
 
 impl ExecutableFunction {
     #[must_use]
     pub fn rows(&self) -> &[ExecutableInstruction] {
         &self.rows
+    }
+
+    #[must_use]
+    pub const fn static_leaf_fuel(&self) -> Option<u64> {
+        match self.static_leaf {
+            Some(certificate) => Some(certificate.fixed_fuel),
+            None => None,
+        }
+    }
+
+    pub(crate) const fn static_leaf_certificate(&self) -> Option<StaticLeafCertificate> {
+        self.static_leaf
     }
 }
 
@@ -219,7 +260,8 @@ impl ExecutableModule {
                             }),
                 });
             }
-            functions.push(ExecutableFunction { rows });
+            let static_leaf = certify_static_leaf(function, &rows);
+            functions.push(ExecutableFunction { rows, static_leaf });
         }
         Ok(Self {
             functions,
@@ -260,6 +302,277 @@ impl ExecutableModule {
     }
 }
 
+struct StaticLeafAnalysis {
+    // A class value can also denote state-backed `Opaque` storage, which
+    // requires a registry unavailable to this executor. Class provenance
+    // therefore records only values created by a local `ClassNew`.
+    local_class: [bool; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    // Identity plus exact length for locally created arrays.
+    local_array: [Option<(u8, usize)>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    i32_constant: [Option<i32>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    // Original argument register for buffers; moves retain the origin so
+    // preflight never needs to inspect an uninitialized temporary register.
+    buffer_value: [Option<u16>; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+    next_array: u8,
+    array_pushes: u8,
+    array_push_element_fuel: u64,
+    buffer_copy: Option<StaticLeafBufferCopy>,
+    buffer_get: Option<StaticLeafBufferGet>,
+    buffer_work_fuel: u64,
+}
+
+impl StaticLeafAnalysis {
+    fn new(parameter_count: usize) -> Option<Self> {
+        let mut buffer_value = [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY];
+        for (index, parameter) in buffer_value.iter_mut().take(parameter_count).enumerate() {
+            *parameter = Some(u16::try_from(index).ok()?);
+        }
+        Some(Self {
+            local_class: [false; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+            local_array: [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+            i32_constant: [None; crate::trusted::STATIC_LEAF_REGISTER_CAPACITY],
+            buffer_value,
+            next_array: 0,
+            array_pushes: 0,
+            array_push_element_fuel: 0,
+            buffer_copy: None,
+            buffer_get: None,
+            buffer_work_fuel: 0,
+        })
+    }
+
+    fn clear_destination(&mut self, dst: u16) -> Option<()> {
+        *self.local_class.get_mut(usize::from(dst))? = false;
+        *self.local_array.get_mut(usize::from(dst))? = None;
+        *self.i32_constant.get_mut(usize::from(dst))? = None;
+        *self.buffer_value.get_mut(usize::from(dst))? = None;
+        Some(())
+    }
+
+    fn observe(&mut self, instruction: Instruction) -> Option<()> {
+        match instruction {
+            instruction @ (Instruction::ClassNew { .. }
+            | Instruction::ClassGet { .. }
+            | Instruction::ClassSet { .. }) => self.observe_class(instruction),
+            instruction @ (Instruction::ArrayNew { .. }
+            | Instruction::ArrayPush { .. }
+            | Instruction::ArraySet { .. }
+            | Instruction::ArrayGet { .. }
+            | Instruction::ArrayLen { .. }) => self.observe_array(instruction),
+            instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
+                self.observe_buffer(instruction)
+            }
+            Instruction::Move { dst, source } => {
+                *self.local_class.get_mut(usize::from(dst))? =
+                    *self.local_class.get(usize::from(source))?;
+                *self.local_array.get_mut(usize::from(dst))? =
+                    *self.local_array.get(usize::from(source))?;
+                *self.i32_constant.get_mut(usize::from(dst))? =
+                    *self.i32_constant.get(usize::from(source))?;
+                *self.buffer_value.get_mut(usize::from(dst))? =
+                    *self.buffer_value.get(usize::from(source))?;
+                Some(())
+            }
+            Instruction::LoadI32 { dst, value } => {
+                self.clear_destination(dst)?;
+                *self.i32_constant.get_mut(usize::from(dst))? = Some(value);
+                Some(())
+            }
+            Instruction::Add { dst, lhs, rhs } => {
+                let value = match (
+                    *self.i32_constant.get(usize::from(lhs))?,
+                    *self.i32_constant.get(usize::from(rhs))?,
+                ) {
+                    (Some(lhs), Some(rhs)) => Some(lhs.wrapping_add(rhs)),
+                    _ => None,
+                };
+                self.clear_destination(dst)?;
+                *self.i32_constant.get_mut(usize::from(dst))? = value;
+                Some(())
+            }
+            Instruction::LoadString { dst, .. }
+            | Instruction::StringByteLen { dst, .. }
+            | Instruction::EnumNew { dst, .. } => self.clear_destination(dst),
+            Instruction::Return { .. } => Some(()),
+            _ => None,
+        }
+    }
+
+    fn observe_class(&mut self, instruction: Instruction) -> Option<()> {
+        match instruction {
+            Instruction::ClassNew { dst, .. } => {
+                self.clear_destination(dst)?;
+                *self.local_class.get_mut(usize::from(dst))? = true;
+            }
+            Instruction::ClassGet { source, dst, .. } => {
+                if !*self.local_class.get(usize::from(source))? {
+                    return None;
+                }
+                self.clear_destination(dst)?;
+            }
+            Instruction::ClassSet { source, .. } => {
+                if !*self.local_class.get(usize::from(source))? {
+                    return None;
+                }
+            }
+            _ => unreachable!("class analysis receives only class instructions"),
+        }
+        Some(())
+    }
+
+    fn observe_array(&mut self, instruction: Instruction) -> Option<()> {
+        match instruction {
+            Instruction::ArrayNew { dst, .. } => {
+                let identity = self.next_array;
+                self.next_array = self.next_array.checked_add(1)?;
+                self.clear_destination(dst)?;
+                *self.local_array.get_mut(usize::from(dst))? = Some((identity, 0));
+            }
+            Instruction::ArrayPush { source, .. } => {
+                let (identity, length) = (*self.local_array.get(usize::from(source))?)?;
+                self.array_pushes = self.array_pushes.checked_add(1)?;
+                self.array_push_element_fuel = self.array_push_element_fuel.checked_add(
+                    u64::try_from(length.max(1))
+                        .ok()?
+                        .div_ceil(nexa_bytecode::STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS),
+                )?;
+                let next_length = length.checked_add(1)?;
+                for array in &mut self.local_array {
+                    if array.is_some_and(|(candidate, _)| candidate == identity) {
+                        *array = Some((identity, next_length));
+                    }
+                }
+            }
+            Instruction::ArraySet { source, index, .. } => {
+                self.validate_array_index(source, index)?;
+            }
+            Instruction::ArrayGet {
+                source, index, dst, ..
+            } => {
+                self.validate_array_index(source, index)?;
+                self.clear_destination(dst)?;
+            }
+            Instruction::ArrayLen { source, dst } => {
+                let (_, length) = (*self.local_array.get(usize::from(source))?)?;
+                self.clear_destination(dst)?;
+                *self.i32_constant.get_mut(usize::from(dst))? = i32::try_from(length).ok();
+            }
+            _ => unreachable!("array analysis receives only array instructions"),
+        }
+        Some(())
+    }
+
+    fn validate_array_index(&self, source: u16, index: u16) -> Option<()> {
+        let (_, length) = (*self.local_array.get(usize::from(source))?)?;
+        let index = usize::try_from((*self.i32_constant.get(usize::from(index))?)?).ok()?;
+        (index < length).then_some(())
+    }
+
+    fn observe_buffer(&mut self, instruction: Instruction) -> Option<()> {
+        match instruction {
+            Instruction::BufferCopy {
+                destination,
+                source,
+                source_start,
+                destination_start,
+                length,
+            } => {
+                let destination = (*self.buffer_value.get(usize::from(destination))?)?;
+                let source = (*self.buffer_value.get(usize::from(source))?)?;
+                if self.buffer_copy.is_some() {
+                    return None;
+                }
+                let source_start =
+                    usize::try_from((*self.i32_constant.get(usize::from(source_start))?)?).ok()?;
+                let destination_start =
+                    usize::try_from((*self.i32_constant.get(usize::from(destination_start))?)?)
+                        .ok()?;
+                let length =
+                    usize::try_from((*self.i32_constant.get(usize::from(length))?)?).ok()?;
+                self.buffer_work_fuel = self.buffer_work_fuel.checked_add(
+                    u64::try_from(length)
+                        .ok()?
+                        .div_ceil(nexa_bytecode::STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS),
+                )?;
+                self.buffer_copy = Some(StaticLeafBufferCopy {
+                    destination,
+                    source,
+                    source_start,
+                    destination_start,
+                    length,
+                });
+            }
+            Instruction::BufferGet { source, index, dst } => {
+                let source = (*self.buffer_value.get(usize::from(source))?)?;
+                if self.buffer_get.is_some() {
+                    return None;
+                }
+                let index = usize::try_from((*self.i32_constant.get(usize::from(index))?)?).ok()?;
+                self.buffer_get = Some(StaticLeafBufferGet { source, index });
+                self.clear_destination(dst)?;
+            }
+            _ => unreachable!("buffer analysis receives only buffer instructions"),
+        }
+        Some(())
+    }
+
+    const fn finish(self, fixed_fuel: u64) -> StaticLeafCertificate {
+        StaticLeafCertificate {
+            fixed_fuel,
+            array_pushes: self.array_pushes,
+            array_push_element_fuel: self.array_push_element_fuel,
+            buffer_copy: self.buffer_copy,
+            buffer_get: self.buffer_get,
+            buffer_work_fuel: self.buffer_work_fuel,
+        }
+    }
+}
+
+fn certify_static_leaf(
+    function: &nexa_bytecode::Function,
+    rows: &[ExecutableInstruction],
+) -> Option<StaticLeafCertificate> {
+    if usize::from(function.registers) > crate::trusted::STATIC_LEAF_REGISTER_CAPACITY
+        || function.code.len() > STATIC_LEAF_MAX_INSTRUCTIONS
+    {
+        return None;
+    }
+    let mut analysis = StaticLeafAnalysis::new(function.signature.parameters.len())?;
+    for instruction in function.code.iter().copied() {
+        if !static_leaf_instruction_supported(instruction) {
+            return None;
+        }
+        analysis.observe(instruction)?;
+    }
+    let fixed_fuel = rows
+        .iter()
+        .try_fold(0_u64, |fuel, row| fuel.checked_add(row.attempt_fuel))?;
+    Some(analysis.finish(fixed_fuel))
+}
+
+const fn static_leaf_instruction_supported(instruction: Instruction) -> bool {
+    matches!(
+        instruction,
+        Instruction::LoadI32 { .. }
+            | Instruction::LoadString { .. }
+            | Instruction::Move { .. }
+            | Instruction::Add { .. }
+            | Instruction::StringByteLen { .. }
+            | Instruction::EnumNew { .. }
+            | Instruction::ClassNew { .. }
+            | Instruction::ClassGet { .. }
+            | Instruction::ClassSet { .. }
+            | Instruction::ArrayNew { .. }
+            | Instruction::ArrayPush { .. }
+            | Instruction::ArraySet { .. }
+            | Instruction::ArrayGet { .. }
+            | Instruction::ArrayLen { .. }
+            | Instruction::BufferCopy { .. }
+            | Instruction::BufferGet { .. }
+            | Instruction::Return { .. }
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use nexa_bytecode::{
@@ -269,7 +582,7 @@ mod tests {
     use nexa_core::StableId;
     use nexa_verifier::{VerifierLimits, verify};
 
-    use super::{ExecutableBuildError, ExecutableModule};
+    use super::{ExecutableBuildError, ExecutableModule, static_leaf_instruction_supported};
     use crate::interpreter::{OpcodeCostTable, is_safepoint};
 
     const CORPUS: &str = r#"
@@ -466,5 +779,132 @@ fn update_counter() -> i32 {
             ExecutableModule::build(&module, &costs),
             Err(ExecutableBuildError::CostTableVersionMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn static_leaf_instruction_surface_is_narrow() {
+        for instruction in [
+            Instruction::LoadI32 { dst: 0, value: 7 },
+            Instruction::LoadString { dst: 0, string: 0 },
+            Instruction::Move { dst: 1, source: 0 },
+            Instruction::Add {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Instruction::StringByteLen { dst: 1, source: 0 },
+            Instruction::EnumNew {
+                type_id: StableId(1),
+                variant: StableId(2),
+                payload: Some(0),
+                dst: 1,
+            },
+            Instruction::ClassNew {
+                type_id: StableId(3),
+                fields_base: 0,
+                fields_count: 1,
+                dst: 1,
+            },
+            Instruction::ClassGet {
+                source: 1,
+                field: StableId(4),
+                dst: 2,
+            },
+            Instruction::ClassSet {
+                source: 1,
+                field: StableId(4),
+                value: 2,
+            },
+            Instruction::ArrayNew {
+                type_id: StableId(5),
+                dst: 0,
+            },
+            Instruction::ArrayPush {
+                source: 0,
+                value: 1,
+            },
+            Instruction::ArraySet {
+                source: 0,
+                index: 1,
+                value: 2,
+            },
+            Instruction::ArrayGet {
+                source: 0,
+                index: 1,
+                dst: 2,
+            },
+            Instruction::ArrayLen { source: 0, dst: 1 },
+            Instruction::BufferCopy {
+                destination: 0,
+                source: 1,
+                source_start: 2,
+                destination_start: 2,
+                length: 2,
+            },
+            Instruction::BufferGet {
+                source: 0,
+                index: 1,
+                dst: 2,
+            },
+            Instruction::Return { source: 0 },
+        ] {
+            assert!(
+                static_leaf_instruction_supported(instruction),
+                "certified leaf instruction: {instruction:?}"
+            );
+        }
+        for instruction in [
+            Instruction::Div {
+                dst: 2,
+                lhs: 0,
+                rhs: 1,
+            },
+            Instruction::Trap,
+            Instruction::Call {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+                dst: 0,
+            },
+            Instruction::DeferPush {
+                function: 0,
+                args_base: 0,
+                args_count: 0,
+            },
+            Instruction::Yield,
+        ] {
+            assert!(
+                !static_leaf_instruction_supported(instruction),
+                "effectful, trapping, or control-flow instruction: {instruction:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_leaf_certificate_is_register_bounded() {
+        let mut function = FunctionBuilder::new(
+            Signature {
+                parameters: vec![],
+                result: Some(ValueType::I32),
+            },
+            17,
+        );
+        function
+            .emit(Instruction::LoadI32 { dst: 16, value: 7 })
+            .emit(Instruction::Return { source: 16 });
+        let mut builder = ModuleBuilder::new();
+        builder.metadata(
+            StableId::from_name("static-leaf-register-bound"),
+            nexa_bytecode::StateSchema::default().fingerprint(),
+        );
+        builder.function(function.finish().expect("wide leaf function"));
+        let module = verify(builder.finish(), VerifierLimits::default()).expect("verify wide leaf");
+        let executable =
+            ExecutableModule::build(&module, OpcodeCostTable::canonical()).expect("predecode");
+        assert_eq!(
+            executable.functions()[0].static_leaf_fuel(),
+            None,
+            "a verified function wider than the fixed leaf bank must fall back"
+        );
     }
 }

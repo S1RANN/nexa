@@ -443,6 +443,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         return verify_products();
     }
+    if arguments
+        .iter()
+        .any(|argument| argument == "--dump-bytecode")
+    {
+        let module = nexa_compiler::compile(&full_language_source())?;
+        for (index, function) in module.module().functions.iter().enumerate() {
+            println!("{index}: {:?}", function.code);
+        }
+        return Ok(());
+    }
     let smoke = arguments.iter().any(|argument| argument == "--smoke");
     let samples = argument_value(&arguments, "--samples")
         .map(str::parse)
@@ -464,6 +474,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(1_usize);
     let profiler_enabled = arguments.iter().any(|argument| argument == "--profile");
+    if arguments
+        .iter()
+        .any(|argument| argument == "--static-leaf-ab")
+    {
+        return run_static_leaf_ab(samples, argument_value(&arguments, "--output"));
+    }
     if processes > 1 {
         return run_multi_process(&arguments, processes, samples);
     }
@@ -1467,6 +1483,163 @@ fn verify_products() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// K20 diagnostic: isolates the certified leaf executor from the pooled
+/// continuation path in one process. Each pair alternates order and creates
+/// its fresh heap before timing, so clock drift and setup cannot masquerade
+/// as an execution gain.
+fn run_static_leaf_ab(
+    samples: usize,
+    output: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let module = nexa_compiler::compile(&full_language_source())?;
+    let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())?;
+    let cases = [
+        ("immediate_call", 0, vec![RuntimeValue::I32(41)]),
+        ("result_ok", 1, vec![RuntimeValue::I32(7)]),
+        ("result_err", 2, vec![]),
+        ("string_concat", 4, vec![]),
+        ("struct_construction", 5, vec![]),
+        ("class_allocation", 6, vec![]),
+        ("enum_match", 7, vec![]),
+        ("array_operations", 8, vec![]),
+        ("buffer_copy", 10, vec![]),
+    ];
+    let mut reports = Vec::with_capacity(cases.len());
+    for (name, function, arguments) in cases {
+        if executable.functions()[function as usize]
+            .static_leaf_fuel()
+            .is_none()
+        {
+            return Err(format!("{name} is not certified as a static leaf").into());
+        }
+        let mut full_pool = None;
+        for _ in 0..WARMUP.min(samples) {
+            let (mut fast_heap, fast_arguments) =
+                static_leaf_ab_input(&module, function, &arguments);
+            black_box(run_returned(
+                &module,
+                &executable,
+                function,
+                &fast_arguments,
+                &mut fast_heap,
+                256,
+                &mut None,
+            ));
+            let (mut full_heap, full_arguments) =
+                static_leaf_ab_input(&module, function, &arguments);
+            black_box(run_returned_full(
+                &module,
+                &executable,
+                function,
+                &full_arguments,
+                &mut full_heap,
+                256,
+                &mut full_pool,
+            ));
+        }
+        let mut fast = Vec::with_capacity(samples);
+        let mut full = Vec::with_capacity(samples);
+        for sample in 0..samples {
+            let mut measure = |static_leaf: bool| {
+                let (mut heap, measured_arguments) =
+                    static_leaf_ab_input(&module, function, &arguments);
+                let started = Instant::now();
+                let observation = if static_leaf {
+                    run_returned(
+                        &module,
+                        &executable,
+                        function,
+                        &measured_arguments,
+                        &mut heap,
+                        256,
+                        &mut None,
+                    )
+                } else {
+                    run_returned_full(
+                        &module,
+                        &executable,
+                        function,
+                        &measured_arguments,
+                        &mut heap,
+                        256,
+                        &mut full_pool,
+                    )
+                };
+                black_box(observation);
+                started.elapsed()
+            };
+            if sample % 2 == 0 {
+                fast.push(measure(true));
+                full.push(measure(false));
+            } else {
+                full.push(measure(false));
+                fast.push(measure(true));
+            }
+        }
+        fast.sort_unstable();
+        full.sort_unstable();
+        let fast_p50 = percentile(&fast, 50).max(1);
+        let full_p50 = percentile(&full, 50);
+        reports.push(serde_json::json!({
+            "case": name,
+            "samples": samples,
+            "static_leaf_p50_ns": u64::try_from(fast_p50).unwrap_or(u64::MAX),
+            "full_interpreter_p50_ns": u64::try_from(full_p50).unwrap_or(u64::MAX),
+            "speedup_milli": u64::try_from(
+                full_p50.saturating_mul(1_000) / fast_p50
+            ).unwrap_or(u64::MAX),
+        }));
+    }
+    let report = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "schema": 1,
+            "protocol": "same-process alternating order; fresh heap before each timed operation",
+            "cases": reports,
+        }))?
+    );
+    if let Some(output) = output {
+        std::fs::write(output, &report)?;
+    }
+    print!("{report}");
+    Ok(())
+}
+
+fn static_leaf_ab_input(
+    module: &VerifiedModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+) -> (Heap, Vec<RuntimeValue>) {
+    let mut heap = Heap::new_with_limits(64, 4_096, 64);
+    if function != 10 {
+        return (heap, arguments.to_vec());
+    }
+    let buffer_type = module.module().buffer_types[0].type_id;
+    let destination = heap
+        .allocate_buffer(
+            buffer_type,
+            ValueType::I32,
+            &[
+                RuntimeValue::I32(1),
+                RuntimeValue::I32(2),
+                RuntimeValue::I32(3),
+            ],
+        )
+        .expect("A/B destination buffer");
+    let source = heap
+        .allocate_buffer(
+            buffer_type,
+            ValueType::I32,
+            &[
+                RuntimeValue::I32(7),
+                RuntimeValue::I32(8),
+                RuntimeValue::I32(9),
+            ],
+        )
+        .expect("A/B source buffer");
+    (heap, vec![destination, source])
+}
+
 /// Runs one argument-less product function to completion and returns its
 /// i32 result.
 fn returned_i32(
@@ -1521,6 +1694,32 @@ fn run_returned(
     // continuation storage cycles through `pool` exactly like realm task
     // admission, so steady-state samples measure execution, not arena
     // reservation; cold-start cases pass a fresh empty pool on purpose.
+    if let Some(returned) = CheckedInterpreter::try_run_static_leaf(
+        module,
+        function,
+        arguments,
+        FuelState::new(fuel, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        heap,
+        executable,
+    )
+    .expect("verified static benchmark leaf")
+    {
+        black_box(returned.value);
+        return observation(returned.charge, heap);
+    }
+    run_returned_full(module, executable, function, arguments, heap, fuel, pool)
+}
+
+fn run_returned_full(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+    heap: &mut Heap,
+    fuel: u64,
+    pool: &mut Option<nexa_runtime::FrameArena>,
+) -> Observation {
     let limits = FrameLimits::default();
     let continuation = nexa_runtime::InterpreterContinuation::new_with_storage(
         module,

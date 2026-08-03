@@ -86,7 +86,7 @@ pub use interpreter::{
     CheckedInterpreter, ExecutionCharge, FuelState, HostCallBoundary, InterpreterContinuation,
     InterpreterError, InterpreterHost, InterpreterHostOutcome, InterpreterOutcome,
     InterpreterState, MAX_SCRIPT_CALL_STACK_DEPTH, OpcodeCostTable, ScriptCallStack, ScriptFrame,
-    SuspendReason, Trap, TrapKind,
+    StaticLeafReturn, SuspendReason, Trap, TrapKind,
 };
 pub use metrics::ExecutionMetrics;
 pub use profiler::{

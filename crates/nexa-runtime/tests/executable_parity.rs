@@ -221,3 +221,323 @@ fn trap_kinds_survive_the_row_path() {
         Outcome::Trapped(TrapKind::ArrayIndexOutOfBounds)
     );
 }
+
+const STATIC_LEAF_CORPUS: &str = r#"
+enum Inner { Value(i32), }
+enum Outer { Wrap(Inner), }
+class Counter { mut value: i32, }
+
+fn leaf_add(x: i32) -> i32 {
+    return x + 1;
+}
+fn leaf_string_length() -> i32 {
+    return "static-leaf".byte_len();
+}
+fn leaf_nested(x: i32) -> Outer {
+    return Outer::Wrap(Inner::Value(x));
+}
+fn leaf_class() -> i32 {
+    let value: Counter = new Counter { value: 7 };
+    value.value = value.value + 1;
+    return value.value;
+}
+fn class_argument(value: Counter) -> i32 {
+    return value.value;
+}
+fn leaf_array() -> i32 {
+    let values: Array<i32> = Array::new();
+    values.push(1);
+    values.push(2);
+    values.set(0, 3);
+    return values.get(0) + values.len();
+}
+fn array_argument(values: Array<i32>) -> i32 {
+    return values.get(0);
+}
+fn leaf_buffer(destination: Buffer<i32>, source: Buffer<i32>) -> i32 {
+    destination.copy(source, 0, 0, 3);
+    return destination.get(2);
+}
+fn not_a_leaf(lhs: i32, rhs: i32) -> i32 {
+    return lhs / rhs;
+}
+"#;
+
+fn run_executable_once(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+    heap: &mut Heap,
+) -> (
+    Option<RuntimeValue>,
+    nexa_runtime::ExecutionCharge,
+    FuelState,
+) {
+    let limits = FrameLimits::default();
+    let continuation = CheckedInterpreter::start(
+        module,
+        function,
+        arguments,
+        limits,
+        ContinuationReservation::for_limits(limits),
+    )
+    .expect("start full interpreter");
+    let outcome = CheckedInterpreter::poll_with_heap_and_executable(
+        module,
+        continuation,
+        FuelState::new(1_000_000, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        heap,
+        executable,
+    )
+    .expect("run full interpreter");
+    let InterpreterOutcome::Returned {
+        value,
+        charge,
+        fuel,
+    } = outcome
+    else {
+        panic!("static-leaf reference must return");
+    };
+    (value, charge, fuel)
+}
+
+fn value_shape(heap: &Heap, value: RuntimeValue) -> String {
+    match value {
+        RuntimeValue::NamedRef { .. } => {
+            let (type_id, variant, tag, payload) = heap
+                .enum_parts(value)
+                .expect("named leaf result is an enum");
+            let payload =
+                payload.map_or_else(|| "none".to_owned(), |payload| value_shape(heap, payload));
+            format!("{type_id:?}/{variant:?}/{tag}/{payload}")
+        }
+        RuntimeValue::String { reference, .. } => {
+            format!("string:{:?}", heap.string(reference).expect("leaf string"))
+        }
+        scalar => format!("{scalar:?}"),
+    }
+}
+
+fn assert_static_leaf_certification(module: &VerifiedModule, executable: &ExecutableModule) {
+    assert!(
+        executable.functions()[0].static_leaf_fuel().is_some(),
+        "arithmetic leaf is certified"
+    );
+    assert!(
+        executable.functions()[1].static_leaf_fuel().is_some(),
+        "string leaf is certified"
+    );
+    assert!(
+        executable.functions()[2].static_leaf_fuel().is_some(),
+        "nested enum leaf is certified"
+    );
+    assert!(
+        executable.functions()[3].static_leaf_fuel().is_some(),
+        "locally allocated class leaf is certified"
+    );
+    assert_eq!(
+        executable.functions()[4].static_leaf_fuel(),
+        None,
+        "a class argument may be state-backed and retains the full interpreter"
+    );
+    assert!(
+        executable.functions()[5].static_leaf_fuel().is_some(),
+        "local array shape and indexes are certified: {:?}",
+        module.module().functions[5]
+    );
+    assert_eq!(
+        executable.functions()[6].static_leaf_fuel(),
+        None,
+        "an argument array has no load-time shape proof"
+    );
+    assert!(
+        executable.functions()[7].static_leaf_fuel().is_some(),
+        "constant-range buffer copy is certified with runtime bounds preflight"
+    );
+    assert_eq!(
+        executable.functions()[8].static_leaf_fuel(),
+        None,
+        "division retains the full trapping interpreter"
+    );
+}
+
+fn assert_static_leaf_case(
+    module: &VerifiedModule,
+    executable: &ExecutableModule,
+    function: u32,
+    arguments: &[RuntimeValue],
+) {
+    let mut reference_heap = Heap::new_with_limits(64, 4_096, 64);
+    let (reference_value, reference_charge, reference_fuel) =
+        run_executable_once(module, executable, function, arguments, &mut reference_heap);
+    let mut leaf_heap = Heap::new_with_limits(64, 4_096, 64);
+    let leaf = CheckedInterpreter::try_run_static_leaf(
+        module,
+        function,
+        arguments,
+        FuelState::new(1_000_000, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        &mut leaf_heap,
+        executable,
+    )
+    .expect("static leaf executes")
+    .expect("function is certified");
+
+    assert_eq!(
+        leaf.charge, reference_charge,
+        "identical instruction charge"
+    );
+    assert_eq!(leaf.fuel, reference_fuel, "identical fuel settlement");
+    assert_eq!(
+        leaf.value.map(|value| value_shape(&leaf_heap, value)),
+        reference_value.map(|value| value_shape(&reference_heap, value)),
+        "identical returned value shape"
+    );
+    assert_eq!(
+        leaf_heap.byte_inspection(),
+        reference_heap.byte_inspection(),
+        "identical heap accounting"
+    );
+}
+
+fn buffer_arguments(module: &VerifiedModule, heap: &mut Heap) -> Vec<RuntimeValue> {
+    let buffer_type = module.module().buffer_types[0].type_id;
+    vec![
+        heap.allocate_buffer(
+            buffer_type,
+            nexa_bytecode::ValueType::I32,
+            &[
+                RuntimeValue::I32(1),
+                RuntimeValue::I32(2),
+                RuntimeValue::I32(3),
+            ],
+        )
+        .expect("destination buffer"),
+        heap.allocate_buffer(
+            buffer_type,
+            nexa_bytecode::ValueType::I32,
+            &[
+                RuntimeValue::I32(7),
+                RuntimeValue::I32(8),
+                RuntimeValue::I32(9),
+            ],
+        )
+        .expect("source buffer"),
+    ]
+}
+
+fn assert_static_buffer_leaf_case(module: &VerifiedModule, executable: &ExecutableModule) {
+    let mut reference_heap = Heap::new_with_limits(64, 4_096, 64);
+    let reference_arguments = buffer_arguments(module, &mut reference_heap);
+    let (reference_value, reference_charge, reference_fuel) = run_executable_once(
+        module,
+        executable,
+        7,
+        &reference_arguments,
+        &mut reference_heap,
+    );
+    let mut leaf_heap = Heap::new_with_limits(64, 4_096, 64);
+    let leaf_arguments = buffer_arguments(module, &mut leaf_heap);
+    let leaf = CheckedInterpreter::try_run_static_leaf(
+        module,
+        7,
+        &leaf_arguments,
+        FuelState::new(1_000_000, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        &mut leaf_heap,
+        executable,
+    )
+    .expect("buffer leaf executes")
+    .expect("buffer leaf is certified and in bounds");
+    assert_eq!(leaf.value, reference_value);
+    assert_eq!(leaf.charge, reference_charge);
+    assert_eq!(leaf.fuel, reference_fuel);
+    assert_eq!(
+        leaf_heap.byte_inspection(),
+        reference_heap.byte_inspection()
+    );
+}
+
+#[test]
+fn certified_static_leaves_match_full_execution_exactly() {
+    let module = nexa_compiler::compile(STATIC_LEAF_CORPUS).expect("static-leaf corpus compiles");
+    let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
+        .expect("predecode static-leaf corpus");
+    assert_static_leaf_certification(&module, &executable);
+    for (function, arguments) in [
+        (0, vec![RuntimeValue::I32(41)]),
+        (1, vec![]),
+        (2, vec![RuntimeValue::I32(9)]),
+        (3, vec![]),
+        (5, vec![]),
+    ] {
+        assert_static_leaf_case(&module, &executable, function, &arguments);
+    }
+    assert_static_buffer_leaf_case(&module, &executable);
+}
+
+#[test]
+fn static_leaf_fuel_rejection_precedes_heap_mutation() {
+    let module = nexa_compiler::compile(STATIC_LEAF_CORPUS).expect("static-leaf corpus compiles");
+    let executable = ExecutableModule::build(&module, OpcodeCostTable::canonical())
+        .expect("predecode static-leaf corpus");
+    let upper = executable.functions()[2]
+        .static_leaf_fuel()
+        .expect("nested enum is certified");
+    assert!(upper > 0);
+    let mut heap = Heap::new_with_limits(64, 4_096, 64);
+    let before = heap.byte_inspection();
+    let result = CheckedInterpreter::try_run_static_leaf(
+        &module,
+        2,
+        &[RuntimeValue::I32(9)],
+        FuelState::new(upper - 1, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        &mut heap,
+        &executable,
+    )
+    .expect("budget rejection is not an interpreter error");
+    assert_eq!(
+        result, None,
+        "the caller falls back to suspension semantics"
+    );
+    assert_eq!(heap.live_len(), 0, "no enum was allocated");
+    assert_eq!(
+        heap.byte_inspection(),
+        before,
+        "all heap counters stay flat"
+    );
+
+    let buffer_type = module.module().buffer_types[0].type_id;
+    let mut heap = Heap::new_with_limits(64, 4_096, 64);
+    let destination = heap
+        .allocate_buffer(
+            buffer_type,
+            nexa_bytecode::ValueType::I32,
+            &[RuntimeValue::I32(1)],
+        )
+        .expect("short destination");
+    let source = heap
+        .allocate_buffer(
+            buffer_type,
+            nexa_bytecode::ValueType::I32,
+            &[RuntimeValue::I32(7)],
+        )
+        .expect("short source");
+    let before = heap.byte_inspection();
+    let result = CheckedInterpreter::try_run_static_leaf(
+        &module,
+        7,
+        &[destination, source],
+        FuelState::new(1_000_000, 0, u64::MAX),
+        OpcodeCostTable::canonical(),
+        &mut heap,
+        &executable,
+    )
+    .expect("invalid bounds fall back to the trapping interpreter");
+    assert_eq!(result, None);
+    assert_eq!(heap.buffer_get(destination, 0), Ok(RuntimeValue::I32(1)));
+    assert_eq!(heap.byte_inspection(), before);
+}

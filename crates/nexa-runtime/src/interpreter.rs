@@ -40,6 +40,13 @@ pub struct ExecutionCharge {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StaticLeafReturn {
+    pub value: Option<RuntimeValue>,
+    pub charge: ExecutionCharge,
+    pub fuel: FuelState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FuelState {
     pub slice_remaining: u64,
     pub cumulative_used: u64,
@@ -559,6 +566,404 @@ const fn allocation_type_identity(instruction: Instruction) -> Option<u64> {
 
 pub struct CheckedInterpreter;
 
+#[inline]
+fn execute_static_leaf_instruction(
+    instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+    executable: &crate::executable::ExecutableModule,
+) -> Result<Option<RuntimeValue>, InterpreterError> {
+    match instruction {
+        Instruction::LoadI32 { dst, value } => {
+            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(value));
+        }
+        Instruction::LoadString { dst, string } => {
+            let (reference, hash) = if let Some((pool, constant)) = executable.pooled_string(string)
+            {
+                heap.load_pooled_string(
+                    pool,
+                    string,
+                    std::sync::Arc::clone(&constant.value),
+                    constant.hash,
+                )?
+            } else {
+                let value = module
+                    .module()
+                    .strings
+                    .get(string as usize)
+                    .ok_or(InterpreterError::TypeMismatch)?;
+                heap.load_string_literal_with_hash(value)?
+            };
+            crate::trusted::write_static_leaf(
+                registers,
+                dst,
+                RuntimeValue::String { reference, hash },
+            );
+        }
+        Instruction::Move { dst, source } => {
+            let value = crate::trusted::read_static_leaf(registers, source);
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        Instruction::Add { dst, lhs, rhs } => {
+            let RuntimeValue::I32(lhs) = crate::trusted::read_static_leaf(registers, lhs) else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let RuntimeValue::I32(rhs) = crate::trusted::read_static_leaf(registers, rhs) else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            crate::trusted::write_static_leaf(
+                registers,
+                dst,
+                RuntimeValue::I32(lhs.wrapping_add(rhs)),
+            );
+        }
+        Instruction::StringByteLen { dst, source } => {
+            let RuntimeValue::String { reference, .. } =
+                crate::trusted::read_static_leaf(registers, source)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let length = string_length_to_i32(heap.string(reference)?.len())?;
+            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(length));
+        }
+        Instruction::EnumNew {
+            type_id,
+            variant,
+            payload,
+            dst,
+        } => {
+            let variant = module
+                .enum_variant(type_id.0, variant.0)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let payload =
+                payload.map(|payload| crate::trusted::read_static_leaf(registers, payload));
+            let value = heap.allocate_enum(type_id, variant.stable_id, variant.tag, payload)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        instruction @ (Instruction::ClassNew { .. }
+        | Instruction::ClassGet { .. }
+        | Instruction::ClassSet { .. }) => {
+            execute_static_leaf_class(instruction, row, registers, module, heap)?;
+        }
+        instruction @ (Instruction::ArrayNew { .. }
+        | Instruction::ArrayPush { .. }
+        | Instruction::ArraySet { .. }
+        | Instruction::ArrayGet { .. }
+        | Instruction::ArrayLen { .. }) => {
+            execute_static_leaf_array(instruction, registers, module, heap)?;
+        }
+        instruction @ (Instruction::BufferCopy { .. } | Instruction::BufferGet { .. }) => {
+            execute_static_leaf_buffer(instruction, registers, heap)?;
+        }
+        Instruction::Return { source } => {
+            return Ok(Some(crate::trusted::read_static_leaf(registers, source)));
+        }
+        _ => {
+            debug_assert!(
+                false,
+                "executable static-leaf certification and executor diverged"
+            );
+            return Err(InterpreterError::TypeMismatch);
+        }
+    }
+    Ok(None)
+}
+
+fn execute_static_leaf_class(
+    instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+) -> Result<(), InterpreterError> {
+    match instruction {
+        Instruction::ClassNew {
+            type_id,
+            fields_base,
+            fields_count,
+            dst,
+        } => {
+            let fields =
+                crate::trusted::read_static_leaf_window(registers, fields_base, fields_count);
+            let value = heap.allocate_class(type_id, fields)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        Instruction::ClassGet { source, field, dst } => {
+            let value = crate::trusted::read_static_leaf(registers, source);
+            let RuntimeValue::NamedRef { type_id, .. } = value else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let (index, expected) =
+                resolved_class_field(module, type_id, field, row.resolved_nominal)?;
+            let field_value = heap.class_field(value, index)?;
+            if runtime_value_type(field_value) != Some(expected) {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            crate::trusted::write_static_leaf(registers, dst, field_value);
+        }
+        Instruction::ClassSet {
+            source,
+            field,
+            value,
+        } => {
+            let object = crate::trusted::read_static_leaf(registers, source);
+            let replacement = crate::trusted::read_static_leaf(registers, value);
+            let RuntimeValue::NamedRef { type_id, .. } = object else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let (index, expected) =
+                resolved_class_field(module, type_id, field, row.resolved_nominal)?;
+            if runtime_value_type(replacement) != Some(expected) {
+                return Err(InterpreterError::TypeMismatch);
+            }
+            heap.set_class_field(object, index, replacement)?;
+        }
+        _ => unreachable!("class leaf helper receives only class instructions"),
+    }
+    Ok(())
+}
+
+fn execute_static_leaf_array(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    module: &VerifiedModule,
+    heap: &mut Heap,
+) -> Result<(), InterpreterError> {
+    match instruction {
+        Instruction::ArrayNew { type_id, dst } => {
+            let element_type = module
+                .array_type(type_id.0)
+                .map(|array_type| array_type.element)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            let row_fields = match element_type {
+                ValueType::Named(element_id) => module
+                    .struct_type(element_id.0)
+                    .and_then(|layout| u8::try_from(layout.fields.len()).ok())
+                    .and_then(std::num::NonZeroU8::new),
+                _ => None,
+            };
+            let value = match row_fields {
+                Some(field_count) => {
+                    heap.allocate_struct_row_array(type_id, element_type, field_count)?
+                }
+                None => heap.allocate_array(type_id, element_type)?,
+            };
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        Instruction::ArrayPush { source, value } => {
+            let array = crate::trusted::read_static_leaf(registers, source);
+            let value = crate::trusted::read_static_leaf(registers, value);
+            heap.array_push(array, value)?;
+        }
+        Instruction::ArraySet {
+            source,
+            index,
+            value,
+        } => {
+            let array = crate::trusted::read_static_leaf(registers, source);
+            let RuntimeValue::I32(index) = crate::trusted::read_static_leaf(registers, index)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let replacement = crate::trusted::read_static_leaf(registers, value);
+            let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
+            heap.array_set(array, index, replacement)?;
+        }
+        Instruction::ArrayGet { source, index, dst } => {
+            let array = crate::trusted::read_static_leaf(registers, source);
+            let RuntimeValue::I32(index) = crate::trusted::read_static_leaf(registers, index)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
+            let value = heap.array_get(array, index)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        Instruction::ArrayLen { source, dst } => {
+            let array = crate::trusted::read_static_leaf(registers, source);
+            let length = i32::try_from(heap.array_len(array)?)
+                .map_err(|_| InterpreterError::StringLengthOverflow)?;
+            crate::trusted::write_static_leaf(registers, dst, RuntimeValue::I32(length));
+        }
+        _ => unreachable!("array leaf helper receives only array instructions"),
+    }
+    Ok(())
+}
+
+fn execute_static_leaf_buffer(
+    instruction: Instruction,
+    registers: &mut crate::trusted::StaticLeafRegisters,
+    heap: &mut Heap,
+) -> Result<(), InterpreterError> {
+    match instruction {
+        Instruction::BufferCopy {
+            destination,
+            source,
+            source_start,
+            destination_start,
+            length,
+        } => {
+            let destination = crate::trusted::read_static_leaf(registers, destination);
+            let source = crate::trusted::read_static_leaf(registers, source);
+            let RuntimeValue::I32(source_start) =
+                crate::trusted::read_static_leaf(registers, source_start)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let RuntimeValue::I32(destination_start) =
+                crate::trusted::read_static_leaf(registers, destination_start)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let RuntimeValue::I32(length) = crate::trusted::read_static_leaf(registers, length)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            heap.buffer_copy(
+                destination,
+                source,
+                usize::try_from(source_start).map_err(|_| InterpreterError::TypeMismatch)?,
+                usize::try_from(destination_start).map_err(|_| InterpreterError::TypeMismatch)?,
+                usize::try_from(length).map_err(|_| InterpreterError::TypeMismatch)?,
+            )?;
+        }
+        Instruction::BufferGet { source, index, dst } => {
+            let buffer = crate::trusted::read_static_leaf(registers, source);
+            let RuntimeValue::I32(index) = crate::trusted::read_static_leaf(registers, index)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            let index = usize::try_from(index).map_err(|_| InterpreterError::TypeMismatch)?;
+            let value = heap.buffer_get(buffer, index)?;
+            crate::trusted::write_static_leaf(registers, dst, value);
+        }
+        _ => unreachable!("buffer leaf helper receives only buffer instructions"),
+    }
+    Ok(())
+}
+
+fn resolved_class_field(
+    module: &VerifiedModule,
+    type_id: StableId,
+    field: StableId,
+    resolved: nexa_verifier::ResolvedNominalOperand,
+) -> Result<(usize, ValueType), InterpreterError> {
+    match resolved {
+        nexa_verifier::ResolvedNominalOperand::ClassField { type_index, index } => {
+            let expected = module
+                .module()
+                .class_types
+                .get(usize::from(type_index))
+                .and_then(|class_type| class_type.fields.get(usize::from(index)))
+                .map(|field| field.ty)
+                .ok_or(InterpreterError::TypeMismatch)?;
+            Ok((usize::from(index), expected))
+        }
+        _ => module
+            .class_field(type_id.0, field.0)
+            .map(|(index, field)| (index, field.ty))
+            .ok_or(InterpreterError::TypeMismatch),
+    }
+}
+
+fn static_leaf_upper_fuel(
+    certificate: crate::executable::StaticLeafCertificate,
+    heap: &Heap,
+) -> Result<u64, InterpreterError> {
+    let mut upper = fuel_add(
+        certificate.fixed_fuel,
+        fuel_add(
+            certificate.array_push_element_fuel,
+            certificate.buffer_work_fuel,
+        )?,
+    )?;
+    let initial_ranges = fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?;
+    for push in 0..certificate.array_pushes {
+        // A splitting claim and the following release can each add at most
+        // one free range. Pretend every prior push grew so this remains an
+        // upper bound for any allocator shape the certified local array sees.
+        let ranges = initial_ranges
+            .checked_add(u64::from(push).saturating_mul(2))
+            .ok_or(InterpreterError::FuelCostOverflow)?;
+        upper = fuel_add(
+            upper,
+            collection_arena_metadata_shape_fuel(ranges, true, true)?,
+        )?;
+    }
+    Ok(upper)
+}
+
+fn static_leaf_attempt_fuel(
+    instruction: Instruction,
+    row: crate::executable::ExecutableInstruction,
+    registers: &crate::trusted::StaticLeafRegisters,
+    heap: &Heap,
+) -> Result<u64, InterpreterError> {
+    if !row.dynamic_fuel || matches!(instruction, Instruction::Return { .. }) {
+        return Ok(row.attempt_fuel);
+    }
+    let work = match instruction {
+        Instruction::ArrayPush { source, .. } => {
+            let array = crate::trusted::read_static_leaf(registers, source);
+            let (live, capacity) = heap.array_fuel_shape(array)?;
+            let moved = if live < capacity { 1 } else { live.max(1) };
+            let element_work =
+                fuel_blocks(fuel_usize(moved)?, STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS)?;
+            fuel_add(
+                element_work,
+                collection_arena_metadata_fuel(heap, live >= capacity, live >= capacity)?,
+            )?
+        }
+        Instruction::BufferCopy { length, .. } => {
+            let RuntimeValue::I32(length) = crate::trusted::read_static_leaf(registers, length)
+            else {
+                return Err(InterpreterError::TypeMismatch);
+            };
+            fuel_blocks(
+                u64::try_from(length).map_err(|_| InterpreterError::TypeMismatch)?,
+                STANDARD_COLLECTION_FUEL_BLOCK_ELEMENTS,
+            )?
+        }
+        _ => {
+            debug_assert!(false, "certified leaf dynamic-fuel surface diverged");
+            return Err(InterpreterError::TypeMismatch);
+        }
+    };
+    fuel_add(row.attempt_fuel, work)
+}
+
+fn static_leaf_buffers_valid(
+    certificate: crate::executable::StaticLeafCertificate,
+    registers: &crate::trusted::StaticLeafRegisters,
+    heap: &Heap,
+) -> bool {
+    if let Some(check) = certificate.buffer_copy {
+        let destination = crate::trusted::read_static_leaf(registers, check.destination);
+        let source = crate::trusted::read_static_leaf(registers, check.source);
+        if heap
+            .validate_buffer_copy(
+                destination,
+                source,
+                check.source_start,
+                check.destination_start,
+                check.length,
+            )
+            .is_err()
+        {
+            return false;
+        }
+    }
+    if let Some(check) = certificate.buffer_get {
+        let buffer = crate::trusted::read_static_leaf(registers, check.source);
+        if !matches!(heap.buffer_len(buffer), Ok(length) if check.index < length) {
+            return false;
+        }
+    }
+    true
+}
+
 pub trait InterpreterHost {
     fn call(
         &mut self,
@@ -651,6 +1056,105 @@ impl CheckedInterpreter {
         reservation: ContinuationReservation,
     ) -> Result<InterpreterContinuation, InterpreterError> {
         InterpreterContinuation::new(module, function, arguments, limits, reservation)
+    }
+
+    /// Executes a verifier-certified tiny leaf without constructing a
+    /// continuation or touching the frame pool. Admission is all-or-nothing:
+    /// the executable image supplies a static upper fuel bound, and
+    /// insufficient budgets return `None` before any heap mutation so the
+    /// caller can preserve ordinary suspension semantics through the full
+    /// interpreter.
+    pub fn try_run_static_leaf(
+        module: &VerifiedModule,
+        function: u32,
+        arguments: &[RuntimeValue],
+        mut fuel: FuelState,
+        costs: &OpcodeCostTable,
+        heap: &mut Heap,
+        executable: &crate::executable::ExecutableModule,
+    ) -> Result<Option<StaticLeafReturn>, InterpreterError> {
+        if executable.cost_table_version() != costs.version {
+            return Err(InterpreterError::OpcodeCostTableVersion {
+                expected: executable.cost_table_version(),
+                actual: costs.version,
+            });
+        }
+        let function_meta = module
+            .module()
+            .functions
+            .get(function as usize)
+            .ok_or(InterpreterError::MissingFunction(function))?;
+        let executable_function = executable
+            .functions()
+            .get(function as usize)
+            .ok_or(InterpreterError::MissingFunction(function))?;
+        let Some(certificate) = executable_function.static_leaf_certificate() else {
+            return Ok(None);
+        };
+        // `ExecutableModule` is normally owned beside the exact verified
+        // module it was built from. Keep the fixed register kernel sound
+        // even for direct callers that accidentally cross those objects:
+        // the verifier-owned function must independently fit the leaf
+        // register bank and have one bytecode row per executable row.
+        if usize::from(function_meta.registers) > crate::trusted::STATIC_LEAF_REGISTER_CAPACITY
+            || function_meta.code.len() != executable_function.rows().len()
+        {
+            return Ok(None);
+        }
+        validate_arguments(arguments, &function_meta.signature.parameters)?;
+        let mut registers = crate::trusted::new_static_leaf_registers();
+        for (destination, argument) in (0_u16..).zip(arguments.iter().copied()) {
+            crate::trusted::write_static_leaf(&mut registers, destination, argument);
+        }
+        if !static_leaf_buffers_valid(certificate, &registers, heap) {
+            return Ok(None);
+        }
+        let upper_fuel = static_leaf_upper_fuel(certificate, heap)?;
+        let Some(cumulative_after_upper) = fuel.cumulative_used.checked_add(upper_fuel) else {
+            return Ok(None);
+        };
+        if upper_fuel > fuel.slice_remaining || cumulative_after_upper > fuel.cumulative_limit {
+            return Ok(None);
+        }
+        let mut pc = 0_usize;
+        let mut charge = ExecutionCharge::default();
+        loop {
+            let instruction = *function_meta
+                .code
+                .get(pc)
+                .ok_or(InterpreterError::FellOffFunction)?;
+            let row = executable_function
+                .rows()
+                .get(pc)
+                .ok_or(InterpreterError::FellOffFunction)?;
+            charge.instructions = charge.instructions.saturating_add(1);
+            let attempt_fuel = static_leaf_attempt_fuel(instruction, *row, &registers, heap)?;
+            charge.fuel_used = charge
+                .fuel_used
+                .checked_add(attempt_fuel)
+                .ok_or(InterpreterError::FuelCostOverflow)?;
+            if let Some(value) = execute_static_leaf_instruction(
+                instruction,
+                *row,
+                &mut registers,
+                module,
+                heap,
+                executable,
+            )? {
+                debug_assert!(charge.fuel_used <= upper_fuel);
+                fuel.slice_remaining -= charge.fuel_used;
+                fuel.cumulative_used = fuel
+                    .cumulative_used
+                    .checked_add(charge.fuel_used)
+                    .ok_or(InterpreterError::FuelCostOverflow)?;
+                return Ok(Some(StaticLeafReturn {
+                    value: Some(value),
+                    charge,
+                    fuel,
+                }));
+            }
+            pc += 1;
+        }
     }
 
     pub fn poll(
@@ -3508,11 +4012,22 @@ fn collection_arena_metadata_fuel(
     claim: bool,
     release: bool,
 ) -> Result<u64, InterpreterError> {
+    collection_arena_metadata_shape_fuel(
+        fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?,
+        claim,
+        release,
+    )
+}
+
+fn collection_arena_metadata_shape_fuel(
+    ranges: u64,
+    claim: bool,
+    release: bool,
+) -> Result<u64, InterpreterError> {
     if !claim && !release {
         return Ok(0);
     }
 
-    let ranges = fuel_usize(heap.collection_arena_fuel_shape().free_ranges)?;
     let mut metadata_steps = 0_u64;
     if claim {
         // find_free scan + claim position scan + one Vec remove/insert shift.

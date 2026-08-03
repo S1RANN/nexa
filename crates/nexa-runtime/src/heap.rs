@@ -3989,10 +3989,8 @@ impl Heap {
         destination_start: usize,
         length: usize,
     ) -> Result<(), HeapError> {
+        self.validate_buffer_copy(destination, source, source_start, destination_start, length)?;
         let destination_metadata = self.buffer_metadata(destination)?;
-        if self.buffer_metadata(source)? != destination_metadata {
-            return Err(invalid_value_reference());
-        }
         let source_end =
             checked_collection_end(source_start, length, self.buffer_range(source)?.1.length)?;
         let destination_end = checked_collection_end(
@@ -4046,6 +4044,26 @@ impl Heap {
             }
         }
         debug_assert_eq!(destination_end - destination_start, length);
+        Ok(())
+    }
+
+    pub(crate) fn validate_buffer_copy(
+        &self,
+        destination: RuntimeValue,
+        source: RuntimeValue,
+        source_start: usize,
+        destination_start: usize,
+        length: usize,
+    ) -> Result<(), HeapError> {
+        if self.buffer_metadata(source)? != self.buffer_metadata(destination)? {
+            return Err(invalid_value_reference());
+        }
+        checked_collection_end(source_start, length, self.buffer_range(source)?.1.length)?;
+        checked_collection_end(
+            destination_start,
+            length,
+            self.buffer_range(destination)?.1.length,
+        )?;
         Ok(())
     }
 
